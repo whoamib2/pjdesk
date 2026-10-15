@@ -152,8 +152,17 @@ impl eframe::App for App {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SvcAction {
+    Install,
+    Uninstall,
+    Start,
+    Stop,
+}
+
 impl App {
     fn service_card(&mut self, ui: &mut egui::Ui) {
+        let mut action: Option<SvcAction> = None;
         card(ui, |ui| {
             heading(ui, "SERVICE");
             let (installed, running) = svc_status();
@@ -172,18 +181,18 @@ impl App {
             ui.horizontal(|ui| {
                 if !installed {
                     if ui.add(egui::Button::new("Install service").fill(ACCENT)).clicked() {
-                        run_elevated(&["service", "install", "--firewall"]);
+                        action = Some(SvcAction::Install);
                     }
                 } else {
                     if ui.button("Uninstall").clicked() {
-                        run_elevated(&["service", "uninstall"]);
+                        action = Some(SvcAction::Uninstall);
                     }
                     if running {
                         if ui.button("Stop").clicked() {
-                            run_elevated(&["service", "stop"]);
+                            action = Some(SvcAction::Stop);
                         }
                     } else if ui.button("Start").clicked() {
-                        run_elevated(&["service", "start"]);
+                        action = Some(SvcAction::Start);
                     }
                 }
             });
@@ -201,6 +210,32 @@ impl App {
             });
             ui.label(RichText::new("Clients pin this on first connect; compare it when setting up a new computer.").color(MUTED).size(11.0));
         });
+
+        if let Some(action) = action {
+            self.run_service_action(action);
+        }
+    }
+
+    /// Runs a service action in-process (the server always runs elevated).
+    fn run_service_action(&mut self, action: SvcAction) {
+        let result = match action {
+            SvcAction::Install => {
+                let opts = crate::ServerOpts {
+                    bind: std::net::IpAddr::from([0, 0, 0, 0]),
+                    port: self.port,
+                    data_dir: Some(self.data_dir.clone()),
+                };
+                crate::service::install(&opts, &self.data_dir, true).map(|_| "Service installed and started.")
+            }
+            SvcAction::Uninstall => crate::service::uninstall().map(|_| "Service removed."),
+            SvcAction::Start => crate::service::start().map(|_| "Service started."),
+            SvcAction::Stop => crate::service::stop().map(|_| "Service stopped."),
+        };
+        self.status = match result {
+            Ok(msg) => msg.to_string(),
+            Err(e) => format!("{e:#}"),
+        };
+        self.refresh();
     }
 
     fn accounts_card(&mut self, ui: &mut egui::Ui) {
