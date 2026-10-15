@@ -3,6 +3,7 @@
 pub mod decoder;
 mod keymap;
 mod render;
+mod toolbar;
 mod window;
 
 use std::net::SocketAddr;

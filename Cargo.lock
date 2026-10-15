@@ -2413,10 +2413,12 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "pjdesk"
 version = "0.1.1"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "arboard",
  "clap",
  "eframe",
+ "epaint_default_fonts",
  "hex",
  "openh264",
  "pjdesk-proto",

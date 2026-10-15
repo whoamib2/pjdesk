@@ -34,7 +34,9 @@ use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
 
 use super::decoder::VideoDecoder;
 use super::render::{self, Layout, RgbFrame};
+use super::toolbar::{self, Action};
 use super::{keymap, Link};
+use pjdesk_proto::peer::SpecialCommand;
 
 /// Events delivered to the window from other threads.
 #[derive(Debug)]
@@ -103,8 +105,10 @@ pub fn run(runtime: Runtime, link: Link) -> Result<()> {
         keys_down: HashMap::new(),
         modifiers: ModifiersState::empty(),
         last_position: None,
+        cursor_px: (0.0, 0.0),
         wheel: (0.0, 0.0),
         closed: false,
+        toolbar: toolbar::Toolbar::default(),
     };
     event_loop.run_app(&mut app)?;
 
@@ -253,9 +257,12 @@ struct App {
     keys_down: HashMap<KeyCode, u16>,
     modifiers: ModifiersState,
     last_position: Option<(u16, u16)>,
+    /// Last pointer position in window pixels (for toolbar hit-testing).
+    cursor_px: (f64, f64),
     /// Fractional wheel movement not sent yet (touchpads).
     wheel: (f64, f64),
     closed: bool,
+    toolbar: super::toolbar::Toolbar,
 }
 
 impl App {
@@ -303,7 +310,41 @@ impl App {
             Some(frame) => self.layout = render::draw(frame, &mut buffer, size.width as usize, size.height as usize),
             None => buffer.fill(0x00_1e_1e_22),
         }
+        self.toolbar.draw(&mut buffer, size.width as usize, size.height as usize);
         let _ = buffer.present();
+    }
+
+    /// Carries out a toolbar action. Returns true if the window should close.
+    fn perform(&mut self, action: Action) -> bool {
+        match action {
+            Action::Fullscreen => {
+                if let Some(window) = &self.window {
+                    let on = window.fullscreen().is_none();
+                    window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
+                }
+            }
+            Action::ActualSize => {
+                if let (Some(window), Some(frame)) = (&self.window, &self.current) {
+                    let _ = window.request_inner_size(PhysicalSize::new(frame.width as u32, frame.height as u32));
+                }
+            }
+            Action::Refresh => {
+                let _ = self.control.send(ControlMsg::RequestKeyframe);
+            }
+            Action::CtrlAltDel => {
+                let _ = self.control.send(ControlMsg::Special(SpecialCommand::CtrlAltDel));
+            }
+            Action::ToggleBlockInput => {
+                self.toolbar.block_input = !self.toolbar.block_input;
+                // Don't leave anything held on the host when we stop sending.
+                self.release_all();
+            }
+            Action::Disconnect => return true,
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        false
     }
 
     fn on_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
@@ -316,6 +357,10 @@ impl App {
                 window.set_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
             }
             let _ = event_loop;
+            return;
+        }
+        // "Block input" also suppresses forwarded keystrokes.
+        if self.toolbar.block_input {
             return;
         }
         let Some(mut scan) = keymap::scancode(code) else { return };
@@ -334,6 +379,23 @@ impl App {
     }
 
     fn on_cursor(&mut self, position: PhysicalPosition<f64>) {
+        self.cursor_px = (position.x, position.y);
+        // The toolbar reveals near the top; hovering it must not move the
+        // remote pointer.
+        if let Some(window) = &self.window {
+            let win_w = window.inner_size().width as usize;
+            let was_visible = self.toolbar.is_visible();
+            let over_bar = self.toolbar.on_pointer(position.x, position.y, win_w);
+            if self.toolbar.is_visible() || was_visible {
+                window.request_redraw();
+            }
+            if over_bar {
+                return;
+            }
+        }
+        if self.toolbar.block_input {
+            return;
+        }
         let layout = self.layout;
         if layout.width == 0 || layout.height == 0 {
             return;
@@ -456,6 +518,19 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.on_key(event_loop, event),
             WindowEvent::CursorMoved { position, .. } => self.on_cursor(position),
             WindowEvent::MouseInput { state, button, .. } => {
+                // A click on the toolbar runs its action locally.
+                if button == winit::event::MouseButton::Left {
+                    let win_w = self.window.as_ref().map(|w| w.inner_size().width as usize).unwrap_or(0);
+                    if let Some(action) = self.toolbar.hit(self.cursor_px.0, self.cursor_px.1, win_w) {
+                        if state == ElementState::Pressed && self.perform(action) {
+                            event_loop.exit();
+                        }
+                        return;
+                    }
+                }
+                if self.toolbar.block_input {
+                    return;
+                }
                 let button = match button {
                     winit::event::MouseButton::Left => MouseButton::Left,
                     winit::event::MouseButton::Right => MouseButton::Right,
@@ -466,7 +541,11 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 self.send(InputEvent::MouseButton { button, down: state == ElementState::Pressed });
             }
-            WindowEvent::MouseWheel { delta, .. } => self.on_wheel(delta),
+            WindowEvent::MouseWheel { delta, .. } => {
+                if !self.toolbar.block_input {
+                    self.on_wheel(delta);
+                }
+            }
             _ => {}
         }
     }

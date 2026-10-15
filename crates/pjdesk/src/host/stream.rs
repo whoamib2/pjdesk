@@ -137,6 +137,13 @@ pub async fn run(
                 }
                 Ok(ControlMsg::FrameAck { seq }) => shared.flow.ack(seq),
                 Ok(ControlMsg::RequestKeyframe) => shared.keyframe_requested.store(true, Ordering::SeqCst),
+                Ok(ControlMsg::Special(cmd)) => {
+                    if !args.view_only {
+                        match cmd {
+                            pjdesk_proto::peer::SpecialCommand::CtrlAltDel => crate::platform::send_ctrl_alt_del(),
+                        }
+                    }
+                }
                 Ok(ControlMsg::Ping { t_us }) => {
                     if let Err(e) = write_msg(&mut control_send, &HostMsg::Pong { t_us }).await {
                         break Err(e);

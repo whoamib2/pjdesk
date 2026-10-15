@@ -87,6 +87,32 @@ pub fn run_elevated(args: &[&str]) -> bool {
     }
 }
 
+/// Injects the secure attention sequence (Ctrl+Alt+Del) via `sas.dll`. This
+/// only works when the caller runs with enough privilege — i.e. the background
+/// service — so it's best effort. The DLL is loaded dynamically because it
+/// isn't present on every SKU.
+#[cfg(windows)]
+pub fn send_ctrl_alt_del() {
+    use windows::core::s;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+    unsafe {
+        let Ok(lib) = LoadLibraryA(s!("sas.dll")) else {
+            tracing::warn!("Ctrl+Alt+Del: sas.dll not available");
+            return;
+        };
+        if let Some(proc) = GetProcAddress(lib, s!("SendSAS")) {
+            // void SendSAS(BOOL AsUser)
+            let send: unsafe extern "system" fn(i32) = std::mem::transmute(proc);
+            send(0); // AsUser = FALSE: works from a service/SYSTEM session
+        } else {
+            tracing::warn!("Ctrl+Alt+Del: SendSAS not found in sas.dll");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn send_ctrl_alt_del() {}
+
 #[cfg(not(windows))]
 pub fn run_elevated(_args: &[&str]) -> bool {
     false

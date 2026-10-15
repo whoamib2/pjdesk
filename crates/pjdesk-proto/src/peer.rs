@@ -42,9 +42,19 @@ pub enum ControlMsg {
     },
     /// The decoder lost sync; please send an IDR frame.
     RequestKeyframe,
+    /// A special command the host performs itself (e.g. Ctrl+Alt+Del).
+    Special(SpecialCommand),
     Ping {
         t_us: u64,
     },
+}
+
+/// Commands the controller asks the host to carry out directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpecialCommand {
+    /// Secure attention sequence (Ctrl+Alt+Del). Works when the host runs as
+    /// the background service; a normal app can't inject it.
+    CtrlAltDel,
 }
 
 /// Host → controller messages after authentication.
