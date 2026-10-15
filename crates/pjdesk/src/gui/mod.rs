@@ -1,0 +1,392 @@
+//! The PJDesk desktop app: the window you get by running `pjdesk` with no
+//! arguments (or double-clicking it).
+//!
+//! Left half shares this computer (your ID + password, served by a host thread
+//! running in the background); right half connects to another computer. A
+//! settings window and an optional sign-in to your server round it out. Each
+//! outgoing session opens in its own viewer process, so the window stays
+//! responsive.
+
+mod panels;
+mod settings;
+mod theme;
+mod widgets;
+
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use pjdesk_proto::{format_id, is_valid_id, normalize_id};
+use eframe::egui;
+
+use crate::account;
+use crate::config::Config;
+use crate::host::{self, HostShared};
+use crate::signaling::ServerAddr;
+use crate::HostArgs;
+
+/// Launches the app and blocks until the window is closed.
+pub fn run(server_flag: Option<String>) -> Result<()> {
+    let mut config = Config::load().unwrap_or_default();
+    // A --server flag updates the saved server.
+    if let Some(flag) = &server_flag {
+        if let Ok(addr) = ServerAddr::parse(flag) {
+            config.server = Some(addr.to_string());
+            let _ = config.save();
+        }
+    }
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([940.0, 620.0])
+            .with_min_inner_size([760.0, 520.0])
+            .with_title("PJDesk")
+            .with_app_id("pjdesk"),
+        renderer: preferred_renderer(),
+        ..Default::default()
+    };
+
+    eframe::run_native("PJDesk", options, Box::new(|cc| Ok(Box::new(App::new(cc, config)))))
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// wgpu renders correctly on the broadest range of Windows GPUs here; glow is a
+/// fallback via `PJDESK_RENDERER=glow`.
+fn preferred_renderer() -> eframe::Renderer {
+    match std::env::var("PJDESK_RENDERER").as_deref() {
+        Ok("glow") => eframe::Renderer::Glow,
+        _ => eframe::Renderer::Wgpu,
+    }
+}
+
+/// Supervises the background host thread (the "share this computer" side).
+struct Engine {
+    shared: Arc<HostShared>,
+    server: Option<ServerAddr>,
+}
+
+impl Engine {
+    /// Starts a host thread if a server is configured; otherwise stays idle.
+    fn start(config: &Config) -> Self {
+        let shared = Arc::new(HostShared::default());
+        let server = config.server.as_deref().and_then(|s| ServerAddr::parse(s).ok());
+        if let Some(server) = &server {
+            spawn_host(server.clone(), config.clone(), shared.clone());
+        }
+        Self { shared, server }
+    }
+
+    /// Restarts hosting with the current config (e.g. after the server or a
+    /// quality setting changed).
+    fn restart(&mut self, config: &Config) {
+        self.shared.request_stop();
+        let shared = Arc::new(HostShared::default());
+        self.shared = shared.clone();
+        self.server = config.server.as_deref().and_then(|s| ServerAddr::parse(s).ok());
+        if let Some(server) = &self.server {
+            spawn_host(server.clone(), config.clone(), shared);
+        }
+    }
+}
+
+fn spawn_host(server: ServerAddr, config: Config, shared: Arc<HostShared>) {
+    let args = HostArgs::from_settings(&config.settings);
+    std::thread::Builder::new()
+        .name("host".into())
+        .spawn(move || {
+            if let Err(e) = host::run_with(server, config, args, Some(shared.clone())) {
+                *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
+            }
+        })
+        .expect("spawn host thread");
+}
+
+/// Outcome of a background sign-in attempt.
+enum LoginMsg {
+    Ok { display_name: String },
+    Err(String),
+}
+
+pub struct App {
+    cfg: Config,
+    engine: Engine,
+
+    // "Control remote" panel.
+    connect_id: String,
+    connect_password: String,
+    remember: bool,
+
+    // Account sign-in.
+    show_login: bool,
+    login_user: String,
+    login_pass: String,
+    login_busy: bool,
+    login_rx: Option<Receiver<LoginMsg>>,
+
+    // Settings window.
+    show_settings: bool,
+    settings: settings::SettingsDraft,
+
+    // Add-to-address-book dialog.
+    book_alias: String,
+    book_target: Option<String>,
+
+    status: String,
+    toast: widgets::Toast,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>, cfg: Config) -> Self {
+        theme::apply(&cc.egui_ctx);
+        let engine = Engine::start(&cfg);
+        let settings = settings::SettingsDraft::from_config(&cfg);
+        let mut app = Self {
+            cfg,
+            engine,
+            connect_id: String::new(),
+            connect_password: String::new(),
+            remember: false,
+            show_login: false,
+            login_user: String::new(),
+            login_pass: String::new(),
+            login_busy: false,
+            login_rx: None,
+            show_settings: false,
+            settings,
+            book_alias: String::new(),
+            book_target: None,
+            status: String::new(),
+            toast: widgets::Toast::default(),
+        };
+        // Refresh a saved sign-in in the background.
+        if app.cfg.account.is_some() {
+            app.start_token_refresh();
+        }
+        app
+    }
+
+    fn server_addr(&self) -> Option<ServerAddr> {
+        self.cfg.server.as_deref().and_then(|s| ServerAddr::parse(s).ok())
+    }
+
+    /// Saves config without clobbering the identity the host thread owns.
+    fn save_cfg(&mut self) {
+        self.cfg.reload_identity_from_disk();
+        if let Err(e) = self.cfg.save() {
+            self.status = format!("Could not save settings: {e}");
+        }
+    }
+
+    // --- Account ----------------------------------------------------------
+
+    fn start_token_refresh(&mut self) {
+        let Some(server) = self.server_addr() else { return };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.login_rx = Some(rx);
+        self.login_busy = true;
+        let mut cfg = self.cfg.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(LoginMsg::Err(e.to_string()));
+                    return;
+                }
+            };
+            match rt.block_on(account::refresh(&server, &mut cfg)) {
+                Ok(Some(info)) => {
+                    let _ = cfg.save();
+                    let _ = tx.send(LoginMsg::Ok { display_name: info.display_name });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = cfg.save();
+                    let _ = tx.send(LoginMsg::Err(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_login(&mut self, tx: Sender<LoginMsg>) {
+        let Some(server) = self.server_addr() else {
+            self.status = "Set your server in Settings first.".into();
+            return;
+        };
+        let (user, pass) = (self.login_user.trim().to_string(), self.login_pass.clone());
+        if user.is_empty() || pass.is_empty() {
+            self.status = "Enter a username and password.".into();
+            return;
+        }
+        self.login_busy = true;
+        let mut cfg = self.cfg.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            match rt.block_on(account::login(&server, &mut cfg, &user, &pass)) {
+                Ok(info) => {
+                    let _ = cfg.save();
+                    let _ = tx.send(LoginMsg::Ok { display_name: info.display_name });
+                }
+                Err(e) => {
+                    let _ = tx.send(LoginMsg::Err(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
+    fn poll_login(&mut self) {
+        let Some(rx) = &self.login_rx else { return };
+        match rx.try_recv() {
+            Ok(LoginMsg::Ok { display_name, .. }) => {
+                self.login_busy = false;
+                self.login_rx = None;
+                self.show_login = false;
+                self.login_pass.clear();
+                // The worker saved the token + address book to disk; reload it.
+                let keep_id = (self.cfg.device_id.clone(), self.cfg.device_secret.clone());
+                if let Ok(fresh) = Config::load() {
+                    self.cfg = fresh;
+                    self.cfg.device_id = self.cfg.device_id.clone().or(keep_id.0);
+                    self.cfg.device_secret = self.cfg.device_secret.clone().or(keep_id.1);
+                }
+                self.toast.show(format!("Signed in as {display_name}"));
+            }
+            Ok(LoginMsg::Err(e)) => {
+                self.login_busy = false;
+                self.login_rx = None;
+                self.status = e;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.login_busy = false;
+                self.login_rx = None;
+            }
+        }
+    }
+
+    fn sign_out(&mut self) {
+        if let Some(server) = self.server_addr() {
+            let mut cfg = self.cfg.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let _ = rt.block_on(account::logout(&server, &mut cfg));
+            });
+        }
+        self.cfg.account = None;
+        self.cfg.address_book.clear();
+        self.save_cfg();
+        self.toast.show("Signed out");
+    }
+
+    /// Pushes the address book to the server after a local change.
+    fn sync_address_book(&mut self) {
+        self.save_cfg();
+        if self.cfg.account.is_none() {
+            return;
+        }
+        let Some(server) = self.server_addr() else { return };
+        let mut cfg = self.cfg.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let _ = rt.block_on(account::push_address_book(&server, &mut cfg));
+        });
+    }
+
+    // --- Connecting -------------------------------------------------------
+
+    /// Launches a viewer process for `id`, using `password` (or a saved one).
+    fn connect_to(&mut self, id: &str, password: Option<String>) {
+        let id = normalize_id(id);
+        if !is_valid_id(&id) {
+            self.status = "That isn't a 9-digit PJDesk ID.".into();
+            return;
+        }
+        let Some(server) = self.cfg.server.clone() else {
+            self.status = "Set your server in Settings first.".into();
+            return;
+        };
+        let password = password
+            .filter(|p| !p.is_empty())
+            .or_else(|| self.cfg.saved_password(&id))
+            .unwrap_or_default();
+
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                self.status = format!("Can't find the PJDesk program: {e}");
+                return;
+            }
+        };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--server").arg(server).arg("connect").arg(&id);
+        if !password.is_empty() {
+            cmd.env("PJDESK_PASSWORD", &password);
+        }
+        match cmd.spawn() {
+            Ok(_) => {
+                self.toast.show(format!("Opening {}", format_id(&id)));
+                if self.remember && !password.is_empty() {
+                    self.remember_password(&id, &password);
+                }
+            }
+            Err(e) => self.status = format!("Could not open the viewer: {e}"),
+        }
+    }
+
+    fn remember_password(&mut self, id: &str, password: &str) {
+        // Prefer the synced address book when signed in; else the local store.
+        if self.cfg.account.is_some() {
+            if let Some(entry) = self.cfg.address_book.iter_mut().find(|e| e.id == id) {
+                entry.password = Some(password.to_string());
+            } else {
+                self.cfg.address_book.push(pjdesk_proto::signal::AddressEntry {
+                    id: id.to_string(),
+                    password: Some(password.to_string()),
+                    ..Default::default()
+                });
+            }
+            self.sync_address_book();
+        } else {
+            self.cfg.remember_password(id, Some(password));
+            self.save_cfg();
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_login();
+        let ctx = ui.ctx().clone();
+        // Keep status (online/connected) fresh.
+        ctx.request_repaint_after(Duration::from_millis(400));
+
+        egui::Panel::top("topbar").show(ui, |ui| self.top_bar(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.columns(2, |cols| {
+                self.host_panel(&mut cols[0]);
+                self.control_panel(&mut cols[1]);
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            self.address_book(ui);
+        });
+
+        self.settings_window(&ctx);
+        self.login_window(&ctx);
+        self.add_book_window(&ctx);
+        self.toast.render(&ctx);
+
+        if !self.status.is_empty() {
+            egui::Panel::bottom("status").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(theme::WARN, "⚠");
+                    ui.label(&self.status);
+                    if ui.small_button("✕").clicked() {
+                        self.status.clear();
+                    }
+                });
+            });
+        }
+    }
+}

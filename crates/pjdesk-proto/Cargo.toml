@@ -1,0 +1,20 @@
+[package]
+name = "pjdesk-proto"
+description = "Wire protocol, framing and crypto helpers shared by the PJDesk server and client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+hmac.workspace = true
+postcard.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+sha2.workspace = true
+spake2.workspace = true
+tokio.workspace = true

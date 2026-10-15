@@ -1,9 +1,9 @@
-# DeskLink
+# PJDesk
 
 A self-hosted, open-source remote desktop in the spirit of RustDesk, written in Rust.
 
-* **`desklink-server.exe`**: one small server for signaling, NAT rendezvous and relay. It runs in a console or as a Windows service.
-* **`desklink.exe`**: one client that both **shares** this computer (host) and **controls** other computers (controller).
+* **`pjdesk-server.exe`**: one small server for signaling, NAT rendezvous and relay. It runs in a console or as a Windows service.
+* **`pjdesk.exe`**: one client that both **shares** this computer (host) and **controls** other computers (controller).
 
 Connections are **peer-to-peer** whenever UDP hole punching works, and are **relayed** through your server when it doesn't. Video is **end-to-end encrypted** either way (QUIC/TLS 1.3). Passwords are checked with **SPAKE2**, so they never travel over the network, not even to your own server.
 
@@ -15,7 +15,7 @@ Connections are **peer-to-peer** whenever UDP hole punching works, and are **rel
 
 ```text
                          ┌─────────────────────────────────────────┐
-                         │        desklink-server  (Windows)       │
+                         │        pjdesk-server  (Windows)       │
                          │                                         │
                          │  TCP 21200  TLS 1.3 signaling           │
                          │    • device IDs (registry: devices.json)│
@@ -27,7 +27,7 @@ Connections are **peer-to-peer** whenever UDP hole punching works, and are **rel
                      signaling  │ (TLS)          (TLS)     │  signaling
                      + UDP bind │                          │  + UDP bind
          ┌──────────────────────┴───┐                  ┌───┴────────────────────────┐
-         │  desklink.exe  HOST      │   QUIC (UDP)     │  desklink.exe  CONTROLLER   │
+         │  pjdesk.exe  HOST      │   QUIC (UDP)     │  pjdesk.exe  CONTROLLER   │
          │  DXGI/GDI capture        │◄════════════════►│  winit window + softbuffer  │
          │  BGRA→I420→H.264         │ direct P2P, or   │  H.264 decode → 0RGB        │
          │  SendInput (mouse/keys)  │ via server relay │  mouse/keyboard capture     │
@@ -59,13 +59,13 @@ On a LAN the expected glass-to-glass latency is about 30–60 ms at 1080p/30 fps
 ## Project structure
 
 ```text
-DeskLink/
+PJDesk/
 ├── Cargo.toml                      workspace (shared dependency versions)
 ├── .cargo/config.toml              static C runtime on Windows (single-file .exe)
 ├── build.cmd                       one-step Windows build → .\dist
 ├── CHANGELOG.md                    what changed in each version
 ├── crates/
-│   ├── desklink-proto/             wire protocol shared by server and client
+│   ├── pjdesk-proto/             wire protocol shared by server and client
 │   │   └── src/
 │   │       ├── signal.rs           signaling messages (+ sequence diagram)
 │   │       ├── udp.rs              rendezvous datagrams (Bind / BindAck / Punch)
@@ -73,17 +73,17 @@ DeskLink/
 │   │       ├── framing.rs          length-prefixed postcard framing
 │   │       ├── auth.rs             SPAKE2 + channel-bound key confirmation
 │   │       └── tls.rs              self-signed identities, fingerprint pinning
-│   ├── desklink-server/            the server
+│   ├── pjdesk-server/            the server
 │   │   └── src/
 │   │       ├── main.rs             CLI: run | fingerprint | service ...
 │   │       ├── server.rs           TLS signaling, sessions, rate limiting
 │   │       ├── relay.rs            UDP rendezvous + packet relay
 │   │       ├── registry.rs         persistent ID registry (devices.json)
 │   │       └── service.rs          Windows service install/uninstall/run
-│   └── desklink/                   the client (host + controller)
+│   └── pjdesk/                   the client (host + controller)
 │       └── src/
 │           ├── main.rs             CLI + double-click interactive mode
-│           ├── config.rs           %APPDATA%\DeskLink\client.json
+│           ├── config.rs           %APPDATA%\PJDesk\client.json
 │           ├── signaling.rs        TLS connection to the server (TOFU pinning)
 │           ├── p2p.rs              UDP binding, hole punching, QUIC, relay fallback
 │           ├── udp_fallback.rs     plain-UDP socket for unusual network stacks
@@ -116,7 +116,7 @@ DeskLink/
 This installs the Microsoft C++ build tools (OpenH264 and *ring* contain C/C++), Rust, and NASM (optional, for faster H.264 encoding). The build tools go first; otherwise the Rust installer installs the much larger Visual Studio Community instead. Run it in an **administrator** PowerShell or Command Prompt:
 
 ```bat
-cd "C:\App Dev\DeskLink"
+cd "C:\App Dev\PJDesk"
 winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 winget install --id Rustlang.Rustup -e
 winget install --id NASM.NASM -e
@@ -128,17 +128,17 @@ Close the terminal and open a new one, so `cargo` is on the PATH.
 ### 2. Build
 
 ```bat
-cd "C:\App Dev\DeskLink"
+cd "C:\App Dev\PJDesk"
 .\build.cmd
 
 ```
 
-The first build takes a few minutes; later builds are incremental. You get `dist\desklink-server.exe` and `dist\desklink.exe`. Both are self-contained (no DLLs or runtime installs needed), so copy them to any Windows 10/11 PC.
+The first build takes a few minutes; later builds are incremental. You get `dist\pjdesk-server.exe` and `dist\pjdesk.exe`. Both are self-contained (no DLLs or runtime installs needed), so copy them to any Windows 10/11 PC.
 
 Run the tests (optional):
 
 ```bat
-cd "C:\App Dev\DeskLink"
+cd "C:\App Dev\PJDesk"
 cargo test --workspace
 
 ```
@@ -152,78 +152,78 @@ cargo test --workspace
 On the machine that will be the server:
 
 ```bat
-cd "C:\App Dev\DeskLink\dist"
-.\desklink-server.exe
+cd "C:\App Dev\PJDesk\dist"
+.\pjdesk-server.exe
 
 ```
 
 (The `.\` prefix makes the commands work in both PowerShell and Command Prompt.)
 
-It prints the ports, its data folder (`C:\ProgramData\DeskLink\server`) and its **key fingerprint**. When Windows Firewall asks, allow it. To install it as an **auto-start Windows service** instead (run as administrator; `--firewall` also adds the inbound firewall rule):
+It prints the ports, its data folder (`C:\ProgramData\PJDesk\server`) and its **key fingerprint**. When Windows Firewall asks, allow it. To install it as an **auto-start Windows service** instead (run as administrator; `--firewall` also adds the inbound firewall rule):
 
 ```bat
-cd "C:\App Dev\DeskLink\dist"
-.\desklink-server.exe service install --firewall
+cd "C:\App Dev\PJDesk\dist"
+.\pjdesk-server.exe service install --firewall
 
 ```
 
-Other service commands are `service start`, `service stop` and `service uninstall`. The service logs to `C:\ProgramData\DeskLink\server\server.log`. Installing the service also limits the data folder, which holds the server's private key and the ID registry, to SYSTEM and Administrators.
+Other service commands are `service start`, `service stop` and `service uninstall`. The service logs to `C:\ProgramData\PJDesk\server\server.log`. Installing the service also limits the data folder, which holds the server's private key and the ID registry, to SYSTEM and Administrators.
 
-**Ports:** TCP **and** UDP **21200** (change with `--port`). To use DeskLink over the Internet, forward both on your router to the server PC.
+**Ports:** TCP **and** UDP **21200** (change with `--port`). To use PJDesk over the Internet, forward both on your router to the server PC.
 
 ### Client
 
-**Double-click `desklink.exe`.** The first time, it asks for your server's address and saves it. It then shares this computer (showing its **ID** and **password**) and lets you type another computer's ID to control it. Each viewer opens in its own window.
+**Double-click `pjdesk.exe`.** The first time, it asks for your server's address and saves it. It then shares this computer (showing its **ID** and **password**) and lets you type another computer's ID to control it. Each viewer opens in its own window.
 
 Or use the commands directly:
 
 ```bat
-cd "C:\App Dev\DeskLink\dist"
-.\desklink.exe config --set-server 192.168.1.10
-.\desklink.exe host
+cd "C:\App Dev\PJDesk\dist"
+.\pjdesk.exe config --set-server 192.168.1.10
+.\pjdesk.exe host
 
 ```
 
 And on the other computer:
 
 ```bat
-cd "C:\App Dev\DeskLink\dist"
-.\desklink.exe connect 123456789
+cd "C:\App Dev\PJDesk\dist"
+.\pjdesk.exe connect 123456789
 
 ```
 
 | Command | What it does |
 |---|---|
-| `desklink host` | Share this computer. `--password X` sets a fixed password for unattended access. `--display N` picks a monitor. `--fps 30`, `--bitrate 6000` (kbit/s) and `--max-width 2560` (wider screens are downscaled) tune the stream. `--gdi` forces GDI capture and `--view-only` blocks control. |
-| `desklink connect <ID>` | Control a computer. You're asked for the password (or pass `--password`). `--force-relay` skips P2P. |
-| `desklink config` | Show settings. `--set-server ADDR[:PORT]`, `--fingerprint X` (pin the server key from its console), `--reset-fingerprint` (after reinstalling the server), `--reset-id` |
+| `pjdesk host` | Share this computer. `--password X` sets a fixed password for unattended access. `--display N` picks a monitor. `--fps 30`, `--bitrate 6000` (kbit/s) and `--max-width 2560` (wider screens are downscaled) tune the stream. `--gdi` forces GDI capture and `--view-only` blocks control. |
+| `pjdesk connect <ID>` | Control a computer. You're asked for the password (or pass `--password`). `--force-relay` skips P2P. |
+| `pjdesk config` | Show settings. `--set-server ADDR[:PORT]`, `--fingerprint X` (pin the server key from its console), `--reset-fingerprint` (after reinstalling the server), `--reset-id` |
 | `--server ADDR[:PORT]` | Use another server for one command |
 
 **In the viewer:** your mouse and keyboard go to the remote computer. **Ctrl+Alt+Enter** toggles full screen. The small dot is your local pointer; the remote cursor is drawn in the video. Numpad digits arrive as digits, whatever the remote computer's NumLock state.
 
-Client settings live in `%APPDATA%\DeskLink\client.json` (set `DESKLINK_CONFIG` to use another file, for example to run two clients on one PC).
+Client settings live in `%APPDATA%\PJDesk\client.json` (set `PJDESK_CONFIG` to use another file, for example to run two clients on one PC).
 
 ### Quick test on one PC
 
-Open three terminals in `C:\App Dev\DeskLink\dist`:
+Open three terminals in `C:\App Dev\PJDesk\dist`:
 
 ```bat
-cd "C:\App Dev\DeskLink\dist"
-.\desklink-server.exe
+cd "C:\App Dev\PJDesk\dist"
+.\pjdesk-server.exe
 
 ```
 
 ```bat
-cd "C:\App Dev\DeskLink\dist"
-.\desklink.exe --server 127.0.0.1 host --password test1234
+cd "C:\App Dev\PJDesk\dist"
+.\pjdesk.exe --server 127.0.0.1 host --password test1234
 
 ```
 
 Replace `123456789` with the ID the host printed:
 
 ```bat
-cd "C:\App Dev\DeskLink\dist"
-.\desklink.exe --server 127.0.0.1 connect 123456789 --password test1234
+cd "C:\App Dev\PJDesk\dist"
+.\pjdesk.exe --server 127.0.0.1 connect 123456789 --password test1234
 
 ```
 
@@ -235,7 +235,7 @@ cd "C:\App Dev\DeskLink\dist"
 
 | Layer | Protection |
 |---|---|
-| Client ⇄ server | TLS 1.3. The server's self-signed key is **trusted on first use** and pinned in `client.json`, and a changed key is refused loudly. For zero-trust setup, pin it up front with `desklink config --fingerprint <value from the server console>`. |
+| Client ⇄ server | TLS 1.3. The server's self-signed key is **trusted on first use** and pinned in `client.json`, and a changed key is refused loudly. For zero-trust setup, pin it up front with `pjdesk config --fingerprint <value from the server console>`. |
 | Device IDs | Bound to a per-device secret; the server stores only its hash, so nobody can take over your ID. |
 | Controller ⇄ host | QUIC (TLS 1.3) end-to-end. The host's certificate fingerprint is pinned, both direct and relayed. |
 | Password | SPAKE2 PAKE with channel binding. The password never crosses the network. A man in the middle, even the server, gets **one online guess** per connection request and nothing to crack offline. |
@@ -258,8 +258,8 @@ cd "C:\App Dev\DeskLink\dist"
 
 * **"no UDP reply from the server"**: UDP 21200 is blocked. Allow it in the server's firewall and forward it on the router.
 * **Always "relayed"**: P2P is not possible between those networks (for example symmetric NAT or carrier-grade NAT). The relay still works, at the cost of server bandwidth.
-* **"SERVER KEY MISMATCH"**: the server was reinstalled (new key), or something is intercepting. Compare with `desklink-server fingerprint`, then `desklink config --reset-fingerprint`.
-* **Can't control admin windows or UAC prompts**: Windows blocks input from normal apps into elevated apps. Run `desklink.exe` as administrator on the host. UAC's secure desktop and Ctrl+Alt+Del need a SYSTEM service (roadmap).
+* **"SERVER KEY MISMATCH"**: the server was reinstalled (new key), or something is intercepting. Compare with `pjdesk-server fingerprint`, then `pjdesk config --reset-fingerprint`.
+* **Can't control admin windows or UAC prompts**: Windows blocks input from normal apps into elevated apps. Run `pjdesk.exe` as administrator on the host. UAC's secure desktop and Ctrl+Alt+Del need a SYSTEM service (roadmap).
 * **Slow encoding at 4K**: use `--max-width 1920`, and build with NASM installed.
 * **Verbose logs**: `set RUST_LOG=debug` before running.
 
@@ -279,4 +279,4 @@ cd "C:\App Dev\DeskLink\dist"
 
 ## License
 
-MIT, see [LICENSE](LICENSE). DeskLink compiles Cisco's **OpenH264** from source (BSD-2-Clause). Note that Cisco's free H.264 patent coverage applies only to Cisco's own prebuilt OpenH264 binaries; distributing your own build is your responsibility, which may matter if you ship it commercially.
+MIT, see [LICENSE](LICENSE). PJDesk compiles Cisco's **OpenH264** from source (BSD-2-Clause). Note that Cisco's free H.264 patent coverage applies only to Cisco's own prebuilt OpenH264 binaries; distributing your own build is your responsibility, which may matter if you ship it commercially.

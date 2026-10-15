@@ -1,5 +1,5 @@
 @echo off
-rem Builds DeskLink (server + client) in release mode and copies the
+rem Builds PJDesk (server + client) in release mode and copies the
 rem programs to .\dist. Run from anywhere: it switches to its own folder.
 setlocal
 cd /d "%~dp0"
@@ -23,9 +23,9 @@ cargo build --release --workspace
 if errorlevel 1 exit /b 1
 
 if not exist dist mkdir dist
-copy /y target\release\desklink.exe dist\ >nul
-copy /y target\release\desklink-server.exe dist\ >nul
+copy /y target\release\pjdesk.exe dist\ >nul
+copy /y target\release\pjdesk-server.exe dist\ >nul
 echo.
 echo Built:
-echo   %CD%\dist\desklink-server.exe
-echo   %CD%\dist\desklink.exe
+echo   %CD%\dist\pjdesk-server.exe
+echo   %CD%\dist\pjdesk.exe

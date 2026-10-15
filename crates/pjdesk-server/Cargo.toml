@@ -1,0 +1,27 @@
+[package]
+name = "pjdesk-server"
+description = "PJDesk signaling, rendezvous and relay server (runs as a console app or Windows service)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pjdesk-proto = { path = "../pjdesk-proto" }
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Password hashing for server accounts.
+argon2 = "0.5"
+# Console password prompt for `account add`.
+rpassword = "7"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"

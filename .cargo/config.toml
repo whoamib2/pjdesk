@@ -1,5 +1,5 @@
-# Link the C runtime statically on Windows, so desklink.exe and
-# desklink-server.exe run on any PC without installing the VC++ redistributable.
+# Link the C runtime statically on Windows, so pjdesk.exe and
+# pjdesk-server.exe run on any PC without installing the VC++ redistributable.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 

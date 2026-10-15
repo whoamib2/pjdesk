@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/desklink-proto",
-    "crates/desklink-server",
-    "crates/desklink",
+    "crates/pjdesk-proto",
+    "crates/pjdesk-server",
+    "crates/pjdesk",
 ]
 
 [workspace.package]
@@ -11,7 +11,7 @@ version = "0.1.1"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
-repository = "https://github.com/whoamib2/desklink"
+repository = "https://github.com/whoamib2/pjdesk"
 
 [workspace.dependencies]
 anyhow = "1"

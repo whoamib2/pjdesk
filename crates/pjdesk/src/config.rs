@@ -1,0 +1,268 @@
+//! Client settings, stored as JSON in `%APPDATA%\PJDesk\client.json`
+//! (or `~/.config/PJDesk/client.json`). Set `PJDESK_CONFIG` to use
+//! another file (handy for running two instances on one machine).
+//!
+//! Secrets in this file — the account login token, a saved permanent password,
+//! and any "remembered" passwords for remote computers — are encrypted with
+//! [`crate::secure`] (DPAPI on Windows) before they are written.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use pjdesk_proto::signal::AddressEntry;
+use pjdesk_proto::tls::{parse_fingerprint, Fingerprint};
+use serde::{Deserialize, Serialize};
+
+use crate::secure;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Config {
+    /// Server address, `host[:port]`.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// Pinned server key fingerprint (saved on first connection).
+    #[serde(default)]
+    pub server_fingerprint: Option<String>,
+    /// This device's ID, assigned by the server.
+    #[serde(default)]
+    pub device_id: Option<String>,
+    /// Secret proving ownership of `device_id` (hex, 32 bytes).
+    #[serde(default)]
+    pub device_secret: Option<String>,
+    /// Quality, behaviour and startup settings.
+    #[serde(default)]
+    pub settings: Settings,
+    /// The signed-in account, if any.
+    #[serde(default)]
+    pub account: Option<Account>,
+    /// Cached copy of the account's address book (also usable offline).
+    #[serde(default)]
+    pub address_book: Vec<AddressEntry>,
+    /// Remembered passwords for direct connections, by device ID (encrypted).
+    /// The account address book is the synced store; this is the local one.
+    #[serde(default)]
+    saved_passwords: BTreeMap<String, String>,
+}
+
+/// Quality, behaviour and startup preferences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    /// Maximum frames per second when sharing this screen.
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+    /// Target video bitrate in kbit/s.
+    #[serde(default = "default_bitrate")]
+    pub bitrate_kbps: u32,
+    /// Screens wider than this are downscaled before encoding.
+    #[serde(default = "default_max_width")]
+    pub max_width: u32,
+    /// Prefer GDI capture over DXGI (compatibility).
+    #[serde(default)]
+    pub force_gdi: bool,
+    /// When sharing, let controllers watch but not control by default.
+    #[serde(default)]
+    pub view_only: bool,
+    /// A fixed password for unattended access (encrypted). When set, the host
+    /// uses it instead of a fresh random password each start.
+    #[serde(default)]
+    pub permanent_password: Option<String>,
+    /// Start PJDesk automatically when this user signs in to Windows.
+    #[serde(default)]
+    pub start_with_windows: bool,
+}
+
+fn default_fps() -> u32 {
+    30
+}
+fn default_bitrate() -> u32 {
+    6000
+}
+fn default_max_width() -> u32 {
+    2560
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            fps: default_fps(),
+            bitrate_kbps: default_bitrate(),
+            max_width: default_max_width(),
+            force_gdi: false,
+            view_only: false,
+            permanent_password: None,
+            start_with_windows: false,
+        }
+    }
+}
+
+impl Settings {
+    /// The permanent password in the clear, if one is set and decodes.
+    pub fn permanent_password(&self) -> Option<String> {
+        self.permanent_password.as_deref().and_then(secure::reveal)
+    }
+
+    /// Sets (or clears, with `None`) the permanent password, encrypting it.
+    pub fn set_permanent_password(&mut self, password: Option<&str>) {
+        self.permanent_password = password.filter(|p| !p.is_empty()).map(secure::protect);
+    }
+}
+
+/// A signed-in server account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Account {
+    pub username: String,
+    #[serde(default)]
+    pub display_name: String,
+    /// Login token (encrypted), presented instead of the password next time.
+    token: String,
+    #[serde(default)]
+    pub is_admin: bool,
+}
+
+impl Account {
+    pub fn new(username: String, display_name: String, token: &str, is_admin: bool) -> Self {
+        Self { username, display_name, token: secure::protect(token), is_admin }
+    }
+
+    /// The login token in the clear, if it decodes.
+    pub fn token(&self) -> Option<String> {
+        secure::reveal(&self.token)
+    }
+}
+
+impl Config {
+    pub fn path() -> PathBuf {
+        if let Some(path) = std::env::var_os("PJDESK_CONFIG") {
+            return PathBuf::from(path);
+        }
+        let base = if cfg!(windows) {
+            std::env::var_os("APPDATA").map(PathBuf::from)
+        } else {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        };
+        base.unwrap_or_else(|| PathBuf::from(".")).join("PJDesk").join("client.json")
+    }
+
+    pub fn load() -> Result<Self> {
+        let path = Self::path();
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// The device secret, created (and saved) on first use.
+    pub fn device_secret(&mut self) -> Result<[u8; 32]> {
+        if let Some(hex_secret) = &self.device_secret {
+            if let Ok(bytes) = hex::decode(hex_secret) {
+                if let Ok(secret) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                    return Ok(secret);
+                }
+            }
+        }
+        let secret = pjdesk_proto::random_bytes::<32>();
+        self.device_secret = Some(hex::encode(secret));
+        self.device_id = None; // a new secret can't claim the old ID
+        self.save()?;
+        Ok(secret)
+    }
+
+    pub fn pinned_fingerprint(&self) -> Option<Fingerprint> {
+        self.server_fingerprint.as_deref().and_then(|s| parse_fingerprint(s).ok())
+    }
+
+    /// Re-reads the device identity and pinned fingerprint from disk. The host
+    /// thread assigns and saves these; calling this before [`Self::save`] keeps
+    /// the GUI from clobbering them when it writes settings.
+    pub fn reload_identity_from_disk(&mut self) {
+        if let Ok(disk) = Self::load() {
+            if disk.device_id.is_some() {
+                self.device_id = disk.device_id;
+            }
+            if disk.device_secret.is_some() {
+                self.device_secret = disk.device_secret;
+            }
+            if disk.server_fingerprint.is_some() {
+                self.server_fingerprint = disk.server_fingerprint;
+            }
+        }
+    }
+
+    // --- Remembered passwords for direct connections -----------------------
+
+    /// Remembers (encrypted) or, with `None`, forgets a device's password.
+    pub fn remember_password(&mut self, id: &str, password: Option<&str>) {
+        match password.filter(|p| !p.is_empty()) {
+            Some(pw) => {
+                self.saved_passwords.insert(id.to_string(), secure::protect(pw));
+            }
+            None => {
+                self.saved_passwords.remove(id);
+            }
+        }
+    }
+
+    /// A remembered password for `id`, from the address book first, then local.
+    pub fn saved_password(&self, id: &str) -> Option<String> {
+        if let Some(entry) = self.address_book.iter().find(|e| e.id == id) {
+            if let Some(pw) = &entry.password {
+                return Some(pw.clone());
+            }
+        }
+        self.saved_passwords.get(id).and_then(|s| secure::reveal(s))
+    }
+
+    // --- Account -----------------------------------------------------------
+
+    pub fn account_token(&self) -> Option<String> {
+        self.account.as_ref().and_then(|a| a.token())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remembered_password_roundtrips() {
+        let mut c = Config::default();
+        c.remember_password("123456789", Some("s3cret"));
+        assert_eq!(c.saved_password("123456789").as_deref(), Some("s3cret"));
+        c.remember_password("123456789", None);
+        assert_eq!(c.saved_password("123456789"), None);
+    }
+
+    #[test]
+    fn address_book_password_takes_priority() {
+        let mut c = Config::default();
+        c.remember_password("111222333", Some("local"));
+        c.address_book =
+            vec![AddressEntry { id: "111222333".into(), password: Some("synced".into()), ..Default::default() }];
+        assert_eq!(c.saved_password("111222333").as_deref(), Some("synced"));
+    }
+
+    #[test]
+    fn permanent_password_encodes() {
+        let mut s = Settings::default();
+        s.set_permanent_password(Some("letmein"));
+        assert_ne!(s.permanent_password.as_deref(), Some("letmein"));
+        assert_eq!(s.permanent_password().as_deref(), Some("letmein"));
+        s.set_permanent_password(None);
+        assert_eq!(s.permanent_password(), None);
+    }
+}
