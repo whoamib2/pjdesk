@@ -113,12 +113,12 @@ DeskLink/
 
 ### 1. One-time setup
 
-This installs Rust, the Microsoft C++ build tools (OpenH264 and *ring* contain C/C++), and NASM (optional, for faster H.264 encoding). Run it in an **administrator** PowerShell or Command Prompt:
+This installs the Microsoft C++ build tools (OpenH264 and *ring* contain C/C++), Rust, and NASM (optional, for faster H.264 encoding). The build tools go first; otherwise the Rust installer installs the much larger Visual Studio Community instead. Run it in an **administrator** PowerShell or Command Prompt:
 
 ```bat
 cd "C:\App Dev\DeskLink"
-winget install --id Rustlang.Rustup -e
 winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+winget install --id Rustlang.Rustup -e
 winget install --id NASM.NASM -e
 
 ```

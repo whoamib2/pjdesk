@@ -6,7 +6,7 @@ cd /d "%~dp0"
 
 where cargo >nul 2>nul
 if errorlevel 1 (
-  echo Rust is not installed. Install it with:  winget install --id Rustlang.Rustup -e
+  echo Rust is not installed. Run the one-time setup in README.md ^(build tools, then Rust^),
   echo then open a NEW terminal and run build.cmd again.
   exit /b 1
 )
