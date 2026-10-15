@@ -1,0 +1,23 @@
+[package]
+name = "desklink-server"
+description = "DeskLink signaling, rendezvous and relay server (runs as a console app or Windows service)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+desklink-proto = { path = "../desklink-proto" }
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
