@@ -2,3 +2,5 @@
 /dist/
 *.log
 *.json.tmp
+/installer/build/
+/installer/*.exe
