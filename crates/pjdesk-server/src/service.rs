@@ -72,7 +72,8 @@ fn run_service(opts: ServerOpts, data_dir: PathBuf) -> Result<()> {
         ServiceExitCode::Win32(0),
         Duration::default(),
     )?;
-    protect_data_dir(&data_dir);
+    // server::run protects the data folder itself, just before it reads the
+    // identity (see crate::server::run).
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(crate::server::run(opts, data_dir, async move {
         let _ = stop_rx.wait_for(|stopped| *stopped).await;
@@ -94,12 +95,29 @@ fn run_service(opts: ServerOpts, data_dir: PathBuf) -> Result<()> {
 }
 
 /// Restricts the data folder (server private key, device registry, log) to
-/// SYSTEM and Administrators; ProgramData is readable by every local user.
-fn protect_data_dir(dir: &Path) {
+/// SYSTEM and Administrators; ProgramData is otherwise readable by every user.
+///
+/// This also repairs a folder an earlier version locked down too tightly: it
+/// reclaims ownership first so the `icacls` grant can rewrite the DACL on
+/// files whose previous ACL left them unreadable even to administrators (the
+/// `server-cert.pem` "Access is denied" that stopped the server from starting).
+/// Every step is best-effort — the server must still come up if it fails.
+pub(crate) fn protect_data_dir(dir: &Path) {
     let _ = std::fs::create_dir_all(dir);
+    // Take ownership of the folder and everything under it, so the grant below
+    // can rewrite DACLs on any file a stricter earlier ACL orphaned.
+    let _ = std::process::Command::new("takeown")
+        .arg("/f")
+        .arg(dir)
+        .args(["/r", "/d", "y"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    // /C keeps going past any single file it can't touch; /T recurses to
+    // existing files so the cert and key pick up the SYSTEM+Administrators grant.
     let status = std::process::Command::new("icacls")
         .arg(dir)
-        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/Q"])
+        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/C", "/Q"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

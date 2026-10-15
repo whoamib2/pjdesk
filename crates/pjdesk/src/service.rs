@@ -525,9 +525,18 @@ pub fn init_service_logging() {
 pub fn protect_service_dir() {
     let dir = crate::syspaths::service_dir();
     let _ = std::fs::create_dir_all(&dir);
+    // Reclaim ownership first so the grant can rewrite DACLs on any file an
+    // earlier, stricter ACL left unreadable even to administrators (best-effort).
+    let _ = std::process::Command::new("takeown")
+        .arg("/f")
+        .arg(&dir)
+        .args(["/r", "/d", "y"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     let _ = std::process::Command::new("icacls")
         .arg(&dir)
-        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/Q"])
+        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/C", "/Q"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

@@ -148,6 +148,12 @@ pub fn load_identity(data_dir: &Path) -> Result<TlsIdentity> {
 /// Runs the server until `shutdown` completes.
 pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Output = ()>) -> Result<()> {
     std::fs::create_dir_all(&data_dir).with_context(|| format!("creating data folder {}", data_dir.display()))?;
+    // Lock the folder down to SYSTEM + Administrators and repair any ACL an
+    // earlier version left too strict, before touching the identity files.
+    // Harmless if the service path already did it; needed for a plain elevated
+    // `run` so the console path can read (or self-heal) its own key.
+    #[cfg(windows)]
+    crate::service::protect_data_dir(&data_dir);
     let identity = load_identity(&data_dir)?;
     let registry = Registry::load(data_dir.join("devices.json"))?;
     let device_count = registry.len();

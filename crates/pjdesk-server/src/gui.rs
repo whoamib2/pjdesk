@@ -80,6 +80,13 @@ impl App {
             && std::fs::write(self.data_dir.join(".wtest"), b"1").is_ok();
         let _ = std::fs::remove_file(self.data_dir.join(".wtest"));
 
+        // When elevated (always, via the manifest), reclaim and re-lock the
+        // folder so load_identity below can read — or self-heal — the key even
+        // if an earlier version's ACL orphaned it.
+        if self.can_write {
+            crate::service::protect_data_dir(&self.data_dir);
+        }
+
         self.fingerprint = match crate::server::load_identity(&self.data_dir) {
             Ok(id) => pjdesk_proto::tls::format_fingerprint(&id.fingerprint()),
             Err(_) => "(unknown — run as administrator)".into(),

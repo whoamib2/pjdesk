@@ -69,15 +69,46 @@ impl TlsIdentity {
     }
 
     /// Loads the identity from PEM files, creating them on first run.
+    ///
+    /// If the files exist but can't be read or parsed — a stale or
+    /// over-restrictive ACL left by an earlier version, a half-written file, a
+    /// key that no longer matches its certificate — they are regenerated
+    /// instead of failing. A server that can't read its own identity would
+    /// otherwise be unable to start at all, which is worse than rotating a
+    /// self-signed key that clients re-pin on next connect.
     pub fn load_or_create(cert_path: &Path, key_path: &Path, name: &str) -> Result<Self> {
         if cert_path.exists() && key_path.exists() {
-            let cert =
-                CertificateDer::from_pem_file(cert_path).with_context(|| format!("reading {}", cert_path.display()))?;
-            let key =
-                PrivateKeyDer::from_pem_file(key_path).with_context(|| format!("reading {}", key_path.display()))?;
-            return Ok(Self { cert, key });
+            match Self::load(cert_path, key_path) {
+                Ok(identity) => return Ok(identity),
+                Err(e) => {
+                    eprintln!(
+                        "pjdesk: regenerating the TLS identity in {} ({e:#})",
+                        cert_path.parent().unwrap_or(cert_path).display()
+                    );
+                }
+            }
         }
+        Self::create(cert_path, key_path, name)
+    }
+
+    /// Reads an existing identity from its PEM files.
+    fn load(cert_path: &Path, key_path: &Path) -> Result<Self> {
+        let cert =
+            CertificateDer::from_pem_file(cert_path).with_context(|| format!("reading {}", cert_path.display()))?;
+        let key =
+            PrivateKeyDer::from_pem_file(key_path).with_context(|| format!("reading {}", key_path.display()))?;
+        Ok(Self { cert, key })
+    }
+
+    /// Generates a fresh identity and writes it, replacing any existing files.
+    fn create(cert_path: &Path, key_path: &Path, name: &str) -> Result<Self> {
         let certified = rcgen::generate_simple_self_signed(vec![name.to_string()])?;
+        // Delete any existing (possibly unreadable) files first. An elevated
+        // account can remove them through the parent folder's permissions even
+        // when a file's own ACL would deny the truncating overwrite that a
+        // plain write of an existing file needs.
+        let _ = std::fs::remove_file(cert_path);
+        let _ = std::fs::remove_file(key_path);
         std::fs::write(cert_path, certified.cert.pem()).with_context(|| format!("writing {}", cert_path.display()))?;
         std::fs::write(key_path, certified.signing_key.serialize_pem())
             .with_context(|| format!("writing {}", key_path.display()))?;
