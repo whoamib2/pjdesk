@@ -81,6 +81,11 @@ impl TlsIdentity {
         std::fs::write(cert_path, certified.cert.pem()).with_context(|| format!("writing {}", cert_path.display()))?;
         std::fs::write(key_path, certified.signing_key.serialize_pem())
             .with_context(|| format!("writing {}", key_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(Self {
             cert: certified.cert.der().clone(),
             key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())),

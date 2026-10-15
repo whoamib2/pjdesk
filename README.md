@@ -7,7 +7,7 @@ A self-hosted, open-source remote desktop in the spirit of RustDesk, written in 
 
 Connections are **peer-to-peer** whenever UDP hole punching works, and are **relayed** through your server when it doesn't. Video is **end-to-end encrypted** either way (QUIC/TLS 1.3). Passwords are checked with **SPAKE2**, so they never travel over the network, not even to your own server.
 
-> Status: **v0.1.0 MVP.** See [What's tested](#whats-tested) and [Limitations & roadmap](#limitations--roadmap).
+> Status: **v0.1.1 MVP.** See [What's tested](#whats-tested), [Limitations & roadmap](#limitations--roadmap) and the [changelog](CHANGELOG.md).
 
 ---
 
@@ -37,7 +37,7 @@ Connections are **peer-to-peer** whenever UDP hole punching works, and are **rel
 ### How a connection is made
 
 1. **Host registers.** On first run the host makes a random 32-byte device secret. It sends the secret over TLS, and the server gives it a permanent 9-digit **ID**, storing only the secret's SHA-256. The host shows its ID and a **one-time password**, which is generated locally and never sent anywhere.
-2. **Controller asks for the ID.** The server tells the host, and the host accepts unless it is already busy.
+2. **Controller asks for the ID.** The server tells the host, and the host accepts unless another controller is already connected (one at a time).
 3. **UDP rendezvous.** Each side opens one UDP socket for this session and sends a `Bind` datagram (with a session token) to the server's UDP port. The server records each socket's **public address** (its NAT mapping) and both sides report their LAN addresses. The server then sends each peer the other's addresses, plus the host's certificate fingerprint for the controller.
 4. **Hole punching.** Both sides fire small "punch" datagrams at each other's candidates, so each NAT expects the other's traffic. The controller then **races QUIC connections** to every candidate.
 5. **Relay fallback.** If nothing answers within 3 s (for example a symmetric NAT or strict firewall), the controller connects to the **server's UDP port** instead. The server forwards every packet from one bound address to the other, like a minimal TURN server. QUIC is end-to-end encrypted, so the relay only sees ciphertext.
@@ -63,6 +63,7 @@ DeskLink/
 ├── Cargo.toml                      workspace (shared dependency versions)
 ├── .cargo/config.toml              static C runtime on Windows (single-file .exe)
 ├── build.cmd                       one-step Windows build → .\dist
+├── CHANGELOG.md                    what changed in each version
 ├── crates/
 │   ├── desklink-proto/             wire protocol shared by server and client
 │   │   └── src/
@@ -152,19 +153,21 @@ On the machine that will be the server:
 
 ```bat
 cd "C:\App Dev\DeskLink\dist"
-desklink-server.exe
+.\desklink-server.exe
 
 ```
+
+(The `.\` prefix makes the commands work in both PowerShell and Command Prompt.)
 
 It prints the ports, its data folder (`C:\ProgramData\DeskLink\server`) and its **key fingerprint**. When Windows Firewall asks, allow it. To install it as an **auto-start Windows service** instead (run as administrator; `--firewall` also adds the inbound firewall rule):
 
 ```bat
 cd "C:\App Dev\DeskLink\dist"
-desklink-server.exe service install --firewall
+.\desklink-server.exe service install --firewall
 
 ```
 
-Other service commands are `service start`, `service stop` and `service uninstall`. The service logs to `C:\ProgramData\DeskLink\server\server.log`.
+Other service commands are `service start`, `service stop` and `service uninstall`. The service logs to `C:\ProgramData\DeskLink\server\server.log`. Installing the service also limits the data folder, which holds the server's private key and the ID registry, to SYSTEM and Administrators.
 
 **Ports:** TCP **and** UDP **21200** (change with `--port`). To use DeskLink over the Internet, forward both on your router to the server PC.
 
@@ -176,9 +179,16 @@ Or use the commands directly:
 
 ```bat
 cd "C:\App Dev\DeskLink\dist"
-desklink.exe config --set-server 192.168.1.10
-desklink.exe host
-desklink.exe connect 123456789
+.\desklink.exe config --set-server 192.168.1.10
+.\desklink.exe host
+
+```
+
+And on the other computer:
+
+```bat
+cd "C:\App Dev\DeskLink\dist"
+.\desklink.exe connect 123456789
 
 ```
 
@@ -189,7 +199,7 @@ desklink.exe connect 123456789
 | `desklink config` | Show settings. `--set-server ADDR[:PORT]`, `--fingerprint X` (pin the server key from its console), `--reset-fingerprint` (after reinstalling the server), `--reset-id` |
 | `--server ADDR[:PORT]` | Use another server for one command |
 
-**In the viewer:** your mouse and keyboard go to the remote computer. **Ctrl+Alt+Enter** toggles full screen. The small dot is your local pointer; the remote cursor is drawn in the video.
+**In the viewer:** your mouse and keyboard go to the remote computer. **Ctrl+Alt+Enter** toggles full screen. The small dot is your local pointer; the remote cursor is drawn in the video. Numpad digits arrive as digits, whatever the remote computer's NumLock state.
 
 Client settings live in `%APPDATA%\DeskLink\client.json` (set `DESKLINK_CONFIG` to use another file, for example to run two clients on one PC).
 
@@ -199,19 +209,21 @@ Open three terminals in `C:\App Dev\DeskLink\dist`:
 
 ```bat
 cd "C:\App Dev\DeskLink\dist"
-desklink-server.exe
+.\desklink-server.exe
 
 ```
 
 ```bat
 cd "C:\App Dev\DeskLink\dist"
-desklink.exe --server 127.0.0.1 host --password test1234
+.\desklink.exe --server 127.0.0.1 host --password test1234
 
 ```
 
+Replace `123456789` with the ID the host printed:
+
 ```bat
 cd "C:\App Dev\DeskLink\dist"
-desklink.exe --server 127.0.0.1 connect <the ID shown by the host> --password test1234
+.\desklink.exe --server 127.0.0.1 connect 123456789 --password test1234
 
 ```
 
@@ -226,18 +238,19 @@ desklink.exe --server 127.0.0.1 connect <the ID shown by the host> --password te
 | Client ⇄ server | TLS 1.3. The server's self-signed key is **trusted on first use** and pinned in `client.json`, and a changed key is refused loudly. For zero-trust setup, pin it up front with `desklink config --fingerprint <value from the server console>`. |
 | Device IDs | Bound to a per-device secret; the server stores only its hash, so nobody can take over your ID. |
 | Controller ⇄ host | QUIC (TLS 1.3) end-to-end. The host's certificate fingerprint is pinned, both direct and relayed. |
-| Password | SPAKE2 PAKE with channel binding. The password never crosses the network. A man in the middle, even the server, gets **one online guess** per attempt and nothing to crack offline. |
-| Brute force | Server: 30 connection attempts per minute per IP. Host: a random password is replaced after 3 misses, and a fixed password locks out new sessions for 1 minute after 5 misses. |
-| Relay | Forwards only for sessions the host accepted (token-checked binds); sees only ciphertext. |
+| Password | SPAKE2 PAKE with channel binding. The password never crosses the network. A man in the middle, even the server, gets **one online guess** per connection request and nothing to crack offline. |
+| Brute force | Server: 30 connection requests per minute per IP. Host: one password guess per request and at most 3 requests waiting at once; a random password is replaced after 3 misses, and a fixed password locks out new sessions for 1 minute after 5 misses. |
+| Relay | Forwards only for sessions the host accepted. Each side binds with its own token, and an address that is actively relaying one session can't be taken over by another. The relay sees only ciphertext. |
+| Server data | The server's private key and the ID registry live in its data folder. Installing the service limits that folder to SYSTEM and Administrators. |
 
 ---
 
 ## What's tested
 
 * **24 unit tests:** framing, UDP datagrams, SPAKE2 (right password, wrong password, MITM channel), TLS pinning, ID registry, rate limiting, color conversion, H.264 encode→decode round trip, flow control, scaling, key map.
-* **End-to-end** with a real server, a host and a controller: direct P2P, forced relay, wrong password and offline ID, plus a color check of the decoded test pattern.
+* **End-to-end** with a real server, a host and a controller: direct P2P, forced relay, wrong password and offline ID, a wrong password followed by the right one, and a second controller being turned away while the first keeps streaming, plus a color check of the decoded test pattern.
 * **Windows builds under Wine:** the server, a host with real GDI capture streaming a desktop, and the viewer window rendering it. Mouse moves landed on the exact pixel, and typing in the viewer put text into Notepad on the host.
-* **Not yet tested on real Windows hardware:** DXGI capture, cursor compositing with real cursors, and the Windows service. The first run on a real PC covers these.
+* **Not yet tested on real Windows hardware:** DXGI capture, cursor compositing with real cursors, the Windows service, and the numpad-digit path. The first run on a real PC covers these.
 
 ---
 

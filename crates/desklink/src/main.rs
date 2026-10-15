@@ -100,8 +100,9 @@ impl Default for HostArgs {
 
 #[derive(Args, Clone, Debug)]
 pub struct ConnectArgs {
-    /// ID of the computer to control.
-    pub id: String,
+    /// ID of the computer to control, with or without spaces ("123 456 789").
+    #[arg(required = true, num_args = 1..=9, value_name = "ID")]
+    pub id: Vec<String>,
     /// Its password (asked interactively if omitted).
     #[arg(long, env = "DESKLINK_PASSWORD", hide_env_values = true)]
     pub password: Option<String>,

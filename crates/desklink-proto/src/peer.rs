@@ -77,6 +77,8 @@ pub enum InputEvent {
     },
     /// A physical key, as a PC/AT "set 1" scan code. Extended keys carry the
     /// 0xE0 prefix in the high byte (e.g. Left arrow = 0xE04B); Pause is 0xE11D.
+    /// Numpad keys typed with the controller's NumLock on carry
+    /// [`KEY_NUMPAD_DIGIT`], so they produce digits whatever the host's NumLock.
     Key {
         scan: u16,
         down: bool,
@@ -85,6 +87,9 @@ pub enum InputEvent {
     /// (sent when the viewer window loses focus).
     ReleaseAll,
 }
+
+/// Flag on [`InputEvent::Key`] scan codes: a numpad key meant as a digit.
+pub const KEY_NUMPAD_DIGIT: u16 = 0x8000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {

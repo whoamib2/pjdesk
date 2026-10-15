@@ -3,10 +3,10 @@
 //! GDI can't tell us when the screen changed, so each grab is compared with
 //! the previous one and unchanged frames are skipped.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use windows::Win32::Graphics::Gdi::{BitBlt, GetDC, ReleaseDC, CAPTUREBLT, HDC, ROP_CODE, SRCCOPY};
+use windows::Win32::Graphics::Gdi::{BitBlt, GetDC, ReleaseDC, HDC, SRCCOPY};
 
 use super::win::{monitors, CursorOverlay, CursorState, DibCanvas};
 use super::{Capturer, Frame, Rect};
@@ -18,15 +18,17 @@ pub struct GdiCapturer {
     previous: Vec<u8>,
     cursor: CursorOverlay,
     last_cursor: CursorState,
+    display: usize,
     rect: Rect,
     has_image: bool,
-    use_captureblt: bool,
+    /// Used only because DXGI failed (vs. chosen with `--gdi`).
+    fallback: bool,
+    next_layout_check: Instant,
 }
 
 impl GdiCapturer {
-    pub fn new(display: usize) -> Result<Self> {
-        let all = monitors();
-        let rect = *all.get(display).ok_or_else(|| anyhow!("display {display} not found ({} attached)", all.len()))?;
+    pub fn new(display: usize, fallback: bool) -> Result<Self> {
+        let rect = monitor_rect(display)?;
         let screen = unsafe { GetDC(None) };
         if screen.is_invalid() {
             return Err(anyhow!("GetDC failed"));
@@ -37,9 +39,11 @@ impl GdiCapturer {
             previous: Vec::new(),
             cursor: CursorOverlay::default(),
             last_cursor: CursorState::default(),
+            display,
             rect,
             has_image: false,
-            use_captureblt: true,
+            fallback,
+            next_layout_check: Instant::now() + Duration::from_secs(2),
         })
     }
 
@@ -51,6 +55,29 @@ impl GdiCapturer {
             stride: self.canvas.stride(),
         }
     }
+
+    /// Follows resolution and monitor-layout changes.
+    fn check_layout(&mut self) -> Result<()> {
+        if Instant::now() < self.next_layout_check {
+            return Ok(());
+        }
+        self.next_layout_check = Instant::now() + Duration::from_secs(2);
+        let rect = monitor_rect(self.display)?;
+        if rect != self.rect {
+            if (rect.width, rect.height) != (self.rect.width, self.rect.height) {
+                self.canvas = DibCanvas::new(rect.width as usize, rect.height as usize)?;
+            }
+            self.rect = rect;
+            self.previous.clear();
+            self.has_image = false;
+        }
+        Ok(())
+    }
+}
+
+fn monitor_rect(display: usize) -> Result<Rect> {
+    let all = monitors();
+    all.get(display).copied().ok_or_else(|| anyhow!("display {display} not found ({} attached)", all.len()))
 }
 
 impl Capturer for GdiCapturer {
@@ -62,8 +89,16 @@ impl Capturer for GdiCapturer {
         self.rect
     }
 
+    fn is_fallback(&self) -> bool {
+        self.fallback
+    }
+
     fn capture(&mut self, _timeout: Duration) -> Result<Option<Frame<'_>>> {
-        let grab = |rop: ROP_CODE| unsafe {
+        self.check_layout()?;
+        // Plain SRCCOPY: with desktop composition (Windows 8+) the screen DC
+        // already includes layered windows, and CAPTUREBLT makes the host's
+        // own mouse cursor flicker.
+        unsafe {
             BitBlt(
                 self.canvas.dc(),
                 0,
@@ -73,16 +108,9 @@ impl Capturer for GdiCapturer {
                 Some(self.screen),
                 self.rect.left,
                 self.rect.top,
-                rop,
+                SRCCOPY,
             )
-        };
-        // CAPTUREBLT includes layered (semi-transparent) windows such as
-        // tooltips and menus; some drivers don't support it, so retry without.
-        if self.use_captureblt && grab(ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0)).is_err() {
-            self.use_captureblt = false;
-        }
-        if !self.use_captureblt {
-            grab(SRCCOPY).context("BitBlt")?;
+            .context("BitBlt")?;
         }
         let image_changed = self.previous.as_slice() != self.canvas.pixels();
         if image_changed {

@@ -50,6 +50,11 @@ pub trait Capturer {
     /// Waits up to `timeout` for the screen or cursor to change. Returns the
     /// new image, or `None` if nothing changed.
     fn capture(&mut self, timeout: Duration) -> Result<Option<Frame<'_>>>;
+
+    /// True for the GDI fallback that was used only because DXGI failed.
+    fn is_fallback(&self) -> bool {
+        false
+    }
 }
 
 /// Opens the best available capturer for the host options.
@@ -65,11 +70,24 @@ pub fn open(args: &HostArgs) -> Result<Box<dyn Capturer>> {
                 Err(e) => warn!("DXGI Desktop Duplication unavailable ({e:#}); using GDI capture"),
             }
         }
-        Ok(Box::new(gdi::GdiCapturer::new(args.display)?))
+        Ok(Box::new(gdi::GdiCapturer::new(args.display, !args.gdi)?))
     }
     #[cfg(not(windows))]
     {
         warn!("Real screen capture is implemented for Windows hosts only; streaming a test pattern");
         Ok(Box::new(synthetic::Synthetic::new(1280, 720)))
+    }
+}
+
+/// Tries the preferred backend again (used to leave the GDI fallback).
+pub fn try_preferred(args: &HostArgs) -> Option<Box<dyn Capturer>> {
+    #[cfg(windows)]
+    {
+        dxgi::DxgiCapturer::new(args.display).ok().map(|c| Box::new(c) as Box<dyn Capturer>)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        None
     }
 }

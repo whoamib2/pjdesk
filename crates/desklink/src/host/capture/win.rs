@@ -186,7 +186,9 @@ impl CursorOverlay {
         let (x0, y0) = (x.max(0), y.max(0));
         let (x1, y1) = ((x + cw).min(canvas.width as i32), (y + ch).min(canvas.height as i32));
         if x0 >= x1 || y0 >= y1 {
-            return state;
+            // On another monitor: not visible here, so moving it around
+            // there doesn't count as a change of this display.
+            return CursorState::default();
         }
         let area_w = (x1 - x0) as usize;
         let area_h = (y1 - y0) as usize;

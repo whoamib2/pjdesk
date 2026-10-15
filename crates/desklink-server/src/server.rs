@@ -49,7 +49,9 @@ pub struct OnlineHost {
 
 /// A connection attempt between a controller and a host.
 pub struct Session {
-    pub token: [u8; 16],
+    /// Separate UDP bind tokens, so neither peer can bind as the other.
+    pub host_token: [u8; 16],
+    pub controller_token: [u8; 16],
     pub host_id: String,
     pub host_name: String,
     pub host_conn: u64,
@@ -75,6 +77,13 @@ pub struct PeerSlot {
 }
 
 impl Session {
+    pub fn token_for(&self, role: Role) -> [u8; 16] {
+        match role {
+            Role::Host => self.host_token,
+            Role::Controller => self.controller_token,
+        }
+    }
+
     pub fn slot_mut(&mut self, role: Role) -> &mut PeerSlot {
         match role {
             Role::Host => &mut self.host,
@@ -323,17 +332,19 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 return;
             }
             let session_id = desklink_proto::random_u64();
-            let token = desklink_proto::random_bytes::<16>();
+            let host_token = desklink_proto::random_bytes::<16>();
+            let controller_token = desklink_proto::random_bytes::<16>();
             let controller_name: String = controller_name.chars().take(64).collect();
             let _ = host.tx.send(ServerMsg::IncomingSession {
                 session_id,
-                token,
+                token: host_token,
                 udp_port: st.udp_port,
                 controller_name: controller_name.clone(),
                 controller_ip: conn.addr.ip().to_string(),
             });
             let session = Session {
-                token,
+                host_token,
+                controller_token,
                 host_id: target.clone(),
                 host_name: host.hostname.clone(),
                 host_conn: host.conn_id,
@@ -363,7 +374,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 session.accepted = true;
                 let _ = session.controller_tx.send(ServerMsg::SessionReady {
                     session_id,
-                    token: session.token,
+                    token: session.controller_token,
                     udp_port: st.udp_port,
                     host_name: session.host_name.clone(),
                 });

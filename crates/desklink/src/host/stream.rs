@@ -191,8 +191,20 @@ fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedF
     // The newest image in `picture` hasn't reached the controller yet
     // (the encoder dropped it to hold the bitrate).
     let mut undelivered = false;
+    // When GDI is only a fallback, keep trying to get back to DXGI
+    // (it may have been unavailable at start, e.g. during a UAC prompt).
+    let mut next_dxgi_retry = Instant::now() + Duration::from_secs(10);
 
     while !shared.flow.stopped() {
+        if capturer.is_fallback() && Instant::now() >= next_dxgi_retry {
+            next_dxgi_retry = Instant::now() + Duration::from_secs(10);
+            if let Some(better) = capture::try_preferred(args) {
+                info!("Switched back to {}", better.name());
+                capturer = better;
+                *shared.display.lock().unwrap() = capturer.display_rect();
+                shared.keyframe_requested.store(true, Ordering::SeqCst);
+            }
+        }
         if !shared.flow.wait_for_credit(Duration::from_millis(250)) {
             continue;
         }
@@ -226,16 +238,29 @@ fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedF
                 shared.keyframe_requested.store(true, Ordering::SeqCst);
             }
             if errors >= 3 {
-                // Display mode change, desktop switch, ... start over.
                 warn!("Capture error ({e:#}); restarting capture");
+                // Release the old capturer (and its desktop duplication)
+                // before opening a new one: an output can only be duplicated once.
+                drop(capturer);
                 std::thread::sleep(Duration::from_millis(500));
                 capturer = capture::open(args)?;
-                *shared.display.lock().unwrap() = capturer.display_rect();
                 errors = 0;
+                shared.keyframe_requested.store(true, Ordering::SeqCst);
             }
             continue;
         }
-        errors = 0;
+        if have_picture {
+            errors = 0;
+        }
+        // The display can move or change size (resolution change, monitor layout).
+        {
+            let rect = capturer.display_rect();
+            let mut display = shared.display.lock().unwrap();
+            if *display != rect {
+                info!("Now capturing {}", describe(rect));
+                *display = rect;
+            }
+        }
         if !have_picture && (want_keyframe || undelivered) && picture.width > 0 {
             // Nothing changed, but the controller needs a keyframe or never got
             // the latest image: encode the newest picture again.

@@ -92,8 +92,15 @@ fn handle_bind(
 ) -> Option<Vec<u8>> {
     let mut st = state.lock().unwrap();
     let session = st.sessions.get_mut(&session_id)?;
-    if session.token != token || !session.accepted {
+    if !session.accepted || !constant_time_eq(&session.token_for(role), &token) {
         return None;
+    }
+    // Never hijack an address that is actively relaying another session
+    // (live relays carry QUIC keep-alives every few seconds).
+    if let Some(existing) = routes.get(&src) {
+        if existing.session_id != session_id && existing.last_seen.elapsed() < Duration::from_secs(10) {
+            return None;
+        }
     }
     let first_time = session.slot_mut(role).public != Some(src);
     session.slot_mut(role).public = Some(src);
@@ -109,4 +116,9 @@ fn handle_bind(
     session.maybe_send_peer_info(session_id);
 
     Some(udp::encode(&UdpMsg::BindAck { session_id, observed: src }))
+}
+
+/// Compares tokens without revealing (through timing) how many bytes matched.
+fn constant_time_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }

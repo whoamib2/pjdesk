@@ -1,12 +1,13 @@
-//! Host mode: stay online, show ID + password, accept one controller at a time.
+//! Host mode: stay online, show ID + password, stream to one controller at a time.
 
 pub mod capture;
 mod encoder;
 mod input;
 mod stream;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,13 +28,23 @@ use crate::session::{self, Authenticated, WrongPassword};
 use crate::signaling::{ServerAddr, SignalClient};
 use crate::{p2p, HostArgs};
 
+/// Connection requests that may be in setup at once. Only an authenticated
+/// session is exclusive, so strangers who know the ID can't keep the host
+/// "busy" by sending requests they never complete.
+const MAX_PENDING: usize = 3;
+
 /// Shared state of the hosting process.
 struct HostState {
     /// Certificate for the QUIC connection (its fingerprint goes to controllers).
     identity: TlsIdentity,
     password: Mutex<String>,
     fixed_password: bool,
-    busy: AtomicBool,
+    /// An authenticated controller is connected.
+    streaming: AtomicBool,
+    /// Sessions being set up (not yet authenticated).
+    pending: AtomicUsize,
+    /// Routes the server's PeerInfo messages to the session waiting for them.
+    peer_info_routes: Mutex<HashMap<SessionId, mpsc::UnboundedSender<ServerMsg>>>,
     failures: Mutex<Failures>,
     args: HostArgs,
     name: String,
@@ -48,8 +59,11 @@ struct Failures {
 impl HostState {
     /// Why a new session can't be accepted right now, if it can't.
     fn refuse_reason(&self) -> Option<String> {
-        if self.busy.load(Ordering::SeqCst) {
+        if self.streaming.load(Ordering::SeqCst) {
             return Some("this computer is already in a remote session".into());
+        }
+        if self.pending.load(Ordering::SeqCst) >= MAX_PENDING {
+            return Some("too many connection attempts in progress; try again shortly".into());
         }
         let failures = self.failures.lock().unwrap();
         match failures.locked_until {
@@ -92,7 +106,9 @@ async fn host_main(server: ServerAddr, mut config: Config, args: HostArgs) -> Re
         identity: TlsIdentity::generate(PEER_SERVER_NAME)?,
         password: Mutex::new(args.password.clone().unwrap_or_else(generate_password)),
         fixed_password: args.password.is_some(),
-        busy: AtomicBool::new(false),
+        streaming: AtomicBool::new(false),
+        pending: AtomicUsize::new(0),
+        peer_info_routes: Mutex::new(HashMap::new()),
         failures: Mutex::new(Failures::default()),
         name: crate::hostname(),
         args,
@@ -146,8 +162,6 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
     let server_ip = signal.server_addr.ip();
     let mut ping = tokio::time::interval(Duration::from_secs(25));
     ping.tick().await;
-    // Routes PeerInfo messages to the session task that is waiting for them.
-    let mut active: Option<(SessionId, mpsc::UnboundedSender<ServerMsg>)> = None;
 
     loop {
         tokio::select! {
@@ -164,10 +178,10 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                             signal.send(ClientMsg::SessionResponse { session_id, accept: false, reason })?;
                             continue;
                         }
-                        state.busy.store(true, Ordering::SeqCst);
+                        state.pending.fetch_add(1, Ordering::SeqCst);
                         signal.send(ClientMsg::SessionResponse { session_id, accept: true, reason: String::new() })?;
                         let (tx, rx) = mpsc::unbounded_channel();
-                        active = Some((session_id, tx));
+                        state.peer_info_routes.lock().unwrap().insert(session_id, tx);
                         let server_udp = SocketAddr::new(server_ip, udp_port);
                         tokio::spawn(run_session(
                             state.clone(),
@@ -181,10 +195,8 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                         ));
                     }
                     ServerMsg::PeerInfo { session_id, .. } => {
-                        if let Some((id, tx)) = &active {
-                            if *id == session_id {
-                                let _ = tx.send(msg);
-                            }
+                        if let Some(tx) = state.peer_info_routes.lock().unwrap().get(&session_id) {
+                            let _ = tx.send(msg);
                         }
                     }
                     ServerMsg::Pong => {}
@@ -220,15 +232,19 @@ async fn run_session(
     controller_ip: String,
 ) {
     info!("Connection request from \"{controller_name}\" ({controller_ip})");
-    match session_inner(&state, signal, peer_info, session_id, token, server_udp).await {
+    let mut still_pending = true;
+    match session_inner(&state, signal, peer_info, session_id, token, server_udp, &mut still_pending).await {
         Ok(()) => info!("Remote session ended"),
         Err(e) if e.is::<WrongPassword>() => {
             warn!("\"{controller_name}\" ({controller_ip}) entered a wrong password");
             state.record_failure();
         }
-        Err(e) => warn!("Remote session failed: {e:#}"),
+        Err(e) => warn!("Connection from \"{controller_name}\" ended: {e:#}"),
     }
-    state.busy.store(false, Ordering::SeqCst);
+    if still_pending {
+        state.pending.fetch_sub(1, Ordering::SeqCst);
+    }
+    state.peer_info_routes.lock().unwrap().remove(&session_id);
 }
 
 async fn session_inner(
@@ -238,6 +254,7 @@ async fn session_inner(
     session_id: SessionId,
     token: [u8; 16],
     server_udp: SocketAddr,
+    still_pending: &mut bool,
 ) -> Result<()> {
     let binding = p2p::bind_udp(server_udp, session_id, token, Role::Host).await?;
     debug!("our public address for this session: {}", binding.observed);
@@ -248,7 +265,7 @@ async fn session_inner(
         cert_fingerprint: Some(state.identity.fingerprint()),
     })?;
 
-    let (peer_public, peer_local) = match timeout(Duration::from_secs(20), peer_info.recv()).await {
+    let (peer_public, peer_local) = match timeout(Duration::from_secs(15), peer_info.recv()).await {
         Ok(Some(ServerMsg::PeerInfo { public_addr, local_addrs, .. })) => (public_addr, local_addrs),
         _ => bail!("the controller never finished setting up the connection"),
     };
@@ -257,37 +274,56 @@ async fn session_inner(
     let punching = p2p::spawn_punching(binding.punch_socket, targets, session_id, Duration::from_secs(8));
 
     let password = state.password.lock().unwrap().clone();
-    let accepted = accept_authenticated(&endpoint, &password, &state.name, Duration::from_secs(30)).await;
+    let accepted = accept_authenticated(&endpoint, &password, &state.name, Duration::from_secs(20)).await;
     punching.abort();
     let (connection, auth) = accepted?;
     state.reset_failures();
 
+    // Authenticated: this session takes the screen, unless another one got there first.
+    state.pending.fetch_sub(1, Ordering::SeqCst);
+    *still_pending = false;
+    if state.streaming.swap(true, Ordering::SeqCst) {
+        connection.close(2u32.into(), b"another controller is already connected");
+        let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+        bail!("another controller connected first");
+    }
+
     let path = if connection.remote_address() == server_udp { "relayed via the server" } else { "direct P2P" };
     info!("\"{}\" connected ({path}, {})", auth.peer_name, connection.remote_address());
     let result = stream::run(connection.clone(), auth.send, auth.recv, state.args.clone()).await;
+    state.streaming.store(false, Ordering::SeqCst);
     connection.close(0u32.into(), b"session over");
     let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
     result
 }
 
-/// Accepts QUIC connections until one authenticates (several may arrive when
-/// the controller tries multiple addresses at once).
+/// Accepts QUIC connections until one authenticates. The controller may try
+/// several addresses at once, so several connections can arrive, but only
+/// one password attempt is allowed per session.
 async fn accept_authenticated(
     endpoint: &Endpoint,
     password: &str,
     my_name: &str,
     limit: Duration,
 ) -> Result<(Connection, Authenticated)> {
+    const MAX_CONNECTIONS: usize = 4;
     let deadline = tokio::time::Instant::now() + limit;
+    let attempt_used = Arc::new(AtomicBool::new(false));
     let mut pending: JoinSet<Result<(Connection, Authenticated)>> = JoinSet::new();
+    let mut accepted = 0;
     loop {
         tokio::select! {
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { bail!("the QUIC endpoint closed") };
-                let (password, my_name) = (password.to_owned(), my_name.to_owned());
+                accepted += 1;
+                if accepted > MAX_CONNECTIONS {
+                    incoming.refuse();
+                    continue;
+                }
+                let (password, my_name, attempt_used) = (password.to_owned(), my_name.to_owned(), attempt_used.clone());
                 pending.spawn(async move {
                     let connection = incoming.await?;
-                    let auth = session::host_auth(&connection, &password, &my_name).await?;
+                    let auth = session::host_auth(&connection, &password, &my_name, &attempt_used).await?;
                     Ok((connection, auth))
                 });
             }
@@ -306,8 +342,34 @@ async fn accept_authenticated(
 fn platform_init() {
     #[cfg(windows)]
     unsafe {
-        use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-        // Physical pixels everywhere: capture, cursor position and SendInput agree.
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        use windows::core::{s, w, BOOL};
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwareness, DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            PROCESS_PER_MONITOR_DPI_AWARE,
+        };
+        // Physical pixels everywhere, so capture, cursor position and
+        // SendInput agree on scaled displays. Per-monitor v2 needs Windows 10
+        // 1703, so it is looked up at run time (importing it would stop the
+        // exe from starting on Windows Server 2016); older systems fall back
+        // to the Windows 8.1 API.
+        type SetContext = unsafe extern "system" fn(DPI_AWARENESS_CONTEXT) -> BOOL;
+        let per_monitor_v2 = GetModuleHandleW(w!("user32.dll"))
+            .ok()
+            .and_then(|user32| GetProcAddress(user32, s!("SetProcessDpiAwarenessContext")))
+            .map(|f| {
+                let set = std::mem::transmute::<unsafe extern "system" fn() -> isize, SetContext>(f);
+                set(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).as_bool()
+            })
+            .unwrap_or(false);
+        if !per_monitor_v2 {
+            match SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE) {
+                // E_ACCESSDENIED means the awareness was already set (e.g. by a manifest).
+                Err(e) if e.code() != windows::Win32::Foundation::E_ACCESSDENIED => {
+                    warn!("Could not make the process DPI aware ({e}); scaled displays may be captured incorrectly")
+                }
+                _ => {}
+            }
+        }
     }
 }

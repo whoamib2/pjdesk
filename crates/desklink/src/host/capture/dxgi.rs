@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0,
 };
@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
+    DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_UNSUPPORTED,
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
 
@@ -118,6 +119,14 @@ impl DxgiCapturer {
         }
     }
 
+    /// Re-reads where this output sits on the desktop (after mode changes).
+    fn refresh_rect(&mut self) {
+        if let Ok(desc) = unsafe { self.output.GetDesc() } {
+            let r = desc.DesktopCoordinates;
+            self.rect = Rect { left: r.left, top: r.top, width: r.right - r.left, height: r.bottom - r.top };
+        }
+    }
+
     /// Copies a new desktop image into the canvas. Returns false for
     /// pointer-only updates.
     fn copy_image(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO, resource: Option<IDXGIResource>) -> Result<bool> {
@@ -132,7 +141,11 @@ impl DxgiCapturer {
             bail!("unsupported desktop format {:?}", desc.Format);
         }
         if desc.Width as usize != self.canvas.width || desc.Height as usize != self.canvas.height {
-            bail!("the display resolution changed");
+            // Resolution changed: follow it.
+            self.canvas = DibCanvas::new(desc.Width as usize, desc.Height as usize)?;
+            self.staging = None;
+            self.cursor.invalidate();
+            self.refresh_rect();
         }
 
         if self.staging.is_none() {
@@ -183,9 +196,27 @@ impl Capturer for DxgiCapturer {
 
     fn capture(&mut self, timeout: Duration) -> Result<Option<Frame<'_>>> {
         if self.duplication.is_none() {
-            // Lost access earlier (mode change, UAC prompt, full-screen app): retry.
+            // Lost access earlier (mode change, UAC prompt, lock screen,
+            // full-screen app): retry. The secure desktop (UAC, Ctrl+Alt+Del,
+            // lock screen) refuses duplication until it goes away; keep
+            // showing the last image meanwhile instead of giving up on DXGI.
             match unsafe { self.output.DuplicateOutput(&self.device) } {
-                Ok(duplication) => self.duplication = Some(duplication),
+                Ok(duplication) => {
+                    self.duplication = Some(duplication);
+                    self.refresh_rect();
+                }
+                Err(e)
+                    if [
+                        E_ACCESSDENIED,
+                        DXGI_ERROR_UNSUPPORTED,
+                        DXGI_ERROR_SESSION_DISCONNECTED,
+                        DXGI_ERROR_NOT_CURRENTLY_AVAILABLE,
+                    ]
+                    .contains(&e.code()) =>
+                {
+                    std::thread::sleep(timeout);
+                    return Ok(None);
+                }
                 Err(e) => {
                     std::thread::sleep(timeout);
                     return Err(e).context("re-creating desktop duplication");

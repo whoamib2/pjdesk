@@ -8,7 +8,7 @@
 //!
 //! Local shortcut (not sent to the host): Ctrl+Alt+Enter toggles full screen.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use desklink_proto::format_id;
 use desklink_proto::framing::{read_msg, MAX_CONTROL_FRAME};
-use desklink_proto::peer::{read_video_frame, ControlMsg, HostMsg, InputEvent, MouseButton, VideoHeader};
+use desklink_proto::peer::{
+    read_video_frame, ControlMsg, HostMsg, InputEvent, MouseButton, VideoHeader, KEY_NUMPAD_DIGIT,
+};
 use quinn::{Connection, SendStream};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -27,7 +29,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
 
 use super::decoder::VideoDecoder;
@@ -98,7 +100,7 @@ pub fn run(runtime: Runtime, link: Link) -> Result<()> {
         layout: Layout::default(),
         control: control_tx,
         sized_to_remote: false,
-        keys_down: HashSet::new(),
+        keys_down: HashMap::new(),
         modifiers: ModifiersState::empty(),
         last_position: None,
         wheel: (0.0, 0.0),
@@ -247,7 +249,8 @@ struct App {
     layout: Layout,
     control: mpsc::UnboundedSender<ControlMsg>,
     sized_to_remote: bool,
-    keys_down: HashSet<u16>,
+    /// Keys held down here, and the code each was sent as.
+    keys_down: HashMap<KeyCode, u16>,
     modifiers: ModifiersState,
     last_position: Option<(u16, u16)>,
     /// Fractional wheel movement not sent yet (touchpads).
@@ -315,11 +318,17 @@ impl App {
             let _ = event_loop;
             return;
         }
-        let Some(scan) = keymap::scancode(code) else { return };
+        let Some(mut scan) = keymap::scancode(code) else { return };
         if down {
-            self.keys_down.insert(scan);
-        } else {
-            self.keys_down.remove(&scan);
+            // Numpad keys typed as digits here (NumLock on) are sent as digits,
+            // so they don't turn into arrow keys when the host's NumLock is off.
+            if keymap::is_numpad_digit_key(code) && matches!(event.logical_key, Key::Character(_)) {
+                scan |= KEY_NUMPAD_DIGIT;
+            }
+            self.keys_down.insert(code, scan);
+        } else if let Some(pressed_as) = self.keys_down.remove(&code) {
+            // Release exactly what was pressed.
+            scan = pressed_as;
         }
         self.send(InputEvent::Key { scan, down });
     }
@@ -329,8 +338,9 @@ impl App {
         if layout.width == 0 || layout.height == 0 {
             return;
         }
-        let fx = ((position.x - layout.x as f64) / layout.width as f64).clamp(0.0, 1.0);
-        let fy = ((position.y - layout.y as f64) / layout.height as f64).clamp(0.0, 1.0);
+        // Pixel centers: the first and last pixel map to 0 and 65535.
+        let fx = ((position.x - layout.x as f64) / (layout.width.max(2) - 1) as f64).clamp(0.0, 1.0);
+        let fy = ((position.y - layout.y as f64) / (layout.height.max(2) - 1) as f64).clamp(0.0, 1.0);
         let point = ((fx * 65535.0).round() as u16, (fy * 65535.0).round() as u16);
         if self.last_position != Some(point) {
             self.last_position = Some(point);

@@ -2,6 +2,7 @@
 //! `desklink_proto::auth` for the cryptography).
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -75,7 +76,16 @@ pub async fn controller_auth(connection: &Connection, password: &str, my_name: &
 }
 
 /// Host side: check the controller's password proof.
-pub async fn host_auth(connection: &Connection, password: &str, my_name: &str) -> Result<Authenticated> {
+///
+/// `attempt_used` allows one password attempt per session: the controller
+/// may race several connections, but only the first to start the exchange
+/// gets a SPAKE2 reply (each reply lets the peer test exactly one guess).
+pub async fn host_auth(
+    connection: &Connection,
+    password: &str,
+    my_name: &str,
+    attempt_used: &AtomicBool,
+) -> Result<Authenticated> {
     let (mut send, mut recv) = timeout(Duration::from_secs(10), connection.accept_bi())
         .await
         .context("the controller did not start authentication")??;
@@ -94,16 +104,20 @@ pub async fn host_auth(connection: &Connection, password: &str, my_name: &str) -
         bail!(message);
     }
 
+    if attempt_used.swap(true, Ordering::SeqCst) {
+        bail!("only one password attempt is allowed per connection request");
+    }
+
     let binding = channel_binding(connection)?;
     let (exchange, spake) = auth::host_start(password);
     let key = exchange.finish(&controller_spake)?;
     write_msg(&mut send, &AuthMsg::Challenge { spake, confirm: key.host_confirm(&binding) }).await?;
 
+    // From here on, anything but a valid confirmation counts as a failed
+    // password attempt (the controller has already been able to test its guess).
     let confirm = match timeout(Duration::from_secs(15), read_msg::<_, AuthMsg>(&mut recv, MAX_CONTROL_FRAME)).await {
         Ok(Ok(AuthMsg::Confirm { confirm })) => confirm,
-        Ok(Ok(other)) => bail!("unexpected message from the controller: {other:?}"),
-        // The controller hung up after seeing our confirmation: its password was wrong.
-        Ok(Err(_)) | Err(_) => return Err(WrongPassword.into()),
+        _ => return Err(WrongPassword.into()),
     };
     if !key.verify_controller(&binding, &confirm) {
         let _ = write_msg(

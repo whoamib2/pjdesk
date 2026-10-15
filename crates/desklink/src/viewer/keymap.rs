@@ -144,6 +144,25 @@ pub fn scancode(key: KeyCode) -> Option<u16> {
     })
 }
 
+/// Numpad keys that type a digit (or the decimal separator) with NumLock on.
+pub fn is_numpad_digit_key(key: KeyCode) -> bool {
+    use KeyCode::*;
+    matches!(
+        key,
+        Numpad0
+            | Numpad1
+            | Numpad2
+            | Numpad3
+            | Numpad4
+            | Numpad5
+            | Numpad6
+            | Numpad7
+            | Numpad8
+            | Numpad9
+            | NumpadDecimal
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

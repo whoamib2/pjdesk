@@ -35,9 +35,10 @@ pub struct Link {
 }
 
 pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<()> {
-    let target = normalize_id(&args.id);
+    let typed = args.id.join(" ");
+    let target = normalize_id(&typed);
     if !is_valid_id(&target) {
-        bail!("\"{}\" is not a DeskLink ID (IDs have 9 digits)", args.id);
+        bail!("\"{typed}\" is not a DeskLink ID (IDs have 9 digits)");
     }
     let password = match args.password.clone() {
         Some(password) => password,
@@ -136,6 +137,14 @@ async fn connect(
 /// Test mode: receive and decode `frames` frames, then print statistics.
 async fn headless(link: Link, frames: u32) -> Result<()> {
     let Link { connection, endpoint, mut control_send, .. } = link;
+    let result = receive_frames(&connection, &mut control_send, frames).await;
+    // Hang up on success and failure alike, so the host is free again at once.
+    connection.close(0u32.into(), b"done");
+    let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+    result
+}
+
+async fn receive_frames(connection: &Connection, control_send: &mut SendStream, frames: u32) -> Result<()> {
     let mut video =
         timeout(Duration::from_secs(15), connection.accept_uni()).await.context("no video from the host")??;
     let mut decoder = decoder::VideoDecoder::new()?;
@@ -145,16 +154,17 @@ async fn headless(link: Link, frames: u32) -> Result<()> {
     let started = Instant::now();
 
     while decoded < frames {
+        // The host only sends frames when its screen changes.
         let header = timeout(Duration::from_secs(10), read_video_frame(&mut video, &mut data))
             .await
-            .context("the host stopped sending video")??;
+            .with_context(|| format!("no new frame for 10 s after {decoded} (is the host's screen idle?)"))??;
         bytes += data.len();
         keyframes += header.keyframe as u32;
         if let Some(dims) = decoder.decode(&data, &mut rgb)? {
             decoded += 1;
             size = dims;
         }
-        write_msg(&mut control_send, &ControlMsg::FrameAck { seq: header.seq }).await?;
+        write_msg(control_send, &ControlMsg::FrameAck { seq: header.seq }).await?;
     }
     let secs = started.elapsed().as_secs_f64();
     println!(
@@ -172,7 +182,5 @@ async fn headless(link: Link, frames: u32) -> Result<()> {
             [1usize, 3, 5, 7].iter().map(|q| format!("#{:06x}", rgb[row + size.0 * q / 8])).collect();
         println!("Center-row colors: {}", samples.join(" "));
     }
-    connection.close(0u32.into(), b"done");
-    let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
     Ok(())
 }

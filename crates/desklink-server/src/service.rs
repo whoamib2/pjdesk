@@ -53,28 +53,59 @@ fn run_service(opts: ServerOpts, data_dir: PathBuf) -> Result<()> {
         _ => ServiceControlHandlerResult::NotImplemented,
     };
     let status = service_control_handler::register(SERVICE_NAME, handler)?;
-    let report = |state: ServiceState, accept: ServiceControlAccept, code: u32| {
-        status.set_service_status(ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: state,
-            controls_accepted: accept,
-            exit_code: ServiceExitCode::Win32(code),
-            checkpoint: 0,
-            wait_hint: Duration::from_secs(5),
-            process_id: None,
-        })
-    };
+    let report =
+        |state: ServiceState, accept: ServiceControlAccept, exit_code: ServiceExitCode, wait_hint: Duration| {
+            status.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: state,
+                controls_accepted: accept,
+                exit_code,
+                checkpoint: 0,
+                wait_hint,
+                process_id: None,
+            })
+        };
 
-    report(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, 0)?;
+    report(
+        ServiceState::Running,
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        ServiceExitCode::Win32(0),
+        Duration::default(),
+    )?;
+    protect_data_dir(&data_dir);
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(crate::server::run(opts, data_dir, async move {
         let _ = stop_rx.wait_for(|stopped| *stopped).await;
+        let _ = report(
+            ServiceState::StopPending,
+            ServiceControlAccept::empty(),
+            ServiceExitCode::Win32(0),
+            Duration::from_secs(10),
+        );
     }));
     if let Err(e) = &result {
         tracing::error!("server stopped with an error: {e:#}");
     }
-    report(ServiceState::Stopped, ServiceControlAccept::empty(), if result.is_ok() { 0 } else { 1 })?;
+    // Close the sockets before reporting "stopped", so a restart can bind at once.
+    runtime.shutdown_timeout(Duration::from_secs(3));
+    let exit_code = if result.is_ok() { ServiceExitCode::Win32(0) } else { ServiceExitCode::ServiceSpecific(1) };
+    report(ServiceState::Stopped, ServiceControlAccept::empty(), exit_code, Duration::default())?;
     result
+}
+
+/// Restricts the data folder (server private key, device registry, log) to
+/// SYSTEM and Administrators; ProgramData is readable by every local user.
+fn protect_data_dir(dir: &Path) {
+    let _ = std::fs::create_dir_all(dir);
+    let status = std::process::Command::new("icacls")
+        .arg(dir)
+        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/Q"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        tracing::warn!("could not restrict access to {} ({status:?})", dir.display());
+    }
 }
 
 fn init_file_logging(data_dir: &Path) {
@@ -95,7 +126,7 @@ fn manager(access: ServiceManagerAccess) -> Result<ServiceManager> {
 }
 
 /// Installs the service (auto-start, LocalSystem) and starts it.
-pub fn install(opts: &ServerOpts, firewall: bool) -> Result<()> {
+pub fn install(opts: &ServerOpts, data_dir: &Path, firewall: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
     let manager = manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
 
@@ -108,8 +139,9 @@ pub fn install(opts: &ServerOpts, firewall: bool) -> Result<()> {
         opts.port.to_string().into(),
     ];
     if let Some(dir) = &opts.data_dir {
+        // The service starts in System32, so relative paths must be resolved now.
         args.push("--data-dir".into());
-        args.push(dir.clone().into_os_string());
+        args.push(std::path::absolute(dir)?.into_os_string());
     }
 
     let info = ServiceInfo {
@@ -132,6 +164,7 @@ pub fn install(opts: &ServerOpts, firewall: bool) -> Result<()> {
     if firewall {
         add_firewall_rule(&exe)?;
     }
+    protect_data_dir(data_dir);
 
     service.start::<&str>(&[]).context("service installed but failed to start")?;
     println!("Installed and started the \"{DISPLAY_NAME}\" service ({SERVICE_NAME}).");

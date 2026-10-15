@@ -102,7 +102,7 @@ fn main() -> Result<()> {
 #[cfg(windows)]
 fn service_command(cmd: ServiceCommand, opts: ServerOpts, data_dir: PathBuf) -> Result<()> {
     match cmd {
-        ServiceCommand::Install { firewall } => service::install(&opts, firewall),
+        ServiceCommand::Install { firewall } => service::install(&opts, &data_dir, firewall),
         ServiceCommand::Uninstall => service::uninstall(),
         ServiceCommand::Start => service::start(),
         ServiceCommand::Stop => service::stop(),
