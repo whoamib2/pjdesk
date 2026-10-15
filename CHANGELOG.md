@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.2.0
+
+The project is now **PJDesk** (formerly DeskLink), with a graphical app, a
+background service, user accounts and Windows installers. Update the server and
+all clients together — the signaling protocol changed (version 2).
+
+### Apps
+
+* **A real window.** Double-clicking `pjdesk.exe` opens a RustDesk-style
+  window: your ID and password on the left, a box to connect to another
+  computer on the right, your saved computers below, and a Settings window
+  (General, Security, Network, Display, About). The old text mode is still
+  there as `pjdesk console`.
+* **Server management window.** Double-clicking `pjdesk-server.exe` opens a
+  window with the service status, the server key fingerprint, user accounts
+  (add/remove/disable) and the registered computers.
+* **Viewer toolbar.** A control bar drops down at the top of a session: full
+  screen, actual size, refresh, **Ctrl+Alt+Del**, block input, and disconnect.
+
+### Background service
+
+* **Reach this computer at the sign-in screen.** Install the service (from the
+  installer, the Settings ▸ Security tab, or `pjdesk service install`) and
+  PJDesk runs from boot. It launches a helper as SYSTEM into the active
+  session and follows the input desktop, so you can connect before anyone
+  signs in and through UAC prompts, including Ctrl+Alt+Del.
+
+### Accounts
+
+* **Sign in to your server.** Create accounts on the server
+  (`pjdesk-server account add`, or the server window). Signing in from the app
+  saves your login (encrypted with DPAPI) and syncs an **address book** of
+  saved computers to every machine you use. Each computer can remember its
+  password.
+
+### Installers
+
+* **One-click setup.** `PJDesk-Setup` and `PJDesk-Server-Setup` install to
+  Program Files, add shortcuts and an uninstaller, and can set up the service.
+
+### Security
+
+* Account passwords are stored as Argon2id hashes; a saved login is a random
+  token, revocable by changing the password. Login timing doesn't reveal
+  whether an account exists. Saved passwords and tokens are encrypted at rest
+  with DPAPI. The service folder is locked to SYSTEM and Administrators.
+
 ## 0.1.1
 
 Fixes from a code review of 0.1.0. The wire protocol is unchanged, but update the server and all clients together.

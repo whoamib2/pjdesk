@@ -212,15 +212,28 @@ fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedF
     while !shared.flow.stopped() {
         // Follow desktop switches (UAC / lock / sign-in screen): re-attach this
         // thread and rebuild capture so it grabs the desktop now on screen.
+        // An empty name means the read failed transiently — don't treat that as
+        // a switch, and don't let a transient capture failure kill the thread.
         if args.follow_desktop {
             let current = crate::platform::input_desktop_name().unwrap_or_default();
-            if current != desktop {
+            if !current.is_empty() && current != desktop {
                 info!("Input desktop changed to \"{current}\"; following it");
                 desktop = current;
                 crate::platform::attach_thread_to_input_desktop();
                 drop(capturer);
                 std::thread::sleep(Duration::from_millis(200));
-                capturer = capture::open(args)?;
+                capturer = loop {
+                    match capture::open(args) {
+                        Ok(c) => break c,
+                        Err(e) => {
+                            if shared.flow.stopped() {
+                                return Ok(());
+                            }
+                            warn!("Capture unavailable after desktop switch ({e:#}); retrying");
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                    }
+                };
                 *shared.display.lock().unwrap() = capturer.display_rect();
                 shared.keyframe_requested.store(true, Ordering::SeqCst);
             }

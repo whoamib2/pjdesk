@@ -71,7 +71,11 @@ enum Cmd {
     Service(ServiceCommand),
     /// Internal: the hosting helper the service launches into a user session.
     #[command(name = "__session-host", hide = true)]
-    SessionHost,
+    SessionHost {
+        /// Path to the service config to host from.
+        #[arg(long)]
+        config: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -238,8 +242,8 @@ fn main() {
                 fatal(&format!("PJDesk could not start: {e:#}"));
             }
         }
-        Some(Cmd::SessionHost) => {
-            if let Err(e) = service::session_host() {
+        Some(Cmd::SessionHost { config }) => {
+            if let Err(e) = service::session_host(config.clone()) {
                 tracing::error!("session host: {e:#}");
             }
         }
@@ -274,7 +278,9 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Logout) => logout_command(&mut config, cli.server),
         Some(Cmd::Console) => interactive(config, cli.server),
         Some(Cmd::Service(cmd)) => service_command(cmd),
-        Some(Cmd::SessionHost) | Some(Cmd::Service(ServiceCommand::Run)) | None => unreachable!("handled in main"),
+        Some(Cmd::SessionHost { .. }) | Some(Cmd::Service(ServiceCommand::Run)) | None => {
+            unreachable!("handled in main")
+        }
     }
 }
 

@@ -218,14 +218,14 @@ impl App {
                     return;
                 }
             };
+            // account::refresh persists the token + address book itself (with
+            // the identity guard), so we don't save the stale clone here.
             match rt.block_on(account::refresh(&server, &mut cfg)) {
                 Ok(Some(info)) => {
-                    let _ = cfg.save();
                     let _ = tx.send(LoginMsg::Ok { display_name: info.display_name });
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    let _ = cfg.save();
                     let _ = tx.send(LoginMsg::Err(e.to_string()));
                 }
             }
@@ -248,7 +248,7 @@ impl App {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             match rt.block_on(account::login(&server, &mut cfg, &user, &pass)) {
                 Ok(info) => {
-                    let _ = cfg.save();
+                    // account::login already saved the token + address book.
                     let _ = tx.send(LoginMsg::Ok { display_name: info.display_name });
                 }
                 Err(e) => {

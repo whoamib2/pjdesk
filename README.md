@@ -1,13 +1,23 @@
 # PJDesk
 
-A self-hosted, open-source remote desktop in the spirit of RustDesk, written in Rust.
+A self-hosted, open-source remote desktop in the spirit of RustDesk, written in Rust. Your computers connect only through a server you run — no cloud, no accounts with anyone but you. [pjdesk.com](https://pjdesk.com)
 
-* **`pjdesk-server.exe`**: one small server for signaling, NAT rendezvous and relay. It runs in a console or as a Windows service.
-* **`pjdesk.exe`**: one client that both **shares** this computer (host) and **controls** other computers (controller).
+* **`pjdesk.exe`** — the app. A window to share this computer (ID + password) and control others, with a settings window, a sign-in to your server, a synced address book, and an optional background service so you can connect at the sign-in screen and during UAC prompts.
+* **`pjdesk-server.exe`** — the hub. Signaling, NAT rendezvous and relay, with a management window for the service, user accounts and registered computers. Runs in a console or as a Windows service.
 
 Connections are **peer-to-peer** whenever UDP hole punching works, and are **relayed** through your server when it doesn't. Video is **end-to-end encrypted** either way (QUIC/TLS 1.3). Passwords are checked with **SPAKE2**, so they never travel over the network, not even to your own server.
 
-> Status: **v0.1.1 MVP.** See [What's tested](#whats-tested), [Limitations & roadmap](#limitations--roadmap) and the [changelog](CHANGELOG.md).
+> Status: **v0.2.0.** See the [changelog](CHANGELOG.md), [What's tested](#whats-tested) and [Limitations & roadmap](#limitations--roadmap).
+
+---
+
+## Getting started
+
+1. **Run the server.** Install `PJDesk-Server-Setup` on a computer that stays on (or build it and run `pjdesk-server`). Tick "run as a service" so it starts with Windows. Note its address — a hostname or LAN IP — and, for use over the internet, forward TCP + UDP 21200 to it.
+2. **Install the app.** Run `PJDesk-Setup` on each computer. Open PJDesk, go to **Settings ▸ Network**, and enter your server's address.
+3. **Connect.** Your computer now shows a 9-digit **ID** and a password. Give those to someone, or type another computer's ID and password to control it.
+4. **(Optional) Always-on access.** In **Settings ▸ Security**, install the **background service** to reach this computer before anyone signs in and during UAC prompts. Set a permanent password there too.
+5. **(Optional) Sign in.** Create an account on the server (its window, or `pjdesk-server account add <name>`), then sign in from the app to sync an **address book** of saved computers across your machines.
 
 ---
 

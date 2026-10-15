@@ -58,6 +58,7 @@ pub async fn refresh(server: &ServerAddr, config: &mut Config) -> Result<Option<
         Err(e) => {
             // Token no longer valid: drop it so the UI prompts for a password.
             config.account = None;
+            config.reload_identity_from_disk();
             let _ = config.save();
             Err(e)
         }
@@ -85,6 +86,8 @@ async fn finish_login(signal: &mut SignalClient, username: &str, config: &mut Co
         _ => config.address_book.clone(), // keep the cached copy on any hiccup
     };
     config.address_book = entries.clone();
+    // Don't clobber the device identity the host thread may have just written.
+    config.reload_identity_from_disk();
     config.save()?;
     Ok(LoggedIn { display_name, is_admin, address_book: entries })
 }
@@ -108,6 +111,7 @@ pub async fn logout(server: &ServerAddr, config: &mut Config) -> Result<()> {
         }
     }
     config.account = None;
+    config.reload_identity_from_disk();
     config.save()?;
     Ok(())
 }

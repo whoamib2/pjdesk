@@ -318,25 +318,36 @@ mod imp {
             let _ = CloseHandle(proc_token);
             dup_result.context("DuplicateTokenEx")?;
 
-            // Move the token into the target session.
-            let sid = session_id;
-            SetTokenInformation(dup, TokenSessionId, &sid as *const u32 as *const core::ffi::c_void, 4)
-                .context("SetTokenInformation(session)")?;
-
-            // Environment block for the token.
-            let mut env_block: *mut core::ffi::c_void = std::ptr::null_mut();
-            let have_env = CreateEnvironmentBlock(&mut env_block, Some(dup), false).is_ok();
-
-            // Command line and desktop.
-            let exe = std::env::current_exe()?;
+            // Build the command line and desktop first, so an error here can't
+            // leak the token or the environment block.
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(e) => {
+                    let _ = CloseHandle(dup);
+                    return Err(e.into());
+                }
+            };
+            // The helper gets its config path on the command line — the SYSTEM
+            // environment block does NOT carry our PJDESK_CONFIG, so passing it
+            // via the environment would silently fail.
+            let cfg_path = crate::syspaths::service_config_path();
             let mut cmdline: Vec<u16> =
-                format!("\"{}\" __session-host", exe.display()).encode_utf16().chain(std::iter::once(0)).collect();
+                format!("\"{}\" __session-host --config \"{}\"", exe.display(), cfg_path.display())
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
             let mut desktop: Vec<u16> = "winsta0\\default".encode_utf16().chain(std::iter::once(0)).collect();
 
-            // Pass the service config path to the helper via the config env var.
-            let cfg_path = crate::syspaths::service_config_path();
-            let prev = std::env::var_os("PJDESK_CONFIG");
-            std::env::set_var("PJDESK_CONFIG", &cfg_path);
+            // Move the token into the target session.
+            let sid = session_id;
+            if let Err(e) = SetTokenInformation(dup, TokenSessionId, &sid as *const u32 as *const core::ffi::c_void, 4) {
+                let _ = CloseHandle(dup);
+                return Err(e).context("SetTokenInformation(session)");
+            }
+
+            // Environment block for the token (the SYSTEM profile).
+            let mut env_block: *mut core::ffi::c_void = std::ptr::null_mut();
+            let have_env = CreateEnvironmentBlock(&mut env_block, Some(dup), false).is_ok();
 
             let mut si = STARTUPINFOW {
                 cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -360,11 +371,6 @@ mod imp {
                 &mut pi,
             );
 
-            // Restore our env var.
-            match prev {
-                Some(v) => std::env::set_var("PJDESK_CONFIG", v),
-                None => std::env::remove_var("PJDESK_CONFIG"),
-            }
             if have_env {
                 let _ = DestroyEnvironmentBlock(env_block);
             }
@@ -388,7 +394,10 @@ pub use imp::{install, is_windows, run_dispatcher, start, status, stop, uninstal
 
 /// The helper that actually hosts, launched by the service into a user session.
 /// Follows the input desktop and publishes a status file for the GUI.
-pub fn session_host() -> Result<()> {
+///
+/// `config_path` is the service config the launcher passes on the command line;
+/// if absent (e.g. run by hand) it falls back to the default service config.
+pub fn session_host(config_path: Option<String>) -> Result<()> {
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -396,6 +405,11 @@ pub fn session_host() -> Result<()> {
     use crate::host::{self, HostShared};
     use crate::signaling::ServerAddr;
     use crate::syspaths::ServiceStatus;
+
+    // Point every config read/write at the service config, so the host thread
+    // also saves its identity there.
+    let path = config_path.map(std::path::PathBuf::from).unwrap_or_else(crate::syspaths::service_config_path);
+    std::env::set_var("PJDESK_CONFIG", &path);
 
     init_service_logging();
     let config = Config::load().unwrap_or_default();

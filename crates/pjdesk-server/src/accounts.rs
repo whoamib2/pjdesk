@@ -181,7 +181,15 @@ impl Accounts {
     /// Checks a password and, on success, mints and stores a login token.
     pub fn login_password(&mut self, username: &str, password: &str, _device: &str) -> Result<Session> {
         let username = normalize_username(username);
-        let user = self.data.users.get(&username).context("wrong username or password")?;
+        let user = match self.data.users.get(&username) {
+            Some(u) => u,
+            None => {
+                // Spend the same Argon2 time as a real check, so a missing
+                // username isn't distinguishable by response time.
+                let _ = verify_password(dummy_hash(), password);
+                bail!("wrong username or password");
+            }
+        };
         if user.disabled {
             bail!("this account is disabled");
         }
@@ -244,7 +252,7 @@ impl Accounts {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("json.tmp");
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(entries)?)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
@@ -257,7 +265,8 @@ impl Accounts {
             user.tokens.retain(|_, last| *last >= cutoff);
         }
         std::fs::create_dir_all(&self.dir)?;
-        let tmp = self.path.with_extension("json.tmp");
+        // Per-process temp name so a concurrent writer (GUI/CLI) can't collide.
+        let tmp = self.path.with_extension(format!("json.tmp.{}", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(&self.data)?)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
@@ -280,6 +289,13 @@ fn verify_password(phc: &str, password: &str) -> Result<()> {
 
 fn mint_token() -> String {
     hex::encode(pjdesk_proto::random_bytes::<32>())
+}
+
+/// A fixed valid hash to verify against when the username is unknown, so login
+/// timing doesn't reveal whether an account exists.
+fn dummy_hash() -> &'static str {
+    static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    H.get_or_init(|| hash_password("pjdesk-timing-equalizer").unwrap_or_default())
 }
 
 fn prune_tokens(tokens: &mut BTreeMap<String, u64>) {

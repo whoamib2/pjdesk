@@ -37,10 +37,16 @@ pub fn input_desktop_name() -> Option<String> {
 /// Returns true on success.
 #[cfg(windows)]
 pub fn attach_thread_to_input_desktop() -> bool {
+    use std::cell::Cell;
     use windows::Win32::System::StationsAndDesktops::{
-        OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_CREATEWINDOW,
-        DESKTOP_JOURNALPLAYBACK, DESKTOP_JOURNALRECORD, DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS,
+        CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
+        DESKTOP_CREATEWINDOW, DESKTOP_JOURNALPLAYBACK, DESKTOP_JOURNALRECORD, DESKTOP_READOBJECTS,
+        DESKTOP_WRITEOBJECTS, HDESK,
     };
+    // The desktop this thread previously opened (0 = none). SetThreadDesktop
+    // does not free it, so we close it ourselves after switching away.
+    thread_local! { static PREV: Cell<isize> = const { Cell::new(0) }; }
+
     let access = DESKTOP_ACCESS_FLAGS(
         DESKTOP_READOBJECTS.0
             | DESKTOP_WRITEOBJECTS.0
@@ -50,9 +56,23 @@ pub fn attach_thread_to_input_desktop() -> bool {
     );
     unsafe {
         match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), true, access) {
-            // Ownership of hdesk passes to the thread; the old one is released
-            // by the OS when the thread exits or attaches to another desktop.
-            Ok(hdesk) => SetThreadDesktop(hdesk).is_ok(),
+            Ok(hdesk) => {
+                if SetThreadDesktop(hdesk).is_ok() {
+                    // We've switched off the previous desktop, so it's safe to
+                    // close our old handle (closing never destroys a desktop
+                    // other handles still reference).
+                    PREV.with(|p| {
+                        let old = p.replace(hdesk.0 as isize);
+                        if old != 0 {
+                            let _ = CloseDesktop(HDESK(old as *mut core::ffi::c_void));
+                        }
+                    });
+                    true
+                } else {
+                    let _ = CloseDesktop(hdesk);
+                    false
+                }
+            }
             Err(_) => false,
         }
     }
@@ -68,11 +88,7 @@ pub fn run_elevated(args: &[&str]) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let Ok(exe) = std::env::current_exe() else { return false };
-    let params = args
-        .iter()
-        .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.to_string() })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let params = args.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" ");
     unsafe {
         let hinst = ShellExecuteW(
             None,
@@ -112,6 +128,45 @@ pub fn send_ctrl_alt_del() {
 
 #[cfg(not(windows))]
 pub fn send_ctrl_alt_del() {}
+
+/// Quotes one argument the way `CommandLineToArgvW` parses it, so a value with
+/// spaces, quotes or trailing backslashes (e.g. a password) survives intact.
+#[cfg(windows)]
+fn quote_arg(s: &str) -> String {
+    if !s.is_empty() && !s.bytes().any(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | b'"')) {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::from("\"");
+    let mut i = 0;
+    while i < chars.len() {
+        let mut backslashes = 0;
+        while i < chars.len() && chars[i] == '\\' {
+            backslashes += 1;
+            i += 1;
+        }
+        if i == chars.len() {
+            // Escape all backslashes that precede the closing quote.
+            for _ in 0..backslashes * 2 {
+                out.push('\\');
+            }
+        } else if chars[i] == '"' {
+            for _ in 0..backslashes * 2 + 1 {
+                out.push('\\');
+            }
+            out.push('"');
+            i += 1;
+        } else {
+            for _ in 0..backslashes {
+                out.push('\\');
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out.push('"');
+    out
+}
 
 #[cfg(not(windows))]
 pub fn run_elevated(_args: &[&str]) -> bool {
