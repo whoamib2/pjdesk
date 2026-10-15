@@ -4,3 +4,4 @@
 *.json.tmp
 /installer/build/
 /installer/*.exe
+/installer/SHA256SUMS
