@@ -204,6 +204,18 @@ pub fn start() -> Result<()> {
     Ok(())
 }
 
+/// Whether the service exists, and whether it is running (for the GUI).
+pub fn status() -> (bool, bool) {
+    let Ok(manager) = manager(ServiceManagerAccess::CONNECT) else { return (false, false) };
+    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        Ok(service) => match service.query_status() {
+            Ok(s) => (true, s.current_state == ServiceState::Running),
+            Err(_) => (true, false),
+        },
+        Err(_) => (false, false),
+    }
+}
+
 pub fn stop() -> Result<()> {
     let manager = manager(ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP).context("the service is not installed")?;

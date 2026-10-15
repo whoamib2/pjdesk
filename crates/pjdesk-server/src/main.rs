@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! PJDesk server.
 //!
 //! One small executable that provides:
@@ -12,6 +13,8 @@
 //! (`pjdesk-server service install`).
 
 mod accounts;
+#[cfg(windows)]
+mod gui;
 mod registry;
 mod relay;
 mod server;
@@ -106,27 +109,81 @@ enum ServiceCommand {
 }
 
 fn main() -> Result<()> {
+    // The SCM-launched `service run` has no console and sets up its own logging.
+    let raw: Vec<String> = std::env::args().collect();
+    let is_background = raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run");
+    if raw.len() > 1 && !is_background {
+        ensure_console();
+    }
     let cli = Cli::parse();
     let data_dir = server::resolve_data_dir(cli.opts.data_dir.clone());
 
-    match cli.command.unwrap_or(Command::Run) {
-        Command::Run => {
+    match cli.command {
+        None => {
+            // Default: the management window on Windows; the console server
+            // elsewhere (the GUI is Windows-only).
+            #[cfg(windows)]
+            {
+                if let Err(e) = gui::run(data_dir, cli.opts.port) {
+                    fatal(&format!("PJDesk Server could not start: {e:#}"));
+                }
+                Ok(())
+            }
+            #[cfg(not(windows))]
+            {
+                init_console_logging();
+                let runtime = tokio::runtime::Runtime::new()?;
+                runtime.block_on(server::run(cli.opts, data_dir, async {
+                    let _ = tokio::signal::ctrl_c().await;
+                }))
+            }
+        }
+        Some(Command::Run) => {
             init_console_logging();
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(server::run(cli.opts, data_dir, async {
                 let _ = tokio::signal::ctrl_c().await;
             }))
         }
-        Command::Fingerprint => {
+        Some(Command::Fingerprint) => {
             std::fs::create_dir_all(&data_dir)?;
             let identity = server::load_identity(&data_dir)?;
             println!("{}", pjdesk_proto::tls::format_fingerprint(&identity.fingerprint()));
             Ok(())
         }
-        Command::Account(cmd) => account_command(cmd, &data_dir),
-        Command::Service(cmd) => service_command(cmd, cli.opts, data_dir),
+        Some(Command::Account(cmd)) => account_command(cmd, &data_dir),
+        Some(Command::Service(cmd)) => service_command(cmd, cli.opts, data_dir),
     }
 }
+
+/// Shows a fatal error: a message box on Windows (no console), stderr elsewhere.
+fn fatal(message: &str) -> ! {
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::HSTRING;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        MessageBoxW(None, &HSTRING::from(message), &HSTRING::from("PJDesk Server"), MB_OK | MB_ICONERROR);
+    }
+    eprintln!("{message}");
+    std::process::exit(1);
+}
+
+/// Attaches to the parent console, or allocates one, so a windowed build still
+/// works as a CLI.
+#[cfg(windows)]
+fn ensure_console() {
+    unsafe {
+        use windows::Win32::System::Console::{AllocConsole, AttachConsole, GetConsoleWindow, ATTACH_PARENT_PROCESS};
+        if GetConsoleWindow().0.is_null() {
+            if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+                let _ = AllocConsole();
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn ensure_console() {}
 
 fn account_command(cmd: AccountCommand, data_dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(data_dir)?;

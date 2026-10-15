@@ -68,6 +68,24 @@ impl Registry {
         self.data.devices.len()
     }
 
+    /// Rows for the management window: (id, hostname, last-seen unix seconds),
+    /// most recently seen first.
+    pub fn list(&self) -> Vec<(String, String, u64)> {
+        let mut rows: Vec<_> =
+            self.data.devices.iter().map(|(id, d)| (id.clone(), d.hostname.clone(), d.last_seen)).collect();
+        rows.sort_by(|a, b| b.2.cmp(&a.2));
+        rows
+    }
+
+    /// Forgets a device (the GUI's "remove"). The device can re-register and
+    /// will get a new ID.
+    pub fn remove(&mut self, id: &str) -> Result<()> {
+        if self.data.devices.remove(id).is_some() {
+            self.save()?;
+        }
+        Ok(())
+    }
+
     /// Registers a device. Returns its (possibly newly assigned) ID.
     ///
     /// * Known ID + matching secret → same ID.

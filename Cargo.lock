@@ -2460,8 +2460,10 @@ name = "pjdesk-server"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "arboard",
  "argon2",
  "clap",
+ "eframe",
  "hex",
  "pjdesk-proto",
  "rpassword",
@@ -2472,6 +2474,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "windows",
  "windows-service",
 ]
 
