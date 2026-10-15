@@ -103,6 +103,8 @@ fn run_service(opts: ServerOpts, data_dir: PathBuf) -> Result<()> {
 /// `server-cert.pem` "Access is denied" that stopped the server from starting).
 /// Every step is best-effort — the server must still come up if it fails.
 pub(crate) fn protect_data_dir(dir: &Path) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let _ = std::fs::create_dir_all(dir);
     // Take ownership of the folder and everything under it, so the grant below
     // can rewrite DACLs on any file a stricter earlier ACL orphaned.
@@ -110,6 +112,7 @@ pub(crate) fn protect_data_dir(dir: &Path) {
         .arg("/f")
         .arg(dir)
         .args(["/r", "/d", "y"])
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
@@ -118,6 +121,7 @@ pub(crate) fn protect_data_dir(dir: &Path) {
     let status = std::process::Command::new("icacls")
         .arg(dir)
         .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/C", "/Q"])
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

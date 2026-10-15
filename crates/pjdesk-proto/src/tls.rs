@@ -91,8 +91,8 @@ impl TlsIdentity {
         Self::create(cert_path, key_path, name)
     }
 
-    /// Reads an existing identity from its PEM files.
-    fn load(cert_path: &Path, key_path: &Path) -> Result<Self> {
+    /// Reads an existing identity from its PEM files (never creates one).
+    pub fn load(cert_path: &Path, key_path: &Path) -> Result<Self> {
         let cert =
             CertificateDer::from_pem_file(cert_path).with_context(|| format!("reading {}", cert_path.display()))?;
         let key =

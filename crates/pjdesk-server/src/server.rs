@@ -147,6 +147,12 @@ pub fn load_identity(data_dir: &Path) -> Result<TlsIdentity> {
     TlsIdentity::load_or_create(&data_dir.join("server-cert.pem"), &data_dir.join("server-key.pem"), SIGNAL_SERVER_NAME)
 }
 
+/// Reads the identity for display only — never creates or regenerates it, so
+/// the management window can show the fingerprint without rotating the key.
+pub fn read_identity(data_dir: &Path) -> Option<TlsIdentity> {
+    TlsIdentity::load(&data_dir.join("server-cert.pem"), &data_dir.join("server-key.pem")).ok()
+}
+
 /// Runs the server until `shutdown` completes.
 pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Output = ()>) -> Result<()> {
     std::fs::create_dir_all(&data_dir).with_context(|| format!("creating data folder {}", data_dir.display()))?;
