@@ -63,6 +63,18 @@ enum Cmd {
     Login(LoginArgs),
     /// Sign out and forget the saved login.
     Logout,
+    /// Check for a newer PJDesk and install it (the daily task runs this).
+    Update {
+        /// Only report whether an update is available; don't install.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Internal: turn the daily auto-update task on or off.
+    #[command(name = "update-task", hide = true)]
+    UpdateTask {
+        #[arg(long)]
+        disable: bool,
+    },
     /// Run the text-mode host/controller in this console (no window).
     #[command(hide = true)]
     Console,
@@ -276,6 +288,8 @@ fn run(cli: Cli) -> Result<()> {
         }
         Some(Cmd::Login(args)) => login_command(&mut config, args, cli.server),
         Some(Cmd::Logout) => logout_command(&mut config, cli.server),
+        Some(Cmd::Update { check }) => update_command(check),
+        Some(Cmd::UpdateTask { disable }) => service::set_update_task(!disable),
         Some(Cmd::Console) => interactive(config, cli.server),
         Some(Cmd::Service(cmd)) => service_command(cmd),
         Some(Cmd::SessionHost { .. }) | Some(Cmd::Service(ServiceCommand::Run)) | None => {
@@ -355,6 +369,16 @@ fn login_command(config: &mut Config, args: LoginArgs, server_flag: Option<Strin
         if info.is_admin { " (administrator)" } else { "" },
         info.address_book.len()
     );
+    Ok(())
+}
+
+fn update_command(check: bool) -> Result<()> {
+    use pjdesk_proto::update::Outcome;
+    match pjdesk_proto::update::perform(pjdesk_proto::UPDATE_REPO, env!("CARGO_PKG_VERSION"), "PJDesk-Setup", check)? {
+        Outcome::UpToDate(v) => println!("PJDesk {v} is up to date."),
+        Outcome::Found(v) => println!("PJDesk {v} is available (run `pjdesk update` to install it)."),
+        Outcome::Installing(v) => println!("Installing PJDesk {v}..."),
+    }
     Ok(())
 }
 

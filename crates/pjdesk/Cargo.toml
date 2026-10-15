@@ -51,6 +51,7 @@ features = [
     "Win32_System_Environment",
     "Win32_System_RemoteDesktop",
     "Win32_System_StationsAndDesktops",
+    "Win32_Storage_FileSystem",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",

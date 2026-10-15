@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 pub const SERVICE_NAME: &str = "PJDesk";
 #[cfg(windows)]
@@ -437,6 +437,72 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
         ServiceStatus::now(shared.id(), shared.is_online(), shared.connected_peer()).write();
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+/// Name of the daily auto-update scheduled task (matches the installer).
+pub const UPDATE_TASK: &str = "PJDesk Update";
+
+/// Whether the daily auto-update task is registered.
+#[cfg(windows)]
+pub fn update_task_enabled() -> bool {
+    std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", UPDATE_TASK])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Creates or removes the daily auto-update task (needs Administrator rights).
+#[cfg(windows)]
+pub fn set_update_task(enable: bool) -> Result<()> {
+    if !enable {
+        let _ = std::process::Command::new("schtasks").args(["/Delete", "/TN", UPDATE_TASK, "/F"]).status();
+        println!("Automatic updates turned off.");
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    // A short (8.3) path has no spaces, so the task's /TR needs no inner quotes.
+    let tr = format!("{} update", short_path(&exe).unwrap_or_else(|| exe.display().to_string()));
+    let status = std::process::Command::new("schtasks")
+        .args(["/Create", "/TN", UPDATE_TASK, "/TR", &tr, "/SC", "DAILY", "/ST", "03:00", "/RU", "SYSTEM", "/RL",
+            "HIGHEST", "/F"])
+        .status()
+        .context("running schtasks")?;
+    if !status.success() {
+        anyhow::bail!("schtasks could not create the update task (run as Administrator)");
+    }
+    println!("Automatic updates turned on (daily).");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn short_path(path: &std::path::Path) -> Option<String> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+    let wide = HSTRING::from(path.as_os_str());
+    unsafe {
+        let len = GetShortPathNameW(PCWSTR(wide.as_ptr()), None);
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; len as usize];
+        let written = GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf));
+        if written == 0 || written as usize >= buf.len() + 1 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..written as usize]))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn update_task_enabled() -> bool {
+    false
+}
+#[cfg(not(windows))]
+pub fn set_update_task(_enable: bool) -> Result<()> {
+    anyhow::bail!("scheduled updates are only available on Windows")
 }
 
 /// Logs to a file in the service folder (the service has no console).

@@ -57,6 +57,12 @@ enum Command {
     Run,
     /// Print the server key fingerprint, so clients can pin it.
     Fingerprint,
+    /// Check for a newer PJDesk Server and install it (the daily task runs this).
+    Update {
+        /// Only report whether an update is available; don't install.
+        #[arg(long)]
+        check: bool,
+    },
     /// Manage user accounts (sign-in for the address book and saved logins).
     #[command(subcommand)]
     Account(AccountCommand),
@@ -149,6 +155,20 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&data_dir)?;
             let identity = server::load_identity(&data_dir)?;
             println!("{}", pjdesk_proto::tls::format_fingerprint(&identity.fingerprint()));
+            Ok(())
+        }
+        Some(Command::Update { check }) => {
+            use pjdesk_proto::update::Outcome;
+            match pjdesk_proto::update::perform(
+                pjdesk_proto::UPDATE_REPO,
+                env!("CARGO_PKG_VERSION"),
+                "PJDesk-Server-Setup",
+                check,
+            )? {
+                Outcome::UpToDate(v) => println!("PJDesk Server {v} is up to date."),
+                Outcome::Found(v) => println!("PJDesk Server {v} is available."),
+                Outcome::Installing(v) => println!("Installing PJDesk Server {v}..."),
+            }
             Ok(())
         }
         Some(Command::Account(cmd)) => account_command(cmd, &data_dir),

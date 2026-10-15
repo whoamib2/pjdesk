@@ -20,6 +20,10 @@ pub mod peer;
 pub mod signal;
 pub mod tls;
 pub mod udp;
+pub mod update;
+
+/// GitHub repo PJDesk updates itself from.
+pub const UPDATE_REPO: &str = "whoamib2/pjdesk";
 
 /// Bumped whenever a wire-incompatible change is made.
 pub const PROTOCOL_VERSION: u16 = 2;

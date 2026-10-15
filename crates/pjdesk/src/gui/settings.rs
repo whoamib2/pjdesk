@@ -28,6 +28,7 @@ pub struct SettingsDraft {
     max_width: u32,
     force_gdi: bool,
     service_password: String,
+    auto_update: bool,
 }
 
 impl SettingsDraft {
@@ -45,6 +46,7 @@ impl SettingsDraft {
             max_width: s.max_width,
             force_gdi: s.force_gdi,
             service_password: String::new(),
+            auto_update: crate::service::update_task_enabled(),
         }
     }
 }
@@ -160,6 +162,12 @@ impl App {
             }
         }
 
+        // Apply the auto-update toggle (needs elevation to touch the task).
+        if d.auto_update != crate::service::update_task_enabled() {
+            let args: &[&str] = if d.auto_update { &["update-task"] } else { &["update-task", "--disable"] };
+            crate::platform::run_elevated(args);
+        }
+
         self.save_cfg();
 
         if server_changed || quality_changed {
@@ -173,6 +181,15 @@ fn general_tab(d: &mut SettingsDraft, ui: &mut egui::Ui) {
     super::widgets::heading(ui, "STARTUP");
     ui.checkbox(&mut d.start_with_windows, "Start PJDesk when I sign in to Windows");
     ui.label(RichText::new("For always-on access (even at the login screen), install the background service — see the Security tab.").color(theme::MUTED).size(12.0));
+
+    ui.add_space(12.0);
+    super::widgets::heading(ui, "UPDATES");
+    ui.checkbox(&mut d.auto_update, "Install updates automatically (checks daily)");
+    ui.label(
+        RichText::new("Downloads new versions from the project's GitHub releases, verifies them and installs silently. Changing this asks for Administrator rights.")
+            .color(theme::MUTED)
+            .size(12.0),
+    );
 }
 
 fn security_tab(d: &mut SettingsDraft, ui: &mut egui::Ui) {

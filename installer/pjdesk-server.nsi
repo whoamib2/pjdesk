@@ -38,6 +38,12 @@ SetCompressor /SOLID lzma
 
 Section "PJDesk Server (required)" SecCore
   SectionIn RO
+
+  ; Upgrade in place: stop the service and close the window so files unlock.
+  nsExec::Exec 'net stop PJDeskServer'
+  nsExec::Exec 'taskkill /F /IM ${EXE}'
+  Sleep 800
+
   SetOutPath "$INSTDIR"
   File "${EXE}"
   File "README.md"
@@ -45,6 +51,12 @@ Section "PJDesk Server (required)" SecCore
 
   WriteRegStr HKLM "Software\PJDeskServer" "InstallDir" "$INSTDIR"
   WriteUninstaller "$INSTDIR\uninstall.exe"
+
+  ; Daily auto-update check, as SYSTEM (short path avoids quoting the spaces).
+  GetFullPathName /SHORT $0 "$INSTDIR\${EXE}"
+  nsExec::Exec 'schtasks /Create /TN "PJDesk Server Update" /TR "$0 update" /SC DAILY /ST 03:30 /RU SYSTEM /RL HIGHEST /F'
+  ; Restart the service if it was already installed.
+  nsExec::Exec 'net start PJDeskServer'
 
   CreateDirectory "$SMPROGRAMS\${APPNAME}"
   CreateShortcut "$SMPROGRAMS\${APPNAME}\PJDesk Server.lnk" "$INSTDIR\${EXE}"
@@ -73,6 +85,7 @@ SectionEnd
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Section "Uninstall"
+  nsExec::Exec 'schtasks /Delete /TN "PJDesk Server Update" /F'
   ExecWait '"$INSTDIR\${EXE}" service uninstall'
 
   Delete "$INSTDIR\${EXE}"
