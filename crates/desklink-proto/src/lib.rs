@@ -22,7 +22,7 @@ pub mod tls;
 pub mod udp;
 
 /// Bumped whenever a wire-incompatible change is made.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Default port of the server, used for TCP (signaling) and UDP (rendezvous/relay).
 pub const DEFAULT_PORT: u16 = 21200;

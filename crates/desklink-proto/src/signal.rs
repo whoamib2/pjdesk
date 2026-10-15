@@ -38,8 +38,54 @@ pub enum ClientMsg {
     /// LAN candidate addresses. Hosts also send their QUIC certificate
     /// fingerprint so the controller can pin it.
     UdpReady { session_id: SessionId, local_addrs: Vec<SocketAddr>, cert_fingerprint: Option<[u8; 32]> },
+    /// Sign in to an account on the server, with a password or a saved token
+    /// (see [`Credential`]). The reply is [`ServerMsg::LoginResult`].
+    Login { proto: u16, username: String, credential: Credential, device_name: String },
+    /// Invalidate the saved token in [`Credential::Token`] (sign out everywhere
+    /// is a server setting; this just drops the current one).
+    Logout { token: String },
+    /// Fetch the signed-in account's address book ([`ServerMsg::AddressBook`]).
+    GetAddressBook { token: String },
+    /// Replace the signed-in account's address book.
+    SaveAddressBook { token: String, entries: Vec<AddressEntry> },
     /// Keep-alive.
     Ping,
+}
+
+/// How a client proves who it is when signing in.
+#[derive(Clone, Serialize, Deserialize)]
+pub enum Credential {
+    /// A password typed by the user (checked against the server's Argon2 hash).
+    Password(String),
+    /// A token issued by an earlier successful login and saved by the client.
+    Token(String),
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the secret.
+        match self {
+            Credential::Password(_) => f.write_str("Password(***)"),
+            Credential::Token(_) => f.write_str("Token(***)"),
+        }
+    }
+}
+
+/// One saved computer in an account's address book.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AddressEntry {
+    /// The remote device's nine-digit DeskLink ID.
+    pub id: String,
+    /// A friendly name the user gave it (may be empty).
+    #[serde(default)]
+    pub alias: String,
+    /// Free-form tags for grouping (may be empty).
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// The host's access password, if the user asked to remember it. Stored in
+    /// the user's own account on their own server; encrypted at rest on disk.
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 /// Messages sent by the server to clients.
@@ -67,6 +113,11 @@ pub enum ServerMsg {
         /// SHA-256 of the host's QUIC certificate (sent to controllers only).
         cert_fingerprint: Option<[u8; 32]>,
     },
+    /// Reply to [`ClientMsg::Login`]. On success, `token` can be saved and used
+    /// in a later [`Credential::Token`] so the user needn't retype the password.
+    LoginResult { ok: bool, token: String, display_name: String, is_admin: bool, message: String },
+    /// Reply to [`ClientMsg::GetAddressBook`].
+    AddressBook { entries: Vec<AddressEntry> },
     /// Something went wrong.
     Error { code: ErrorCode, message: String },
     /// Keep-alive reply.
@@ -83,5 +134,7 @@ pub enum ErrorCode {
     HostOffline,
     HostBusy,
     RateLimited,
+    /// Login failed, or an account-only request arrived without a valid token.
+    Unauthorized,
     Internal,
 }

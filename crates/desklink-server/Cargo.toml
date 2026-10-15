@@ -18,6 +18,10 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Password hashing for server accounts.
+argon2 = "0.5"
+# Console password prompt for `account add`.
+rpassword = "7"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

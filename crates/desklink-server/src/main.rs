@@ -11,6 +11,7 @@
 //! Runs in a console (`desklink-server`) or as a Windows service
 //! (`desklink-server service install`).
 
+mod accounts;
 mod registry;
 mod relay;
 mod server;
@@ -53,9 +54,36 @@ enum Command {
     Run,
     /// Print the server key fingerprint, so clients can pin it.
     Fingerprint,
+    /// Manage user accounts (sign-in for the address book and saved logins).
+    #[command(subcommand)]
+    Account(AccountCommand),
     /// Install, remove, start or stop the Windows service.
     #[command(subcommand)]
     Service(ServiceCommand),
+}
+
+#[derive(Subcommand)]
+enum AccountCommand {
+    /// Add an account, or change its password (prompts if --password is omitted).
+    Add {
+        username: String,
+        #[arg(long)]
+        password: Option<String>,
+        /// Grant administrator rights.
+        #[arg(long)]
+        admin: bool,
+    },
+    /// List accounts.
+    List,
+    /// Remove an account and its address book.
+    Remove { username: String },
+    /// Enable or disable an account without deleting it.
+    Disable {
+        username: String,
+        /// Re-enable instead of disabling.
+        #[arg(long)]
+        undo: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -95,8 +123,55 @@ fn main() -> Result<()> {
             println!("{}", desklink_proto::tls::format_fingerprint(&identity.fingerprint()));
             Ok(())
         }
+        Command::Account(cmd) => account_command(cmd, &data_dir),
         Command::Service(cmd) => service_command(cmd, cli.opts, data_dir),
     }
+}
+
+fn account_command(cmd: AccountCommand, data_dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let mut accounts = accounts::Accounts::load(data_dir)?;
+    match cmd {
+        AccountCommand::Add { username, password, admin } => {
+            let password = match password {
+                Some(p) => p,
+                None => {
+                    let p = rpassword::prompt_password(format!("New password for \"{username}\": "))?;
+                    let again = rpassword::prompt_password("Repeat password: ")?;
+                    if p != again {
+                        anyhow::bail!("passwords did not match");
+                    }
+                    p
+                }
+            };
+            let existed = accounts.list().iter().any(|a| a.username == accounts::normalize_username(&username));
+            accounts.create(&username, &password, admin, true)?;
+            println!("{} account \"{}\"{}.", if existed { "Updated" } else { "Created" }, accounts::normalize_username(&username), if admin { " (administrator)" } else { "" });
+        }
+        AccountCommand::List => {
+            let list = accounts.list();
+            if list.is_empty() {
+                println!("No accounts yet. Add one with: desklink-server account add <username>");
+            }
+            for a in list {
+                println!(
+                    "{:20} {}{}",
+                    a.username,
+                    if a.is_admin { "admin" } else { "user " },
+                    if a.disabled { "  (disabled)" } else { "" }
+                );
+            }
+        }
+        AccountCommand::Remove { username } => {
+            accounts.delete(&username)?;
+            println!("Removed \"{}\".", accounts::normalize_username(&username));
+        }
+        AccountCommand::Disable { username, undo } => {
+            accounts.set_disabled(&username, !undo)?;
+            println!("{} \"{}\".", if undo { "Enabled" } else { "Disabled" }, accounts::normalize_username(&username));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

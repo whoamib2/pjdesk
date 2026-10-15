@@ -10,10 +10,12 @@
 //! Double-clicking `desklink.exe` does both: it hosts in the background and
 //! lets you type a partner ID to control another machine.
 
+mod account;
 mod color;
 mod config;
 mod host;
 mod p2p;
+mod secure;
 mod session;
 mod signaling;
 mod udp_fallback;
@@ -52,6 +54,19 @@ enum Cmd {
     Connect(ConnectArgs),
     /// Show or change saved settings.
     Config(ConfigArgs),
+    /// Sign in to your DeskLink server account (saves your login).
+    Login(LoginArgs),
+    /// Sign out and forget the saved login.
+    Logout,
+}
+
+#[derive(Args, Clone, Debug)]
+struct LoginArgs {
+    /// Account username (asked interactively if omitted).
+    username: Option<String>,
+    /// Account password (asked interactively if omitted).
+    #[arg(long, env = "DESKLINK_ACCOUNT_PASSWORD", hide_env_values = true)]
+    password: Option<String>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -160,8 +175,49 @@ fn run(cli: Cli) -> Result<()> {
             let server = resolve_server(&mut config, cli.server, false)?;
             viewer::run(server, config, args)
         }
+        Some(Cmd::Login(args)) => login_command(&mut config, args, cli.server),
+        Some(Cmd::Logout) => logout_command(&mut config, cli.server),
         None => interactive(config, cli.server),
     }
+}
+
+fn login_command(config: &mut Config, args: LoginArgs, server_flag: Option<String>) -> Result<()> {
+    let server = resolve_server(config, server_flag, true)?;
+    let username = match args.username {
+        Some(u) => u,
+        None => {
+            print!("Username: ");
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            line.trim().to_string()
+        }
+    };
+    let password = match args.password {
+        Some(p) => p,
+        None => rpassword::prompt_password(format!("Password for {username}: "))?,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let info = runtime.block_on(crate::account::login(&server, config, &username, &password))?;
+    println!(
+        "Signed in as {}{}. Address book: {} saved computer(s).",
+        if info.display_name.is_empty() { username.as_str() } else { info.display_name.as_str() },
+        if info.is_admin { " (administrator)" } else { "" },
+        info.address_book.len()
+    );
+    Ok(())
+}
+
+fn logout_command(config: &mut Config, server_flag: Option<String>) -> Result<()> {
+    if config.account.is_none() {
+        println!("Not signed in.");
+        return Ok(());
+    }
+    let server = resolve_server(config, server_flag, false)?;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    runtime.block_on(crate::account::logout(&server, config))?;
+    println!("Signed out.");
+    Ok(())
 }
 
 /// Works out which server to use, prompting on first run if allowed.

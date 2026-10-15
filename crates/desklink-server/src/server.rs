@@ -32,6 +32,7 @@ static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// Everything the server knows, behind one mutex (it is only held briefly).
 pub struct State {
     pub registry: Registry,
+    pub accounts: crate::accounts::Accounts,
     pub online: HashMap<String, OnlineHost>,
     pub sessions: HashMap<SessionId, Session>,
     pub limiter: RateLimiter,
@@ -150,6 +151,8 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     let identity = load_identity(&data_dir)?;
     let registry = Registry::load(data_dir.join("devices.json"))?;
     let device_count = registry.len();
+    let accounts = crate::accounts::Accounts::load(&data_dir)?;
+    let account_count = accounts.list().len();
 
     let tcp = TcpListener::bind((opts.bind, opts.port))
         .await
@@ -163,11 +166,13 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     info!("  Rendezvous/relay (UDP)   : {}:{}", opts.bind, opts.port);
     info!("  Data folder              : {}", data_dir.display());
     info!("  Registered devices       : {device_count}");
+    info!("  User accounts            : {account_count}");
     info!("  Server key fingerprint   : {}", tls::format_fingerprint(&identity.fingerprint()));
     info!("Clients trust this key on first connect; compare it with what they print.");
 
     let state: Shared = Arc::new(Mutex::new(State {
         registry,
+        accounts,
         online: HashMap::new(),
         sessions: HashMap::new(),
         limiter: RateLimiter::default(),
@@ -400,6 +405,66 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             }
             session.maybe_send_peer_info(session_id);
         }
+
+        ClientMsg::Login { proto, username, credential, device_name } => {
+            if proto != PROTOCOL_VERSION {
+                conn.error(
+                    ErrorCode::VersionMismatch,
+                    format!("server speaks protocol {PROTOCOL_VERSION}, client {proto}"),
+                );
+                return;
+            }
+            // Throttle password guessing per IP.
+            if !st.limiter.allow(conn.addr.ip(), "login", 15) {
+                conn.error(ErrorCode::RateLimited, "too many sign-in attempts, wait a minute");
+                return;
+            }
+            let device_name: String = device_name.chars().take(64).collect();
+            let result = match &credential {
+                desklink_proto::signal::Credential::Password(pw) => {
+                    st.accounts.login_password(&username, pw, &device_name)
+                }
+                desklink_proto::signal::Credential::Token(token) => st.accounts.login_token(&username, token),
+            };
+            match result {
+                Ok(session) => {
+                    info!("Account \"{}\" signed in from {} ({device_name})", session.username, conn.addr.ip());
+                    conn.send(ServerMsg::LoginResult {
+                        ok: true,
+                        token: session.token,
+                        display_name: session.display_name,
+                        is_admin: session.is_admin,
+                        message: String::new(),
+                    });
+                }
+                Err(e) => {
+                    conn.send(ServerMsg::LoginResult {
+                        ok: false,
+                        token: String::new(),
+                        display_name: String::new(),
+                        is_admin: false,
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        ClientMsg::Logout { token } => st.accounts.logout(&token),
+
+        ClientMsg::GetAddressBook { token } => match st.accounts.user_for_token(&token) {
+            Some(user) => conn.send(ServerMsg::AddressBook { entries: st.accounts.address_book(&user) }),
+            None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
+        },
+
+        ClientMsg::SaveAddressBook { token, entries } => match st.accounts.user_for_token(&token) {
+            Some(user) => {
+                let entries: Vec<_> = entries.into_iter().take(2000).collect();
+                if let Err(e) = st.accounts.save_address_book(&user, &entries) {
+                    conn.error(ErrorCode::Internal, format!("could not save the address book: {e}"));
+                }
+            }
+            None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
+        },
     }
 }
 
