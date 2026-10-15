@@ -41,6 +41,10 @@ impl App {
 
     /// Left panel: share this computer.
     pub(super) fn host_panel(&mut self, ui: &mut egui::Ui) {
+        if self.engine.service_running {
+            self.service_host_panel(ui);
+            return;
+        }
         theme::card(ui, |ui| {
             widgets::heading(ui, "SHARE THIS COMPUTER");
             ui.add_space(4.0);
@@ -99,6 +103,43 @@ impl App {
             ui.add_space(10.0);
             ui.label(
                 RichText::new("Give your ID and password to someone to let them control this computer.")
+                    .color(theme::MUTED)
+                    .size(12.0),
+            );
+        });
+    }
+
+    /// Left panel when the background service is doing the hosting.
+    fn service_host_panel(&mut self, ui: &mut egui::Ui) {
+        let status = crate::syspaths::ServiceStatus::load().unwrap_or_default();
+        let fresh = status.is_fresh();
+        theme::card(ui, |ui| {
+            widgets::heading(ui, "SHARE THIS COMPUTER");
+            ui.add_space(4.0);
+
+            if let Some(peer) = status.connected.filter(|_| fresh) {
+                widgets::status_dot(ui, theme::ACCENT, &format!("Connected: {peer} is controlling this computer"));
+            } else if fresh && status.online {
+                widgets::status_dot(ui, theme::OK, "Ready — shared by the background service");
+            } else {
+                widgets::status_dot(ui, theme::MUTED, "Background service is starting…");
+            }
+
+            ui.add_space(12.0);
+            ui.label(RichText::new("Your ID").color(theme::MUTED).size(12.0));
+            ui.horizontal(|ui| {
+                let shown = status.id.as_deref().map(format_id).unwrap_or_else(|| "— — —".into());
+                ui.label(RichText::new(shown).size(26.0).strong().monospace().color(Color32::WHITE));
+                if let Some(id) = &status.id {
+                    if ui.button("⧉").on_hover_text("Copy ID").clicked() && widgets::copy_to_clipboard(id) {
+                        self.toast.show("ID copied");
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("This computer is shared by the PJDesk background service, so it's reachable even at the sign-in screen. Its password was set when the service was installed (Settings ▸ Security to change it).")
                     .color(theme::MUTED)
                     .size(12.0),
             );

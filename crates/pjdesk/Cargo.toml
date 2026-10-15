@@ -40,9 +40,14 @@ arboard = { version = "3", default-features = false }
 version = "0.62"
 features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_System_Console",
     "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Environment",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
@@ -53,4 +58,8 @@ features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
 ]
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"

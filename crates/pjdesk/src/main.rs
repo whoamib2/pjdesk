@@ -17,9 +17,12 @@ mod config;
 mod gui;
 mod host;
 mod p2p;
+mod platform;
 mod secure;
+mod service;
 mod session;
 mod signaling;
+mod syspaths;
 mod udp_fallback;
 mod viewer;
 
@@ -63,6 +66,44 @@ enum Cmd {
     /// Run the text-mode host/controller in this console (no window).
     #[command(hide = true)]
     Console,
+    /// Manage the background service (reach this computer at the sign-in screen).
+    #[command(subcommand)]
+    Service(ServiceCommand),
+    /// Internal: the hosting helper the service launches into a user session.
+    #[command(name = "__session-host", hide = true)]
+    SessionHost,
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install and start the background service (run from an Administrator prompt).
+    Install {
+        /// Server address to use (defaults to your current server).
+        #[arg(long)]
+        server: Option<String>,
+        /// Unattended password (a random one is generated and shown if omitted).
+        #[arg(long)]
+        password: Option<String>,
+        /// Also add a Windows Firewall rule.
+        #[arg(long)]
+        firewall: bool,
+    },
+    /// Stop and remove the background service.
+    Uninstall,
+    /// Start the installed service.
+    Start,
+    /// Stop the running service.
+    Stop,
+    /// Change the service's server or unattended password.
+    Configure {
+        #[arg(long)]
+        server: Option<String>,
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Entry point used by the Windows Service Control Manager.
+    #[command(hide = true)]
+    Run,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -101,6 +142,10 @@ pub struct HostArgs {
     /// Let controllers watch but not control.
     #[arg(long)]
     pub view_only: bool,
+    /// Follow the active input desktop (service helper only), so capture sees
+    /// UAC prompts and the sign-in screen. Not a user-facing flag.
+    #[arg(skip)]
+    pub follow_desktop: bool,
 }
 
 impl Default for HostArgs {
@@ -114,6 +159,7 @@ impl Default for HostArgs {
             gdi: false,
             test_pattern: false,
             view_only: false,
+            follow_desktop: false,
         }
     }
 }
@@ -131,6 +177,7 @@ impl HostArgs {
             gdi: settings.force_gdi,
             test_pattern: false,
             view_only: settings.view_only,
+            follow_desktop: false,
         }
     }
 }
@@ -171,28 +218,43 @@ struct ConfigArgs {
 }
 
 fn main() {
-    // With no arguments (double-click) we open the GUI and need no console.
-    // With any argument we make sure a console is attached so output and clap
-    // errors are visible, whether launched from a terminal or a shortcut.
-    let has_args = std::env::args_os().len() > 1;
-    if has_args {
+    // The service and its helper run with no console and set up their own
+    // (file) logging, so route them before touching the console.
+    let raw: Vec<String> = std::env::args().collect();
+    let is_background = raw.iter().any(|a| a == "__session-host")
+        || (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"));
+
+    // With any other argument, attach a console so output and clap errors show.
+    if raw.len() > 1 && !is_background {
         ensure_console();
     }
     let cli = Cli::parse();
 
-    if cli.command.is_none() {
-        // Default: the graphical app.
-        init_gui_logging();
-        if let Err(e) = gui::run(cli.server) {
-            fatal(&format!("PJDesk could not start: {e:#}"));
+    match &cli.command {
+        None => {
+            // Default: the graphical app.
+            init_gui_logging();
+            if let Err(e) = gui::run(cli.server.clone()) {
+                fatal(&format!("PJDesk could not start: {e:#}"));
+            }
         }
-        return;
-    }
-
-    init_logging();
-    if let Err(e) = run(cli) {
-        eprintln!("\nError: {e:#}");
-        std::process::exit(1);
+        Some(Cmd::SessionHost) => {
+            if let Err(e) = service::session_host() {
+                tracing::error!("session host: {e:#}");
+            }
+        }
+        Some(Cmd::Service(ServiceCommand::Run)) => {
+            if let Err(e) = service::run_dispatcher() {
+                tracing::error!("service dispatcher: {e:#}");
+            }
+        }
+        Some(_) => {
+            init_logging();
+            if let Err(e) = run(cli) {
+                eprintln!("\nError: {e:#}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -211,7 +273,25 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Login(args)) => login_command(&mut config, args, cli.server),
         Some(Cmd::Logout) => logout_command(&mut config, cli.server),
         Some(Cmd::Console) => interactive(config, cli.server),
-        None => unreachable!("handled in main"),
+        Some(Cmd::Service(cmd)) => service_command(cmd),
+        Some(Cmd::SessionHost) | Some(Cmd::Service(ServiceCommand::Run)) | None => unreachable!("handled in main"),
+    }
+}
+
+fn service_command(cmd: ServiceCommand) -> Result<()> {
+    match cmd {
+        ServiceCommand::Install { server, password, firewall } => {
+            service::install(server.as_deref(), password.as_deref(), firewall)
+        }
+        ServiceCommand::Uninstall => service::uninstall(),
+        ServiceCommand::Start => service::start(),
+        ServiceCommand::Stop => service::stop(),
+        ServiceCommand::Configure { server, password } => {
+            let pw = service::write_service_config(server.as_deref(), password.as_deref())?;
+            println!("Service settings updated. Unattended password: {pw}");
+            Ok(())
+        }
+        ServiceCommand::Run => service::run_dispatcher(),
     }
 }
 

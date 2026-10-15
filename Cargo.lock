@@ -2432,6 +2432,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows",
+ "windows-service",
  "winit",
 ]
 

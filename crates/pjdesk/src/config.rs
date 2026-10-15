@@ -147,8 +147,12 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
-        let path = Self::path();
-        match std::fs::read(&path) {
+        Self::load_from(&Self::path())
+    }
+
+    /// Loads a config from a specific file (missing file → defaults).
+    pub fn load_from(path: &std::path::Path) -> Result<Self> {
+        match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
@@ -156,13 +160,17 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::path();
+        self.save_to(&Self::path())
+    }
+
+    /// Writes this config to a specific file (atomically).
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 

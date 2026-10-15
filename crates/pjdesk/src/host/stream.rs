@@ -178,6 +178,13 @@ fn scale_factor(width: usize, height: usize, max_width: usize) -> usize {
 /// Capture → convert → encode loop (runs on its own thread).
 fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedFrame>) -> Result<()> {
     let _awake = KeepAwake::new();
+    // Service helper: attach this capture thread to the input desktop so it can
+    // see UAC prompts, the lock screen and the sign-in screen.
+    let mut desktop = String::new();
+    if args.follow_desktop {
+        crate::platform::attach_thread_to_input_desktop();
+        desktop = crate::platform::input_desktop_name().unwrap_or_default();
+    }
     let mut capturer = capture::open(args)?;
     info!("Capturing {} with {}", describe(capturer.display_rect()), capturer.name());
     *shared.display.lock().unwrap() = capturer.display_rect();
@@ -196,6 +203,21 @@ fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedF
     let mut next_dxgi_retry = Instant::now() + Duration::from_secs(10);
 
     while !shared.flow.stopped() {
+        // Follow desktop switches (UAC / lock / sign-in screen): re-attach this
+        // thread and rebuild capture so it grabs the desktop now on screen.
+        if args.follow_desktop {
+            let current = crate::platform::input_desktop_name().unwrap_or_default();
+            if current != desktop {
+                info!("Input desktop changed to \"{current}\"; following it");
+                desktop = current;
+                crate::platform::attach_thread_to_input_desktop();
+                drop(capturer);
+                std::thread::sleep(Duration::from_millis(200));
+                capturer = capture::open(args)?;
+                *shared.display.lock().unwrap() = capturer.display_rect();
+                shared.keyframe_requested.store(true, Ordering::SeqCst);
+            }
+        }
         if capturer.is_fallback() && Instant::now() >= next_dxgi_retry {
             next_dxgi_retry = Instant::now() + Duration::from_secs(10);
             if let Some(better) = capture::try_preferred(args) {

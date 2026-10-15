@@ -27,6 +27,7 @@ pub struct SettingsDraft {
     bitrate_kbps: u32,
     max_width: u32,
     force_gdi: bool,
+    service_password: String,
 }
 
 impl SettingsDraft {
@@ -43,6 +44,7 @@ impl SettingsDraft {
             bitrate_kbps: s.bitrate_kbps,
             max_width: s.max_width,
             force_gdi: s.force_gdi,
+            service_password: String::new(),
         }
     }
 }
@@ -194,13 +196,53 @@ fn security_tab(d: &mut SettingsDraft, ui: &mut egui::Ui) {
     ui.checkbox(&mut d.view_only, "View only by default (don't let them use the mouse and keyboard)");
     ui.add_space(10.0);
     super::widgets::heading(ui, "BACKGROUND SERVICE");
+    let (installed, running) = crate::service::status();
+    if installed {
+        super::widgets::status_dot(
+            ui,
+            if running { theme::OK } else { theme::WARN },
+            if running { "Installed and running" } else { "Installed, not running" },
+        );
+    } else {
+        super::widgets::status_dot(ui, theme::MUTED, "Not installed");
+    }
     ui.label(
         RichText::new(
-            "Installing the service lets you reach this computer before anyone signs in and during UAC prompts. Install it from the PJDesk installer, or run \u{201c}pjdesk service install\u{201d} from an Administrator prompt.",
+            "The service lets you reach this computer before anyone signs in and during UAC prompts. Each button asks for Administrator rights.",
         )
         .color(theme::MUTED)
         .size(12.0),
     );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if !installed {
+            if ui.add(egui::Button::new("Install service").fill(theme::ACCENT)).clicked() {
+                crate::platform::run_elevated(&["service", "install", "--firewall"]);
+            }
+        } else {
+            if ui.button("Uninstall service").clicked() {
+                crate::platform::run_elevated(&["service", "uninstall"]);
+            }
+            if running {
+                if ui.button("Stop").clicked() {
+                    crate::platform::run_elevated(&["service", "stop"]);
+                }
+            } else if ui.button("Start").clicked() {
+                crate::platform::run_elevated(&["service", "start"]);
+            }
+        }
+    });
+    if installed {
+        ui.add_space(6.0);
+        ui.label(RichText::new("Set the service's unattended password").color(theme::MUTED).size(12.0));
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut d.service_password).password(true).desired_width(200.0));
+            if ui.button("Apply").clicked() && !d.service_password.trim().is_empty() {
+                crate::platform::run_elevated(&["service", "configure", "--password", d.service_password.trim()]);
+                d.service_password.clear();
+            }
+        });
+    }
 }
 
 fn network_tab(d: &mut SettingsDraft, ui: &mut egui::Ui) {

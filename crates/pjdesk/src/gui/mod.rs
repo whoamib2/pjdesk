@@ -61,31 +61,53 @@ fn preferred_renderer() -> eframe::Renderer {
 }
 
 /// Supervises the background host thread (the "share this computer" side).
+///
+/// When the background service is running it hosts this computer, so the GUI
+/// stays out of the way (it would otherwise register the same device twice) and
+/// just shows the service's status.
 struct Engine {
     shared: Arc<HostShared>,
     server: Option<ServerAddr>,
+    /// True when the background service is running and doing the hosting.
+    service_running: bool,
 }
 
 impl Engine {
-    /// Starts a host thread if a server is configured; otherwise stays idle.
+    /// Starts a host thread if a server is configured and the service isn't
+    /// already hosting; otherwise stays idle.
     fn start(config: &Config) -> Self {
+        let service_running = crate::service::status().1;
         let shared = Arc::new(HostShared::default());
         let server = config.server.as_deref().and_then(|s| ServerAddr::parse(s).ok());
-        if let Some(server) = &server {
-            spawn_host(server.clone(), config.clone(), shared.clone());
+        if !service_running {
+            if let Some(server) = &server {
+                spawn_host(server.clone(), config.clone(), shared.clone());
+            }
         }
-        Self { shared, server }
+        Self { shared, server, service_running }
     }
 
     /// Restarts hosting with the current config (e.g. after the server or a
     /// quality setting changed).
     fn restart(&mut self, config: &Config) {
         self.shared.request_stop();
+        self.service_running = crate::service::status().1;
         let shared = Arc::new(HostShared::default());
         self.shared = shared.clone();
         self.server = config.server.as_deref().and_then(|s| ServerAddr::parse(s).ok());
-        if let Some(server) = &self.server {
-            spawn_host(server.clone(), config.clone(), shared);
+        if !self.service_running {
+            if let Some(server) = &self.server {
+                spawn_host(server.clone(), config.clone(), shared);
+            }
+        }
+    }
+
+    /// Re-checks whether the service is running; restarts the engine if that
+    /// changed (so the GUI starts or stops its own hosting to match).
+    fn refresh_service(&mut self, config: &Config) {
+        let running = crate::service::status().1;
+        if running != self.service_running {
+            self.restart(config);
         }
     }
 }
@@ -134,6 +156,7 @@ pub struct App {
 
     status: String,
     toast: widgets::Toast,
+    last_service_check: std::time::Instant,
 }
 
 impl App {
@@ -158,6 +181,7 @@ impl App {
             book_target: None,
             status: String::new(),
             toast: widgets::Toast::default(),
+            last_service_check: std::time::Instant::now(),
         };
         // Refresh a saved sign-in in the background.
         if app.cfg.account.is_some() {
@@ -356,6 +380,11 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_login();
+        if self.last_service_check.elapsed() > Duration::from_secs(3) {
+            self.last_service_check = std::time::Instant::now();
+            let cfg = self.cfg.clone();
+            self.engine.refresh_service(&cfg);
+        }
         let ctx = ui.ctx().clone();
         // Keep status (online/connected) fresh.
         ctx.request_repaint_after(Duration::from_millis(400));
