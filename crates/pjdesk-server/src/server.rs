@@ -37,6 +37,8 @@ pub struct State {
     pub sessions: HashMap<SessionId, Session>,
     pub limiter: RateLimiter,
     pub udp_port: u16,
+    /// Data folder, so accounts can be re-read when they change out-of-process.
+    pub data_dir: PathBuf,
 }
 
 pub type Shared = Arc<Mutex<State>>;
@@ -183,6 +185,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         sessions: HashMap::new(),
         limiter: RateLimiter::default(),
         udp_port: opts.port,
+        data_dir: data_dir.clone(),
     }));
     let acceptor = TlsAcceptor::from(Arc::new(tls::server_config(&identity, ALPN_SIGNAL)?));
 
@@ -424,6 +427,15 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             if !st.limiter.allow(conn.addr.ip(), "login", 15) {
                 conn.error(ErrorCode::RateLimited, "too many sign-in attempts, wait a minute");
                 return;
+            }
+            // Pick up accounts added or changed out-of-process (the management
+            // window or the CLI) since startup, so a new sign-in works without
+            // restarting the service.
+            {
+                let dir = st.data_dir.clone();
+                if let Ok(fresh) = crate::accounts::Accounts::load(&dir) {
+                    st.accounts = fresh;
+                }
             }
             let device_name: String = device_name.chars().take(64).collect();
             let result = match &credential {

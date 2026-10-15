@@ -91,10 +91,26 @@ pub fn valid_username(name: &str) -> bool {
 impl Accounts {
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("accounts.json");
-        let data = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => AccountsFile::default(),
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // The file was written by the other identity — the SYSTEM
+                // service vs. the elevated management window — with an ACL this
+                // process can't read. Reclaim access and try once more rather
+                // than failing outright.
+                reclaim_access(&path);
+                match std::fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+                }
+            }
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let data = match bytes {
+            Some(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?,
+            None => AccountsFile::default(),
         };
         Ok(Self { dir: dir.to_path_buf(), path, data })
     }
@@ -255,6 +271,7 @@ impl Accounts {
         let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(entries)?)?;
         std::fs::rename(&tmp, &path)?;
+        grant_shared_access(&path);
         Ok(())
     }
 
@@ -269,9 +286,45 @@ impl Accounts {
         let tmp = self.path.with_extension(format!("json.tmp.{}", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(&self.data)?)?;
         std::fs::rename(&tmp, &self.path)?;
+        grant_shared_access(&self.path);
         Ok(())
     }
 }
+
+/// Windows: reclaim read access to a file the other identity created — the
+/// SYSTEM service vs. the elevated management window — by taking ownership and
+/// granting SYSTEM + Administrators. A no-op elsewhere, and harmless if it
+/// fails: the caller still surfaces the original error if the retry can't read.
+#[cfg(windows)]
+fn reclaim_access(path: &Path) {
+    use std::process::Stdio;
+    let _ = std::process::Command::new("takeown")
+        .arg("/f")
+        .arg(path)
+        .args(["/d", "y"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    grant_shared_access(path);
+}
+#[cfg(not(windows))]
+fn reclaim_access(_path: &Path) {}
+
+/// Windows: grant SYSTEM and Administrators full control of a file we just
+/// wrote, so whichever identity writes it, the other can read it back. A no-op
+/// elsewhere.
+#[cfg(windows)]
+fn grant_shared_access(path: &Path) {
+    use std::process::Stdio;
+    let _ = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/grant", "*S-1-5-18:(F)", "/grant", "*S-1-5-32-544:(F)", "/C", "/Q"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+#[cfg(not(windows))]
+fn grant_shared_access(_path: &Path) {}
 
 fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::encode_b64(&pjdesk_proto::random_bytes::<16>()).map_err(|e| anyhow::anyhow!("{e}"))?;
