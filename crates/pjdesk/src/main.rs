@@ -307,8 +307,12 @@ fn service_command(cmd: ServiceCommand) -> Result<()> {
         ServiceCommand::Start => service::start(),
         ServiceCommand::Stop => service::stop(),
         ServiceCommand::Configure { server, password } => {
-            let pw = service::write_service_config(server.as_deref(), password.as_deref())?;
-            println!("Service settings updated. Unattended password: {pw}");
+            service::write_service_config(server.as_deref(), password.as_deref())?;
+            // Pick up the new config if the service is running.
+            if service::status().1 {
+                service::restart()?;
+            }
+            println!("Service settings updated.");
             Ok(())
         }
         ServiceCommand::Run => service::run_dispatcher(),

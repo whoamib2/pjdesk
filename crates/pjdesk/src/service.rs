@@ -80,7 +80,7 @@ mod imp {
         DuplicateTokenEx, SetTokenInformation, SecurityIdentification, TokenPrimary, TokenSessionId,
         TOKEN_ACCESS_MASK, TOKEN_ALL_ACCESS,
     };
-    use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+    use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess, CREATE_NO_WINDOW,
         CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
@@ -171,6 +171,29 @@ mod imp {
         Ok(())
     }
 
+    /// Stops (waiting for it to settle) and starts the service, so a changed
+    /// config is picked up. A no-op if the service isn't installed.
+    pub fn restart() -> Result<()> {
+        let manager = manager(ServiceManagerAccess::CONNECT)?;
+        let Ok(service) = manager
+            .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START)
+        else {
+            return Ok(());
+        };
+        if service.query_status().map(|s| s.current_state != ServiceState::Stopped).unwrap_or(false) {
+            let _ = service.stop();
+            for _ in 0..50 {
+                if service.query_status().map(|s| s.current_state == ServiceState::Stopped).unwrap_or(true) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        service.start::<&str>(&[])?;
+        println!("Restarted the PJDesk service.");
+        Ok(())
+    }
+
     /// Whether the service exists, and whether it is running right now.
     pub fn status() -> (bool, bool) {
         let Ok(manager) = manager(ServiceManagerAccess::CONNECT) else { return (false, false) };
@@ -236,28 +259,55 @@ mod imp {
 
     /// Keeps a session-host helper running in whichever session is on screen.
     fn supervise(stop_rx: &std::sync::mpsc::Receiver<()>) {
+        use std::time::Instant;
         let mut current_session = u32::MAX;
         let mut child: Option<Child> = None;
+        let mut spawned_at = Instant::now();
+        let mut quick_failures: u32 = 0;
 
         loop {
             if stop_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
                 break;
             }
             let active = unsafe { WTSGetActiveConsoleSessionId() };
+            if active == u32::MAX {
+                continue; // No console session right now (fast user switching, etc.).
+            }
+            let session_changed = active != current_session;
             let child_dead = child.as_ref().map(|c| !c.is_alive()).unwrap_or(true);
+            if !session_changed && !child_dead {
+                continue; // Healthy and on the same session — nothing to do.
+            }
 
-            if active != u32::MAX && (active != current_session || child_dead) {
-                if let Some(mut c) = child.take() {
-                    c.kill();
+            // If the helper keeps dying almost immediately, slow the relaunch
+            // rate (up to ~30 s) so a persistent failure can't spin once a
+            // second, and record the exit code so the cause is visible.
+            if child_dead && !session_changed {
+                if let Some(c) = &child {
+                    tracing::warn!("session-host (session {current_session}) exited with code {}", c.exit_code());
                 }
-                match spawn_session_host(active) {
-                    Ok(c) => {
-                        tracing::info!("Launched session-host in session {active}");
-                        child = Some(c);
-                        current_session = active;
+                if spawned_at.elapsed() < Duration::from_secs(8) {
+                    quick_failures = (quick_failures + 1).min(10);
+                    let wait = Duration::from_secs(u64::from(quick_failures) * 3);
+                    if spawned_at.elapsed() < wait {
+                        continue;
                     }
-                    Err(e) => tracing::warn!("could not launch session-host in session {active}: {e:#}"),
+                } else {
+                    quick_failures = 0;
                 }
+            }
+
+            if let Some(mut c) = child.take() {
+                c.kill();
+            }
+            match spawn_session_host(active) {
+                Ok(c) => {
+                    tracing::info!("Launched session-host in session {active}");
+                    child = Some(c);
+                    current_session = active;
+                    spawned_at = Instant::now();
+                }
+                Err(e) => tracing::warn!("could not launch session-host in session {active}: {e:#}"),
             }
         }
         if let Some(mut c) = child.take() {
@@ -280,6 +330,14 @@ mod imp {
             let mut code = 0u32;
             unsafe { GetExitCodeProcess(self.process, &mut code).is_ok() && code == STILL_ACTIVE }
         }
+        fn exit_code(&self) -> u32 {
+            use windows::Win32::System::Threading::GetExitCodeProcess;
+            let mut code = 0u32;
+            unsafe {
+                let _ = GetExitCodeProcess(self.process, &mut code);
+            }
+            code
+        }
         fn kill(&mut self) {
             unsafe {
                 let _ = TerminateProcess(self.process, 1);
@@ -296,40 +354,41 @@ mod imp {
     /// as SYSTEM is what lets the helper reach the secure desktop.
     fn spawn_session_host(session_id: u32) -> Result<Child> {
         unsafe {
-            // Our own process token.
-            let mut proc_token = HANDLE::default();
-            OpenProcessToken(
-                GetCurrentProcess(),
-                TOKEN_ACCESS_MASK(TOKEN_ALL_ACCESS.0),
-                &mut proc_token,
-            )
-            .context("OpenProcessToken")?;
+            // Prefer the interactive user's own token for this session: the
+            // helper then runs exactly like the user's own app — stable, and
+            // able to read secrets DPAPI-encrypted for that user — instead of
+            // as LocalSystem. Only when nobody is signed in (the lock / sign-in
+            // screen) do we fall back to a SYSTEM token so we stay reachable.
+            let mut token = HANDLE::default();
+            let as_user = WTSQueryUserToken(session_id, &mut token).is_ok();
+            if !as_user {
+                let mut proc_token = HANDLE::default();
+                OpenProcessToken(GetCurrentProcess(), TOKEN_ACCESS_MASK(TOKEN_ALL_ACCESS.0), &mut proc_token)
+                    .context("OpenProcessToken")?;
+                let dup_result =
+                    DuplicateTokenEx(proc_token, TOKEN_ALL_ACCESS, None, SecurityIdentification, TokenPrimary, &mut token);
+                let _ = CloseHandle(proc_token);
+                dup_result.context("DuplicateTokenEx")?;
+                // Move the SYSTEM token into the target session.
+                let sid = session_id;
+                if let Err(e) =
+                    SetTokenInformation(token, TokenSessionId, &sid as *const u32 as *const core::ffi::c_void, 4)
+                {
+                    let _ = CloseHandle(token);
+                    return Err(e).context("SetTokenInformation(session)");
+                }
+            }
 
-            // A primary token we can hand to CreateProcessAsUser.
-            let mut dup = HANDLE::default();
-            let dup_result = DuplicateTokenEx(
-                proc_token,
-                TOKEN_ALL_ACCESS,
-                None,
-                SecurityIdentification,
-                TokenPrimary,
-                &mut dup,
-            );
-            let _ = CloseHandle(proc_token);
-            dup_result.context("DuplicateTokenEx")?;
-
-            // Build the command line and desktop first, so an error here can't
-            // leak the token or the environment block.
+            // Build the command line and desktop. The helper gets its config
+            // path on the command line — the token's environment block does not
+            // carry our PJDESK_CONFIG, so passing it that way would silently fail.
             let exe = match std::env::current_exe() {
                 Ok(exe) => exe,
                 Err(e) => {
-                    let _ = CloseHandle(dup);
+                    let _ = CloseHandle(token);
                     return Err(e.into());
                 }
             };
-            // The helper gets its config path on the command line — the SYSTEM
-            // environment block does NOT carry our PJDESK_CONFIG, so passing it
-            // via the environment would silently fail.
             let cfg_path = crate::syspaths::service_config_path();
             let mut cmdline: Vec<u16> =
                 format!("\"{}\" __session-host --config \"{}\"", exe.display(), cfg_path.display())
@@ -338,16 +397,9 @@ mod imp {
                     .collect();
             let mut desktop: Vec<u16> = "winsta0\\default".encode_utf16().chain(std::iter::once(0)).collect();
 
-            // Move the token into the target session.
-            let sid = session_id;
-            if let Err(e) = SetTokenInformation(dup, TokenSessionId, &sid as *const u32 as *const core::ffi::c_void, 4) {
-                let _ = CloseHandle(dup);
-                return Err(e).context("SetTokenInformation(session)");
-            }
-
-            // Environment block for the token (the SYSTEM profile).
+            // Environment block for the chosen token.
             let mut env_block: *mut core::ffi::c_void = std::ptr::null_mut();
-            let have_env = CreateEnvironmentBlock(&mut env_block, Some(dup), false).is_ok();
+            let have_env = CreateEnvironmentBlock(&mut env_block, Some(token), false).is_ok();
 
             let mut si = STARTUPINFOW {
                 cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -358,7 +410,7 @@ mod imp {
 
             let flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
             let result = CreateProcessAsUserW(
-                Some(dup),
+                Some(token),
                 windows::core::PCWSTR::null(),
                 Some(PWSTR(cmdline.as_mut_ptr())),
                 None,
@@ -374,7 +426,7 @@ mod imp {
             if have_env {
                 let _ = DestroyEnvironmentBlock(env_block);
             }
-            let _ = CloseHandle(dup);
+            let _ = CloseHandle(token);
             let _ = &mut si;
 
             result.context("CreateProcessAsUser")?;
@@ -390,7 +442,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{install, is_windows, run_dispatcher, start, status, stop, uninstall};
+pub use imp::{install, is_windows, restart, run_dispatcher, start, status, stop, uninstall};
 
 /// The helper that actually hosts, launched by the service into a user session.
 /// Follows the input desktop and publishes a status file for the GUI.
@@ -534,16 +586,22 @@ pub fn protect_service_dir() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+    // SYSTEM and Administrators get full control; the interactive Users group
+    // gets Modify because the session-host now runs as the signed-in user and
+    // must persist its ID and status here (the unattended password in this
+    // folder is DPAPI-encrypted, so it stays unreadable to other users).
     let _ = std::process::Command::new("icacls")
         .arg(&dir)
-        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/C", "/Q"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    // The status file is read by the (non-admin) GUI, so allow users to read it.
-    let _ = std::process::Command::new("icacls")
-        .arg(crate::syspaths::service_status_path())
-        .args(["/grant:r", "*S-1-5-32-545:(R)", "/Q"])
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "*S-1-5-32-545:(OI)(CI)M",
+            "/T",
+            "/C",
+            "/Q",
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
@@ -595,6 +653,10 @@ pub fn start() -> Result<()> {
 }
 #[cfg(not(windows))]
 pub fn stop() -> Result<()> {
+    anyhow::bail!("the background service is only available on Windows")
+}
+#[cfg(not(windows))]
+pub fn restart() -> Result<()> {
     anyhow::bail!("the background service is only available on Windows")
 }
 #[cfg(not(windows))]

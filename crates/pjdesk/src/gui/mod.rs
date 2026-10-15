@@ -139,6 +139,9 @@ pub struct App {
     connect_password: String,
     remember: bool,
 
+    /// Reveal this computer's host password in the UI (masked by default).
+    show_password: bool,
+
     // Account sign-in.
     show_login: bool,
     login_user: String,
@@ -170,6 +173,7 @@ impl App {
             connect_id: String::new(),
             connect_password: String::new(),
             remember: false,
+            show_password: false,
             show_login: false,
             login_user: String::new(),
             login_pass: String::new(),

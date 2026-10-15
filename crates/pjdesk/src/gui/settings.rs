@@ -170,6 +170,15 @@ impl App {
 
         self.save_cfg();
 
+        // If the background service is installed, push the new server address
+        // into its separate config too (it restarts itself to pick it up). This
+        // needs elevation, so it goes through run_elevated.
+        if server_changed && crate::service::status().0 {
+            if let Some(addr) = self.cfg.server.clone() {
+                crate::platform::run_elevated(&["service", "configure", "--server", &addr]);
+            }
+        }
+
         if server_changed || quality_changed {
             self.engine.restart(&self.cfg);
         }

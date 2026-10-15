@@ -8,8 +8,10 @@ use super::{theme, widgets, App};
 
 impl App {
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(RichText::new("◆").size(16.0).color(theme::ACCENT));
             ui.label(RichText::new("PJDesk").size(20.0).strong().color(Color32::WHITE));
             ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(theme::MUTED).size(12.0));
 
@@ -75,7 +77,7 @@ impl App {
             ui.label(RichText::new("Your ID").color(theme::MUTED).size(12.0));
             ui.horizontal(|ui| {
                 let shown = id.as_deref().map(format_id).unwrap_or_else(|| "— — —".into());
-                ui.label(RichText::new(shown).size(26.0).strong().monospace().color(Color32::WHITE));
+                ui.label(RichText::new(shown).size(32.0).strong().monospace().color(Color32::WHITE));
                 if id.is_some() && ui.button("⧉").on_hover_text("Copy ID").clicked() {
                     if widgets::copy_to_clipboard(&normalize_id(id.as_deref().unwrap_or(""))) {
                         self.toast.show("ID copied");
@@ -85,18 +87,29 @@ impl App {
 
             ui.add_space(8.0);
 
-            // Password.
+            // Password — masked by default; reveal with the eye button.
             let permanent = self.cfg.settings.permanent_password.is_some();
             ui.label(RichText::new(if permanent { "Password (permanent)" } else { "One-time password" }).color(theme::MUTED).size(12.0));
             ui.horizontal(|ui| {
-                ui.label(RichText::new(if password.is_empty() { "…".into() } else { password.clone() }).size(20.0).monospace().color(Color32::WHITE));
-                if !password.is_empty() && ui.button("⧉").on_hover_text("Copy password").clicked() {
-                    if widgets::copy_to_clipboard(&password) {
+                let shown = if password.is_empty() {
+                    "…".to_string()
+                } else if self.show_password {
+                    password.clone()
+                } else {
+                    "•".repeat(password.chars().count().max(6))
+                };
+                ui.label(RichText::new(shown).size(20.0).monospace().color(Color32::WHITE));
+                if !password.is_empty() {
+                    let eye = if self.show_password { "🙈" } else { "👁" };
+                    if ui.button(eye).on_hover_text(if self.show_password { "Hide" } else { "Reveal" }).clicked() {
+                        self.show_password = !self.show_password;
+                    }
+                    if ui.button("⧉").on_hover_text("Copy password").clicked() && widgets::copy_to_clipboard(&password) {
                         self.toast.show("Password copied");
                     }
-                }
-                if !permanent && ui.button("🔄").on_hover_text("New random password").clicked() {
-                    shared.request_regenerate();
+                    if !permanent && ui.button("🔄").on_hover_text("New random password").clicked() {
+                        shared.request_regenerate();
+                    }
                 }
             });
 
@@ -129,7 +142,7 @@ impl App {
             ui.label(RichText::new("Your ID").color(theme::MUTED).size(12.0));
             ui.horizontal(|ui| {
                 let shown = status.id.as_deref().map(format_id).unwrap_or_else(|| "— — —".into());
-                ui.label(RichText::new(shown).size(26.0).strong().monospace().color(Color32::WHITE));
+                ui.label(RichText::new(shown).size(32.0).strong().monospace().color(Color32::WHITE));
                 if let Some(id) = &status.id {
                     if ui.button("⧉").on_hover_text("Copy ID").clicked() && widgets::copy_to_clipboard(id) {
                         self.toast.show("ID copied");

@@ -344,12 +344,15 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
     }
 }
 
-fn print_banner(id: &str, password: &str, fixed: bool, server: &ServerAddr) {
+fn print_banner(id: &str, _password: &str, fixed: bool, server: &ServerAddr) {
+    // The password is deliberately NOT printed here: this text can reach the
+    // service log and the console, so the password is shown only in the app
+    // window (masked, with a reveal button).
     println!();
     println!("  ==================================================");
     println!("    This computer can now be controlled remotely");
     println!("      ID       : {}", format_id(id));
-    println!("      Password : {password}{}", if fixed { "  (fixed)" } else { "" });
+    println!("      Password : {} (shown in the PJDesk window)", if fixed { "set" } else { "one-time" });
     println!("      Server   : {server}");
     println!("  ==================================================");
     println!();

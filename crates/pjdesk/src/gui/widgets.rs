@@ -30,9 +30,10 @@ impl Toast {
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(Color32::from_rgb(0x26, 0x2c, 0x37))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::symmetric(14, 9))
+                    .fill(theme::ELEV)
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .stroke(egui::Stroke::new(1.0, theme::LINE))
                     .show(ui, |ui| {
                         ui.colored_label(Color32::WHITE, &self.text);
                     });
@@ -48,16 +49,13 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     }
 }
 
-/// A colored status dot followed by a label.
+/// A status indicator rendered as a tinted pill.
 pub fn status_dot(ui: &mut egui::Ui, color: Color32, label: &str) {
-    ui.horizontal(|ui| {
-        ui.colored_label(color, "●");
-        ui.label(label);
-    });
+    theme::pill(ui, color, label);
 }
 
-/// A section heading in muted small caps-ish styling.
+/// A section heading in muted small-caps styling.
 pub fn heading(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).color(theme::MUTED).size(12.0).strong());
-    ui.add_space(2.0);
+    ui.label(egui::RichText::new(text).color(theme::MUTED).size(11.5).strong());
+    ui.add_space(4.0);
 }
