@@ -52,6 +52,12 @@ makensis -DVERSION="$VERSION" pjdesk-client.nsi
 makensis -DVERSION="$VERSION" pjdesk-server.nsi
 
 mv -f "PJDesk-Setup-$VERSION.exe" "PJDesk-Server-Setup-$VERSION.exe" "$HERE/"
+
+# Checksums the auto-updater verifies downloads against (upload with the release).
+cd "$HERE"
+sha256sum "PJDesk-Setup-$VERSION.exe" "PJDesk-Server-Setup-$VERSION.exe" > SHA256SUMS
+
 echo "Built:"
 echo "  $HERE/PJDesk-Setup-$VERSION.exe"
 echo "  $HERE/PJDesk-Server-Setup-$VERSION.exe"
+echo "  $HERE/SHA256SUMS"
