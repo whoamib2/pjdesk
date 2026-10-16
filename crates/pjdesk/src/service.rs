@@ -518,14 +518,14 @@ pub fn set_update_task(enable: bool) -> Result<()> {
     // A short (8.3) path has no spaces, so the task's /TR needs no inner quotes.
     let tr = format!("{} update", short_path(&exe).unwrap_or_else(|| exe.display().to_string()));
     let status = std::process::Command::new("schtasks")
-        .args(["/Create", "/TN", UPDATE_TASK, "/TR", &tr, "/SC", "DAILY", "/ST", "03:00", "/RU", "SYSTEM", "/RL",
+        .args(["/Create", "/TN", UPDATE_TASK, "/TR", &tr, "/SC", "MINUTE", "/MO", "30", "/RU", "SYSTEM", "/RL",
             "HIGHEST", "/F"])
         .status()
         .context("running schtasks")?;
     if !status.success() {
         anyhow::bail!("schtasks could not create the update task (run as Administrator)");
     }
-    println!("Automatic updates turned on (daily).");
+    println!("Automatic updates turned on (checks every 30 minutes).");
     Ok(())
 }
 

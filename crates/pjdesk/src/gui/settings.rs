@@ -193,7 +193,7 @@ fn general_tab(d: &mut SettingsDraft, ui: &mut egui::Ui) {
 
     ui.add_space(12.0);
     super::widgets::heading(ui, "UPDATES");
-    ui.checkbox(&mut d.auto_update, "Install updates automatically (checks daily)");
+    ui.checkbox(&mut d.auto_update, "Install updates automatically (checks every 30 minutes)");
     ui.label(
         RichText::new("Downloads new versions from the project's GitHub releases, verifies them and installs silently. Changing this asks for Administrator rights.")
             .color(theme::MUTED)

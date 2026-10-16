@@ -52,9 +52,9 @@ Section "PJDesk Server (required)" SecCore
   WriteRegStr HKLM "Software\PJDeskServer" "InstallDir" "$INSTDIR"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  ; Daily auto-update check, as SYSTEM (short path avoids quoting the spaces).
+  ; Auto-update check every 30 minutes, as SYSTEM (short path avoids quoting the spaces).
   GetFullPathName /SHORT $0 "$INSTDIR\${EXE}"
-  nsExec::Exec 'schtasks /Create /TN "PJDesk Server Update" /TR "$0 update" /SC DAILY /ST 03:30 /RU SYSTEM /RL HIGHEST /F'
+  nsExec::Exec 'schtasks /Create /TN "PJDesk Server Update" /TR "$0 update" /SC MINUTE /MO 30 /RU SYSTEM /RL HIGHEST /F'
   ; Restart the service if it was already installed.
   nsExec::Exec 'net start PJDeskServer'
 
