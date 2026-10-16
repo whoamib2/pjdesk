@@ -5,3 +5,31 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# GNU (MinGW) cross-build: ship a single self-contained pjdesk.exe with no
+# libstdc++-6.dll dependency. OpenH264's C++ (compiled by the `cc` crate) would
+# otherwise link the C++ runtime dynamically. CXXSTDLIB="" tells `cc` not to add
+# that dynamic -lstdc++, and the rustflags below link the static libstdc++
+# archive instead (Windows system DLLs stay as normal imports).
+[env]
+CXXSTDLIB = ""
+
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    # Link the static C++ runtime last, in a group so the circular references
+    # between libstdc++, libgcc (win32 gthreads) and libmingwex resolve in one
+    # pass, then the Windows import libs they call into. This keeps pjdesk.exe a
+    # single self-contained file with no libstdc++-6.dll dependency.
+    "-C", "link-arg=-Wl,-Bstatic",
+    "-C", "link-arg=-Wl,--start-group",
+    "-C", "link-arg=-lstdc++",
+    "-C", "link-arg=-lgcc",
+    "-C", "link-arg=-lgcc_eh",
+    "-C", "link-arg=-lmingwex",
+    "-C", "link-arg=-lmingw32",
+    "-C", "link-arg=-Wl,--end-group",
+    "-C", "link-arg=-Wl,-Bdynamic",
+    "-C", "link-arg=-lmsvcrt",
+    "-C", "link-arg=-lkernel32",
+    "-C", "link-arg=-luser32",
+]
