@@ -31,6 +31,11 @@ pub const PROTOCOL_VERSION: u16 = 2;
 /// Default port of the server, used for TCP (signaling) and UDP (rendezvous/relay).
 pub const DEFAULT_PORT: u16 = 21200;
 
+/// The server a fresh install points at until the user sets their own in
+/// Settings. Baking this in means the app gets an ID and is reachable out of the
+/// box, without a sign-in — the way a self-hosted RustDesk points at its server.
+pub const DEFAULT_SERVER: &str = "pjdesk.spader.us:21200";
+
 /// ALPN protocol id for the signaling TLS connection.
 pub const ALPN_SIGNAL: &[u8] = b"pjdesk-signal/1";
 /// ALPN protocol id for the peer-to-peer QUIC connection.
@@ -40,6 +45,18 @@ pub const ALPN_PEER: &[u8] = b"pjdesk-peer/1";
 /// informational only.
 pub const SIGNAL_SERVER_NAME: &str = "pjdesk-server";
 pub const PEER_SERVER_NAME: &str = "pjdesk-host";
+
+/// Derives a stable 32-byte device secret from a machine-unique string (such as
+/// the Windows MachineGuid). It is deterministic, so the same machine always
+/// yields the same secret: the GUI and the background service then register as
+/// one device (no duplicates) and the assigned ID survives reinstalls.
+pub fn derive_device_secret(machine_id: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"pjdesk-device-identity-v1\0");
+    h.update(machine_id.trim().to_ascii_lowercase().as_bytes());
+    h.finalize().into()
+}
 
 /// Fills an array with bytes from the operating system's secure RNG.
 pub fn random_bytes<const N: usize>() -> [u8; N] {

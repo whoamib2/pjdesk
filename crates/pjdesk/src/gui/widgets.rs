@@ -59,3 +59,38 @@ pub fn heading(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).color(theme::MUTED).size(11.5).strong());
     ui.add_space(4.0);
 }
+
+/// A small caption label placed above an input field.
+pub fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).color(theme::MUTED).size(12.0));
+    ui.add_space(5.0);
+}
+
+/// A padded, full-width single-line text field with consistent styling.
+/// Returns the response so callers can detect Enter / focus loss.
+pub fn text_field(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    hint: &str,
+    password: bool,
+    monospace: bool,
+) -> egui::Response {
+    let font = if monospace { egui::TextStyle::Monospace } else { egui::TextStyle::Body };
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .hint_text(hint)
+            .password(password)
+            .font(font)
+            .margin(egui::Margin::symmetric(12, 10))
+            .desired_width(f32::INFINITY),
+    )
+}
+
+/// A full-width primary (accent) button of a comfortable height.
+pub fn primary_button(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.add_sized(
+        [ui.available_width(), 40.0],
+        egui::Button::new(egui::RichText::new(label).strong().size(15.0).color(Color32::WHITE)).fill(theme::ACCENT),
+    )
+    .clicked()
+}

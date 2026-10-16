@@ -175,7 +175,23 @@ impl Config {
     }
 
     /// The device secret, created (and saved) on first use.
+    ///
+    /// Prefers a machine-derived secret so the GUI and the background service
+    /// share one identity (no duplicate device registrations) and the assigned
+    /// ID survives restarts and reinstalls. Falls back to a stored random secret
+    /// only where no stable machine id is available.
     pub fn device_secret(&mut self) -> Result<[u8; 32]> {
+        if let Some(secret) = crate::identity::machine_secret() {
+            let hexed = hex::encode(secret);
+            if self.device_secret.as_deref() != Some(hexed.as_str()) {
+                // Adopting the machine secret: any stored ID belonged to an older
+                // secret, so drop it and let the server assign one for this one.
+                self.device_secret = Some(hexed);
+                self.device_id = None;
+                self.save()?;
+            }
+            return Ok(secret);
+        }
         if let Some(hex_secret) = &self.device_secret {
             if let Ok(bytes) = hex::decode(hex_secret) {
                 if let Ok(secret) = <[u8; 32]>::try_from(bytes.as_slice()) {
@@ -192,6 +208,16 @@ impl Config {
 
     pub fn pinned_fingerprint(&self) -> Option<Fingerprint> {
         self.server_fingerprint.as_deref().and_then(|s| parse_fingerprint(s).ok())
+    }
+
+    /// The server to use: the one the user set, else the baked-in default, so a
+    /// fresh install is reachable without any configuration.
+    pub fn effective_server(&self) -> String {
+        self.server
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| pjdesk_proto::DEFAULT_SERVER.to_string())
     }
 
     /// Re-reads the device identity and pinned fingerprint from disk. The host

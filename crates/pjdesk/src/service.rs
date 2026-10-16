@@ -32,7 +32,9 @@ pub fn write_service_config(server: Option<&str>, password: Option<&str>) -> Res
     let path = crate::syspaths::service_config_path();
     let mut cfg = Config::load_from(&path).unwrap_or_default();
 
-    // Server: explicit flag, else keep existing, else copy the installing user's.
+    // Server: explicit flag, else keep existing, else copy the installing user's,
+    // else the baked-in default — so the service can always register, even when
+    // it's installed as SYSTEM and the user hasn't signed in yet.
     if let Some(s) = server {
         cfg.server = Some(s.to_string());
     } else if cfg.server.is_none() {
@@ -41,22 +43,20 @@ pub fn write_service_config(server: Option<&str>, password: Option<&str>) -> Res
             cfg.server_fingerprint = user.server_fingerprint;
         }
     }
+    if cfg.server.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        cfg.server = Some(pjdesk_proto::DEFAULT_SERVER.to_string());
+    }
 
-    // Unattended password: explicit flag, else keep existing, else generate.
-    let generated;
+    // Unattended password: set a *permanent* one only when explicitly provided
+    // (or keep an existing one). Otherwise the host uses a rotating one-time
+    // password shown in the PJDesk window, so letting someone in needs no
+    // permanent password at all. An empty return means "using a one-time password".
     let effective = match password {
         Some(p) if !p.is_empty() => {
             cfg.settings.set_permanent_password(Some(p));
             p.to_string()
         }
-        _ => match cfg.settings.permanent_password() {
-            Some(existing) => existing,
-            None => {
-                generated = pjdesk_proto::auth::generate_password();
-                cfg.settings.set_permanent_password(Some(&generated));
-                generated
-            }
-        },
+        _ => cfg.settings.permanent_password().unwrap_or_default(),
     };
     cfg.save_to(&path)?;
     Ok(effective)
@@ -128,8 +128,13 @@ mod imp {
         }
         service.start::<&str>(&[]).context("service installed but failed to start")?;
         println!("Installed and started the PJDesk background service.");
-        println!("Unattended password for this computer: {effective}");
-        println!("Keep it safe — anyone with your ID and this password can control this computer.");
+        if effective.is_empty() {
+            println!("This computer uses a one-time password, shown in the PJDesk window.");
+            println!("Open PJDesk to see its ID and the current password to share.");
+        } else {
+            println!("Unattended password for this computer: {effective}");
+            println!("Keep it safe — anyone with your ID and this password can control this computer.");
+        }
         Ok(())
     }
 
@@ -314,7 +319,7 @@ mod imp {
             c.kill();
         }
         // Mark offline for the GUI.
-        crate::syspaths::ServiceStatus::now(None, false, None).write();
+        crate::syspaths::ServiceStatus::now(None, false, None, None).write();
     }
 
     /// A launched helper process we can poll and kill.
@@ -465,16 +470,17 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
 
     init_service_logging();
     let config = Config::load().unwrap_or_default();
-    let server = match config.server.as_deref().and_then(|s| ServerAddr::parse(s).ok()) {
-        Some(s) => s,
-        None => {
-            anyhow::bail!("the service has no server configured; run `pjdesk service install --server <address>`")
-        }
-    };
+    // Falls back to the baked-in default server, so the service registers and
+    // gets an ID even if its config was never seeded with one.
+    let server = ServerAddr::parse(&config.effective_server())
+        .map_err(|e| anyhow::anyhow!("invalid server address \"{}\": {e}", config.effective_server()))?;
 
     let shared = Arc::new(HostShared::default());
     let mut args = crate::HostArgs::from_settings(&config.settings);
     args.follow_desktop = true;
+    // Only a one-time password is ever published to the GUI; a permanent
+    // password stays encrypted in the config and is never written to status.json.
+    let one_time = config.settings.permanent_password.is_none();
 
     let host_shared = shared.clone();
     std::thread::Builder::new().name("host".into()).spawn(move || {
@@ -486,7 +492,8 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
 
     // Publish status for the GUI until the process is killed.
     loop {
-        ServiceStatus::now(shared.id(), shared.is_online(), shared.connected_peer()).write();
+        let password = one_time.then(|| shared.password()).filter(|p| !p.is_empty());
+        ServiceStatus::now(shared.id(), shared.is_online(), shared.connected_peer(), password).write();
         std::thread::sleep(Duration::from_secs(2));
     }
 }

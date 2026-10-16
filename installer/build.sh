@@ -33,10 +33,12 @@ PJDesk - quick start
 ====================
 
 1. Open PJDesk (Start menu or desktop).
-2. In Settings, enter the address of your PJDesk server (for example
-   desk.example.com or 192.168.1.10). The default port is 21200.
-3. Your computer now shows an ID and a password. Give those to someone,
-   or type another computer's ID to control it.
+2. Your computer shows an ID and a one-time password. Give those to
+   someone to let them control it - no setup or sign-in needed.
+3. To control another computer, type its ID and password, then Connect.
+
+PJDesk connects through pjdesk.spader.us by default. To point it at your
+own PJDesk server instead, set the address in Settings (default port 21200).
 
 For always-on access - before anyone signs in, and during UAC prompts -
 install the background service from Settings > Security, or tick

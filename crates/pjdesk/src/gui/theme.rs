@@ -64,10 +64,10 @@ pub fn apply(ctx: &egui::Context) {
 
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-        style.spacing.button_padding = egui::vec2(14.0, 8.0);
+        style.spacing.button_padding = egui::vec2(14.0, 9.0);
         style.spacing.window_margin = egui::Margin::same(16);
         style.spacing.menu_margin = egui::Margin::same(8);
-        style.spacing.interact_size.y = 30.0;
+        style.spacing.interact_size.y = 32.0;
 
         use egui::{FontFamily::Proportional, FontId, TextStyle};
         style.text_styles.insert(TextStyle::Heading, FontId::new(22.0, Proportional));

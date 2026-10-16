@@ -132,7 +132,7 @@ impl App {
 
     /// Left panel when the background service is doing the hosting.
     fn service_host_panel(&mut self, ui: &mut egui::Ui) {
-        let status = crate::syspaths::ServiceStatus::load().unwrap_or_default();
+        let status = self.svc_status.clone();
         let fresh = status.is_fresh();
         theme::card(ui, |ui| {
             widgets::heading(ui, "SHARE THIS COMPUTER");
@@ -158,12 +158,41 @@ impl App {
                 }
             });
 
-            ui.add_space(10.0);
+            ui.add_space(8.0);
+            let one_time_pw = status.password.clone().filter(|p| !p.is_empty());
             ui.label(
-                RichText::new("This computer is shared by the PJDesk background service, so it's reachable even at the sign-in screen. Its password was set when the service was installed (Settings ▸ Security to change it).")
+                RichText::new(if one_time_pw.is_some() { "One-time password" } else { "Password" })
                     .color(theme::MUTED)
                     .size(12.0),
             );
+            ui.horizontal(|ui| match &one_time_pw {
+                Some(pw) => {
+                    let shown =
+                        if self.show_password { pw.clone() } else { "•".repeat(pw.chars().count().max(6)) };
+                    ui.label(RichText::new(shown).size(20.0).monospace().color(Color32::WHITE));
+                    let eye = if self.show_password { "🙈" } else { "👁" };
+                    if ui.button(eye).on_hover_text(if self.show_password { "Hide" } else { "Reveal" }).clicked() {
+                        self.show_password = !self.show_password;
+                    }
+                    if ui.button("⧉").on_hover_text("Copy password").clicked() && widgets::copy_to_clipboard(pw) {
+                        self.toast.show("Password copied");
+                    }
+                }
+                None if fresh && status.online => {
+                    ui.label(RichText::new("•".repeat(10)).size(20.0).monospace().color(Color32::WHITE));
+                }
+                None => {
+                    ui.label(RichText::new("…").size(20.0).monospace().color(theme::MUTED));
+                }
+            });
+
+            ui.add_space(10.0);
+            let note = if one_time_pw.is_some() {
+                "Shared by the background service, so it's reachable even at the sign-in screen. Give your ID and this one-time password to let someone in — it changes when the service restarts."
+            } else {
+                "Shared by the background service, so it's reachable even at the sign-in screen. A permanent password is set — change it in Settings ▸ Security."
+            };
+            ui.label(RichText::new(note).color(theme::MUTED).size(12.0));
         });
     }
 
@@ -173,30 +202,18 @@ impl App {
             widgets::heading(ui, "CONTROL ANOTHER COMPUTER");
             ui.add_space(4.0);
 
-            ui.label(RichText::new("Remote ID").color(theme::MUTED).size(12.0));
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.connect_id)
-                    .hint_text("123 456 789")
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY),
-            );
+            widgets::field_label(ui, "Remote ID");
+            let resp = widgets::text_field(ui, &mut self.connect_id, "123 456 789", false, true);
 
-            ui.add_space(6.0);
-            ui.label(RichText::new("Password (optional if saved)").color(theme::MUTED).size(12.0));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.connect_password)
-                    .password(true)
-                    .hint_text("password")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add_space(6.0);
+            ui.add_space(10.0);
+            widgets::field_label(ui, "Password (optional if saved)");
+            widgets::text_field(ui, &mut self.connect_password, "password", true, false);
+            ui.add_space(10.0);
             ui.checkbox(&mut self.remember, "Remember this computer's password");
 
-            ui.add_space(12.0);
+            ui.add_space(14.0);
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let connect = ui
-                .add_sized([ui.available_width(), 34.0], egui::Button::new(RichText::new("Connect").strong()).fill(theme::ACCENT))
-                .clicked();
+            let connect = widgets::primary_button(ui, "Connect");
             if connect || enter {
                 let (id, pw) = (self.connect_id.clone(), self.connect_password.clone());
                 self.connect_to(&id, Some(pw));

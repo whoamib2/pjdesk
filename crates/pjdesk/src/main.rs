@@ -16,6 +16,7 @@ mod color;
 mod config;
 mod gui;
 mod host;
+mod identity;
 mod p2p;
 mod platform;
 mod secure;

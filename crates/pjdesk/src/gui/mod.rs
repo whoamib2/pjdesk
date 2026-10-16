@@ -78,7 +78,7 @@ impl Engine {
     fn start(config: &Config) -> Self {
         let service_running = crate::service::status().1;
         let shared = Arc::new(HostShared::default());
-        let server = config.server.as_deref().and_then(|s| ServerAddr::parse(s).ok());
+        let server = ServerAddr::parse(&config.effective_server()).ok();
         if !service_running {
             if let Some(server) = &server {
                 spawn_host(server.clone(), config.clone(), shared.clone());
@@ -94,7 +94,7 @@ impl Engine {
         self.service_running = crate::service::status().1;
         let shared = Arc::new(HostShared::default());
         self.shared = shared.clone();
-        self.server = config.server.as_deref().and_then(|s| ServerAddr::parse(s).ok());
+        self.server = ServerAddr::parse(&config.effective_server()).ok();
         if !self.service_running {
             if let Some(server) = &self.server {
                 spawn_host(server.clone(), config.clone(), shared);
@@ -160,6 +160,10 @@ pub struct App {
     status: String,
     toast: widgets::Toast,
     last_service_check: std::time::Instant,
+    /// Cached service status, refreshed on a timer so we don't read the status
+    /// file from disk on every repaint (which makes typing feel laggy).
+    svc_status: crate::syspaths::ServiceStatus,
+    svc_status_at: std::time::Instant,
 }
 
 impl App {
@@ -186,6 +190,8 @@ impl App {
             status: String::new(),
             toast: widgets::Toast::default(),
             last_service_check: std::time::Instant::now(),
+            svc_status: crate::syspaths::ServiceStatus::load().unwrap_or_default(),
+            svc_status_at: std::time::Instant::now(),
         };
         // Refresh a saved sign-in in the background.
         if app.cfg.account.is_some() {
@@ -195,7 +201,7 @@ impl App {
     }
 
     fn server_addr(&self) -> Option<ServerAddr> {
-        self.cfg.server.as_deref().and_then(|s| ServerAddr::parse(s).ok())
+        ServerAddr::parse(&self.cfg.effective_server()).ok()
     }
 
     /// Saves config without clobbering the identity the host thread owns.
@@ -329,10 +335,7 @@ impl App {
             self.status = "That isn't a 9-digit PJDesk ID.".into();
             return;
         }
-        let Some(server) = self.cfg.server.clone() else {
-            self.status = "Set your server in Settings first.".into();
-            return;
-        };
+        let server = self.cfg.effective_server();
         let password = password
             .filter(|p| !p.is_empty())
             .or_else(|| self.cfg.saved_password(&id))
@@ -394,6 +397,10 @@ impl eframe::App for App {
             self.last_service_check = std::time::Instant::now();
             let cfg = self.cfg.clone();
             self.engine.refresh_service(&cfg);
+        }
+        if self.svc_status_at.elapsed() > Duration::from_millis(900) {
+            self.svc_status_at = std::time::Instant::now();
+            self.svc_status = crate::syspaths::ServiceStatus::load().unwrap_or_default();
         }
         let ctx = ui.ctx().clone();
         // Keep status (online/connected) fresh.
