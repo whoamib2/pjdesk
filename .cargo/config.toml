@@ -5,15 +5,3 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
-
-# The GNU (MinGW) cross-build links the C++ runtime statically too, otherwise
-# the client needs libstdc++-6.dll at runtime (pulled in by the video codec)
-# and fails to start on a clean PC with "libstdc++-6.dll was not found".
-[target.x86_64-pc-windows-gnu]
-rustflags = [
-    "-C", "target-feature=+crt-static",
-    # -static makes the linker resolve libstdc++/libgcc/winpthread from their
-    # static archives (the C++ codec pulls in a dynamic -lstdc++ by default);
-    # Windows system DLLs stay as normal imports.
-    "-C", "link-arg=-static",
-]
