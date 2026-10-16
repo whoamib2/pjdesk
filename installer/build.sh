@@ -25,6 +25,7 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 cp "$TARGET/pjdesk.exe" "$TARGET/pjdesk-server.exe" "$WORK/"
 cp "$ROOT/README.md" "$ROOT/LICENSE" "$WORK/"
+cp "$ROOT/crates/pjdesk/assets/pjdesk.ico" "$WORK/"
 cp "$HERE/pjdesk-client.nsi" "$HERE/pjdesk-server.nsi" "$WORK/"
 
 # QUICKSTART packaged with the client.

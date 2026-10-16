@@ -18,6 +18,8 @@ SetCompressor /SOLID lzma
 
 !include "MUI2.nsh"
 
+!define MUI_ICON "pjdesk.ico"
+!define MUI_UNICON "pjdesk.ico"
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${EXE}"
 !define MUI_FINISHPAGE_RUN_TEXT "Open PJDesk now"

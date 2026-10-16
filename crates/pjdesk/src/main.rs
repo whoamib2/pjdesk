@@ -137,10 +137,10 @@ struct LoginArgs {
 
 #[derive(Args, Clone, Debug)]
 pub struct HostArgs {
-    /// Use this fixed password instead of a new random one each start
-    /// (for unattended access).
-    #[arg(long, env = "PJDESK_HOST_PASSWORD")]
-    pub password: Option<String>,
+    /// A permanent password for unattended access. The host always also shows a
+    /// rotating one-time password; both let a controller in.
+    #[arg(long = "password", env = "PJDESK_HOST_PASSWORD")]
+    pub permanent_password: Option<String>,
     /// Monitor to share (0 = primary).
     #[arg(long, default_value_t = 0)]
     pub display: usize,
@@ -171,7 +171,7 @@ pub struct HostArgs {
 impl Default for HostArgs {
     fn default() -> Self {
         Self {
-            password: std::env::var("PJDESK_HOST_PASSWORD").ok(),
+            permanent_password: std::env::var("PJDESK_HOST_PASSWORD").ok(),
             display: 0,
             fps: 30,
             bitrate: 6000,
@@ -189,7 +189,7 @@ impl HostArgs {
     /// if one is set (otherwise a fresh random password each start).
     pub fn from_settings(settings: &config::Settings) -> Self {
         Self {
-            password: settings.permanent_password(),
+            permanent_password: settings.permanent_password(),
             display: 0,
             fps: settings.fps,
             bitrate: settings.bitrate_kbps,

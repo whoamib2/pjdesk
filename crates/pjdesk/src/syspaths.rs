@@ -40,22 +40,31 @@ pub struct ServiceStatus {
     pub id: Option<String>,
     pub online: bool,
     pub connected: Option<String>,
-    /// The current one-time password to share, when the service isn't using a
-    /// permanent password. `None` means a permanent password is set (so nothing
-    /// is exposed here) or none is known yet.
+    /// The current rotating one-time password to share. `None` means none is
+    /// known yet (the service is still starting).
     #[serde(default)]
     pub password: Option<String>,
+    /// Whether a permanent password is also set (it works in addition).
+    #[serde(default)]
+    pub permanent_set: bool,
     #[serde(default)]
     pub updated_unix: u64,
 }
 
 impl ServiceStatus {
-    pub fn now(id: Option<String>, online: bool, connected: Option<String>, password: Option<String>) -> Self {
+    pub fn now(
+        id: Option<String>,
+        online: bool,
+        connected: Option<String>,
+        password: Option<String>,
+        permanent_set: bool,
+    ) -> Self {
         Self {
             id,
             online,
             connected,
             password,
+            permanent_set,
             updated_unix: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         }
     }

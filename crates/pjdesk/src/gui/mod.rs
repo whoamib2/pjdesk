@@ -10,6 +10,7 @@
 mod panels;
 mod settings;
 mod theme;
+mod tray;
 mod widgets;
 
 use std::sync::mpsc::{Receiver, Sender};
@@ -42,13 +43,20 @@ pub fn run(server_flag: Option<String>) -> Result<()> {
             .with_inner_size([940.0, 620.0])
             .with_min_inner_size([760.0, 520.0])
             .with_title("PJDesk")
-            .with_app_id("pjdesk"),
+            .with_app_id("pjdesk")
+            .with_icon(std::sync::Arc::new(app_icon())),
         renderer: preferred_renderer(),
         ..Default::default()
     };
 
     eframe::run_native("PJDesk", options, Box::new(|cc| Ok(Box::new(App::new(cc, config)))))
         .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The window/taskbar icon, decoded from a raw 256×256 RGBA blob so no image
+/// decoder is needed at runtime.
+fn app_icon() -> egui::IconData {
+    egui::IconData { rgba: include_bytes!("../../assets/icon_256.rgba").to_vec(), width: 256, height: 256 }
 }
 
 /// wgpu renders correctly on the broadest range of Windows GPUs here; glow is a
@@ -141,6 +149,8 @@ pub struct App {
 
     /// Reveal this computer's host password in the UI (masked by default).
     show_password: bool,
+    /// Input for setting a permanent password from the share panel.
+    perm_input: String,
 
     // Account sign-in.
     show_login: bool,
@@ -159,6 +169,14 @@ pub struct App {
 
     status: String,
     toast: widgets::Toast,
+    /// System-tray icon (minimize-to-tray); `None` if the system has no tray.
+    tray: Option<tray::Tray>,
+    /// The app logo texture, shown in the header.
+    logo: Option<egui::TextureHandle>,
+    /// Set when the user picks Quit from the tray, so the close isn't trapped.
+    really_quit: bool,
+    /// Whether we've shown the "still running in the tray" hint once.
+    told_tray: bool,
     last_service_check: std::time::Instant,
     /// Cached service status, refreshed on a timer so we don't read the status
     /// file from disk on every repaint (which makes typing feel laggy).
@@ -178,6 +196,7 @@ impl App {
             connect_password: String::new(),
             remember: false,
             show_password: false,
+            perm_input: String::new(),
             show_login: false,
             login_user: String::new(),
             login_pass: String::new(),
@@ -189,6 +208,14 @@ impl App {
             book_target: None,
             status: String::new(),
             toast: widgets::Toast::default(),
+            tray: tray::Tray::new(&cc.egui_ctx),
+            logo: Some(cc.egui_ctx.load_texture(
+                "pjdesk-logo",
+                egui::ColorImage::from_rgba_unmultiplied([256, 256], include_bytes!("../../assets/icon_256.rgba")),
+                egui::TextureOptions::LINEAR,
+            )),
+            really_quit: false,
+            told_tray: false,
             last_service_check: std::time::Instant::now(),
             svc_status: crate::syspaths::ServiceStatus::load().unwrap_or_default(),
             svc_status_at: std::time::Instant::now(),
@@ -212,10 +239,27 @@ impl App {
         }
     }
 
-    /// Switches this computer from a permanent password to a rotating one-time
-    /// password (shown in the app), clearing the permanent one everywhere it's
-    /// stored and restarting hosting so a fresh one-time password is shown.
-    fn use_one_time_password(&mut self) {
+    /// Sets a permanent password (kept in addition to the one-time password —
+    /// both let a controller in). Applies to the service too when it's hosting.
+    fn set_permanent_password(&mut self, pw: &str) {
+        let pw = pw.trim();
+        if pw.is_empty() {
+            return;
+        }
+        self.cfg.settings.set_permanent_password(Some(pw));
+        self.save_cfg();
+        if crate::service::status().0 {
+            crate::platform::run_elevated(&["service", "configure", "--password", pw]);
+        }
+        let cfg = self.cfg.clone();
+        self.engine.restart(&cfg);
+        self.perm_input.clear();
+        self.toast.show("Permanent password set");
+    }
+
+    /// Removes the permanent password, leaving only the rotating one-time
+    /// password. Clears it everywhere it's stored and restarts hosting.
+    fn remove_permanent_password(&mut self) {
         self.cfg.settings.set_permanent_password(None);
         self.save_cfg();
         // If the background service is the one hosting, clear its password too.
@@ -224,8 +268,7 @@ impl App {
         }
         let cfg = self.cfg.clone();
         self.engine.restart(&cfg);
-        self.show_password = false;
-        self.toast.show("Switched to a one-time password");
+        self.toast.show("Permanent password removed");
     }
 
     // --- Account ----------------------------------------------------------
@@ -419,6 +462,31 @@ impl eframe::App for App {
             self.svc_status = crate::syspaths::ServiceStatus::load().unwrap_or_default();
         }
         let ctx = ui.ctx().clone();
+
+        // System tray: Show/Quit, and hide-to-tray when the window is closed.
+        let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        let has_tray = self.tray.is_some();
+        for action in tray_actions {
+            match action {
+                tray::Action::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                tray::Action::Quit => {
+                    self.really_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if has_tray && !self.really_quit && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if !self.told_tray {
+                self.told_tray = true;
+                self.toast.show("PJDesk is still running — click the tray icon, or right-click it to Quit");
+            }
+        }
+
         // Keep status (online/connected) fresh.
         ctx.request_repaint_after(Duration::from_millis(400));
 

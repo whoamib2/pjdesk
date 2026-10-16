@@ -41,29 +41,59 @@ fn channel_binding(connection: &Connection) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Controller side: prove we know the host's password.
+/// Number of password slots the controller offers — enough for the host's
+/// permanent and one-time passwords. The controller uses its single typed
+/// password in every slot; the host tests one of its passwords per slot.
+const AUTH_SLOTS: usize = 2;
+
+/// Controller side: prove we know one of the host's passwords.
 pub async fn controller_auth(connection: &Connection, password: &str, my_name: &str) -> Result<Authenticated> {
     let (mut send, mut recv) = connection.open_bi().await?;
     let binding = channel_binding(connection)?;
-    let (exchange, spake) = auth::controller_start(password);
-    write_msg(&mut send, &AuthMsg::Start { proto: PROTOCOL_VERSION, spake, controller_name: my_name.into() }).await?;
+
+    // One independent SPAKE2 exchange per slot, all with the typed password.
+    let mut exchanges = Vec::with_capacity(AUTH_SLOTS);
+    let mut spakes = Vec::with_capacity(AUTH_SLOTS);
+    for _ in 0..AUTH_SLOTS {
+        let (exchange, spake) = auth::controller_start(password);
+        exchanges.push(exchange);
+        spakes.push(spake);
+    }
+    write_msg(&mut send, &AuthMsg::Start { proto: PROTOCOL_VERSION, spakes, controller_name: my_name.into() }).await?;
 
     let reply: AuthMsg = timeout(Duration::from_secs(15), read_msg(&mut recv, MAX_CONTROL_FRAME))
         .await
         .context("the host did not answer")??;
-    let (host_spake, host_confirm) = match reply {
-        AuthMsg::Challenge { spake, confirm } => (spake, confirm),
+    let (host_spakes, host_confirms) = match reply {
+        AuthMsg::Challenge { spakes, confirms } => (spakes, confirms),
         AuthMsg::Result { ok: false, message, .. } => bail!("the host refused the connection: {message}"),
         other => bail!("unexpected message from the host: {other:?}"),
     };
-    let key = exchange.finish(&host_spake)?;
-    if !key.verify_host(&binding, &host_confirm) {
-        // Tell the host (so it counts the failed attempt), then give up.
-        let _ = write_msg(&mut send, &AuthMsg::Confirm { confirm: [0; 32] }).await;
-        let _ = send.finish();
-        return Err(WrongPassword.into());
+
+    // Find the slot whose confirmation verifies: that's the host password our
+    // typed password matched (permanent or one-time).
+    let mut matched: Option<(usize, auth::SessionKey)> = None;
+    for (i, exchange) in exchanges.into_iter().enumerate() {
+        if i >= host_spakes.len() || i >= host_confirms.len() {
+            break;
+        }
+        if let Ok(key) = exchange.finish(&host_spakes[i]) {
+            if key.verify_host(&binding, &host_confirms[i]) {
+                matched = Some((i, key));
+                break;
+            }
+        }
     }
-    write_msg(&mut send, &AuthMsg::Confirm { confirm: key.controller_confirm(&binding) }).await?;
+    let (slot, key) = match matched {
+        Some(m) => m,
+        None => {
+            // Tell the host (so it counts the failed attempt), then give up.
+            let _ = write_msg(&mut send, &AuthMsg::Confirm { slot: 0xFF, confirm: [0; 32] }).await;
+            let _ = send.finish();
+            return Err(WrongPassword.into());
+        }
+    };
+    write_msg(&mut send, &AuthMsg::Confirm { slot: slot as u8, confirm: key.controller_confirm(&binding) }).await?;
 
     let verdict: AuthMsg = timeout(Duration::from_secs(15), read_msg(&mut recv, MAX_CONTROL_FRAME))
         .await
@@ -82,7 +112,7 @@ pub async fn controller_auth(connection: &Connection, password: &str, my_name: &
 /// gets a SPAKE2 reply (each reply lets the peer test exactly one guess).
 pub async fn host_auth(
     connection: &Connection,
-    password: &str,
+    passwords: &[String],
     my_name: &str,
     attempt_used: &AtomicBool,
 ) -> Result<Authenticated> {
@@ -92,8 +122,8 @@ pub async fn host_auth(
     let start: AuthMsg = timeout(Duration::from_secs(10), read_msg(&mut recv, MAX_CONTROL_FRAME))
         .await
         .context("the controller did not start authentication")??;
-    let (proto, controller_spake, controller_name) = match start {
-        AuthMsg::Start { proto, spake, controller_name } => (proto, spake, controller_name),
+    let (proto, controller_spakes, controller_name) = match start {
+        AuthMsg::Start { proto, spakes, controller_name } => (proto, spakes, controller_name),
         other => bail!("unexpected message from the controller: {other:?}"),
     };
     if proto != PROTOCOL_VERSION {
@@ -109,17 +139,32 @@ pub async fn host_auth(
     }
 
     let binding = channel_binding(connection)?;
-    let (exchange, spake) = auth::host_start(password);
-    let key = exchange.finish(&controller_spake)?;
-    write_msg(&mut send, &AuthMsg::Challenge { spake, confirm: key.host_confirm(&binding) }).await?;
+    // Run one SPAKE2 per password the host accepts, each against the matching
+    // controller slot; the controller tells us which one its password verified.
+    let n = passwords.len().min(controller_spakes.len());
+    if n == 0 {
+        bail!("the controller sent no authentication material");
+    }
+    let mut keys = Vec::with_capacity(n);
+    let mut spakes = Vec::with_capacity(n);
+    let mut confirms = Vec::with_capacity(n);
+    for i in 0..n {
+        let (exchange, spake) = auth::host_start(&passwords[i]);
+        let key = exchange.finish(&controller_spakes[i])?;
+        confirms.push(key.host_confirm(&binding));
+        spakes.push(spake);
+        keys.push(key);
+    }
+    write_msg(&mut send, &AuthMsg::Challenge { spakes, confirms }).await?;
 
     // From here on, anything but a valid confirmation counts as a failed
     // password attempt (the controller has already been able to test its guess).
-    let confirm = match timeout(Duration::from_secs(15), read_msg::<_, AuthMsg>(&mut recv, MAX_CONTROL_FRAME)).await {
-        Ok(Ok(AuthMsg::Confirm { confirm })) => confirm,
-        _ => return Err(WrongPassword.into()),
-    };
-    if !key.verify_controller(&binding, &confirm) {
+    let (slot, confirm) =
+        match timeout(Duration::from_secs(15), read_msg::<_, AuthMsg>(&mut recv, MAX_CONTROL_FRAME)).await {
+            Ok(Ok(AuthMsg::Confirm { slot, confirm })) => (slot as usize, confirm),
+            _ => return Err(WrongPassword.into()),
+        };
+    if slot >= keys.len() || !keys[slot].verify_controller(&binding, &confirm) {
         let _ = write_msg(
             &mut send,
             &AuthMsg::Result { ok: false, message: "wrong password".into(), host_name: String::new() },

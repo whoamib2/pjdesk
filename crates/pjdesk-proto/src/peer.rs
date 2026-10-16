@@ -20,14 +20,21 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_VIDEO_FRAME: usize = 16 * 1024 * 1024;
 
 /// Password-authenticated key exchange (see [`crate::auth`]).
+///
+/// The host may accept more than one password at once (a persistent permanent
+/// password and/or a rotating one-time password). The controller therefore
+/// sends one SPAKE2 message per "slot" with the single password it is trying,
+/// and the host replies with one message + confirmation per password it offers;
+/// the controller then names the slot whose confirmation verified.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthMsg {
-    /// Controller → host: SPAKE2 message A.
-    Start { proto: u16, spake: Vec<u8>, controller_name: String },
-    /// Host → controller: SPAKE2 message B plus the host's key confirmation.
-    Challenge { spake: Vec<u8>, confirm: [u8; 32] },
-    /// Controller → host: the controller's key confirmation.
-    Confirm { confirm: [u8; 32] },
+    /// Controller → host: one SPAKE2 message A per candidate slot (same password).
+    Start { proto: u16, spakes: Vec<Vec<u8>>, controller_name: String },
+    /// Host → controller: a SPAKE2 message B + key confirmation for each
+    /// password the host accepts (index-aligned with the controller's slots).
+    Challenge { spakes: Vec<Vec<u8>>, confirms: Vec<[u8; 32]> },
+    /// Controller → host: which slot matched (`0xFF` = none) and its confirmation.
+    Confirm { slot: u8, confirm: [u8; 32] },
     /// Host → controller: final verdict.
     Result { ok: bool, message: String, host_name: String },
 }

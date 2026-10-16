@@ -45,6 +45,8 @@ pub struct HostShared {
     pub connected: Mutex<Option<String>>,
     /// Last error worth showing the user (e.g. can't reach the server).
     pub last_error: Mutex<Option<String>>,
+    /// True when a permanent password is also set (both passwords work).
+    pub permanent_set: AtomicBool,
     /// UI → host: switch to this exact password.
     set_password: Mutex<Option<String>>,
     /// UI → host: pick a fresh random password.
@@ -68,6 +70,9 @@ impl HostShared {
     }
     pub fn is_online(&self) -> bool {
         self.online.load(Ordering::SeqCst)
+    }
+    pub fn permanent_set(&self) -> bool {
+        self.permanent_set.load(Ordering::SeqCst)
     }
     /// Request a specific new password (used by the "set password" field).
     pub fn request_password(&self, password: String) {
@@ -95,8 +100,11 @@ const MAX_PENDING: usize = 3;
 struct HostState {
     /// Certificate for the QUIC connection (its fingerprint goes to controllers).
     identity: TlsIdentity,
+    /// The rotating one-time password, always available and shown in the app.
     password: Mutex<String>,
-    fixed_password: bool,
+    /// An optional permanent password that also authenticates, when the user
+    /// has set one. Both this and the one-time password let a controller in.
+    permanent: Mutex<Option<String>>,
     /// An authenticated controller is connected.
     streaming: AtomicBool,
     /// Sessions being set up (not yet authenticated).
@@ -115,7 +123,20 @@ impl HostState {
     fn publish_password(&self) {
         if let Some(shared) = &self.shared {
             *shared.password.lock().unwrap() = self.password.lock().unwrap().clone();
+            shared.permanent_set.store(self.permanent.lock().unwrap().is_some(), Ordering::SeqCst);
         }
+    }
+
+    /// The passwords a controller may authenticate with: the one-time password
+    /// and, if set, the permanent one (either grants access).
+    fn auth_passwords(&self) -> Vec<String> {
+        let mut pws = vec![self.password.lock().unwrap().clone()];
+        if let Some(p) = self.permanent.lock().unwrap().clone() {
+            if !p.trim().is_empty() && !pws.contains(&p) {
+                pws.push(p);
+            }
+        }
+        pws
     }
 
     /// Applies any password change the UI asked for (regenerate or set).
@@ -160,22 +181,24 @@ impl HostState {
         }
     }
 
-    /// Counts a wrong password. Random passwords are replaced after three
-    /// misses; fixed passwords lock out new sessions for a minute after five.
+    /// Counts a wrong password. The one-time password is replaced every three
+    /// misses (so an overheard or guessed one stops working); if a permanent
+    /// password is also set, sustained misses lock out new sessions for a
+    /// minute to slow brute-forcing it.
     fn record_failure(&self) {
+        let has_permanent = self.permanent.lock().unwrap().is_some();
         let mut failures = self.failures.lock().unwrap();
         failures.count += 1;
-        if !self.fixed_password && failures.count >= 3 {
-            let new_password = generate_password();
-            *self.password.lock().unwrap() = new_password.clone();
-            failures.count = 0;
-            drop(failures);
-            self.publish_password();
-            println!("\nThree wrong passwords — the password is now: {new_password}\n");
-        } else if self.fixed_password && failures.count >= 5 {
+        let rotate = failures.count % 3 == 0;
+        if has_permanent && failures.count >= 6 {
             failures.count = 0;
             failures.locked_until = Some(Instant::now() + Duration::from_secs(60));
-            warn!("Five wrong passwords; refusing connections for one minute");
+            warn!("Too many wrong passwords; refusing connections for one minute");
+        }
+        drop(failures);
+        if rotate {
+            *self.password.lock().unwrap() = generate_password();
+            self.publish_password();
         }
     }
 
@@ -204,8 +227,8 @@ async fn host_main(
 ) -> Result<()> {
     let state = Arc::new(HostState {
         identity: TlsIdentity::generate(PEER_SERVER_NAME)?,
-        password: Mutex::new(args.password.clone().unwrap_or_else(generate_password)),
-        fixed_password: args.password.is_some(),
+        password: Mutex::new(generate_password()),
+        permanent: Mutex::new(args.permanent_password.clone().filter(|p| !p.trim().is_empty())),
         streaming: AtomicBool::new(false),
         pending: AtomicUsize::new(0),
         peer_info_routes: Mutex::new(HashMap::new()),
@@ -279,7 +302,8 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
         config.device_id = Some(device_id.clone());
         config.save()?;
     }
-    print_banner(&device_id, &state.password.lock().unwrap(), state.fixed_password, server);
+    let has_permanent = state.permanent.lock().unwrap().is_some();
+    print_banner(&device_id, &state.password.lock().unwrap(), has_permanent, server);
     crate::HOST_ONLINE.store(true, Ordering::SeqCst);
     if let Some(shared) = &state.shared {
         *shared.id.lock().unwrap() = Some(device_id.clone());
@@ -344,7 +368,7 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
     }
 }
 
-fn print_banner(id: &str, _password: &str, fixed: bool, server: &ServerAddr) {
+fn print_banner(id: &str, _password: &str, has_permanent: bool, server: &ServerAddr) {
     // The password is deliberately NOT printed here: this text can reach the
     // service log and the console, so the password is shown only in the app
     // window (masked, with a reveal button).
@@ -352,7 +376,7 @@ fn print_banner(id: &str, _password: &str, fixed: bool, server: &ServerAddr) {
     println!("  ==================================================");
     println!("    This computer can now be controlled remotely");
     println!("      ID       : {}", format_id(id));
-    println!("      Password : {} (shown in the PJDesk window)", if fixed { "set" } else { "one-time" });
+    println!("      Password : {} (shown in the PJDesk window)", if has_permanent { "one-time + permanent" } else { "one-time" });
     println!("      Server   : {server}");
     println!("  ==================================================");
     println!();
@@ -412,8 +436,8 @@ async fn session_inner(
     debug!("controller candidates: {targets:?}");
     let punching = p2p::spawn_punching(binding.punch_socket, targets, session_id, Duration::from_secs(8));
 
-    let password = state.password.lock().unwrap().clone();
-    let accepted = accept_authenticated(&endpoint, &password, &state.name, Duration::from_secs(20)).await;
+    let passwords = state.auth_passwords();
+    let accepted = accept_authenticated(&endpoint, &passwords, &state.name, Duration::from_secs(20)).await;
     punching.abort();
     let (connection, auth) = accepted?;
     state.reset_failures();
@@ -447,7 +471,7 @@ async fn session_inner(
 /// one password attempt is allowed per session.
 async fn accept_authenticated(
     endpoint: &Endpoint,
-    password: &str,
+    passwords: &[String],
     my_name: &str,
     limit: Duration,
 ) -> Result<(Connection, Authenticated)> {
@@ -465,10 +489,10 @@ async fn accept_authenticated(
                     incoming.refuse();
                     continue;
                 }
-                let (password, my_name, attempt_used) = (password.to_owned(), my_name.to_owned(), attempt_used.clone());
+                let (passwords, my_name, attempt_used) = (passwords.to_vec(), my_name.to_owned(), attempt_used.clone());
                 pending.spawn(async move {
                     let connection = incoming.await?;
-                    let auth = session::host_auth(&connection, &password, &my_name, &attempt_used).await?;
+                    let auth = session::host_auth(&connection, &passwords, &my_name, &attempt_used).await?;
                     Ok((connection, auth))
                 });
             }

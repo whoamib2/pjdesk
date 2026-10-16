@@ -330,7 +330,7 @@ mod imp {
             c.kill();
         }
         // Mark offline for the GUI.
-        crate::syspaths::ServiceStatus::now(None, false, None, None).write();
+        crate::syspaths::ServiceStatus::now(None, false, None, None, false).write();
     }
 
     /// A launched helper process we can poll and kill.
@@ -489,9 +489,6 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
     let shared = Arc::new(HostShared::default());
     let mut args = crate::HostArgs::from_settings(&config.settings);
     args.follow_desktop = true;
-    // Only a one-time password is ever published to the GUI; a permanent
-    // password stays encrypted in the config and is never written to status.json.
-    let one_time = config.settings.permanent_password.is_none();
 
     let host_shared = shared.clone();
     std::thread::Builder::new().name("host".into()).spawn(move || {
@@ -501,10 +498,13 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
         }
     })?;
 
-    // Publish status for the GUI until the process is killed.
+    // Publish status for the GUI until the process is killed. The one-time
+    // password is always shown; a permanent password (if set) works too but is
+    // never written here.
     loop {
-        let password = one_time.then(|| shared.password()).filter(|p| !p.is_empty());
-        ServiceStatus::now(shared.id(), shared.is_online(), shared.connected_peer(), password).write();
+        let password = Some(shared.password()).filter(|p| !p.is_empty());
+        ServiceStatus::now(shared.id(), shared.is_online(), shared.connected_peer(), password, shared.permanent_set())
+            .write();
         std::thread::sleep(Duration::from_secs(2));
     }
 }

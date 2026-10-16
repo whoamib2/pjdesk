@@ -121,6 +121,55 @@ mod tests {
         assert_eq!(run("pw", "pw", b"chan-a", b"chan-b"), (false, false));
     }
 
+    /// Simulates the multi-slot handshake: the controller offers two exchanges
+    /// with one password; the host tests each of its passwords against a slot.
+    #[test]
+    fn dual_password_matches_either_slot() {
+        let binding = b"chan";
+        let cases: &[(&[&str], &str, Option<usize>)] = &[
+            (&["onetimeaa", "permpass1"], "onetimeaa", Some(0)),
+            (&["onetimeaa", "permpass1"], "permpass1", Some(1)),
+            (&["onetimeaa", "permpass1"], "wrongpw", None),
+            (&["onetimeaa"], "onetimeaa", Some(0)),
+            (&["onetimeaa"], "wrongpw", None),
+        ];
+        for (host_pws, ctrl_pw, expect) in cases {
+            const SLOTS: usize = 2;
+            let (mut ctrl_ex, mut ctrl_msgs) = (Vec::new(), Vec::new());
+            for _ in 0..SLOTS {
+                let (ex, msg) = controller_start(ctrl_pw);
+                ctrl_ex.push(ex);
+                ctrl_msgs.push(msg);
+            }
+            let n = host_pws.len().min(ctrl_msgs.len());
+            let (mut host_keys, mut host_msgs, mut host_confirms) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..n {
+                let (ex, msg) = host_start(host_pws[i]);
+                let key = ex.finish(&ctrl_msgs[i]).unwrap();
+                host_confirms.push(key.host_confirm(binding));
+                host_msgs.push(msg);
+                host_keys.push(key);
+            }
+            let mut matched = None;
+            for (i, ex) in ctrl_ex.into_iter().enumerate() {
+                if i >= host_msgs.len() {
+                    break;
+                }
+                if let Ok(key) = ex.finish(&host_msgs[i]) {
+                    if key.verify_host(binding, &host_confirms[i]) {
+                        matched = Some((i, key));
+                        break;
+                    }
+                }
+            }
+            assert_eq!(matched.as_ref().map(|(i, _)| *i), *expect, "ctrl_pw={ctrl_pw}");
+            if let Some((slot, ckey)) = matched {
+                let cconfirm = ckey.controller_confirm(binding);
+                assert!(host_keys[slot].verify_controller(binding, &cconfirm), "host verify ctrl_pw={ctrl_pw}");
+            }
+        }
+    }
+
     #[test]
     fn passwords_look_right() {
         let pw = generate_password();

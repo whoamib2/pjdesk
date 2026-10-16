@@ -67,3 +67,9 @@ features = [
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
+# System-tray icon + menu (minimize-to-tray, Show/Quit).
+tray-icon = "0.26"
+
+[build-dependencies]
+# Embeds the app icon + version metadata into the Windows .exe.
+winresource = "0.1"

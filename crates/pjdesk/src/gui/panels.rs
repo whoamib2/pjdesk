@@ -11,7 +11,12 @@ impl App {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(RichText::new("◆").size(16.0).color(theme::ACCENT));
+            if let Some(logo) = &self.logo {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(logo.id(), egui::vec2(24.0, 24.0))));
+                ui.add_space(2.0);
+            } else {
+                ui.label(RichText::new("◆").size(16.0).color(theme::ACCENT));
+            }
             ui.label(RichText::new("PJDesk").size(20.0).strong().color(Color32::WHITE));
             ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(theme::MUTED).size(12.0));
 
@@ -87,24 +92,20 @@ impl App {
 
             ui.add_space(8.0);
 
-            // A permanent password is one you set yourself in Settings, so it's
-            // never revealed here — only ever masked, and it can't be copied off
-            // this screen. The one-time password can be revealed, since you have
-            // to read it out to whoever is connecting.
-            let permanent = self.cfg.settings.permanent_password.is_some();
-            ui.label(RichText::new(if permanent { "Password (permanent)" } else { "One-time password" }).color(theme::MUTED).size(12.0));
+            // The one-time password is always available and shown here (you read
+            // it out to whoever is connecting). A permanent password, if set,
+            // also works but is never shown.
+            ui.label(RichText::new("One-time password").color(theme::MUTED).size(12.0));
             ui.horizontal(|ui| {
                 let shown = if password.is_empty() {
                     "…".to_string()
-                } else if permanent {
-                    "•".repeat(10)
                 } else if self.show_password {
                     password.clone()
                 } else {
                     "•".repeat(password.chars().count().max(6))
                 };
                 ui.label(RichText::new(shown).size(20.0).monospace().color(Color32::WHITE));
-                if !password.is_empty() && !permanent {
+                if !password.is_empty() {
                     let eye = if self.show_password { "🙈" } else { "👁" };
                     if ui.button(eye).on_hover_text(if self.show_password { "Hide" } else { "Reveal" }).clicked() {
                         self.show_password = !self.show_password;
@@ -112,26 +113,52 @@ impl App {
                     if ui.button("⧉").on_hover_text("Copy password").clicked() && widgets::copy_to_clipboard(&password) {
                         self.toast.show("Password copied");
                     }
-                    if ui.button("🔄").on_hover_text("New random password").clicked() {
+                    if ui.button("🔄").on_hover_text("New one-time password").clicked() {
                         shared.request_regenerate();
                     }
                 }
             });
-            if permanent {
-                ui.label(RichText::new("Hidden for security — set or change it in Settings ▸ Security.").color(theme::MUTED).size(11.0));
-                ui.add_space(5.0);
-                if ui.button("Use a one-time password instead").clicked() {
-                    self.use_one_time_password();
-                }
-            }
+
+            let permanent = self.cfg.settings.permanent_password.is_some();
+            self.permanent_password_row(ui, permanent);
 
             ui.add_space(10.0);
             ui.label(
-                RichText::new("Give your ID and password to someone to let them control this computer.")
+                RichText::new("Give your ID and the one-time password to let someone in. A permanent password, if set, works too.")
                     .color(theme::MUTED)
                     .size(12.0),
             );
         });
+    }
+
+    /// A compact permanent-password control, shared by both share panels. When
+    /// one is set it shows a Remove button; otherwise a field to set one. The
+    /// permanent password works in addition to the one-time password.
+    fn permanent_password_row(&mut self, ui: &mut egui::Ui, is_set: bool) {
+        ui.add_space(8.0);
+        if is_set {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("🔒 Permanent password set").color(theme::OK).size(12.0));
+                if ui.small_button("Remove").on_hover_text("Stop accepting the permanent password").clicked() {
+                    self.remove_permanent_password();
+                }
+            });
+        } else {
+            ui.label(RichText::new("Permanent password (optional, for unattended access)").color(theme::MUTED).size(12.0));
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.perm_input)
+                        .password(true)
+                        .hint_text("set one…")
+                        .desired_width(200.0),
+                );
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.button("Set").clicked() || enter) && !self.perm_input.trim().is_empty() {
+                    let pw = self.perm_input.clone();
+                    self.set_permanent_password(&pw);
+                }
+            });
+        }
     }
 
     /// Left panel when the background service is doing the hosting.
@@ -164,11 +191,7 @@ impl App {
 
             ui.add_space(8.0);
             let one_time_pw = status.password.clone().filter(|p| !p.is_empty());
-            ui.label(
-                RichText::new(if one_time_pw.is_some() { "One-time password" } else { "Password" })
-                    .color(theme::MUTED)
-                    .size(12.0),
-            );
+            ui.label(RichText::new("One-time password").color(theme::MUTED).size(12.0));
             ui.horizontal(|ui| match &one_time_pw {
                 Some(pw) => {
                     let shown =
@@ -182,27 +205,19 @@ impl App {
                         self.toast.show("Password copied");
                     }
                 }
-                None if fresh && status.online => {
-                    ui.label(RichText::new("•".repeat(10)).size(20.0).monospace().color(Color32::WHITE));
-                }
                 None => {
                     ui.label(RichText::new("…").size(20.0).monospace().color(theme::MUTED));
                 }
             });
 
+            self.permanent_password_row(ui, status.permanent_set);
+
             ui.add_space(10.0);
-            let note = if one_time_pw.is_some() {
-                "Shared by the background service, so it's reachable even at the sign-in screen. Give your ID and this one-time password to let someone in — it changes when the service restarts."
-            } else {
-                "Shared by the background service, so it's reachable even at the sign-in screen. A permanent password is set — change it in Settings ▸ Security."
-            };
-            ui.label(RichText::new(note).color(theme::MUTED).size(12.0));
-            if one_time_pw.is_none() && fresh && status.online {
-                ui.add_space(5.0);
-                if ui.button("Use a one-time password instead").clicked() {
-                    self.use_one_time_password();
-                }
-            }
+            ui.label(
+                RichText::new("Shared by the background service, so it's reachable even at the sign-in screen. Give your ID and the one-time password to let someone in; a permanent password, if set, works too.")
+                    .color(theme::MUTED)
+                    .size(12.0),
+            );
         });
     }
 
