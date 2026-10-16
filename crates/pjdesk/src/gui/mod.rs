@@ -350,6 +350,12 @@ impl App {
         if !password.is_empty() {
             cmd.env("PJDESK_PASSWORD", &password);
         }
+        // Don't let the spawned viewer flash a console window.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         match cmd.spawn() {
             Ok(_) => {
                 self.toast.show(format!("Opening {}", format_id(&id)));

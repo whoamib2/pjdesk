@@ -1,12 +1,17 @@
-//! Draws the remote picture into the window buffer: fit to the window with
-//! the aspect ratio kept (letterboxed), 1:1 copy when sizes match, bilinear
-//! scaling otherwise.
+//! Draws the remote picture into the window buffer.
+//!
+//! The caller decides *where* the picture goes — a [`Layout`] rectangle in
+//! window pixels, which may be smaller than the window (fit / zoomed out,
+//! letterboxed) or larger than it (zoomed in, cropped to what's visible and
+//! panned). [`draw`] renders the frame into that rectangle with bilinear
+//! scaling and fills the rest with the background colour.
 
-/// Where the remote picture sits inside the window, in window pixels.
+/// Where the remote picture sits inside the window, in window pixels. `x`/`y`
+/// may be negative when zoomed in (the picture extends past the top-left).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Layout {
-    pub x: usize,
-    pub y: usize,
+    pub x: i32,
+    pub y: i32,
     pub width: usize,
     pub height: usize,
 }
@@ -20,45 +25,102 @@ pub struct RgbFrame {
     pub pixels: Vec<u32>,
 }
 
-/// Largest rectangle with the picture's aspect ratio that fits the window.
+/// Largest rectangle with the picture's aspect ratio that fits the window
+/// (centred, letterboxed) — the "fit / adaptive" zoom.
 pub fn fit(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Layout {
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return Layout::default();
     }
     let (width, height) = if src_w * dst_h <= dst_w * src_h {
-        // Window is relatively wider: full height.
         ((src_w * dst_h / src_h).clamp(1, dst_w), dst_h)
     } else {
         (dst_w, (src_h * dst_w / src_w).clamp(1, dst_h))
     };
-    Layout { x: (dst_w - width) / 2, y: (dst_h - height) / 2, width, height }
+    Layout { x: ((dst_w - width) / 2) as i32, y: ((dst_h - height) / 2) as i32, width, height }
 }
 
-/// Renders `frame` into `dst` (a `dst_w`×`dst_h` buffer) and returns where it went.
-pub fn draw(frame: &RgbFrame, dst: &mut [u32], dst_w: usize, dst_h: usize) -> Layout {
-    let layout = fit(frame.width, frame.height, dst_w, dst_h);
-    // Letterbox bars.
+/// Places the picture at an explicit scale (`1.0` = 100%, pixel-for-pixel),
+/// centred when it is smaller than the window and panned by `pan` (clamped so
+/// it can't drift off-screen) when it is larger.
+pub fn placement(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize, scale: f32, pan: (i32, i32)) -> Layout {
+    let width = ((src_w as f32 * scale).round() as usize).max(1);
+    let height = ((src_h as f32 * scale).round() as usize).max(1);
+    let x = if width <= dst_w {
+        ((dst_w - width) / 2) as i32
+    } else {
+        pan.0.clamp(dst_w as i32 - width as i32, 0)
+    };
+    let y = if height <= dst_h {
+        ((dst_h - height) / 2) as i32
+    } else {
+        pan.1.clamp(dst_h as i32 - height as i32, 0)
+    };
+    Layout { x, y, width, height }
+}
+
+/// Renders `frame` into the `dst_w`×`dst_h` buffer at `layout`, cropping to the
+/// window and filling everything outside the picture with the background.
+pub fn draw(frame: &RgbFrame, dst: &mut [u32], dst_w: usize, dst_h: usize, layout: Layout) {
+    if frame.width == 0 || frame.height == 0 || layout.width == 0 || layout.height == 0 {
+        dst[..dst_w * dst_h].fill(BACKGROUND);
+        return;
+    }
+    // Visible slice of the picture, in window pixels.
+    let vx0 = layout.x.max(0) as usize;
+    let vy0 = layout.y.max(0) as usize;
+    let vx1 = (layout.x + layout.width as i32).clamp(0, dst_w as i32) as usize;
+    let vy1 = (layout.y + layout.height as i32).clamp(0, dst_h as i32) as usize;
+
+    // Background: whole rows above/below the picture, and the side margins.
     for (row, line) in dst.chunks_exact_mut(dst_w).enumerate().take(dst_h) {
-        if row < layout.y || row >= layout.y + layout.height {
+        if row < vy0 || row >= vy1 {
             line.fill(BACKGROUND);
         } else {
-            line[..layout.x].fill(BACKGROUND);
-            line[layout.x + layout.width..].fill(BACKGROUND);
+            line[..vx0.min(dst_w)].fill(BACKGROUND);
+            line[vx1.min(dst_w)..].fill(BACKGROUND);
         }
     }
-    if layout.width == 0 {
-        return layout;
+    if vx1 <= vx0 || vy1 <= vy0 {
+        return;
     }
 
-    if layout.width == frame.width && layout.height == frame.height {
-        for row in 0..layout.height {
-            let start = (layout.y + row) * dst_w + layout.x;
-            dst[start..start + layout.width].copy_from_slice(&frame.pixels[row * frame.width..(row + 1) * frame.width]);
-        }
+    let (sw, sh) = (frame.width, frame.height);
+    // Per visible column, the two source columns and the blend weight.
+    let columns: Vec<(usize, usize, u32)> = (vx0..vx1)
+        .map(|dx| {
+            let (x0, fx) = source_at(dx as i32 - layout.x, layout.width, sw);
+            (x0, (x0 + 1).min(sw - 1), fx)
+        })
+        .collect();
+
+    let visible_w = vx1 - vx0;
+    let visible_h = vy1 - vy0;
+    let threads = if visible_w * visible_h >= 640 * 480 {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 4)
     } else {
-        scale_bilinear(frame, dst, dst_w, layout);
-    }
-    layout
+        1
+    };
+    let rows_per_chunk = visible_h.div_ceil(threads);
+    let band = &mut dst[vy0 * dst_w..vy1 * dst_w];
+    let columns = &columns;
+    std::thread::scope(|scope| {
+        for (chunk_index, chunk) in band.chunks_mut(rows_per_chunk * dst_w).enumerate() {
+            scope.spawn(move || {
+                for (r, line) in chunk.chunks_exact_mut(dst_w).enumerate() {
+                    let dy = vy0 + chunk_index * rows_per_chunk + r;
+                    let (y0, fy) = source_at(dy as i32 - layout.y, layout.height, sh);
+                    let y1 = (y0 + 1).min(sh - 1);
+                    let top = &frame.pixels[y0 * sw..(y0 + 1) * sw];
+                    let bottom = &frame.pixels[y1 * sw..(y1 + 1) * sw];
+                    for (dx, &(x0, x1, fx)) in (vx0..vx1).zip(columns) {
+                        let upper = lerp(top[x0], top[x1], fx);
+                        let lower = lerp(bottom[x0], bottom[x1], fx);
+                        line[dx] = lerp(upper, lower, fy);
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// Blends two 0RGB pixels: `t` in 0..=256 is the weight of `b`.
@@ -69,53 +131,14 @@ fn lerp(a: u32, b: u32, t: u32) -> u32 {
     rb | g
 }
 
-/// Maps destination index `i` of `dst_len` to a source position in 16.16 fixed point.
+/// Maps destination offset `i` (within a picture `dst_len` pixels tall/wide) to
+/// a source pixel and blend weight, sampling at pixel centres.
 #[inline(always)]
-fn source_pos(i: usize, dst_len: usize, src_len: usize) -> (usize, u32) {
-    // Sample at pixel centers: (i + 0.5) * src/dst - 0.5
-    let pos = (((2 * i + 1) * src_len) << 16) / (2 * dst_len);
-    let pos = pos.saturating_sub(1 << 15);
-    let whole = (pos >> 16).min(src_len - 1);
-    let frac = ((pos & 0xFFFF) >> 8) as u32; // 0..=255
-    (whole, frac)
-}
-
-fn scale_bilinear(frame: &RgbFrame, dst: &mut [u32], dst_w: usize, layout: Layout) {
-    let (sw, sh) = (frame.width, frame.height);
-    let columns: Vec<(usize, usize, u32)> = (0..layout.width)
-        .map(|x| {
-            let (x0, fx) = source_pos(x, layout.width, sw);
-            (x0, (x0 + 1).min(sw - 1), fx)
-        })
-        .collect();
-
-    let threads = if layout.width * layout.height >= 640 * 480 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 4)
-    } else {
-        1
-    };
-    let rows_per_chunk = layout.height.div_ceil(threads);
-    let region = &mut dst[layout.y * dst_w..(layout.y + layout.height) * dst_w];
-    let columns = &columns;
-    std::thread::scope(|scope| {
-        for (chunk_index, chunk) in region.chunks_mut(rows_per_chunk * dst_w).enumerate() {
-            scope.spawn(move || {
-                for (r, line) in chunk.chunks_exact_mut(dst_w).enumerate() {
-                    let y = chunk_index * rows_per_chunk + r;
-                    let (y0, fy) = source_pos(y, layout.height, sh);
-                    let y1 = (y0 + 1).min(sh - 1);
-                    let top = &frame.pixels[y0 * sw..(y0 + 1) * sw];
-                    let bottom = &frame.pixels[y1 * sw..(y1 + 1) * sw];
-                    let out = &mut line[layout.x..layout.x + layout.width];
-                    for (pixel, &(x0, x1, fx)) in out.iter_mut().zip(columns) {
-                        let upper = lerp(top[x0], top[x1], fx);
-                        let lower = lerp(bottom[x0], bottom[x1], fx);
-                        *pixel = lerp(upper, lower, fy);
-                    }
-                }
-            });
-        }
-    });
+fn source_at(i: i32, dst_len: usize, src_len: usize) -> (usize, u32) {
+    let pos = ((i as f64 + 0.5) * src_len as f64 / dst_len as f64 - 0.5).max(0.0);
+    let whole = (pos as usize).min(src_len - 1);
+    let frac = ((pos - whole as f64) * 256.0) as u32;
+    (whole, frac.min(256))
 }
 
 #[cfg(test)]
@@ -130,14 +153,38 @@ mod tests {
     }
 
     #[test]
+    fn placement_centres_and_pans() {
+        // Smaller than the window: centred, pan ignored.
+        assert_eq!(placement(100, 100, 400, 400, 1.0, (50, 50)), Layout { x: 150, y: 150, width: 100, height: 100 });
+        // Larger than the window: panned and clamped so an edge can't show gap.
+        let big = placement(100, 100, 200, 200, 4.0, (-1000, 0));
+        assert_eq!((big.width, big.height), (400, 400));
+        assert_eq!(big.x, -200); // clamped to dst_w - width
+        assert_eq!(big.y, 0); // centred pan 0 clamps to top when exactly offered
+    }
+
+    #[test]
     fn draw_letterboxes_and_scales() {
         let frame = RgbFrame { width: 4, height: 2, pixels: vec![0xFF0000; 8] };
         let mut dst = vec![0u32; 8 * 8];
-        let layout = draw(&frame, &mut dst, 8, 8);
+        let layout = fit(4, 2, 8, 8);
         assert_eq!(layout, Layout { x: 0, y: 2, width: 8, height: 4 });
+        draw(&frame, &mut dst, 8, 8, layout);
         assert_eq!(dst[0], BACKGROUND);
         assert_eq!(dst[3 * 8 + 4], 0xFF0000);
         assert_eq!(dst[7 * 8], BACKGROUND);
+    }
+
+    #[test]
+    fn draw_crops_when_zoomed_in() {
+        // 2x zoom of a 4x4 frame into an 8x8 window with the picture shifted
+        // left by 4px: only the right half of the (8x8) scaled picture shows.
+        let frame = RgbFrame { width: 4, height: 4, pixels: vec![0x00FF00; 16] };
+        let mut dst = vec![0u32; 8 * 8];
+        draw(&frame, &mut dst, 8, 8, Layout { x: -4, y: 0, width: 8, height: 8 });
+        assert_eq!(dst[0], 0x00FF00); // left half of the window is inside the picture
+        assert_eq!(dst[3], 0x00FF00);
+        assert_eq!(dst[7], BACKGROUND); // right half is past the left-shifted picture
     }
 
     #[test]

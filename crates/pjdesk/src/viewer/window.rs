@@ -34,7 +34,7 @@ use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
 
 use super::decoder::VideoDecoder;
 use super::render::{self, Layout, RgbFrame};
-use super::toolbar::{self, Action};
+use super::toolbar::{self, Action, Combo};
 use super::{keymap, Link};
 use pjdesk_proto::peer::SpecialCommand;
 
@@ -109,6 +109,8 @@ pub fn run(runtime: Runtime, link: Link) -> Result<()> {
         wheel: (0.0, 0.0),
         closed: false,
         toolbar: toolbar::Toolbar::default(),
+        zoom: Zoom::Fit,
+        pan: (0, 0),
     };
     event_loop.run_app(&mut app)?;
 
@@ -243,6 +245,15 @@ fn decode_loop(
     }
 }
 
+/// How the remote picture is scaled in the window.
+#[derive(Clone, Copy)]
+enum Zoom {
+    /// Fit to the window, keeping aspect ratio (adaptive).
+    Fit,
+    /// An explicit scale (1.0 = pixel-for-pixel).
+    Scale(f32),
+}
+
 struct App {
     title: String,
     window: Option<Rc<Window>>,
@@ -263,6 +274,9 @@ struct App {
     wheel: (f64, f64),
     closed: bool,
     toolbar: super::toolbar::Toolbar,
+    zoom: Zoom,
+    /// Pan offset in window pixels when the picture is zoomed past the window.
+    pan: (i32, i32),
 }
 
 impl App {
@@ -305,12 +319,20 @@ impl App {
         if surface.resize(width, height).is_err() {
             return;
         }
+        let (win_w, win_h) = (size.width as usize, size.height as usize);
         let Ok(mut buffer) = surface.buffer_mut() else { return };
         match &self.current {
-            Some(frame) => self.layout = render::draw(frame, &mut buffer, size.width as usize, size.height as usize),
+            Some(frame) => {
+                let layout = match self.zoom {
+                    Zoom::Fit => render::fit(frame.width, frame.height, win_w, win_h),
+                    Zoom::Scale(scale) => render::placement(frame.width, frame.height, win_w, win_h, scale, self.pan),
+                };
+                self.layout = layout;
+                render::draw(frame, &mut buffer, win_w, win_h, layout);
+            }
             None => buffer.fill(0x00_1e_1e_22),
         }
-        self.toolbar.draw(&mut buffer, size.width as usize, size.height as usize);
+        self.toolbar.draw(&mut buffer, win_w, win_h);
         let _ = buffer.present();
     }
 
@@ -323,16 +345,16 @@ impl App {
                     window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
                 }
             }
-            Action::ActualSize => {
-                if let (Some(window), Some(frame)) = (&self.window, &self.current) {
-                    let _ = window.request_inner_size(PhysicalSize::new(frame.width as u32, frame.height as u32));
-                }
+            Action::ZoomFit => {
+                self.zoom = Zoom::Fit;
+                self.pan = (0, 0);
             }
+            Action::ZoomTo(percent) => self.set_scale(percent as f32 / 100.0),
+            Action::ZoomIn => self.set_scale(self.current_scale() * 1.25),
+            Action::ZoomOut => self.set_scale(self.current_scale() / 1.25),
+            Action::Keys(combo) => self.send_combo(combo),
             Action::Refresh => {
                 let _ = self.control.send(ControlMsg::RequestKeyframe);
-            }
-            Action::CtrlAltDel => {
-                let _ = self.control.send(ControlMsg::Special(SpecialCommand::CtrlAltDel));
             }
             Action::ToggleBlockInput => {
                 self.toolbar.block_input = !self.toolbar.block_input;
@@ -345,6 +367,87 @@ impl App {
             window.request_redraw();
         }
         false
+    }
+
+    /// The scale currently in effect (the live fit scale when fitting).
+    fn current_scale(&self) -> f32 {
+        match self.zoom {
+            Zoom::Scale(s) => s,
+            Zoom::Fit => self.fit_scale(),
+        }
+    }
+
+    /// The scale "fit to window" is using right now.
+    fn fit_scale(&self) -> f32 {
+        let (Some(window), Some(frame)) = (&self.window, &self.current) else { return 1.0 };
+        let size = window.inner_size();
+        (size.width as f32 / frame.width.max(1) as f32).min(size.height as f32 / frame.height.max(1) as f32)
+    }
+
+    fn set_scale(&mut self, scale: f32) {
+        let new = scale.clamp(0.1, 8.0);
+        let old = self.current_scale();
+        let old_zoom = self.zoom;
+        let old_pan = self.pan;
+        // Keep the spot under the window centre fixed as the scale changes.
+        if let (Some(window), Some((fw, fh))) =
+            (self.window.clone(), self.current.as_ref().map(|f| (f.width, f.height)))
+        {
+            let size = window.inner_size();
+            let (ww, wh) = (size.width as i32, size.height as i32);
+            let old_layout = match old_zoom {
+                Zoom::Fit => render::fit(fw, fh, ww as usize, wh as usize),
+                Zoom::Scale(_) => render::placement(fw, fh, ww as usize, wh as usize, old, old_pan),
+            };
+            let cx = (ww / 2 - old_layout.x) as f32 / old_layout.width.max(1) as f32;
+            let cy = (wh / 2 - old_layout.y) as f32 / old_layout.height.max(1) as f32;
+            let niw = (fw as f32 * new) as i32;
+            let nih = (fh as f32 * new) as i32;
+            self.pan = (ww / 2 - (cx * niw as f32) as i32, wh / 2 - (cy * nih as f32) as i32);
+        }
+        self.zoom = Zoom::Scale(new);
+    }
+
+    /// Sends a key combination to the host: presses the keys in order, then
+    /// releases them in reverse. Ctrl+Alt+Del goes through the host's secure
+    /// path, since it can't be injected as plain keystrokes.
+    fn send_combo(&mut self, combo: Combo) {
+        if combo == Combo::CtrlAltDel {
+            let _ = self.control.send(ControlMsg::Special(SpecialCommand::CtrlAltDel));
+            return;
+        }
+        // PC/AT set-1 scan codes; 0xE0__ marks an extended key.
+        const LCTRL: u16 = 0x1D;
+        const LALT: u16 = 0x38;
+        const LSHIFT: u16 = 0x2A;
+        const ESC: u16 = 0x01;
+        const TAB: u16 = 0x0F;
+        const F4: u16 = 0x3E;
+        const D: u16 = 0x20;
+        const E: u16 = 0x12;
+        const L: u16 = 0x26;
+        const LWIN: u16 = 0xE05B;
+        const PRTSC: u16 = 0xE037;
+        let keys: &[u16] = match combo {
+            Combo::Win => &[LWIN],
+            Combo::AltTab => &[LALT, TAB],
+            Combo::CtrlEsc => &[LCTRL, ESC],
+            Combo::WinD => &[LWIN, D],
+            Combo::WinE => &[LWIN, E],
+            Combo::WinL => &[LWIN, L],
+            Combo::TaskMgr => &[LCTRL, LSHIFT, ESC],
+            Combo::AltF4 => &[LALT, F4],
+            Combo::PrintScreen => &[PRTSC],
+            Combo::CtrlAltDel => return,
+        };
+        // Clear anything held locally so modifiers don't pile up on the host.
+        self.release_all();
+        for &scan in keys {
+            self.send(InputEvent::Key { scan, down: true });
+        }
+        for &scan in keys.iter().rev() {
+            self.send(InputEvent::Key { scan, down: false });
+        }
     }
 
     fn on_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
@@ -382,7 +485,7 @@ impl App {
         self.cursor_px = (position.x, position.y);
         // The toolbar reveals near the top; hovering it must not move the
         // remote pointer.
-        if let Some(window) = &self.window {
+        if let Some(window) = self.window.clone() {
             let win_w = window.inner_size().width as usize;
             let was_visible = self.toolbar.is_visible();
             let over_bar = self.toolbar.on_pointer(position.x, position.y, win_w);
@@ -391,6 +494,41 @@ impl App {
             }
             if over_bar {
                 return;
+            }
+        }
+        // When zoomed in past the window, pan to keep the pointer in sight: a
+        // dead-zone near each edge nudges the picture along.
+        if let (Zoom::Scale(_), Some(window)) = (self.zoom, self.window.clone()) {
+            let size = window.inner_size();
+            let (ww, wh) = (size.width as i32, size.height as i32);
+            let (iw, ih) = (self.layout.width as i32, self.layout.height as i32);
+            let mut moved = false;
+            if iw > ww {
+                let margin = ww / 6;
+                let cx = position.x as i32;
+                if cx < margin {
+                    self.pan.0 += margin - cx;
+                    moved = true;
+                } else if cx > ww - margin {
+                    self.pan.0 -= cx - (ww - margin);
+                    moved = true;
+                }
+                self.pan.0 = self.pan.0.clamp(ww - iw, 0);
+            }
+            if ih > wh {
+                let margin = wh / 6;
+                let cy = position.y as i32;
+                if cy < margin {
+                    self.pan.1 += margin - cy;
+                    moved = true;
+                } else if cy > wh - margin {
+                    self.pan.1 -= cy - (wh - margin);
+                    moved = true;
+                }
+                self.pan.1 = self.pan.1.clamp(wh - ih, 0);
+            }
+            if moved {
+                window.request_redraw();
             }
         }
         if self.toolbar.block_input {
@@ -518,12 +656,18 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.on_key(event_loop, event),
             WindowEvent::CursorMoved { position, .. } => self.on_cursor(position),
             WindowEvent::MouseInput { state, button, .. } => {
-                // A click on the toolbar runs its action locally.
+                // Clicks on the toolbar (or its open menu) are handled locally.
                 if button == winit::event::MouseButton::Left {
                     let win_w = self.window.as_ref().map(|w| w.inner_size().width as usize).unwrap_or(0);
-                    if let Some(action) = self.toolbar.hit(self.cursor_px.0, self.cursor_px.1, win_w) {
-                        if state == ElementState::Pressed && self.perform(action) {
-                            event_loop.exit();
+                    if self.toolbar.covers(self.cursor_px.0, self.cursor_px.1, win_w) {
+                        if state == ElementState::Pressed {
+                            if let Some(action) = self.toolbar.click(self.cursor_px.0, self.cursor_px.1, win_w) {
+                                if self.perform(action) {
+                                    event_loop.exit();
+                                }
+                            } else if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
                         }
                         return;
                     }
@@ -542,7 +686,15 @@ impl ApplicationHandler<UserEvent> for App {
                 self.send(InputEvent::MouseButton { button, down: state == ElementState::Pressed });
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if !self.toolbar.block_input {
+                if self.modifiers.control_key() {
+                    // Ctrl + wheel zooms the view locally instead of scrolling
+                    // the remote.
+                    let up = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                        MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+                    };
+                    self.perform(if up { Action::ZoomIn } else { Action::ZoomOut });
+                } else if !self.toolbar.block_input {
                     self.on_wheel(delta);
                 }
             }

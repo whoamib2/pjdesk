@@ -1,34 +1,68 @@
 //! A small control bar drawn over the top of the viewer, like RustDesk's.
 //!
 //! It auto-hides and appears when the pointer is near the top of the window.
-//! Text is rasterized with `ab_glyph` straight into the softbuffer, so the
-//! viewer stays a lightweight winit + softbuffer window.
+//! Two of its buttons ("Zoom" and "Send keys") open drop-down menus. Text is
+//! rasterized with `ab_glyph` straight into the softbuffer, so the viewer stays
+//! a lightweight winit + softbuffer window.
 
 use std::sync::OnceLock;
 
 use ab_glyph::{Font, FontRef, Glyph, ScaleFont};
 
-/// Actions a toolbar button can trigger.
+/// Actions a toolbar button or menu item can trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    /// Fit the picture to the window (adaptive).
+    ZoomFit,
+    /// Set an explicit zoom percentage (100 = pixel-for-pixel).
+    ZoomTo(u16),
+    ZoomIn,
+    ZoomOut,
+    /// Send a key combination to the remote computer.
+    Keys(Combo),
     Fullscreen,
-    ActualSize,
     Refresh,
-    CtrlAltDel,
     ToggleBlockInput,
     Disconnect,
 }
 
+/// Key combinations the "Send keys" menu can send to the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Combo {
+    CtrlAltDel,
+    Win,
+    AltTab,
+    CtrlEsc,
+    WinD,
+    WinE,
+    WinL,
+    TaskMgr,
+    AltF4,
+    PrintScreen,
+}
+
+const BAR_H: f32 = 36.0;
+const ITEM_H: f32 = 28.0;
+const PAD: f32 = 12.0;
+const FONT_PX: f32 = 15.0;
+
+enum Kind {
+    Act(Action),
+    /// Opens the menu at this index in `menus`.
+    Menu(usize),
+}
+
 struct Button {
     label: &'static str,
-    action: Action,
+    kind: Kind,
     x: f32,
     w: f32,
 }
 
-const BAR_H: f32 = 34.0;
-const PAD: f32 = 12.0;
-const FONT_PX: f32 = 15.0;
+struct Menu {
+    items: &'static [(&'static str, Action)],
+    width: f32,
+}
 
 fn font() -> &'static FontRef<'static> {
     static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
@@ -51,35 +85,72 @@ fn text_width(text: &str) -> f32 {
     w
 }
 
+const ZOOM_ITEMS: &[(&str, Action)] = &[
+    ("Fit to window", Action::ZoomFit),
+    ("100%  (actual size)", Action::ZoomTo(100)),
+    ("125%", Action::ZoomTo(125)),
+    ("150%", Action::ZoomTo(150)),
+    ("200%", Action::ZoomTo(200)),
+    ("300%", Action::ZoomTo(300)),
+    ("400%", Action::ZoomTo(400)),
+    ("75%", Action::ZoomTo(75)),
+    ("50%", Action::ZoomTo(50)),
+];
+
+const KEY_ITEMS: &[(&str, Action)] = &[
+    ("Ctrl + Alt + Del", Action::Keys(Combo::CtrlAltDel)),
+    ("Windows key", Action::Keys(Combo::Win)),
+    ("Alt + Tab", Action::Keys(Combo::AltTab)),
+    ("Start menu  (Ctrl+Esc)", Action::Keys(Combo::CtrlEsc)),
+    ("Show desktop  (Win+D)", Action::Keys(Combo::WinD)),
+    ("File Explorer  (Win+E)", Action::Keys(Combo::WinE)),
+    ("Lock screen  (Win+L)", Action::Keys(Combo::WinL)),
+    ("Task Manager", Action::Keys(Combo::TaskMgr)),
+    ("Close window  (Alt+F4)", Action::Keys(Combo::AltF4)),
+    ("Print Screen", Action::Keys(Combo::PrintScreen)),
+];
+
 pub struct Toolbar {
     buttons: Vec<Button>,
+    menus: Vec<Menu>,
     width: f32,
-    /// Shown now (pointer near the top, or pinned open briefly after a move).
+    /// Shown now (pointer near the top, or a menu is open).
     visible: bool,
-    hovered: Option<usize>,
+    hovered_button: Option<usize>,
+    /// Index (into `buttons`) of the button whose menu is open.
+    open: Option<usize>,
+    hovered_item: Option<usize>,
     /// True while input forwarding is suppressed ("view only" from this side).
     pub block_input: bool,
 }
 
 impl Default for Toolbar {
     fn default() -> Self {
-        let labels = [
-            ("Full screen", Action::Fullscreen),
-            ("Actual size", Action::ActualSize),
-            ("Refresh", Action::Refresh),
-            ("Ctrl+Alt+Del", Action::CtrlAltDel),
-            ("Block input", Action::ToggleBlockInput),
-            ("Disconnect", Action::Disconnect),
+        let menus = vec![
+            Menu { items: ZOOM_ITEMS, width: menu_width(ZOOM_ITEMS) },
+            Menu { items: KEY_ITEMS, width: menu_width(KEY_ITEMS) },
+        ];
+        let spec: [(&'static str, Kind); 6] = [
+            ("Zoom \u{25be}", Kind::Menu(0)),
+            ("Send keys \u{25be}", Kind::Menu(1)),
+            ("Full screen", Kind::Act(Action::Fullscreen)),
+            ("Refresh", Kind::Act(Action::Refresh)),
+            ("Block input", Kind::Act(Action::ToggleBlockInput)),
+            ("Disconnect", Kind::Act(Action::Disconnect)),
         ];
         let mut buttons = Vec::new();
         let mut x = PAD;
-        for (label, action) in labels {
+        for (label, kind) in spec {
             let w = text_width(label) + PAD * 2.0;
-            buttons.push(Button { label, action, x, w });
+            buttons.push(Button { label, kind, x, w });
             x += w;
         }
-        Toolbar { buttons, width: x + PAD, visible: false, hovered: None, block_input: false }
+        Toolbar { buttons, menus, width: x + PAD, visible: false, hovered_button: None, open: None, hovered_item: None, block_input: false }
     }
+}
+
+fn menu_width(items: &[(&str, Action)]) -> f32 {
+    items.iter().map(|(l, _)| text_width(l)).fold(0.0_f32, f32::max) + PAD * 3.0
 }
 
 impl Toolbar {
@@ -92,59 +163,150 @@ impl Toolbar {
         self.visible
     }
 
-    /// Updates hover/visibility for a pointer at `(px, py)` in window pixels.
-    /// Returns true if the pointer is over the bar (so the caller shouldn't
-    /// forward that movement to the host).
-    pub fn on_pointer(&mut self, px: f64, py: f64, win_w: usize) -> bool {
-        // Reveal when near the top; hide once the pointer drops below the bar.
-        if py <= BAR_H as f64 + 4.0 {
-            self.visible = true;
-        } else if py > BAR_H as f64 + 48.0 {
-            self.visible = false;
+    fn menu_index(&self, button: usize) -> Option<usize> {
+        match self.buttons[button].kind {
+            Kind::Menu(m) => Some(m),
+            Kind::Act(_) => None,
         }
-        self.hovered = None;
+    }
+
+    /// (left x, top y, width, height) of the currently open menu, if any.
+    fn open_menu_rect(&self, win_w: usize) -> Option<(f32, f32, f32, f32)> {
+        let bi = self.open?;
+        let m = self.menu_index(bi)?;
+        let menu = &self.menus[m];
+        let left = self.bar_x(win_w) + self.buttons[bi].x;
+        let height = menu.items.len() as f32 * ITEM_H;
+        Some((left, BAR_H, menu.width, height))
+    }
+
+    /// Does `(px, py)` fall on the bar or the open menu? (Then the caller must
+    /// not forward that pointer event to the host.)
+    pub fn covers(&self, px: f64, py: f64, win_w: usize) -> bool {
         if !self.visible {
             return false;
         }
         let bx = self.bar_x(win_w) as f64;
         if py <= BAR_H as f64 && px >= bx && px <= bx + self.width as f64 {
-            let local = px - bx;
-            self.hovered = self.buttons.iter().position(|b| local >= b.x as f64 && local < (b.x + b.w) as f64);
             return true;
+        }
+        if let Some((mx, my, mw, mh)) = self.open_menu_rect(win_w) {
+            if px >= mx as f64 && px <= (mx + mw) as f64 && py >= my as f64 && py <= (my + mh) as f64 {
+                return true;
+            }
         }
         false
     }
 
-    /// Returns the action if `(px, py)` falls on a button (for a click).
-    pub fn hit(&self, px: f64, py: f64, win_w: usize) -> Option<Action> {
-        if !self.visible || py > BAR_H as f64 {
+    /// Updates hover/visibility for a pointer at `(px, py)`. Returns true if the
+    /// pointer is over the bar or open menu.
+    pub fn on_pointer(&mut self, px: f64, py: f64, win_w: usize) -> bool {
+        let menu_bottom = self.open_menu_rect(win_w).map(|(_, my, _, mh)| my + mh).unwrap_or(BAR_H);
+        if py <= BAR_H as f64 + 4.0 {
+            self.visible = true;
+        } else if py > menu_bottom as f64 + 24.0 {
+            self.visible = false;
+            self.open = None;
+            self.hovered_button = None;
+            self.hovered_item = None;
+            return false;
+        }
+        self.hovered_button = None;
+        self.hovered_item = None;
+        if !self.visible {
+            return false;
+        }
+        let bx = self.bar_x(win_w) as f64;
+        if py <= BAR_H as f64 {
+            if px >= bx && px <= bx + self.width as f64 {
+                let local = px - bx;
+                self.hovered_button = self.buttons.iter().position(|b| local >= b.x as f64 && local < (b.x + b.w) as f64);
+                return true;
+            }
+            return false;
+        }
+        if let Some((mx, my, mw, mh)) = self.open_menu_rect(win_w) {
+            if px >= mx as f64 && px <= (mx + mw) as f64 && py >= my as f64 && py <= (my + mh) as f64 {
+                self.hovered_item = Some(((py - my as f64) / ITEM_H as f64) as usize);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Handles a left-button press at `(px, py)`. Opens/closes a menu (returns
+    /// `None`) or yields the action to perform.
+    pub fn click(&mut self, px: f64, py: f64, win_w: usize) -> Option<Action> {
+        if !self.visible {
             return None;
         }
         let bx = self.bar_x(win_w) as f64;
-        let local = px - bx;
-        self.buttons.iter().find(|b| local >= b.x as f64 && local < (b.x + b.w) as f64).map(|b| b.action)
+        if py <= BAR_H as f64 {
+            if px >= bx && px <= bx + self.width as f64 {
+                let local = px - bx;
+                if let Some(i) = self.buttons.iter().position(|b| local >= b.x as f64 && local < (b.x + b.w) as f64) {
+                    match self.buttons[i].kind {
+                        Kind::Menu(_) => {
+                            self.open = if self.open == Some(i) { None } else { Some(i) };
+                            return None;
+                        }
+                        Kind::Act(a) => {
+                            self.open = None;
+                            return Some(a);
+                        }
+                    }
+                }
+            }
+            self.open = None;
+            return None;
+        }
+        if let Some((mx, my, mw, mh)) = self.open_menu_rect(win_w) {
+            if px >= mx as f64 && px <= (mx + mw) as f64 && py >= my as f64 && py <= (my + mh) as f64 {
+                let idx = ((py - my as f64) / ITEM_H as f64) as usize;
+                let m = self.menu_index(self.open.unwrap()).unwrap();
+                if let Some(&(_, action)) = self.menus[m].items.get(idx) {
+                    self.open = None;
+                    return Some(action);
+                }
+            }
+        }
+        self.open = None;
+        None
     }
 
-    /// Draws the bar into the ARGB `buf` (if visible).
+    /// Draws the bar (and the open menu) into the ARGB `buf`.
     pub fn draw(&self, buf: &mut [u32], win_w: usize, win_h: usize) {
         if !self.visible || win_h < BAR_H as usize {
             return;
         }
         let bx = self.bar_x(win_w);
-        // Bar background.
-        fill_rect(buf, win_w, win_h, bx, 0.0, self.width, BAR_H, 0xE6_1b_20_28);
+        fill_rect(buf, win_w, win_h, bx, 0.0, self.width, BAR_H, 0xF0_1b_20_28);
         line(buf, win_w, win_h, bx, BAR_H, self.width, 0xFF_2a_30_3b);
 
         for (i, b) in self.buttons.iter().enumerate() {
-            let on = matches!(b.action, Action::ToggleBlockInput) && self.block_input;
-            if self.hovered == Some(i) {
+            let toggled = matches!(b.kind, Kind::Act(Action::ToggleBlockInput)) && self.block_input;
+            let menu_open = self.open == Some(i);
+            if self.hovered_button == Some(i) || menu_open {
                 fill_rect(buf, win_w, win_h, bx + b.x, 3.0, b.w, BAR_H - 6.0, 0xFF_30_38_46);
-            } else if on {
+            } else if toggled {
                 fill_rect(buf, win_w, win_h, bx + b.x, 3.0, b.w, BAR_H - 6.0, 0xFF_3a_2a_2a);
             }
-            let color = if on { 0xFF_f2_b0_3a } else { 0xFF_e8_ec_f2 };
+            let color = if toggled { 0xFF_f2_b0_3a } else { 0xFF_e8_ec_f2 };
             let tw = text_width(b.label);
-            draw_text(buf, win_w, win_h, bx + b.x + (b.w - tw) / 2.0, 22.0, b.label, color);
+            draw_text(buf, win_w, win_h, bx + b.x + (b.w - tw) / 2.0, 23.0, b.label, color);
+        }
+
+        if let (Some((mx, my, mw, mh)), Some(bi)) = (self.open_menu_rect(win_w), self.open) {
+            let m = self.menu_index(bi).unwrap();
+            fill_rect(buf, win_w, win_h, mx, my, mw, mh, 0xF7_22_27_30);
+            line(buf, win_w, win_h, mx, my + mh, mw, 0xFF_2a_30_3b);
+            for (idx, &(label, _)) in self.menus[m].items.iter().enumerate() {
+                let iy = my + idx as f32 * ITEM_H;
+                if self.hovered_item == Some(idx) {
+                    fill_rect(buf, win_w, win_h, mx + 2.0, iy + 2.0, mw - 4.0, ITEM_H - 4.0, 0xFF_32_3b_4a);
+                }
+                draw_text(buf, win_w, win_h, mx + PAD * 1.5, iy + ITEM_H * 0.66, label, 0xFF_e8_ec_f2);
+            }
         }
     }
 }

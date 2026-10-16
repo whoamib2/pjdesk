@@ -337,11 +337,13 @@ fn fatal(message: &str) -> ! {
 #[cfg(windows)]
 fn ensure_console() {
     unsafe {
-        use windows::Win32::System::Console::{AllocConsole, AttachConsole, GetConsoleWindow, ATTACH_PARENT_PROCESS};
+        use windows::Win32::System::Console::{AttachConsole, GetConsoleWindow, ATTACH_PARENT_PROCESS};
         if GetConsoleWindow().0.is_null() {
-            if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
-                let _ = AllocConsole();
-            }
+            // Attach to the launching terminal if there is one, but never
+            // AllocConsole: the app spawns the viewer (`connect`) as a child
+            // process, and allocating a console there popped up a stray command
+            // window every time you started a remote session.
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         }
     }
 }

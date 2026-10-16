@@ -87,19 +87,24 @@ impl App {
 
             ui.add_space(8.0);
 
-            // Password — masked by default; reveal with the eye button.
+            // A permanent password is one you set yourself in Settings, so it's
+            // never revealed here — only ever masked, and it can't be copied off
+            // this screen. The one-time password can be revealed, since you have
+            // to read it out to whoever is connecting.
             let permanent = self.cfg.settings.permanent_password.is_some();
             ui.label(RichText::new(if permanent { "Password (permanent)" } else { "One-time password" }).color(theme::MUTED).size(12.0));
             ui.horizontal(|ui| {
                 let shown = if password.is_empty() {
                     "…".to_string()
+                } else if permanent {
+                    "•".repeat(10)
                 } else if self.show_password {
                     password.clone()
                 } else {
                     "•".repeat(password.chars().count().max(6))
                 };
                 ui.label(RichText::new(shown).size(20.0).monospace().color(Color32::WHITE));
-                if !password.is_empty() {
+                if !password.is_empty() && !permanent {
                     let eye = if self.show_password { "🙈" } else { "👁" };
                     if ui.button(eye).on_hover_text(if self.show_password { "Hide" } else { "Reveal" }).clicked() {
                         self.show_password = !self.show_password;
@@ -107,11 +112,14 @@ impl App {
                     if ui.button("⧉").on_hover_text("Copy password").clicked() && widgets::copy_to_clipboard(&password) {
                         self.toast.show("Password copied");
                     }
-                    if !permanent && ui.button("🔄").on_hover_text("New random password").clicked() {
+                    if ui.button("🔄").on_hover_text("New random password").clicked() {
                         shared.request_regenerate();
                     }
                 }
             });
+            if permanent {
+                ui.label(RichText::new("Hidden for security — set or change it in Settings ▸ Security.").color(theme::MUTED).size(11.0));
+            }
 
             ui.add_space(10.0);
             ui.label(
