@@ -212,6 +212,22 @@ impl App {
         }
     }
 
+    /// Switches this computer from a permanent password to a rotating one-time
+    /// password (shown in the app), clearing the permanent one everywhere it's
+    /// stored and restarting hosting so a fresh one-time password is shown.
+    fn use_one_time_password(&mut self) {
+        self.cfg.settings.set_permanent_password(None);
+        self.save_cfg();
+        // If the background service is the one hosting, clear its password too.
+        if crate::service::status().0 {
+            crate::platform::run_elevated(&["service", "configure", "--clear-password"]);
+        }
+        let cfg = self.cfg.clone();
+        self.engine.restart(&cfg);
+        self.show_password = false;
+        self.toast.show("Switched to a one-time password");
+    }
+
     // --- Account ----------------------------------------------------------
 
     fn start_token_refresh(&mut self) {

@@ -62,6 +62,17 @@ pub fn write_service_config(server: Option<&str>, password: Option<&str>) -> Res
     Ok(effective)
 }
 
+/// Clears the service's permanent password, so it falls back to a rotating
+/// one-time password shown in the app.
+pub fn clear_service_password() -> Result<()> {
+    use crate::config::Config;
+    let path = crate::syspaths::service_config_path();
+    let mut cfg = Config::load_from(&path).unwrap_or_default();
+    cfg.settings.set_permanent_password(None);
+    cfg.save_to(&path)?;
+    Ok(())
+}
+
 // ----------------------------------------------------------------------------
 // Windows implementation
 // ----------------------------------------------------------------------------

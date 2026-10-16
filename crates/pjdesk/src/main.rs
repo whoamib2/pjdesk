@@ -117,6 +117,9 @@ enum ServiceCommand {
         server: Option<String>,
         #[arg(long)]
         password: Option<String>,
+        /// Clear the permanent password so the service uses a one-time password.
+        #[arg(long)]
+        clear_password: bool,
     },
     /// Entry point used by the Windows Service Control Manager.
     #[command(hide = true)]
@@ -307,8 +310,13 @@ fn service_command(cmd: ServiceCommand) -> Result<()> {
         ServiceCommand::Uninstall => service::uninstall(),
         ServiceCommand::Start => service::start(),
         ServiceCommand::Stop => service::stop(),
-        ServiceCommand::Configure { server, password } => {
-            service::write_service_config(server.as_deref(), password.as_deref())?;
+        ServiceCommand::Configure { server, password, clear_password } => {
+            if clear_password {
+                service::clear_service_password()?;
+            }
+            if server.is_some() || password.is_some() {
+                service::write_service_config(server.as_deref(), password.as_deref())?;
+            }
             // Pick up the new config if the service is running.
             if service::status().1 {
                 service::restart()?;

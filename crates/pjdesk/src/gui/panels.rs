@@ -119,6 +119,10 @@ impl App {
             });
             if permanent {
                 ui.label(RichText::new("Hidden for security — set or change it in Settings ▸ Security.").color(theme::MUTED).size(11.0));
+                ui.add_space(5.0);
+                if ui.button("Use a one-time password instead").clicked() {
+                    self.use_one_time_password();
+                }
             }
 
             ui.add_space(10.0);
@@ -193,6 +197,12 @@ impl App {
                 "Shared by the background service, so it's reachable even at the sign-in screen. A permanent password is set — change it in Settings ▸ Security."
             };
             ui.label(RichText::new(note).color(theme::MUTED).size(12.0));
+            if one_time_pw.is_none() && fresh && status.online {
+                ui.add_space(5.0);
+                if ui.button("Use a one-time password instead").clicked() {
+                    self.use_one_time_password();
+                }
+            }
         });
     }
 
