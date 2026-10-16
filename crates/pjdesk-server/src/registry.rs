@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use pjdesk_proto::{format_id, generate_id, is_valid_id};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,12 +54,25 @@ fn now() -> u64 {
 }
 
 impl Registry {
-    /// Loads the registry, or starts an empty one if the file doesn't exist.
+    /// Loads the registry, starting an empty one if the file is missing,
+    /// unreadable or corrupt.
+    ///
+    /// A missing file is normal (first run). An unreadable or corrupt file is
+    /// not fatal either: the registry only maps device IDs to their secrets, so
+    /// starting empty just means devices re-register on their next connect —
+    /// far better than refusing to start. (An earlier permissions bug left
+    /// `devices.json` unreadable and took the whole server down with it.)
     pub fn load(path: PathBuf) -> Result<Self> {
         let data = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?,
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                tracing::warn!("ignoring unreadable device registry {} ({e}); starting empty", path.display());
+                RegistryFile::default()
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => RegistryFile::default(),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            Err(e) => {
+                tracing::warn!("ignoring unreadable device registry {} ({e}); starting empty", path.display());
+                RegistryFile::default()
+            }
         };
         Ok(Self { path, data })
     }

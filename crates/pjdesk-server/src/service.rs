@@ -94,20 +94,27 @@ fn run_service(opts: ServerOpts, data_dir: PathBuf) -> Result<()> {
     result
 }
 
-/// Restricts the data folder (server private key, device registry, log) to
-/// SYSTEM and Administrators; ProgramData is otherwise readable by every user.
+/// Repairs the permissions on the data folder (server key/cert, device
+/// registry, accounts, log) so the server can always read its own files.
 ///
-/// This also repairs a folder an earlier version locked down too tightly: it
-/// reclaims ownership first so the `icacls` grant can rewrite the DACL on
-/// files whose previous ACL left them unreadable even to administrators (the
-/// `server-cert.pem` "Access is denied" that stopped the server from starting).
-/// Every step is best-effort — the server must still come up if it fails.
-pub(crate) fn protect_data_dir(dir: &Path) {
+/// It reclaims ownership of everything under the folder and resets each item to
+/// the permissions it inherits from `%ProgramData%` (SYSTEM and Administrators
+/// full control, Users read). It uses `icacls /reset` rather than
+/// `/inheritance:r /grant`: an earlier version granted
+/// `SYSTEM,Administrators:(OI)(CI)F` recursively, but those container-inherit
+/// flags are invalid on files, so `icacls` stripped each file's inherited
+/// permissions and then failed to add the grant back — leaving an empty DACL
+/// that denied access to everyone, SYSTEM included. That is what made the
+/// service read `devices.json`, hit "Access is denied", and stop. `/reset`
+/// restores the inherited permissions and can never leave an empty DACL. Every
+/// step is best-effort — the server must still come up if it fails.
+pub(crate) fn repair_data_dir(dir: &Path) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let _ = std::fs::create_dir_all(dir);
-    // Take ownership of the folder and everything under it, so the grant below
-    // can rewrite DACLs on any file a stricter earlier ACL orphaned.
+    // Reclaim ownership of the folder and everything under it, so the reset
+    // below can rewrite the permissions on any file an earlier version left
+    // unreadable (owned by SYSTEM with an empty DACL).
     let _ = std::process::Command::new("takeown")
         .arg("/f")
         .arg(dir)
@@ -116,17 +123,17 @@ pub(crate) fn protect_data_dir(dir: &Path) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    // /C keeps going past any single file it can't touch; /T recurses to
-    // existing files so the cert and key pick up the SYSTEM+Administrators grant.
+    // /reset restores the inherited permissions on the folder and, with /T, on
+    // every file under it; /C keeps going past any single file it can't touch.
     let status = std::process::Command::new("icacls")
         .arg(dir)
-        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/C", "/Q"])
+        .args(["/reset", "/T", "/C", "/Q"])
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
     if !matches!(status, Ok(s) if s.success()) {
-        tracing::warn!("could not restrict access to {} ({status:?})", dir.display());
+        tracing::warn!("could not repair permissions on {} ({status:?})", dir.display());
     }
 }
 
@@ -186,7 +193,7 @@ pub fn install(opts: &ServerOpts, data_dir: &Path, firewall: bool) -> Result<()>
     if firewall {
         add_firewall_rule(&exe)?;
     }
-    protect_data_dir(data_dir);
+    repair_data_dir(data_dir);
 
     service.start::<&str>(&[]).context("service installed but failed to start")?;
     println!("Installed and started the \"{DISPLAY_NAME}\" service ({SERVICE_NAME}).");
