@@ -360,6 +360,17 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                         }
                     }
                     ServerMsg::Pong => {}
+                    ServerMsg::UpdateNow => {
+                        info!("Server requested an update; running the update task now");
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::process::CommandExt;
+                            let _ = std::process::Command::new("schtasks")
+                                .args(["/Run", "/TN", crate::service::UPDATE_TASK])
+                                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                                .spawn();
+                        }
+                    }
                     ServerMsg::Error { message, .. } => warn!("Server: {message}"),
                     other => debug!("ignoring {other:?}"),
                 }

@@ -48,6 +48,7 @@ pub struct OnlineHost {
     pub conn_id: u64,
     pub tx: mpsc::UnboundedSender<ServerMsg>,
     pub hostname: String,
+    pub app_version: String,
 }
 
 /// A connection attempt between a controller and a host.
@@ -197,6 +198,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
 
     let relay = tokio::spawn(crate::relay::run(Arc::new(udp), state.clone()));
     let janitor = tokio::spawn(janitor(state.clone()));
+    let fleet = tokio::spawn(fleet_sync(state.clone()));
 
     let accept_loop = async {
         loop {
@@ -224,6 +226,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         r = relay => warn!("UDP relay stopped: {r:?}"),
     }
     janitor.abort();
+    fleet.abort();
     Ok(())
 }
 
@@ -312,11 +315,17 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 return;
             }
             let hostname: String = hostname.chars().take(64).collect();
-            match st.registry.register(device_id.as_deref(), &device_secret, &hostname) {
+            let app_version: String = app_version.chars().take(32).collect();
+            match st.registry.register(device_id.as_deref(), &device_secret, &hostname, &app_version) {
                 Ok(id) => {
                     st.online.insert(
                         id.clone(),
-                        OnlineHost { conn_id: conn.id, tx: conn.tx.clone(), hostname: hostname.clone() },
+                        OnlineHost {
+                            conn_id: conn.id,
+                            tx: conn.tx.clone(),
+                            hostname: hostname.clone(),
+                            app_version: app_version.clone(),
+                        },
                     );
                     conn.host_id = Some(id.clone());
                     conn.send(ServerMsg::Registered { device_id: id.clone() });
@@ -500,6 +509,58 @@ async fn janitor(state: Shared) {
         let mut st = state.lock().unwrap();
         st.sessions.retain(|_, s| s.created.elapsed() < SESSION_TTL);
         st.limiter.sweep();
+    }
+}
+
+/// One online device, published to `online.json` for the management window.
+#[derive(serde::Serialize)]
+struct OnlineInfo {
+    id: String,
+    hostname: String,
+    version: String,
+}
+
+/// Publishes the live set of online devices to `online.json`, and carries out
+/// update requests the management window leaves in `update-requests.json`
+/// (a JSON array of device IDs, or `"*"` for every online device).
+async fn fleet_sync(state: Shared) {
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        tick.tick().await;
+        let (online_path, cmd_path, snapshot) = {
+            let st = state.lock().unwrap();
+            let snapshot: Vec<OnlineInfo> = st
+                .online
+                .iter()
+                .map(|(id, h)| OnlineInfo {
+                    id: id.clone(),
+                    hostname: h.hostname.clone(),
+                    version: h.app_version.clone(),
+                })
+                .collect();
+            (st.data_dir.join("online.json"), st.data_dir.join("update-requests.json"), snapshot)
+        };
+        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
+            let tmp = online_path.with_extension("json.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &online_path);
+            }
+        }
+        if let Ok(bytes) = std::fs::read(&cmd_path) {
+            if let Ok(reqs) = serde_json::from_slice::<Vec<String>>(&bytes) {
+                let st = state.lock().unwrap();
+                for req in &reqs {
+                    if req == "*" {
+                        for h in st.online.values() {
+                            let _ = h.tx.send(ServerMsg::UpdateNow);
+                        }
+                    } else if let Some(h) = st.online.get(req) {
+                        let _ = h.tx.send(ServerMsg::UpdateNow);
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&cmd_path);
+        }
     }
 }
 

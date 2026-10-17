@@ -122,6 +122,9 @@ pub enum ServerMsg {
     Error { code: ErrorCode, message: String },
     /// Keep-alive reply.
     Pong,
+    /// To a host: run your update check now (the server operator asked for it).
+    /// Added in 0.3.3; older clients never receive it.
+    UpdateNow,
 }
 
 /// Machine-readable error categories.

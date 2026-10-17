@@ -22,8 +22,18 @@ struct RegistryFile {
 struct DeviceRecord {
     secret_sha256: String,
     hostname: String,
+    #[serde(default)]
+    app_version: String,
     first_seen: u64,
     last_seen: u64,
+}
+
+/// A registered device, for the management window.
+pub struct DeviceRow {
+    pub id: String,
+    pub hostname: String,
+    pub version: String,
+    pub last_seen: u64,
 }
 
 pub struct Registry {
@@ -81,12 +91,20 @@ impl Registry {
         self.data.devices.len()
     }
 
-    /// Rows for the management window: (id, hostname, last-seen unix seconds),
-    /// most recently seen first.
-    pub fn list(&self) -> Vec<(String, String, u64)> {
-        let mut rows: Vec<_> =
-            self.data.devices.iter().map(|(id, d)| (id.clone(), d.hostname.clone(), d.last_seen)).collect();
-        rows.sort_by(|a, b| b.2.cmp(&a.2));
+    /// Rows for the management window, most recently seen first.
+    pub fn list(&self) -> Vec<DeviceRow> {
+        let mut rows: Vec<DeviceRow> = self
+            .data
+            .devices
+            .iter()
+            .map(|(id, d)| DeviceRow {
+                id: id.clone(),
+                hostname: d.hostname.clone(),
+                version: d.app_version.clone(),
+                last_seen: d.last_seen,
+            })
+            .collect();
+        rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         rows
     }
 
@@ -111,6 +129,7 @@ impl Registry {
         requested: Option<&str>,
         secret: &[u8; 32],
         hostname: &str,
+        app_version: &str,
     ) -> Result<String, RegisterError> {
         let secret_sha256 = hex::encode(Sha256::digest(secret));
         let now = now();
@@ -123,6 +142,7 @@ impl Registry {
                     }
                     record.last_seen = now;
                     record.hostname = hostname.to_string();
+                    record.app_version = app_version.to_string();
                     let id = id.to_string();
                     self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
                     return Ok(id);
@@ -139,7 +159,13 @@ impl Registry {
 
         self.data.devices.insert(
             id.clone(),
-            DeviceRecord { secret_sha256, hostname: hostname.to_string(), first_seen: now, last_seen: now },
+            DeviceRecord {
+                secret_sha256,
+                hostname: hostname.to_string(),
+                app_version: app_version.to_string(),
+                first_seen: now,
+                last_seen: now,
+            },
         );
         self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
         Ok(id)
@@ -167,15 +193,15 @@ mod tests {
 
         let mut reg = Registry::load(path.clone()).unwrap();
         let secret = [1u8; 32];
-        let id = reg.register(None, &secret, "pc").unwrap();
+        let id = reg.register(None, &secret, "pc", "0.3.3").unwrap();
         assert!(is_valid_id(&id));
         // Same secret keeps the ID.
-        assert_eq!(reg.register(Some(&id), &secret, "pc").unwrap(), id);
+        assert_eq!(reg.register(Some(&id), &secret, "pc", "0.3.3").unwrap(), id);
         // Another device cannot take it.
-        assert!(matches!(reg.register(Some(&id), &[2u8; 32], "evil"), Err(RegisterError::Conflict(_))));
+        assert!(matches!(reg.register(Some(&id), &[2u8; 32], "evil", "0.3.3"), Err(RegisterError::Conflict(_))));
         // Survives a reload.
         let mut reg = Registry::load(path.clone()).unwrap();
-        assert_eq!(reg.register(Some(&id), &secret, "pc").unwrap(), id);
+        assert_eq!(reg.register(Some(&id), &secret, "pc", "0.3.3").unwrap(), id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

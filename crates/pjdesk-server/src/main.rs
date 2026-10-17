@@ -16,6 +16,8 @@ mod accounts;
 #[cfg(windows)]
 mod gui;
 mod registry;
+#[cfg(windows)]
+mod tray;
 mod relay;
 mod server;
 #[cfg(windows)]
@@ -63,6 +65,10 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Leave an update request for the running server (used by the window when
+    /// it isn't elevated). TARGET is a device ID, or "*" for every online one.
+    #[command(hide = true)]
+    RequestUpdate { target: String },
     /// Manage user accounts (sign-in for the address book and saved logins).
     #[command(subcommand)]
     Account(AccountCommand),
@@ -169,6 +175,12 @@ fn main() -> Result<()> {
                 Outcome::Found(v) => println!("PJDesk Server {v} is available."),
                 Outcome::Installing(v) => println!("Installing PJDesk Server {v}..."),
             }
+            Ok(())
+        }
+        Some(Command::RequestUpdate { target }) => {
+            std::fs::create_dir_all(&data_dir)?;
+            let targets = vec![target];
+            std::fs::write(data_dir.join("update-requests.json"), serde_json::to_vec(&targets)?)?;
             Ok(())
         }
         Some(Command::Account(cmd)) => account_command(cmd, &data_dir),

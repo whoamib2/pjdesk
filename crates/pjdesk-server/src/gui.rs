@@ -11,8 +11,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use eframe::egui::{self, Color32, RichText};
 
+use std::collections::HashMap;
+
 use crate::accounts::{self, Accounts};
-use crate::registry::Registry;
+use crate::registry::{DeviceRow, Registry};
 
 const ACCENT: Color32 = Color32::from_rgb(0x4d, 0x9b, 0xff);
 const OK: Color32 = Color32::from_rgb(0x3f, 0xcf, 0x6b);
@@ -26,7 +28,12 @@ pub fn run(data_dir: PathBuf, port: u16) -> Result<()> {
             .with_inner_size([760.0, 720.0])
             .with_min_inner_size([620.0, 520.0])
             .with_title("PJDesk Server")
-            .with_app_id("pjdesk-server"),
+            .with_app_id("pjdesk-server")
+            .with_icon(std::sync::Arc::new(egui::IconData {
+                rgba: include_bytes!("../assets/icon_server_256.rgba").to_vec(),
+                width: 256,
+                height: 256,
+            })),
         renderer: match std::env::var("PJDESK_RENDERER").as_deref() {
             Ok("glow") => eframe::Renderer::Glow,
             _ => eframe::Renderer::Wgpu,
@@ -43,7 +50,9 @@ struct App {
     fingerprint: String,
     can_write: bool,
     accounts: Vec<accounts::AccountInfo>,
-    devices: Vec<(String, String, u64)>,
+    devices: Vec<DeviceRow>,
+    /// Live online devices (id → reported version), from the server's online.json.
+    online: HashMap<String, String>,
     log_tail: String,
     status: String,
 
@@ -51,6 +60,9 @@ struct App {
     new_pass: String,
     new_admin: bool,
     last_refresh: std::time::Instant,
+    tray: Option<crate::tray::Tray>,
+    really_quit: bool,
+    told_tray: bool,
 }
 
 impl App {
@@ -63,12 +75,16 @@ impl App {
             can_write: false,
             accounts: Vec::new(),
             devices: Vec::new(),
+            online: HashMap::new(),
             log_tail: String::new(),
             status: String::new(),
             new_user: String::new(),
             new_pass: String::new(),
             new_admin: false,
             last_refresh: std::time::Instant::now(),
+            tray: crate::tray::Tray::new(&cc.egui_ctx),
+            really_quit: false,
+            told_tray: false,
         };
         app.refresh();
         app
@@ -90,6 +106,7 @@ impl App {
         };
         self.accounts = Accounts::load(&self.data_dir).map(|a| a.list()).unwrap_or_default();
         self.devices = Registry::load(self.data_dir.join("devices.json")).map(|r| r.list()).unwrap_or_default();
+        self.online = read_online(&self.data_dir);
         self.log_tail = tail(&self.data_dir.join("server.log"), 40);
     }
 
@@ -110,7 +127,32 @@ impl eframe::App for App {
             self.last_refresh = std::time::Instant::now();
             self.refresh();
         }
-        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        let ctx = ui.ctx().clone();
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+
+        // System tray: Show/Quit, and hide-to-tray when the window is closed.
+        let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        let has_tray = self.tray.is_some();
+        for action in tray_actions {
+            match action {
+                crate::tray::Action::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                crate::tray::Action::Quit => {
+                    self.really_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if has_tray && !self.really_quit && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if !self.told_tray {
+                self.told_tray = true;
+                self.status = "PJDesk Server is still running in the tray — right-click it to Quit.".into();
+            }
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -324,35 +366,83 @@ impl App {
     }
 
     fn devices_card(&mut self, ui: &mut egui::Ui) {
+        let mut remove: Option<String> = None;
+        let mut update: Option<String> = None;
+        let mut update_all = false;
         card(ui, |ui| {
-            heading(ui, &format!("REGISTERED COMPUTERS ({})", self.devices.len()));
+            let online = self.online.len();
+            ui.horizontal(|ui| {
+                heading(ui, &format!("REGISTERED COMPUTERS ({}, {online} online)", self.devices.len()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if online > 0
+                        && ui.small_button("Update all online").on_hover_text("Tell every online computer to update now").clicked()
+                    {
+                        update_all = true;
+                    }
+                });
+            });
             if self.devices.is_empty() {
                 ui.label(RichText::new("No computers have registered yet.").color(MUTED));
             }
-            let mut remove: Option<String> = None;
-            egui::ScrollArea::vertical().max_height(160.0).id_salt("devices").show(ui, |ui| {
-                for (id, hostname, last_seen) in &self.devices {
+            egui::ScrollArea::vertical().max_height(200.0).id_salt("devices").show(ui, |ui| {
+                for d in &self.devices {
+                    let live = self.online.get(&d.id);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(pjdesk_proto::format_id(id)).monospace().color(Color32::WHITE));
-                        ui.label(RichText::new(hostname).color(MUTED));
+                        ui.label(RichText::new(pjdesk_proto::format_id(&d.id)).monospace().color(Color32::WHITE));
+                        ui.label(RichText::new(&d.hostname).color(MUTED));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_enabled_ui(self.can_write, |ui| {
                                 if ui.small_button("Forget").clicked() {
-                                    remove = Some(id.clone());
+                                    remove = Some(d.id.clone());
                                 }
                             });
-                            ui.label(RichText::new(ago(*last_seen)).color(MUTED).size(11.0));
+                            if live.is_some() && ui.small_button("Update").on_hover_text("Update this computer now").clicked() {
+                                update = Some(d.id.clone());
+                            }
+                            let version = live.cloned().unwrap_or_else(|| d.version.clone());
+                            let vtext = if version.is_empty() { "unknown".into() } else { format!("v{version}") };
+                            if live.is_some() {
+                                ui.label(RichText::new(format!("● online · {vtext}")).color(OK).size(11.0));
+                            } else {
+                                ui.label(RichText::new(format!("{vtext} · {}", ago(d.last_seen))).color(MUTED).size(11.0));
+                            }
                         });
                     });
                 }
             });
-            if let Some(id) = remove {
-                if let Ok(mut reg) = Registry::load(self.data_dir.join("devices.json")) {
-                    let _ = reg.remove(&id);
-                    self.refresh();
-                }
-            }
         });
+        if let Some(id) = remove {
+            if let Ok(mut reg) = Registry::load(self.data_dir.join("devices.json")) {
+                let _ = reg.remove(&id);
+                self.refresh();
+            }
+        }
+        if update_all {
+            self.request_update("*");
+        }
+        if let Some(id) = update {
+            self.request_update(&id);
+        }
+    }
+
+    /// Asks the running server to update one device (`"*"` = every online one)
+    /// by leaving a request file it picks up. The data folder is admin-only, so
+    /// this relaunches elevated when the window itself can't write there.
+    fn request_update(&mut self, target: &str) {
+        if self.can_write {
+            match write_update_request(&self.data_dir, target) {
+                Ok(()) => {
+                    self.status = if target == "*" {
+                        "Asked all online computers to update.".into()
+                    } else {
+                        "Asked that computer to update.".into()
+                    }
+                }
+                Err(e) => self.status = format!("Could not write the update request: {e}"),
+            }
+        } else if run_elevated(&["request-update", target]) {
+            self.status = "Sent the update request.".into();
+        }
     }
 
     fn log_card(&mut self, ui: &mut egui::Ui) {
@@ -372,6 +462,37 @@ impl App {
 fn heading(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).color(MUTED).size(12.0).strong());
     ui.add_space(2.0);
+}
+
+/// Reads the server's live online snapshot (id → reported version). Ignores a
+/// stale file (older than ~15 s), which means the server isn't running.
+fn read_online(data_dir: &std::path::Path) -> HashMap<String, String> {
+    #[derive(serde::Deserialize)]
+    struct OnlineInfo {
+        id: String,
+        #[serde(default)]
+        version: String,
+    }
+    let path = data_dir.join("online.json");
+    let fresh = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().map(|e| e.as_secs() <= 15).unwrap_or(false))
+        .unwrap_or(false);
+    if !fresh {
+        return HashMap::new();
+    }
+    std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<OnlineInfo>>(&b).ok())
+        .map(|v| v.into_iter().map(|o| (o.id, o.version)).collect())
+        .unwrap_or_default()
+}
+
+/// Leaves an update request the running server picks up (`"*"` = all online).
+fn write_update_request(data_dir: &std::path::Path, target: &str) -> std::io::Result<()> {
+    let targets = vec![target.to_string()];
+    let bytes = serde_json::to_vec(&targets).unwrap_or_else(|_| b"[]".to_vec());
+    std::fs::write(data_dir.join("update-requests.json"), bytes)
 }
 
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
