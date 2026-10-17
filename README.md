@@ -241,6 +241,46 @@ cd "C:\App Dev\PJDesk\dist"
 
 ---
 
+## Backup server & moving the server
+
+A PJDesk server's identity is a handful of files: its TLS key (which every
+client pins), the user accounts and address books, and the computer list.
+**Cloud Sync** keeps an encrypted copy of them in a Cloudflare R2 bucket (any
+S3-compatible bucket works), so a second server can take over just by
+pointing the server's DNS name at it.
+
+**Set up (main server).** In Cloudflare, create an R2 bucket and an R2 API
+token with *Object Read & Write* on that bucket. In the PJDesk Server window,
+open **Cloud Sync & Backup Server**, choose *This is the main server*, paste
+the S3 endpoint, bucket, access key ID and secret, and click **Start
+syncing**. Then **Copy join code** and keep it somewhere safe (a password
+manager) — it holds the bucket key and the encryption key.
+
+**Add a backup server.** Install PJDesk Server on another computer (another
+location is the point), choose *This is a backup server*, paste the join
+code, and click **Join**. It now has the same key fingerprint, accounts and
+computer IDs, and keeps them current while on standby.
+
+**Switch over** (planned move or outage):
+
+1. At the backup's location, forward TCP + UDP 21200 to it.
+2. Point the DNS name (e.g. `pjdesk.spader.us`) at the backup's public IP.
+   A short TTL (1–5 minutes) makes this quick.
+3. Stop the old server if it's still running.
+
+Computers reconnect within a couple of minutes (a client that hears nothing
+from its server for 70 s reconnects and looks the name up again), keep their
+IDs, and need no changes. Roles are automatic: the server with computers
+connected is *active* and uploads changes (accounts right away, the computer
+list at most every five minutes); a server with none is on *standby* and
+downloads them.
+
+From the command line: `pjdesk-server cloud setup|join|code|status|sync|off`.
+
+The copy is sealed with ChaCha20-Poly1305 under a random key made at setup.
+The sync settings (bucket secret + key) are stored in the server's data
+folder, readable by SYSTEM and Administrators only.
+
 ## Security model
 
 | Layer | Protection |

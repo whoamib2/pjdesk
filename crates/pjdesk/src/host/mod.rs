@@ -316,6 +316,10 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
     let mut ping = tokio::time::interval(Duration::from_secs(25));
     ping.tick().await;
     let mut ui_tick = tokio::time::interval(Duration::from_millis(300));
+    // The server answers every ping. If it goes quiet (its computer died, or
+    // DNS now points to a backup server), reconnect, which looks the server's
+    // name up again.
+    let mut last_heard = std::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -325,12 +329,19 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                 }
                 state.apply_ui_requests();
             }
-            _ = ping.tick() => signal.send(ClientMsg::Ping)?,
+            _ = ping.tick() => {
+                if last_heard.elapsed() > Duration::from_secs(70) {
+                    warn!("No reply from the server for over a minute; reconnecting");
+                    return Ok(());
+                }
+                signal.send(ClientMsg::Ping)?;
+            }
             msg = signal.recv() => {
                 let Some(msg) = msg else {
                     warn!("Lost the connection to the server");
                     return Ok(());
                 };
+                last_heard = std::time::Instant::now();
                 match msg {
                     ServerMsg::IncomingSession { session_id, token, udp_port, controller_name, controller_ip } => {
                         if let Some(reason) = state.refuse_reason() {

@@ -132,6 +132,11 @@ pub(crate) fn repair_data_dir(dir: &Path) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+    // The cloud-sync settings hold the bucket secret: keep them admin-only.
+    let cloud = dir.join(crate::cloud::CONFIG_FILE);
+    if cloud.exists() {
+        crate::cloud::protect(&cloud);
+    }
     if !matches!(status, Ok(s) if s.success()) {
         tracing::warn!("could not repair permissions on {} ({status:?})", dir.display());
     }

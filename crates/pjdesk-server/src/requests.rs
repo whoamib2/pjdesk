@@ -12,6 +12,10 @@ use std::path::Path;
 pub const UPDATE_FILE: &str = "update-requests.json";
 /// Device IDs to forget.
 pub const FORGET_FILE: &str = "forget-requests.json";
+/// Run a cloud sync pass now.
+pub const SYNC_FILE: &str = "sync-requests.json";
+/// Reload the key, accounts and computer list from disk (after joining).
+pub const RELOAD_FILE: &str = "reload-requests.json";
 
 /// Adds `target` to a request file, keeping any not yet picked up.
 pub fn push(data_dir: &Path, file: &str, target: &str) -> std::io::Result<()> {

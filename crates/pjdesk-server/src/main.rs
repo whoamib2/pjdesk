@@ -13,6 +13,7 @@
 //! (`pjdesk-server service install`).
 
 mod accounts;
+mod cloud;
 #[cfg(windows)]
 mod gui;
 mod registry;
@@ -76,6 +77,9 @@ enum Command {
     /// Manage user accounts (sign-in for the address book and saved logins).
     #[command(subcommand)]
     Account(AccountCommand),
+    /// Cloud sync to a Cloudflare R2 bucket, for a backup server.
+    #[command(subcommand)]
+    Cloud(CloudCommand),
     /// Install, remove, start or stop the Windows service.
     #[command(subcommand)]
     Service(ServiceCommand),
@@ -103,6 +107,37 @@ enum AccountCommand {
         #[arg(long)]
         undo: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum CloudCommand {
+    /// Turn on sync as the main server and upload now. Prints the join code
+    /// for backup servers.
+    Setup {
+        /// S3 endpoint from Cloudflare (https://<account-id>.r2.cloudflarestorage.com) or the account ID.
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        bucket: String,
+        #[arg(long)]
+        access_key_id: String,
+        #[arg(long)]
+        secret_access_key: String,
+        /// Replace a copy already in the bucket.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Join as a backup server: download the main server's key, accounts and
+    /// computer list (replacing this server's) and keep them in sync.
+    Join { code: String },
+    /// Print the join code for adding a backup server.
+    Code,
+    /// Show the sync status.
+    Status,
+    /// Sync now.
+    Sync,
+    /// Stop syncing on this server (the copy in the bucket is kept).
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -191,6 +226,7 @@ fn main() -> Result<()> {
             requests::forget_device(&data_dir, &id)
         }
         Some(Command::Account(cmd)) => account_command(cmd, &data_dir),
+        Some(Command::Cloud(cmd)) => cloud_command(cmd, &data_dir),
         Some(Command::Service(cmd)) => service_command(cmd, cli.opts, data_dir),
     }
 }
@@ -265,6 +301,66 @@ fn account_command(cmd: AccountCommand, data_dir: &std::path::Path) -> Result<()
         AccountCommand::Disable { username, undo } => {
             accounts.set_disabled(&username, !undo)?;
             println!("{} \"{}\".", if undo { "Enabled" } else { "Disabled" }, accounts::normalize_username(&username));
+        }
+    }
+    Ok(())
+}
+
+fn cloud_command(cmd: CloudCommand, data_dir: &std::path::Path) -> Result<()> {
+    use cloud::{CloudConfig, CloudStatus};
+    std::fs::create_dir_all(data_dir)?;
+    match cmd {
+        CloudCommand::Setup { endpoint, bucket, access_key_id, secret_access_key, replace } => {
+            let cfg = CloudConfig::new(&endpoint, &bucket, &access_key_id, &secret_access_key)?;
+            if matches!(cloud::check_bucket(&cfg)?, cloud::SetupCheck::Occupied) && !replace {
+                anyhow::bail!(
+                    "bucket \"{}\" already holds a PJDesk server copy. To make this server the main one anyway, \
+                     add --replace; to make it a backup, use `cloud join` with the main server's join code.",
+                    cfg.bucket
+                );
+            }
+            cloud::setup(data_dir, &cfg)?;
+            let _ = requests::push(data_dir, requests::RELOAD_FILE, "now");
+            println!("Cloud sync is on; this server's state is uploaded to \"{}\".", cfg.bucket);
+            println!("\nJoin code for a backup server (keep it like a password):\n\n{}\n", cfg.join_code());
+        }
+        CloudCommand::Join { code } => {
+            let cfg = CloudConfig::from_join_code(&code)?;
+            let from = cloud::join(data_dir, &cfg)?;
+            let _ = requests::push(data_dir, requests::RELOAD_FILE, "now");
+            println!("Joined: this server now has the key, accounts and computer list from {from}, and stays in sync.");
+            if let Some(id) = server::read_identity(data_dir) {
+                println!("Server key fingerprint: {}", pjdesk_proto::tls::format_fingerprint(&id.fingerprint()));
+            }
+        }
+        CloudCommand::Code => match CloudConfig::load(data_dir) {
+            Some(cfg) => println!("{}", cfg.join_code()),
+            None => anyhow::bail!("cloud sync isn't set up on this server"),
+        },
+        CloudCommand::Status => match (CloudConfig::load(data_dir), CloudStatus::load(data_dir)) {
+            (None, _) => println!("Cloud sync is off."),
+            (Some(cfg), status) => {
+                let s = status.unwrap_or_default();
+                println!("Bucket: {} ({})", cfg.bucket, cfg.endpoint);
+                println!("Role: {}", if s.role.is_empty() { "unknown (is the server running?)" } else { &s.role });
+                if s.last_upload_at > 0 {
+                    println!("Last upload: {}", registry::format_local(s.last_upload_at));
+                }
+                if !s.applied_from.is_empty() {
+                    println!("Last synced from: {} ({})", s.applied_from, registry::format_local(s.applied_written_at));
+                }
+                if !s.error.is_empty() {
+                    println!("Error: {}", s.error);
+                }
+            }
+        },
+        CloudCommand::Sync => {
+            requests::push(data_dir, requests::SYNC_FILE, "now")?;
+            println!("Asked the running server to sync now.");
+        }
+        CloudCommand::Off => {
+            cloud::turn_off(data_dir);
+            println!("Cloud sync is off on this server (the copy in the bucket is kept).");
         }
     }
     Ok(())

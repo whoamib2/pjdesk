@@ -5,7 +5,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -200,11 +200,13 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         udp_port: opts.port,
         data_dir: data_dir.clone(),
     }));
-    let acceptor = TlsAcceptor::from(Arc::new(tls::server_config(&identity, ALPN_SIGNAL)?));
+    // Swappable, so a standby server can take on the key it syncs from the cloud.
+    let acceptor = Arc::new(RwLock::new(TlsAcceptor::from(Arc::new(tls::server_config(&identity, ALPN_SIGNAL)?))));
 
     let relay = tokio::spawn(crate::relay::run(Arc::new(udp), state.clone()));
     let janitor = tokio::spawn(janitor(state.clone()));
     let fleet = tokio::spawn(fleet_sync(state.clone()));
+    let cloud = tokio::spawn(cloud_sync(state.clone(), acceptor.clone()));
 
     let accept_loop = async {
         loop {
@@ -216,7 +218,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
                     continue;
                 }
             };
-            let acceptor = acceptor.clone();
+            let acceptor = acceptor.read().unwrap().clone();
             let state = state.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(acceptor, stream, addr, state).await {
@@ -233,6 +235,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     }
     janitor.abort();
     fleet.abort();
+    cloud.abort();
     Ok(())
 }
 
@@ -621,6 +624,60 @@ async fn fleet_sync(state: Shared) {
             }
         }
     }
+}
+
+/// Cloud sync (see [`crate::cloud`]): every 30 s, or when the window asks,
+/// uploads this server's state if it is in use, or takes the newest copy from
+/// the main server if it is on standby — then reloads the key, accounts and
+/// computer list so it is ready to take over.
+async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
+    use crate::cloud::{sync_once, Role};
+    use crate::requests::{take, RELOAD_FILE, SYNC_FILE};
+    const PASS_EVERY: u32 = 15; // ticks of 2 s
+    let data_dir = state.lock().unwrap().data_dir.clone();
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    let mut ticks: u32 = 0;
+    loop {
+        tick.tick().await;
+        ticks = ticks.wrapping_add(1);
+        if !take(&data_dir, RELOAD_FILE).is_empty() {
+            reload_from_disk(&state, &acceptor, &data_dir);
+        }
+        let forced = !take(&data_dir, SYNC_FILE).is_empty();
+        if !forced && ticks % PASS_EVERY != 1 {
+            continue;
+        }
+        let role = if state.lock().unwrap().online.is_empty() { Role::Standby } else { Role::Active };
+        let dir = data_dir.clone();
+        let applied = tokio::task::spawn_blocking(move || sync_once(&dir, role, forced)).await.unwrap_or(false);
+        if applied {
+            reload_from_disk(&state, &acceptor, &data_dir);
+        }
+    }
+}
+
+/// Re-reads the server key, accounts and computer list from the data folder.
+fn reload_from_disk(state: &Shared, acceptor: &RwLock<TlsAcceptor>, data_dir: &Path) {
+    match load_identity(data_dir).and_then(|id| {
+        let fp = tls::format_fingerprint(&id.fingerprint());
+        Ok((TlsAcceptor::from(Arc::new(tls::server_config(&id, ALPN_SIGNAL)?)), fp))
+    }) {
+        Ok((new, fp)) => {
+            *acceptor.write().unwrap() = new;
+            info!("Server key is now {fp}");
+        }
+        Err(e) => warn!("could not reload the server key: {e:#}"),
+    }
+    let mut st = state.lock().unwrap();
+    match Registry::load(data_dir.join("devices.json")) {
+        Ok(reg) => st.registry = reg,
+        Err(e) => warn!("could not reload the computer list: {e:#}"),
+    }
+    match crate::accounts::Accounts::load(data_dir) {
+        Ok(acc) => st.accounts = acc,
+        Err(e) => warn!("could not reload accounts: {e:#}"),
+    }
+    info!("Reloaded {} computers and {} accounts from disk", st.registry.len(), st.accounts.list().len());
 }
 
 /// Fixed-window per-IP rate limiter.

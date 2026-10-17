@@ -24,6 +24,11 @@ argon2 = "0.5"
 rpassword = "7"
 # Local date/time for "last seen" in the management window.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Cloud sync (Cloudflare R2 / S3): HTTPS, request signing, sealing, encoding.
+ureq = { version = "2.10", default-features = false, features = ["tls"] }
+hmac.workspace = true
+ring = "0.17"
+base64 = "0.22"
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 # Management window (same toolkit as the client); Windows-only.
