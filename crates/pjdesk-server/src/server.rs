@@ -1,6 +1,6 @@
 //! Signaling server: registration, ID management and session setup.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,11 @@ pub struct State {
     pub registry: Registry,
     pub accounts: crate::accounts::Accounts,
     pub online: HashMap<String, OnlineHost>,
+    /// Older connections still open for an online ID — normally the app and
+    /// the background service of one computer briefly overlapping while one
+    /// hands over to the other. If the active connection drops, the newest
+    /// still-open one here takes over, so the computer doesn't look offline.
+    pub standby: HashMap<String, Vec<OnlineHost>>,
     pub sessions: HashMap<SessionId, Session>,
     pub limiter: RateLimiter,
     pub udp_port: u16,
@@ -189,6 +194,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         registry,
         accounts,
         online: HashMap::new(),
+        standby: HashMap::new(),
         sessions: HashMap::new(),
         limiter: RateLimiter::default(),
         udp_port: opts.port,
@@ -281,14 +287,36 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
     }
     .await;
 
-    // Clean up: a host that disconnects goes offline (unless it already
-    // reconnected on a newer connection).
+    // Clean up: a host that disconnects goes offline, unless it already
+    // reconnected on a newer connection or another open connection for the
+    // same computer can take over. Either way its last-seen time is saved.
     if let Some(id) = &conn.host_id {
-        let mut st = state.lock().unwrap();
+        let mut guard = state.lock().unwrap();
+        let st = &mut *guard;
         if st.online.get(id).map(|h| h.conn_id) == Some(conn.id) {
             st.online.remove(id);
-            info!("Host {} is offline", format_id(id));
+            let mut replacement = None;
+            if let Some(list) = st.standby.get_mut(id) {
+                while let Some(h) = list.pop() {
+                    if !h.tx.is_closed() {
+                        replacement = Some(h);
+                        break;
+                    }
+                }
+            }
+            match replacement {
+                Some(h) => {
+                    st.online.insert(id.clone(), h);
+                }
+                None => info!("Host {} is offline", format_id(id)),
+            }
+        } else if let Some(list) = st.standby.get_mut(id) {
+            list.retain(|h| h.conn_id != conn.id);
         }
+        if st.standby.get(id).is_some_and(|l| l.is_empty()) {
+            st.standby.remove(id);
+        }
+        st.registry.touch(std::slice::from_ref(id));
     }
     // Give queued replies (e.g. an error) a moment to go out.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -318,18 +346,26 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             let app_version: String = app_version.chars().take(32).collect();
             match st.registry.register(device_id.as_deref(), &device_secret, &hostname, &app_version) {
                 Ok(id) => {
-                    st.online.insert(
-                        id.clone(),
-                        OnlineHost {
-                            conn_id: conn.id,
-                            tx: conn.tx.clone(),
-                            hostname: hostname.clone(),
-                            app_version: app_version.clone(),
-                        },
-                    );
+                    let host = OnlineHost {
+                        conn_id: conn.id,
+                        tx: conn.tx.clone(),
+                        hostname: hostname.clone(),
+                        app_version: app_version.clone(),
+                    };
+                    if let Some(prev) = st.online.insert(id.clone(), host) {
+                        if prev.conn_id != conn.id && !prev.tx.is_closed() {
+                            st.standby.entry(id.clone()).or_default().push(prev);
+                        }
+                    }
                     conn.host_id = Some(id.clone());
                     conn.send(ServerMsg::Registered { device_id: id.clone() });
                     info!("Host {} \"{hostname}\" online from {} (v{app_version})", format_id(&id), conn.addr.ip());
+                    // One record per computer: drop its old, offline records.
+                    let online: HashSet<String> = st.online.keys().cloned().collect();
+                    let removed = st.registry.remove_stale_duplicates(&id, &online);
+                    if removed > 0 {
+                        info!("Removed {removed} old record(s) for \"{hostname}\"; it is {} now", format_id(&id));
+                    }
                 }
                 Err(e) => {
                     warn!("{}: registration refused: {e}", conn.addr);
@@ -509,6 +545,10 @@ async fn janitor(state: Shared) {
         let mut st = state.lock().unwrap();
         st.sessions.retain(|_, s| s.created.elapsed() < SESSION_TTL);
         st.limiter.sweep();
+        st.standby.retain(|_, list| {
+            list.retain(|h| !h.tx.is_closed());
+            !list.is_empty()
+        });
     }
 }
 
@@ -520,15 +560,25 @@ struct OnlineInfo {
     version: String,
 }
 
-/// Publishes the live set of online devices to `online.json`, and carries out
-/// update requests the management window leaves in `update-requests.json`
-/// (a JSON array of device IDs, or `"*"` for every online device).
+/// Publishes the live set of online devices to `online.json`, carries out the
+/// update and forget requests the management window leaves (see
+/// [`crate::requests`]), and once a minute saves the last-seen time of every
+/// connected device so it stays accurate however long they stay online.
 async fn fleet_sync(state: Shared) {
+    use crate::requests::{take, FORGET_FILE, UPDATE_FILE};
+    const TOUCH_EVERY: u32 = 30; // ticks of 2 s
     let mut tick = tokio::time::interval(Duration::from_secs(2));
+    let mut ticks: u32 = 0;
     loop {
         tick.tick().await;
-        let (online_path, cmd_path, snapshot) = {
-            let st = state.lock().unwrap();
+        ticks = ticks.wrapping_add(1);
+        let (data_dir, snapshot) = {
+            let mut guard = state.lock().unwrap();
+            let st = &mut *guard;
+            if ticks % TOUCH_EVERY == 0 {
+                let ids: Vec<String> = st.online.keys().cloned().collect();
+                st.registry.touch(&ids);
+            }
             let snapshot: Vec<OnlineInfo> = st
                 .online
                 .iter()
@@ -538,28 +588,37 @@ async fn fleet_sync(state: Shared) {
                     version: h.app_version.clone(),
                 })
                 .collect();
-            (st.data_dir.join("online.json"), st.data_dir.join("update-requests.json"), snapshot)
+            (st.data_dir.clone(), snapshot)
         };
+        let online_path = data_dir.join("online.json");
         if let Ok(bytes) = serde_json::to_vec(&snapshot) {
             let tmp = online_path.with_extension("json.tmp");
             if std::fs::write(&tmp, bytes).is_ok() {
                 let _ = std::fs::rename(&tmp, &online_path);
             }
         }
-        if let Ok(bytes) = std::fs::read(&cmd_path) {
-            if let Ok(reqs) = serde_json::from_slice::<Vec<String>>(&bytes) {
-                let st = state.lock().unwrap();
-                for req in &reqs {
-                    if req == "*" {
-                        for h in st.online.values() {
-                            let _ = h.tx.send(ServerMsg::UpdateNow);
-                        }
-                    } else if let Some(h) = st.online.get(req) {
-                        let _ = h.tx.send(ServerMsg::UpdateNow);
-                    }
+
+        let updates = take(&data_dir, UPDATE_FILE);
+        let forgets = take(&data_dir, FORGET_FILE);
+        if updates.is_empty() && forgets.is_empty() {
+            continue;
+        }
+        let mut st = state.lock().unwrap();
+        for req in &updates {
+            if req == "*" {
+                for h in st.online.values() {
+                    let _ = h.tx.send(ServerMsg::UpdateNow);
                 }
+            } else if let Some(h) = st.online.get(req) {
+                let _ = h.tx.send(ServerMsg::UpdateNow);
             }
-            let _ = std::fs::remove_file(&cmd_path);
+        }
+        for id in &forgets {
+            if let Err(e) = st.registry.remove(id) {
+                warn!("could not forget {}: {e}", format_id(id));
+            } else {
+                info!("Forgot device {}", format_id(id));
+            }
         }
     }
 }

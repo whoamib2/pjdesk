@@ -14,7 +14,7 @@ use eframe::egui::{self, Color32, RichText};
 use std::collections::HashMap;
 
 use crate::accounts::{self, Accounts};
-use crate::registry::{DeviceRow, Registry};
+use crate::registry::{format_local, DeviceRow, Registry};
 
 const ACCENT: Color32 = Color32::from_rgb(0x4d, 0x9b, 0xff);
 const OK: Color32 = Color32::from_rgb(0x3f, 0xcf, 0x6b);
@@ -391,20 +391,34 @@ impl App {
                         ui.label(RichText::new(pjdesk_proto::format_id(&d.id)).monospace().color(Color32::WHITE));
                         ui.label(RichText::new(&d.hostname).color(MUTED));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_enabled_ui(self.can_write, |ui| {
-                                if ui.small_button("Forget").clicked() {
-                                    remove = Some(d.id.clone());
-                                }
-                            });
+                            if ui
+                                .small_button("Forget")
+                                .on_hover_text("Remove from this list. If this computer connects again, it comes back with the same ID.")
+                                .clicked()
+                            {
+                                remove = Some(d.id.clone());
+                            }
                             if live.is_some() && ui.small_button("Update").on_hover_text("Update this computer now").clicked() {
                                 update = Some(d.id.clone());
                             }
                             let version = live.cloned().unwrap_or_else(|| d.version.clone());
-                            let vtext = if version.is_empty() { "unknown".into() } else { format!("v{version}") };
+                            let vtext = if version.is_empty() { String::new() } else { format!(" · v{version}") };
+                            let details = format!(
+                                "Last seen {} ({})\nFirst registered {}",
+                                format_local(d.last_seen),
+                                ago(d.last_seen),
+                                format_local(d.first_seen)
+                            );
                             if live.is_some() {
-                                ui.label(RichText::new(format!("● online · {vtext}")).color(OK).size(11.0));
+                                ui.label(RichText::new(format!("● online now{vtext}")).color(OK).size(11.0))
+                                    .on_hover_text(details);
                             } else {
-                                ui.label(RichText::new(format!("{vtext} · {}", ago(d.last_seen))).color(MUTED).size(11.0));
+                                ui.label(
+                                    RichText::new(format!("last seen {}{vtext}", format_local(d.last_seen)))
+                                        .color(MUTED)
+                                        .size(11.0),
+                                )
+                                .on_hover_text(details);
                             }
                         });
                     });
@@ -412,10 +426,7 @@ impl App {
             });
         });
         if let Some(id) = remove {
-            if let Ok(mut reg) = Registry::load(self.data_dir.join("devices.json")) {
-                let _ = reg.remove(&id);
-                self.refresh();
-            }
+            self.forget(&id);
         }
         if update_all {
             self.request_update("*");
@@ -423,6 +434,22 @@ impl App {
         if let Some(id) = update {
             self.request_update(&id);
         }
+    }
+
+    /// Forgets a device. Goes through the running server (which keeps the
+    /// device list in memory) so it doesn't write the record back; relaunches
+    /// elevated when the window can't write the admin-only data folder.
+    fn forget(&mut self, id: &str) {
+        let shown = pjdesk_proto::format_id(id);
+        if self.can_write {
+            match crate::requests::forget_device(&self.data_dir, id) {
+                Ok(()) => self.status = format!("Forgot {shown}."),
+                Err(e) => self.status = format!("Could not forget {shown}: {e}"),
+            }
+        } else if run_elevated(&["forget-device", id]) {
+            self.status = format!("Forgot {shown}.");
+        }
+        self.refresh();
     }
 
     /// Asks the running server to update one device (`"*"` = every online one)
@@ -490,9 +517,7 @@ fn read_online(data_dir: &std::path::Path) -> HashMap<String, String> {
 
 /// Leaves an update request the running server picks up (`"*"` = all online).
 fn write_update_request(data_dir: &std::path::Path, target: &str) -> std::io::Result<()> {
-    let targets = vec![target.to_string()];
-    let bytes = serde_json::to_vec(&targets).unwrap_or_else(|_| b"[]".to_vec());
-    std::fs::write(data_dir.join("update-requests.json"), bytes)
+    crate::requests::push(data_dir, crate::requests::UPDATE_FILE, target)
 }
 
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {

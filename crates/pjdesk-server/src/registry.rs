@@ -1,10 +1,12 @@
 //! Persistent device registry: which ID belongs to which device.
 //!
-//! Each host proves ownership of its ID with a random 32-byte secret created
-//! on first run. The server stores only the SHA-256 of that secret, in
-//! `devices.json` inside the data folder.
+//! Each host proves ownership of its ID with a 32-byte secret (since 0.3.1 it
+//! is derived from the computer itself, so the app and the background service
+//! share it). The server stores only the SHA-256 of that secret, in
+//! `devices.json` inside the data folder. The secret is the device's identity:
+//! one secret always maps to one ID, so a computer keeps a single record.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,6 +35,7 @@ pub struct DeviceRow {
     pub id: String,
     pub hostname: String,
     pub version: String,
+    pub first_seen: u64,
     pub last_seen: u64,
 }
 
@@ -101,6 +104,7 @@ impl Registry {
                 id: id.clone(),
                 hostname: d.hostname.clone(),
                 version: d.app_version.clone(),
+                first_seen: d.first_seen,
                 last_seen: d.last_seen,
             })
             .collect();
@@ -108,8 +112,8 @@ impl Registry {
         rows
     }
 
-    /// Forgets a device (the GUI's "remove"). The device can re-register and
-    /// will get a new ID.
+    /// Forgets a device (the window's "Forget"). If that computer connects
+    /// again it gets the same ID back (it still holds the ID and its secret).
     pub fn remove(&mut self, id: &str) -> Result<()> {
         if self.data.devices.remove(id).is_some() {
             self.save()?;
@@ -117,12 +121,17 @@ impl Registry {
         Ok(())
     }
 
-    /// Registers a device. Returns its (possibly newly assigned) ID.
+    /// Registers a device. Returns its ID.
     ///
-    /// * Known ID + matching secret → same ID.
-    /// * Known ID + wrong secret → [`RegisterError::Conflict`].
+    /// * Secret already known → that device's ID, whatever ID (if any) the
+    ///   client asked for. Extra records with the same secret — older servers
+    ///   handed out a fresh ID whenever a config file had none, so the app and
+    ///   the background service could end up with different IDs — are merged
+    ///   into the one kept (the requested ID if it is one of them, otherwise
+    ///   the most recently seen).
+    /// * Known ID + someone else's secret → [`RegisterError::Conflict`].
     /// * Unknown but well-formed ID → claimed (keeps IDs stable if the
-    ///   server's data folder was lost).
+    ///   server's data folder was lost, or the record was forgotten).
     /// * No ID → a fresh random nine-digit ID.
     pub fn register(
         &mut self,
@@ -134,18 +143,39 @@ impl Registry {
         let secret_sha256 = hex::encode(Sha256::digest(secret));
         let now = now();
 
+        let mut owned: Vec<(String, u64)> = self
+            .data
+            .devices
+            .iter()
+            .filter(|(_, d)| d.secret_sha256 == secret_sha256)
+            .map(|(id, d)| (id.clone(), d.last_seen))
+            .collect();
+        if !owned.is_empty() {
+            let keep = match requested.filter(|r| owned.iter().any(|(id, _)| id == r)) {
+                Some(r) => r.to_string(),
+                None => {
+                    owned.sort_by(|a, b| b.1.cmp(&a.1));
+                    owned[0].0.clone()
+                }
+            };
+            for (id, _) in &owned {
+                if *id != keep {
+                    self.data.devices.remove(id);
+                }
+            }
+            if let Some(record) = self.data.devices.get_mut(&keep) {
+                record.last_seen = now;
+                record.hostname = hostname.to_string();
+                record.app_version = app_version.to_string();
+            }
+            self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
+            return Ok(keep);
+        }
+
         let id = match requested.filter(|id| is_valid_id(id)) {
             Some(id) => {
-                if let Some(record) = self.data.devices.get_mut(id) {
-                    if record.secret_sha256 != secret_sha256 {
-                        return Err(RegisterError::Conflict(id.to_string()));
-                    }
-                    record.last_seen = now;
-                    record.hostname = hostname.to_string();
-                    record.app_version = app_version.to_string();
-                    let id = id.to_string();
-                    self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
-                    return Ok(id);
+                if self.data.devices.contains_key(id) {
+                    return Err(RegisterError::Conflict(id.to_string()));
                 }
                 id.to_string()
             }
@@ -171,6 +201,54 @@ impl Registry {
         Ok(id)
     }
 
+    /// Removes the other records with the same computer name as `keep` that
+    /// aren't online — leftovers from before IDs were tied to the computer.
+    /// (A different computer that happens to share the name loses nothing: it
+    /// still holds its ID and gets it back the next time it connects.)
+    /// Returns how many were removed.
+    pub fn remove_stale_duplicates(&mut self, keep: &str, online: &HashSet<String>) -> usize {
+        let Some(name) = self.data.devices.get(keep).map(|d| d.hostname.trim().to_lowercase()) else {
+            return 0;
+        };
+        if name.is_empty() {
+            return 0;
+        }
+        let stale: Vec<String> = self
+            .data
+            .devices
+            .iter()
+            .filter(|(id, d)| id.as_str() != keep && !online.contains(*id) && d.hostname.trim().to_lowercase() == name)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stale {
+            self.data.devices.remove(id);
+        }
+        if !stale.is_empty() {
+            if let Err(e) = self.save() {
+                tracing::warn!("could not save the device registry: {e}");
+            }
+        }
+        stale.len()
+    }
+
+    /// Records that these devices are connected right now (their last-seen
+    /// time), and saves it so it survives restarts.
+    pub fn touch(&mut self, ids: &[String]) {
+        let now = now();
+        let mut changed = false;
+        for id in ids {
+            if let Some(d) = self.data.devices.get_mut(id) {
+                d.last_seen = now;
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(e) = self.save() {
+                tracing::warn!("could not save the device registry: {e}");
+            }
+        }
+    }
+
     /// Writes atomically (temp file + rename).
     fn save(&self) -> Result<()> {
         let tmp = self.path.with_extension("json.tmp");
@@ -180,28 +258,111 @@ impl Registry {
     }
 }
 
+/// Formats a Unix time as a local date and time, e.g. "Oct 17, 2026 8:15 AM".
+pub fn format_local(unix: u64) -> String {
+    use chrono::{Local, TimeZone};
+    if unix == 0 {
+        return "never".into();
+    }
+    match Local.timestamp_opt(unix as i64, 0).single() {
+        Some(t) => t.format("%b %-d, %Y %-I:%M %p").to_string(),
+        None => "unknown".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn register_assigns_and_protects_ids() {
-        let dir = std::env::temp_dir().join(format!("pjdesk-registry-test-{}", std::process::id()));
+    fn fresh(name: &str) -> (PathBuf, Registry) {
+        let dir = std::env::temp_dir().join(format!("pjdesk-registry-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("devices.json");
         let _ = std::fs::remove_file(&path);
+        let reg = Registry::load(path.clone()).unwrap();
+        (path, reg)
+    }
 
-        let mut reg = Registry::load(path.clone()).unwrap();
+    #[test]
+    fn register_assigns_and_protects_ids() {
+        let (path, mut reg) = fresh("protect");
         let secret = [1u8; 32];
-        let id = reg.register(None, &secret, "pc", "0.3.3").unwrap();
+        let id = reg.register(None, &secret, "pc", "0.3.4").unwrap();
         assert!(is_valid_id(&id));
         // Same secret keeps the ID.
-        assert_eq!(reg.register(Some(&id), &secret, "pc", "0.3.3").unwrap(), id);
+        assert_eq!(reg.register(Some(&id), &secret, "pc", "0.3.4").unwrap(), id);
         // Another device cannot take it.
-        assert!(matches!(reg.register(Some(&id), &[2u8; 32], "evil", "0.3.3"), Err(RegisterError::Conflict(_))));
+        assert!(matches!(reg.register(Some(&id), &[2u8; 32], "evil", "0.3.4"), Err(RegisterError::Conflict(_))));
         // Survives a reload.
         let mut reg = Registry::load(path.clone()).unwrap();
-        assert_eq!(reg.register(Some(&id), &secret, "pc", "0.3.3").unwrap(), id);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reg.register(Some(&id), &secret, "pc", "0.3.4").unwrap(), id);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn same_computer_without_saved_id_keeps_its_record() {
+        // The app and the background service each have their own config; one
+        // of them (or a reinstall) can connect without a saved ID.
+        let (path, mut reg) = fresh("noid");
+        let secret = [7u8; 32];
+        let id = reg.register(None, &secret, "CABINDESK", "0.3.4").unwrap();
+        assert_eq!(reg.register(None, &secret, "CABINDESK", "0.3.4").unwrap(), id);
+        assert_eq!(reg.register(Some("123456789"), &secret, "CABINDESK", "0.3.4").unwrap(), id);
+        assert_eq!(reg.len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn duplicate_records_for_one_secret_are_merged() {
+        let (path, mut reg) = fresh("merge");
+        let secret = [9u8; 32];
+        // Two records with the same secret, as older servers could leave.
+        let a = reg.register(Some("111111111"), &[1u8; 32], "PC", "").unwrap();
+        let b = reg.register(Some("222222222"), &[2u8; 32], "PC", "").unwrap();
+        let sha = hex::encode(Sha256::digest(secret));
+        for id in [&a, &b] {
+            reg.data.devices.get_mut(id).unwrap().secret_sha256 = sha.clone();
+        }
+        // The client's own ID wins and the other record goes away.
+        assert_eq!(reg.register(Some(&b), &secret, "PC", "0.3.4").unwrap(), b);
+        assert_eq!(reg.len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stale_records_with_the_same_name_are_removed() {
+        let (path, mut reg) = fresh("stale");
+        let old1 = reg.register(None, &[1u8; 32], "BENLENOVODESK", "").unwrap();
+        let old2 = reg.register(None, &[2u8; 32], "benlenovodesk", "").unwrap();
+        let other = reg.register(None, &[3u8; 32], "CABINDESK", "").unwrap();
+        let live = reg.register(None, &[4u8; 32], "BENLENOVODESK", "0.3.4").unwrap();
+        let mut online = HashSet::new();
+        online.insert(live.clone());
+        assert_eq!(reg.remove_stale_duplicates(&live, &online), 2);
+        let ids: Vec<String> = reg.list().into_iter().map(|r| r.id).collect();
+        assert!(ids.contains(&live) && ids.contains(&other));
+        assert!(!ids.contains(&old1) && !ids.contains(&old2));
+        // A removed computer that is really still around gets its ID back.
+        assert_eq!(reg.register(Some(&old1), &[1u8; 32], "BENLENOVODESK", "0.3.4").unwrap(), old1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn touch_updates_last_seen_and_persists() {
+        let (path, mut reg) = fresh("touch");
+        let id = reg.register(None, &[5u8; 32], "pc", "0.3.4").unwrap();
+        reg.data.devices.get_mut(&id).unwrap().last_seen = 1;
+        reg.touch(&[id.clone()]);
+        let reg = Registry::load(path.clone()).unwrap();
+        assert!(reg.list()[0].last_seen > 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn formats_a_readable_local_time() {
+        let text = format_local(1_792_243_800); // Oct 17, 2026 (UTC)
+        assert!(text.contains("2026"), "{text}");
+        assert!(text.ends_with("AM") || text.ends_with("PM"), "{text}");
+        assert_eq!(format_local(0), "never");
     }
 }

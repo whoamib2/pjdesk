@@ -22,6 +22,8 @@ tracing-subscriber.workspace = true
 argon2 = "0.5"
 # Console password prompt for `account add`.
 rpassword = "7"
+# Local date/time for "last seen" in the management window.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 # Management window (same toolkit as the client); Windows-only.

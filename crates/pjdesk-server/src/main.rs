@@ -16,9 +16,10 @@ mod accounts;
 #[cfg(windows)]
 mod gui;
 mod registry;
+mod relay;
+mod requests;
 #[cfg(windows)]
 mod tray;
-mod relay;
 mod server;
 #[cfg(windows)]
 mod service;
@@ -69,6 +70,9 @@ enum Command {
     /// it isn't elevated). TARGET is a device ID, or "*" for every online one.
     #[command(hide = true)]
     RequestUpdate { target: String },
+    /// Forget a device (used by the window when it isn't elevated).
+    #[command(hide = true)]
+    ForgetDevice { id: String },
     /// Manage user accounts (sign-in for the address book and saved logins).
     #[command(subcommand)]
     Account(AccountCommand),
@@ -179,9 +183,12 @@ fn main() -> Result<()> {
         }
         Some(Command::RequestUpdate { target }) => {
             std::fs::create_dir_all(&data_dir)?;
-            let targets = vec![target];
-            std::fs::write(data_dir.join("update-requests.json"), serde_json::to_vec(&targets)?)?;
+            requests::push(&data_dir, requests::UPDATE_FILE, &target)?;
             Ok(())
+        }
+        Some(Command::ForgetDevice { id }) => {
+            std::fs::create_dir_all(&data_dir)?;
+            requests::forget_device(&data_dir, &id)
         }
         Some(Command::Account(cmd)) => account_command(cmd, &data_dir),
         Some(Command::Service(cmd)) => service_command(cmd, cli.opts, data_dir),
