@@ -15,7 +15,7 @@ run_worker_first = ["/api/*", "/download/*"]
 [[d1_databases]]
 binding = "DB"
 database_name = "pjdesk-cloud"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "1f7d21b1-0851-49f5-b5c8-d6c4150f7f62"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
