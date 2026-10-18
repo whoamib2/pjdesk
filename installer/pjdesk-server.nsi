@@ -57,6 +57,7 @@ FunctionEnd
 
 ; If the install stops after the service was stopped, bring it back.
 Function .onInstFailed
+  nsExec::Exec '"$INSTDIR\${EXE}" update-handoff'
   nsExec::Exec 'net start PJDeskServer'
 FunctionEnd
 
@@ -83,13 +84,14 @@ Section "PJDesk Server (required)" SecCore
   ; every newer release on its own. The data folder under ProgramData is not
   ; touched: the key, accounts, cloud settings and the update preference stay.
   nsExec::Exec 'schtasks /Delete /TN "PJDesk Server Update" /F'
-  ; Tray icon for the user who installed, started now and at every sign-in.
+  ; Tray icon for the user who installed, started at every sign-in.
   ; The service itself cannot show a tray (it runs in session 0).
   WriteRegDWORD HKCU "Software\PJDeskServer" "TrayAtLogin" 1
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "PJDesk Server" '"$INSTDIR\${EXE}" --tray'
-  Exec '"$INSTDIR\${EXE}" --tray'
-  ; Restart the service if it was already installed. .onInstFailed starts it
-  ; again when this install does not finish.
+  ; Restart the service (several tries) and start the tray in the signed-in
+  ; user's session. Launching it from this installer would run it as SYSTEM
+  ; when the update task is the one installing. net start is the fallback.
+  nsExec::ExecToLog '"$INSTDIR\${EXE}" update-handoff'
   nsExec::Exec 'net start PJDeskServer'
 
   CreateDirectory "$SMPROGRAMS\${APPNAME}"

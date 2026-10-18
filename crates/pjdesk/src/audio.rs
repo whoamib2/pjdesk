@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
+#[cfg_attr(not(windows), allow(unused_imports))]
 use pjdesk_proto::quality::{resample_s16_interleaved, AUDIO_CHANNELS, AUDIO_FRAME_SAMPLES, AUDIO_RATE};
 use tokio::sync::mpsc;
 

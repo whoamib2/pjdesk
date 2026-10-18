@@ -177,6 +177,19 @@ fn trusted_download_url(url: &str) -> bool {
 /// Where verified installers are written. Not the shared temp directory: the
 /// update task runs as SYSTEM, and a predictable name there can be replaced
 /// by another local user between the write and the launch.
+/// Appends one line to the update handoff log. The installer runs as SYSTEM,
+/// which can write this directory; a failure to log must not stop the restart.
+pub fn record_handoff(line: &str) {
+    let dir = update_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let path = dir.join("handoff.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(file, "{secs} {line}");
+    }
+}
+
 fn update_dir() -> PathBuf {
     let base = std::env::var_os("ProgramData")
         .map(PathBuf::from)

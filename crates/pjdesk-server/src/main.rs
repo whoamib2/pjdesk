@@ -15,18 +15,29 @@
 mod accounts;
 mod audit;
 mod cloud;
+mod handoff;
 mod password_policy;
-#[cfg(windows)]
 mod gui;
 mod registry;
 mod relay;
 mod requests;
 mod self_update;
+mod status_pipe;
+mod status_view;
 mod tray_tip;
+mod ui_icons;
+mod ui_theme;
+mod ui_widgets;
 #[cfg(windows)]
+mod tray;
+#[cfg(not(windows))]
+#[path = "tray_stub.rs"]
 mod tray;
 mod server;
 #[cfg(windows)]
+mod service;
+#[cfg(not(windows))]
+#[path = "service_stub.rs"]
 mod service;
 
 use std::net::IpAddr;
@@ -68,6 +79,9 @@ enum Command {
     Run,
     /// Print the server key fingerprint, so clients can pin it.
     Fingerprint,
+    /// After a silent install: restart the service and the signed-in user's tray.
+    #[command(name = "update-handoff", hide = true)]
+    UpdateHandoff,
     /// Check for a newer PJDesk Server and install it.
     Update {
         /// Only report whether an update is available; don't install.
@@ -224,7 +238,7 @@ fn main() -> Result<()> {
     // The SCM-launched `service run` has no console and sets up its own logging.
     let raw: Vec<String> = std::env::args().collect();
     let is_background = (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"))
-        || raw.iter().any(|a| a == "--tray");
+        || raw.iter().any(|a| a == "--tray" || a == "update-handoff");
     if raw.len() > 1 && !is_background {
         ensure_console();
     }
@@ -265,6 +279,7 @@ fn main() -> Result<()> {
             println!("{}", pjdesk_proto::tls::format_fingerprint(&identity.fingerprint()));
             Ok(())
         }
+        Some(Command::UpdateHandoff) => handoff::run(),
         Some(Command::Update { check, auto }) => {
             std::fs::create_dir_all(&data_dir)?;
             if check {
@@ -304,6 +319,7 @@ fn main() -> Result<()> {
 }
 
 /// Shows a fatal error: a message box on Windows (no console), stderr elsewhere.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn fatal(message: &str) -> ! {
     #[cfg(windows)]
     unsafe {

@@ -4,6 +4,7 @@
 //! `request_repaint` so the app processes them even while hidden in the tray.
 
 /// What the user asked for via the tray.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum Action {
     Show,
     Quit,
