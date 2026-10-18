@@ -29,6 +29,15 @@ impl App {
             }
             ui.label(RichText::new("PJDesk").size(20.0).strong().color(p.text));
             ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(p.muted).size(12.5));
+            ui.add_space(12.0);
+            let connect_on = self.page == super::MainPage::Connect;
+            let saved_on = self.page == super::MainPage::Saved;
+            if ui.selectable_label(connect_on, "Connect").clicked() {
+                self.page = super::MainPage::Connect;
+            }
+            if ui.selectable_label(saved_on, "Saved computers").clicked() {
+                self.page = super::MainPage::Saved;
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if widgets::icon_button(ui, Icon::Gear, "Settings (Ctrl+,)").clicked() {
@@ -61,6 +70,10 @@ impl App {
     }
 
     pub(super) fn body(&mut self, ui: &mut egui::Ui) {
+        if self.page == super::MainPage::Saved {
+            self.saved_page(ui);
+            return;
+        }
         let width = ui.available_width();
         let height = ui.available_height();
         if width < 900.0 {
@@ -449,14 +462,8 @@ impl App {
 
     fn apply_row(&mut self, kind: RowAction, id: &str) {
         match kind {
-            RowAction::Connect => {
-                let pw = self.saved_for(id);
-                self.connect_to(id, pw, false);
-            }
-            RowAction::Files => {
-                let pw = self.saved_for(id);
-                self.connect_to(id, pw, true);
-            }
+            RowAction::Connect => self.connect_to(id, None, false),
+            RowAction::Files => self.connect_to(id, None, true),
             RowAction::Favorite => self.toggle_favorite(id),
             RowAction::Forget => {
                 self.cfg.settings.peers.remove(id);
@@ -536,7 +543,7 @@ impl App {
         }
     }
 
-    fn row_title(&self, id: &str) -> String {
+    pub(super) fn row_title(&self, id: &str) -> String {
         self.cfg
             .address_book
             .iter()

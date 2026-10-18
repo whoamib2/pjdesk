@@ -14,8 +14,8 @@ use pjdesk_proto::filesafe::{self, MAX_TRANSFER_BYTES};
 use pjdesk_proto::framing::{read_msg, MAX_CONTROL_FRAME};
 use pjdesk_proto::peer::{
     read_side_chunk, read_side_header, read_video_frame, write_side_chunk, write_side_header, Clipboard, ClipKind,
-    ControlMsg, FileMsg, HostMsg, MonitorInfo, SideHeader, TunnelMsg, VideoHeader, AUDIO_MAGIC, CLIP_MAGIC, FILE_MAGIC,
-    MAX_CLIP_IMAGE, MAX_CLIP_TEXT,
+    ControlMsg, DisplayLayout, FileMsg, HostMsg, MonitorInfo, SideHeader, TunnelMsg, VideoHeader, AUDIO_MAGIC,
+    CLIP_MAGIC, FILE_MAGIC, MAX_CLIP_IMAGE, MAX_CLIP_TEXT, VIEW_ALL, VIEW_SINGLE,
 };
 use pjdesk_proto::perms::{self, has};
 use pjdesk_proto::quality;
@@ -40,6 +40,11 @@ pub struct Live {
     pub v3: bool,
     pub perms: u32,
     pub monitors: Vec<MonitorInfo>,
+    pub displays: Vec<DisplayLayout>,
+    pub platform_family: String,
+    pub platform_version: String,
+    pub view_mode: u8,
+    pub current_display: u8,
     pub remote_files: Vec<String>,
     pub transfers: Vec<Transfer>,
     pub chat: Vec<(bool, String)>,
@@ -62,6 +67,11 @@ impl Live {
             v3,
             perms: if v3 { 0 } else { perms::CLASSIC },
             monitors: Vec::new(),
+            displays: Vec::new(),
+            platform_family: String::new(),
+            platform_version: String::new(),
+            view_mode: VIEW_SINGLE,
+            current_display: 0,
             remote_files: Vec::new(),
             transfers: Vec::new(),
             chat: Vec::new(),
@@ -94,6 +104,11 @@ impl Live {
             v3: self.v3,
             perms: self.perms,
             monitors: self.monitors.clone(),
+            displays: self.displays.clone(),
+            platform_family: self.platform_family.clone(),
+            platform_version: self.platform_version.clone(),
+            view_mode: self.view_mode,
+            current_display: self.current_display,
             remote_files: self.remote_files.clone(),
             transfers: self.transfers.clone(),
             chat: self.chat.clone(),
@@ -144,6 +159,7 @@ pub fn start(
     control: mpsc::UnboundedSender<ControlMsg>,
     frames: std::sync::mpsc::Sender<(VideoHeader, Vec<u8>)>,
     peer_proto: u16,
+    host_id: String,
     wake: impl Fn() + Send + Sync + 'static,
 ) -> (Arc<Mutex<Live>>, mpsc::UnboundedSender<Cmd>, Arc<Mutex<RecorderSlot>>) {
     let live = Arc::new(Mutex::new(Live::new(peer_proto >= 3)));
@@ -154,9 +170,10 @@ pub fn start(
     let tunnels = Arc::new(Mutex::new(PendingTunnel { waiters: HashMap::new() }));
 
     if peer_proto >= 3 {
+        let saved_display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0u8);
         let _ = control.send(ControlMsg::Hello {
-            permissions: perms::ALL,
-            monitor: 0,
+            permissions: perms::ALL | perms::LAYOUT,
+            monitor: saved_display,
             quality: quality::preset("balanced").unwrap_or_default(),
         });
     }
@@ -173,9 +190,20 @@ pub fn start(
     let conn_loop = connection.clone();
     let wake_loop = wake.clone();
     let recorder_loop = recorder.clone();
-    tokio::spawn(async move {
-        run_loop(conn_loop, control_recv, control_loop, cmd_rx, live_loop, tunnels, recorder_loop, wake_loop).await;
-    });
+        tokio::spawn(async move {
+            run_loop(
+                conn_loop,
+                control_recv,
+                control_loop,
+                cmd_rx,
+                live_loop,
+                tunnels,
+                recorder_loop,
+                wake_loop,
+                host_id,
+            )
+            .await;
+        });
 
     let live_clip = live.clone();
     let control_clip = control;
@@ -196,12 +224,13 @@ async fn run_loop(
     tunnels: Arc<Mutex<PendingTunnel>>,
     recorder: Arc<Mutex<RecorderSlot>>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    host_id: String,
 ) {
     loop {
         tokio::select! {
             msg = read_msg::<_, HostMsg>(&mut control_recv, MAX_CONTROL_FRAME) => {
                 match msg {
-                    Ok(msg) => on_host(msg, &connection, &control, &live, &tunnels, &wake),
+                    Ok(msg) => on_host(msg, &connection, &control, &live, &tunnels, &wake, &host_id),
                     Err(_) => {
                         let mut g = live.lock().unwrap();
                         if g.closed.is_none() && !g.restart {
@@ -235,6 +264,7 @@ fn on_host(
     live: &Arc<Mutex<Live>>,
     tunnels: &Arc<Mutex<PendingTunnel>>,
     wake: &Arc<dyn Fn() + Send + Sync>,
+    host_id: &str,
 ) {
     let mut g = live.lock().unwrap();
     match msg {
@@ -242,6 +272,31 @@ fn on_host(
             g.perms = permissions;
             g.monitors = monitors;
             g.note(format!("This session can {}", perms::describe(permissions)));
+        }
+        HostMsg::Displays { displays } => {
+            let first = g.displays.is_empty();
+            g.displays = displays;
+            if first {
+                let mode = std::env::var("PJDESK_VIEW").ok().and_then(|s| s.parse().ok()).unwrap_or(VIEW_SINGLE);
+                let display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let mode = if mode == VIEW_ALL { VIEW_ALL } else { VIEW_SINGLE };
+                let display = if g.displays.iter().any(|d| d.index == display) {
+                    display
+                } else {
+                    g.displays.first().map(|d| d.index).unwrap_or(0)
+                };
+                g.view_mode = mode;
+                g.current_display = display;
+                let _ = control.send(ControlMsg::View { mode, display });
+                if mode == VIEW_SINGLE {
+                    let _ = control.send(ControlMsg::SelectMonitor { index: display });
+                }
+            }
+        }
+        HostMsg::Platform { family, version } => {
+            g.platform_family = family.clone();
+            g.platform_version = version.clone();
+            remember_platform(host_id, &family, &version);
         }
         HostMsg::Notice(text) => g.note(text),
         HostMsg::Denied { what, reason } => g.note(format!("{what}: {reason}")),
@@ -299,6 +354,21 @@ fn on_host(
     }
     drop(g);
     wake();
+}
+
+fn remember_platform(host_id: &str, family: &str, version: &str) {
+    if host_id.is_empty() {
+        return;
+    }
+    let (id, family, version) = (host_id.to_string(), family.to_string(), version.to_string());
+    std::thread::spawn(move || {
+        if let Ok(mut cfg) = crate::config::Config::load() {
+            let note = cfg.settings.peers.entry(id).or_default();
+            note.os_family = family;
+            note.os_version = version;
+            let _ = cfg.save();
+        }
+    });
 }
 
 fn apply_clip(g: &mut Live, clip: Clipboard) {

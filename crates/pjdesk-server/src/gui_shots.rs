@@ -12,13 +12,13 @@ fn server_shots() {
         std::env::var("PJDESK_SHOT_DIR").unwrap_or_else(|_| "/opt/cursor/artifacts/pjdesk-ui".into()),
     );
     std::fs::create_dir_all(&dir).expect("create shot dir");
-    for (name, locked) in [("server-dark", false), ("server-unelevated", true)] {
+    for (name, locked) in [("server-dark", false), ("server-unelevated", true), ("server-devices", false)] {
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(960.0, 1040.0))
             .with_pixels_per_point(1.0)
             .with_theme(egui::Theme::Dark)
             .wgpu()
-            .build_eframe(move |cc| preview(cc, locked));
+            .build_eframe(move |cc| preview(cc, locked, name == "server-devices"));
         harness.step();
         let image = harness.render().unwrap_or_else(|e| panic!("render {name}: {e}"));
         let path = dir.join(format!("{name}.png"));
@@ -27,7 +27,7 @@ fn server_shots() {
     }
 }
 
-fn preview(cc: &eframe::CreationContext<'_>, locked: bool) -> App {
+fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -> App {
     let dir = std::env::temp_dir().join(if locked { "pjdesk-server-shot-locked" } else { "pjdesk-server-shot-open" });
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -56,11 +56,20 @@ fn preview(cc: &eframe::CreationContext<'_>, locked: bool) -> App {
         std::fs::write(
             dir.join(crate::cloud::STATUS_FILE),
             format!(
-                r#"{{"enabled":true,"role":"active","account":"ben@spader.us","epoch":4,"active_name":"office","bucket":"PJDesk Cloud","updated_at":{now},"last_upload_at":{}}}"#,
+                r#"{{"enabled":true,"role":"active","account":"ben@spader.us","epoch":4,"active_name":"office","bucket":"PJDesk Cloud","updated_at":{now},"last_upload_at":{},"peer_name":"cabin","peer_version":"0.5.1","peer_role":"standby"}}"#,
                 now.saturating_sub(60)
             ),
         )
         .unwrap();
+        std::fs::write(
+            dir.join("devices.json"),
+            r#"{"devices":{"123456789":{"secret_sha256":"hidden","hostname":"Office","app_version":"0.5.1","first_seen":1,"last_seen":2},"555666777":{"secret_sha256":"hidden","hostname":"Laptop","app_version":"","first_seen":1,"last_seen":2},"902488771":{"secret_sha256":"hidden","hostname":"This PC","app_version":"0.5.2","first_seen":1,"last_seen":2}}}"#,
+        )
+        .unwrap();
+        let online = format!(
+            r#"[{{"id":"123456789","hostname":"Office","version":"0.5.1"}},{{"id":"902488771","hostname":"This PC","version":"0.5.2"}}]"#
+        );
+        std::fs::write(dir.join("online.json"), online).unwrap();
     }
     let mut app = App::build(cc, dir, 21200, false);
     app.svc_override = Some((true, true));
@@ -90,10 +99,32 @@ fn preview(cc: &eframe::CreationContext<'_>, locked: bool) -> App {
             active_name: "office".into(),
             bucket: "PJDesk Cloud".into(),
             cloud_updated_at: now,
+            peer_name: "cabin".into(),
+            peer_version: "0.5.1".into(),
+            peer_role: "standby".into(),
+            devices: vec![
+                crate::status_view::ListedDevice {
+                    id: "123456789".into(),
+                    hostname: "Office".into(),
+                    version: "0.5.1".into(),
+                    online: true,
+                },
+                crate::status_view::ListedDevice {
+                    id: "444555666".into(),
+                    hostname: "Old laptop".into(),
+                    version: String::new(),
+                    online: false,
+                },
+            ],
             ..Snapshot::default()
         });
     } else {
         app.refresh();
+        app.latest_release = Some("0.5.2".into());
+    }
+    if devices_only {
+        app.preview_devices = true;
+        app.latest_release = Some("0.5.2".into());
     }
     app
 }

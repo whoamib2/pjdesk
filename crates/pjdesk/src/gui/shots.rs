@@ -39,4 +39,38 @@ fn client_shots() {
         image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
         eprintln!("wrote {}", path.display());
     }
+
+    for (name, prep) in [
+        ("saved-dark", Prep::Saved),
+        ("password-dark", Prep::Password),
+    ] {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1180.0, 760.0))
+            .with_pixels_per_point(1.0)
+            .with_theme(egui::Theme::Dark)
+            .wgpu()
+            .build_eframe(move |cc| {
+                let mut cfg = crate::config::Config::default();
+                cfg.settings.theme = "dark".into();
+                let mut app = App::create(cc, cfg, true);
+                match prep {
+                    Prep::Saved => app.load_saved_preview(),
+                    Prep::Password => app.load_password_preview(),
+                }
+                app
+            });
+        harness.step();
+        let image = harness.render().unwrap_or_else(|e| panic!("render {name}: {e}"));
+        let path = dir.join(format!("{name}.png"));
+        image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
+        eprintln!("wrote {}", path.display());
+    }
+
+    crate::viewer::render_monitor_shots(&dir);
+}
+
+#[derive(Clone, Copy)]
+enum Prep {
+    Saved,
+    Password,
 }

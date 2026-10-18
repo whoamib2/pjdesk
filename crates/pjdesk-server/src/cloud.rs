@@ -1030,6 +1030,13 @@ pub struct CloudStatus {
     /// Takeover / step-down note for the window and the log.
     #[serde(default)]
     pub notice: String,
+    /// The other server in this Cloud Sync pair, from its health report.
+    #[serde(default)]
+    pub peer_name: String,
+    #[serde(default)]
+    pub peer_version: String,
+    #[serde(default)]
+    pub peer_role: String,
 }
 
 impl CloudStatus {
@@ -1556,6 +1563,7 @@ pub fn join(data_dir: &Path, cfg: &CloudConfig) -> Result<String> {
 fn sync_status_now(data_dir: &Path, role: Role) -> Option<()> {
     let cfg = CloudConfig::load(data_dir)?;
     let st = SyncState::load(data_dir);
+    let (peer_name, peer_version, peer_role) = other_peer(data_dir);
     CloudStatus {
         enabled: true,
         role: if role == Role::Active { "active" } else { "standby" }.into(),
@@ -1571,9 +1579,24 @@ fn sync_status_now(data_dir: &Path, role: Role) -> Option<()> {
         active_instance: st.active_instance,
         active_name: st.active_name,
         notice: st.notice,
+        peer_name,
+        peer_version,
+        peer_role,
     }
     .save(data_dir);
     Some(())
+}
+
+/// Name, version, and role of a different server that published health.
+fn other_peer(data_dir: &Path) -> (String, String, String) {
+    let mine = instance_id(data_dir);
+    let mut peers = peer_health(data_dir);
+    peers.retain(|p| p.instance != mine && !p.version.is_empty());
+    peers.sort_by_key(|p| std::cmp::Reverse(p.at));
+    match peers.into_iter().next() {
+        Some(p) => (p.name, p.version, p.role),
+        None => (String::new(), String::new(), String::new()),
+    }
 }
 
 // ---------------------------------------------------------------------------

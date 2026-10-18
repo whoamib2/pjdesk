@@ -13,8 +13,8 @@ use pjdesk_proto::filesafe::{self, MAX_TRANSFER_BYTES};
 use pjdesk_proto::framing::write_msg;
 use pjdesk_proto::peer::{
     read_side_chunk, read_side_header, write_side_chunk, write_side_header, Clipboard, ClipKind, ControlMsg,
-    FileMsg, HostMsg, KeyboardMode, SideHeader, SpecialCommand, TunnelMsg, CLIP_MAGIC, FILE_MAGIC,
-    MAX_CLIP_IMAGE, MAX_CLIP_TEXT, SIDE_CHUNK,
+    DisplayLayout, FileMsg, HostMsg, KeyboardMode, SideHeader, SpecialCommand, TunnelMsg, CLIP_MAGIC, FILE_MAGIC,
+    MAX_CLIP_IMAGE, MAX_CLIP_TEXT, SIDE_CHUNK, VIEW_ALL,
 };
 use pjdesk_proto::perms::{self, grant, has};
 use pjdesk_proto::quality::{BitrateControl, StreamQuality};
@@ -52,6 +52,14 @@ struct OutFile {
     resume: u64,
 }
 
+fn layout_key(displays: &[DisplayLayout]) -> String {
+    displays
+        .iter()
+        .map(|d| format!("{}:{}:{}:{}:{}:{}:{}", d.index, d.x, d.y, d.width, d.height, d.dpi, u8::from(d.primary)))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// Shared with the capture thread and the side-stream tasks.
 pub struct Session {
     pub perms: AtomicU32,
@@ -78,6 +86,12 @@ pub struct Session {
     audio_stop: Arc<AtomicBool>,
     clip_text: Mutex<Option<String>>,
     clip_tick: AtomicU32,
+    /// Hello asked for display layout. Older controllers leave this false, so
+    /// they never receive the new host messages.
+    layout_aware: AtomicBool,
+    layout_key: Mutex<String>,
+    platform_sent: AtomicBool,
+    layout_ticks: AtomicU32,
     conn: Connection,
     shared: Option<Arc<HostShared>>,
     peer_name: String,
@@ -126,6 +140,10 @@ impl Session {
             audio_stop: Arc::new(AtomicBool::new(true)),
             clip_text: Mutex::new(None),
             clip_tick: AtomicU32::new(0),
+            layout_aware: AtomicBool::new(false),
+            layout_key: Mutex::new(String::new()),
+            platform_sent: AtomicBool::new(false),
+            layout_ticks: AtomicU32::new(0),
             conn,
             shared,
             peer_name: grant.peer_name,
@@ -216,6 +234,19 @@ impl Session {
                 keyframe.store(true, Ordering::SeqCst);
                 info!("Controller selected monitor {index}");
             }
+            ControlMsg::View { mode, display: shown } => {
+                if !self.layout_aware.load(Ordering::SeqCst) {
+                    return Ok(false);
+                }
+                if mode == VIEW_ALL {
+                    self.display.store(super::capture::ALL_DISPLAYS, Ordering::SeqCst);
+                    info!("Controller selected all displays");
+                } else {
+                    self.display.store(shown as usize, Ordering::SeqCst);
+                    info!("Controller selected monitor {shown}");
+                }
+                keyframe.store(true, Ordering::SeqCst);
+            }
             ControlMsg::File(msg) => self.file_ctrl(msg, send).await?,
             ControlMsg::Restart => {
                 if !self.allow(perms::RESTART) {
@@ -268,6 +299,8 @@ impl Session {
         if self.service_host && !has(ceiling, perms::FILE) {
             ceiling &= !perms::FILE;
         }
+        let wants_layout = requested & perms::LAYOUT != 0;
+        self.layout_aware.store(wants_layout, Ordering::SeqCst);
         let granted = grant(requested, ceiling, self.view_only);
         let dir = self.receive_dir.lock().unwrap().clone();
         let granted = if dir.trim().is_empty() { granted & !perms::FILE } else { granted };
@@ -278,6 +311,27 @@ impl Session {
         let monitors = super::capture::monitor_infos();
         info!("{} granted: {}", self.peer_name, perms::describe(granted));
         write_msg(send, &HostMsg::Welcome { permissions: granted, monitors, proto: PROTOCOL_VERSION }).await?;
+        if wants_layout {
+            self.publish_layout(send, true).await?;
+        }
+        Ok(())
+    }
+
+    async fn publish_layout(&self, send: &mut SendStream, force: bool) -> Result<()> {
+        let displays = super::capture::display_layouts();
+        let key = layout_key(&displays);
+        {
+            let mut last = self.layout_key.lock().unwrap();
+            if !force && *last == key {
+                return Ok(());
+            }
+            *last = key;
+        }
+        write_msg(send, &HostMsg::Displays { displays }).await?;
+        if self.platform_sent.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            let (family, version) = super::capture::platform_report();
+            write_msg(send, &HostMsg::Platform { family, version }).await?;
+        }
         Ok(())
     }
 
@@ -518,6 +572,12 @@ impl Session {
             }
         }
         self.watch_clipboard(send).await?;
+        if self.layout_aware.load(Ordering::SeqCst) {
+            let n = self.layout_ticks.fetch_add(1, Ordering::Relaxed);
+            if n % 10 == 9 {
+                self.publish_layout(send, false).await?;
+            }
+        }
         Ok(())
     }
 

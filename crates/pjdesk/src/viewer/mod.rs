@@ -1,5 +1,10 @@
 //! Controller mode: connect to a host by ID and show its screen.
 
+#[cfg(feature = "ui-shots")]
+pub(crate) fn render_monitor_shots(dir: &std::path::Path) {
+    toolbar::render_monitor_shots(dir);
+}
+
 pub mod decoder;
 mod controls;
 mod keymap;
@@ -67,9 +72,27 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
                 std::thread::sleep(Duration::from_secs(3));
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                let wrong = e.to_string().to_ascii_lowercase().contains("wrong password");
+                if wrong && std::env::var("PJDESK_SAVED").ok().as_deref() == Some("1") && is_valid_id(&target) {
+                    config.remember_password(&target, None);
+                    if let Some(entry) = config.address_book.iter_mut().find(|e| e.id == target) {
+                        entry.password = None;
+                    }
+                    let _ = config.save();
+                    std::process::exit(3);
+                }
+                return Err(e);
+            }
         };
         tries = 0;
+        if std::env::var("PJDESK_REMEMBER").ok().as_deref() == Some("1") && !password.is_empty() && is_valid_id(&target) {
+            config.remember_password(&target, Some(&password));
+            if let Some(entry) = config.address_book.iter_mut().find(|e| e.id == target) {
+                entry.password = None;
+            }
+            let _ = config.save();
+        }
         println!("Connected to \"{}\" ({}, {})", link.host_name, format_id(&link.host_id), link.path);
         if args.headless {
             return runtime.block_on(headless(link, args.frames));

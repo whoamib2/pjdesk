@@ -242,9 +242,14 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
         let want_display = session.display.load(Ordering::SeqCst);
         if want_display != args.display {
             args.display = want_display;
+            let label = if want_display == capture::ALL_DISPLAYS {
+                "all displays".to_string()
+            } else {
+                format!("monitor {want_display}")
+            };
             match capture::open(&args) {
                 Ok(next) => {
-                    info!("Switched to monitor {want_display}");
+                    info!("Switched to {label}");
                     capturer = next;
                     *shared.display.lock().unwrap() = capturer.display_rect();
                     shared.keyframe_requested.store(true, Ordering::SeqCst);

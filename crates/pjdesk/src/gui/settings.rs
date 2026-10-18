@@ -24,6 +24,7 @@ pub struct SettingsDraft {
     tab: Tab,
     server: String,
     start_with_windows: bool,
+    remember_passwords: bool,
     view_only: bool,
     use_permanent: bool,
     permanent_password: String,
@@ -56,6 +57,7 @@ impl SettingsDraft {
             tab: Tab::General,
             server: cfg.server.clone().unwrap_or_default(),
             start_with_windows: s.start_with_windows,
+            remember_passwords: s.remember_passwords,
             view_only: s.view_only,
             use_permanent: s.permanent_password.is_some(),
             permanent_password: s.permanent_password().unwrap_or_default(),
@@ -280,6 +282,7 @@ impl App {
         let old = self.cfg.settings.clone();
         let s = &mut self.cfg.settings;
         s.start_with_windows = d.start_with_windows;
+        s.remember_passwords = d.remember_passwords;
         s.view_only = d.view_only;
         s.fps = d.fps.clamp(1, 120);
         s.bitrate_kbps = d.bitrate_kbps.clamp(200, 50_000);
@@ -424,6 +427,11 @@ fn general_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
     ui.add_space(12.0);
     widgets::heading(ui, "STARTUP");
     widgets::checkbox(ui, &mut d.start_with_windows, "Start PJDesk when I sign in to Windows");
+    widgets::checkbox(ui, &mut d.remember_passwords, "Remember passwords for new computers");
+    ui.label(widgets::muted(
+        ui,
+        "When this is on, the password prompt starts with Remember password checked. The password is saved only after the other computer accepts it.",
+    ));
     ui.label(widgets::muted(
         ui,
         "For always-on access (even at the login screen), install the background service on the Security page.",

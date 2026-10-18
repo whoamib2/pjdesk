@@ -91,7 +91,19 @@ pub enum ControlMsg {
     Audio {
         enabled: bool,
     },
+    /// 0.5.2. Watch one display, or the whole desktop as one picture.
+    /// Sent only after the host has published [`HostMsg::Displays`]. An older
+    /// host never receives this variant. `mode` is [`VIEW_SINGLE`] or [`VIEW_ALL`].
+    View {
+        mode: u8,
+        display: u8,
+    },
 }
+
+/// [`ControlMsg::View`] mode: one display, the one named by `display`.
+pub const VIEW_SINGLE: u8 = 0;
+/// [`ControlMsg::View`] mode: every display, stitched at its real position.
+pub const VIEW_ALL: u8 = 1;
 
 /// Commands the controller asks the host to carry out directly.
 ///
@@ -116,7 +128,9 @@ pub enum KeyboardMode {
     Translate,
 }
 
-/// One display the host can share.
+/// One display the host can share. Kept as it was in 0.4.0 so a Welcome from
+/// this build still decodes on a 0.4/0.5.1 controller. Position and DPI ride
+/// on [`DisplayLayout`] instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorInfo {
     pub index: u8,
@@ -124,6 +138,22 @@ pub struct MonitorInfo {
     pub height: u16,
     pub primary: bool,
     pub name: String,
+}
+
+/// One display, including where it sits on the virtual desktop.
+///
+/// `x` and `y` are negative when the display is left of or above the primary.
+/// `dpi` is the effective DPI, or 0 when the host could not read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayLayout {
+    pub index: u8,
+    pub name: String,
+    pub width: u16,
+    pub height: u16,
+    pub x: i32,
+    pub y: i32,
+    pub primary: bool,
+    pub dpi: u32,
 }
 
 /// Clipboard contents. Text rides in `bytes` (UTF-8). Images are PNG bytes and,
@@ -223,6 +253,19 @@ pub enum HostMsg {
     Denied {
         what: String,
         reason: String,
+    },
+    /// 0.5.2. Every attached display. Sent only when Hello carried
+    /// [`crate::perms::LAYOUT`], and again when a display is added, removed,
+    /// or resized. An older controller never sets that bit, so it never
+    /// receives this variant.
+    Displays {
+        displays: Vec<DisplayLayout>,
+    },
+    /// 0.5.2. Host operating system. Sent once, with the same gate as
+    /// [`HostMsg::Displays`].
+    Platform {
+        family: String,
+        version: String,
     },
 }
 
@@ -355,6 +398,17 @@ mod tests {
         assert_eq!(postcard::to_stdvec(&ControlMsg::Ping { t_us: 1 }).unwrap()[0], 4);
         assert_eq!(postcard::to_stdvec(&HostMsg::Notice("ok".into())).unwrap()[0], 1);
         assert_eq!(postcard::to_stdvec(&SpecialCommand::CtrlAltDel).unwrap()[0], 0);
+        assert_eq!(postcard::to_stdvec(&HostMsg::Denied { what: "a".into(), reason: "b".into() }).unwrap()[0], 9);
+        assert_eq!(postcard::to_stdvec(&ControlMsg::Audio { enabled: true }).unwrap()[0], 17);
+        assert_eq!(postcard::to_stdvec(&ControlMsg::View { mode: VIEW_SINGLE, display: 0 }).unwrap()[0], 18);
+        assert_eq!(
+            postcard::to_stdvec(&HostMsg::Displays { displays: vec![] }).unwrap()[0],
+            10
+        );
+        assert_eq!(
+            postcard::to_stdvec(&HostMsg::Platform { family: "linux".into(), version: String::new() }).unwrap()[0],
+            11
+        );
         let hello = ControlMsg::Hello {
             permissions: 1,
             monitor: 0,

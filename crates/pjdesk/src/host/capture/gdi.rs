@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use windows::Win32::Graphics::Gdi::{BitBlt, GetDC, ReleaseDC, HDC, SRCCOPY};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
 
 use super::win::{monitors, CursorOverlay, CursorState, DibCanvas};
 use super::{Capturer, Frame, Rect};
@@ -20,6 +23,8 @@ pub struct GdiCapturer {
     last_cursor: CursorState,
     display: usize,
     rect: Rect,
+    /// Capture the whole virtual desktop instead of one monitor.
+    all: bool,
     has_image: bool,
     /// Used only because DXGI failed (vs. chosen with `--gdi`).
     fallback: bool,
@@ -41,8 +46,32 @@ impl GdiCapturer {
             last_cursor: CursorState::default(),
             display,
             rect,
+            all: false,
             has_image: false,
             fallback,
+            next_layout_check: Instant::now() + Duration::from_secs(2),
+        })
+    }
+
+    /// One `BitBlt` of the virtual desktop. `is_fallback` is false so the DXGI
+    /// retry does not replace this with a single monitor.
+    pub fn virtual_desktop() -> Result<Self> {
+        let rect = virtual_rect()?;
+        let screen = unsafe { GetDC(None) };
+        if screen.is_invalid() {
+            return Err(anyhow!("GetDC failed"));
+        }
+        Ok(Self {
+            screen,
+            canvas: DibCanvas::new(rect.width as usize, rect.height as usize)?,
+            previous: Vec::new(),
+            cursor: CursorOverlay::default(),
+            last_cursor: CursorState::default(),
+            display: super::ALL_DISPLAYS,
+            rect,
+            all: true,
+            has_image: false,
+            fallback: false,
             next_layout_check: Instant::now() + Duration::from_secs(2),
         })
     }
@@ -62,7 +91,7 @@ impl GdiCapturer {
             return Ok(());
         }
         self.next_layout_check = Instant::now() + Duration::from_secs(2);
-        let rect = monitor_rect(self.display)?;
+        let rect = if self.all { virtual_rect()? } else { monitor_rect(self.display)? };
         if rect != self.rect {
             if (rect.width, rect.height) != (self.rect.width, self.rect.height) {
                 self.canvas = DibCanvas::new(rect.width as usize, rect.height as usize)?;
@@ -78,6 +107,21 @@ impl GdiCapturer {
 fn monitor_rect(display: usize) -> Result<Rect> {
     let all = monitors();
     all.get(display).copied().ok_or_else(|| anyhow!("display {display} not found ({} attached)", all.len()))
+}
+
+fn virtual_rect() -> Result<Rect> {
+    let rect = unsafe {
+        Rect {
+            left: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            top: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            width: GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            height: GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        }
+    };
+    if rect.width <= 0 || rect.height <= 0 {
+        return Err(anyhow!("the virtual desktop has no size"));
+    }
+    Ok(rect)
 }
 
 impl Capturer for GdiCapturer {

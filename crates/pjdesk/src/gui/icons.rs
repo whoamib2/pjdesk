@@ -20,6 +20,15 @@ pub enum Icon {
     Close,
     Check,
     Alert,
+    /// A window frame. Not the four-square mark.
+    OsWindows,
+    /// A rounded window with three dots. Not an apple.
+    OsMac,
+    /// A terminal prompt. Not a penguin.
+    OsLinux,
+    /// A phone outline. Not a robot.
+    OsAndroid,
+    OsUnknown,
 }
 
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -105,7 +114,39 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.line_segment([c + Vec2::new(0.0, -s * 0.08), c + Vec2::new(0.0, s * 0.08)], stroke);
             painter.circle_filled(c + Vec2::new(0.0, s * 0.18), s * 0.045, color);
         }
+        Icon::OsWindows => {
+            let frame = Rect::from_center_size(c, Vec2::new(s * 0.72, s * 0.56));
+            painter.rect_stroke(frame, CornerRadius::same(2), stroke, StrokeKind::Inside);
+            painter.line_segment([Pos2::new(frame.left(), frame.top() + s * 0.14), Pos2::new(frame.right(), frame.top() + s * 0.14)], stroke);
+        }
+        Icon::OsMac => {
+            let frame = Rect::from_center_size(c + Vec2::new(0.0, s * 0.04), Vec2::new(s * 0.74, s * 0.56));
+            painter.rect_stroke(frame, CornerRadius::same((s * 0.12) as u8), stroke, StrokeKind::Inside);
+            for i in 0..3 {
+                painter.circle_filled(Pos2::new(frame.left() + s * (0.12 + i as f32 * 0.12), frame.top() + s * 0.12), s * 0.035, color);
+            }
+        }
+        Icon::OsLinux => {
+            draw_prompt(painter, c, s, stroke);
+        }
+        Icon::OsAndroid => {
+            let body = Rect::from_center_size(c + Vec2::new(0.0, s * 0.04), Vec2::new(s * 0.42, s * 0.68));
+            painter.rect_stroke(body, CornerRadius::same((s * 0.08) as u8), stroke, StrokeKind::Inside);
+            painter.line_segment([Pos2::new(body.left() + s * 0.08, body.top() + s * 0.16), Pos2::new(body.right() - s * 0.08, body.top() + s * 0.16)], stroke);
+        }
+        Icon::OsUnknown => {
+            painter.circle_stroke(c, s * 0.28, stroke);
+            painter.line_segment([c + Vec2::new(0.0, -s * 0.08), c + Vec2::new(0.0, s * 0.02)], stroke);
+            painter.circle_filled(c + Vec2::new(0.0, s * 0.12), s * 0.04, color);
+        }
     }
+}
+
+fn draw_prompt(painter: &egui::Painter, c: Pos2, s: f32, stroke: Stroke) {
+    let left = c + Vec2::new(-s * 0.28, 0.0);
+    painter.line_segment([left + Vec2::new(0.0, -s * 0.16), left], stroke);
+    painter.line_segment([left, left + Vec2::new(s * 0.16, s * 0.14)], stroke);
+    painter.line_segment([c + Vec2::new(s * 0.02, s * 0.14), c + Vec2::new(s * 0.28, s * 0.14)], stroke);
 }
 
 fn eye(painter: &egui::Painter, c: Pos2, s: f32, color: Color32, stroke: Stroke, slashed: bool) {

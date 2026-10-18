@@ -70,6 +70,9 @@ pub struct Settings {
     /// Start PJDesk automatically when this user signs in to Windows.
     #[serde(default)]
     pub start_with_windows: bool,
+    /// The first-login "Remember password" box starts checked.
+    #[serde(default)]
+    pub remember_passwords: bool,
     /// "system" follows Windows, or "dark" / "light".
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -111,6 +114,16 @@ pub struct PeerNote {
     pub favorite: bool,
     #[serde(default)]
     pub last_connected: u64,
+    /// "windows", "macos", "linux", "android", or empty when the host did not say.
+    #[serde(default)]
+    pub os_family: String,
+    #[serde(default)]
+    pub os_version: String,
+    /// 0 = one display, 1 = all displays in one view. See `pjdesk_proto::peer::VIEW_*`.
+    #[serde(default)]
+    pub view_mode: u8,
+    #[serde(default)]
+    pub last_display: u8,
 }
 
 fn default_fps() -> u32 {
@@ -133,6 +146,7 @@ impl Default for Settings {
             view_only: false,
             permanent_password: None,
             start_with_windows: false,
+            remember_passwords: false,
             theme: default_theme(),
             approval: default_approval(),
             receive_dir: String::new(),
@@ -307,14 +321,14 @@ impl Config {
         }
     }
 
-    /// A remembered password for `id`, from the address book first, then local.
+    /// A remembered password for `id`. The encrypted local copy wins. A password
+    /// left in the address book by an older build is used only when there is
+    /// no local copy.
     pub fn saved_password(&self, id: &str) -> Option<String> {
-        if let Some(entry) = self.address_book.iter().find(|e| e.id == id) {
-            if let Some(pw) = &entry.password {
-                return Some(pw.clone());
-            }
+        if let Some(pw) = self.saved_passwords.get(id).and_then(|s| secure::reveal(s)) {
+            return Some(pw);
         }
-        self.saved_passwords.get(id).and_then(|s| secure::reveal(s))
+        self.address_book.iter().find(|e| e.id == id).and_then(|e| e.password.clone()).filter(|p| !p.is_empty())
     }
 
     // --- Account -----------------------------------------------------------
@@ -338,12 +352,41 @@ mod tests {
     }
 
     #[test]
-    fn address_book_password_takes_priority() {
+    fn local_password_beats_a_plaintext_address_book_copy() {
         let mut c = Config::default();
         c.remember_password("111222333", Some("local"));
         c.address_book =
             vec![AddressEntry { id: "111222333".into(), password: Some("synced".into()), ..Default::default() }];
+        assert_eq!(c.saved_password("111222333").as_deref(), Some("local"));
+        let stored = c.saved_passwords.get("111222333").unwrap();
+        assert_ne!(stored, "local");
+        assert!(stored.starts_with("dpapi:") || stored.starts_with("plain:"));
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("\"local\""));
+    }
+
+    #[test]
+    fn legacy_address_book_password_still_opens() {
+        let mut c = Config::default();
+        c.address_book =
+            vec![AddressEntry { id: "111222333".into(), password: Some("synced".into()), ..Default::default() }];
         assert_eq!(c.saved_password("111222333").as_deref(), Some("synced"));
+    }
+
+    #[test]
+    fn peer_note_keeps_os_and_view_mode() {
+        let mut note = PeerNote::default();
+        note.os_family = "linux".into();
+        note.os_version = "24.04".into();
+        note.view_mode = 1;
+        note.last_display = 2;
+        let json = serde_json::to_string(&note).unwrap();
+        let back: PeerNote = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, note);
+        let old: PeerNote = serde_json::from_str(r#"{"favorite":true,"last_connected":3}"#).unwrap();
+        assert!(old.favorite);
+        assert!(old.os_family.is_empty());
+        assert_eq!(old.view_mode, 0);
     }
 
     #[test]

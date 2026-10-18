@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.2
+
+* The PJDesk Server window lists each computer's version. A client that connected before 0.5.2 shows "unknown (<0.5.2)". A computer behind the current release on pjdesk.com gets an "update available" badge next to Update. This server's version is shown on the service card. The other Cloud Sync server's version comes from that server's health report. The unelevated status pipe carries the same device list and the other server's version.
+* pjdesk.com `/admin/` is a dashboard: Overview, Accounts, Servers & devices, Plans, and an audit log. Plans are Free and Cloud Sync (the site does not advertise other prices). Granting a plan records who, when, the old plan, and the new plan. An expiry turns Cloud Sync off the next time that account is used. Server versions are stored from the sync health report. Desktop client versions stay on the PJDesk Server window, because the cloud copy is sealed. Local user accounts in the PJDesk Server window are not pjdesk.com plans.
+* The client has a Saved computers page: search by name, ID, or operating system, sort, favorites, and a menu to rename, transfer a file, favorite, forget a password, or remove. The host reports its operating system during the session. Older hosts show an unknown icon. A password is saved only after the other computer accepts it, with Windows DPAPI for the current user. The Remember box starts checked only when that option is on in Settings.
+* A remote session can switch displays without reconnecting. The host sends each display's name, size, position, and DPI, and sends the list again when a display is added or resized. The viewer toolbar shows that arrangement; Ctrl+Alt+1 through 9 picks a display and Ctrl+Alt+Left/Right cycles. One screen captures only that display. All screens is one capture of the whole virtual desktop, so the pointer crosses from one display to the next. The last choice is remembered per computer. Separate windows, one local window per remote display, are not in this version.
+
 ## 0.5.1
 
 * The server window, opened without Administrator rights, no longer pretends the data folder is empty. The running service publishes the fingerprint, update setting, last check, cloud role, signed-in email, and generation on a local pipe the interactive user can read. Sections the pipe does not cover say "Locked — open as administrator to view" instead of a blank sign-in form. Restart as administrator is a button. Icons are drawn, and the window uses the same type and theme as the client.

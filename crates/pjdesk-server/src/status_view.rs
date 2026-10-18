@@ -74,9 +74,32 @@ pub struct Snapshot {
     pub cloud_updated_at: u64,
     pub cloud_error: String,
     pub notice: String,
+    /// The other Cloud Sync server, from that server's health report.
+    #[serde(default)]
+    pub peer_name: String,
+    #[serde(default)]
+    pub peer_version: String,
+    #[serde(default)]
+    pub peer_role: String,
+    /// Registered computers, without secrets. Filled when the data folder is readable.
+    #[serde(default)]
+    pub devices: Vec<ListedDevice>,
+}
+
+/// One computer, safe to put on the status pipe. No password, secret, or key.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedDevice {
+    pub id: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub online: bool,
 }
 
 impl Snapshot {
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn from_disk(dir: &Path, port: u16, service_running: bool) -> Self {
         let mut snap = Self {
             version: env!("CARGO_PKG_VERSION").into(),
@@ -127,12 +150,72 @@ impl Snapshot {
             snap.cloud_updated_at = s.updated_at;
             snap.cloud_error = s.error;
             snap.notice = s.notice;
+            snap.peer_name = s.peer_name;
+            snap.peer_version = s.peer_version;
+            snap.peer_role = s.peer_role;
         } else if !dir.join(cloud::STATUS_FILE).exists() {
             snap.cloud_known = true;
             snap.cloud_on = config_exists;
         }
+        snap.devices = listed_devices(dir);
         snap
     }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        devices: std::collections::BTreeMap<String, Rec>,
+    }
+    #[derive(Deserialize)]
+    struct Rec {
+        #[serde(default)]
+        hostname: String,
+        #[serde(default)]
+        app_version: String,
+    }
+    #[derive(Deserialize)]
+    struct Online {
+        id: String,
+        #[serde(default)]
+        version: String,
+    }
+    let Ok(bytes) = std::fs::read(dir.join("devices.json")) else {
+        return Vec::new();
+    };
+    let Ok(file) = serde_json::from_slice::<File>(&bytes) else {
+        return Vec::new();
+    };
+    let online_fresh = std::fs::metadata(dir.join("online.json"))
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().map(|e| e.as_secs() <= 15).unwrap_or(false))
+        .unwrap_or(false);
+    let online: std::collections::BTreeMap<String, String> = if online_fresh {
+        std::fs::read(dir.join("online.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<Online>>(&b).ok())
+            .map(|rows| rows.into_iter().map(|o| (o.id, o.version)).collect())
+            .unwrap_or_default()
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    let mut rows: Vec<ListedDevice> = file
+        .devices
+        .into_iter()
+        .map(|(id, rec)| {
+            let live = online.get(&id);
+            ListedDevice {
+                id,
+                hostname: rec.hostname,
+                version: live.cloned().unwrap_or(rec.app_version),
+                online: live.is_some(),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.hostname.cmp(&b.hostname).then(a.id.cmp(&b.id)));
+    rows
 }
 
 #[cfg(test)]
@@ -187,8 +270,18 @@ mod tests {
         assert_eq!(snap.account, "ben@spader.us");
         assert_eq!(snap.role, "active");
         assert_eq!(snap.epoch, 4);
+        std::fs::write(
+            dir.join("devices.json"),
+            r#"{"devices":{"123456789":{"secret_sha256":"DEVICESECRETSHA","hostname":"office","app_version":"0.5.1","first_seen":1,"last_seen":2}}}"#,
+        )
+        .unwrap();
+        let snap = Snapshot::from_disk(&dir, 21200, true);
+        assert_eq!(snap.devices.len(), 1);
+        assert_eq!(snap.devices[0].version, "0.5.1");
+        assert_eq!(snap.devices[0].hostname, "office");
 
         let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("DEVICESECRETSHA"));
         assert!(!json.contains("SUPERSECRETTOKEN"));
         assert!(!json.contains("SUPERSECRETKEY"));
         assert!(!json.contains("BEGIN"));

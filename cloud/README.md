@@ -26,9 +26,13 @@ a forgotten password.
 
 ## Accounts and Cloud Sync
 
-New accounts start with Cloud Sync off. Turn it on for a customer at
-`/admin/` (accounts listed in `ADMIN_EMAILS` are administrators and always
-have it). Billing will hook into the same switch later.
+New accounts start on the Free plan (Cloud Sync off). An administrator grants
+Cloud Sync at `/admin/` — optional expiry, a note, and an audit row for every
+change. Accounts listed in `ADMIN_EMAILS` are administrators and always have
+Cloud Sync. The site does not list prices, so Free and Cloud Sync are the only
+plans. A grant that reaches its expiry turns Cloud Sync off the next time that
+account is used. `deploy.cmd` applies D1 migrations, including `0002_plans.sql`,
+before it deploys the Worker.
 
 ## Develop
 

@@ -10,8 +10,9 @@ use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors, GdiFlush, GetDC,
     GetMonitorInfoW, GetObjectW, ReleaseDC, SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO,
+    HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFOEXW,
 };
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     DrawIconEx, GetCursorInfo, GetIconInfo, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, HCURSOR, HICON, ICONINFO,
     MONITORINFOF_PRIMARY,
@@ -19,25 +20,84 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::Rect;
 
+/// One attached display, primary sorted first (the `--display N` order).
+pub struct MonitorDetail {
+    pub rect: Rect,
+    pub primary: bool,
+    pub name: String,
+    pub dpi: u32,
+}
+
 /// All monitors: the primary first, then left to right (this is the order of
 /// `--display N`).
 pub fn monitors() -> Vec<Rect> {
+    monitor_details().into_iter().map(|d| d.rect).collect()
+}
+
+/// Every attached display, with its virtual-desktop position and DPI.
+pub fn monitor_details() -> Vec<MonitorDetail> {
     unsafe extern "system" fn collect(monitor: HMONITOR, _dc: HDC, _clip: *mut RECT, data: LPARAM) -> BOOL {
-        let list = unsafe { &mut *(data.0 as *mut Vec<(Rect, bool)>) };
-        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-            let r = info.rcMonitor;
-            let rect = Rect { left: r.left, top: r.top, width: r.right - r.left, height: r.bottom - r.top };
-            list.push((rect, info.dwFlags & MONITORINFOF_PRIMARY != 0));
+        let list = unsafe { &mut *(data.0 as *mut Vec<MonitorDetail>) };
+        let mut info = MONITORINFOEXW {
+            monitorInfo: windows::Win32::Graphics::Gdi::MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+            let r = info.monitorInfo.rcMonitor;
+            let primary = info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0;
+            let mut dpi_x = 0u32;
+            let mut dpi_y = 0u32;
+            let dpi = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
+                .ok()
+                .map(|_| dpi_x.max(1))
+                .unwrap_or(0);
+            let name = device_name(&info.szDevice);
+            list.push(MonitorDetail {
+                rect: Rect { left: r.left, top: r.top, width: r.right - r.left, height: r.bottom - r.top },
+                primary,
+                name,
+                dpi,
+            });
         }
         BOOL(1)
     }
-    let mut list: Vec<(Rect, bool)> = Vec::new();
+    let mut list: Vec<MonitorDetail> = Vec::new();
     unsafe {
         let _ = EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut list as *mut _ as isize));
     }
-    sort_displays(&mut list);
-    list.into_iter().map(|(rect, _)| rect).collect()
+    list.sort_by_key(|d| (!d.primary, d.rect.left, d.rect.top));
+    for (i, d) in list.iter_mut().enumerate() {
+        if d.name.is_empty() {
+            d.name = format!("Display {}", i + 1);
+        }
+    }
+    list
+}
+
+fn device_name(raw: &[u16]) -> String {
+    let end = raw.iter().position(|c| *c == 0).unwrap_or(raw.len());
+    String::from_utf16_lossy(&raw[..end]).trim().to_string()
+}
+
+/// `major.minor.build` from `RtlGetVersion` (not the compatibility-shimmed
+/// `GetVersionEx`, which still reports Windows 8).
+pub fn windows_version() -> String {
+    use windows::Wdk::System::SystemServices::RtlGetVersion;
+    use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+    unsafe {
+        let mut info = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        if RtlGetVersion(&mut info).is_ok() {
+            format!("{}.{}.{}", info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber)
+        } else {
+            String::new()
+        }
+    }
 }
 
 /// Primary first, then by position. Shared with the DXGI output ordering.

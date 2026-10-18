@@ -80,6 +80,7 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         control_tx.clone(),
         frame_tx,
         peer_proto,
+        host_id.clone(),
         move || {
             let _ = wake_proxy.send_event(UserEvent::Frame);
         },
@@ -115,6 +116,7 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         cmds,
         panel: super::panel::Panel::default(),
         restarting: false,
+        peer_id: host_id,
     };
     if std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files") {
         app.panel.open = true;
@@ -272,6 +274,7 @@ struct App {
     cmds: mpsc::UnboundedSender<super::controls::Cmd>,
     panel: super::panel::Panel,
     restarting: bool,
+    peer_id: String,
 }
 
 impl App {
@@ -284,6 +287,71 @@ impl App {
     fn release_all(&mut self) {
         self.keys_down.clear();
         self.send(InputEvent::ReleaseAll);
+    }
+
+    fn display_indexes(&self) -> Vec<u8> {
+        let g = self.live.lock().unwrap();
+        let mut v: Vec<u8> = if !g.displays.is_empty() {
+            g.displays.iter().map(|d| d.index).collect()
+        } else {
+            g.monitors.iter().map(|m| m.index).collect()
+        };
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn cycle_display(&mut self, next: bool) {
+        let indexes = self.display_indexes();
+        if indexes.is_empty() {
+            return;
+        }
+        let current = self.live.lock().unwrap().current_display;
+        let pos = indexes.iter().position(|i| *i == current).unwrap_or(0);
+        let pos = if next { (pos + 1) % indexes.len() } else { (pos + indexes.len() - 1) % indexes.len() };
+        self.choose_view(pjdesk_proto::peer::VIEW_SINGLE, indexes[pos]);
+    }
+
+    /// Switches display or view mode without reconnecting. `View` is sent only
+    /// after the host has published a layout, so an older host only sees
+    /// `SelectMonitor`.
+    fn choose_view(&mut self, mode: u8, display: u8) {
+        let known = {
+            let mut g = self.live.lock().unwrap();
+            let known = !g.displays.is_empty();
+            if mode == pjdesk_proto::peer::VIEW_SINGLE {
+                g.current_display = display;
+            }
+            if known {
+                g.view_mode = mode;
+            }
+            known
+        };
+        if known {
+            let _ = self.control.send(ControlMsg::View { mode, display });
+            self.note_view(mode, display);
+        }
+        if mode == pjdesk_proto::peer::VIEW_SINGLE {
+            let _ = self.control.send(ControlMsg::SelectMonitor { index: display });
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn note_view(&self, mode: u8, display: u8) {
+        let id = self.peer_id.clone();
+        if id.is_empty() {
+            return;
+        }
+        std::thread::spawn(move || {
+            if let Ok(mut cfg) = crate::config::Config::load() {
+                let note = cfg.settings.peers.entry(id).or_default();
+                note.view_mode = mode;
+                note.last_display = display;
+                let _ = cfg.save();
+            }
+        });
     }
 
     fn redraw(&mut self) {
@@ -327,8 +395,9 @@ impl App {
             }
             None => buffer.fill(0x00_1e_1e_22),
         }
-        self.toolbar.draw(&mut buffer, win_w, win_h);
         let snap = self.live.lock().unwrap().snapshot();
+        self.toolbar.sync(screens_of(&snap.displays), snap.current_display, snap.view_mode == pjdesk_proto::peer::VIEW_ALL);
+        self.toolbar.draw(&mut buffer, win_w, win_h);
         self.panel.draw(&mut buffer, win_w, win_h, &snap);
         if snap.restart {
             self.restarting = true;
@@ -398,6 +467,12 @@ impl App {
                 }
             }
             Action::Disconnect => return true,
+            Action::SelectDisplay(index) => self.choose_view(pjdesk_proto::peer::VIEW_SINGLE, index),
+            Action::ViewSingle => {
+                let display = self.live.lock().unwrap().current_display;
+                self.choose_view(pjdesk_proto::peer::VIEW_SINGLE, display);
+            }
+            Action::ViewAll => self.choose_view(pjdesk_proto::peer::VIEW_ALL, 0),
         }
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -608,6 +683,18 @@ impl App {
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
+                return;
+            }
+        }
+        if down && !event.repeat && self.modifiers.control_key() && self.modifiers.alt_key() {
+            if let Some(n) = display_key(code) {
+                if let Some(index) = self.display_indexes().get(n).copied() {
+                    self.choose_view(pjdesk_proto::peer::VIEW_SINGLE, index);
+                }
+                return;
+            }
+            if matches!(code, KeyCode::ArrowLeft | KeyCode::ArrowRight) {
+                self.cycle_display(code == KeyCode::ArrowRight);
                 return;
             }
         }
@@ -891,4 +978,33 @@ impl ApplicationHandler<UserEvent> for App {
             _ => {}
         }
     }
+}
+
+fn screens_of(displays: &[pjdesk_proto::peer::DisplayLayout]) -> Vec<pjdesk_proto::layout::Screen> {
+    displays
+        .iter()
+        .map(|d| pjdesk_proto::layout::Screen {
+            index: d.index,
+            x: d.x,
+            y: d.y,
+            width: d.width as u32,
+            height: d.height as u32,
+            dpi: d.dpi,
+        })
+        .collect()
+}
+
+fn display_key(code: KeyCode) -> Option<usize> {
+    Some(match code {
+        KeyCode::Digit1 | KeyCode::Numpad1 => 0,
+        KeyCode::Digit2 | KeyCode::Numpad2 => 1,
+        KeyCode::Digit3 | KeyCode::Numpad3 => 2,
+        KeyCode::Digit4 | KeyCode::Numpad4 => 3,
+        KeyCode::Digit5 | KeyCode::Numpad5 => 4,
+        KeyCode::Digit6 | KeyCode::Numpad6 => 5,
+        KeyCode::Digit7 | KeyCode::Numpad7 => 6,
+        KeyCode::Digit8 | KeyCode::Numpad8 => 7,
+        KeyCode::Digit9 | KeyCode::Numpad9 => 8,
+        _ => return None,
+    })
 }
