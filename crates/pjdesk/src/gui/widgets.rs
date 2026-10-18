@@ -26,9 +26,9 @@ impl Toast {
             return;
         }
         ctx.request_repaint_after(Duration::from_millis(200));
-        egui::Area::new(egui::Id::new("toast"))
-            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
-            .show(ctx, |ui| {
+        egui::Area::new(egui::Id::new("toast")).anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0)).show(
+            ctx,
+            |ui| {
                 egui::Frame::NONE
                     .fill(theme::ELEV)
                     .corner_radius(egui::CornerRadius::same(10))
@@ -37,7 +37,8 @@ impl Toast {
                     .show(ui, |ui| {
                         ui.colored_label(Color32::WHITE, &self.text);
                     });
-            });
+            },
+        );
     }
 }
 
@@ -84,6 +85,26 @@ pub fn text_field(
             .margin(egui::Margin::symmetric(12, 10))
             .desired_width(f32::INFINITY),
     )
+}
+
+/// A password field with a Show/Hide toggle. Returns the text field's response
+/// so the caller can react to Enter.
+pub fn password_field(ui: &mut egui::Ui, value: &mut String, hint: &str, shown: &mut bool) -> egui::Response {
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 72.0).max(80.0);
+        let resp = ui.add(
+            egui::TextEdit::singleline(value)
+                .hint_text(hint)
+                .password(!*shown)
+                .desired_width(width)
+                .margin(egui::Margin::symmetric(12, 10)),
+        );
+        if ui.button(if *shown { "Hide" } else { "Show" }).clicked() {
+            *shown = !*shown;
+        }
+        resp
+    })
+    .inner
 }
 
 /// A full-width primary (accent) button of a comfortable height.

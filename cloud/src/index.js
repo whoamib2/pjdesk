@@ -24,7 +24,10 @@
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 const AUTH_HASH_ITERATIONS = 100000; // the Workers PBKDF2 maximum
 const LOGIN_FAILS = { limit: 10, window: 15 * 60 };
+const LOGIN_IP = { limit: 30, window: 15 * 60 };
 const SIGNUPS = { limit: 5, window: 60 * 60 };
+const SESSION_IDLE = 90 * 24 * 3600;
+const SESSION_ABSOLUTE = 365 * 24 * 3600;
 const SEAL_MAGIC = "PJSYNC1\0";
 
 export default {
@@ -58,7 +61,14 @@ const now = () => Math.floor(Date.now() / 1000);
 function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...headers },
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      "x-frame-options": "DENY",
+      ...headers,
+    },
   });
 }
 
@@ -140,14 +150,19 @@ async function session(request, env) {
   if (!m) throw new HttpError(401, "Please sign in.");
   const tokenHash = await sha256Hex(m[1]);
   const row = await env.DB.prepare(
-    `SELECT s.account_id, s.last_used_at, a.email, a.sync_enabled
+    `SELECT s.account_id, s.created_at, s.last_used_at, a.email, a.sync_enabled
        FROM sessions s JOIN accounts a ON a.id = s.account_id
       WHERE s.token_hash = ?`,
   )
     .bind(tokenHash)
     .first();
   if (!row) throw new HttpError(401, "You were signed out. Please sign in again.");
-  if (now() - row.last_used_at > 3600) {
+  const t = now();
+  if (t - row.created_at > SESSION_ABSOLUTE || t - row.last_used_at > SESSION_IDLE) {
+    await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(tokenHash).run();
+    throw new HttpError(401, "You were signed out. Please sign in again.");
+  }
+  if (t - row.last_used_at > 3600) {
     await env.DB.prepare("UPDATE sessions SET last_used_at = ? WHERE token_hash = ?").bind(now(), tokenHash).run();
   }
   const admin = isAdmin(env, row.email);
@@ -189,6 +204,12 @@ async function signup(request, env) {
   }
   const salt = randomHex(16);
   const hash = await hashAuthKey(auth_key, salt);
+  // Count the attempt before insert so a duplicate address burns a slot too.
+  // The response is the same whether or not the address was new: saying
+  // "already exists" lets anyone enumerate accounts. There is no mailer, so
+  // this cannot be closed completely — a follow-up sign-in with the same
+  // password still succeeds only for an address the caller just created.
+  await noteEvent(env, `signup:${ip}`);
   try {
     await env.DB.prepare(
       "INSERT INTO accounts (id, email, auth_hash, auth_salt, sync_enabled, created_at) VALUES (?, ?, ?, ?, 0, ?)",
@@ -196,18 +217,21 @@ async function signup(request, env) {
       .bind(randomHex(16), email, hash, salt, now())
       .run();
   } catch (e) {
-    if (String(e).includes("UNIQUE")) throw new HttpError(409, "An account with that email already exists. Sign in instead.");
+    if (String(e).includes("UNIQUE")) return json({ ok: true }, 201);
     throw e;
   }
-  await noteEvent(env, `signup:${ip}`);
-  return json({ ok: true, email, sync_enabled: isAdmin(env, email) }, 201);
+  return json({ ok: true }, 201);
 }
 
 async function login(request, env) {
   const { email: rawEmail, auth_key, device } = await readJson(request);
   const email = normEmail(rawEmail);
   if (!validEmail(email) || !validKey(auth_key)) throw new HttpError(400, "Enter your email and password.");
-  if (await rateLimited(env, `login:${email}`, LOGIN_FAILS)) {
+  const ip = request.headers.get("cf-connecting-ip") || "local";
+  if (
+    (await rateLimited(env, `login:${email}`, LOGIN_FAILS)) ||
+    (await rateLimited(env, `login-ip:${ip}`, LOGIN_IP))
+  ) {
     throw new HttpError(429, "Too many failed sign-ins. Wait 15 minutes and try again.");
   }
   const acct = await env.DB.prepare("SELECT id, auth_hash, auth_salt, sync_enabled FROM accounts WHERE email = ?")
@@ -217,6 +241,7 @@ async function login(request, env) {
   const hash = await hashAuthKey(auth_key, acct ? acct.auth_salt : "00".repeat(16));
   if (!acct || !sameHex(hash, acct.auth_hash)) {
     await noteEvent(env, `login:${email}`);
+    await noteEvent(env, `login-ip:${ip}`);
     throw new HttpError(401, "Wrong email or password.");
   }
   const token = base64url(crypto.getRandomValues(new Uint8Array(32)));
@@ -285,6 +310,7 @@ async function syncGet(request, env) {
   requireSync(s);
   const obj = await env.SYNC.get(objectKey(s.accountId), { onlyIf: request.headers });
   if (obj === null) return json({ error: "Nothing has been uploaded yet." }, 404);
+  if (obj.size > MAX_SYNC_BYTES) return json({ error: "That server copy is too large." }, 413);
   if (!("body" in obj) || !obj.body) {
     return new Response(null, { status: 304, headers: { etag: obj.httpEtag, "cache-control": "no-store" } });
   }
@@ -293,20 +319,45 @@ async function syncGet(request, env) {
   });
 }
 
+/** Reads a request body, stopping once it passes `max` bytes. */
+async function readLimited(request, max) {
+  const declared = Number(request.headers.get("content-length") || 0);
+  if (Number.isFinite(declared) && declared > max) {
+    throw new HttpError(413, "That server copy is too large.");
+  }
+  if (!request.body) throw new HttpError(400, "Bad request.");
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel();
+      throw new HttpError(413, "That server copy is too large.");
+    }
+    chunks.push(value);
+  }
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const chunk of chunks) {
+    buf.set(chunk, off);
+    off += chunk.byteLength;
+  }
+  return buf;
+}
+
 async function syncPut(request, env) {
   const s = await session(request, env);
   requireSync(s);
-  if (Number(request.headers.get("content-length") || 0) > MAX_SYNC_BYTES) {
-    throw new HttpError(413, "That server copy is too large.");
-  }
-  const buf = await request.arrayBuffer();
-  if (buf.byteLength > MAX_SYNC_BYTES) throw new HttpError(413, "That server copy is too large.");
+  const buf = await readLimited(request, MAX_SYNC_BYTES);
   // The service can't read the copy, but it must at least be a sealed one.
-  const head = new Uint8Array(buf.slice(0, SEAL_MAGIC.length));
+  const head = buf.subarray(0, SEAL_MAGIC.length);
   if (buf.byteLength < 64 || String.fromCharCode(...head) !== SEAL_MAGIC) {
     throw new HttpError(400, "That isn't a sealed PJDesk server copy.");
   }
-  const obj = await env.SYNC.put(objectKey(s.accountId), buf, {
+  const obj = await env.SYNC.put(objectKey(s.accountId), buf.buffer, {
     httpMetadata: { contentType: "application/octet-stream" },
   });
   await env.DB.prepare(
@@ -391,7 +442,17 @@ async function latestTag(repo) {
   return null;
 }
 
+function safeRepo(repo) {
+  return typeof repo === "string" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo);
+}
+
+/** Release tags become part of a redirect URL, so they stay a single path segment. */
+function safeTag(tag) {
+  return typeof tag === "string" && /^v?[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/.test(tag) && !tag.includes("..");
+}
+
 async function latestRelease(env) {
+  if (!safeRepo(env.RELEASE_REPO)) throw new HttpError(500, "Release repository is not configured.");
   if (releaseMemo && Date.now() - releaseMemo.at < RELEASE_TTL_MS) return releaseMemo.info;
   let tag = null;
   try {
@@ -399,7 +460,7 @@ async function latestRelease(env) {
   } catch (e) {
     console.error("release lookup failed:", e && e.message);
   }
-  if (!tag) {
+  if (!safeTag(tag)) {
     if (releaseMemo) return releaseMemo.info; // stale is better than nothing
     throw new HttpError(502, "Couldn't reach GitHub for the latest release.");
   }
@@ -417,5 +478,8 @@ async function download(env, url) {
     // Fall back to the releases page below.
   }
   const target = info && { client: info.client, server: info.server, sums: info.sums }[what];
-  return Response.redirect(target || `https://github.com/${env.RELEASE_REPO}/releases/latest`, 302);
+  const fallback = safeRepo(env.RELEASE_REPO)
+    ? `https://github.com/${env.RELEASE_REPO}/releases/latest`
+    : "https://pjdesk.com/";
+  return Response.redirect(target || fallback, 302);
 }

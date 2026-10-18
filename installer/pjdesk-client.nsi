@@ -36,6 +36,15 @@ SetCompressor /SOLID lzma
 
 !insertmacro MUI_LANGUAGE "English"
 
+; Don't load DLLs from the folder the installer was launched from.
+Function .onInit
+  System::Call 'kernel32::SetDllDirectoryA(t "")'
+FunctionEnd
+
+Function un.onInit
+  System::Call 'kernel32::SetDllDirectoryA(t "")'
+FunctionEnd
+
 !define ARP "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
 
 Section "PJDesk (required)" SecCore

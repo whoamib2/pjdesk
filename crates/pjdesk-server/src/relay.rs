@@ -10,7 +10,7 @@
 //! failed. The packets are end-to-end encrypted; the relay never sees content.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,15 @@ use crate::server::Shared;
 
 /// Relay routes with no traffic for this long are removed.
 const ROUTE_IDLE: Duration = Duration::from_secs(120);
+/// One session may relay at most this much. The route exists before the
+/// password check (QUIC has to come up first), so an open-ended forward would
+/// let anyone who can open a session burn bandwidth.
+const ROUTE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// Cap on simultaneous relay routes, so a flood of binds cannot grow forever.
+const MAX_ROUTES: usize = 4096;
+/// Bind datagrams one address may send in a second. Past this they are dropped
+/// before the session table is locked.
+const MAX_BINDS_PER_SEC: u32 = 30;
 
 struct Route {
     to: SocketAddr,
@@ -35,6 +44,7 @@ struct Route {
 pub async fn run(socket: Arc<UdpSocket>, state: Shared) -> Result<()> {
     let mut buf = vec![0u8; 65_535];
     let mut routes: HashMap<SocketAddr, Route> = HashMap::new();
+    let mut binds: HashMap<IpAddr, (Instant, u32)> = HashMap::new();
     let mut last_sweep = Instant::now();
 
     loop {
@@ -51,10 +61,15 @@ pub async fn run(socket: Arc<UdpSocket>, state: Shared) -> Result<()> {
 
         if udp::is_control(packet) {
             if let Some(UdpMsg::Bind { session_id, token, role }) = udp::decode(packet) {
-                if let Some(reply) = handle_bind(&state, &mut routes, src, session_id, token, role) {
-                    let _ = socket.send_to(&reply, src).await;
+                if bind_allowed(&mut binds, src.ip()) {
+                    if let Some(reply) = handle_bind(&state, &mut routes, src, session_id, token, role) {
+                        let _ = socket.send_to(&reply, src).await;
+                    }
                 }
             }
+        } else if routes.get(&src).is_some_and(|route| route.bytes.saturating_add(len as u64) > ROUTE_MAX_BYTES) {
+            info!("relay route from {src} hit the {} MiB cap; closing it", ROUTE_MAX_BYTES / (1024 * 1024));
+            routes.remove(&src);
         } else if let Some(route) = routes.get_mut(&src) {
             route.last_seen = Instant::now();
             route.bytes += len as u64;
@@ -64,6 +79,10 @@ pub async fn run(socket: Arc<UdpSocket>, state: Shared) -> Result<()> {
 
         if last_sweep.elapsed() > Duration::from_secs(10) {
             last_sweep = Instant::now();
+            binds.retain(|_, (start, _)| start.elapsed() < Duration::from_secs(60));
+            if binds.len() > 8192 {
+                binds.clear();
+            }
             routes.retain(|addr, route| {
                 let keep = route.last_seen.elapsed() < ROUTE_IDLE;
                 if !keep && route.bytes > 0 {
@@ -80,6 +99,16 @@ pub async fn run(socket: Arc<UdpSocket>, state: Shared) -> Result<()> {
     }
 }
 
+/// True when this address is still under the per-second bind cap.
+fn bind_allowed(binds: &mut HashMap<IpAddr, (Instant, u32)>, ip: IpAddr) -> bool {
+    let slot = binds.entry(ip).or_insert((Instant::now(), 0));
+    if slot.0.elapsed() >= Duration::from_secs(1) {
+        *slot = (Instant::now(), 0);
+    }
+    slot.1 += 1;
+    slot.1 <= MAX_BINDS_PER_SEC
+}
+
 /// Validates a Bind, records the peer's public address and, when both sides
 /// are known, installs the relay routes. Returns the BindAck to send.
 fn handle_bind(
@@ -90,6 +119,9 @@ fn handle_bind(
     token: [u8; 16],
     role: Role,
 ) -> Option<Vec<u8>> {
+    if routes.len() >= MAX_ROUTES && !routes.contains_key(&src) {
+        return None;
+    }
     let mut st = state.lock().unwrap();
     let session = st.sessions.get_mut(&session_id)?;
     if !session.accepted || !constant_time_eq(&session.token_for(role), &token) {

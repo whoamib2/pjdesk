@@ -1,8 +1,8 @@
 //! The panels that make up the main window, as methods on [`super::App`].
 
+use eframe::egui::{self, Color32, RichText};
 use pjdesk_proto::signal::AddressEntry;
 use pjdesk_proto::{format_id, normalize_id};
-use eframe::egui::{self, Color32, RichText};
 
 use super::{theme, widgets, App};
 
@@ -28,7 +28,11 @@ impl App {
                 ui.separator();
                 match &self.cfg.account {
                     Some(acct) => {
-                        let who = if acct.display_name.is_empty() { acct.username.clone() } else { acct.display_name.clone() };
+                        let who = if acct.display_name.is_empty() {
+                            acct.username.clone()
+                        } else {
+                            acct.display_name.clone()
+                        };
                         if ui.button("Sign out").clicked() {
                             self.sign_out();
                         }
@@ -110,7 +114,8 @@ impl App {
                     if ui.button(eye).on_hover_text(if self.show_password { "Hide" } else { "Reveal" }).clicked() {
                         self.show_password = !self.show_password;
                     }
-                    if ui.button("⧉").on_hover_text("Copy password").clicked() && widgets::copy_to_clipboard(&password) {
+                    if ui.button("⧉").on_hover_text("Copy password").clicked() && widgets::copy_to_clipboard(&password)
+                    {
                         self.toast.show("Password copied");
                     }
                     if ui.button("🔄").on_hover_text("New one-time password").clicked() {
@@ -144,13 +149,15 @@ impl App {
                 }
             });
         } else {
-            ui.label(RichText::new("Permanent password (optional, for unattended access)").color(theme::MUTED).size(12.0));
+            ui.label(
+                RichText::new("Permanent password (optional, for unattended access)").color(theme::MUTED).size(12.0),
+            );
             ui.horizontal(|ui| {
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.perm_input)
-                        .password(true)
-                        .hint_text("set one…")
-                        .desired_width(200.0),
+                let resp = widgets::password_field(
+                    ui,
+                    &mut self.perm_input,
+                    "at least 8 characters",
+                    &mut self.show_perm_input,
                 );
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if (ui.button("Set").clicked() || enter) && !self.perm_input.trim().is_empty() {
@@ -194,8 +201,7 @@ impl App {
             ui.label(RichText::new("One-time password").color(theme::MUTED).size(12.0));
             ui.horizontal(|ui| match &one_time_pw {
                 Some(pw) => {
-                    let shown =
-                        if self.show_password { pw.clone() } else { "•".repeat(pw.chars().count().max(6)) };
+                    let shown = if self.show_password { pw.clone() } else { "•".repeat(pw.chars().count().max(6)) };
                     ui.label(RichText::new(shown).size(20.0).monospace().color(Color32::WHITE));
                     let eye = if self.show_password { "🙈" } else { "👁" };
                     if ui.button(eye).on_hover_text(if self.show_password { "Hide" } else { "Reveal" }).clicked() {
@@ -232,7 +238,7 @@ impl App {
 
             ui.add_space(10.0);
             widgets::field_label(ui, "Password (optional if saved)");
-            widgets::text_field(ui, &mut self.connect_password, "password", true, false);
+            widgets::password_field(ui, &mut self.connect_password, "password", &mut self.show_connect_password);
             ui.add_space(10.0);
             ui.checkbox(&mut self.remember, "Remember this computer's password");
 
@@ -265,7 +271,12 @@ impl App {
 
         if self.cfg.address_book.is_empty() {
             ui.add_space(6.0);
-            ui.label(RichText::new("No saved computers yet. Connect to one and choose \u{201c}Add to saved computers\u{201d}.").color(theme::MUTED));
+            ui.label(
+                RichText::new(
+                    "No saved computers yet. Connect to one and choose \u{201c}Add to saved computers\u{201d}.",
+                )
+                .color(theme::MUTED),
+            );
             return;
         }
 
@@ -280,11 +291,7 @@ impl App {
                         let title = if entry.alias.is_empty() { format_id(&entry.id) } else { entry.alias.clone() };
                         ui.vertical(|ui| {
                             ui.label(RichText::new(title).strong().color(Color32::WHITE));
-                            let sub = if entry.alias.is_empty() {
-                                String::new()
-                            } else {
-                                format_id(&entry.id)
-                            };
+                            let sub = if entry.alias.is_empty() { String::new() } else { format_id(&entry.id) };
                             let saved = if entry.password.is_some() { "  🔑 password saved" } else { "" };
                             ui.label(RichText::new(format!("{sub}{saved}")).color(theme::MUTED).size(12.0));
                         });
@@ -382,11 +389,15 @@ impl App {
                 ui.text_edit_singleline(&mut self.login_user);
                 ui.add_space(4.0);
                 ui.label("Password");
-                let pw = ui.add(egui::TextEdit::singleline(&mut self.login_pass).password(true));
+                let pw = widgets::password_field(ui, &mut self.login_pass, "", &mut self.show_login_pass);
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let clicked = ui
-                        .add_enabled(!self.login_busy, egui::Button::new(if self.login_busy { "Signing in…" } else { "Sign in" }).fill(theme::ACCENT))
+                        .add_enabled(
+                            !self.login_busy,
+                            egui::Button::new(if self.login_busy { "Signing in…" } else { "Sign in" })
+                                .fill(theme::ACCENT),
+                        )
                         .clicked();
                     let entered = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     submit = clicked || entered;

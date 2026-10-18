@@ -129,6 +129,58 @@ pub fn send_ctrl_alt_del() {
 #[cfg(not(windows))]
 pub fn send_ctrl_alt_del() {}
 
+/// Relaunches elevated with `args`, passing `password` through a file in the
+/// caller's profile instead of the command line. The command line of an
+/// elevated process is visible to other local users and to audit logs.
+#[cfg(windows)]
+pub fn run_elevated_with_password(args: &[&str], password: &str) -> bool {
+    let name = format!("pjdesk-pw-{}.txt", hex::encode(pjdesk_proto::random_bytes::<8>()));
+    let path = std::env::temp_dir().join(name);
+    if std::fs::write(&path, password).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    let path_str = path.display().to_string();
+    let mut owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    owned.push("--password-file".into());
+    owned.push(path_str);
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let ok = run_elevated(&refs);
+    if !ok {
+        let _ = std::fs::remove_file(&path);
+        return false;
+    }
+    // ShellExecute returns as soon as the UAC prompt appears. If the prompt is
+    // dismissed, nothing else deletes the file, so this process does — after
+    // long enough for an accepted prompt to have read it.
+    let cleanup = path;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(10 * 60));
+        let _ = std::fs::remove_file(cleanup);
+    });
+    true
+}
+
+#[cfg(not(windows))]
+pub fn run_elevated_with_password(_args: &[&str], _password: &str) -> bool {
+    false
+}
+
+/// Reads a password file passed to an elevated helper and deletes it.
+pub fn read_password_file(path: &std::path::Path) -> anyhow::Result<String> {
+    let pw = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("could not read the password file: {e}"))?;
+    let _ = std::fs::remove_file(path);
+    let pw = pw.trim_end_matches(['\r', '\n']).to_string();
+    if pw.is_empty() {
+        anyhow::bail!("the password file was empty");
+    }
+    Ok(pw)
+}
+
 /// Quotes one argument the way `CommandLineToArgvW` parses it, so a value with
 /// spaces, quotes or trailing backslashes (e.g. a password) survives intact.
 #[cfg(windows)]

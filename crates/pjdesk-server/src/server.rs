@@ -26,6 +26,18 @@ use crate::ServerOpts;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Sessions that never complete are forgotten after this long.
 const SESSION_TTL: Duration = Duration::from_secs(600);
+/// Open sessions one address may have at once. Past this, further connection
+/// attempts are refused so one source cannot fill the relay.
+const MAX_SESSIONS_PER_IP: usize = 8;
+/// Hard cap on sessions the process will track.
+const MAX_SESSIONS: usize = 2000;
+/// Signaling messages one connection may send in a second before it is dropped.
+const MAX_MSGS_PER_SEC: u32 = 40;
+/// Open TCP connections, process-wide and per source address. Past this, new
+/// connections are dropped before the TLS handshake so a flood cannot spawn
+/// unbounded tasks.
+const MAX_CONNECTIONS: usize = 1024;
+const MAX_CONNECTIONS_PER_IP: usize = 32;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -54,6 +66,9 @@ pub struct OnlineHost {
     pub tx: mpsc::UnboundedSender<ServerMsg>,
     pub hostname: String,
     pub app_version: String,
+    /// Address the registration arrived from, so a second registration of the
+    /// same device from somewhere else can be logged.
+    pub addr: SocketAddr,
 }
 
 /// A connection attempt between a controller and a host.
@@ -66,6 +81,7 @@ pub struct Session {
     pub host_conn: u64,
     pub host_tx: mpsc::UnboundedSender<ServerMsg>,
     pub controller_conn: u64,
+    pub controller_ip: IpAddr,
     pub controller_tx: mpsc::UnboundedSender<ServerMsg>,
     pub accepted: bool,
     pub host: PeerSlot,
@@ -162,10 +178,15 @@ pub fn read_identity(data_dir: &Path) -> Option<TlsIdentity> {
 /// Runs the server until `shutdown` completes.
 pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Output = ()>) -> Result<()> {
     std::fs::create_dir_all(&data_dir).with_context(|| format!("creating data folder {}", data_dir.display()))?;
-    // Repair the data folder's permissions (reset them to the inherited
-    // SYSTEM/Administrators/Users ACL) before touching the identity files, so a
-    // folder an earlier version left unreadable can't stop the server from
-    // starting. Harmless if the service path already did it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    // Repair the data folder's permissions (SYSTEM and Administrators only)
+    // before touching the identity files, so a folder an earlier version left
+    // unreadable — or readable by every local user — can't stop the server
+    // or leak its key. Harmless if the service path already did it.
     #[cfg(windows)]
     crate::service::repair_data_dir(&data_dir);
     let identity = load_identity(&data_dir)?;
@@ -207,6 +228,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     let janitor = tokio::spawn(janitor(state.clone()));
     let fleet = tokio::spawn(fleet_sync(state.clone()));
     let cloud = tokio::spawn(cloud_sync(state.clone(), acceptor.clone()));
+    let budget = Arc::new(Mutex::new(ConnBudget::default()));
 
     let accept_loop = async {
         loop {
@@ -218,9 +240,14 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
                     continue;
                 }
             };
+            let Some(permit) = ConnBudget::try_acquire(&budget, addr.ip()) else {
+                debug!("{addr}: connection refused (too many open)");
+                continue;
+            };
             let acceptor = acceptor.read().unwrap().clone();
             let state = state.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = handle_connection(acceptor, stream, addr, state).await {
                     debug!("{addr}: connection closed: {e:#}");
                 }
@@ -237,6 +264,47 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     fleet.abort();
     cloud.abort();
     Ok(())
+}
+
+/// Tracks how many TCP connections are open so a flood is dropped at accept.
+#[derive(Default)]
+struct ConnBudget {
+    total: usize,
+    per_ip: HashMap<IpAddr, usize>,
+}
+
+struct ConnPermit {
+    ip: IpAddr,
+    budget: Arc<Mutex<ConnBudget>>,
+}
+
+impl ConnBudget {
+    fn try_acquire(this: &Arc<Mutex<Self>>, ip: IpAddr) -> Option<ConnPermit> {
+        let mut guard = this.lock().unwrap();
+        if guard.total >= MAX_CONNECTIONS {
+            return None;
+        }
+        let n = guard.per_ip.get(&ip).copied().unwrap_or(0);
+        if n >= MAX_CONNECTIONS_PER_IP {
+            return None;
+        }
+        guard.total += 1;
+        guard.per_ip.insert(ip, n + 1);
+        Some(ConnPermit { ip, budget: Arc::clone(this) })
+    }
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        let mut guard = self.budget.lock().unwrap();
+        guard.total = guard.total.saturating_sub(1);
+        if let Some(n) = guard.per_ip.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                guard.per_ip.remove(&self.ip);
+            }
+        }
+    }
 }
 
 /// Per-connection context.
@@ -279,12 +347,24 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
     debug!("{addr}: connected (conn {})", conn.id);
 
     let result: Result<()> = async {
+        let mut burst_start = Instant::now();
+        let mut burst = 0u32;
         loop {
             let msg: ClientMsg = match tokio::time::timeout(IDLE_TIMEOUT, read_msg(&mut reader, MAX_SIGNAL_FRAME)).await
             {
                 Ok(msg) => msg?,
                 Err(_) => bail!("idle timeout"),
             };
+            // A single connection that sprays messages holds the process-wide
+            // lock on every one of them. Drop it instead of queuing forever.
+            if burst_start.elapsed() >= Duration::from_secs(1) {
+                burst_start = Instant::now();
+                burst = 0;
+            }
+            burst += 1;
+            if burst > MAX_MSGS_PER_SEC {
+                bail!("too many messages");
+            }
             handle_message(&state, &mut conn, msg);
         }
     }
@@ -327,10 +407,88 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
     result
 }
 
+fn handle_login(
+    state: &Shared,
+    conn: &mut Conn,
+    proto: u16,
+    username: String,
+    credential: pjdesk_proto::signal::Credential,
+    device_name: String,
+) {
+    if proto != PROTOCOL_VERSION {
+        conn.error(ErrorCode::VersionMismatch, format!("server speaks protocol {PROTOCOL_VERSION}, client {proto}"));
+        return;
+    }
+    let data_dir = {
+        let mut guard = state.lock().unwrap();
+        if !guard.limiter.allow(conn.addr.ip(), "login", 15) {
+            conn.error(ErrorCode::RateLimited, "too many sign-in attempts, wait a minute");
+            return;
+        }
+        // Pick up accounts added out of process (the management window or the
+        // CLI) so a new sign-in works without restarting the service.
+        if let Ok(fresh) = crate::accounts::Accounts::load(&guard.data_dir) {
+            guard.accounts = fresh;
+        }
+        guard.data_dir.clone()
+    };
+    let device_name: String = device_name.chars().take(64).collect();
+    let result = match credential {
+        pjdesk_proto::signal::Credential::Password(pw) => {
+            let prep = state.lock().unwrap().accounts.prep_password_login(&username);
+            // Argon2 runs here, with the server lock released.
+            let matched = crate::accounts::verify_password(&prep.hash, &pw).is_ok();
+            let mut guard = state.lock().unwrap();
+            if let Ok(fresh) = crate::accounts::Accounts::load(&data_dir) {
+                guard.accounts = fresh;
+            }
+            if matched {
+                guard.accounts.commit_password_login(&prep)
+            } else {
+                Err(anyhow::anyhow!("wrong username or password"))
+            }
+        }
+        pjdesk_proto::signal::Credential::Token(token) => {
+            let mut guard = state.lock().unwrap();
+            guard.accounts.login_token(&username, &token)
+        }
+    };
+    match result {
+        Ok(session) => {
+            info!("Account \"{}\" signed in from {} ({device_name})", session.username, conn.addr.ip());
+            conn.send(ServerMsg::LoginResult {
+                ok: true,
+                token: session.token,
+                display_name: session.display_name,
+                is_admin: session.is_admin,
+                message: String::new(),
+            });
+        }
+        Err(e) => {
+            conn.send(ServerMsg::LoginResult {
+                ok: false,
+                token: String::new(),
+                display_name: String::new(),
+                is_admin: false,
+                message: e.to_string(),
+            });
+        }
+    }
+}
+
 fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
+    // Password checks are slow (Argon2). Do them off the process-wide lock so
+    // one sign-in attempt cannot stall every other connection.
+    if let ClientMsg::Login { proto, username, credential, device_name } = msg {
+        handle_login(state, conn, proto, username, credential, device_name);
+        return;
+    }
     let mut guard = state.lock().unwrap();
     let st = &mut *guard;
     match msg {
+        // Handled before this match so the password hash does not hold `state`'s lock.
+        ClientMsg::Login { .. } => unreachable!("login is handled before the server lock"),
+
         ClientMsg::Ping => conn.send(ServerMsg::Pong),
 
         ClientMsg::Register { proto, device_id, device_secret, hostname, app_version } => {
@@ -354,8 +512,17 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                         tx: conn.tx.clone(),
                         hostname: hostname.clone(),
                         app_version: app_version.clone(),
+                        addr: conn.addr,
                     };
                     if let Some(prev) = st.online.insert(id.clone(), host) {
+                        if prev.conn_id != conn.id && prev.addr.ip() != conn.addr.ip() {
+                            warn!(
+                                "Host {} is now registered from {} (it was {}). The device secret is known to both.",
+                                format_id(&id),
+                                conn.addr.ip(),
+                                prev.addr.ip()
+                            );
+                        }
                         if prev.conn_id != conn.id && !prev.tx.is_closed() {
                             st.standby.entry(id.clone()).or_default().push(prev);
                         }
@@ -399,6 +566,11 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 conn.error(ErrorCode::BadRequest, "a device cannot connect to itself on the same connection");
                 return;
             }
+            let from_here = st.sessions.values().filter(|s| s.controller_ip == conn.addr.ip()).count();
+            if from_here >= MAX_SESSIONS_PER_IP || st.sessions.len() >= MAX_SESSIONS {
+                conn.error(ErrorCode::RateLimited, "too many connection attempts, wait a minute");
+                return;
+            }
             let session_id = pjdesk_proto::random_u64();
             let host_token = pjdesk_proto::random_bytes::<16>();
             let controller_token = pjdesk_proto::random_bytes::<16>();
@@ -418,6 +590,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 host_conn: host.conn_id,
                 host_tx: host.tx.clone(),
                 controller_conn: conn.id,
+                controller_ip: conn.addr.ip(),
                 controller_tx: conn.tx.clone(),
                 accepted: false,
                 host: PeerSlot::default(),
@@ -467,58 +640,6 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 slot.fingerprint = cert_fingerprint;
             }
             session.maybe_send_peer_info(session_id);
-        }
-
-        ClientMsg::Login { proto, username, credential, device_name } => {
-            if proto != PROTOCOL_VERSION {
-                conn.error(
-                    ErrorCode::VersionMismatch,
-                    format!("server speaks protocol {PROTOCOL_VERSION}, client {proto}"),
-                );
-                return;
-            }
-            // Throttle password guessing per IP.
-            if !st.limiter.allow(conn.addr.ip(), "login", 15) {
-                conn.error(ErrorCode::RateLimited, "too many sign-in attempts, wait a minute");
-                return;
-            }
-            // Pick up accounts added or changed out-of-process (the management
-            // window or the CLI) since startup, so a new sign-in works without
-            // restarting the service.
-            {
-                let dir = st.data_dir.clone();
-                if let Ok(fresh) = crate::accounts::Accounts::load(&dir) {
-                    st.accounts = fresh;
-                }
-            }
-            let device_name: String = device_name.chars().take(64).collect();
-            let result = match &credential {
-                pjdesk_proto::signal::Credential::Password(pw) => {
-                    st.accounts.login_password(&username, pw, &device_name)
-                }
-                pjdesk_proto::signal::Credential::Token(token) => st.accounts.login_token(&username, token),
-            };
-            match result {
-                Ok(session) => {
-                    info!("Account \"{}\" signed in from {} ({device_name})", session.username, conn.addr.ip());
-                    conn.send(ServerMsg::LoginResult {
-                        ok: true,
-                        token: session.token,
-                        display_name: session.display_name,
-                        is_admin: session.is_admin,
-                        message: String::new(),
-                    });
-                }
-                Err(e) => {
-                    conn.send(ServerMsg::LoginResult {
-                        ok: false,
-                        token: String::new(),
-                        display_name: String::new(),
-                        is_admin: false,
-                        message: e.to_string(),
-                    });
-                }
-            }
         }
 
         ClientMsg::Logout { token } => st.accounts.logout(&token),
@@ -596,8 +717,8 @@ async fn fleet_sync(state: Shared) {
         let online_path = data_dir.join("online.json");
         if let Ok(bytes) = serde_json::to_vec(&snapshot) {
             let tmp = online_path.with_extension("json.tmp");
-            if std::fs::write(&tmp, bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, &online_path);
+            if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &online_path).is_ok() {
+                crate::cloud::protect(&online_path);
             }
         }
 

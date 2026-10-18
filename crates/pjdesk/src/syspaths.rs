@@ -29,7 +29,8 @@ pub fn service_config_path() -> PathBuf {
     service_dir().join("client.json")
 }
 
-/// The service's live status, readable by the GUI (no secrets).
+/// The service's live status, including the current one-time password.
+/// The service folder's ACL is what keeps other local users from reading it.
 pub fn service_status_path() -> PathBuf {
     service_dir().join("status.json")
 }

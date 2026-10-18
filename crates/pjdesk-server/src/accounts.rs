@@ -11,7 +11,10 @@
 //!
 //! Passwords are verified with Argon2id and never stored in the clear. A
 //! successful login mints a random token the client can save (encrypted on the
-//! client with DPAPI) and present next time instead of the password.
+//! client with DPAPI) and present next time instead of the password. The
+//! server stores only a SHA-256 of that token. Address-book files sit in the
+//! same admin-only folder; the passwords inside them are the account owner's,
+//! on the owner's server.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,6 +25,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use pjdesk_proto::signal::AddressEntry;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// How many tokens one account may hold before the oldest is dropped (one per
 /// signed-in device, roughly).
@@ -45,7 +49,9 @@ struct User {
     is_admin: bool,
     #[serde(default)]
     disabled: bool,
-    /// Active login tokens → last-used unix seconds.
+    /// SHA-256 of each active login token (`h:<hex>`) → last-used unix seconds.
+    /// Older files stored the token itself; [`migrate_token_storage`] rewrites
+    /// those on load. Clients still send the raw token.
     #[serde(default)]
     tokens: BTreeMap<String, u64>,
     created: u64,
@@ -64,6 +70,16 @@ pub struct Session {
     pub display_name: String,
     pub is_admin: bool,
     pub token: String,
+}
+
+/// What [`Accounts::prep_password_login`] copied out so the slow Argon2 check
+/// can run without holding the server's global lock.
+pub struct PasswordPrep {
+    pub username: String,
+    /// PHC hash to check, or a dummy hash when the account does not exist.
+    pub hash: String,
+    pub exists: bool,
+    pub disabled: bool,
 }
 
 /// A row for the server's account list in the GUI/CLI.
@@ -108,11 +124,16 @@ impl Accounts {
             }
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let data = match bytes {
+        let mut data = match bytes {
             Some(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?,
             None => AccountsFile::default(),
         };
-        Ok(Self { dir: dir.to_path_buf(), path, data })
+        let migrated = migrate_token_storage(&mut data);
+        let mut store = Self { dir: dir.to_path_buf(), path, data };
+        if migrated {
+            store.save()?;
+        }
+        Ok(store)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -138,8 +159,8 @@ impl Accounts {
         if !valid_username(&username) {
             bail!("username must be 1-32 characters: letters, digits, '.', '_' or '-'");
         }
-        if password.len() < 6 {
-            bail!("password must be at least 6 characters");
+        if password.chars().count() < 8 {
+            bail!("password must be at least 8 characters");
         }
         let exists = self.data.users.contains_key(&username);
         if exists && !overwrite {
@@ -194,58 +215,89 @@ impl Accounts {
         self.save()
     }
 
-    /// Checks a password and, on success, mints and stores a login token.
-    pub fn login_password(&mut self, username: &str, password: &str, _device: &str) -> Result<Session> {
+    /// Copies the hash a password login must check. Missing accounts get a
+    /// dummy hash so the check takes the same time either way. Disabled
+    /// accounts still return their real hash: the caller verifies it and
+    /// [`commit_password_login`] then refuses, with the same error text.
+    pub fn prep_password_login(&self, username: &str) -> PasswordPrep {
         let username = normalize_username(username);
-        let user = match self.data.users.get(&username) {
-            Some(u) => u,
-            None => {
-                // Spend the same Argon2 time as a real check, so a missing
-                // username isn't distinguishable by response time.
-                let _ = verify_password(dummy_hash(), password);
-                bail!("wrong username or password");
-            }
-        };
-        if user.disabled {
-            bail!("this account is disabled");
+        match self.data.users.get(&username) {
+            Some(u) => PasswordPrep { username, hash: u.password_hash.clone(), exists: true, disabled: u.disabled },
+            None => PasswordPrep { username, hash: dummy_hash().to_string(), exists: false, disabled: false },
         }
-        verify_password(&user.password_hash, password).map_err(|_| anyhow::anyhow!("wrong username or password"))?;
+    }
+
+    /// Mints a token after the caller has already checked `prep.hash`. Fails
+    /// closed if the account changed or is disabled since the check.
+    pub fn commit_password_login(&mut self, prep: &PasswordPrep) -> Result<Session> {
+        if !prep.exists || prep.disabled {
+            bail!("wrong username or password");
+        }
+        let Some(user) = self.data.users.get(&prep.username) else {
+            bail!("wrong username or password");
+        };
+        if user.disabled || user.password_hash != prep.hash {
+            bail!("wrong username or password");
+        }
         let display_name = user.display_name.clone();
         let is_admin = user.is_admin;
         let token = mint_token();
-        let user = self.data.users.get_mut(&username).unwrap();
-        user.tokens.insert(token.clone(), now());
+        let user = self.data.users.get_mut(&prep.username).unwrap();
+        user.tokens.insert(token_id(&token), now());
         prune_tokens(&mut user.tokens);
         self.save()?;
-        Ok(Session { username, display_name, is_admin, token })
+        Ok(Session { username: prep.username.clone(), display_name, is_admin, token })
+    }
+
+    /// Checks a password and, on success, mints and stores a login token.
+    ///
+    /// The running server uses [`Self::prep_password_login`] and
+    /// [`Self::commit_password_login`] so the slow check does not hold the
+    /// process-wide lock. This combined form is what tests and other callers
+    /// use.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn login_password(&mut self, username: &str, password: &str, _device: &str) -> Result<Session> {
+        let prep = self.prep_password_login(username);
+        if verify_password(&prep.hash, password).is_err() {
+            bail!("wrong username or password");
+        }
+        self.commit_password_login(&prep)
     }
 
     /// Validates a saved token, refreshing its last-used time.
+    ///
+    /// Unknown accounts and bad tokens get the same message, so this cannot
+    /// be used to learn which usernames exist.
     pub fn login_token(&mut self, username: &str, token: &str) -> Result<Session> {
         let username = normalize_username(username);
-        let user = self.data.users.get_mut(&username).context("unknown account")?;
-        if user.disabled || !user.tokens.contains_key(token) {
+        let id = token_id(token);
+        let Some(user) = self.data.users.get_mut(&username) else {
+            bail!("your saved sign-in has expired; please sign in again");
+        };
+        if user.disabled || !user.tokens.contains_key(&id) {
             bail!("your saved sign-in has expired; please sign in again");
         }
-        user.tokens.insert(token.to_string(), now());
-        let session =
-            Session { username: username.clone(), display_name: user.display_name.clone(), is_admin: user.is_admin, token: token.to_string() };
+        user.tokens.insert(id, now());
+        let session = Session {
+            username: username.clone(),
+            display_name: user.display_name.clone(),
+            is_admin: user.is_admin,
+            token: token.to_string(),
+        };
         self.save()?;
         Ok(session)
     }
 
     /// Finds the account a token belongs to (for per-request authorization).
     pub fn user_for_token(&self, token: &str) -> Option<String> {
-        self.data
-            .users
-            .iter()
-            .find(|(_, u)| !u.disabled && u.tokens.contains_key(token))
-            .map(|(name, _)| name.clone())
+        let id = token_id(token);
+        self.data.users.iter().find(|(_, u)| !u.disabled && u.tokens.contains_key(&id)).map(|(name, _)| name.clone())
     }
 
     pub fn logout(&mut self, token: &str) {
+        let id = token_id(token);
         for user in self.data.users.values_mut() {
-            if user.tokens.remove(token).is_some() {
+            if user.tokens.remove(&id).is_some() {
                 let _ = self.save();
                 return;
             }
@@ -271,7 +323,7 @@ impl Accounts {
         let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(entries)?)?;
         std::fs::rename(&tmp, &path)?;
-        grant_shared_access(&path);
+        lock_down(&path);
         Ok(())
     }
 
@@ -286,9 +338,33 @@ impl Accounts {
         let tmp = self.path.with_extension(format!("json.tmp.{}", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(&self.data)?)?;
         std::fs::rename(&tmp, &self.path)?;
-        grant_shared_access(&self.path);
+        lock_down(&self.path);
         Ok(())
     }
+}
+
+/// Rewrites raw tokens left by 0.3.6 and earlier into `h:<sha256>`. Returns
+/// whether anything changed. A key that already starts with `h:` is left
+/// alone, so this is safe to run on every load.
+fn migrate_token_storage(data: &mut AccountsFile) -> bool {
+    let mut changed = false;
+    for user in data.users.values_mut() {
+        let old = std::mem::take(&mut user.tokens);
+        for (token, seen) in old {
+            if token.starts_with("h:") {
+                user.tokens.insert(token, seen);
+            } else {
+                user.tokens.insert(token_id(&token), seen);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Storage key for a client-presented token. The raw token never hits disk.
+fn token_id(token: &str) -> String {
+    format!("h:{}", hex::encode(Sha256::digest(token.as_bytes())))
 }
 
 /// Windows: reclaim read access to a file the other identity created — the
@@ -305,39 +381,29 @@ fn reclaim_access(path: &Path) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    grant_shared_access(path);
+    lock_down(path);
 }
 #[cfg(not(windows))]
 fn reclaim_access(_path: &Path) {}
 
-/// Windows: grant SYSTEM and Administrators full control of a file we just
-/// wrote, so whichever identity writes it, the other can read it back. A no-op
-/// elsewhere.
-#[cfg(windows)]
-fn grant_shared_access(path: &Path) {
-    use std::process::Stdio;
-    let _ = std::process::Command::new("icacls")
-        .arg(path)
-        .args(["/grant", "*S-1-5-18:(F)", "/grant", "*S-1-5-32-544:(F)", "/C", "/Q"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+/// SYSTEM and Administrators only. Removes inherited access, so a Users read
+/// entry inherited from ProgramData cannot survive on a file that holds
+/// password hashes or tokens. The same helper locks cloud-sync settings.
+fn lock_down(path: &Path) {
+    crate::cloud::protect(path);
 }
-#[cfg(not(windows))]
-fn grant_shared_access(_path: &Path) {}
 
 fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::encode_b64(&pjdesk_proto::random_bytes::<16>()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let hash =
-        Argon2::default().hash_password(password.as_bytes(), &salt).map_err(|e| anyhow::anyhow!("hashing failed: {e}"))?;
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("hashing failed: {e}"))?;
     Ok(hash.to_string())
 }
 
-fn verify_password(phc: &str, password: &str) -> Result<()> {
+pub(crate) fn verify_password(phc: &str, password: &str) -> Result<()> {
     let parsed = PasswordHash::new(phc).map_err(|e| anyhow::anyhow!("stored hash is invalid: {e}"))?;
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .map_err(|_| anyhow::anyhow!("password mismatch"))
+    Argon2::default().verify_password(password.as_bytes(), &parsed).map_err(|_| anyhow::anyhow!("password mismatch"))
 }
 
 fn mint_token() -> String {
@@ -348,7 +414,7 @@ fn mint_token() -> String {
 /// timing doesn't reveal whether an account exists.
 fn dummy_hash() -> &'static str {
     static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    H.get_or_init(|| hash_password("pjdesk-timing-equalizer").unwrap_or_default())
+    H.get_or_init(|| hash_password("pjdesk-timing-equalizer").expect("dummy password hash"))
 }
 
 fn prune_tokens(tokens: &mut BTreeMap<String, u64>) {
@@ -367,6 +433,13 @@ fn prune_tokens(tokens: &mut BTreeMap<String, u64>) {
 mod tests {
     use super::*;
 
+    fn err_text<T>(result: Result<T>) -> String {
+        match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        }
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pjdesk-accounts-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -384,12 +457,19 @@ mod tests {
         assert!(a.login_password("ben", "nope", "pc").is_err());
         let s = a.login_password("BEN", "hunter2x", "pc").unwrap();
         assert!(s.is_admin);
-        // The token round-trips through a reload.
+        // The token round-trips through a reload, and the file stores only a hash.
         let token = s.token.clone();
+        let on_disk = std::fs::read_to_string(dir.join("accounts.json")).unwrap();
+        assert!(!on_disk.contains(&token), "raw login token was written to disk");
+        assert!(on_disk.contains("h:"));
         let mut a = Accounts::load(&dir).unwrap();
         assert_eq!(a.user_for_token(&token).as_deref(), Some("ben"));
         let s2 = a.login_token("ben", &token).unwrap();
         assert_eq!(s2.username, "ben");
+        // A wrong token and an unknown user look the same.
+        let missing = err_text(a.login_token("nobody", &token));
+        let bad = err_text(a.login_token("ben", "not-a-real-token"));
+        assert_eq!(missing, bad);
         // Changing the password invalidates tokens.
         a.create("ben", "newpass1", true, true).unwrap();
         assert!(a.login_token("ben", &token).is_err());
@@ -421,7 +501,38 @@ mod tests {
         let mut a = Accounts::load(&dir).unwrap();
         a.create("joe", "password", false, false).unwrap();
         a.set_disabled("joe", true).unwrap();
-        assert!(a.login_password("joe", "password", "pc").is_err());
+        let disabled = err_text(a.login_password("joe", "password", "pc"));
+        let wrong = err_text(a.login_password("joe", "password!", "pc"));
+        let missing = err_text(a.login_password("nobody", "password", "pc"));
+        assert_eq!(disabled, "wrong username or password");
+        assert_eq!(disabled, wrong);
+        assert_eq!(disabled, missing);
+        assert!(a.create("short", "short", false, false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_plaintext_tokens_are_hashed_on_load() {
+        let dir = temp_dir("migrate");
+        let mut a = Accounts::load(&dir).unwrap();
+        a.create("ben", "hunter2x", false, false).unwrap();
+        // Pretend this file was written by 0.3.6, which stored the token raw.
+        let path = dir.join("accounts.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let tokens = value["users"]["ben"]["tokens"].as_object_mut().unwrap();
+        tokens.clear();
+        // A recent last-used time: save() drops tokens idle for 90 days, and
+        // the migration saves.
+        tokens.insert(
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
+            serde_json::json!(now()),
+        );
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let raw = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let a = Accounts::load(&dir).unwrap();
+        assert_eq!(a.user_for_token(raw).as_deref(), Some("ben"));
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains(raw));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

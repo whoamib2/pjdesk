@@ -317,10 +317,21 @@ fn normalize_endpoint(text: &str) -> Result<(String, Option<String>)> {
         Some((h, p)) => (h, Some(p.trim_matches('/').to_string()).filter(|p| !p.is_empty())),
         None => (rest, None),
     };
-    if host.is_empty() || host.contains(' ') {
+    if !valid_endpoint_host(host) {
         bail!("that doesn't look like an S3 endpoint");
     }
     Ok((format!("https://{}", host.to_lowercase()), path))
+}
+
+/// Hosts we will put in a signed request. Rejects anything that could inject a
+/// header or point the request at a different scheme or userinfo.
+fn valid_endpoint_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.starts_with('.')
+        && !host.starts_with('-')
+        && !host.contains("..")
+        && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
 }
 
 /// Locks a file to SYSTEM and Administrators (it holds the bucket secret and
@@ -399,16 +410,16 @@ fn authorization(
         format!("{method}\n{canonical_path}\n\n{canonical_headers}\n{signed_headers}\n{payload_sha256}");
     let date = &amz_date[..8];
     let scope = format!("{date}/{region}/s3/aws4_request");
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-        hex::encode(Sha256::digest(canonical_request.as_bytes()))
-    );
+    let string_to_sign =
+        format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", hex::encode(Sha256::digest(canonical_request.as_bytes())));
     let k_date = hmac(format!("AWS4{secret_access_key}").as_bytes(), date);
     let k_region = hmac(&k_date, region);
     let k_service = hmac(&k_region, "s3");
     let k_signing = hmac(&k_service, "aws4_request");
     let signature = hex::encode(hmac(&k_signing, &string_to_sign));
-    format!("AWS4-HMAC-SHA256 Credential={access_key_id}/{scope}, SignedHeaders={signed_headers}, Signature={signature}")
+    format!(
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    )
 }
 
 fn agent() -> ureq::Agent {
@@ -418,7 +429,9 @@ fn agent() -> ureq::Agent {
 /// A readable reason from an S3 error response.
 fn s3_error(code: u16, body: &str) -> anyhow::Error {
     let tag = |t: &str| {
-        body.split_once(&format!("<{t}>")).and_then(|(_, r)| r.split_once(&format!("</{t}>"))).map(|(v, _)| v.to_string())
+        body.split_once(&format!("<{t}>"))
+            .and_then(|(_, r)| r.split_once(&format!("</{t}>")))
+            .map(|(v, _)| v.to_string())
     };
     let what = tag("Code").unwrap_or_default();
     let hint = match (code, what.as_str()) {
@@ -563,9 +576,7 @@ fn api_put(cfg: &CloudConfig, body: &[u8]) -> Result<String> {
 }
 
 fn api_get(cfg: &CloudConfig, etag: Option<&str>) -> Result<Fetched> {
-    let mut req = agent()
-        .get(&format!("{}/api/sync", cfg.api))
-        .set("authorization", &format!("Bearer {}", cfg.token));
+    let mut req = agent().get(&format!("{}/api/sync", cfg.api)).set("authorization", &format!("Bearer {}", cfg.token));
     if let Some(tag) = etag.filter(|t| !t.is_empty()) {
         req = req.set("If-None-Match", tag);
     }
@@ -607,10 +618,8 @@ pub fn computers_online(data_dir: &Path) -> usize {
 
 /// Best-effort sign-out (revokes this server's token).
 fn api_sign_out(cfg: &CloudConfig) {
-    let _ = agent()
-        .post(&format!("{}/api/logout", cfg.api))
-        .set("authorization", &format!("Bearer {}", cfg.token))
-        .call();
+    let _ =
+        agent().post(&format!("{}/api/logout", cfg.api)).set("authorization", &format!("Bearer {}", cfg.token)).call();
 }
 
 // ---------------------------------------------------------------------------
@@ -727,12 +736,31 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+const MAX_BUNDLE_FILE: usize = 4 * 1024 * 1024;
+const MAX_BUNDLE_TOTAL: usize = 8 * 1024 * 1024;
+/// A standby ignores a copy dated further ahead than this. A holder of the
+/// sync key could otherwise stamp a copy with a far-future time and make
+/// every later, genuine copy look older.
+const MAX_CLOCK_SKEW: u64 = 24 * 60 * 60;
+
+fn timestamp_ok(written_at: u64) -> bool {
+    written_at <= now().saturating_add(MAX_CLOCK_SKEW)
+}
+
 /// Checks a downloaded set of files and writes them into the data folder.
 fn apply(data_dir: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
-    for rel in files.keys() {
+    let mut total = 0usize;
+    for (rel, bytes) in files {
         if !allowed_path(rel) {
             bail!("the cloud copy contains an unexpected file \"{rel}\"");
         }
+        if bytes.len() > MAX_BUNDLE_FILE {
+            bail!("{rel} in the cloud copy is too large");
+        }
+        total = total.saturating_add(bytes.len());
+    }
+    if total > MAX_BUNDLE_TOTAL {
+        bail!("the cloud copy is too large");
     }
     let (Some(cert), Some(key)) = (files.get("server-cert.pem"), files.get("server-key.pem")) else {
         bail!("the cloud copy has no server key");
@@ -742,6 +770,10 @@ fn apply(data_dir: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
     std::fs::create_dir_all(&check)?;
     std::fs::write(check.join("cert.pem"), cert)?;
     std::fs::write(check.join("key.pem"), key)?;
+    // The key is on disk for the load check below. Lock it before that, in
+    // case the data folder's ACL has not been repaired yet.
+    protect(&check.join("cert.pem"));
+    protect(&check.join("key.pem"));
     let ok = pjdesk_proto::tls::TlsIdentity::load(&check.join("cert.pem"), &check.join("key.pem"));
     let _ = std::fs::remove_dir_all(&check);
     ok.map_err(|e| anyhow!("the server key in the cloud copy doesn't load: {e}"))?;
@@ -753,7 +785,13 @@ fn apply(data_dir: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
     }
 
     for (rel, bytes) in files {
-        write_atomic(&data_dir.join(rel), bytes)?;
+        let path = data_dir.join(rel);
+        write_atomic(&path, bytes)?;
+        // The private key and the account file must not be left world-readable
+        // on a machine whose data folder still has the old inherited ACL.
+        if rel.ends_with(".pem") || rel.ends_with(".json") {
+            protect(&path);
+        }
     }
     // Address books of accounts removed on the other server.
     if let Ok(dir) = std::fs::read_dir(data_dir.join("addressbook")) {
@@ -992,6 +1030,9 @@ fn fetch(cfg: &CloudConfig, etag: Option<&str>) -> Result<Remote> {
 
 /// Writes a downloaded copy into the data folder and records it.
 fn apply_bundle(data_dir: &Path, bundle: &Bundle, etag: String) -> Result<()> {
+    if !timestamp_ok(bundle.written_at) {
+        bail!("the cloud copy is dated too far in the future, so it was not applied");
+    }
     let mut files = BTreeMap::new();
     for (rel, text) in &bundle.files {
         files.insert(rel.clone(), b64().decode(text).map_err(|_| anyhow!("the cloud copy is damaged"))?);
@@ -1236,9 +1277,17 @@ mod tests {
     #[test]
     fn endpoint_accepts_what_cloudflare_shows() {
         let id = "0123456789abcdef0123456789ABCDEF";
-        assert_eq!(normalize_endpoint(id).unwrap().0, "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com");
-        assert_eq!(normalize_endpoint("x.r2.cloudflarestorage.com/").unwrap(), ("https://x.r2.cloudflarestorage.com".into(), None));
+        assert_eq!(
+            normalize_endpoint(id).unwrap().0,
+            "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
+        );
+        assert_eq!(
+            normalize_endpoint("x.r2.cloudflarestorage.com/").unwrap(),
+            ("https://x.r2.cloudflarestorage.com".into(), None)
+        );
         assert!(normalize_endpoint(" ").is_err());
+        assert!(normalize_endpoint("https://evil.example.com\r\nX: y").is_err());
+        assert!(normalize_endpoint("https://user@host.example/bucket").is_err());
     }
 
     #[test]
@@ -1253,12 +1302,19 @@ mod tests {
 
     #[test]
     fn decisions() {
-        let mut st = SyncState { last_push_core: "c".into(), last_push_devices: "d".into(), last_push_at: 1000, ..Default::default() };
+        let mut st = SyncState {
+            last_push_core: "c".into(),
+            last_push_devices: "d".into(),
+            last_push_at: 1000,
+            ..Default::default()
+        };
         assert!(!push_due(&st, "c", "d", 2000));
         assert!(push_due(&st, "c2", "d", 1001)); // accounts changed: right away
         assert!(!push_due(&st, "c", "d2", 1100)); // only the computer list: wait
         assert!(push_due(&st, "c", "d2", 1000 + DEVICES_PUSH_INTERVAL));
         // A standby takes another server's newer copy, never its own or an older one.
+        assert!(timestamp_ok(now()));
+        assert!(!timestamp_ok(now().saturating_add(MAX_CLOCK_SKEW + 120)));
         assert!(should_apply(&st, 1500, "other", "me"));
         assert!(!should_apply(&st, 1500, "me", "me"));
         assert!(!should_apply(&st, 900, "other", "me"));
@@ -1272,8 +1328,12 @@ mod tests {
         let (a, b) = (base.join("a"), base.join("b"));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(a.join("addressbook")).unwrap();
-        let id = pjdesk_proto::tls::TlsIdentity::load_or_create(&a.join("server-cert.pem"), &a.join("server-key.pem"), "pjdesk")
-            .unwrap();
+        let id = pjdesk_proto::tls::TlsIdentity::load_or_create(
+            &a.join("server-cert.pem"),
+            &a.join("server-key.pem"),
+            "pjdesk",
+        )
+        .unwrap();
         std::fs::write(a.join("accounts.json"), b"{}").unwrap();
         std::fs::write(a.join("devices.json"), b"{\"devices\":{}}").unwrap();
         std::fs::write(a.join("addressbook/ben.json"), b"[]").unwrap();
@@ -1285,7 +1345,8 @@ mod tests {
         apply(&b, &files).unwrap();
         assert!(b.join("addressbook/ben.json").exists());
         assert!(!b.join("addressbook/gone.json").exists());
-        let copied = pjdesk_proto::tls::TlsIdentity::load(&b.join("server-cert.pem"), &b.join("server-key.pem")).unwrap();
+        let copied =
+            pjdesk_proto::tls::TlsIdentity::load(&b.join("server-cert.pem"), &b.join("server-key.pem")).unwrap();
         assert_eq!(copied.fingerprint(), id.fingerprint());
         let _ = std::fs::remove_dir_all(&base);
     }

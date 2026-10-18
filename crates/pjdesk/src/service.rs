@@ -53,7 +53,9 @@ pub fn write_service_config(server: Option<&str>, password: Option<&str>) -> Res
     // permanent password at all. An empty return means "using a one-time password".
     let effective = match password {
         Some(p) if !p.is_empty() => {
-            cfg.settings.set_permanent_password(Some(p));
+            // Machine scope so the sign-in-screen helper (SYSTEM) can read it.
+            // The file's ACL, not DPAPI alone, keeps other users out.
+            cfg.settings.set_permanent_password_machine(Some(p));
             p.to_string()
         }
         _ => cfg.settings.permanent_password().unwrap_or_default(),
@@ -88,15 +90,15 @@ mod imp {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
-        DuplicateTokenEx, SetTokenInformation, SecurityIdentification, TokenPrimary, TokenSessionId,
-        TOKEN_ACCESS_MASK, TOKEN_ALL_ACCESS,
+        DuplicateTokenEx, SecurityIdentification, SetTokenInformation, TokenPrimary, TokenSessionId, TOKEN_ACCESS_MASK,
+        TOKEN_ALL_ACCESS,
     };
+    use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
     use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess, CREATE_NO_WINDOW,
         CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
     };
-    use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
     use windows_service::service::{
         ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo,
         ServiceStartType, ServiceState, ServiceStatus, ServiceType,
@@ -143,8 +145,8 @@ mod imp {
             println!("This computer uses a one-time password, shown in the PJDesk window.");
             println!("Open PJDesk to see its ID and the current password to share.");
         } else {
-            println!("Unattended password for this computer: {effective}");
-            println!("Keep it safe — anyone with your ID and this password can control this computer.");
+            println!("An unattended password is set. It was not printed here.");
+            println!("Anyone with your ID and that password can control this computer.");
         }
         Ok(())
     }
@@ -316,6 +318,11 @@ mod imp {
             if let Some(mut c) = child.take() {
                 c.kill();
             }
+            // The helper runs as the signed-in user and must read the service
+            // config. Grant that user, and nobody else: a blanket Users
+            // Modify let every account read the one-time password and rewrite
+            // which server this computer trusts.
+            super::secure_service_dir(Some(active));
             match spawn_session_host(active) {
                 Ok(c) => {
                     tracing::info!("Launched session-host in session {active}");
@@ -381,8 +388,14 @@ mod imp {
                 let mut proc_token = HANDLE::default();
                 OpenProcessToken(GetCurrentProcess(), TOKEN_ACCESS_MASK(TOKEN_ALL_ACCESS.0), &mut proc_token)
                     .context("OpenProcessToken")?;
-                let dup_result =
-                    DuplicateTokenEx(proc_token, TOKEN_ALL_ACCESS, None, SecurityIdentification, TokenPrimary, &mut token);
+                let dup_result = DuplicateTokenEx(
+                    proc_token,
+                    TOKEN_ALL_ACCESS,
+                    None,
+                    SecurityIdentification,
+                    TokenPrimary,
+                    &mut token,
+                );
                 let _ = CloseHandle(proc_token);
                 dup_result.context("DuplicateTokenEx")?;
                 // Move the SYSTEM token into the target session.
@@ -480,7 +493,16 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
     std::env::set_var("PJDESK_CONFIG", &path);
 
     init_service_logging();
-    let config = Config::load().unwrap_or_default();
+    let mut config = Config::load().unwrap_or_default();
+    // 0.3.6 sealed the unattended password to the user who set it, so SYSTEM
+    // could not read it at the sign-in screen. Re-seal it for the machine the
+    // first time a user who can still open the old blob runs the helper.
+    if config.settings.permanent_password.as_deref().is_some_and(|s| s.starts_with("dpapi:")) {
+        if let Some(pw) = config.settings.permanent_password() {
+            config.settings.set_permanent_password_machine(Some(&pw));
+            let _ = config.save();
+        }
+    }
     // Falls back to the baked-in default server, so the service registers and
     // gets an ID even if its config was never seeded with one.
     let server = ServerAddr::parse(&config.effective_server())
@@ -536,8 +558,22 @@ pub fn set_update_task(enable: bool) -> Result<()> {
     // A short (8.3) path has no spaces, so the task's /TR needs no inner quotes.
     let tr = format!("{} update", short_path(&exe).unwrap_or_else(|| exe.display().to_string()));
     let status = std::process::Command::new("schtasks")
-        .args(["/Create", "/TN", UPDATE_TASK, "/TR", &tr, "/SC", "MINUTE", "/MO", "30", "/RU", "SYSTEM", "/RL",
-            "HIGHEST", "/F"])
+        .args([
+            "/Create",
+            "/TN",
+            UPDATE_TASK,
+            "/TR",
+            &tr,
+            "/SC",
+            "MINUTE",
+            "/MO",
+            "30",
+            "/RU",
+            "SYSTEM",
+            "/RL",
+            "HIGHEST",
+            "/F",
+        ])
         .status()
         .context("running schtasks")?;
     if !status.success() {
@@ -589,40 +625,95 @@ pub fn init_service_logging() {
     }
 }
 
-/// Restricts the service folder to SYSTEM and Administrators (it holds the
-/// identity and the unattended password).
+/// Restricts the service folder to SYSTEM and Administrators, then (when a
+/// console session is given) the user who is signed in there.
+///
+/// The one-time password is published in `status.json` so the PJDesk window
+/// can show it. That file used to be writable and readable by every local
+/// user, which handed the password — and the ability to retarget the server
+/// — to any account on the machine. The signed-in user still needs access,
+/// because the session helper runs as them and the window runs as them.
 #[cfg(windows)]
 pub fn protect_service_dir() {
+    secure_service_dir(None);
+}
+
+#[cfg(windows)]
+pub fn secure_service_dir(session_id: Option<u32>) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let dir = crate::syspaths::service_dir();
     let _ = std::fs::create_dir_all(&dir);
-    // Reclaim ownership first so the grant can rewrite DACLs on any file an
-    // earlier, stricter ACL left unreadable even to administrators (best-effort).
     let _ = std::process::Command::new("takeown")
         .arg("/f")
         .arg(&dir)
         .args(["/r", "/d", "y"])
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    // SYSTEM and Administrators get full control; the interactive Users group
-    // gets Modify because the session-host now runs as the signed-in user and
-    // must persist its ID and status here (the unattended password in this
-    // folder is DPAPI-encrypted, so it stays unreadable to other users).
+    // Directory only. (OI)(CI) on a file is an invalid ACE and is what left
+    // empty DACLs when an earlier version passed /T.
+    let mut grant = String::from("*S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F");
+    if let Some(session_id) = session_id {
+        if let Some(sid) = session_user_sid(session_id) {
+            grant.push_str(&format!(" *{sid}:(OI)(CI)M"));
+        }
+    }
     let _ = std::process::Command::new("icacls")
         .arg(&dir)
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)F",
-            "*S-1-5-32-544:(OI)(CI)F",
-            "*S-1-5-32-545:(OI)(CI)M",
-            "/T",
-            "/C",
-            "/Q",
-        ])
+        .args(["/inheritance:r", "/grant:r"])
+        .args(grant.split_whitespace())
+        .arg("/Q")
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+    let _ = std::process::Command::new("icacls")
+        .arg(format!("{}\\*", dir.display()))
+        .args(["/reset", "/T", "/C", "/Q"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// SID of the user logged into `session_id`, as `S-1-...`.
+#[cfg(windows)]
+fn session_user_sid(session_id: u32) -> Option<String> {
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER};
+    use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
+
+    unsafe {
+        let mut token = HANDLE::default();
+        if WTSQueryUserToken(session_id, &mut token).is_err() {
+            return None;
+        }
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        if needed == 0 {
+            let _ = CloseHandle(token);
+            return None;
+        }
+        // The SID bytes follow the TOKEN_USER header in this buffer, so it
+        // has to be one allocation and pointer-aligned.
+        let mut buf = vec![0u64; needed.div_ceil(8) as usize];
+        let ok = GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr() as *mut _), needed, &mut needed);
+        let _ = CloseHandle(token);
+        if ok.is_err() {
+            return None;
+        }
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut wide = windows::core::PWSTR::null();
+        if ConvertSidToStringSidW(user.User.Sid, &mut wide).is_err() || wide.is_null() {
+            return None;
+        }
+        let sid = wide.to_string().ok();
+        let _ = LocalFree(Some(HLOCAL(wide.as_ptr() as *mut _)));
+        sid.filter(|s| s.starts_with("S-1-") && s.len() < 200 && s.bytes().all(|b| b.is_ascii_graphic()))
+    }
 }
 
 #[cfg(windows)]

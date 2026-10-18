@@ -98,9 +98,13 @@ enum ServiceCommand {
         /// Server address to use (defaults to your current server).
         #[arg(long)]
         server: Option<String>,
-        /// Unattended password (a random one is generated and shown if omitted).
+        /// Unattended password (prefer a prompt; this shows up in the process list).
         #[arg(long)]
         password: Option<String>,
+        /// Read the unattended password from a file, then delete the file.
+        /// The window uses this so the password is not on the command line.
+        #[arg(long)]
+        password_file: Option<String>,
         /// Also add a Windows Firewall rule.
         #[arg(long)]
         firewall: bool,
@@ -117,6 +121,9 @@ enum ServiceCommand {
         server: Option<String>,
         #[arg(long)]
         password: Option<String>,
+        /// Read the unattended password from a file, then delete the file.
+        #[arg(long)]
+        password_file: Option<String>,
         /// Clear the permanent password so the service uses a one-time password.
         #[arg(long)]
         clear_password: bool,
@@ -302,15 +309,24 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
+fn password_from_file(password: Option<String>, password_file: Option<String>) -> Result<Option<String>> {
+    match password_file {
+        Some(path) => Ok(Some(crate::platform::read_password_file(std::path::Path::new(&path))?)),
+        None => Ok(password),
+    }
+}
+
 fn service_command(cmd: ServiceCommand) -> Result<()> {
     match cmd {
-        ServiceCommand::Install { server, password, firewall } => {
+        ServiceCommand::Install { server, password, password_file, firewall } => {
+            let password = password_from_file(password, password_file)?;
             service::install(server.as_deref(), password.as_deref(), firewall)
         }
         ServiceCommand::Uninstall => service::uninstall(),
         ServiceCommand::Start => service::start(),
         ServiceCommand::Stop => service::stop(),
-        ServiceCommand::Configure { server, password, clear_password } => {
+        ServiceCommand::Configure { server, password, password_file, clear_password } => {
+            let password = password_from_file(password, password_file)?;
             if clear_password {
                 service::clear_service_password()?;
             }
@@ -545,8 +561,11 @@ fn init_logging() {
 /// GUI logging goes to a rolling file under the config folder, since there may
 /// be no console attached.
 fn init_gui_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn,quinn_proto=warn,rustls=warn,wgpu=warn,naga=warn,eframe=warn,egui_wgpu=warn"));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "info,quinn=warn,quinn_proto=warn,rustls=warn,wgpu=warn,naga=warn,eframe=warn,egui_wgpu=warn",
+        )
+    });
     let mut builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
     if let Some(dir) = Config::path().parent() {
         let _ = std::fs::create_dir_all(dir);
