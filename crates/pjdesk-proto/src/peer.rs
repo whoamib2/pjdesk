@@ -57,14 +57,134 @@ pub enum ControlMsg {
     Ping {
         t_us: u64,
     },
+    /// Version 3. Announces what the controller wants. The host answers with
+    /// [`HostMsg::Welcome`]. A version-2 host never receives this.
+    Hello {
+        permissions: u32,
+        monitor: u8,
+        quality: crate::quality::StreamQuality,
+    },
+    Chat {
+        text: String,
+    },
+    Clipboard(Clipboard),
+    SetQuality(crate::quality::StreamQuality),
+    SelectMonitor {
+        index: u8,
+    },
+    File(FileMsg),
+    /// Ask Windows to restart. Requires [`crate::perms::RESTART`].
+    Restart,
+    Privacy {
+        enabled: bool,
+    },
+    BlockInput {
+        enabled: bool,
+    },
+    SetKeyboardMode(KeyboardMode),
+    Tunnel(TunnelMsg),
+    /// Unicode input used when the keyboard mode is [`KeyboardMode::Translate`].
+    Text {
+        chars: String,
+    },
+    /// Start or stop host system-audio. Samples follow on a side stream.
+    Audio {
+        enabled: bool,
+    },
 }
 
 /// Commands the controller asks the host to carry out directly.
+///
+/// New commands are added at the end. A version-2 host only understands
+/// [`SpecialCommand::CtrlAltDel`]; newer commands are sent only to a version-3 host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpecialCommand {
     /// Secure attention sequence (Ctrl+Alt+Del). Works when the host runs as
     /// the background service; a normal app can't inject it.
     CtrlAltDel,
+    /// Lock the host session (the Windows lock screen).
+    Lock,
+    /// Open Task Manager on the host.
+    TaskManager,
+}
+
+/// How keystrokes are delivered. Map sends hardware scan codes (the layout of
+/// the focused app on the host). Translate sends Unicode characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyboardMode {
+    Map,
+    Translate,
+}
+
+/// One display the host can share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    pub index: u8,
+    pub width: u16,
+    pub height: u16,
+    pub primary: bool,
+    pub name: String,
+}
+
+/// Clipboard contents. Text rides in `bytes` (UTF-8). Images are PNG bytes and,
+/// when larger than a control frame, travel on a side stream with `bytes` empty
+/// and `byte_len` set. A view-only session never sends or accepts these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Clipboard {
+    pub kind: ClipKind,
+    #[serde(default)]
+    pub bytes: Vec<u8>,
+    /// Total payload size. Equals `bytes.len()` when the bytes are inline.
+    pub byte_len: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipKind {
+    Text,
+    ImagePng,
+}
+
+/// File-transfer control. The bytes themselves use a separate QUIC stream so
+/// they never block keyboard input. See [`crate::filesafe`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileMsg {
+    Offer { id: u64, name: String, size: u64, resume_from: u64 },
+    Accept { id: u64, resume_from: u64 },
+    Reject { id: u64, reason: String },
+    Progress { id: u64, bytes: u64 },
+    Done { id: u64 },
+    Cancel { id: u64 },
+    Error { id: u64, reason: String },
+}
+
+/// A TCP forward. Data uses its own bidirectional QUIC stream, headed by the id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TunnelMsg {
+    Open { id: u64, remote_host: String, remote_port: u16 },
+    Ready { id: u64 },
+    Close { id: u64, reason: String },
+}
+
+/// First bytes of a side stream (file, audio, clipboard image).
+pub const FILE_MAGIC: &[u8; 8] = b"PJFILE1\0";
+pub const AUDIO_MAGIC: &[u8; 8] = b"PJAUDI1\0";
+pub const CLIP_MAGIC: &[u8; 8] = b"PJCLIP1\0";
+
+/// Largest chunk on a side stream. Kept well under the control-frame cap.
+pub const SIDE_CHUNK: usize = 64 * 1024;
+/// Largest clipboard image accepted (PNG).
+pub const MAX_CLIP_IMAGE: u32 = 4 * 1024 * 1024;
+/// Largest inline clipboard text. Larger text is refused rather than split.
+pub const MAX_CLIP_TEXT: usize = 48 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SideHeader {
+    pub id: u64,
+    pub offset: u64,
+    /// For audio: sample rate. For clipboard: width. Otherwise unused.
+    pub a: u32,
+    /// For audio: channels. For clipboard: height. Otherwise unused.
+    pub b: u32,
 }
 
 /// Host → controller messages after authentication.
@@ -75,6 +195,28 @@ pub enum HostMsg {
     },
     /// Human-readable status for the controller's title bar / console.
     Notice(String),
+    /// Version 3. Permissions actually granted, and the monitors the host can share.
+    Welcome {
+        permissions: u32,
+        monitors: Vec<MonitorInfo>,
+        proto: u16,
+    },
+    Chat {
+        text: String,
+    },
+    Clipboard(Clipboard),
+    File(FileMsg),
+    /// The host accepted a restart and Windows is about to reboot.
+    Restarting,
+    Privacy {
+        enabled: bool,
+    },
+    Tunnel(TunnelMsg),
+    /// A request was refused; the session continues.
+    Denied {
+        what: String,
+        reason: String,
+    },
 }
 
 /// Input from the controller, replayed on the host with `SendInput`.
@@ -198,4 +340,121 @@ mod tests {
         let mut got = Vec::new();
         assert!(read_video_frame(&mut b, &mut got).await.is_err());
     }
+
+    #[test]
+    fn existing_variants_keep_their_indexes() {
+        // Postcard encodes the variant index first. These indexes are the
+        // version-2 contract. New variants are appended after them.
+        assert_eq!(postcard::to_stdvec(&ControlMsg::Ping { t_us: 1 }).unwrap()[0], 4);
+        assert_eq!(postcard::to_stdvec(&HostMsg::Notice("ok".into())).unwrap()[0], 1);
+        assert_eq!(postcard::to_stdvec(&SpecialCommand::CtrlAltDel).unwrap()[0], 0);
+        let hello = ControlMsg::Hello {
+            permissions: 1,
+            monitor: 0,
+            quality: crate::quality::StreamQuality::default(),
+        };
+        assert!(postcard::to_stdvec(&hello).unwrap()[0] > 4);
+    }
+
+    #[test]
+    fn version3_messages_roundtrip() {
+        let msgs = vec![
+            ControlMsg::Chat { text: "hello".into() },
+            ControlMsg::File(FileMsg::Offer { id: 7, name: "a.txt".into(), size: 10, resume_from: 0 }),
+            ControlMsg::Clipboard(Clipboard { kind: ClipKind::Text, bytes: b"hi".to_vec(), byte_len: 2 }),
+            ControlMsg::SelectMonitor { index: 1 },
+            ControlMsg::Restart,
+            ControlMsg::Privacy { enabled: true },
+            ControlMsg::SetKeyboardMode(KeyboardMode::Translate),
+            ControlMsg::Text { chars: "é".into() },
+            ControlMsg::Tunnel(TunnelMsg::Open { id: 1, remote_host: "127.0.0.1".into(), remote_port: 22 }),
+        ];
+        for msg in msgs {
+            let bytes = postcard::to_stdvec(&msg).unwrap();
+            let back: ControlMsg = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(format!("{msg:?}"), format!("{back:?}"));
+        }
+        let welcome = HostMsg::Welcome {
+            permissions: crate::perms::CLASSIC,
+            monitors: vec![MonitorInfo { index: 0, width: 1920, height: 1080, primary: true, name: "Primary".into() }],
+            proto: 3,
+        };
+        let bytes = postcard::to_stdvec(&welcome).unwrap();
+        assert!(matches!(postcard::from_bytes(&bytes).unwrap(), HostMsg::Welcome { proto: 3, .. }));
+    }
+
+    #[tokio::test]
+    async fn side_stream_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(1 << 16);
+        let header = SideHeader { id: 3, offset: 100, a: 0, b: 0 };
+        write_side_header(&mut a, FILE_MAGIC, &header).await.unwrap();
+        write_side_chunk(&mut a, b"abcdef").await.unwrap();
+        write_side_chunk(&mut a, &[]).await.unwrap();
+        let (magic, got) = read_side_header::<_, SideHeader>(&mut b).await.unwrap();
+        assert_eq!(&magic, FILE_MAGIC);
+        assert_eq!(got.offset, 100);
+        assert_eq!(read_side_chunk(&mut b).await.unwrap().unwrap(), b"abcdef");
+        assert!(read_side_chunk(&mut b).await.unwrap().is_none());
+    }
+}
+
+/// Writes the magic and a postcard header that introduces a side stream.
+pub async fn write_side_header<W, T>(w: &mut W, magic: &[u8; 8], header: &T) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let body = postcard::to_stdvec(header)?;
+    if body.len() > 4096 {
+        bail!("side stream header too large");
+    }
+    w.write_all(magic).await?;
+    w.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    w.write_all(&body).await?;
+    Ok(())
+}
+
+/// Reads a side-stream magic and header.
+pub async fn read_side_header<R, T>(r: &mut R) -> Result<([u8; 8], T)>
+where
+    R: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    let mut magic = [0u8; 8];
+    r.read_exact(&mut magic).await?;
+    let mut lenb = [0u8; 4];
+    r.read_exact(&mut lenb).await?;
+    let len = u32::from_be_bytes(lenb) as usize;
+    if len > 4096 {
+        bail!("side stream header too large");
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).await?;
+    Ok((magic, postcard::from_bytes(&body)?))
+}
+
+/// Writes one chunk. An empty chunk ends the stream's payload.
+pub async fn write_side_chunk<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> Result<()> {
+    if data.len() > SIDE_CHUNK {
+        bail!("side stream chunk too large");
+    }
+    w.write_all(&(data.len() as u32).to_be_bytes()).await?;
+    w.write_all(data).await?;
+    Ok(())
+}
+
+/// Reads one chunk. `None` is the end marker.
+pub async fn read_side_chunk<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Vec<u8>>> {
+    let mut lenb = [0u8; 4];
+    r.read_exact(&mut lenb).await?;
+    let len = u32::from_be_bytes(lenb) as usize;
+    if len == 0 {
+        return Ok(None);
+    }
+    if len > SIDE_CHUNK {
+        bail!("side stream chunk too large");
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf).await?;
+    Ok(Some(buf))
 }

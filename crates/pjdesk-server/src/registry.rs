@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use pjdesk_proto::{format_id, generate_id, is_valid_id};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,6 +28,10 @@ struct DeviceRecord {
     app_version: String,
     first_seen: u64,
     last_seen: u64,
+    /// A label the operator assigned ("Office", "Lab"). Empty if none.
+    /// Missing in files written before 0.4.0.
+    #[serde(default)]
+    group: String,
 }
 
 /// A registered device, for the management window.
@@ -35,6 +39,7 @@ pub struct DeviceRow {
     pub id: String,
     pub hostname: String,
     pub version: String,
+    pub group: String,
     pub first_seen: u64,
     pub last_seen: u64,
 }
@@ -104,6 +109,7 @@ impl Registry {
                 id: id.clone(),
                 hostname: d.hostname.clone(),
                 version: d.app_version.clone(),
+                group: d.group.clone(),
                 first_seen: d.first_seen,
                 last_seen: d.last_seen,
             })
@@ -114,6 +120,23 @@ impl Registry {
 
     /// Forgets a device (the window's "Forget"). If that computer connects
     /// again it gets the same ID back (it still holds the ID and its secret).
+    /// Sets the group label for a computer. An empty group clears it.
+    /// The name is a short label, not a path.
+    pub fn set_group(&mut self, id: &str, group: &str) -> Result<()> {
+        let group = group.trim();
+        if group.chars().count() > 40 || group.chars().any(|c| c.is_control() || c == '/' || c == '\\') {
+            anyhow::bail!("a group name is at most 40 characters and cannot contain a path");
+        }
+        let record = self.data.devices.get_mut(id).context("no such computer")?;
+        record.group = group.to_string();
+        self.save()?;
+        Ok(())
+    }
+
+    pub fn group_of(&self, id: &str) -> Option<String> {
+        self.data.devices.get(id).map(|d| d.group.clone())
+    }
+
     pub fn remove(&mut self, id: &str) -> Result<()> {
         if self.data.devices.remove(id).is_some() {
             self.save()?;
@@ -195,6 +218,7 @@ impl Registry {
                 app_version: app_version.to_string(),
                 first_seen: now,
                 last_seen: now,
+                group: String::new(),
             },
         );
         self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
@@ -365,5 +389,17 @@ mod tests {
         assert!(text.contains("2026"), "{text}");
         assert!(text.ends_with("AM") || text.ends_with("PM"), "{text}");
         assert_eq!(format_local(0), "never");
+    }
+
+    #[test]
+    fn groups_persist_and_reject_paths() {
+        let (path, mut reg) = fresh("group");
+        let id = reg.register(None, &[8u8; 32], "pc", "0.4.0").unwrap();
+        reg.set_group(&id, "Office").unwrap();
+        assert_eq!(reg.group_of(&id).as_deref(), Some("Office"));
+        assert!(reg.set_group(&id, "../etc").is_err());
+        let reg = Registry::load(path.clone()).unwrap();
+        assert_eq!(reg.list()[0].group, "Office");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

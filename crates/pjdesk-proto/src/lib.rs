@@ -15,8 +15,13 @@
 //!   password is checked with SPAKE2 ([`auth`]) so it never crosses the wire.
 
 pub mod auth;
+pub mod discover;
+pub mod filesafe;
 pub mod framing;
 pub mod peer;
+pub mod perms;
+pub mod quality;
+pub mod record;
 pub mod signal;
 pub mod tls;
 pub mod udp;
@@ -25,8 +30,34 @@ pub mod update;
 /// GitHub repo PJDesk updates itself from.
 pub const UPDATE_REPO: &str = "whoamib2/pjdesk";
 
-/// Bumped whenever a wire-incompatible change is made.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// Highest protocol version this build speaks.
+///
+/// Version 2 is the 0.3.x session (screen, keyboard, mouse). Version 3 adds
+/// permissions, file transfer, clipboard, chat, audio, monitors and the other
+/// session features. Peers that only speak version 2 still connect; the new
+/// messages are sent only after both sides have agreed on version 3.
+pub const PROTOCOL_VERSION: u16 = 3;
+
+/// Oldest protocol version this build still accepts.
+pub const MIN_PROTOCOL_VERSION: u16 = 2;
+
+/// True when `peer` is a version we can still talk to.
+pub fn protocol_ok(peer: u16) -> bool {
+    (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&peer)
+}
+
+/// True when a peer rejected our protocol version and a retry at
+/// [`MIN_PROTOCOL_VERSION`] is worth attempting. Matches both this server's
+/// wording and the 0.3.x wording ("server speaks protocol 2").
+pub fn version_rejected(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("version mismatch") || m.contains("speaks protocol")
+}
+
+/// UDP port a host listens on for direct IP connections (no signaling server).
+pub const DIRECT_PORT: u16 = 21201;
+/// UDP port used for LAN discovery beacons.
+pub const DISCOVERY_PORT: u16 = 21202;
 
 /// Default port of the server, used for TCP (signaling) and UDP (rendezvous/relay).
 pub const DEFAULT_PORT: u16 = 21200;
@@ -123,5 +154,20 @@ mod tests {
         }
         assert!(!is_valid_id("012345678"));
         assert!(!is_valid_id("12345678"));
+    }
+
+    #[test]
+    fn protocol_range_accepts_current_and_previous() {
+        assert!(protocol_ok(MIN_PROTOCOL_VERSION));
+        assert!(protocol_ok(PROTOCOL_VERSION));
+        assert!(!protocol_ok(1));
+        assert!(!protocol_ok(PROTOCOL_VERSION + 1));
+    }
+
+    #[test]
+    fn version_rejection_is_recognized_for_old_and_new_wording() {
+        assert!(version_rejected("version mismatch (host speaks protocol 3, controller 9)"));
+        assert!(version_rejected("server speaks protocol 2, client 3"));
+        assert!(!version_rejected("wrong password"));
     }
 }

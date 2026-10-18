@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use pjdesk_proto::signal::AddressEntry;
+use pjdesk_proto::signal::{AddressEntry, Policy, Role};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -37,6 +37,11 @@ const TOKEN_TTL_SECS: u64 = 60 * 60 * 24 * 90; // 90 days
 struct AccountsFile {
     #[serde(default)]
     users: BTreeMap<String, User>,
+    /// Server-wide rules. A 0.3.x file has no policy; the defaults keep
+    /// unattended access working. A 0.3.x server that rewrites the file drops
+    /// this field, which is safe: it does not enforce policy anyway.
+    #[serde(default)]
+    policy: Policy,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -49,6 +54,10 @@ struct User {
     is_admin: bool,
     #[serde(default)]
     disabled: bool,
+    /// Absent in files written before 0.4.0. [`User::role`] fills that in from
+    /// `is_admin`, which those files do have.
+    #[serde(default)]
+    role: Option<Role>,
     /// SHA-256 of each active login token (`h:<hex>`) → last-used unix seconds.
     /// Older files stored the token itself; [`migrate_token_storage`] rewrites
     /// those on load. Clients still send the raw token.
@@ -87,7 +96,14 @@ pub struct AccountInfo {
     pub username: String,
     pub display_name: String,
     pub is_admin: bool,
+    pub role: Role,
     pub disabled: bool,
+}
+
+impl User {
+    fn role(&self) -> Role {
+        self.role.unwrap_or(if self.is_admin { Role::Admin } else { Role::User })
+    }
 }
 
 fn now() -> u64 {
@@ -147,7 +163,8 @@ impl Accounts {
             .map(|(username, u)| AccountInfo {
                 username: username.clone(),
                 display_name: u.display_name.clone(),
-                is_admin: u.is_admin,
+                is_admin: u.role().is_admin(),
+                role: u.role(),
                 disabled: u.disabled,
             })
             .collect()
@@ -159,17 +176,20 @@ impl Accounts {
         if !valid_username(&username) {
             bail!("username must be 1-32 characters: letters, digits, '.', '_' or '-'");
         }
-        if password.chars().count() < 8 {
-            bail!("password must be at least 8 characters");
-        }
+        // One shared check for the GUI, the CLI, and any other caller.
+        // Existing hashes are not rewritten; only a new or changed password
+        // comes through here.
+        crate::password_policy::require(password, &username)?;
         let exists = self.data.users.contains_key(&username);
         if exists && !overwrite {
             bail!("account \"{username}\" already exists");
         }
         let hash = hash_password(password)?;
+        let role = if is_admin { Role::Admin } else { Role::User };
         if let Some(user) = self.data.users.get_mut(&username) {
             user.password_hash = hash;
             user.is_admin = is_admin;
+            user.role = Some(role);
             user.disabled = false;
             // A password change invalidates saved tokens.
             user.tokens.clear();
@@ -180,6 +200,7 @@ impl Accounts {
                     password_hash: hash,
                     display_name: username.clone(),
                     is_admin,
+                    role: Some(role),
                     disabled: false,
                     tokens: BTreeMap::new(),
                     created: now(),
@@ -193,6 +214,37 @@ impl Accounts {
         let username = normalize_username(username);
         let user = self.data.users.get_mut(&username).context("no such account")?;
         user.is_admin = is_admin;
+        if is_admin {
+            user.role = Some(Role::Admin);
+        } else if user.role() == Role::Admin {
+            user.role = Some(Role::User);
+        }
+        self.save()
+    }
+
+    pub fn set_role(&mut self, username: &str, role: Role) -> Result<()> {
+        let username = normalize_username(username);
+        let user = self.data.users.get_mut(&username).context("no such account")?;
+        user.role = Some(role);
+        user.is_admin = role.is_admin();
+        self.save()
+    }
+
+    pub fn role_of(&self, username: &str) -> Option<Role> {
+        self.data.users.get(&normalize_username(username)).map(|u| u.role())
+    }
+
+    pub fn policy(&self) -> Policy {
+        self.data.policy.clone()
+    }
+
+    pub fn set_policy(&mut self, mut policy: Policy) -> Result<()> {
+        policy.tunnel_ports.retain(|p| *p != 0);
+        policy.tunnel_ports.sort_unstable();
+        policy.tunnel_ports.dedup();
+        policy.tunnel_ports.truncate(32);
+        policy.max_permissions &= pjdesk_proto::perms::ALL;
+        self.data.policy = policy;
         self.save()
     }
 
@@ -240,7 +292,7 @@ impl Accounts {
             bail!("wrong username or password");
         }
         let display_name = user.display_name.clone();
-        let is_admin = user.is_admin;
+        let is_admin = user.role().is_admin();
         let token = mint_token();
         let user = self.data.users.get_mut(&prep.username).unwrap();
         user.tokens.insert(token_id(&token), now());
@@ -281,7 +333,7 @@ impl Accounts {
         let session = Session {
             username: username.clone(),
             display_name: user.display_name.clone(),
-            is_admin: user.is_admin,
+            is_admin: user.role().is_admin(),
             token: token.to_string(),
         };
         self.save()?;
@@ -452,10 +504,10 @@ mod tests {
         let dir = temp_dir("login");
         let mut a = Accounts::load(&dir).unwrap();
         assert!(a.is_empty());
-        a.create("Ben", "hunter2x", true, false).unwrap();
+        a.create("Ben", "Correct-horse-9!", true, false).unwrap();
         // Case-insensitive, wrong password rejected.
         assert!(a.login_password("ben", "nope", "pc").is_err());
-        let s = a.login_password("BEN", "hunter2x", "pc").unwrap();
+        let s = a.login_password("BEN", "Correct-horse-9!", "pc").unwrap();
         assert!(s.is_admin);
         // The token round-trips through a reload, and the file stores only a hash.
         let token = s.token.clone();
@@ -471,7 +523,7 @@ mod tests {
         let bad = err_text(a.login_token("ben", "not-a-real-token"));
         assert_eq!(missing, bad);
         // Changing the password invalidates tokens.
-        a.create("ben", "newpass1", true, true).unwrap();
+        a.create("ben", "Correct-horse-8!", true, true).unwrap();
         assert!(a.login_token("ben", &token).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -480,7 +532,7 @@ mod tests {
     fn address_book_roundtrip() {
         let dir = temp_dir("ab");
         let mut a = Accounts::load(&dir).unwrap();
-        a.create("sam", "password", false, false).unwrap();
+        a.create("sam", "Correct-horse-7!", false, false).unwrap();
         let entries = vec![AddressEntry {
             id: "123456789".into(),
             alias: "Office".into(),
@@ -499,11 +551,11 @@ mod tests {
     fn disabled_cannot_log_in() {
         let dir = temp_dir("disabled");
         let mut a = Accounts::load(&dir).unwrap();
-        a.create("joe", "password", false, false).unwrap();
+        a.create("joe", "Correct-horse-6!", false, false).unwrap();
         a.set_disabled("joe", true).unwrap();
-        let disabled = err_text(a.login_password("joe", "password", "pc"));
+        let disabled = err_text(a.login_password("joe", "Correct-horse-6!", "pc"));
         let wrong = err_text(a.login_password("joe", "password!", "pc"));
-        let missing = err_text(a.login_password("nobody", "password", "pc"));
+        let missing = err_text(a.login_password("nobody", "Correct-horse-6!", "pc"));
         assert_eq!(disabled, "wrong username or password");
         assert_eq!(disabled, wrong);
         assert_eq!(disabled, missing);
@@ -515,7 +567,7 @@ mod tests {
     fn legacy_plaintext_tokens_are_hashed_on_load() {
         let dir = temp_dir("migrate");
         let mut a = Accounts::load(&dir).unwrap();
-        a.create("ben", "hunter2x", false, false).unwrap();
+        a.create("ben", "Correct-horse-9!", false, false).unwrap();
         // Pretend this file was written by 0.3.6, which stored the token raw.
         let path = dir.join("accounts.json");
         let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -533,6 +585,30 @@ mod tests {
         assert_eq!(a.user_for_token(raw).as_deref(), Some("ben"));
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(!on_disk.contains(raw));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roles_survive_and_old_files_still_mean_admin() {
+        let dir = temp_dir("roles");
+        let mut a = Accounts::load(&dir).unwrap();
+        a.create("ada", "Correct-horse-9!", true, false).unwrap();
+        a.create("bea", "Correct-horse-8!", false, false).unwrap();
+        assert_eq!(a.role_of("ada"), Some(Role::Admin));
+        a.set_role("bea", Role::Operator).unwrap();
+        assert_eq!(a.role_of("bea"), Some(Role::Operator));
+        assert!(!a.list().iter().find(|i| i.username == "bea").unwrap().is_admin);
+        // A 0.3.x file has is_admin and no role field.
+        let legacy = r#"{"users":{"cara":{"password_hash":"x","is_admin":true,"tokens":{},"created":1}}}"#;
+        std::fs::write(dir.join("accounts.json"), legacy).unwrap();
+        let a = Accounts::load(&dir).unwrap();
+        assert_eq!(a.role_of("cara"), Some(Role::Admin));
+        let mut a = a;
+        a.set_policy(Policy { force_prompt: true, tunnel_ports: vec![22, 22, 0], ..Policy::default() }).unwrap();
+        let again = Accounts::load(&dir).unwrap();
+        let p = again.policy();
+        assert!(p.force_prompt);
+        assert_eq!(p.tunnel_ports, vec![22]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

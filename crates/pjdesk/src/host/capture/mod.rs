@@ -79,6 +79,34 @@ pub fn open(args: &HostArgs) -> Result<Box<dyn Capturer>> {
     }
 }
 
+/// One entry per attached monitor, in the same order as `--display`.
+pub fn monitor_infos() -> Vec<pjdesk_proto::peer::MonitorInfo> {
+    #[cfg(windows)]
+    {
+        win::monitors()
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| pjdesk_proto::peer::MonitorInfo {
+                index: i as u8,
+                width: r.width.clamp(0, u16::MAX as i32) as u16,
+                height: r.height.clamp(0, u16::MAX as i32) as u16,
+                primary: i == 0,
+                name: format!("Monitor {}", i + 1),
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![pjdesk_proto::peer::MonitorInfo {
+            index: 0,
+            width: 1280,
+            height: 720,
+            primary: true,
+            name: "Test pattern".into(),
+        }]
+    }
+}
+
 /// Tries the preferred backend again (used to leave the GDI fallback).
 pub fn try_preferred(args: &HostArgs) -> Option<Box<dyn Capturer>> {
     #[cfg(windows)]

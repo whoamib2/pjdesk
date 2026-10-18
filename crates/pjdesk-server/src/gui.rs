@@ -64,6 +64,8 @@ struct App {
     really_quit: bool,
     told_tray: bool,
     show_new_pass: bool,
+    update_start: String,
+    update_end: String,
 
     /// Cloud sync status written by the running server.
     cloud: Option<crate::cloud::CloudStatus>,
@@ -104,6 +106,8 @@ struct CloudForm {
     show_code: bool,
     confirm_replace: bool,
     confirm_join: bool,
+    confirm_promote: bool,
+    confirm_demote: bool,
 }
 
 enum CloudAct {
@@ -114,6 +118,8 @@ enum CloudAct {
     Setup { replace: bool },
     Join,
     SyncNow,
+    Promote,
+    Demote,
     CopyCode,
     Off,
     SignInAgain,
@@ -140,11 +146,16 @@ impl App {
             really_quit: false,
             told_tray: false,
             show_new_pass: false,
+            update_start: String::new(),
+            update_end: String::new(),
             cloud: None,
             cloud_on: false,
             cloud_form: CloudForm { bucket: "pjdesk-sync".into(), ..Default::default() },
             cloud_job: None,
         };
+        let update = crate::self_update::Settings::load(&app.data_dir);
+        app.update_start = update.window_start;
+        app.update_end = update.window_end;
         app.refresh();
         app
     }
@@ -201,11 +212,39 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
+                crate::tray::Action::CheckUpdates => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    let dir = self.data_dir.clone();
+                    self.status = "Checking for updates…".into();
+                    std::thread::spawn(move || {
+                        let _ = crate::self_update::check_now(&dir);
+                    });
+                }
+                crate::tray::Action::Promote => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    self.cloud_form.confirm_promote = true;
+                    self.cloud_form.confirm_demote = false;
+                }
+                crate::tray::Action::Demote => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    self.cloud_form.confirm_demote = true;
+                    self.cloud_form.confirm_promote = false;
+                }
+                crate::tray::Action::SyncNow => {
+                    self.status = match crate::requests::push(&self.data_dir, crate::requests::SYNC_FILE, "now") {
+                        Ok(()) => "Syncing now.".into(),
+                        Err(e) => format!("Could not ask the server to sync: {e}"),
+                    };
+                }
                 crate::tray::Action::Quit => {
                     self.really_quit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
+        }
+        if has_tray && ctx.input(|i| i.viewport().minimized == Some(true)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         if has_tray && !self.really_quit && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -214,6 +253,19 @@ impl eframe::App for App {
                 self.told_tray = true;
                 self.status = "PJDesk Server is still running in the tray — right-click it to Quit.".into();
             }
+        }
+
+        if let Some(tray) = &self.tray {
+            let role = self.cloud.as_ref().map(|s| s.role.as_str()).filter(|s| !s.is_empty()).unwrap_or("off");
+            let epoch = self.cloud.as_ref().map(|s| s.epoch).unwrap_or(0);
+            let who = self.cloud.as_ref().map(|s| s.active_name.as_str()).filter(|s| !s.is_empty()).unwrap_or("none");
+            let upd = crate::self_update::UpdateStatus::load(&self.data_dir);
+            let available = if upd.available.is_empty() {
+                String::new()
+            } else {
+                format!("\nUpdate available: {}", upd.available)
+            };
+            tray.set_tooltip(&format!("PJDesk Server\nCloud sync: {role} · generation {epoch} · active: {who}{available}"));
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -238,6 +290,8 @@ impl eframe::App for App {
                 }
 
                 self.service_card(ui);
+                ui.add_space(8.0);
+                self.updates_card(ui);
                 ui.add_space(8.0);
                 self.cloud_card(ui);
                 ui.add_space(8.0);
@@ -271,6 +325,84 @@ enum SvcAction {
 }
 
 impl App {
+    fn updates_card(&mut self, ui: &mut egui::Ui) {
+        use crate::self_update::{self, Settings};
+        let mut settings = Settings::load(&self.data_dir);
+        let reported = self_update::UpdateStatus::load(&self.data_dir);
+        card(ui, |ui| {
+            heading(ui, "UPDATES");
+            let mut auto = settings.auto;
+            if ui.checkbox(&mut auto, "Install server updates automatically").changed() {
+                settings.auto = auto;
+                settings.save(&self.data_dir);
+                match self_update::set_task(&self.data_dir, auto) {
+                    Ok(()) => {
+                        self.status = if auto {
+                            "Automatic server updates are on. The service checks about once an hour.".into()
+                        } else {
+                            "Automatic server updates are off.".into()
+                        };
+                    }
+                    Err(e) => {
+                        self.status = format!("{e:#}");
+                    }
+                }
+            }
+            ui.label(
+                RichText::new(
+                    "Off until you turn it on. A standby updates first. A primary waits until the standby is on the new version, or 24 hours, so both servers do not restart together.",
+                )
+                .color(MUTED)
+                .size(11.0),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Maintenance window");
+                ui.add(egui::TextEdit::singleline(&mut self.update_start).hint_text("any time").desired_width(70.0));
+                ui.label("to");
+                ui.add(egui::TextEdit::singleline(&mut self.update_end).hint_text("HH:MM").desired_width(70.0));
+                if ui.button("Save").clicked() {
+                    self.status = match self_update::set_window(&self.data_dir, &self.update_start, &self.update_end) {
+                        Ok(()) => "Saved the maintenance window. Leave both blank for any time.".into(),
+                        Err(e) => format!("{e}"),
+                    };
+                }
+            });
+            ui.label(RichText::new("Local time. Leave both blank to install at any time.").color(MUTED).size(11.0));
+            ui.add_space(4.0);
+            let checked = if reported.last_check_at == 0 {
+                "Last check: never".to_string()
+            } else {
+                format!("Last check: {}", format_local(reported.last_check_at))
+            };
+            let result = if reported.last_result.is_empty() { "no result yet" } else { reported.last_result.as_str() };
+            ui.label(RichText::new(format!("{checked} · {result}")).color(MUTED).size(12.0));
+            if !reported.available.is_empty() {
+                ui.label(format!("Available version: {}", reported.available));
+            }
+            if !reported.error.is_empty() {
+                ui.colored_label(WARN, format!("⚠ {}", reported.error));
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("Check for updates now").clicked() {
+                    let dir = self.data_dir.clone();
+                    self.status = "Checking for updates…".into();
+                    std::thread::spawn(move || {
+                        let _ = self_update::check_now(&dir);
+                    });
+                }
+                if !reported.available.is_empty() && ui.add(egui::Button::new("Install this update").fill(ACCENT)).clicked() {
+                    let dir = self.data_dir.clone();
+                    self.status = "Installing the update…".into();
+                    std::thread::spawn(move || {
+                        let _ = self_update::install_if_planned(&dir, true);
+                    });
+                }
+            });
+        });
+    }
+
     fn service_card(&mut self, ui: &mut egui::Ui) {
         let mut action: Option<SvcAction> = None;
         card(ui, |ui| {
@@ -397,6 +529,22 @@ impl App {
                     });
                     ui.end_row();
                 });
+                if !self.new_pass.is_empty() {
+                    let report = crate::password_policy::evaluate(&self.new_pass, &self.new_user);
+                    let word = match report.score {
+                        0 => "empty",
+                        1 => "too weak",
+                        2 => "acceptable",
+                        3 => "strong",
+                        _ => "very strong",
+                    };
+                    ui.label(RichText::new(format!("Strength: {word}")).color(if report.ok { OK } else { WARN }).size(12.0));
+                    for check in &report.checks {
+                        let mark = if check.met { "✓" } else { "○" };
+                        let color = if check.met { OK } else { MUTED };
+                        ui.label(RichText::new(format!("{mark} {}", check.label)).color(color).size(11.0));
+                    }
+                }
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.new_admin, "Administrator");
                     if ui.add(egui::Button::new("Add").fill(ACCENT)).clicked() {
@@ -452,12 +600,17 @@ impl App {
                         ui.label("Sync is on, but the server isn't running, so nothing is syncing.");
                     } else if s.role == "active" {
                         ui.colored_label(OK, "●");
-                        ui.label("In use: computers connect here, and this server's data is backed up to the cloud.");
+                        let who = if s.active_name.is_empty() { "this server".to_string() } else { s.active_name.clone() };
+                        ui.label(format!("Primary: {who} uploads to the cloud (generation {}).", s.epoch));
                     } else {
                         ui.colored_label(ACCENT, "●");
-                        ui.label("Standby: ready to take over with the main server's data.");
+                        let who = if s.active_name.is_empty() { "the other server".to_string() } else { s.active_name.clone() };
+                        ui.label(format!("Standby. Primary: {who} (generation {}).", s.epoch));
                     }
                 });
+                if !s.notice.is_empty() {
+                    ui.colored_label(WARN, s.notice.clone());
+                }
                 let detail = if s.role == "active" || s.applied_from.is_empty() {
                     if s.last_upload_at > 0 {
                         format!("Last uploaded {}", format_local(s.last_upload_at))
@@ -483,6 +636,13 @@ impl App {
                         if ui.button("Sync now").clicked() {
                             act = Some(CloudAct::SyncNow);
                         }
+                        if s.role == "standby" {
+                            if ui.button("Make this the primary").clicked() {
+                                self.cloud_form.confirm_promote = true;
+                            }
+                        } else if s.role == "active" && ui.button("Step down to standby").clicked() {
+                            self.cloud_form.confirm_demote = true;
+                        }
                         if !is_account
                             && ui
                                 .button("Copy join code")
@@ -501,6 +661,38 @@ impl App {
                         }
                     });
                 });
+                if self.cloud_form.confirm_promote {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        WARN,
+                        "Make this server the primary? It downloads the latest copy first. The other server becomes the standby the next time it checks, even if that server is offline right now.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("Make this the primary").fill(ACCENT)).clicked() {
+                            self.cloud_form.confirm_promote = false;
+                            act = Some(CloudAct::Promote);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.cloud_form.confirm_promote = false;
+                        }
+                    });
+                }
+                if self.cloud_form.confirm_demote {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        WARN,
+                        "Step down to standby? This server will stop uploading. The other server stays the primary until you make it the primary there.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("Step down").fill(ACCENT)).clicked() {
+                            self.cloud_form.confirm_demote = false;
+                            act = Some(CloudAct::Demote);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.cloud_form.confirm_demote = false;
+                        }
+                    });
+                }
                 ui.add_space(4.0);
                 let how_to_add = if is_account {
                     format!("Backup server: install PJDesk Server on another computer and sign in there with {}.", s.account)
@@ -752,6 +944,36 @@ impl App {
                     Ok(()) => "Syncing now.".into(),
                     Err(e) => format!("Could not ask the server to sync: {e}"),
                 };
+            }
+            CloudAct::Promote => {
+                if crate::cloud::status_is_fresh(&dir) {
+                    self.status = match crate::requests::push(&dir, crate::requests::PROMOTE_FILE, "now") {
+                        Ok(()) => "Asking the running server to become the primary.".into(),
+                        Err(e) => format!("Could not ask the server to become the primary: {e}"),
+                    };
+                } else {
+                    self.spawn_cloud_job(move || {
+                        crate::cloud::promote(&dir)?;
+                        Ok(JobDone::Message(
+                            "This server is now the primary. The other server will switch to standby the next time it checks.".into(),
+                        ))
+                    });
+                }
+            }
+            CloudAct::Demote => {
+                if crate::cloud::status_is_fresh(&dir) {
+                    self.status = match crate::requests::push(&dir, crate::requests::DEMOTE_FILE, "now") {
+                        Ok(()) => "Asking the running server to step down to standby.".into(),
+                        Err(e) => format!("Could not ask the server to step down: {e}"),
+                    };
+                } else {
+                    self.spawn_cloud_job(move || {
+                        crate::cloud::demote(&dir)?;
+                        Ok(JobDone::Message(
+                            "This server stepped down to standby and will not upload.".into(),
+                        ))
+                    });
+                }
             }
             CloudAct::CopyCode => match CloudConfig::load(&dir) {
                 Some(cfg) => {

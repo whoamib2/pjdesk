@@ -12,6 +12,8 @@
 //! lets you type a partner ID to control another machine.
 
 mod account;
+mod audio;
+mod clip;
 mod color;
 mod config;
 mod gui;
@@ -173,6 +175,21 @@ pub struct HostArgs {
     /// UAC prompts and the sign-in screen. Not a user-facing flag.
     #[arg(skip)]
     pub follow_desktop: bool,
+    /// "prompt" or "unattended". Not a command-line flag; copied from settings.
+    #[arg(skip)]
+    pub approval: String,
+    /// Directory received files may be written into.
+    #[arg(skip)]
+    pub receive_dir: String,
+    /// Listen for direct IP / LAN connections.
+    #[arg(skip)]
+    pub allow_direct: bool,
+    /// Ports a tunnel may open on this computer (loopback).
+    #[arg(skip)]
+    pub tunnel_ports: Vec<u16>,
+    /// True when this process is the background service helper (runs as SYSTEM).
+    #[arg(skip)]
+    pub service_host: bool,
 }
 
 impl Default for HostArgs {
@@ -187,6 +204,11 @@ impl Default for HostArgs {
             test_pattern: false,
             view_only: false,
             follow_desktop: false,
+            approval: "prompt".into(),
+            receive_dir: String::new(),
+            allow_direct: true,
+            tunnel_ports: Vec::new(),
+            service_host: false,
         }
     }
 }
@@ -205,6 +227,11 @@ impl HostArgs {
             test_pattern: false,
             view_only: settings.view_only,
             follow_desktop: false,
+            approval: if settings.approval == "unattended" { "unattended".into() } else { "prompt".into() },
+            receive_dir: settings.receive_dir.clone(),
+            allow_direct: settings.allow_direct,
+            tunnel_ports: settings.tunnel_ports.clone(),
+            service_host: false,
         }
     }
 }

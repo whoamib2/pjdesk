@@ -13,12 +13,15 @@
 //! (`pjdesk-server service install`).
 
 mod accounts;
+mod audit;
 mod cloud;
+mod password_policy;
 #[cfg(windows)]
 mod gui;
 mod registry;
 mod relay;
 mod requests;
+mod self_update;
 #[cfg(windows)]
 mod tray;
 mod server;
@@ -61,11 +64,23 @@ enum Command {
     Run,
     /// Print the server key fingerprint, so clients can pin it.
     Fingerprint,
-    /// Check for a newer PJDesk Server and install it (the daily task runs this).
+    /// Check for a newer PJDesk Server and install it.
     Update {
         /// Only report whether an update is available; don't install.
         #[arg(long)]
         check: bool,
+        /// Used by the service and the scheduled task. Installs only when
+        /// automatic updates are on, and waits for a standby when this server
+        /// is the primary.
+        #[arg(long, hide = true)]
+        auto: bool,
+    },
+    /// Turn automatic server updates on or off. Off until you run this.
+    #[command(name = "update-task")]
+    UpdateTask {
+        /// Turn automatic updates off and remove the scheduled task.
+        #[arg(long)]
+        disable: bool,
     },
     /// Leave an update request for the running server (used by the window when
     /// it isn't elevated). TARGET is a device ID, or "*" for every online one.
@@ -107,6 +122,11 @@ enum AccountCommand {
         #[arg(long)]
         undo: bool,
     },
+    /// Set an account's role: user, operator, or admin.
+    ///
+    /// Operators can group computers and read the audit log. Admins can also
+    /// change roles and the server policy. Users sign in and sync an address book.
+    Role { username: String, role: String },
 }
 
 #[derive(Subcommand)]
@@ -157,6 +177,20 @@ enum CloudCommand {
     Status,
     /// Sync now.
     Sync,
+    /// Make this server the primary. It pulls the latest copy, then writes it
+    /// back with a higher generation so the other server becomes the standby.
+    Promote {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Stop uploading. This server becomes a standby; another server stays
+    /// primary until it is promoted.
+    Demote {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Stop syncing on this server (the copy in the bucket is kept).
     Off,
 }
@@ -223,17 +257,26 @@ fn main() -> Result<()> {
             println!("{}", pjdesk_proto::tls::format_fingerprint(&identity.fingerprint()));
             Ok(())
         }
-        Some(Command::Update { check }) => {
-            use pjdesk_proto::update::Outcome;
-            match pjdesk_proto::update::perform(
-                pjdesk_proto::UPDATE_REPO,
-                env!("CARGO_PKG_VERSION"),
-                "PJDesk-Server-Setup",
-                check,
-            )? {
-                Outcome::UpToDate(v) => println!("PJDesk Server {v} is up to date."),
-                Outcome::Found(v) => println!("PJDesk Server {v} is available."),
-                Outcome::Installing(v) => println!("Installing PJDesk Server {v}..."),
+        Some(Command::Update { check, auto }) => {
+            std::fs::create_dir_all(&data_dir)?;
+            if check {
+                println!("{}", self_update::check_now(&data_dir)?);
+                return Ok(());
+            }
+            if auto && !self_update::Settings::load(&data_dir).auto {
+                println!("Automatic server updates are off. Run `pjdesk-server update-task` to turn them on.");
+                return Ok(());
+            }
+            println!("{}", self_update::install_if_planned(&data_dir, !auto)?);
+            Ok(())
+        }
+        Some(Command::UpdateTask { disable }) => {
+            std::fs::create_dir_all(&data_dir)?;
+            self_update::set_task(&data_dir, !disable)?;
+            if disable {
+                println!("Automatic server updates are off.");
+            } else {
+                println!("Automatic server updates are on. The service checks about once an hour.");
             }
             Ok(())
         }
@@ -307,13 +350,30 @@ fn account_command(cmd: AccountCommand, data_dir: &std::path::Path) -> Result<()
                 println!("No accounts yet. Add one with: pjdesk-server account add <username>");
             }
             for a in list {
+                let name = if a.display_name.is_empty() || a.display_name == a.username {
+                    String::new()
+                } else {
+                    format!(" ({})", a.display_name)
+                };
                 println!(
-                    "{:20} {}{}",
+                    "{:20} {:10}{}{}",
                     a.username,
-                    if a.is_admin { "admin" } else { "user " },
+                    a.role.as_str(),
+                    name,
                     if a.disabled { "  (disabled)" } else { "" }
                 );
             }
+        }
+        AccountCommand::Role { username, role } => {
+            let parsed = match role.to_ascii_lowercase().as_str() {
+                "user" => pjdesk_proto::signal::Role::User,
+                "operator" => pjdesk_proto::signal::Role::Operator,
+                "admin" | "administrator" => pjdesk_proto::signal::Role::Admin,
+                other => anyhow::bail!("role must be user, operator, or admin (got {other})"),
+            };
+            accounts.set_role(&username, parsed)?;
+            let _ = crate::requests::push(data_dir, crate::requests::RELOAD_FILE, "now");
+            println!("{} is now {}.", accounts::normalize_username(&username), parsed.as_str());
         }
         AccountCommand::Remove { username } => {
             accounts.delete(&username)?;
@@ -415,6 +475,13 @@ fn cloud_command(cmd: CloudCommand, data_dir: &std::path::Path) -> Result<()> {
                     println!("Bucket: {} ({})", cfg.bucket, cfg.endpoint);
                 }
                 println!("Role: {}", if s.role.is_empty() { "unknown (is the server running?)" } else { &s.role });
+                if s.epoch > 0 || !s.active_name.is_empty() {
+                    let who = if s.active_name.is_empty() { "unknown" } else { &s.active_name };
+                    println!("Generation: {} (active server: {who})", s.epoch);
+                }
+                if !s.notice.is_empty() {
+                    println!("Notice: {}", s.notice);
+                }
                 if s.last_upload_at > 0 {
                     println!("Last upload: {}", registry::format_local(s.last_upload_at));
                 }
@@ -429,6 +496,35 @@ fn cloud_command(cmd: CloudCommand, data_dir: &std::path::Path) -> Result<()> {
         CloudCommand::Sync => {
             requests::push(data_dir, requests::SYNC_FILE, "now")?;
             println!("Asked the running server to sync now.");
+        }
+        CloudCommand::Promote { yes } => {
+            if !confirm(
+                yes,
+                "Make this server the primary? It will download the latest cloud copy, then the other server becomes the standby the next time it checks.",
+            )? {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            if cloud::status_is_fresh(data_dir) {
+                requests::push(data_dir, requests::PROMOTE_FILE, "now")?;
+                println!("Asked the running server to become the primary.");
+            } else {
+                cloud::promote(data_dir)?;
+                println!("This server is now the primary.");
+            }
+        }
+        CloudCommand::Demote { yes } => {
+            if !confirm(yes, "Step this server down to standby? It will stop uploading. The other server stays primary until you promote it.")? {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            if cloud::status_is_fresh(data_dir) {
+                requests::push(data_dir, requests::DEMOTE_FILE, "now")?;
+                println!("Asked the running server to step down to standby.");
+            } else {
+                cloud::demote(data_dir)?;
+                println!("This server is now on standby.");
+            }
         }
         CloudCommand::Off => {
             cloud::turn_off(data_dir);
@@ -452,6 +548,18 @@ fn service_command(cmd: ServiceCommand, opts: ServerOpts, data_dir: PathBuf) -> 
 #[cfg(not(windows))]
 fn service_command(_cmd: ServiceCommand, _opts: ServerOpts, _data_dir: PathBuf) -> Result<()> {
     anyhow::bail!("service management is only available on Windows; run `pjdesk-server` directly or use systemd")
+}
+
+fn confirm(yes: bool, prompt: &str) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    eprint!("{prompt} [y/N] ");
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 fn init_console_logging() {

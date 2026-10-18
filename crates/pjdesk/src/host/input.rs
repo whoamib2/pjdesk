@@ -16,25 +16,51 @@ use pjdesk_proto::peer::{InputEvent, MouseButton};
 use super::capture::Rect;
 
 pub struct InputInjector {
-    view_only: bool,
+    allow_mouse: bool,
+    allow_keyboard: bool,
     keys_down: HashSet<u16>,
     buttons_down: HashSet<MouseButton>,
 }
 
 impl InputInjector {
     pub fn new(view_only: bool) -> Self {
-        Self { view_only, keys_down: HashSet::new(), buttons_down: HashSet::new() }
+        Self {
+            allow_mouse: !view_only,
+            allow_keyboard: !view_only,
+            keys_down: HashSet::new(),
+            buttons_down: HashSet::new(),
+        }
+    }
+
+    pub fn set_allowed(&mut self, mouse: bool, keyboard: bool) {
+        self.allow_mouse = mouse;
+        self.allow_keyboard = keyboard;
+        if !mouse || !keyboard {
+            self.release_all();
+        }
+    }
+
+    /// Unicode entry for Translate keyboard mode. Ignored without keyboard permission.
+    pub fn text(&mut self, chars: &str) {
+        if !self.allow_keyboard {
+            return;
+        }
+        for ch in chars.chars().take(64) {
+            platform::unicode(ch);
+        }
     }
 
     pub fn handle(&mut self, event: InputEvent, display: Rect) {
-        if self.view_only {
-            return;
-        }
         match event {
             InputEvent::MouseMove { x, y } => {
-                platform::mouse_move(display, x, y);
+                if self.allow_mouse {
+                    platform::mouse_move(display, x, y);
+                }
             }
             InputEvent::MouseButton { button, down } => {
+                if !self.allow_mouse {
+                    return;
+                }
                 // Track the state Windows actually has: input is rejected
                 // while the secure desktop (UAC, lock screen) is showing, so a
                 // release may need to be retried later by `release_all`.
@@ -44,8 +70,15 @@ impl InputInjector {
                     self.buttons_down.remove(&button);
                 }
             }
-            InputEvent::Wheel { dx, dy } => platform::wheel(dx, dy),
+            InputEvent::Wheel { dx, dy } => {
+                if self.allow_mouse {
+                    platform::wheel(dx, dy);
+                }
+            }
             InputEvent::Key { scan, down } => {
+                if !self.allow_keyboard {
+                    return;
+                }
                 let sent = platform::key(scan, down);
                 if down && sent {
                     self.keys_down.insert(scan);
@@ -225,6 +258,21 @@ mod platform {
         };
         send(&[input])
     }
+
+    /// Unicode entry for Translate mode. Windows applies the character itself,
+    /// so the host keyboard layout does not matter.
+    pub fn unicode(ch: char) -> bool {
+        if ch.is_control() {
+            return false;
+        }
+        let mut units = [0u16; 2];
+        let encoded = ch.encode_utf16(&mut units);
+        encoded.iter().all(|&unit| {
+            let down = keyboard(VIRTUAL_KEY(0), unit, KEYEVENTF_UNICODE);
+            let up = keyboard(VIRTUAL_KEY(0), unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+            send(&[down, up])
+        })
+    }
 }
 
 #[cfg(not(windows))]
@@ -250,6 +298,11 @@ mod platform {
 
     pub fn key(scan: u16, down: bool) -> bool {
         tracing::debug!("key {scan:#06x} {}", if down { "down" } else { "up" });
+        true
+    }
+
+    pub fn unicode(ch: char) -> bool {
+        tracing::debug!("unicode {ch}");
         true
     }
 }

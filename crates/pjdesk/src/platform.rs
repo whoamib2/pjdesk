@@ -234,3 +234,141 @@ pub fn input_desktop_name() -> Option<String> {
 pub fn attach_thread_to_input_desktop() -> bool {
     false
 }
+
+/// Locks the Windows session. Returns false when the call is not available.
+#[cfg(windows)]
+pub fn lock_workstation() -> bool {
+    use windows::Win32::System::Shutdown::LockWorkStation;
+    unsafe { LockWorkStation().is_ok() }
+}
+
+#[cfg(not(windows))]
+pub fn lock_workstation() -> bool {
+    false
+}
+
+/// Blocks or unblocks the local keyboard and mouse. Needs a privileged host.
+#[cfg(windows)]
+pub fn set_block_input(block: bool) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::BlockInput;
+    unsafe { BlockInput(block).is_ok() }
+}
+
+#[cfg(not(windows))]
+pub fn set_block_input(_block: bool) -> bool {
+    false
+}
+
+/// Asks Windows to restart in a few seconds. The installer/session is not
+/// involved; this is the same restart a person would request from the Start menu.
+#[cfg(windows)]
+pub fn restart_windows() -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("shutdown")
+        .args(["/r", "/t", "5", "/c", "PJDesk remote restart"])
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .is_ok()
+}
+
+#[cfg(not(windows))]
+pub fn restart_windows() -> bool {
+    false
+}
+
+/// Covers every monitor with a black topmost window while `on` is true.
+/// The window is created on a background thread and closed when privacy mode ends.
+pub fn set_privacy_screen(on: bool) {
+    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    ON.store(on, std::sync::atomic::Ordering::SeqCst);
+    if on {
+        std::thread::Builder::new().name("privacy".into()).spawn(move || privacy_thread(&ON)).ok();
+    }
+}
+
+fn privacy_thread(flag: &std::sync::atomic::AtomicBool) {
+    #[cfg(windows)]
+    {
+        privacy_window(flag);
+    }
+    #[cfg(not(windows))]
+    {
+        while flag.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn privacy_window(flag: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{CreateSolidBrush, GetStockObject, BLACK_BRUSH, HBRUSH};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::core::w;
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap_or_default();
+        let class = w!("PJDeskPrivacy");
+        let _ = RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(privacy_wndproc),
+            hInstance: instance.into(),
+            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
+            lpszClassName: class,
+            ..Default::default()
+        });
+        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let wdt = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let hgt = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            class,
+            w!("PJDesk"),
+            WS_POPUP | WS_VISIBLE,
+            x,
+            y,
+            wdt,
+            hgt,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        );
+        let Ok(hwnd) = hwnd else { return };
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, wdt, hgt, SWP_SHOWWINDOW);
+        let _ = CreateSolidBrush; // keep the import used if the stock brush is enough
+        while flag.load(Ordering::SeqCst) {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, Some(hwnd), 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn privacy_wndproc(hwnd: windows::Win32::Foundation::HWND, msg: u32, wparam: windows::Win32::Foundation::WPARAM, lparam: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Graphics::Gdi::{DrawTextW, GetDC, ReleaseDC, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HDC, TRANSPARENT};
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    if msg == WM_PAINT {
+        unsafe {
+            let dc = GetDC(Some(hwnd));
+            if !dc.is_invalid() {
+                let mut rect = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rect);
+                let _ = SetBkMode(dc, TRANSPARENT);
+                let _ = SetTextColor(dc, windows::Win32::Foundation::COLORREF(0x00_e8_ec_f2));
+                let mut text: Vec<u16> = "PJDesk privacy mode — a remote session is active\0".encode_utf16().collect();
+                let _ = DrawTextW(dc, &mut text, &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                let _ = ReleaseDC(Some(hwnd), dc);
+            }
+        }
+        return windows::Win32::Foundation::LRESULT(0);
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}

@@ -23,12 +23,14 @@ Repo: `https://github.com/whoamib2/pjdesk` (public). Site: `https://pjdesk.com`.
 | **Deployed client** | one machine (`benlenovodesk`), device ID `326 135 922` | Running "Build 1" (`pjdesk.exe` + two bundled MinGW DLLs — see §3). End‑to‑end connect to the live server is confirmed working. |
 
 ### Do‑Not‑Touch zones / architectural rules
-1. **Wire protocol is frozen without a coordinated release.** `PROTOCOL_VERSION = 2`
-   (`crates/pjdesk-proto/src/lib.rs`). Changing the signaling messages
-   (`signal.rs`), the peer control/video messages (`peer.rs`), or bumping
-   `PROTOCOL_VERSION` **breaks every already‑deployed client** until it updates.
-   Add fields in a backward‑compatible way (serde `#[serde(default)]`) or ship
-   client **and** server together.
+1. **Wire protocol changes need a coordinated release.** `PROTOCOL_VERSION = 3`
+   (2 is still accepted). A peer that only speaks 2 keeps the classic desktop
+   session. New messages are appended, so an old peer never has to decode them.
+   (`crates/pjdesk-proto/src/lib.rs`). New postcard variants are appended, and
+   a version-2 peer is never sent a version-3 message. Do not add a field to
+   an existing postcard struct: that still breaks a peer that speaks the older
+   layout. `#[serde(default)]` is safe on the JSON files (accounts, devices,
+   the cloud bundle), not on postcard messages.
 2. **Never rotate the server TLS identity casually.** Clients trust the server
    key **on first use (TOFU)** and pin its SHA‑256 (`server_fingerprint` in the
    client config). Deleting/regenerating `server-cert.pem` / `server-key.pem`
@@ -89,7 +91,7 @@ Repo: `https://github.com/whoamib2/pjdesk` (public). Site: `https://pjdesk.com`.
 
 ### Constants (`crates/pjdesk-proto/src/lib.rs`)
 - `UPDATE_REPO = "whoamib2/pjdesk"`
-- `PROTOCOL_VERSION = 2`
+- `PROTOCOL_VERSION = 3` (`MIN_PROTOCOL_VERSION = 2`)
 - `DEFAULT_PORT = 21200`
 - `ALPN_SIGNAL = b"pjdesk-signal/1"`, `ALPN_PEER = b"pjdesk-peer/1"`
 

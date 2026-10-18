@@ -13,7 +13,8 @@ use pjdesk_proto::framing::{read_msg, write_msg, MAX_SIGNAL_FRAME};
 use pjdesk_proto::signal::{ClientMsg, ErrorCode, ServerMsg, SessionId};
 use pjdesk_proto::tls::{self, TlsIdentity};
 use pjdesk_proto::udp::Role;
-use pjdesk_proto::{format_id, normalize_id, ALPN_SIGNAL, PROTOCOL_VERSION, SIGNAL_SERVER_NAME};
+use pjdesk_proto::signal::{DeviceBrief, Role as AccountRole};
+use pjdesk_proto::{format_id, normalize_id, protocol_ok, ALPN_SIGNAL, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SIGNAL_SERVER_NAME};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
@@ -69,6 +70,8 @@ pub struct OnlineHost {
     /// Address the registration arrived from, so a second registration of the
     /// same device from somewhere else can be logged.
     pub addr: SocketAddr,
+    /// Protocol the host registered with. New server messages go only to version 3.
+    pub proto: u16,
 }
 
 /// A connection attempt between a controller and a host.
@@ -228,6 +231,8 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     let janitor = tokio::spawn(janitor(state.clone()));
     let fleet = tokio::spawn(fleet_sync(state.clone()));
     let cloud = tokio::spawn(cloud_sync(state.clone(), acceptor.clone()));
+    let updates = tokio::spawn(server_updates(data_dir.clone()));
+    crate::self_update::retire_legacy_task_if_disabled(&data_dir);
     let budget = Arc::new(Mutex::new(ConnBudget::default()));
 
     let accept_loop = async {
@@ -263,6 +268,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     janitor.abort();
     fleet.abort();
     cloud.abort();
+    updates.abort();
     Ok(())
 }
 
@@ -313,6 +319,8 @@ struct Conn {
     addr: SocketAddr,
     tx: mpsc::UnboundedSender<ServerMsg>,
     host_id: Option<String>,
+    /// Highest protocol version this connection has offered.
+    proto: u16,
 }
 
 impl Conn {
@@ -343,7 +351,7 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
         }
     });
 
-    let mut conn = Conn { id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed), addr, tx, host_id: None };
+    let mut conn = Conn { id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed), addr, tx, host_id: None, proto: 0 };
     debug!("{addr}: connected (conn {})", conn.id);
 
     let result: Result<()> = async {
@@ -415,8 +423,7 @@ fn handle_login(
     credential: pjdesk_proto::signal::Credential,
     device_name: String,
 ) {
-    if proto != PROTOCOL_VERSION {
-        conn.error(ErrorCode::VersionMismatch, format!("server speaks protocol {PROTOCOL_VERSION}, client {proto}"));
+    if !note_proto(conn, proto) {
         return;
     }
     let data_dir = {
@@ -443,7 +450,22 @@ fn handle_login(
                 guard.accounts = fresh;
             }
             if matched {
-                guard.accounts.commit_password_login(&prep)
+                let session = guard.accounts.commit_password_login(&prep);
+                if session.is_ok() && crate::password_policy::is_weak(&pw, &username) {
+                    conn.send(ServerMsg::LoginResult {
+                        ok: true,
+                        token: session.as_ref().map(|s| s.token.clone()).unwrap_or_default(),
+                        display_name: session.as_ref().map(|s| s.display_name.clone()).unwrap_or_default(),
+                        is_admin: session.as_ref().map(|s| s.is_admin).unwrap_or(false),
+                        message: crate::password_policy::weak_login_message().into(),
+                    });
+                    let user = session.as_ref().map(|s| s.username.clone()).unwrap_or_else(|_| username.clone());
+                    drop(guard);
+                    crate::audit::AuditLog::open(&data_dir).record("login", &user, "password accepted; weaker than the current policy");
+                    info!("Account \"{user}\" signed in with a password that no longer meets policy");
+                    return;
+                }
+                session
             } else {
                 Err(anyhow::anyhow!("wrong username or password"))
             }
@@ -453,8 +475,14 @@ fn handle_login(
             guard.accounts.login_token(&username, &token)
         }
     };
+    let data_dir = state.lock().unwrap().data_dir.clone();
     match result {
         Ok(session) => {
+            crate::audit::AuditLog::open(&data_dir).record(
+                "login",
+                &session.username,
+                &format!("from {} ({device_name})", conn.addr.ip()),
+            );
             info!("Account \"{}\" signed in from {} ({device_name})", session.username, conn.addr.ip());
             conn.send(ServerMsg::LoginResult {
                 ok: true,
@@ -465,6 +493,7 @@ fn handle_login(
             });
         }
         Err(e) => {
+            crate::audit::AuditLog::open(&data_dir).record("login_fail", &username, "rejected");
             conn.send(ServerMsg::LoginResult {
                 ok: false,
                 token: String::new(),
@@ -492,11 +521,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         ClientMsg::Ping => conn.send(ServerMsg::Pong),
 
         ClientMsg::Register { proto, device_id, device_secret, hostname, app_version } => {
-            if proto != PROTOCOL_VERSION {
-                conn.error(
-                    ErrorCode::VersionMismatch,
-                    format!("server speaks protocol {PROTOCOL_VERSION}, client {proto}"),
-                );
+            if !note_proto(conn, proto) {
                 return;
             }
             if !st.limiter.allow(conn.addr.ip(), "register", 20) {
@@ -513,6 +538,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                         hostname: hostname.clone(),
                         app_version: app_version.clone(),
                         addr: conn.addr,
+                        proto: conn.proto,
                     };
                     if let Some(prev) = st.online.insert(id.clone(), host) {
                         if prev.conn_id != conn.id && prev.addr.ip() != conn.addr.ip() {
@@ -529,6 +555,14 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                     }
                     conn.host_id = Some(id.clone());
                     conn.send(ServerMsg::Registered { device_id: id.clone() });
+                    if conn.proto >= 3 {
+                        conn.send(ServerMsg::Policy(st.accounts.policy()));
+                    }
+                    crate::audit::AuditLog::open(&st.data_dir).record(
+                        "register",
+                        &hostname,
+                        &format!("{} from {}", format_id(&id), conn.addr.ip()),
+                    );
                     info!("Host {} \"{hostname}\" online from {} (v{app_version})", format_id(&id), conn.addr.ip());
                     // One record per computer: drop its old, offline records.
                     let online: HashSet<String> = st.online.keys().cloned().collect();
@@ -545,11 +579,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::Connect { proto, target_id, controller_name } => {
-            if proto != PROTOCOL_VERSION {
-                conn.error(
-                    ErrorCode::VersionMismatch,
-                    format!("server speaks protocol {PROTOCOL_VERSION}, client {proto}"),
-                );
+            if !note_proto(conn, proto) {
                 return;
             }
             // Throttles ID scanning and password guessing from one address.
@@ -599,6 +629,11 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 created: Instant::now(),
             };
             st.sessions.insert(session_id, session);
+            crate::audit::AuditLog::open(&st.data_dir).record(
+                "connect",
+                &controller_name,
+                &format!("to {} from {}", format_id(&target), conn.addr.ip()),
+            );
             info!(
                 "Session {session_id:016x}: \"{controller_name}\" ({}) → host {}",
                 conn.addr.ip(),
@@ -611,6 +646,12 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             if session.host_conn != conn.id {
                 return;
             }
+            let audit_detail = if accept {
+                "accepted".to_string()
+            } else {
+                format!("refused: {}", reason.chars().take(80).collect::<String>())
+            };
+            crate::audit::AuditLog::open(&st.data_dir).record("session", &session.host_id, &audit_detail);
             if accept {
                 session.accepted = true;
                 let _ = session.controller_tx.send(ServerMsg::SessionReady {
@@ -654,10 +695,136 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 let entries: Vec<_> = entries.into_iter().take(2000).collect();
                 if let Err(e) = st.accounts.save_address_book(&user, &entries) {
                     conn.error(ErrorCode::Internal, format!("could not save the address book: {e}"));
+                } else {
+                    crate::audit::AuditLog::open(&st.data_dir).record(
+                        "address_book",
+                        &user,
+                        &format!("{} computers", entries.len()),
+                    );
                 }
             }
             None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
         },
+
+        ClientMsg::ListDevices { token } => match authorized(st, &token, true) {
+            Some(_) => {
+                let online = st.online.keys().cloned().collect::<HashSet<_>>();
+                let devices = st
+                    .registry
+                    .list()
+                    .into_iter()
+                    .map(|d| DeviceBrief {
+                        online: online.contains(&d.id),
+                        id: d.id,
+                        hostname: d.hostname,
+                        group: d.group,
+                        version: d.version,
+                        last_seen: d.last_seen,
+                    })
+                    .collect();
+                conn.send(ServerMsg::DeviceList { devices });
+            }
+            None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
+        },
+
+        ClientMsg::SetDeviceGroup { token, device_id, group } => match authorized(st, &token, true) {
+            Some(user) => {
+                let id = normalize_id(&device_id);
+                match st.registry.set_group(&id, &group) {
+                    Ok(()) => {
+                        crate::audit::AuditLog::open(&st.data_dir).record(
+                            "group",
+                            &user,
+                            &format!("{} -> {}", format_id(&id), group.chars().take(40).collect::<String>()),
+                        );
+                        conn.send(ServerMsg::Pong);
+                    }
+                    Err(e) => conn.error(ErrorCode::BadRequest, e.to_string()),
+                }
+            }
+            None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
+        },
+
+        ClientMsg::GetPolicy { token } => match authorized(st, &token, false) {
+            Some(_) => conn.send(ServerMsg::Policy(st.accounts.policy())),
+            None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
+        },
+
+        ClientMsg::SetPolicy { token, policy } => match authorized(st, &token, false) {
+            Some(user) if st.accounts.role_of(&user) == Some(AccountRole::Admin) => {
+                if let Err(e) = st.accounts.set_policy(policy) {
+                    conn.error(ErrorCode::Internal, e.to_string());
+                } else {
+                    crate::audit::AuditLog::open(&st.data_dir).record("policy", &user, "updated");
+                    push_policy(st);
+                    conn.send(ServerMsg::Policy(st.accounts.policy()));
+                }
+            }
+            Some(_) => conn.error(ErrorCode::Unauthorized, "only an administrator can change policy"),
+            None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
+        },
+
+        ClientMsg::GetAudit { token, limit } => match authorized(st, &token, true) {
+            Some(_) => {
+                let events = crate::audit::AuditLog::open(&st.data_dir).recent(limit as usize);
+                conn.send(ServerMsg::Audit { events });
+            }
+            None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
+        },
+
+        ClientMsg::SetRole { token, username, role } => match authorized(st, &token, false) {
+            Some(actor) if st.accounts.role_of(&actor) == Some(AccountRole::Admin) => {
+                match st.accounts.set_role(&username, role) {
+                    Ok(()) => {
+                        crate::audit::AuditLog::open(&st.data_dir).record(
+                            "role",
+                            &actor,
+                            &format!("{username} is now {}", role.as_str()),
+                        );
+                        conn.send(ServerMsg::Pong);
+                    }
+                    Err(e) => conn.error(ErrorCode::BadRequest, e.to_string()),
+                }
+            }
+            Some(_) => conn.error(ErrorCode::Unauthorized, "only an administrator can change roles"),
+            None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
+        },
+    }
+}
+
+/// Records the client's protocol version. False when it is too old or too new
+/// to speak to this server — the error text contains "version mismatch" so a
+/// newer client can retry with an older version.
+fn note_proto(conn: &mut Conn, proto: u16) -> bool {
+    if !protocol_ok(proto) {
+        conn.error(
+            ErrorCode::VersionMismatch,
+            format!("version mismatch (server speaks protocol {MIN_PROTOCOL_VERSION}-{PROTOCOL_VERSION}, client {proto})"),
+        );
+        return false;
+    }
+    if proto > conn.proto {
+        conn.proto = proto;
+    }
+    true
+}
+
+/// The signed-in username, if `token` is live. `manage` requires operator or admin.
+fn authorized(st: &State, token: &str, manage: bool) -> Option<String> {
+    let user = st.accounts.user_for_token(token)?;
+    let role = st.accounts.role_of(&user).unwrap_or(AccountRole::User);
+    if manage && !role.can_manage_devices() {
+        return None;
+    }
+    Some(user)
+}
+
+fn push_policy(st: &State) {
+    let msg = ServerMsg::Policy(st.accounts.policy());
+    for host in st.online.values() {
+        if host.proto >= 3 {
+            let _ = host.tx.send(msg.clone());
+        }
     }
 }
 
@@ -724,7 +891,8 @@ async fn fleet_sync(state: Shared) {
 
         let updates = take(&data_dir, UPDATE_FILE);
         let forgets = take(&data_dir, FORGET_FILE);
-        if updates.is_empty() && forgets.is_empty() {
+        let groups = take(&data_dir, crate::requests::GROUP_FILE);
+        if updates.is_empty() && forgets.is_empty() && groups.is_empty() {
             continue;
         }
         let mut st = state.lock().unwrap();
@@ -742,6 +910,18 @@ async fn fleet_sync(state: Shared) {
                 warn!("could not forget {}: {e}", format_id(id));
             } else {
                 info!("Forgot device {}", format_id(id));
+                crate::audit::AuditLog::open(&st.data_dir).record("forget", "server", &format_id(id));
+            }
+        }
+        for target in &groups {
+            if let Some((id, group)) = crate::requests::parse_group_target(target) {
+                match st.registry.set_group(&id, &group) {
+                    Ok(()) => {
+                        info!("Device {} is now in group \"{group}\"", format_id(&id));
+                        crate::audit::AuditLog::open(&st.data_dir).record("group", "server", &format!("{} -> {group}", format_id(&id)));
+                    }
+                    Err(e) => warn!("could not set a group on {}: {e}", format_id(&id)),
+                }
             }
         }
     }
@@ -752,8 +932,8 @@ async fn fleet_sync(state: Shared) {
 /// the main server if it is on standby — then reloads the key, accounts and
 /// computer list so it is ready to take over.
 async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
-    use crate::cloud::{sync_once, Role};
-    use crate::requests::{take, RELOAD_FILE, SYNC_FILE};
+    use crate::cloud::{demote, promote, sync_once, Role};
+    use crate::requests::{take, DEMOTE_FILE, PROMOTE_FILE, RELOAD_FILE, SYNC_FILE};
     const PASS_EVERY: u32 = 15; // ticks of 2 s
     let data_dir = state.lock().unwrap().data_dir.clone();
     let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -764,8 +944,26 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
         if !take(&data_dir, RELOAD_FILE).is_empty() {
             reload_from_disk(&state, &acceptor, &data_dir);
         }
+        let promote_now = !take(&data_dir, PROMOTE_FILE).is_empty();
+        let demote_now = !take(&data_dir, DEMOTE_FILE).is_empty();
+        if promote_now {
+            let dir = data_dir.clone();
+            match tokio::task::spawn_blocking(move || promote(&dir)).await {
+                Ok(Ok(())) => info!("This server is now the cloud primary"),
+                Ok(Err(e)) => warn!("could not become the cloud primary: {e:#}"),
+                Err(e) => warn!("could not become the cloud primary: {e}"),
+            }
+            reload_from_disk(&state, &acceptor, &data_dir);
+        } else if demote_now {
+            let dir = data_dir.clone();
+            match tokio::task::spawn_blocking(move || demote(&dir)).await {
+                Ok(Ok(())) => info!("This server stepped down to cloud standby"),
+                Ok(Err(e)) => warn!("could not step down: {e:#}"),
+                Err(e) => warn!("could not step down: {e}"),
+            }
+        }
         let forced = !take(&data_dir, SYNC_FILE).is_empty();
-        if !forced && ticks % PASS_EVERY != 1 {
+        if !promote_now && !forced && ticks % PASS_EVERY != 1 {
             continue;
         }
         let role = if state.lock().unwrap().online.is_empty() { Role::Standby } else { Role::Active };
@@ -774,6 +972,16 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
         if applied {
             reload_from_disk(&state, &acceptor, &data_dir);
         }
+    }
+}
+
+/// Automatic server updates, when the administrator has turned them on.
+async fn server_updates(data_dir: std::path::PathBuf) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        let dir = data_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::self_update::service_tick(&dir)).await;
     }
 }
 
@@ -799,6 +1007,7 @@ fn reload_from_disk(state: &Shared, acceptor: &RwLock<TlsAcceptor>, data_dir: &P
         Err(e) => warn!("could not reload accounts: {e:#}"),
     }
     info!("Reloaded {} computers and {} accounts from disk", st.registry.len(), st.accounts.list().len());
+    push_policy(&st);
 }
 
 /// Fixed-window per-IP rate limiter.
