@@ -55,6 +55,12 @@ Function un.onInit
   System::Call 'kernel32::SetDllDirectoryA(t "")'
 FunctionEnd
 
+; If the install stops after the service was stopped, bring the computer back.
+Function .onInstFailed
+  nsExec::Exec '"$INSTDIR\${EXE}" update-handoff'
+  nsExec::Exec 'net start ${APPNAME}'
+FunctionEnd
+
 !define ARP "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
 
 Section "PJDesk (required)" SecCore
@@ -77,7 +83,9 @@ Section "PJDesk (required)" SecCore
   ; Auto-update check every 30 minutes, as SYSTEM (short path avoids quoting the spaces).
   GetFullPathName /SHORT $0 "$INSTDIR\${EXE}"
   nsExec::Exec 'schtasks /Create /TN "PJDesk Update" /TR "$0 update" /SC MINUTE /MO 30 /RU SYSTEM /RL HIGHEST /F'
-  ; If the service was installed, start the freshly-updated binary.
+  ; The new exe restarts the service (several tries) and opens PJDesk in the
+  ; signed-in user's session. net start is the fallback if that command is absent.
+  nsExec::ExecToLog '"$INSTDIR\${EXE}" update-handoff'
   nsExec::Exec 'net start ${APPNAME}'
 
   CreateDirectory "$SMPROGRAMS\${APPNAME}"

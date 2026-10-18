@@ -25,6 +25,7 @@ const STATUS_FILE: &str = "server-update-status.json";
 pub const MAX_WAIT_SECS: u64 = 24 * 60 * 60;
 /// A health report older than this is not a standby we should wait for.
 const PEER_FRESH_SECS: u64 = 6 * 60 * 60;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const UPDATE_TASK: &str = "PJDesk Server Update";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,19 +60,44 @@ impl Default for Settings {
     }
 }
 
+/// Whether `server-update.json` was read. Unreadable is not the same as
+/// "automatic updates are off" — an unelevated window cannot open the file.
+#[derive(Debug)]
+pub enum Loaded<T> {
+    Present(T),
+    Absent,
+    Unreadable,
+}
+
 impl Settings {
-    pub fn load(data_dir: &Path) -> Self {
-        let mut s: Settings = std::fs::read(data_dir.join(SETTINGS_FILE))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
-        if s.jitter_secs == 0 {
-            let n = u64::from(pjdesk_proto::random_bytes::<2>()[0]) * 256
-                + u64::from(pjdesk_proto::random_bytes::<2>()[1]);
-            s.jitter_secs = (n % (30 * 60)) + 1;
-            s.save(data_dir);
+    pub fn read(data_dir: &Path) -> Loaded<Self> {
+        match std::fs::read(data_dir.join(SETTINGS_FILE)) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(s) => Loaded::Present(s),
+                Err(_) => Loaded::Present(Self::default()),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Loaded::Absent,
+            Err(_) => Loaded::Unreadable,
         }
-        s
+    }
+
+    pub fn load(data_dir: &Path) -> Self {
+        match Self::read(data_dir) {
+            Loaded::Unreadable => Self::default(),
+            Loaded::Present(mut s) => {
+                if s.jitter_secs == 0 {
+                    s.jitter_secs = fresh_jitter();
+                    s.save(data_dir);
+                }
+                s
+            }
+            Loaded::Absent => {
+                let mut s = Self::default();
+                s.jitter_secs = fresh_jitter();
+                s.save(data_dir);
+                s
+            }
+        }
     }
 
     pub fn save(&self, data_dir: &Path) {
@@ -101,12 +127,28 @@ pub struct UpdateStatus {
     pub error: String,
 }
 
+fn fresh_jitter() -> u64 {
+    let n = u64::from(pjdesk_proto::random_bytes::<2>()[0]) * 256 + u64::from(pjdesk_proto::random_bytes::<2>()[1]);
+    (n % (30 * 60)) + 1
+}
+
 impl UpdateStatus {
+    pub fn read(data_dir: &Path) -> Loaded<Self> {
+        match std::fs::read(data_dir.join(STATUS_FILE)) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(s) => Loaded::Present(s),
+                Err(_) => Loaded::Present(Self::default()),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Loaded::Absent,
+            Err(_) => Loaded::Unreadable,
+        }
+    }
+
     pub fn load(data_dir: &Path) -> Self {
-        std::fs::read(data_dir.join(STATUS_FILE))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        match Self::read(data_dir) {
+            Loaded::Present(s) => s,
+            Loaded::Absent | Loaded::Unreadable => Self::default(),
+        }
     }
 
     fn save(&self, data_dir: &Path) {
@@ -236,6 +278,7 @@ pub fn set_auto(data_dir: &Path, auto: bool) -> Settings {
     s
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn set_window(data_dir: &Path, start: &str, end: &str) -> Result<()> {
     let mut s = Settings::load(data_dir);
     s.window_start = start.trim().to_string();
@@ -510,6 +553,33 @@ mod tests {
         primary.peers[0].epoch = 3;
         primary.peers[0].at = primary.now - PEER_FRESH_SECS - 1;
         assert_eq!(decide(&primary), Plan::Install, "an old report is not a live standby");
+    }
+
+    #[test]
+    fn unreadable_settings_are_not_rewritten_as_off() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-update-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SETTINGS_FILE);
+        let original = r#"{"auto":true,"jitter_secs":5}"#;
+        std::fs::write(&path, original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0);
+            std::fs::set_permissions(&path, perms.clone()).unwrap();
+            let _ = Settings::load(&dir);
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = Settings::load(&dir);
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("true"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

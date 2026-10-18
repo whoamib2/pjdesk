@@ -17,6 +17,7 @@ mod clip;
 mod color;
 mod config;
 mod gui;
+mod handoff;
 mod host;
 mod identity;
 mod p2p;
@@ -66,6 +67,9 @@ enum Cmd {
     Login(LoginArgs),
     /// Sign out and forget the saved login.
     Logout,
+    /// After a silent install: restart the service and the signed-in user's window.
+    #[command(name = "update-handoff", hide = true)]
+    UpdateHandoff,
     /// Check for a newer PJDesk and install it (the daily task runs this).
     Update {
         /// Only report whether an update is available; don't install.
@@ -282,7 +286,7 @@ fn main() {
     // The service and its helper run with no console and set up their own
     // (file) logging, so route them before touching the console.
     let raw: Vec<String> = std::env::args().collect();
-    let is_background = raw.iter().any(|a| a == "__session-host")
+    let is_background = raw.iter().any(|a| a == "__session-host" || a == "update-handoff")
         || (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"));
 
     // With any other argument, attach a console so output and clap errors show.
@@ -302,6 +306,13 @@ fn main() {
         Some(Cmd::SessionHost { config }) => {
             if let Err(e) = service::session_host(config.clone()) {
                 tracing::error!("session host: {e:#}");
+            }
+        }
+        Some(Cmd::UpdateHandoff) => {
+            // A missing client.json must not keep the computer offline.
+            if let Err(e) = handoff::run() {
+                eprintln!("{e:#}");
+                std::process::exit(1);
             }
         }
         Some(Cmd::Service(ServiceCommand::Run)) => {
@@ -334,6 +345,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Login(args)) => login_command(&mut config, args, cli.server),
         Some(Cmd::Logout) => logout_command(&mut config, cli.server),
         Some(Cmd::Update { check }) => update_command(check),
+        Some(Cmd::UpdateHandoff) => handoff::run(),
         Some(Cmd::UpdateTask { disable }) => service::set_update_task(!disable),
         Some(Cmd::Console) => interactive(config, cli.server),
         Some(Cmd::Service(cmd)) => service_command(cmd),

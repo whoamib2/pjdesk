@@ -232,6 +232,14 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     let fleet = tokio::spawn(fleet_sync(state.clone()));
     let cloud = tokio::spawn(cloud_sync(state.clone(), acceptor.clone()));
     let updates = tokio::spawn(server_updates(data_dir.clone()));
+    // The management window reads this when it cannot open the data folder.
+    {
+        let pipe_dir = data_dir.clone();
+        let pipe_port = opts.port;
+        let _ = std::thread::Builder::new().name("status-pipe".into()).spawn(move || {
+            crate::status_pipe::serve(pipe_dir, pipe_port);
+        });
+    }
     crate::self_update::retire_legacy_task_if_disabled(&data_dir);
     let budget = Arc::new(Mutex::new(ConnBudget::default()));
 

@@ -6,7 +6,11 @@
 //! locked to SYSTEM and Administrators), so when the window can't write there
 //! it offers to relaunch elevated.
 
+// The window is the Windows entry point. Linux compiles it for headless shots.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use eframe::egui::{self, Color32, RichText};
@@ -15,12 +19,18 @@ use std::collections::HashMap;
 
 use crate::accounts::{self, Accounts};
 use crate::registry::{format_local, DeviceRow, Registry};
+use crate::status_view::{self, Access, Snapshot};
+use crate::ui_icons::Icon;
+use crate::ui_theme::{self, Paint};
+use crate::ui_widgets;
 
-const ACCENT: Color32 = Color32::from_rgb(0x4d, 0x9b, 0xff);
-const OK: Color32 = Color32::from_rgb(0x3f, 0xcf, 0x6b);
-const WARN: Color32 = Color32::from_rgb(0xf2, 0xb0, 0x3a);
-const MUTED: Color32 = Color32::from_rgb(0x9a, 0xa2, 0xb1);
-const CARD: Color32 = Color32::from_rgb(0x1c, 0x20, 0x28);
+#[cfg(feature = "ui-shots")]
+#[path = "gui_shots.rs"]
+mod shots;
+
+fn p(ui: &egui::Ui) -> Paint {
+    ui_theme::paint(ui)
+}
 
 pub fn run(data_dir: PathBuf, port: u16, start_hidden: bool) -> Result<()> {
     // One icon per user. A second launch asks the first window to show itself.
@@ -30,8 +40,8 @@ pub fn run(data_dir: PathBuf, port: u16, start_hidden: bool) -> Result<()> {
     crate::tray::ensure_login_default();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 720.0])
-            .with_min_inner_size([620.0, 520.0])
+            .with_inner_size([880.0, 820.0])
+            .with_min_inner_size([760.0, 640.0])
             .with_visible(!start_hidden)
             .with_title("PJDesk Server")
             .with_app_id("pjdesk-server")
@@ -79,6 +89,15 @@ struct App {
     cloud_form: CloudForm,
     /// A setup/join running on a worker thread (network calls).
     cloud_job: Option<std::sync::mpsc::Receiver<CloudJobResult>>,
+    /// Whether this process can list the data folder.
+    access: Access,
+    /// Latest snapshot from the service pipe. Used when the folder is locked.
+    live: Option<Snapshot>,
+    probe: Option<std::sync::mpsc::Receiver<Option<Snapshot>>>,
+    opened_at: Instant,
+    /// Screenshots inject the service state. The real window asks Windows.
+    svc_override: Option<(bool, bool)>,
+    preview_locked: bool,
 }
 
 /// How a cloud job (network calls on a worker thread) ended.
@@ -133,7 +152,11 @@ enum CloudAct {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, data_dir: PathBuf, port: u16) -> Self {
-        apply_theme(&cc.egui_ctx);
+        Self::build(cc, data_dir, port, true)
+    }
+
+    fn build(cc: &eframe::CreationContext<'_>, data_dir: PathBuf, port: u16, spawn_probe: bool) -> Self {
+        ui_theme::apply(&cc.egui_ctx, "system");
         let mut app = Self {
             data_dir,
             port,
@@ -158,18 +181,52 @@ impl App {
             cloud_on: false,
             cloud_form: CloudForm { bucket: "pjdesk-sync".into(), ..Default::default() },
             cloud_job: None,
+            access: Access::Missing,
+            live: None,
+            probe: None,
+            opened_at: Instant::now(),
+            svc_override: None,
+            preview_locked: false,
         };
-        let update = crate::self_update::Settings::load(&app.data_dir);
-        app.update_start = update.window_start;
-        app.update_end = update.window_end;
+        if let crate::self_update::Loaded::Present(update) = crate::self_update::Settings::read(&app.data_dir) {
+            app.update_start = update.window_start;
+            app.update_end = update.window_end;
+        }
         app.refresh();
+        if spawn_probe {
+            app.probe = spawn_status_probe(&cc.egui_ctx);
+        }
         app
     }
 
+    fn service_state(&self) -> (bool, bool) {
+        if let Some(state) = self.svc_override {
+            return state;
+        }
+        svc_status()
+    }
+
+    fn waiting_for_service(&self) -> bool {
+        self.access != Access::Readable && self.live.is_none() && self.opened_at.elapsed() < Duration::from_secs(2)
+    }
+
     fn refresh(&mut self) {
-        // Writable if we can create/touch the data dir.
-        self.can_write = std::fs::create_dir_all(&self.data_dir).is_ok()
-            && std::fs::write(self.data_dir.join(".wtest"), b"1").is_ok();
+        if self.preview_locked {
+            self.access = Access::Locked;
+            self.can_write = false;
+            return;
+        }
+        self.access = status_view::access(&self.data_dir);
+        if self.access == Access::Missing && std::fs::create_dir_all(&self.data_dir).is_ok() {
+            self.access = status_view::access(&self.data_dir);
+        }
+        // A locked folder must not be filled in with defaults. The pipe, if
+        // the service is running, is what this window shows instead.
+        if self.access != Access::Readable {
+            self.can_write = false;
+            return;
+        }
+        self.can_write = std::fs::write(self.data_dir.join(".wtest"), b"1").is_ok();
         let _ = std::fs::remove_file(self.data_dir.join(".wtest"));
 
         // Display the fingerprint read-only. This NEVER creates, regenerates or
@@ -201,12 +258,19 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.last_refresh.elapsed() > std::time::Duration::from_secs(3) {
-            self.last_refresh = std::time::Instant::now();
+        if self.last_refresh.elapsed() > Duration::from_secs(3) {
+            self.last_refresh = Instant::now();
             self.refresh();
         }
+        if let Some(rx) = &self.probe {
+            while let Ok(msg) = rx.try_recv() {
+                if let Some(snap) = msg {
+                    self.live = Some(snap);
+                }
+            }
+        }
         let ctx = ui.ctx().clone();
-        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        ctx.request_repaint_after(if self.waiting_for_service() { Duration::from_millis(50) } else { Duration::from_secs(1) });
         self.poll_cloud_job();
 
         // System tray: Show/Quit, and hide-to-tray when the window is closed.
@@ -266,20 +330,33 @@ impl eframe::App for App {
         }
 
         if let Some(tray) = &self.tray {
-            let (installed, running) = svc_status();
-            let role = self.cloud.as_ref().map(|s| s.role.as_str()).unwrap_or("");
-            let epoch = self.cloud.as_ref().map(|s| s.epoch).unwrap_or(0);
-            let who = self.cloud.as_ref().map(|s| s.active_name.as_str()).unwrap_or("");
-            let upd = crate::self_update::UpdateStatus::load(&self.data_dir);
+            let (installed, running) = self.service_state();
+            let (role, epoch, who, available, last_result, hosts) = if self.access != Access::Readable {
+                if let Some(s) = &self.live {
+                    (s.role.clone(), s.epoch, s.active_name.clone(), s.update_available.clone(), s.last_result.clone(), self.online.len())
+                } else {
+                    (String::new(), 0, String::new(), String::new(), String::new(), 0)
+                }
+            } else {
+                let upd = crate::self_update::UpdateStatus::load(&self.data_dir);
+                (
+                    self.cloud.as_ref().map(|s| s.role.clone()).unwrap_or_default(),
+                    self.cloud.as_ref().map(|s| s.epoch).unwrap_or(0),
+                    self.cloud.as_ref().map(|s| s.active_name.clone()).unwrap_or_default(),
+                    upd.available,
+                    upd.last_result,
+                    self.online.len(),
+                )
+            };
             tray.set_tooltip(&crate::tray_tip::format(&crate::tray_tip::Tip {
                 installed,
                 running,
-                hosts: self.online.len(),
-                role,
+                hosts,
+                role: &role,
                 epoch,
-                active: who,
-                available: &upd.available,
-                last_result: &upd.last_result,
+                active: &who,
+                available: &available,
+                last_result: &last_result,
             }));
         }
 
@@ -287,18 +364,20 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("PJDesk Server").size(20.0).strong().color(Color32::WHITE));
-                    ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(MUTED));
+                    ui.label(RichText::new("PJDesk Server").size(22.0).strong().color(p(ui).text));
+                    ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(p(ui).muted));
                 });
                 ui.add_space(8.0);
 
                 if !self.can_write {
                     card(ui, |ui| {
-                        ui.colored_label(WARN, "⚠ Running without Administrator rights — accounts and the service can't be changed.");
-                        if ui.add(egui::Button::new("Restart as administrator").fill(ACCENT)).clicked() {
-                            if run_elevated(&[]) {
-                                std::process::exit(0);
-                            }
+                        ui.horizontal(|ui| {
+                            glyph(ui, Icon::Alert, p(ui).warn);
+                            ui.label("Running without Administrator rights. You can look, and changing accounts or the service needs an administrator.");
+                        });
+                        ui.add_space(8.0);
+                        if ui_widgets::accent_button(ui, "Restart as administrator") && run_elevated(&[]) {
+                            std::process::exit(0);
                         }
                     });
                     ui.add_space(8.0);
@@ -319,9 +398,9 @@ impl eframe::App for App {
                 if !self.status.is_empty() {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        ui.colored_label(WARN, "•");
+                        glyph(ui, Icon::Alert, p(ui).warn);
                         ui.label(&self.status);
-                        if ui.small_button("✕").clicked() {
+                        if ui_widgets::icon_button(ui, Icon::Close, "Dismiss") {
                             self.status.clear();
                         }
                     });
@@ -341,13 +420,17 @@ enum SvcAction {
 
 impl App {
     fn updates_card(&mut self, ui: &mut egui::Ui) {
+        if self.access != Access::Readable {
+            self.updates_locked(ui);
+            return;
+        }
         use crate::self_update::{self, Settings};
         let mut settings = Settings::load(&self.data_dir);
         let reported = self_update::UpdateStatus::load(&self.data_dir);
         card(ui, |ui| {
             heading(ui, "UPDATES");
             let mut auto = settings.auto;
-            if ui.checkbox(&mut auto, "Install server updates automatically").changed() {
+            if ui_widgets::checkbox(ui, &mut auto, "Install server updates automatically") {
                 settings.auto = auto;
                 settings.save(&self.data_dir);
                 match self_update::set_task(&self.data_dir, auto) {
@@ -367,7 +450,7 @@ impl App {
                 RichText::new(
                     "Off until you turn it on. A standby updates first. A primary waits until the standby is on the new version, or 24 hours, so both servers do not restart together.",
                 )
-                .color(MUTED)
+                .color(p(ui).muted)
                 .size(11.0),
             );
             ui.add_space(4.0);
@@ -383,7 +466,7 @@ impl App {
                     };
                 }
             });
-            ui.label(RichText::new("Local time. Leave both blank to install at any time.").color(MUTED).size(11.0));
+            ui.label(RichText::new("Local time. Leave both blank to install at any time.").color(p(ui).muted).size(11.0));
             ui.add_space(4.0);
             let checked = if reported.last_check_at == 0 {
                 "Last check: never".to_string()
@@ -391,12 +474,15 @@ impl App {
                 format!("Last check: {}", format_local(reported.last_check_at))
             };
             let result = if reported.last_result.is_empty() { "no result yet" } else { reported.last_result.as_str() };
-            ui.label(RichText::new(format!("{checked} · {result}")).color(MUTED).size(12.0));
+            ui.label(RichText::new(format!("{checked} · {result}")).color(p(ui).muted).size(12.0));
             if !reported.available.is_empty() {
                 ui.label(format!("Available version: {}", reported.available));
             }
             if !reported.error.is_empty() {
-                ui.colored_label(WARN, format!("⚠ {}", reported.error));
+                ui.horizontal(|ui| {
+                    glyph(ui, Icon::Alert, p(ui).warn);
+                    ui.colored_label(p(ui).warn, &reported.error);
+                });
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -407,7 +493,7 @@ impl App {
                         let _ = self_update::check_now(&dir);
                     });
                 }
-                if !reported.available.is_empty() && ui.add(egui::Button::new("Install this update").fill(ACCENT)).clicked() {
+                if !reported.available.is_empty() && ui.add(egui::Button::new("Install this update").fill(p(ui).accent)).clicked() {
                     let dir = self.data_dir.clone();
                     self.status = "Installing the update…".into();
                     std::thread::spawn(move || {
@@ -422,22 +508,24 @@ impl App {
         let mut action: Option<SvcAction> = None;
         card(ui, |ui| {
             heading(ui, "SERVICE");
-            let (installed, running) = svc_status();
+            let (installed, running) = self.service_state();
             ui.horizontal(|ui| {
                 let (c, t) = if !installed {
-                    (MUTED, "Not installed")
+                    (p(ui).muted, "Not installed")
                 } else if running {
-                    (OK, "Installed and running")
+                    (p(ui).ok, "Installed and running")
                 } else {
-                    (WARN, "Installed, not running")
+                    (p(ui).warn, "Installed, not running")
                 };
-                ui.colored_label(c, "●");
+                ui_widgets::dot(ui, c);
                 ui.label(t);
             });
+            let version = self.live.as_ref().map(|s| s.version.as_str()).unwrap_or(env!("CARGO_PKG_VERSION"));
+            ui.label(RichText::new(format!("Version {version}")).color(p(ui).muted).size(12.0));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if !installed {
-                    if ui.add(egui::Button::new("Install service").fill(ACCENT)).clicked() {
+                    if ui.add(egui::Button::new("Install service").fill(p(ui).accent)).clicked() {
                         action = Some(SvcAction::Install);
                     }
                 } else {
@@ -455,7 +543,7 @@ impl App {
             });
             ui.add_space(8.0);
             let mut tray_login = crate::tray::login_enabled();
-            if ui.checkbox(&mut tray_login, "Start tray at Windows sign-in").changed() {
+            if ui_widgets::checkbox(ui, &mut tray_login, "Start tray at Windows sign-in") {
                 crate::tray::set_login(tray_login);
                 self.status = if tray_login {
                     "The tray icon will start when you sign in to Windows.".into()
@@ -464,18 +552,24 @@ impl App {
                 };
             }
             ui.add_space(6.0);
-            ui.label(RichText::new(format!("Listening port: {} (TCP + UDP)", self.port)).color(MUTED).size(12.0));
-            ui.label(RichText::new(format!("Data folder: {}", self.data_dir.display())).color(MUTED).size(12.0));
+            ui.label(RichText::new(format!("Listening port: {} (TCP + UDP)", self.port)).color(p(ui).muted).size(12.0));
+            ui.label(RichText::new(format!("Data folder: {}", self.data_dir.display())).color(p(ui).muted).size(12.0));
             ui.add_space(4.0);
-            ui.label(RichText::new("Server key fingerprint").color(MUTED).size(12.0));
+            ui.label(RichText::new("Server key fingerprint").color(p(ui).muted).size(12.0));
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&self.fingerprint).monospace().size(11.0));
-                if ui.small_button("⧉").clicked() {
-                    copy(&self.fingerprint);
-                    self.status = "Fingerprint copied".into();
+                let (text, can_copy) = self.fingerprint_line();
+                if text.is_empty() {
+                    ui_widgets::spinner(ui, p(ui).accent);
+                    ui.label("Reading status from the service…");
+                } else {
+                    ui.label(RichText::new(&text).monospace().size(13.0));
+                    if can_copy && ui_widgets::icon_button(ui, Icon::Copy, "Copy fingerprint") {
+                        copy(&text);
+                        self.status = "Fingerprint copied".into();
+                    }
                 }
             });
-            ui.label(RichText::new("Clients pin this on first connect; compare it when setting up a new computer.").color(MUTED).size(11.0));
+            ui.label(RichText::new("Clients pin this on first connect; compare it when setting up a new computer.").color(p(ui).muted).size(11.0));
         });
 
         if let Some(action) = action {
@@ -513,25 +607,137 @@ impl App {
         self.refresh();
     }
 
+    fn fingerprint_line(&self) -> (String, bool) {
+        if self.access == Access::Readable {
+            let known = !self.fingerprint.contains("unknown");
+            return (self.fingerprint.clone(), known && !self.fingerprint.is_empty());
+        }
+        if let Some(snap) = &self.live {
+            if snap.fingerprint_known && !snap.fingerprint.is_empty() {
+                return (snap.fingerprint.clone(), true);
+            }
+            if snap.fingerprint_known {
+                return ("(the server has not created a key yet)".into(), false);
+            }
+        }
+        if self.waiting_for_service() {
+            return (String::new(), false);
+        }
+        ("Locked — open as administrator to view".into(), false)
+    }
+
+    fn updates_locked(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            heading(ui, "UPDATES");
+            let Some(snap) = self.live.clone() else {
+                self.locked_line(ui);
+                return;
+            };
+            if !snap.update_known {
+                self.locked_line(ui);
+                return;
+            }
+            let mut auto = snap.update_auto;
+            ui.add_enabled_ui(false, |ui| {
+                ui_widgets::checkbox(ui, &mut auto, "Install server updates automatically");
+            });
+            ui.label(RichText::new("Shown from the running service. Restart as administrator to change it.").color(p(ui).muted).size(12.0));
+            if !snap.window_start.is_empty() || !snap.window_end.is_empty() {
+                ui.label(format!("Maintenance window {} to {}", snap.window_start, snap.window_end));
+            }
+            let checked = if snap.last_check_at == 0 {
+                "Last check: never".to_string()
+            } else {
+                format!("Last check: {}", format_local(snap.last_check_at))
+            };
+            let result = if snap.last_result.is_empty() { "no result yet" } else { snap.last_result.as_str() };
+            ui.label(RichText::new(format!("{checked} · {result}")).color(p(ui).muted).size(12.0));
+            if !snap.update_available.is_empty() {
+                ui.label(format!("Available version: {}", snap.update_available));
+            }
+            if !snap.update_error.is_empty() {
+                ui.colored_label(p(ui).warn, &snap.update_error);
+            }
+        });
+    }
+
+    fn cloud_locked(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            heading(ui, "CLOUD SYNC & BACKUP SERVER");
+            let Some(snap) = self.live.clone() else {
+                self.locked_line(ui);
+                return;
+            };
+            if !snap.cloud_known {
+                self.locked_line(ui);
+                return;
+            }
+            if !snap.cloud_on {
+                ui.label("Cloud sync is off.");
+                ui.label(RichText::new("Restart as administrator to sign in.").color(p(ui).muted).size(12.0));
+                return;
+            }
+            ui.horizontal(|ui| {
+                let (color, text) = if snap.role == "active" {
+                    let who = if snap.active_name.is_empty() { "this server".to_string() } else { snap.active_name.clone() };
+                    (p(ui).ok, format!("Primary: {who} uploads to the cloud (generation {}).", snap.epoch))
+                } else {
+                    let who = if snap.active_name.is_empty() { "the other server".to_string() } else { snap.active_name.clone() };
+                    (p(ui).accent, format!("Standby. Primary: {who} (generation {}).", snap.epoch))
+                };
+                ui_widgets::dot(ui, color);
+                ui.label(text);
+            });
+            if !snap.account.is_empty() {
+                ui.label(RichText::new(format!("Signed in as {}", snap.account)).color(p(ui).text).size(14.0));
+            }
+            if !snap.notice.is_empty() {
+                ui.colored_label(p(ui).warn, &snap.notice);
+            }
+            if !snap.cloud_error.is_empty() {
+                ui.colored_label(p(ui).warn, &snap.cloud_error);
+            }
+            ui.label(RichText::new("Shown from the running service. Restart as administrator to change cloud sync.").color(p(ui).muted).size(12.0));
+        });
+    }
+
+    fn locked_line(&self, ui: &mut egui::Ui) {
+        if self.waiting_for_service() {
+            ui.horizontal(|ui| {
+                ui_widgets::spinner(ui, p(ui).accent);
+                ui.label("Reading status from the service…");
+            });
+        } else {
+            ui.label("Locked — open as administrator to view.");
+        }
+    }
+
     fn accounts_card(&mut self, ui: &mut egui::Ui) {
+        if self.access != Access::Readable {
+            card(ui, |ui| {
+                heading(ui, "USER ACCOUNTS");
+                self.locked_line(ui);
+            });
+            return;
+        }
         card(ui, |ui| {
             heading(ui, "USER ACCOUNTS");
-            ui.label(RichText::new("Accounts let people sign in to sync their address book and saved logins.").color(MUTED).size(12.0));
+            ui.label(RichText::new("Accounts let people sign in to sync their address book and saved logins.").color(p(ui).muted).size(12.0));
             ui.add_space(6.0);
 
             if self.accounts.is_empty() {
-                ui.label(RichText::new("No accounts yet.").color(MUTED));
+                ui.label(RichText::new("No accounts yet.").color(p(ui).muted));
             }
             let mut remove: Option<String> = None;
             let mut toggle_disabled: Option<(String, bool)> = None;
             for a in &self.accounts {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&a.username).strong().color(Color32::WHITE));
+                    ui.label(RichText::new(&a.username).strong().color(p(ui).text));
                     if a.is_admin {
-                        ui.label(RichText::new("admin").color(ACCENT).size(11.0));
+                        ui.label(RichText::new("admin").color(p(ui).accent).size(11.0));
                     }
                     if a.disabled {
-                        ui.label(RichText::new("disabled").color(WARN).size(11.0));
+                        ui.label(RichText::new("disabled").color(p(ui).warn).size(11.0));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_enabled_ui(self.can_write, |ui| {
@@ -549,7 +755,7 @@ impl App {
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(4.0);
-            ui.label(RichText::new("Add an account").color(MUTED).size(12.0));
+            ui.label(RichText::new("Add an account").color(p(ui).muted).size(12.0));
             ui.add_enabled_ui(self.can_write, |ui| {
                 egui::Grid::new("newacct").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label("Username");
@@ -571,16 +777,16 @@ impl App {
                         3 => "strong",
                         _ => "very strong",
                     };
-                    ui.label(RichText::new(format!("Strength: {word}")).color(if report.ok { OK } else { WARN }).size(12.0));
+                    ui.label(RichText::new(format!("Strength: {word}")).color(if report.ok { p(ui).ok } else { p(ui).warn }).size(12.0));
                     for check in &report.checks {
-                        let mark = if check.met { "✓" } else { "○" };
-                        let color = if check.met { OK } else { MUTED };
-                        ui.label(RichText::new(format!("{mark} {}", check.label)).color(color).size(11.0));
+                        let mark = if check.met { "Met" } else { "Need" };
+                        let color = if check.met { p(ui).ok } else { p(ui).muted };
+                        ui.label(RichText::new(format!("{mark} — {}", check.label)).color(color).size(11.0));
                     }
                 }
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.new_admin, "Administrator");
-                    if ui.add(egui::Button::new("Add").fill(ACCENT)).clicked() {
+                    ui_widgets::checkbox(ui, &mut self.new_admin, "Administrator");
+                    if ui.add(egui::Button::new("Add").fill(p(ui).accent)).clicked() {
                         let (u, p, admin) = (self.new_user.trim().to_string(), self.new_pass.clone(), self.new_admin);
                         if let Some(mut accts) = self.accounts_mut() {
                             match accts.create(&u, &p, admin, false) {
@@ -614,6 +820,10 @@ impl App {
     }
 
     fn cloud_card(&mut self, ui: &mut egui::Ui) {
+        if self.access != Access::Readable {
+            self.cloud_locked(ui);
+            return;
+        }
         let mut act: Option<CloudAct> = None;
         let busy = self.cloud_job.is_some();
         let dns = pjdesk_proto::DEFAULT_SERVER.split(':').next().unwrap_or("your server's name").to_string();
@@ -628,20 +838,20 @@ impl App {
                 let fresh = s.updated_at + 90 >= now;
                 ui.horizontal(|ui| {
                     if !fresh {
-                        ui.colored_label(WARN, "●");
+                        ui_widgets::dot(ui, p(ui).warn);
                         ui.label("Sync is on, but the server isn't running, so nothing is syncing.");
                     } else if s.role == "active" {
-                        ui.colored_label(OK, "●");
+                        ui_widgets::dot(ui, p(ui).ok);
                         let who = if s.active_name.is_empty() { "this server".to_string() } else { s.active_name.clone() };
                         ui.label(format!("Primary: {who} uploads to the cloud (generation {}).", s.epoch));
                     } else {
-                        ui.colored_label(ACCENT, "●");
+                        ui_widgets::dot(ui, p(ui).accent);
                         let who = if s.active_name.is_empty() { "the other server".to_string() } else { s.active_name.clone() };
                         ui.label(format!("Standby. Primary: {who} (generation {}).", s.epoch));
                     }
                 });
                 if !s.notice.is_empty() {
-                    ui.colored_label(WARN, s.notice.clone());
+                    ui.colored_label(p(ui).warn, s.notice.clone());
                 }
                 let detail = if s.role == "active" || s.applied_from.is_empty() {
                     if s.last_upload_at > 0 {
@@ -654,15 +864,18 @@ impl App {
                 } else {
                     format!("Synced from {} (its data from {})", s.applied_from, format_local(s.applied_written_at))
                 };
-                ui.label(RichText::new(format!("{detail} · {}", s.bucket)).color(MUTED).size(12.0));
+                ui.label(RichText::new(format!("{detail} · {}", s.bucket)).color(p(ui).muted).size(12.0));
                 let signed_out = s.error.contains("sign in again");
                 if !s.error.is_empty() {
-                    ui.colored_label(WARN, format!("⚠ {}", s.error));
+                    ui.horizontal(|ui| {
+                        glyph(ui, Icon::Alert, p(ui).warn);
+                        ui.colored_label(p(ui).warn, &s.error);
+                    });
                 }
                 ui.add_space(6.0);
                 ui.add_enabled_ui(can_write && !busy, |ui| {
                     ui.horizontal(|ui| {
-                        if signed_out && ui.add(egui::Button::new("Sign in again").fill(ACCENT)).clicked() {
+                        if signed_out && ui.add(egui::Button::new("Sign in again").fill(p(ui).accent)).clicked() {
                             act = Some(CloudAct::SignInAgain);
                         }
                         if ui.button("Sync now").clicked() {
@@ -696,11 +909,11 @@ impl App {
                 if self.cloud_form.confirm_promote {
                     ui.add_space(4.0);
                     ui.colored_label(
-                        WARN,
+                        p(ui).warn,
                         "Make this server the primary? It downloads the latest copy first. The other server becomes the standby the next time it checks, even if that server is offline right now.",
                     );
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new("Make this the primary").fill(ACCENT)).clicked() {
+                        if ui.add(egui::Button::new("Make this the primary").fill(p(ui).accent)).clicked() {
                             self.cloud_form.confirm_promote = false;
                             act = Some(CloudAct::Promote);
                         }
@@ -712,11 +925,11 @@ impl App {
                 if self.cloud_form.confirm_demote {
                     ui.add_space(4.0);
                     ui.colored_label(
-                        WARN,
+                        p(ui).warn,
                         "Step down to standby? This server will stop uploading. The other server stays the primary until you make it the primary there.",
                     );
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new("Step down").fill(ACCENT)).clicked() {
+                        if ui.add(egui::Button::new("Step down").fill(p(ui).accent)).clicked() {
                             self.cloud_form.confirm_demote = false;
                             act = Some(CloudAct::Demote);
                         }
@@ -738,7 +951,7 @@ impl App {
                     RichText::new(format!(
                         "{how_to_add} To switch, choose Make this the primary on that server (or the tray, or pjdesk-server cloud promote). Computers connect to whichever server {dns} points to, so if the new primary is on a different network, point DNS and the port forward at it."
                     ))
-                    .color(MUTED)
+                    .color(p(ui).muted)
                     .size(11.0),
                 );
             } else {
@@ -748,7 +961,7 @@ impl App {
                          Another PJDesk Server signed in with the same account becomes a standby. Make this the primary there when you want it to take over. \
                          Computers still connect to whichever server {dns} points to."
                     ))
-                    .color(MUTED)
+                    .color(p(ui).muted)
                     .size(12.0),
                 );
                 ui.add_space(6.0);
@@ -767,7 +980,7 @@ impl App {
                         if let Some((from, written_at, readable)) = f.ask.clone() {
                             if readable {
                                 ui.colored_label(
-                                    WARN,
+                                    p(ui).warn,
                                     format!(
                                         "Your account already holds {from}'s data (from {}), and {online} computer(s) are connected to this server.",
                                         format_local(written_at)
@@ -775,7 +988,7 @@ impl App {
                                 );
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .add(egui::Button::new("Make this server a backup").fill(ACCENT))
+                                        .add(egui::Button::new("Make this server a backup").fill(p(ui).accent))
                                         .on_hover_text(format!("Replace this server's key, accounts and computer list with {from}'s"))
                                         .clicked()
                                     {
@@ -793,9 +1006,9 @@ impl App {
                                     }
                                 });
                             } else {
-                                ui.colored_label(WARN, "Your account's cloud copy was made with an older password, so it can't be opened.");
+                                ui.colored_label(p(ui).warn, "Your account's cloud copy was made with an older password, so it can't be opened.");
                                 ui.horizontal(|ui| {
-                                    if ui.add(egui::Button::new("Upload this server's data").fill(ACCENT)).clicked() {
+                                    if ui.add(egui::Button::new("Upload this server's data").fill(p(ui).accent)).clicked() {
                                         act = Some(CloudAct::Choose(crate::cloud::Choice::Replace));
                                     }
                                     if ui.button("Cancel").clicked() {
@@ -824,10 +1037,10 @@ impl App {
                             });
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                if ui.add(egui::Button::new("Sign in").fill(ACCENT)).clicked() {
+                                if ui.add(egui::Button::new("Sign in").fill(p(ui).accent)).clicked() {
                                     act = Some(CloudAct::SignIn);
                                 }
-                                ui.label(RichText::new("No account yet?").color(MUTED).size(12.0));
+                                ui.label(RichText::new("No account yet?").color(p(ui).muted).size(12.0));
                                 if ui.link("Create one at pjdesk.com").clicked() {
                                     act = Some(CloudAct::CreateAccount);
                                 }
@@ -837,7 +1050,7 @@ impl App {
                                     "The first server you sign in is the main one; sign in on another PJDesk Server with the same account to make it the backup. \
                                      Your password never leaves this computer, and the copy is encrypted so only your servers can read it.",
                                 )
-                                .color(MUTED)
+                                .color(p(ui).muted)
                                 .size(11.0),
                             );
                         }
@@ -875,16 +1088,16 @@ impl App {
                             });
                             ui.add_space(4.0);
                             if f.confirm_replace {
-                                ui.colored_label(WARN, "This bucket already holds a PJDesk server copy. Replace it with this server's?");
+                                ui.colored_label(p(ui).warn, "This bucket already holds a PJDesk server copy. Replace it with this server's?");
                                 ui.horizontal(|ui| {
-                                    if ui.add(egui::Button::new("Replace it").fill(ACCENT)).clicked() {
+                                    if ui.add(egui::Button::new("Replace it").fill(p(ui).accent)).clicked() {
                                         act = Some(CloudAct::Setup { replace: true });
                                     }
                                     if ui.button("Cancel").clicked() {
                                         f.confirm_replace = false;
                                     }
                                 });
-                            } else if ui.add(egui::Button::new("Start syncing").fill(ACCENT)).clicked() {
+                            } else if ui.add(egui::Button::new("Start syncing").fill(p(ui).accent)).clicked() {
                                 act = Some(CloudAct::Setup { replace: false });
                             }
                         } else {
@@ -900,21 +1113,21 @@ impl App {
                             });
                             ui.label(
                                 RichText::new("Copy it from the main server (Copy join code). Joining replaces this server's key, accounts and computer list with the main server's.")
-                                    .color(MUTED)
+                                    .color(p(ui).muted)
                                     .size(11.0),
                             );
                             ui.add_space(4.0);
                             if f.confirm_join {
-                                ui.colored_label(WARN, format!("{online} computer(s) are connected to this server right now. Join anyway?"));
+                                ui.colored_label(p(ui).warn, format!("{online} computer(s) are connected to this server right now. Join anyway?"));
                                 ui.horizontal(|ui| {
-                                    if ui.add(egui::Button::new("Join anyway").fill(ACCENT)).clicked() {
+                                    if ui.add(egui::Button::new("Join anyway").fill(p(ui).accent)).clicked() {
                                         act = Some(CloudAct::Join);
                                     }
                                     if ui.button("Cancel").clicked() {
                                         f.confirm_join = false;
                                     }
                                 });
-                            } else if ui.add(egui::Button::new("Join").fill(ACCENT)).clicked() {
+                            } else if ui.add(egui::Button::new("Join").fill(p(ui).accent)).clicked() {
                                 if online > 0 {
                                     f.confirm_join = true;
                                 } else {
@@ -928,7 +1141,7 @@ impl App {
             if busy {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new("Talking to the cloud…").color(MUTED).size(12.0));
+                    ui.label(RichText::new("Talking to the cloud…").color(p(ui).muted).size(12.0));
                 });
             }
         });
@@ -1109,6 +1322,13 @@ impl App {
     }
 
     fn devices_card(&mut self, ui: &mut egui::Ui) {
+        if self.access != Access::Readable {
+            card(ui, |ui| {
+                heading(ui, "REGISTERED COMPUTERS");
+                self.locked_line(ui);
+            });
+            return;
+        }
         let mut remove: Option<String> = None;
         let mut update: Option<String> = None;
         let mut update_all = false;
@@ -1125,14 +1345,14 @@ impl App {
                 });
             });
             if self.devices.is_empty() {
-                ui.label(RichText::new("No computers have registered yet.").color(MUTED));
+                ui.label(RichText::new("No computers have registered yet.").color(p(ui).muted));
             }
             egui::ScrollArea::vertical().max_height(200.0).id_salt("devices").show(ui, |ui| {
                 for d in &self.devices {
                     let live = self.online.get(&d.id);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(pjdesk_proto::format_id(&d.id)).monospace().color(Color32::WHITE));
-                        ui.label(RichText::new(&d.hostname).color(MUTED));
+                        ui.label(RichText::new(pjdesk_proto::format_id(&d.id)).monospace().color(p(ui).text));
+                        ui.label(RichText::new(&d.hostname).color(p(ui).muted));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .small_button("Forget")
@@ -1153,12 +1373,16 @@ impl App {
                                 format_local(d.first_seen)
                             );
                             if live.is_some() {
-                                ui.label(RichText::new(format!("● online now{vtext}")).color(OK).size(11.0))
+                                ui.horizontal(|ui| {
+                                    ui_widgets::dot(ui, p(ui).ok);
+                                    ui.label(RichText::new(format!("online now{vtext}")).color(p(ui).ok).size(11.0));
+                                })
+                                    .response
                                     .on_hover_text(details);
                             } else {
                                 ui.label(
                                     RichText::new(format!("last seen {}{vtext}", format_local(d.last_seen)))
-                                        .color(MUTED)
+                                        .color(p(ui).muted)
                                         .size(11.0),
                                 )
                                 .on_hover_text(details);
@@ -1216,13 +1440,20 @@ impl App {
     }
 
     fn log_card(&mut self, ui: &mut egui::Ui) {
+        if self.access != Access::Readable {
+            card(ui, |ui| {
+                heading(ui, "LOG");
+                self.locked_line(ui);
+            });
+            return;
+        }
         card(ui, |ui| {
             heading(ui, "LOG");
             if self.log_tail.is_empty() {
-                ui.label(RichText::new("No log yet (the server writes server.log in its data folder when it runs).").color(MUTED).size(12.0));
+                ui.label(RichText::new("No log yet (the server writes server.log in its data folder when it runs).").color(p(ui).muted).size(12.0));
             } else {
                 egui::ScrollArea::vertical().max_height(160.0).id_salt("log").stick_to_bottom(true).show(ui, |ui| {
-                    ui.label(RichText::new(&self.log_tail).monospace().size(11.0).color(MUTED));
+                    ui.label(RichText::new(&self.log_tail).monospace().size(11.0).color(p(ui).muted));
                 });
             }
         });
@@ -1278,16 +1509,19 @@ fn open_url(url: &str) {
     }
 }
 
-/// A show/hide toggle for a password field.
+#[cfg(not(windows))]
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
+/// A show/hide toggle for a password field. The label is a word, not an icon.
 fn reveal_toggle(ui: &mut egui::Ui, shown: &mut bool) {
-    if ui.small_button(if *shown { "Hide" } else { "Show" }).clicked() {
-        *shown = !*shown;
-    }
+    ui_widgets::reveal(ui, shown);
 }
 
 fn heading(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).color(MUTED).size(12.0).strong());
-    ui.add_space(2.0);
+    ui.label(RichText::new(text).color(p(ui).muted).size(12.0).strong());
+    ui.add_space(4.0);
 }
 
 /// Reads the server's live online snapshot (id → reported version). Ignores a
@@ -1320,25 +1554,31 @@ fn write_update_request(data_dir: &std::path::Path, target: &str) -> std::io::Re
 }
 
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::NONE
-        .fill(CARD)
-        .corner_radius(egui::CornerRadius::same(12))
-        .inner_margin(egui::Margin::same(14))
-        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(0x2a, 0x30, 0x3b)))
-        .show(ui, add)
-        .inner
+    ui_theme::card(ui, add)
 }
 
-fn apply_theme(ctx: &egui::Context) {
-    ctx.set_theme(egui::ThemePreference::Dark);
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = Color32::from_rgb(0x14, 0x17, 0x1d);
-    v.window_fill = CARD;
-    v.hyperlink_color = ACCENT;
-    v.widgets.inactive.bg_fill = Color32::from_rgb(0x26, 0x2c, 0x37);
-    v.widgets.hovered.bg_fill = Color32::from_rgb(0x30, 0x38, 0x46);
-    ctx.set_visuals_of(egui::Theme::Dark, v.clone());
-    ctx.set_visuals(v);
+fn glyph(ui: &mut egui::Ui, icon: Icon, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    crate::ui_icons::paint(ui.painter(), rect, icon, color);
+}
+
+fn spawn_status_probe(ctx: &egui::Context) -> Option<std::sync::mpsc::Receiver<Option<Snapshot>>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ctx = ctx.clone();
+    std::thread::Builder::new()
+        .name("pjdesk-server-status".into())
+        .spawn(move || loop {
+            let snap = crate::status_pipe::read_snapshot();
+            if snap.is_some() {
+                if tx.send(snap).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        })
+        .ok()?;
+    Some(rx)
 }
 
 fn copy(text: &str) {

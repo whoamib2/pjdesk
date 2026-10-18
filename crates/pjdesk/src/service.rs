@@ -12,8 +12,10 @@
 //! The service keeps its own config and identity under
 //! `%ProgramData%\PJDesk\service`, locked to SYSTEM and Administrators.
 
+#[cfg_attr(not(windows), allow(unused_imports))]
 use anyhow::{Context, Result};
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const SERVICE_NAME: &str = "PJDesk";
 #[cfg(windows)]
 const DISPLAY_NAME: &str = "PJDesk";
@@ -531,6 +533,7 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
 }
 
 /// Name of the daily auto-update scheduled task (matches the installer).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const UPDATE_TASK: &str = "PJDesk Update";
 
 /// Whether the daily auto-update task is registered.
@@ -776,4 +779,5 @@ pub fn status() -> (bool, bool) {
     (false, false)
 }
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub fn protect_service_dir() {}

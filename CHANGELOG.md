@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1
+
+* The server window, opened without Administrator rights, no longer pretends the data folder is empty. The running service publishes the fingerprint, update setting, last check, cloud role, signed-in email, and generation on a local pipe the interactive user can read. Sections the pipe does not cover say "Locked — open as administrator to view" instead of a blank sign-in form. Restart as administrator is a button. Icons are drawn, and the window uses the same type and theme as the client.
+* An update no longer leaves a computer offline. The installer still stops the service and closes the program so it can replace the exe. The new program then starts the service again, retrying for a few seconds, and starts PJDesk in the signed-in user's session. The server update does the same for its service and tray. A second check runs if the service exits immediately. The result is written to the update log. The installer does not touch the server key, accounts, cloud sign-in, or update settings.
+
 ## 0.5.0
 
 * The client window is a new layout: a left rail for this computer (ID, one-time password, status) and a main column to connect, with Recent, Favorites, Address book, and Discovered lists. Settings is a centered page with a sidebar, a scrolling body, and a fixed footer, so labels and Save stay on screen. Light and dark themes follow Windows unless you pick one. Icons are drawn shapes, so copy, show, refresh, and the check mark are no longer empty boxes. The in-session toolbar floats, collapses, and shows a tooltip on each button.

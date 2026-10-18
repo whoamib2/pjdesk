@@ -40,6 +40,7 @@ pub struct DeviceRow {
     pub hostname: String,
     pub version: String,
     pub group: String,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub first_seen: u64,
     pub last_seen: u64,
 }

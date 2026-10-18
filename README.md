@@ -7,7 +7,7 @@ A self-hosted, open-source remote desktop in the spirit of RustDesk, written in 
 
 Connections are **peer-to-peer** whenever UDP hole punching works, and are **relayed** through your server when it doesn't. Video is **end-to-end encrypted** either way (QUIC/TLS 1.3). Passwords are checked with **SPAKE2**, so they never travel over the network, not even to your own server.
 
-> Status: **v0.5.0.** See the [changelog](CHANGELOG.md). A 0.3.7 app still connects for a classic desktop session. Cloud Sync can force one server to be the primary (`pjdesk-server cloud promote`), and PJDesk Server can install its own updates when you turn that on.
+> Status: **v0.5.1.** See the [changelog](CHANGELOG.md). A 0.3.7 app still connects for a classic desktop session. Cloud Sync can force one server to be the primary (`pjdesk-server cloud promote`), and PJDesk Server can install its own updates when you turn that on.
 
 ---
 
