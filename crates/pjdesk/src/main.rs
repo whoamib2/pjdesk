@@ -27,7 +27,6 @@ mod service;
 mod session;
 mod signaling;
 mod syspaths;
-mod udp_fallback;
 mod viewer;
 
 use std::io::{BufRead, Write};

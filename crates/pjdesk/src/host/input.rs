@@ -95,6 +95,9 @@ impl InputInjector {
                 }
             }
             InputEvent::ReleaseAll => self.release_all(),
+            // Accessibility gestures are for Android hosts. A Windows host
+            // keeps the keys it already tracks and ignores the stroke.
+            InputEvent::Gesture { .. } => {}
         }
     }
 

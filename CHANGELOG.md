@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+* Android app (`android/`, version 0.6.0) is a host and a controller. It shares `pjdesk-proto` and the relay through `pjdesk-link` and `pjdesk-mobile`. Video stays H.264 Annex-B: MediaCodec encodes on Android, and the Windows client keeps decoding with OpenH264. Android hosts accept taps, swipes, pinch, Back, Home, Recents, volume, and typed text. The Windows viewer maps mouse and scroll onto those gestures when the remote reports `android`.
+
 ## 0.5.2
 
 * The PJDesk Server window lists each computer's version. A client that connected before 0.5.2 shows "unknown (<0.5.2)". A computer behind the current release on pjdesk.com gets an "update available" badge next to Update. This server's version is shown on the service card. The other Cloud Sync server's version comes from that server's health report. The unelevated status pipe carries the same device list and the other server's version.

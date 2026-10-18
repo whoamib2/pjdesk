@@ -4,7 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,9 +12,9 @@ use anyhow::{Context, Result};
 use pjdesk_proto::filesafe::{self, MAX_TRANSFER_BYTES};
 use pjdesk_proto::framing::write_msg;
 use pjdesk_proto::peer::{
-    read_side_chunk, read_side_header, write_side_chunk, write_side_header, Clipboard, ClipKind, ControlMsg,
+    read_side_chunk, read_side_header, write_side_chunk, write_side_header, AtlasTile, ClipKind, Clipboard, ControlMsg,
     DisplayLayout, FileMsg, HostMsg, KeyboardMode, SideHeader, SpecialCommand, TunnelMsg, CLIP_MAGIC, FILE_MAGIC,
-    AtlasTile, MAX_CLIP_IMAGE, MAX_CLIP_TEXT, SIDE_CHUNK, VIEW_ALL, VIEW_SEPARATE,
+    MAX_CLIP_IMAGE, MAX_CLIP_TEXT, SIDE_CHUNK, VIEW_ALL, VIEW_SEPARATE,
 };
 use pjdesk_proto::perms::{self, grant, has};
 use pjdesk_proto::quality::{BitrateControl, StreamQuality};
@@ -115,11 +115,7 @@ impl Session {
         host_tx: mpsc::UnboundedSender<HostMsg>,
         shared: Option<Arc<HostShared>>,
     ) -> Arc<Self> {
-        let initial = if grant.peer_proto < 3 {
-            perms::grant(perms::CLASSIC, grant.ceiling, view_only)
-        } else {
-            0
-        };
+        let initial = if grant.peer_proto < 3 { perms::grant(perms::CLASSIC, grant.ceiling, view_only) } else { 0 };
         Arc::new(Self {
             perms: AtomicU32::new(initial),
             display: AtomicUsize::new(args_display),
@@ -203,7 +199,11 @@ impl Session {
         }
         let key = format!(
             "{width}x{height}:{}",
-            tiles.iter().map(|t| format!("{}@{},{} {}x{}", t.index, t.x, t.y, t.width, t.height)).collect::<Vec<_>>().join("|")
+            tiles
+                .iter()
+                .map(|t| format!("{}@{},{} {}x{}", t.index, t.x, t.y, t.width, t.height))
+                .collect::<Vec<_>>()
+                .join("|")
         );
         let mut guard = self.atlas_key.lock().unwrap();
         if *guard == key {
@@ -435,6 +435,14 @@ impl Session {
                     self.deny(send, "taskmgr", "could not open Task Manager").await?;
                 }
             }
+            SpecialCommand::Back
+            | SpecialCommand::Home
+            | SpecialCommand::Recents
+            | SpecialCommand::VolumeUp
+            | SpecialCommand::VolumeDown
+            | SpecialCommand::Power => {
+                self.deny(send, "android", "this computer is not running Android").await?;
+            }
         }
         Ok(())
     }
@@ -539,8 +547,11 @@ impl Session {
         }
         if !self.allow(perms::FILE) {
             let id = file_id(&msg);
-            return write_msg(send, &HostMsg::File(FileMsg::Reject { id, reason: "file transfer was not allowed".into() }))
-                .await;
+            return write_msg(
+                send,
+                &HostMsg::File(FileMsg::Reject { id, reason: "file transfer was not allowed".into() }),
+            )
+            .await;
         }
         match msg {
             FileMsg::Offer { id, name, size, resume_from } => self.offer_in(id, &name, size, resume_from, send).await?,
@@ -567,7 +578,11 @@ impl Session {
 
     async fn list_receive(&self, id: u64, path: &str, send: &mut SendStream) -> Result<()> {
         if !path.is_empty() {
-            return write_msg(send, &HostMsg::File(FileMsg::Error { id, reason: "only the receive folder can be listed".into() })).await;
+            return write_msg(
+                send,
+                &HostMsg::File(FileMsg::Error { id, reason: "only the receive folder can be listed".into() }),
+            )
+            .await;
         }
         let root = PathBuf::from(self.receive_dir.lock().unwrap().trim());
         let mut names = Vec::new();
@@ -682,7 +697,8 @@ impl Session {
             return Ok(());
         }
         let byte_len = text.len() as u32;
-        write_msg(send, &HostMsg::Clipboard(Clipboard { kind: ClipKind::Text, bytes: text.into_bytes(), byte_len })).await
+        write_msg(send, &HostMsg::Clipboard(Clipboard { kind: ClipKind::Text, bytes: text.into_bytes(), byte_len }))
+            .await
     }
 
     async fn queue_send(&self, send: &mut SendStream, path: PathBuf) -> Result<()> {
@@ -766,7 +782,9 @@ impl Session {
             offset: j.offset,
         });
         let Some(job) = job else {
-            let _ = self.host_tx.send(HostMsg::File(FileMsg::Error { id: header.id, reason: "unexpected file stream".into() }));
+            let _ = self
+                .host_tx
+                .send(HostMsg::File(FileMsg::Error { id: header.id, reason: "unexpected file stream".into() }));
             return Ok(());
         };
         let root = PathBuf::from(self.receive_dir.lock().unwrap().trim());
@@ -774,7 +792,10 @@ impl Session {
         let mut got = offset;
         while let Some(chunk) = read_side_chunk(stream).await? {
             if got.saturating_add(chunk.len() as u64) > job.size.max(MAX_TRANSFER_BYTES) {
-                let _ = self.host_tx.send(HostMsg::File(FileMsg::Error { id: header.id, reason: "file grew past the offered size".into() }));
+                let _ = self.host_tx.send(HostMsg::File(FileMsg::Error {
+                    id: header.id,
+                    reason: "file grew past the offered size".into(),
+                }));
                 return Ok(());
             }
             file.write_all(&chunk).context("writing the received file")?;
@@ -823,12 +844,19 @@ impl Session {
             return Ok(());
         };
         if !self.allow(perms::TUNNEL) || !self.v3() {
-            return write_msg(send, &HostMsg::Tunnel(TunnelMsg::Close { id, reason: "port forwarding was not allowed".into() })).await;
+            return write_msg(
+                send,
+                &HostMsg::Tunnel(TunnelMsg::Close { id, reason: "port forwarding was not allowed".into() }),
+            )
+            .await;
         }
         if !discover::tunnel_allowed(&remote_host, remote_port, &self.tunnel_ports, self.tunnel_remote) {
             return write_msg(
                 send,
-                &HostMsg::Tunnel(TunnelMsg::Close { id, reason: "that host or port is not in the forward list".into() }),
+                &HostMsg::Tunnel(TunnelMsg::Close {
+                    id,
+                    reason: "that host or port is not in the forward list".into(),
+                }),
             )
             .await;
         }
@@ -842,7 +870,11 @@ impl Session {
                 write_msg(send, &HostMsg::Tunnel(TunnelMsg::Ready { id })).await
             }
             _ => {
-                write_msg(send, &HostMsg::Tunnel(TunnelMsg::Close { id, reason: format!("could not connect to {addr}") })).await
+                write_msg(
+                    send,
+                    &HostMsg::Tunnel(TunnelMsg::Close { id, reason: format!("could not connect to {addr}") }),
+                )
+                .await
             }
         }
     }
@@ -927,5 +959,3 @@ async fn send_file_bytes(
     let _ = tx.send(HostMsg::File(FileMsg::Done { id }));
     Ok(())
 }
-
-

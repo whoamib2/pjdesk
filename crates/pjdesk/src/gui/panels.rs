@@ -117,7 +117,8 @@ impl App {
                 let shown = id.as_deref().map(format_id).unwrap_or_else(|| "— — —".into());
                 ui.label(RichText::new(shown).size(32.0).strong().color(p.text));
                 if let Some(id) = id.clone() {
-                    if widgets::icon_button(ui, Icon::Copy, "Copy ID").clicked() && widgets::copy_to_clipboard(&normalize_id(&id))
+                    if widgets::icon_button(ui, Icon::Copy, "Copy ID").clicked()
+                        && widgets::copy_to_clipboard(&normalize_id(&id))
                     {
                         self.toast.show("ID copied");
                     }
@@ -130,14 +131,17 @@ impl App {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 match &password {
                     Some(pw) => {
-                        let shown = if self.show_password { pw.clone() } else { "•".repeat(pw.chars().count().max(6)) };
+                        let shown =
+                            if self.show_password { pw.clone() } else { "•".repeat(pw.chars().count().max(6)) };
                         ui.label(RichText::new(shown).size(20.0).monospace().color(p.text));
                         let eye = if self.show_password { Icon::EyeOff } else { Icon::Eye };
                         let tip = if self.show_password { "Hide password" } else { "Show password" };
                         if widgets::icon_button(ui, eye, tip).clicked() {
                             self.show_password = !self.show_password;
                         }
-                        if widgets::icon_button(ui, Icon::Copy, "Copy password").clicked() && widgets::copy_to_clipboard(pw) {
+                        if widgets::icon_button(ui, Icon::Copy, "Copy password").clicked()
+                            && widgets::copy_to_clipboard(pw)
+                        {
                             self.toast.show("Password copied");
                         }
                         if in_process && widgets::icon_button(ui, Icon::Refresh, "New one-time password").clicked() {
@@ -213,9 +217,18 @@ impl App {
         } else {
             let pw = {
                 let pw = self.engine.shared.password();
-                if pw.is_empty() { None } else { Some(pw) }
+                if pw.is_empty() {
+                    None
+                } else {
+                    Some(pw)
+                }
             };
-            (self.engine.shared.id(), pw, self.cfg.settings.permanent_password.is_some() || self.engine.shared.permanent_set(), true)
+            (
+                self.engine.shared.id(),
+                pw,
+                self.cfg.settings.permanent_password.is_some() || self.engine.shared.permanent_set(),
+                true,
+            )
         }
     }
 
@@ -232,11 +245,13 @@ impl App {
             });
         } else {
             ui.label(widgets::muted(ui, "Permanent password (optional, for unattended access)"));
-            widgets::password_field(ui, &mut self.perm_input, widgets::PERMANENT_PASSWORD_HINT, &mut self.show_perm_input);
-            if ui
-                .add_sized([88.0, 36.0], egui::Button::new("Set"))
-                .on_hover_text("At least 8 characters")
-                .clicked()
+            widgets::password_field(
+                ui,
+                &mut self.perm_input,
+                widgets::PERMANENT_PASSWORD_HINT,
+                &mut self.show_perm_input,
+            );
+            if ui.add_sized([88.0, 36.0], egui::Button::new("Set")).on_hover_text("At least 8 characters").clicked()
                 && !self.perm_input.trim().is_empty()
             {
                 let pw = self.perm_input.clone();
@@ -256,7 +271,9 @@ impl App {
         }
         ui.horizontal(|ui| {
             let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.chat_draft).hint_text("Message").desired_width(ui.available_width() - 72.0),
+                egui::TextEdit::singleline(&mut self.chat_draft)
+                    .hint_text("Message")
+                    .desired_width(ui.available_width() - 72.0),
             );
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if (ui.button("Send").clicked() || enter) && !self.chat_draft.trim().is_empty() {
@@ -312,7 +329,8 @@ impl App {
 
             ui.add_space(8.0);
             widgets::field_label(ui, "Password (optional if saved)");
-            let pw_resp = widgets::password_field(ui, &mut self.connect_password, "Password", &mut self.show_connect_password);
+            let pw_resp =
+                widgets::password_field(ui, &mut self.connect_password, "Password", &mut self.show_connect_password);
             ui.add_space(4.0);
             widgets::checkbox(ui, &mut self.remember, "Remember this computer's password");
 
@@ -370,7 +388,11 @@ impl App {
                 (super::DeskTab::Lan, "Discovered"),
             ] {
                 let selected = self.desk_tab == tab;
-                let text = if selected { RichText::new(label).strong().color(p.text) } else { RichText::new(label).color(p.muted) };
+                let text = if selected {
+                    RichText::new(label).strong().color(p.text)
+                } else {
+                    RichText::new(label).color(p.muted)
+                };
                 let fill = if selected { p.elev } else { egui::Color32::TRANSPARENT };
                 if ui.add(egui::Button::new(text).fill(fill).frame(selected)).clicked() {
                     self.desk_tab = tab;
@@ -398,7 +420,9 @@ impl App {
             theme::card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    theme::icon_in(ui, Icon::Monitor, 22.0, p.muted);
+                    let family = self.cfg.settings.peers.get(&row.id).map(|n| n.os_family.as_str()).unwrap_or("");
+                    let icon = if family.is_empty() { Icon::Monitor } else { super::saved::os_icon(family) };
+                    theme::icon_in(ui, icon, 22.0, p.muted);
                     if row.online {
                         theme::icon_in(ui, Icon::Check, 10.0, p.ok);
                     }
@@ -414,7 +438,9 @@ impl App {
                         if widgets::icon_button_active(ui, Icon::Star, star_tip, row.favorite).clicked() {
                             action = Some((RowAction::Favorite, id.clone()));
                         }
-                        if self.desk_tab == super::DeskTab::Address && widgets::icon_button(ui, Icon::Trash, "Remove").clicked() {
+                        if self.desk_tab == super::DeskTab::Address
+                            && widgets::icon_button(ui, Icon::Trash, "Remove").clicked()
+                        {
                             action = Some((RowAction::Remove, id.clone()));
                         }
                     });
@@ -525,6 +551,11 @@ impl App {
         if let Some(note) = self.cfg.settings.peers.get(id) {
             if note.last_connected > 0 {
                 bits.push(ago(note.last_connected));
+            }
+        }
+        if let Some(note) = self.cfg.settings.peers.get(id) {
+            if !note.os_family.is_empty() {
+                bits.push(super::saved::os_label(&note.os_family).to_string());
             }
         }
         if self.saved_for(id).is_some() {
@@ -703,7 +734,9 @@ impl App {
                     if self.change_rx.is_some() {
                         widgets::spinner(ui, p.accent);
                     }
-                    if ui.add_enabled(self.change_rx.is_none(), egui::Button::new("Change password").fill(p.accent)).clicked()
+                    if ui
+                        .add_enabled(self.change_rx.is_none(), egui::Button::new("Change password").fill(p.accent))
+                        .clicked()
                     {
                         submit = true;
                     }
@@ -767,10 +800,7 @@ fn server_host(server: &str) -> String {
 }
 
 fn ago(unix: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let secs = now.saturating_sub(unix);
     if secs < 60 {
         "Just now".into()

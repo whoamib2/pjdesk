@@ -135,6 +135,19 @@ pub enum SpecialCommand {
     Lock,
     /// Open Task Manager on the host.
     TaskManager,
+    /// Android global action: Back. Sent only to a host that reported
+    /// `family = "android"`.
+    Back,
+    /// Android global action: Home.
+    Home,
+    /// Android global action: Recents (overview).
+    Recents,
+    /// Raise the media volume on an Android host.
+    VolumeUp,
+    /// Lower the media volume on an Android host.
+    VolumeDown,
+    /// Android power dialog, or the lock screen when the device offers it.
+    Power,
 }
 
 /// How keystrokes are delivered. Map sends hardware scan codes (the layout of
@@ -208,20 +221,51 @@ pub enum ClipKind {
 /// they never block keyboard input. See [`crate::filesafe`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileMsg {
-    Offer { id: u64, name: String, size: u64, resume_from: u64 },
-    Accept { id: u64, resume_from: u64 },
-    Reject { id: u64, reason: String },
-    Progress { id: u64, bytes: u64 },
-    Done { id: u64 },
-    Cancel { id: u64 },
-    Error { id: u64, reason: String },
+    Offer {
+        id: u64,
+        name: String,
+        size: u64,
+        resume_from: u64,
+    },
+    Accept {
+        id: u64,
+        resume_from: u64,
+    },
+    Reject {
+        id: u64,
+        reason: String,
+    },
+    Progress {
+        id: u64,
+        bytes: u64,
+    },
+    Done {
+        id: u64,
+    },
+    Cancel {
+        id: u64,
+    },
+    Error {
+        id: u64,
+        reason: String,
+    },
     /// Ask the host to list files in its receive folder. `path` must be empty;
     /// the host does not browse the rest of the disk.
-    List { id: u64, path: String },
+    List {
+        id: u64,
+        path: String,
+    },
     /// Names in that folder. `path` echoes the request.
-    Entries { id: u64, path: String, names: Vec<String> },
+    Entries {
+        id: u64,
+        path: String,
+        names: Vec<String>,
+    },
     /// Ask the host to send one file from its receive folder.
-    Pull { id: u64, name: String },
+    Pull {
+        id: u64,
+        name: String,
+    },
 }
 
 /// A TCP forward. Data uses its own bidirectional QUIC stream, headed by the id.
@@ -292,7 +336,8 @@ pub enum HostMsg {
         displays: Vec<DisplayLayout>,
     },
     /// 0.5.2. Host operating system. Sent once, with the same gate as
-    /// [`HostMsg::Displays`].
+    /// [`HostMsg::Displays`]. `family` is `windows`, `macos`, `linux`, or
+    /// `android`.
     Platform {
         family: String,
         version: String,
@@ -335,6 +380,21 @@ pub enum InputEvent {
     /// Release every key and button the controller may still be holding
     /// (sent when the viewer window loses focus).
     ReleaseAll,
+    /// An accessibility gesture for an Android host.
+    ///
+    /// Coordinates are normalized to the shared picture, the same space as
+    /// [`InputEvent::MouseMove`]. Sent only after the host has reported
+    /// `family = "android"`. A Windows host ignores it.
+    ///
+    /// `kind` is [`crate::gesture::GESTURE_TAP`], [`crate::gesture::GESTURE_LONG_PRESS`],
+    /// [`crate::gesture::GESTURE_SWIPE`], or [`crate::gesture::GESTURE_PINCH`].
+    /// Points that a kind does not use are zero.
+    Gesture {
+        kind: u8,
+        duration_ms: u16,
+        x: [u16; 4],
+        y: [u16; 4],
+    },
 }
 
 /// Flag on [`InputEvent::Key`] scan codes: a numpad key meant as a digit.
@@ -438,25 +498,23 @@ mod tests {
         assert_eq!(postcard::to_stdvec(&HostMsg::Denied { what: "a".into(), reason: "b".into() }).unwrap()[0], 9);
         assert_eq!(postcard::to_stdvec(&ControlMsg::Audio { enabled: true }).unwrap()[0], 17);
         assert_eq!(postcard::to_stdvec(&ControlMsg::View { mode: VIEW_SINGLE, display: 0 }).unwrap()[0], 18);
-        assert_eq!(
-            postcard::to_stdvec(&HostMsg::Displays { displays: vec![] }).unwrap()[0],
-            10
-        );
+        assert_eq!(postcard::to_stdvec(&HostMsg::Displays { displays: vec![] }).unwrap()[0], 10);
         assert_eq!(
             postcard::to_stdvec(&HostMsg::Platform { family: "linux".into(), version: String::new() }).unwrap()[0],
             11
         );
         assert_eq!(postcard::to_stdvec(&ControlMsg::Watch { displays: vec![0, 2] }).unwrap()[0], 19);
         assert_eq!(postcard::to_stdvec(&ControlMsg::Pointer { display: 1, x: 0, y: 0 }).unwrap()[0], 20);
+        assert_eq!(postcard::to_stdvec(&HostMsg::Atlas { width: 1, height: 1, tiles: vec![] }).unwrap()[0], 12);
+        assert_eq!(postcard::to_stdvec(&InputEvent::ReleaseAll).unwrap()[0], 4);
         assert_eq!(
-            postcard::to_stdvec(&HostMsg::Atlas { width: 1, height: 1, tiles: vec![] }).unwrap()[0],
-            12
+            postcard::to_stdvec(&InputEvent::Gesture { kind: 0, duration_ms: 40, x: [0; 4], y: [0; 4] }).unwrap()[0],
+            5
         );
-        let hello = ControlMsg::Hello {
-            permissions: 1,
-            monitor: 0,
-            quality: crate::quality::StreamQuality::default(),
-        };
+        assert_eq!(postcard::to_stdvec(&SpecialCommand::TaskManager).unwrap()[0], 2);
+        assert_eq!(postcard::to_stdvec(&SpecialCommand::Back).unwrap()[0], 3);
+        assert_eq!(postcard::to_stdvec(&SpecialCommand::Power).unwrap()[0], 8);
+        let hello = ControlMsg::Hello { permissions: 1, monitor: 0, quality: crate::quality::StreamQuality::default() };
         assert!(postcard::to_stdvec(&hello).unwrap()[0] > 4);
     }
 

@@ -39,6 +39,8 @@ pub enum Action {
     ViewSeparate,
     /// Close the screen window this bar belongs to.
     CloseScreen,
+    /// Android host: 0 Back, 1 Home, 2 Recents, 3 Volume up, 4 Volume down, 5 Power.
+    Android(u8),
 }
 
 /// Key combinations the "Send keys" menu can send to the host.
@@ -162,6 +164,15 @@ const KEY_ITEMS: &[(&str, Action)] = &[
     ("Print Screen", Action::Keys(Combo::PrintScreen)),
 ];
 
+const ANDROID_ITEMS: &[(&str, Action)] = &[
+    ("Back", Action::Android(0)),
+    ("Home", Action::Android(1)),
+    ("Recents", Action::Android(2)),
+    ("Volume up", Action::Android(3)),
+    ("Volume down", Action::Android(4)),
+    ("Power", Action::Android(5)),
+];
+
 pub struct Toolbar {
     buttons: Vec<Button>,
     menus: Vec<Menu>,
@@ -183,6 +194,7 @@ pub struct Toolbar {
     /// Light client theme. The tab strip follows this; the floating bar stays dark glass.
     light: bool,
     hovered_slot: Option<usize>,
+    android: bool,
 }
 
 impl Default for Toolbar {
@@ -223,6 +235,7 @@ impl Default for Toolbar {
             screens_open: false,
             light: false,
             hovered_slot: None,
+            android: false,
         }
     }
 }
@@ -318,11 +331,51 @@ impl Toolbar {
 
     /// Height reserved at the top when the remote has more than one display.
     pub fn tab_height(&self) -> f32 {
-        if self.shows_tabs() { TAB_H } else { 0.0 }
+        if self.shows_tabs() {
+            TAB_H
+        } else {
+            0.0
+        }
     }
 
     fn shows_tabs(&self) -> bool {
         self.displays.len() >= 2
+    }
+
+    /// Shows or hides the Android section (Back, Home, Recents, volume, power).
+    pub fn set_android(&mut self, on: bool) {
+        if self.android == on {
+            return;
+        }
+        self.android = on;
+        self.open = None;
+        let mut menus = vec![owned(ZOOM_ITEMS), owned(KEY_ITEMS), owned(CONTROL_ITEMS)];
+        let mut spec: Vec<(&str, &str, Kind, Mark)> = vec![
+            ("View", "Zoom", Kind::Menu(0), Mark::View),
+            ("Screens", "Switch display", Kind::Screens, Mark::Screens),
+            ("Keys", "Send special keys", Kind::Menu(1), Mark::Keys),
+            ("Session", "Audio, privacy, record, restart", Kind::Menu(2), Mark::Session),
+        ];
+        if on {
+            menus.push(owned(ANDROID_ITEMS));
+            spec.push(("Phone", "Back, Home, Recents, volume, power", Kind::Menu(3), Mark::Session));
+        }
+        spec.extend([
+            ("Files", "Send and receive files", Kind::Act(Action::OpenPanel(0)), Mark::Files),
+            ("Chat", "Messages", Kind::Act(Action::OpenPanel(1)), Mark::Chat),
+            ("End", "Disconnect", Kind::Act(Action::Disconnect), Mark::End),
+            ("Hide", "Hide the toolbar", Kind::Collapse, Mark::Collapse),
+        ]);
+        let mut buttons = Vec::new();
+        let mut x = PAD;
+        for (label, tip, kind, mark) in spec {
+            let w = 16.0 + 6.0 + text_width(label) + PAD * 2.0;
+            buttons.push(Button { label, tip, kind, mark, x, w });
+            x += w;
+        }
+        self.buttons = buttons;
+        self.menus = menus;
+        self.width = x + PAD;
     }
 
     fn bar_rect(&self, win_w: usize) -> (f32, f32, f32, f32) {
@@ -405,7 +458,11 @@ impl Toolbar {
         let slots = self.tab_slots(win_w);
         if let Some(i) = self.hovered_slot {
             if let Some(tip) = tooltip_rect_of(slots.get(i)?) {
-                if px >= tip.0 as f64 && py >= tip.1 as f64 && px <= (tip.0 + tip.2) as f64 && py <= (tip.1 + tip.3) as f64 {
+                if px >= tip.0 as f64
+                    && py >= tip.1 as f64
+                    && px <= (tip.0 + tip.2) as f64
+                    && py <= (tip.1 + tip.3) as f64
+                {
                     return Some(i);
                 }
             }
@@ -433,14 +490,26 @@ impl Toolbar {
         fill_rect(buf, win_w, win_h, 0.0, TAB_H - 1.0, win_w as f32, 1.0, c.line);
         for (i, slot) in slots.iter().enumerate() {
             let hover = self.hovered_slot == Some(i);
-            let fill = if slot.active { Some(c.card) } else if hover { Some(c.elev) } else { None };
+            let fill = if slot.active {
+                Some(c.card)
+            } else if hover {
+                Some(c.elev)
+            } else {
+                None
+            };
             if let Some(color) = fill {
                 fill_round(buf, win_w, win_h, slot.x, slot.y, slot.w, slot.h, 8.0, color);
             }
             if slot.active {
                 fill_rect(buf, win_w, win_h, slot.x + 12.0, slot.y + slot.h - 2.0, slot.w - 24.0, 2.0, c.accent);
             }
-            let color = if slot.active { c.text } else if hover { c.text } else { c.muted };
+            let color = if slot.active {
+                c.text
+            } else if hover {
+                c.text
+            } else {
+                c.muted
+            };
             if slot.kind == SlotKind::Separate {
                 let hole = fill.unwrap_or(c.panel);
                 draw_windows_icon(buf, win_w, win_h, slot.x + (slot.w - 14.0) / 2.0, slot.y + 7.0, color, hole);
@@ -776,9 +845,29 @@ impl Toolbar {
         for r in &rects {
             let on = self.view_mode == pjdesk_proto::peer::VIEW_SINGLE && r.index == self.current;
             if on || all || separate {
-                fill_round(buf, win_w, win_h, mx + r.x - 2.0, my + 8.0 + r.y - 2.0, r.w + 4.0, r.h + 4.0, 4.0, 0xFF_4d_9b_ff);
+                fill_round(
+                    buf,
+                    win_w,
+                    win_h,
+                    mx + r.x - 2.0,
+                    my + 8.0 + r.y - 2.0,
+                    r.w + 4.0,
+                    r.h + 4.0,
+                    4.0,
+                    0xFF_4d_9b_ff,
+                );
             }
-            fill_round(buf, win_w, win_h, mx + r.x, my + 8.0 + r.y, r.w, r.h, 3.0, if on { 0xFF_2a_3c_52 } else { 0xFF_32_3b_4a });
+            fill_round(
+                buf,
+                win_w,
+                win_h,
+                mx + r.x,
+                my + 8.0 + r.y,
+                r.w,
+                r.h,
+                3.0,
+                if on { 0xFF_2a_3c_52 } else { 0xFF_32_3b_4a },
+            );
             let label = (r.index + 1).to_string();
             let tw = text_width(&label);
             draw_text(
@@ -1140,7 +1229,10 @@ fn write_png(path: &std::path::Path, w: u32, h: u32, paint: fn(&mut [u32], usize
     let mut encoder = png::Encoder::new(file, w, h);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder.write_header().and_then(|mut wr| wr.write_image_data(&rgba)).unwrap_or_else(|e| panic!("png {}: {e}", path.display()));
+    encoder
+        .write_header()
+        .and_then(|mut wr| wr.write_image_data(&rgba))
+        .unwrap_or_else(|e| panic!("png {}: {e}", path.display()));
 }
 
 #[cfg(test)]
@@ -1174,7 +1266,10 @@ mod tests {
         let x = bx + hide.x + 8.0;
         assert_eq!(bar.click(x as f64, (by + 12.0) as f64, w), None);
         assert!(bar.collapsed);
-        assert!(bar.covers((bx + bw / 2.0) as f64, (by + 8.0) as f64, w) || bar.covers(w as f64 / 2.0, (by + 8.0) as f64, w));
+        assert!(
+            bar.covers((bx + bw / 2.0) as f64, (by + 8.0) as f64, w)
+                || bar.covers(w as f64 / 2.0, (by + 8.0) as f64, w)
+        );
         let (cx, cy, _, _) = bar.bar_rect(w);
         bar.click((cx + 8.0) as f64, (cy + 8.0) as f64, w);
         assert!(!bar.collapsed);

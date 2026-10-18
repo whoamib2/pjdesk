@@ -1,0 +1,27 @@
+[package]
+name = "pjdesk-mobile"
+description = "PJDesk engine for Android: signaling, relay, and the session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pjdesk_mobile"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pjdesk-proto = { path = "../pjdesk-proto" }
+pjdesk-link = { path = "../pjdesk-link" }
+anyhow.workspace = true
+hex.workspace = true
+postcard.workspace = true
+quinn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"

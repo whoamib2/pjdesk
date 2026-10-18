@@ -2,8 +2,10 @@
 resolver = "2"
 members = [
     "crates/pjdesk-proto",
+    "crates/pjdesk-link",
     "crates/pjdesk-server",
     "crates/pjdesk",
+    "crates/pjdesk-mobile",
 ]
 
 [workspace.package]
