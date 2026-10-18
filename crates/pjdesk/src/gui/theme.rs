@@ -5,11 +5,8 @@ use eframe::egui::{self, Color32};
 
 // Brand + semantic colors.
 pub const ACCENT: Color32 = Color32::from_rgb(0x4d, 0x9b, 0xff);
-pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x6b, 0xad, 0xff);
-pub const ACCENT_INK: Color32 = Color32::from_rgb(0x07, 0x11, 0x1f);
 pub const OK: Color32 = Color32::from_rgb(0x46, 0xd1, 0x7d);
 pub const WARN: Color32 = Color32::from_rgb(0xf2, 0xb0, 0x3a);
-pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
 
 // Text + surfaces.
 pub const TEXT: Color32 = Color32::from_rgb(0xe9, 0xed, 0xf3);

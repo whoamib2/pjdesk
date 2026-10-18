@@ -3,7 +3,7 @@
 //! Drawn into the same framebuffer as the picture, so the viewer stays one window.
 
 use super::controls::Live;
-use super::toolbar::{self, draw_text, fill_rect, text_width};
+use super::toolbar::{draw_text, fill_rect, text_width};
 
 const ROW: f32 = 26.0;
 

@@ -6,7 +6,17 @@ Unicode true
 !define COMPANY "PJDesk"
 !define EXE "pjdesk.exe"
 !ifndef VERSION
-  !define VERSION "0.2.0"
+  !if /FileExists "../Cargo.toml"
+    !searchparse /file "../Cargo.toml" `version = "` VERSION `"`
+  !endif
+!endif
+!ifndef VERSION
+  !if /FileExists "../../Cargo.toml"
+    !searchparse /file "../../Cargo.toml" `version = "` VERSION `"`
+  !endif
+!endif
+!ifndef VERSION
+  !error "Could not read the version from Cargo.toml. Pass -DVERSION=x.y.z"
 !endif
 
 Name "${APPNAME}"

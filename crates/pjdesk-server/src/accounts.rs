@@ -152,6 +152,7 @@ impl Accounts {
         Ok(store)
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.data.users.is_empty()
     }
@@ -206,18 +207,6 @@ impl Accounts {
                     created: now(),
                 },
             );
-        }
-        self.save()
-    }
-
-    pub fn set_admin(&mut self, username: &str, is_admin: bool) -> Result<()> {
-        let username = normalize_username(username);
-        let user = self.data.users.get_mut(&username).context("no such account")?;
-        user.is_admin = is_admin;
-        if is_admin {
-            user.role = Some(Role::Admin);
-        } else if user.role() == Role::Admin {
-            user.role = Some(Role::User);
         }
         self.save()
     }

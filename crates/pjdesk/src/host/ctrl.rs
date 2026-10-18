@@ -13,14 +13,14 @@ use pjdesk_proto::filesafe::{self, MAX_TRANSFER_BYTES};
 use pjdesk_proto::framing::write_msg;
 use pjdesk_proto::peer::{
     read_side_chunk, read_side_header, write_side_chunk, write_side_header, Clipboard, ClipKind, ControlMsg,
-    FileMsg, HostMsg, KeyboardMode, SideHeader, SpecialCommand, TunnelMsg, AUDIO_MAGIC, CLIP_MAGIC, FILE_MAGIC,
+    FileMsg, HostMsg, KeyboardMode, SideHeader, SpecialCommand, TunnelMsg, CLIP_MAGIC, FILE_MAGIC,
     MAX_CLIP_IMAGE, MAX_CLIP_TEXT, SIDE_CHUNK,
 };
 use pjdesk_proto::perms::{self, grant, has};
-use pjdesk_proto::quality::{self, BitrateControl, StreamQuality, AUDIO_CHANNELS, AUDIO_FRAME_SAMPLES, AUDIO_RATE};
+use pjdesk_proto::quality::{BitrateControl, StreamQuality};
 use pjdesk_proto::{discover, PROTOCOL_VERSION};
 use quinn::{Connection, RecvStream, SendStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -278,9 +278,6 @@ impl Session {
         let monitors = super::capture::monitor_infos();
         info!("{} granted: {}", self.peer_name, perms::describe(granted));
         write_msg(send, &HostMsg::Welcome { permissions: granted, monitors, proto: PROTOCOL_VERSION }).await?;
-        if let Some(shared) = &self.shared {
-            shared.set_session_perms(granted);
-        }
         Ok(())
     }
 
@@ -716,7 +713,7 @@ impl Session {
         }
     }
 
-    async fn read_tunnel(&self, mut quic_send: SendStream, mut quic_recv: RecvStream) -> Result<()> {
+    async fn read_tunnel(&self, quic_send: SendStream, mut quic_recv: RecvStream) -> Result<()> {
         let mut idb = [0u8; 8];
         quic_recv.read_exact(&mut idb).await?;
         let id = u64::from_be_bytes(idb);
@@ -797,9 +794,4 @@ async fn send_file_bytes(
     Ok(())
 }
 
-impl Session {
-    pub fn set_receive_dir(&self, dir: String) {
-        *self.receive_dir.lock().unwrap() = dir;
-    }
-}
 

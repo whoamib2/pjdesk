@@ -11,7 +11,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 TARGET="$ROOT/target/x86_64-pc-windows-gnu/release"
-VERSION="${1:-0.2.0}"
+# The workspace version, unless the caller passed one: installer/build.sh 0.4.1
+if [ -n "${1:-}" ]; then
+  VERSION="$1"
+else
+  VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1)"
+  if [ -z "$VERSION" ]; then
+    echo "Could not read the version from $ROOT/Cargo.toml" >&2
+    exit 1
+  fi
+fi
 WORK="$HERE/build"
 
 for exe in pjdesk.exe pjdesk-server.exe; do

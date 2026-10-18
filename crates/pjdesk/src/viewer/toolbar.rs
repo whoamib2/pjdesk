@@ -22,8 +22,6 @@ pub enum Action {
     Keys(Combo),
     Fullscreen,
     Refresh,
-    /// Stop sending input from this window.
-    ToggleBlockInput,
     /// Ask the host to ignore its own keyboard and mouse.
     ToggleBlockHost,
     TogglePrivacy,
@@ -313,7 +311,7 @@ impl Toolbar {
 
         for (i, b) in self.buttons.iter().enumerate() {
             let end = matches!(b.kind, Kind::Act(Action::Disconnect));
-            let toggled = matches!(b.kind, Kind::Act(Action::ToggleBlockInput)) && self.block_input;
+            let toggled = self.block_input;
             let menu_open = self.open == Some(i);
             if self.hovered_button == Some(i) || menu_open {
                 let hover = if end { 0xFF_5a_30_34 } else { 0xFF_2c_36_46 };

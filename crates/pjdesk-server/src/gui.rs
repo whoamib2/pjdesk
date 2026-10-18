@@ -617,7 +617,6 @@ impl App {
         let mut act: Option<CloudAct> = None;
         let busy = self.cloud_job.is_some();
         let dns = pjdesk_proto::DEFAULT_SERVER.split(':').next().unwrap_or("your server's name").to_string();
-        let port = self.port;
         let online = self.online.len();
         let can_write = self.can_write;
         card(ui, |ui| {
@@ -728,13 +727,16 @@ impl App {
                 }
                 ui.add_space(4.0);
                 let how_to_add = if is_account {
-                    format!("Backup server: install PJDesk Server on another computer and sign in there with {}.", s.account)
+                    format!(
+                        "Backup server: install PJDesk Server on another computer and sign in there with the same account ({}). It becomes the standby.",
+                        s.account
+                    )
                 } else {
-                    "Backup server: install PJDesk Server on another computer, choose Your own bucket → This is a backup server, and paste the join code.".to_string()
+                    "Backup server: install PJDesk Server on another computer, choose Your own bucket, then This is a backup server, and paste the join code. It becomes the standby.".to_string()
                 };
                 ui.label(
                     RichText::new(format!(
-                        "{how_to_add} To switch over: forward TCP + UDP {port} to that computer, point {dns} at it, and stop this server. Computers move over within a couple of minutes."
+                        "{how_to_add} To switch, choose Make this the primary on that server (or the tray, or pjdesk-server cloud promote). Computers connect to whichever server {dns} points to, so if the new primary is on a different network, point DNS and the port forward at it."
                     ))
                     .color(MUTED)
                     .size(11.0),
@@ -743,7 +745,8 @@ impl App {
                 ui.label(
                     RichText::new(format!(
                         "Keep an encrypted copy of this server (its key, user accounts, address books and computer list) in the cloud. \
-                         A backup server stays in sync and takes over when you point {dns} at it."
+                         Another PJDesk Server signed in with the same account becomes a standby. Make this the primary there when you want it to take over. \
+                         Computers still connect to whichever server {dns} points to."
                     ))
                     .color(MUTED)
                     .size(12.0),

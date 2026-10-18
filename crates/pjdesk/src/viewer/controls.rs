@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,9 +18,8 @@ use pjdesk_proto::peer::{
     MAX_CLIP_IMAGE, MAX_CLIP_TEXT,
 };
 use pjdesk_proto::perms::{self, has};
-use pjdesk_proto::quality::{self, StreamQuality};
+use pjdesk_proto::quality;
 use quinn::Connection;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
@@ -127,7 +126,6 @@ impl Live {
 pub enum Cmd {
     SendFile(PathBuf),
     Accept(u64),
-    Reject(u64),
     Pull(String),
     ListRemote,
     Tunnel { local: u16, host: String, port: u16 },
@@ -424,9 +422,6 @@ async fn on_cmd(
                 t.state = "downloading".into();
             }
         }
-        Cmd::Reject(id) => {
-            let _ = control.send(ControlMsg::File(FileMsg::Reject { id, reason: "declined".into() }));
-        }
         Cmd::Pull(name) => {
             let mut g = live.lock().unwrap();
             if !g.allowed(perms::FILE) {
@@ -703,7 +698,7 @@ async fn listen_tunnel(
                 pending.lock().unwrap().waiters.remove(&id);
                 return;
             }
-            let Ok((mut send, mut recv)) = connection.open_bi().await else { return };
+            let Ok((mut send, recv)) = connection.open_bi().await else { return };
             if send.write_all(&id.to_be_bytes()).await.is_err() {
                 return;
             }

@@ -17,10 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use pjdesk_proto::format_id;
-use pjdesk_proto::framing::{read_msg, MAX_CONTROL_FRAME};
-use pjdesk_proto::peer::{
-    read_video_frame, ControlMsg, HostMsg, InputEvent, MouseButton, VideoHeader, KEY_NUMPAD_DIGIT,
-};
+use pjdesk_proto::peer::{ControlMsg, InputEvent, MouseButton, VideoHeader, KEY_NUMPAD_DIGIT};
 use quinn::{Connection, SendStream};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -148,39 +145,6 @@ async fn send_control(mut send: SendStream, mut rx: mpsc::UnboundedReceiver<Cont
             break;
         }
     }
-}
-
-async fn receive_video(
-    connection: Connection,
-    frames: std::sync::mpsc::Sender<(VideoHeader, Vec<u8>)>,
-    stats: Arc<Stats>,
-    proxy: EventLoopProxy<UserEvent>,
-) {
-    let result: Result<()> = async {
-        let mut video = connection.accept_uni().await?;
-        loop {
-            let mut data = Vec::new();
-            let header = read_video_frame(&mut video, &mut data).await?;
-            stats.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
-            stats.encode_us.store(header.encode_us as u64, Ordering::Relaxed);
-            if frames.send((header, data)).is_err() {
-                return Ok(());
-            }
-        }
-    }
-    .await;
-    let reason = match connection.close_reason() {
-        Some(quinn::ConnectionError::ApplicationClosed(close)) => {
-            format!("the host ended the session ({})", String::from_utf8_lossy(&close.reason))
-        }
-        Some(quinn::ConnectionError::TimedOut) => "the connection timed out".into(),
-        Some(other) => other.to_string(),
-        None => match result {
-            Err(e) => format!("{e:#}"),
-            Ok(()) => "closed".into(),
-        },
-    };
-    let _ = proxy.send_event(UserEvent::Closed(reason));
 }
 
 async fn report_stats(connection: Connection, stats: Arc<Stats>, proxy: EventLoopProxy<UserEvent>, title: String) {
@@ -387,10 +351,6 @@ impl App {
             Action::Keys(combo) => self.send_combo(combo),
             Action::Refresh => {
                 let _ = self.control.send(ControlMsg::RequestKeyframe);
-            }
-            Action::ToggleBlockInput => {
-                self.toolbar.block_input = !self.toolbar.block_input;
-                self.release_all();
             }
             Action::ToggleBlockHost => self.toggle_host(pjdesk_proto::perms::BLOCK_INPUT, |on| ControlMsg::BlockInput { enabled: on }),
             Action::TogglePrivacy => self.toggle_host(pjdesk_proto::perms::PRIVACY, |on| ControlMsg::Privacy { enabled: on }),
