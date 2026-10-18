@@ -48,6 +48,9 @@ pub struct ServiceStatus {
     /// Whether a permanent password is also set (it works in addition).
     #[serde(default)]
     pub permanent_set: bool,
+    /// Last measured round-trip to the server, in milliseconds. 0 means unknown.
+    #[serde(default)]
+    pub rtt_ms: u64,
     #[serde(default)]
     pub updated_unix: u64,
 }
@@ -66,6 +69,7 @@ impl ServiceStatus {
             connected,
             password,
             permanent_set,
+            rtt_ms: 0,
             updated_unix: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         }
     }

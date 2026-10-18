@@ -39,6 +39,8 @@ use crate::{p2p, HostArgs};
 pub struct HostShared {
     /// Registered with the server and reachable.
     pub online: AtomicBool,
+    /// Round-trip of the last server ping, in milliseconds. 0 until the first reply.
+    pub rtt_ms: AtomicU64,
     /// This device's ID once registered.
     pub id: Mutex<Option<String>>,
     /// The password a controller must enter right now.
@@ -105,6 +107,9 @@ impl HostShared {
     }
     pub fn is_online(&self) -> bool {
         self.online.load(Ordering::SeqCst)
+    }
+    pub fn rtt_ms(&self) -> u64 {
+        self.rtt_ms.load(Ordering::Relaxed)
     }
     pub fn permanent_set(&self) -> bool {
         self.permanent_set.load(Ordering::SeqCst)
@@ -442,6 +447,7 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
     // DNS now points to a backup server), reconnect, which looks the server's
     // name up again.
     let mut last_heard = std::time::Instant::now();
+    let mut ping_at: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -457,6 +463,7 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                     return Ok(());
                 }
                 signal.send(ClientMsg::Ping)?;
+                ping_at = Some(Instant::now());
             }
             msg = signal.recv() => {
                 let Some(msg) = msg else {
@@ -509,7 +516,13 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                         info!("Server policy applied (unattended {}, recording {})", policy.unattended_allowed, policy.recording_allowed);
                         *state.policy.lock().unwrap() = policy;
                     }
-                    ServerMsg::Pong => {}
+                    ServerMsg::Pong => {
+                        if let Some(sent) = ping_at.take() {
+                            if let Some(shared) = &state.shared {
+                                shared.rtt_ms.store(sent.elapsed().as_millis() as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     ServerMsg::UpdateNow => {
                         info!("Server requested an update; running the update task now");
                         #[cfg(windows)]
