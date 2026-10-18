@@ -328,10 +328,6 @@
     <span>MIT licensed</span>
   </div>
 </footer>
-<script>
-  fetch("/api/release").then((r) => r.ok ? r.json() : null).then((r) => {
-    if (r && r.version) document.getElementById("dl-version").textContent = "Version " + r.version;
-  }).catch(() => {});
-</script>
+<script src="/site.js"></script>
 </body>
 </html>

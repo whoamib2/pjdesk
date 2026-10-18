@@ -176,24 +176,26 @@ impl HostState {
         }
         let failures = self.failures.lock().unwrap();
         match failures.locked_until {
-            Some(until) if Instant::now() < until => Some("too many wrong passwords; try again in a minute".into()),
+            Some(until) if Instant::now() < until => {
+                Some("too many wrong passwords; try again in a few minutes".into())
+            }
             _ => None,
         }
     }
 
     /// Counts a wrong password. The one-time password is replaced every three
     /// misses (so an overheard or guessed one stops working); if a permanent
-    /// password is also set, sustained misses lock out new sessions for a
-    /// minute to slow brute-forcing it.
+    /// password is also set, five misses lock out new sessions for five
+    /// minutes to slow brute-forcing it.
     fn record_failure(&self) {
         let has_permanent = self.permanent.lock().unwrap().is_some();
         let mut failures = self.failures.lock().unwrap();
         failures.count += 1;
         let rotate = failures.count % 3 == 0;
-        if has_permanent && failures.count >= 6 {
+        if has_permanent && failures.count >= 5 {
             failures.count = 0;
-            failures.locked_until = Some(Instant::now() + Duration::from_secs(60));
-            warn!("Too many wrong passwords; refusing connections for one minute");
+            failures.locked_until = Some(Instant::now() + Duration::from_secs(5 * 60));
+            warn!("Too many wrong passwords; refusing connections for five minutes");
         }
         drop(failures);
         if rotate {
@@ -398,7 +400,10 @@ fn print_banner(id: &str, _password: &str, has_permanent: bool, server: &ServerA
     println!("  ==================================================");
     println!("    This computer can now be controlled remotely");
     println!("      ID       : {}", format_id(id));
-    println!("      Password : {} (shown in the PJDesk window)", if has_permanent { "one-time + permanent" } else { "one-time" });
+    println!(
+        "      Password : {} (shown in the PJDesk window)",
+        if has_permanent { "one-time + permanent" } else { "one-time" }
+    );
     println!("      Server   : {server}");
     println!("  ==================================================");
     println!();

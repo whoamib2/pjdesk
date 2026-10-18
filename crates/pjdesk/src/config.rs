@@ -102,9 +102,17 @@ impl Settings {
         self.permanent_password.as_deref().and_then(secure::reveal)
     }
 
-    /// Sets (or clears, with `None`) the permanent password, encrypting it.
+    /// Sets (or clears, with `None`) the permanent password, encrypting it
+    /// for the current Windows user.
     pub fn set_permanent_password(&mut self, password: Option<&str>) {
         self.permanent_password = password.filter(|p| !p.is_empty()).map(secure::protect);
+    }
+
+    /// Like [`set_permanent_password`], but the ciphertext can also be opened
+    /// by the SYSTEM service at the sign-in screen. Used only for the service
+    /// config file, which is locked down separately.
+    pub fn set_permanent_password_machine(&mut self, password: Option<&str>) {
+        self.permanent_password = password.filter(|p| !p.is_empty()).map(secure::protect_machine);
     }
 }
 

@@ -254,6 +254,7 @@ impl Registry {
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(&self.data)?)?;
         std::fs::rename(&tmp, &self.path)?;
+        crate::cloud::protect(&self.path);
         Ok(())
     }
 }

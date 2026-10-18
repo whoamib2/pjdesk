@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use pjdesk_proto::{format_id, is_valid_id, normalize_id};
 use eframe::egui;
+use pjdesk_proto::{format_id, is_valid_id, normalize_id};
 
 use crate::account;
 use crate::config::Config;
@@ -151,6 +151,9 @@ pub struct App {
     show_password: bool,
     /// Input for setting a permanent password from the share panel.
     perm_input: String,
+    show_perm_input: bool,
+    show_connect_password: bool,
+    show_login_pass: bool,
 
     // Account sign-in.
     show_login: bool,
@@ -197,6 +200,9 @@ impl App {
             remember: false,
             show_password: false,
             perm_input: String::new(),
+            show_perm_input: false,
+            show_connect_password: false,
+            show_login_pass: false,
             show_login: false,
             login_user: String::new(),
             login_pass: String::new(),
@@ -246,10 +252,14 @@ impl App {
         if pw.is_empty() {
             return;
         }
+        if pw.chars().count() < 8 {
+            self.status = "Use at least 8 characters for a permanent password.".into();
+            return;
+        }
         self.cfg.settings.set_permanent_password(Some(pw));
         self.save_cfg();
         if crate::service::status().0 {
-            crate::platform::run_elevated(&["service", "configure", "--password", pw]);
+            crate::platform::run_elevated_with_password(&["service", "configure"], pw);
         }
         let cfg = self.cfg.clone();
         self.engine.restart(&cfg);
@@ -395,10 +405,7 @@ impl App {
             return;
         }
         let server = self.cfg.effective_server();
-        let password = password
-            .filter(|p| !p.is_empty())
-            .or_else(|| self.cfg.saved_password(&id))
-            .unwrap_or_default();
+        let password = password.filter(|p| !p.is_empty()).or_else(|| self.cfg.saved_password(&id)).unwrap_or_default();
 
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,

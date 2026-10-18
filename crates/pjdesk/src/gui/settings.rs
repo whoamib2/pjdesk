@@ -28,6 +28,9 @@ pub struct SettingsDraft {
     max_width: u32,
     force_gdi: bool,
     service_password: String,
+    service_note: String,
+    show_permanent: bool,
+    show_service_password: bool,
     auto_update: bool,
 }
 
@@ -46,6 +49,9 @@ impl SettingsDraft {
             max_width: s.max_width,
             force_gdi: s.force_gdi,
             service_password: String::new(),
+            service_note: String::new(),
+            show_permanent: false,
+            show_service_password: false,
             auto_update: crate::service::update_task_enabled(),
         }
     }
@@ -104,13 +110,14 @@ impl App {
         if cancel || !open {
             self.show_settings = false;
         }
-        if save {
-            self.apply_settings();
+        if save && self.apply_settings() {
             self.show_settings = false;
         }
     }
 
-    fn apply_settings(&mut self) {
+    /// Applies the draft. Returns false when a field was rejected and the
+    /// window should stay open.
+    fn apply_settings(&mut self) -> bool {
         let d = &self.settings;
 
         // Validate the server address if one was entered.
@@ -122,10 +129,15 @@ impl App {
                 Ok(addr) => Some(addr.to_string()),
                 Err(e) => {
                     self.status = format!("Server address: {e}");
-                    return;
+                    return false;
                 }
             }
         };
+
+        if d.use_permanent && d.permanent_password.trim().chars().count() < 8 {
+            self.status = "Use at least 8 characters for a permanent password.".into();
+            return false;
+        }
 
         let server_changed = self.cfg.server != new_server;
         if server_changed {
@@ -183,13 +195,20 @@ impl App {
             self.engine.restart(&self.cfg);
         }
         self.toast.show("Settings saved");
+        true
     }
 }
 
 fn general_tab(d: &mut SettingsDraft, ui: &mut egui::Ui) {
     super::widgets::heading(ui, "STARTUP");
     ui.checkbox(&mut d.start_with_windows, "Start PJDesk when I sign in to Windows");
-    ui.label(RichText::new("For always-on access (even at the login screen), install the background service — see the Security tab.").color(theme::MUTED).size(12.0));
+    ui.label(
+        RichText::new(
+            "For always-on access (even at the login screen), install the background service — see the Security tab.",
+        )
+        .color(theme::MUTED)
+        .size(12.0),
+    );
 
     ui.add_space(12.0);
     super::widgets::heading(ui, "UPDATES");
@@ -207,7 +226,12 @@ fn security_tab(d: &mut SettingsDraft, ui: &mut egui::Ui) {
     ui.add_enabled_ui(d.use_permanent, |ui| {
         ui.horizontal(|ui| {
             ui.label("Password");
-            ui.add(egui::TextEdit::singleline(&mut d.permanent_password).password(true).desired_width(200.0));
+            super::widgets::password_field(
+                ui,
+                &mut d.permanent_password,
+                "at least 8 characters",
+                &mut d.show_permanent,
+            );
         });
     });
     ui.label(
@@ -262,23 +286,43 @@ fn security_tab(d: &mut SettingsDraft, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.label(RichText::new("Set the service's unattended password").color(theme::MUTED).size(12.0));
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut d.service_password).password(true).desired_width(200.0));
+            super::widgets::password_field(
+                ui,
+                &mut d.service_password,
+                "at least 8 characters",
+                &mut d.show_service_password,
+            );
             if ui.button("Apply").clicked() && !d.service_password.trim().is_empty() {
-                crate::platform::run_elevated(&["service", "configure", "--password", d.service_password.trim()]);
+                let pw = d.service_password.trim();
+                if pw.chars().count() < 8 {
+                    d.service_note = "Use at least 8 characters.".into();
+                    return;
+                }
+                d.service_note.clear();
+                crate::platform::run_elevated_with_password(&["service", "configure"], pw);
                 d.service_password.clear();
             }
         });
+        if !d.service_note.is_empty() {
+            ui.label(RichText::new(&d.service_note).color(theme::WARN).size(12.0));
+        }
     }
 }
 
 fn network_tab(d: &mut SettingsDraft, ui: &mut egui::Ui) {
     super::widgets::heading(ui, "YOUR PJDESK SERVER");
     ui.label("Address (host or host:port)");
-    ui.add(egui::TextEdit::singleline(&mut d.server).hint_text("desk.example.com  or  192.168.1.10").desired_width(f32::INFINITY));
+    ui.add(
+        egui::TextEdit::singleline(&mut d.server)
+            .hint_text("desk.example.com  or  192.168.1.10")
+            .desired_width(f32::INFINITY),
+    );
     ui.label(
-        RichText::new("This is the self-hosted PJDesk server your computers connect through. The default port is 21200.")
-            .color(theme::MUTED)
-            .size(12.0),
+        RichText::new(
+            "This is the self-hosted PJDesk server your computers connect through. The default port is 21200.",
+        )
+        .color(theme::MUTED)
+        .size(12.0),
     );
 }
 
@@ -319,8 +363,7 @@ fn about_tab(ui: &mut egui::Ui) {
 fn set_run_at_login(enable: bool) -> anyhow::Result<()> {
     use windows::core::{w, HSTRING, PCWSTR};
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
-        REG_SZ,
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
     };
 
     unsafe {
@@ -331,10 +374,8 @@ fn set_run_at_login(enable: bool) -> anyhow::Result<()> {
         let result = if enable {
             let exe = std::env::current_exe()?;
             let value = HSTRING::from(format!("\"{}\"", exe.display()));
-            let bytes: &[u8] = std::slice::from_raw_parts(
-                value.as_ptr() as *const u8,
-                (value.len() + 1) * std::mem::size_of::<u16>(),
-            );
+            let bytes: &[u8] =
+                std::slice::from_raw_parts(value.as_ptr() as *const u8, (value.len() + 1) * std::mem::size_of::<u16>());
             RegSetValueExW(key, name, Some(0), REG_SZ, Some(bytes)).ok()
         } else {
             // Removing a missing value is fine.

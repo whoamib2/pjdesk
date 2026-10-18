@@ -18,6 +18,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Largest encoded frame accepted (a 4K keyframe is far below this).
 pub const MAX_VIDEO_FRAME: usize = 16 * 1024 * 1024;
+/// Largest video header accepted. A header is a few dozen bytes; anything
+/// larger is a peer trying to make the host or controller allocate.
+pub const MAX_VIDEO_HEADER: usize = 4096;
 
 /// Password-authenticated key exchange (see [`crate::auth`]).
 ///
@@ -152,7 +155,11 @@ where
 {
     let mut len2 = [0u8; 2];
     r.read_exact(&mut len2).await?;
-    let mut head = vec![0u8; u16::from_be_bytes(len2) as usize];
+    let head_len = u16::from_be_bytes(len2) as usize;
+    if head_len > MAX_VIDEO_HEADER {
+        bail!("video header too large ({head_len} bytes)");
+    }
+    let mut head = vec![0u8; head_len];
     r.read_exact(&mut head).await?;
     let header: VideoHeader = postcard::from_bytes(&head)?;
     let mut len4 = [0u8; 4];
@@ -182,5 +189,13 @@ mod tests {
         assert!(h.keyframe);
         assert_eq!((h.width, h.height), (1920, 1080));
         assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_video_header() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        a.write_all(&((MAX_VIDEO_HEADER as u16) + 1).to_be_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        assert!(read_video_frame(&mut b, &mut got).await.is_err());
     }
 }

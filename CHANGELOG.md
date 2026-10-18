@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.3.7
+
+Security fixes from a full review. The wire protocol is still version 2, and the
+pjdesk.com account key derivation is unchanged, so existing 0.3.5 and 0.3.6
+installs keep their IDs, accounts, and saved sign-ins. See `SECURITY-AUDIT.md`
+for the findings and for the steps that have to be done by hand (redeploy the
+website, keep publishing `SHA256SUMS`, re-seal an existing unattended service
+password).
+
+### Server and client
+
+* The server data folder and the client service folder are limited to SYSTEM
+  and Administrators. The signed-in console user can still read the service
+  folder, so the window can show the one-time password. Other local accounts
+  cannot read the server key, account tokens, address-book passwords, or the
+  one-time password, and cannot drop a request file the service would obey.
+* Request files only accept a device ID, `*` for "update all", or `now` for a
+  sync or reload.
+* Login tokens are stored as a SHA-256 hash. Old tokens are rewritten the next
+  time the server starts. Clients still send the raw token.
+* A wrong password, a missing account, and a disabled account all take the
+  same time and return the same error. New passwords must be at least 8
+  characters. Existing ones still work.
+* Password checking no longer holds the lock that every other connection needs.
+* A permanent password locks out new sessions for five minutes after five
+  misses. The one-time password still rotates every three misses.
+* Open connections, sessions, and relay traffic are capped so one address
+  cannot fill the process or the relay.
+* Automatic update requires `SHA256SUMS`, writes the installer into a private
+  directory under a random name, and checks the bytes again before running
+  them. A download URL that is not on GitHub is refused. The installers are
+  still not code-signed.
+* The unattended service password is sealed so the sign-in-screen helper can
+  read it, and the settings window passes it through a file instead of the
+  command line. An old user-scoped blob is re-sealed the next time someone
+  who can open it runs the helper.
+* Installers stop Windows from loading DLLs out of the folder they were
+  launched from.
+* Every password field in the client and server windows has a Show/Hide control.
+
+### Website
+
+* Sessions expire after 90 days idle or one year from creation. Sign-in
+  attempts are limited per network as well as per email. Creating an account
+  no longer says whether the address was already taken. Sync downloads are
+  capped at 8 MB. Pages send a content security policy and the account and
+  admin scripts are files, not inline.
+
 ## 0.2.0
 
 The project is now **PJDesk** (formerly DeskLink), with a graphical app, a

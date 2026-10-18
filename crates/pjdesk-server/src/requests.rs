@@ -17,17 +17,48 @@ pub const SYNC_FILE: &str = "sync-requests.json";
 /// Reload the key, accounts and computer list from disk (after joining).
 pub const RELOAD_FILE: &str = "reload-requests.json";
 
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// A target the service is willing to act on. Anything else is ignored, so a
+/// crafted file cannot smuggle a path or a wildcard the caller did not mean.
+pub fn acceptable_target(file: &str, target: &str) -> bool {
+    match file {
+        UPDATE_FILE => target == "*" || pjdesk_proto::is_valid_id(target),
+        FORGET_FILE => pjdesk_proto::is_valid_id(target),
+        SYNC_FILE | RELOAD_FILE => target == "now",
+        _ => false,
+    }
+}
+
 /// Adds `target` to a request file, keeping any not yet picked up.
 pub fn push(data_dir: &Path, file: &str, target: &str) -> std::io::Result<()> {
+    if !acceptable_target(file, target) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "rejected request target"));
+    }
     let path = data_dir.join(file);
-    let mut list: Vec<String> =
-        std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut list: Vec<String> = read_list(&path);
     if !list.iter().any(|t| t == target) {
         list.push(target.to_string());
     }
+    list.truncate(64);
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec(&list).map_err(std::io::Error::other)?)?;
-    std::fs::rename(&tmp, &path)
+    std::fs::rename(&tmp, &path)?;
+    crate::cloud::protect(&path);
+    Ok(())
+}
+
+fn read_list(path: &Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    if bytes.len() > MAX_REQUEST_BYTES {
+        return Vec::new();
+    }
+    serde_json::from_slice::<Vec<String>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| t.len() <= 16)
+        .take(64)
+        .collect()
 }
 
 /// Takes the pending requests (reads and removes the file). Moves the file
@@ -39,9 +70,9 @@ pub fn take(data_dir: &Path, file: &str) -> Vec<String> {
     if std::fs::rename(&path, &taken).is_err() {
         return Vec::new();
     }
-    let list = std::fs::read(&taken).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let list = read_list(&taken);
     let _ = std::fs::remove_file(&taken);
-    list
+    list.into_iter().filter(|t| acceptable_target(file, t)).collect()
 }
 
 /// Forgets a device: removes it from `devices.json` now (enough when the
@@ -66,6 +97,11 @@ mod tests {
         push(&dir, FORGET_FILE, "111111111").unwrap();
         assert_eq!(take(&dir, FORGET_FILE), vec!["111111111".to_string(), "222222222".to_string()]);
         assert!(take(&dir, FORGET_FILE).is_empty());
+        // A wildcard is an update-all, not a forget. A path is never a target.
+        assert!(push(&dir, FORGET_FILE, "*").is_err());
+        assert!(push(&dir, FORGET_FILE, "../accounts.json").is_err());
+        std::fs::write(dir.join(UPDATE_FILE), br#"["*","not-an-id","123456789"]"#).unwrap();
+        assert_eq!(take(&dir, UPDATE_FILE), vec!["*".to_string(), "123456789".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

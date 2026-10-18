@@ -83,7 +83,9 @@ pub struct AddressEntry {
     #[serde(default)]
     pub tags: Vec<String>,
     /// The host's access password, if the user asked to remember it. Stored in
-    /// the user's own account on their own server; encrypted at rest on disk.
+    /// the user's own account on their own server. The file is locked to
+    /// SYSTEM and Administrators; the password itself is not separately
+    /// encrypted (the server has to hand it back to the signed-in client).
     #[serde(default)]
     pub password: Option<String>,
 }

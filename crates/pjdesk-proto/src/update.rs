@@ -3,9 +3,14 @@
 //!
 //! The client and server each call [`perform`] with their own installer name
 //! prefix. The GitHub API and the download are plain HTTPS to github.com, so
-//! this works unchanged on the user's machine (no server involvement). The
-//! integrity check is the HTTPS origin plus a SHA-256 from a `SHA256SUMS`
-//! asset in the same release.
+//! this works unchanged on the user's machine (no server involvement).
+//!
+//! A release is installed only when its `SHA256SUMS` asset matches the
+//! downloaded bytes. The installer is written under a private directory with
+//! a random name, then read back and hashed again before it is launched, so
+//! a local user cannot swap the file in the shared temp directory. The
+//! installers are not code-signed; a signature check is deliberately not
+//! required until a signing key exists (see SECURITY-AUDIT.md).
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -102,30 +107,151 @@ pub fn check(repo: &str, current: &str, installer_prefix: &str) -> Result<Option
     }))
 }
 
-/// Downloads the installer to a temp file, verifying its SHA-256 against the
-/// release's `SHA256SUMS` when present.
-pub fn download_verified(update: &Available) -> Result<PathBuf> {
-    let bytes = http_get(&update.installer_url)?;
+/// The SHA-256 recorded for `installer_name` in a `SHA256SUMS` file.
+///
+/// Lines look like `<hash>  <name>` or `<hash> *<name>` (the binary-mode marker
+/// GNU coreutils writes).
+pub fn expected_checksum(sums: &str, installer_name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let (hash, name) = line.split_once(char::is_whitespace)?;
+        let name = name.trim().trim_start_matches('*');
+        (name == installer_name).then(|| hash.trim().to_ascii_lowercase())
+    })
+}
 
-    if let Some(sums_url) = &update.sums_url {
-        let sums = String::from_utf8(http_get(sums_url)?).unwrap_or_default();
-        let want = sums
-            .lines()
-            .find_map(|line| {
-                let (hash, name) = line.split_once(char::is_whitespace)?;
-                // SHA256SUMS lines look like "<hash>  <name>" (name may have a * marker).
-                let name = name.trim().trim_start_matches('*');
-                (name == update.installer_name).then(|| hash.trim().to_lowercase())
-            })
-            .with_context(|| format!("no checksum for {} in SHA256SUMS", update.installer_name))?;
-        let got = hex::encode(Sha256::digest(&bytes));
-        if got != want {
-            bail!("checksum mismatch for {} (expected {want}, got {got})", update.installer_name);
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Release downloads must be HTTPS on a GitHub host. The checksum file is
+/// published beside the installer, so a URL that leaves GitHub is not a
+/// second source of truth — it is a place a tampered release listing could
+/// send the updater.
+fn trusted_download_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if rest.chars().any(|c| c.is_control() || c == ' ' || c == '\\') {
+        return false;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() || host.contains('@') {
+        return false;
+    }
+    let host = host.split(':').next().unwrap_or("");
+    matches!(
+        host,
+        "github.com"
+            | "objects.githubusercontent.com"
+            | "release-assets.githubusercontent.com"
+            | "github-releases.githubusercontent.com"
+    )
+}
+
+/// Where verified installers are written. Not the shared temp directory: the
+/// update task runs as SYSTEM, and a predictable name there can be replaced
+/// by another local user between the write and the launch.
+fn update_dir() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("PJDesk").join("updates")
+}
+
+/// Creates the update directory and keeps other users out of it. A symlink or
+/// junction already sitting there is removed first so a local user cannot
+/// redirect the write.
+fn harden_update_dir(path: &std::path::Path) -> Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            let _ = std::fs::remove_dir(path);
+            let _ = std::fs::remove_file(path);
         }
     }
+    std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        bail!("refusing to download an update through a link at {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Grant on the directory only. Inheritance flags are invalid on files,
+        // so this must not be applied with /T (see the server's data-folder notes).
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/Q"])
+            .creation_flags(0x0800_0000)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            bail!("could not lock down the update directory {}", path.display());
+        }
+    }
+    Ok(())
+}
 
-    let path = std::env::temp_dir().join(&update.installer_name);
-    std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+fn safe_version(version: &str) -> String {
+    let s: String = version.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-').take(32).collect();
+    if s.is_empty() {
+        "update".into()
+    } else {
+        s
+    }
+}
+
+/// Downloads the installer into the private update directory and checks its
+/// SHA-256 against the release's `SHA256SUMS`. A release without that file is
+/// refused: HTTPS to GitHub is necessary, and the checksum catches a truncated
+/// or swapped download before anything is executed.
+pub fn download_verified(update: &Available) -> Result<PathBuf> {
+    let sums_url = update.sums_url.as_deref().context(
+        "this release has no SHA256SUMS file, so it was not installed. Publish SHA256SUMS next to the installer.",
+    )?;
+    if !trusted_download_url(&update.installer_url) || !trusted_download_url(sums_url) {
+        bail!("the release points at a download outside GitHub, so it was not installed");
+    }
+    let bytes = http_get(&update.installer_url)?;
+    let sums = String::from_utf8(http_get(sums_url)?).unwrap_or_default();
+    let want = expected_checksum(&sums, &update.installer_name)
+        .with_context(|| format!("no checksum for {} in SHA256SUMS", update.installer_name))?;
+    if want.len() != 64 || !want.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("the checksum for {} is not a SHA-256 hex string", update.installer_name);
+    }
+    let got = sha256_hex(&bytes);
+    if got != want {
+        bail!("checksum mismatch for {} (expected {want}, got {got})", update.installer_name);
+    }
+
+    let dir = update_dir();
+    harden_update_dir(&dir)?;
+    let path = dir.join(format!("{}-{}.exe", hex::encode(crate::random_bytes::<8>()), safe_version(&update.version)));
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()?;
+    }
+    // The directory is locked down, and the name was random, but check the
+    // bytes we are about to execute anyway.
+    if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+        let _ = std::fs::remove_file(&path);
+        bail!("refusing to run an update that is a link");
+    }
+    let again = std::fs::read(&path).with_context(|| format!("reading back {}", path.display()))?;
+    if sha256_hex(&again) != want {
+        let _ = std::fs::remove_file(&path);
+        bail!("the installer changed on disk after its checksum was verified");
+    }
     Ok(path)
 }
 
@@ -134,10 +260,7 @@ pub fn download_verified(update: &Available) -> Result<PathBuf> {
 /// replaces the files and restarts.
 #[cfg(windows)]
 pub fn run_installer(path: &std::path::Path) -> Result<()> {
-    std::process::Command::new(path)
-        .arg("/S")
-        .spawn()
-        .with_context(|| format!("launching {}", path.display()))?;
+    std::process::Command::new(path).arg("/S").spawn().with_context(|| format!("launching {}", path.display()))?;
     Ok(())
 }
 
@@ -175,6 +298,36 @@ mod tests {
         assert!(!is_newer("0.2.0", "garbage"));
         assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
         assert_eq!(parse_version("0.2.0-rc1"), Some((0, 2, 0)));
+    }
+
+    #[test]
+    fn checksum_line_matches_the_installer_only() {
+        let sums = "\
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  PJDesk-Setup-0.3.7.exe
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa *PJDesk-Server-Setup-0.3.7.exe
+";
+        assert_eq!(
+            expected_checksum(sums, "PJDesk-Setup-0.3.7.exe").as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            expected_checksum(sums, "PJDesk-Server-Setup-0.3.7.exe").as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(expected_checksum(sums, "other.exe").is_none());
+    }
+
+    #[test]
+    fn download_urls_stay_on_github() {
+        assert!(trusted_download_url(
+            "https://github.com/whoamib2/pjdesk/releases/download/v0.3.7/PJDesk-Setup-0.3.7.exe"
+        ));
+        assert!(trusted_download_url("https://objects.githubusercontent.com/github-production-release-asset-2e65be/a"));
+        assert!(!trusted_download_url("http://github.com/whoamib2/pjdesk/releases/download/v0.3.7/a.exe"));
+        assert!(!trusted_download_url("https://github.com.evil.example/a.exe"));
+        assert!(!trusted_download_url("https://evil.example/github.com/a.exe"));
+        assert!(!trusted_download_url("https://user:pass@github.com/a.exe"));
+        assert!(!trusted_download_url("https://github.com\r\nX: y/a.exe"));
     }
 
     #[test]

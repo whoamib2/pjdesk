@@ -95,26 +95,23 @@ fn run_service(opts: ServerOpts, data_dir: PathBuf) -> Result<()> {
 }
 
 /// Repairs the permissions on the data folder (server key/cert, device
-/// registry, accounts, log) so the server can always read its own files.
+/// registry, accounts, log) so the server can always read its own files, and
+/// so other local users cannot.
 ///
-/// It reclaims ownership of everything under the folder and resets each item to
-/// the permissions it inherits from `%ProgramData%` (SYSTEM and Administrators
-/// full control, Users read). It uses `icacls /reset` rather than
-/// `/inheritance:r /grant`: an earlier version granted
-/// `SYSTEM,Administrators:(OI)(CI)F` recursively, but those container-inherit
-/// flags are invalid on files, so `icacls` stripped each file's inherited
-/// permissions and then failed to add the grant back — leaving an empty DACL
-/// that denied access to everyone, SYSTEM included. That is what made the
-/// service read `devices.json`, hit "Access is denied", and stop. `/reset`
-/// restores the inherited permissions and can never leave an empty DACL. Every
-/// step is best-effort — the server must still come up if it fails.
+/// The folder is owned by SYSTEM and granted only to SYSTEM and Administrators,
+/// with inheritance set on the directory itself. Children are then reset so
+/// they inherit that ACL. Inheritance flags must not be applied to files with
+/// `/T`: an earlier version did that, `icacls` stripped each file's inherited
+/// permissions, and the empty DACL denied access to everyone, SYSTEM included.
+/// Resetting the directory itself would put ProgramData's ACL back, and that
+/// ACL lets Users read files and create new ones. Every step is best-effort —
+/// the server must still come up if it fails.
 pub(crate) fn repair_data_dir(dir: &Path) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let _ = std::fs::create_dir_all(dir);
-    // Reclaim ownership of the folder and everything under it, so the reset
-    // below can rewrite the permissions on any file an earlier version left
-    // unreadable (owned by SYSTEM with an empty DACL).
+    // Reclaim ownership first. An earlier version left some files with an
+    // empty DACL that even SYSTEM could not read.
     let _ = std::process::Command::new("takeown")
         .arg("/f")
         .arg(dir)
@@ -123,20 +120,28 @@ pub(crate) fn repair_data_dir(dir: &Path) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    // /reset restores the inherited permissions on the folder and, with /T, on
-    // every file under it; /C keeps going past any single file it can't touch.
+    // The folder must NOT inherit ProgramData's ACL. That ACL lets Users read
+    // files and create new ones, which exposed the TLS private key, account
+    // tokens and address-book passwords, and let any local user drop a request
+    // file the service would obey (update every host, forget a computer,
+    // reload accounts). Inheritance flags are set on the directory only —
+    // applying (OI)(CI) to files with /T is what emptied DACLs before.
     let status = std::process::Command::new("icacls")
         .arg(dir)
+        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/Q"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    // Children pick up that ACL by inheritance. /reset on the directory itself
+    // would undo the line above, so it is applied to the children only.
+    let _ = std::process::Command::new("icacls")
+        .arg(format!("{}\\*", dir.display()))
         .args(["/reset", "/T", "/C", "/Q"])
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    // The cloud-sync settings hold the bucket secret: keep them admin-only.
-    let cloud = dir.join(crate::cloud::CONFIG_FILE);
-    if cloud.exists() {
-        crate::cloud::protect(&cloud);
-    }
     if !matches!(status, Ok(s) if s.success()) {
         tracing::warn!("could not repair permissions on {} ({status:?})", dir.display());
     }

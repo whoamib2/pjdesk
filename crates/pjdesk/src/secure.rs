@@ -11,24 +11,42 @@
 //! JSON and is easy to tell apart from plain text.
 
 /// Encrypts `secret` into a string safe to store in JSON.
+///
+/// On Windows the blob is bound to the current user. The background service
+/// uses [`protect_machine`] instead, so the same secret can be read at the
+/// sign-in screen, where the helper runs as SYSTEM.
 pub fn protect(secret: &str) -> String {
+    protect_inner(secret, false)
+}
+
+/// Like [`protect`], but on Windows any process on this machine can decrypt
+/// it. The file that holds the result must itself be locked to SYSTEM, Administrators
+/// and the signed-in user — local-machine DPAPI is not a substitute for an ACL.
+pub fn protect_machine(secret: &str) -> String {
+    protect_inner(secret, true)
+}
+
+fn protect_inner(secret: &str, machine: bool) -> String {
     #[cfg(windows)]
     {
-        if let Some(bytes) = dpapi::protect(secret.as_bytes()) {
-            return format!("dpapi:{}", hex::encode(bytes));
+        if let Some(bytes) = dpapi::protect(secret.as_bytes(), machine) {
+            let tag = if machine { "dpapi-machine" } else { "dpapi" };
+            return format!("{tag}:{}", hex::encode(bytes));
         }
     }
+    let _ = machine;
     // Fallback: clearly not encrypted.
     format!("plain:{}", hex::encode(secret.as_bytes()))
 }
 
-/// Reverses [`protect`]. Returns `None` if the value can't be decoded.
+/// Reverses [`protect`] or [`protect_machine`]. Returns `None` if the value
+/// can't be decoded.
 pub fn reveal(stored: &str) -> Option<String> {
     if let Some(hexed) = stored.strip_prefix("plain:") {
         return hex::decode(hexed).ok().and_then(|b| String::from_utf8(b).ok());
     }
     #[cfg(windows)]
-    if let Some(hexed) = stored.strip_prefix("dpapi:") {
+    if let Some(hexed) = stored.strip_prefix("dpapi-machine:").or_else(|| stored.strip_prefix("dpapi:")) {
         let bytes = hex::decode(hexed).ok()?;
         return dpapi::unprotect(&bytes).and_then(|b| String::from_utf8(b).ok());
     }
@@ -39,7 +57,7 @@ pub fn reveal(stored: &str) -> Option<String> {
 
 #[cfg(windows)]
 mod dpapi {
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB};
 
     fn as_blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
@@ -53,12 +71,15 @@ mod dpapi {
         out
     }
 
-    pub fn protect(data: &[u8]) -> Option<Vec<u8>> {
+    pub fn protect(data: &[u8], machine: bool) -> Option<Vec<u8>> {
         unsafe {
             let input = as_blob(data);
             let mut output = CRYPT_INTEGER_BLOB::default();
             // CRYPTPROTECT_UI_FORBIDDEN (0x1): never show UI (we may be a service).
-            CryptProtectData(&input, None, None, None, None, 0x1, &mut output).ok()?;
+            // CRYPTPROTECT_LOCAL_MACHINE (0x4): decryptable by SYSTEM at the
+            // sign-in screen, not only by the user who set the password.
+            let flags = if machine { 0x1 | 0x4 } else { 0x1 };
+            CryptProtectData(&input, None, None, None, None, flags, &mut output).ok()?;
             Some(take(output))
         }
     }
