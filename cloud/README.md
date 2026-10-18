@@ -44,7 +44,7 @@ Point a server at it with `PJDESK_CLOUD_API=http://127.0.0.1:8787` (window) or
 
 ## Deploy
 
-Deployed by Cloudflare's Git integration (Workers Builds) from this folder on
-every push to `main` — no GitHub Actions. Deploy command: `npm run deploy`
-(applies D1 migrations, then `wrangler deploy`). `wrangler.toml` holds the D1
-database ID and the bucket name.
+From your PC (no CI): open a terminal in `cloud\` and run `deploy.cmd`. It
+installs Cloudflare's deploy tool on first run, signs in to Cloudflare as
+pjdesk@spader.us (browser, first time only), applies database migrations and
+deploys. `wrangler.toml` holds the account, D1 database ID and bucket name.
