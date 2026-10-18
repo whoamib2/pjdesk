@@ -4,7 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,7 @@ use pjdesk_proto::framing::write_msg;
 use pjdesk_proto::peer::{
     read_side_chunk, read_side_header, write_side_chunk, write_side_header, Clipboard, ClipKind, ControlMsg,
     DisplayLayout, FileMsg, HostMsg, KeyboardMode, SideHeader, SpecialCommand, TunnelMsg, CLIP_MAGIC, FILE_MAGIC,
-    MAX_CLIP_IMAGE, MAX_CLIP_TEXT, SIDE_CHUNK, VIEW_ALL,
+    AtlasTile, MAX_CLIP_IMAGE, MAX_CLIP_TEXT, SIDE_CHUNK, VIEW_ALL, VIEW_SEPARATE,
 };
 use pjdesk_proto::perms::{self, grant, has};
 use pjdesk_proto::quality::{BitrateControl, StreamQuality};
@@ -92,6 +92,11 @@ pub struct Session {
     layout_key: Mutex<String>,
     platform_sent: AtomicBool,
     layout_ticks: AtomicU32,
+    /// 0 one display, 1 all displays, 2 separate windows.
+    view_mode: AtomicU8,
+    watch: Mutex<Vec<u8>>,
+    layouts: Mutex<Vec<DisplayLayout>>,
+    atlas_key: Mutex<String>,
     conn: Connection,
     shared: Option<Arc<HostShared>>,
     peer_name: String,
@@ -144,6 +149,10 @@ impl Session {
             layout_key: Mutex::new(String::new()),
             platform_sent: AtomicBool::new(false),
             layout_ticks: AtomicU32::new(0),
+            view_mode: AtomicU8::new(0),
+            watch: Mutex::new(Vec::new()),
+            layouts: Mutex::new(Vec::new()),
+            atlas_key: Mutex::new(String::new()),
             conn,
             shared,
             peer_name: grant.peer_name,
@@ -174,6 +183,34 @@ impl Session {
         if ctl.observe(delay) {
             self.bitrate.store(ctl.current, Ordering::SeqCst);
         }
+    }
+
+    /// What the capture thread should grab, and the layout generation so a
+    /// resolution change reopens capture.
+    pub fn capture_plan(&self) -> (usize, Vec<u8>, String) {
+        let layout = self.layout_key.lock().unwrap().clone();
+        if self.view_mode.load(Ordering::SeqCst) == VIEW_SEPARATE {
+            let watch = self.watch.lock().unwrap().clone();
+            return (super::capture::SEPARATE_DISPLAYS, watch, layout);
+        }
+        (self.display.load(Ordering::SeqCst), Vec::new(), layout)
+    }
+
+    /// Tells the controller where each open display sits in the packed picture.
+    pub fn note_atlas(&self, width: u16, height: u16, tiles: Vec<AtlasTile>) {
+        if !self.layout_aware.load(Ordering::SeqCst) {
+            return;
+        }
+        let key = format!(
+            "{width}x{height}:{}",
+            tiles.iter().map(|t| format!("{}@{},{} {}x{}", t.index, t.x, t.y, t.width, t.height)).collect::<Vec<_>>().join("|")
+        );
+        let mut guard = self.atlas_key.lock().unwrap();
+        if *guard == key {
+            return;
+        }
+        *guard = key;
+        let _ = self.host_tx.send(HostMsg::Atlas { width, height, tiles });
     }
 
     fn v3(&self) -> bool {
@@ -238,14 +275,50 @@ impl Session {
                 if !self.layout_aware.load(Ordering::SeqCst) {
                     return Ok(false);
                 }
+                self.view_mode.store(mode, Ordering::SeqCst);
                 if mode == VIEW_ALL {
                     self.display.store(super::capture::ALL_DISPLAYS, Ordering::SeqCst);
                     info!("Controller selected all displays");
+                } else if mode == VIEW_SEPARATE {
+                    let mut watch = self.watch.lock().unwrap();
+                    if watch.is_empty() {
+                        *watch = vec![shown];
+                    }
+                    info!("Controller opened separate windows");
                 } else {
+                    self.view_mode.store(0, Ordering::SeqCst);
+                    self.watch.lock().unwrap().clear();
                     self.display.store(shown as usize, Ordering::SeqCst);
                     info!("Controller selected monitor {shown}");
                 }
                 keyframe.store(true, Ordering::SeqCst);
+            }
+            ControlMsg::Watch { displays } => {
+                if !self.layout_aware.load(Ordering::SeqCst) {
+                    return Ok(false);
+                }
+                let mut list = displays;
+                list.retain(|d| *d < 32);
+                list.sort_unstable();
+                list.dedup();
+                list.truncate(16);
+                self.view_mode.store(VIEW_SEPARATE, Ordering::SeqCst);
+                *self.watch.lock().unwrap() = list;
+                keyframe.store(true, Ordering::SeqCst);
+            }
+            ControlMsg::Pointer { display, x, y } => {
+                if !self.layout_aware.load(Ordering::SeqCst) {
+                    return Ok(false);
+                }
+                let rect = self.layouts.lock().unwrap().iter().find(|d| d.index == display).map(|d| Rect {
+                    left: d.x,
+                    top: d.y,
+                    width: d.width as i32,
+                    height: d.height as i32,
+                });
+                if let Some(rect) = rect {
+                    injector.move_on(rect, x, y);
+                }
             }
             ControlMsg::File(msg) => self.file_ctrl(msg, send).await?,
             ControlMsg::Restart => {
@@ -327,6 +400,7 @@ impl Session {
             }
             *last = key;
         }
+        *self.layouts.lock().unwrap() = displays.clone();
         write_msg(send, &HostMsg::Displays { displays }).await?;
         if self.platform_sent.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             let (family, version) = super::capture::platform_report();

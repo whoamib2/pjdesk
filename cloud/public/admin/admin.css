@@ -66,6 +66,24 @@ main { flex: 1; min-width: 0; padding: 28px 32px 48px; }
 .top h1 { margin: 0 0 4px; font-size: 26px; letter-spacing: -0.02em; }
 .top p { margin: 0 0 18px; color: var(--muted); }
 .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.ico {
+  width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center; flex: none;
+  background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent);
+}
+.ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.delta { margin-top: 8px; font-size: 12.5px; color: var(--ok); }
+.dash { display: grid; grid-template-columns: 1.35fr 0.9fr; gap: 14px; align-items: start; }
+.dash .panel { margin-top: 0; }
+.dash h2 { margin: 0 0 10px; font-size: 16px; }
+.split { height: 12px; border-radius: 99px; overflow: hidden; display: flex; background: var(--line); }
+.split .cloud { background: var(--accent); }
+.split .free { background: color-mix(in srgb, var(--muted) 55%, var(--line)); }
+.legend { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; color: var(--muted); font-size: 12.5px; }
+.activity { display: flex; flex-direction: column; gap: 10px; }
+.activity .item { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.empty { color: var(--muted); padding: 8px 0 4px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .card, .panel {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -145,5 +163,6 @@ th { color: var(--muted); font-size: 12px; font-weight: 600; }
   .side-foot { margin-top: 0; flex-direction: row; align-items: center; }
   main { padding: 18px 14px 32px; }
   .cards { grid-template-columns: 1fr 1fr; }
+  .dash { grid-template-columns: 1fr; }
   table { display: block; overflow-x: auto; }
 }

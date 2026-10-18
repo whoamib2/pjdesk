@@ -91,12 +91,26 @@ pub enum ControlMsg {
     Audio {
         enabled: bool,
     },
-    /// 0.5.2. Watch one display, or the whole desktop as one picture.
+    /// 0.5.2. Watch one display, every display, or one window per display.
     /// Sent only after the host has published [`HostMsg::Displays`]. An older
-    /// host never receives this variant. `mode` is [`VIEW_SINGLE`] or [`VIEW_ALL`].
+    /// host never receives this variant. `mode` is [`VIEW_SINGLE`], [`VIEW_ALL`],
+    /// or [`VIEW_SEPARATE`].
     View {
         mode: u8,
         display: u8,
+    },
+    /// 0.5.2. Displays that still have a local window. The host captures only
+    /// these. Sent only after [`HostMsg::Displays`].
+    Watch {
+        displays: Vec<u8>,
+    },
+    /// 0.5.2. Pointer inside one display, normalized the same way as
+    /// [`InputEvent::MouseMove`]. The host maps it onto that display's
+    /// virtual-desktop rectangle, which may begin at a negative coordinate.
+    Pointer {
+        display: u8,
+        x: u16,
+        y: u16,
     },
 }
 
@@ -104,6 +118,9 @@ pub enum ControlMsg {
 pub const VIEW_SINGLE: u8 = 0;
 /// [`ControlMsg::View`] mode: every display, stitched at its real position.
 pub const VIEW_ALL: u8 = 1;
+/// [`ControlMsg::View`] mode: one local window per display. The open set is
+/// [`ControlMsg::Watch`].
+pub const VIEW_SEPARATE: u8 = 2;
 
 /// Commands the controller asks the host to carry out directly.
 ///
@@ -154,6 +171,19 @@ pub struct DisplayLayout {
     pub y: i32,
     pub primary: bool,
     pub dpi: u32,
+}
+
+/// Where one display sits inside the separate-windows picture.
+///
+/// Coordinates are capture pixels, before the encoder scales the picture.
+/// A display with no tile is not being captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AtlasTile {
+    pub index: u8,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
 }
 
 /// Clipboard contents. Text rides in `bytes` (UTF-8). Images are PNG bytes and,
@@ -266,6 +296,13 @@ pub enum HostMsg {
     Platform {
         family: String,
         version: String,
+    },
+    /// 0.5.2. Layout of the separate-windows picture. Sent only to a controller
+    /// that asked for [`crate::perms::LAYOUT`], and only while that mode is on.
+    Atlas {
+        width: u16,
+        height: u16,
+        tiles: Vec<AtlasTile>,
     },
 }
 
@@ -408,6 +445,12 @@ mod tests {
         assert_eq!(
             postcard::to_stdvec(&HostMsg::Platform { family: "linux".into(), version: String::new() }).unwrap()[0],
             11
+        );
+        assert_eq!(postcard::to_stdvec(&ControlMsg::Watch { displays: vec![0, 2] }).unwrap()[0], 19);
+        assert_eq!(postcard::to_stdvec(&ControlMsg::Pointer { display: 1, x: 0, y: 0 }).unwrap()[0], 20);
+        assert_eq!(
+            postcard::to_stdvec(&HostMsg::Atlas { width: 1, height: 1, tiles: vec![] }).unwrap()[0],
+            12
         );
         let hello = ControlMsg::Hello {
             permissions: 1,

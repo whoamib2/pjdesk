@@ -237,25 +237,66 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
     // (it may have been unavailable at start, e.g. during a UAC prompt).
     let mut next_dxgi_retry = Instant::now() + Duration::from_secs(10);
     let mut args = args.clone();
+    let mut plan_watch: Vec<u8> = Vec::new();
+    let mut plan_layout = String::new();
 
     while !shared.flow.stopped() {
-        let want_display = session.display.load(Ordering::SeqCst);
-        if want_display != args.display {
-            args.display = want_display;
-            let label = if want_display == capture::ALL_DISPLAYS {
+        let (want_display, want_watch, want_layout) = session.capture_plan();
+        if want_display != args.display || want_watch != plan_watch || want_layout != plan_layout {
+            let label = if want_display == capture::SEPARATE_DISPLAYS {
+                format!("displays {want_watch:?}")
+            } else if want_display == capture::ALL_DISPLAYS {
                 "all displays".to_string()
             } else {
                 format!("monitor {want_display}")
             };
-            match capture::open(&args) {
-                Ok(next) => {
+            let opened = if want_display == capture::SEPARATE_DISPLAYS {
+                if want_watch.is_empty() {
+                    None
+                } else {
+                    match capture::open_separate(&want_watch) {
+                        Ok(next) => Some(next),
+                        Err(e) => {
+                            warn!("Could not switch to {label} ({e:#})");
+                            None
+                        }
+                    }
+                }
+            } else {
+                let mut next_args = args.clone();
+                next_args.display = want_display;
+                match capture::open(&next_args) {
+                    Ok(next) => Some(next),
+                    Err(e) => {
+                        warn!("Could not switch to {label} ({e:#})");
+                        None
+                    }
+                }
+            };
+            match opened {
+                Some(next) => {
                     info!("Switched to {label}");
+                    args.display = want_display;
+                    plan_watch = want_watch;
+                    plan_layout = want_layout;
+                    if let Some((w, h, tiles)) = next.atlas() {
+                        session.note_atlas(w, h, tiles);
+                    }
                     capturer = next;
                     *shared.display.lock().unwrap() = capturer.display_rect();
                     shared.keyframe_requested.store(true, Ordering::SeqCst);
                 }
-                Err(e) => warn!("Could not switch monitor ({e:#})"),
+                None if want_display == capture::SEPARATE_DISPLAYS && want_watch.is_empty() => {
+                    args.display = want_display;
+                    plan_watch = want_watch;
+                    plan_layout = want_layout;
+                }
+                None => {}
             }
+        }
+        if args.display == capture::SEPARATE_DISPLAYS && plan_watch.is_empty() {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
         }
         let fps_now = session.fps.load(Ordering::SeqCst).clamp(1, 120);
         let bitrate_now = session.bitrate.load(Ordering::SeqCst).clamp(200, 50_000);

@@ -538,30 +538,54 @@ async function adminAccounts(request, env) {
 async function adminOverview(request, env) {
   await requireAdmin(request, env);
   const accounts = await env.DB.prepare(
-    "SELECT email, plan, plan_expires_at, sync_enabled FROM accounts",
+    "SELECT email, plan, plan_expires_at, sync_enabled, created_at FROM accounts",
   ).all();
+  const at = now();
+  const week = at - 7 * 86400;
+  const day = at - 86400;
   let cloud = 0;
   let free = 0;
+  let fresh = 0;
   for (const r of accounts.results) {
     const eff = effectivePlan({
       plan: r.plan,
       expiresAt: r.plan_expires_at,
       isAdmin: isAdmin(env, r.email),
-      now: now(),
+      now: at,
     });
     if (eff.plan === "cloud") cloud += 1;
     else free += 1;
+    if (Number(r.created_at) >= week) fresh += 1;
   }
   const servers = await env.DB.prepare("SELECT COUNT(*) AS n FROM server_health").first();
   const signins = await env.DB.prepare("SELECT COUNT(*) AS n FROM sessions").first();
+  const active = await env.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE last_used_at >= ?").bind(day).first();
   const audit = await env.DB.prepare("SELECT COUNT(*) AS n FROM plan_audit").first();
+  const serverList = await env.DB.prepare(
+    `SELECT a.email, h.name, h.version, h.role, h.healthy, h.reported_at
+       FROM server_health h JOIN accounts a ON a.id = h.account_id
+      ORDER BY h.reported_at DESC LIMIT 8`,
+  ).all();
+  const recentAudit = await env.DB.prepare(
+    `SELECT at, actor, email, old_plan, new_plan, note FROM plan_audit ORDER BY id DESC LIMIT 8`,
+  ).all();
+  const recentSignins = await env.DB.prepare(
+    `SELECT a.email, s.device, s.last_used_at
+       FROM sessions s JOIN accounts a ON a.id = s.account_id
+      ORDER BY s.last_used_at DESC LIMIT 8`,
+  ).all();
   return json({
     accounts: accounts.results.length,
     cloud,
     free,
+    new_accounts_7d: fresh,
     servers: servers?.n || 0,
     signins: signins?.n || 0,
+    active_today: active?.n || 0,
     audit: audit?.n || 0,
+    server_list: serverList.results,
+    recent_audit: recentAudit.results,
+    recent_signins: recentSignins.results,
   });
 }
 

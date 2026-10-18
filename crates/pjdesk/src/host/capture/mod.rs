@@ -35,16 +35,22 @@ pub struct Rect {
 
 /// `Session.display` value meaning "capture every display as one picture".
 ///
-/// Bandwidth: single-screen mode captures and encodes only the selected
-/// display (DXGI Desktop Duplication when it is available, otherwise one GDI
-/// `BitBlt` of that monitor). All-screens mode is one GDI `BitBlt` of the
-/// virtual-desktop bounding box, encoded as one stream. DXGI is per-output,
-/// so it is not used for the stitched view. The mouse stays normalized across
-/// that one rectangle and therefore crosses display boundaries.
-///
-/// Separate local windows, one per remote display, are not part of this
-/// capture path.
+/// Bandwidth:
+/// * Single-screen mode captures and encodes only the selected display (DXGI
+///   Desktop Duplication when it is available, otherwise one GDI `BitBlt` of
+///   that monitor).
+/// * All-screens mode is one GDI `BitBlt` of the virtual-desktop bounding box,
+///   encoded as one stream. DXGI is per-output, so it is not used for the
+///   stitched view. The mouse stays normalized across that one rectangle.
+/// * Separate windows pack only the displays that still have a local window
+///   into one picture ([`SEPARATE_DISPLAYS`]). Each is its own GDI `BitBlt`;
+///   a closed window is not captured. The tiles are described by
+///   [`pjdesk_proto::peer::HostMsg::Atlas`] and encoded as one stream. DXGI is
+///   not used, because it duplicates one output at a time.
 pub const ALL_DISPLAYS: usize = usize::MAX;
+
+/// Capture the displays named by [`pjdesk_proto::peer::ControlMsg::Watch`].
+pub const SEPARATE_DISPLAYS: usize = usize::MAX - 1;
 
 /// A captured BGRA image (alpha is unused).
 pub struct Frame<'a> {
@@ -68,6 +74,11 @@ pub trait Capturer {
     fn is_fallback(&self) -> bool {
         false
     }
+
+    /// Separate-windows picture: capture size and where each open display sits.
+    fn atlas(&self) -> Option<(u16, u16, Vec<pjdesk_proto::peer::AtlasTile>)> {
+        None
+    }
 }
 
 /// Opens the best available capturer for the host options.
@@ -77,6 +88,9 @@ pub fn open(args: &HostArgs) -> Result<Box<dyn Capturer>> {
     }
     if args.display == ALL_DISPLAYS {
         return open_all();
+    }
+    if args.display == SEPARATE_DISPLAYS {
+        return open_separate(&[]);
     }
     #[cfg(windows)]
     {
@@ -91,6 +105,20 @@ pub fn open(args: &HostArgs) -> Result<Box<dyn Capturer>> {
     #[cfg(not(windows))]
     {
         warn!("Real screen capture is implemented for Windows hosts only; streaming a test pattern");
+        Ok(Box::new(synthetic::Synthetic::new(1280, 720)))
+    }
+}
+
+/// Separate windows: one packed picture of `indexes` only.
+pub fn open_separate(indexes: &[u8]) -> Result<Box<dyn Capturer>> {
+    #[cfg(windows)]
+    {
+        Ok(Box::new(gdi::GdiCapturer::selected(indexes)?))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = indexes;
+        warn!("Separate-window capture is implemented for Windows hosts; streaming a test pattern");
         Ok(Box::new(synthetic::Synthetic::new(1280, 720)))
     }
 }
@@ -203,7 +231,7 @@ fn os_version() -> String {
 
 /// Tries the preferred backend again (used to leave the GDI fallback).
 pub fn try_preferred(args: &HostArgs) -> Option<Box<dyn Capturer>> {
-    if args.display == ALL_DISPLAYS {
+    if args.display == ALL_DISPLAYS || args.display == SEPARATE_DISPLAYS {
         return None;
     }
     #[cfg(windows)]

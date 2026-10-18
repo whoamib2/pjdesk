@@ -82,24 +82,142 @@
     return PJ.call("GET", path);
   }
 
+  function svg(path) {
+    const ns = "http://www.w3.org/2000/svg";
+    const root = document.createElementNS(ns, "svg");
+    root.setAttribute("viewBox", "0 0 24 24");
+    const p = document.createElementNS(ns, "path");
+    p.setAttribute("d", path);
+    root.append(p);
+    return root;
+  }
+
+  function statCard(label, value, delta, icon) {
+    const card = el("div");
+    card.className = "card";
+    const top = el("div");
+    top.className = "card-top";
+    const text = el("div");
+    text.append(el("div", label, "stat-label"), el("div", String(value), "stat"));
+    const mark = el("div");
+    mark.className = "ico";
+    mark.append(svg(icon));
+    top.append(text, mark);
+    card.append(top);
+    if (delta) card.append(el("div", delta, "delta"));
+    return card;
+  }
+
+  function overviewModel() {
+    const week = Math.floor(Date.now() / 1000) - 7 * 86400;
+    const accounts = fixture.accounts.map((a, i) => (i === 2 ? { ...a, created_at: week + 86400 } : a));
+    return {
+      accounts: accounts.length,
+      cloud: accounts.filter((a) => a.plan === "cloud" || a.is_admin).length,
+      free: accounts.filter((a) => a.plan !== "cloud" && !a.is_admin).length,
+      new_accounts_7d: accounts.filter((a) => a.created_at >= week).length,
+      servers: fixture.servers.servers.length,
+      signins: fixture.servers.signins.length,
+      active_today: 0,
+      audit: fixture.audit.length,
+      server_list: fixture.servers.servers,
+      recent_audit: fixture.audit,
+      recent_signins: fixture.servers.signins,
+    };
+  }
+
   async function renderOverview() {
-    const data = await loadJson("/api/admin/overview", fixture.overview);
-    const cards = [
-      ["Accounts", data.accounts],
-      ["Cloud Sync", data.cloud],
-      ["Free", data.free],
-      ["Servers", data.servers],
-    ];
+    const data = preview ? overviewModel() : await loadJson("/api/admin/overview", fixture.overview);
+    const latest = preview ? fixture.latest : await latestVersion();
+    const icons = {
+      accounts: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75",
+      cloud: "M20 17.5A4.5 4.5 0 0 0 18 9h-1.3A6 6 0 1 0 6 14.5",
+      free: "M12 3l2.2 4.6L19 8.3l-3.5 3.4.8 4.8L12 14.8 7.7 16.5l.8-4.8L5 8.3l4.8-.7L12 3z",
+      servers: "M4 6h16v4H4zM4 14h16v4H4zM7 8h.01M7 16h.01",
+    };
     const wrap = el("div");
     wrap.className = "cards";
-    for (const [label, n] of cards) {
-      const c = el("div");
-      c.className = "card";
-      c.append(el("div", label, "stat-label"), el("div", String(n), "stat"));
-      wrap.append(c);
+    const fresh = Number(data.new_accounts_7d) || 0;
+    const active = Number(data.active_today) || 0;
+    wrap.append(
+      statCard("Accounts", data.accounts, fresh ? fresh + " new this week" : "", icons.accounts),
+      statCard("Cloud Sync", data.cloud, "", icons.cloud),
+      statCard("Free", data.free, "", icons.free),
+      statCard("Servers", data.servers, active ? active + " sign-ins today" : "", icons.servers),
+    );
+
+    const actions = el("div", null, "panel");
+    actions.append(el("h2", "Quick actions"));
+    const row = el("div", null, "actions");
+    const grant = el("button", "Grant plan", "primary");
+    grant.type = "button";
+    grant.addEventListener("click", () => show("accounts"));
+    const view = el("button", "View accounts", "ghost");
+    view.type = "button";
+    view.addEventListener("click", () => show("accounts"));
+    row.append(grant, view);
+    actions.append(row);
+
+    const servers = el("div", null, "panel");
+    servers.append(el("h2", "Servers"));
+    const list = data.server_list || [];
+    if (!list.length) {
+      servers.append(el("p", "No server has reported a health record yet.", "empty"));
+    } else {
+      const table = document.createElement("table");
+      table.append(rowOf(["Name", "Role", "Version", "Last seen"], true));
+      for (const s of list) {
+        const ver = el("td");
+        ver.append(document.createTextNode(s.version || "unknown"));
+        if (versionBehind(s.version, latest)) ver.append(el("span", " update available", "badge warn"));
+        const tr = document.createElement("tr");
+        tr.append(el("td", s.name || "—"), el("td", s.role || "—"), ver, el("td", date(s.reported_at), "muted"));
+        table.append(tr);
+      }
+      servers.append(table);
     }
-    const note = el("div", "Sign-ins " + data.signins + " · Audit rows " + data.audit, "panel note");
-    $("overview").replaceChildren(wrap, note);
+
+    const side = el("div");
+    const plans = el("div", null, "panel");
+    plans.append(el("h2", "Plans"));
+    const total = Math.max(1, Number(data.cloud) + Number(data.free));
+    const bar = el("div", null, "split");
+    const cloud = el("span");
+    cloud.className = "cloud";
+    cloud.style.width = Math.round((Number(data.cloud) / total) * 100) + "%";
+    const free = el("span");
+    free.className = "free";
+    free.style.width = Math.round((Number(data.free) / total) * 100) + "%";
+    bar.append(cloud, free);
+    const legend = el("div", null, "legend");
+    legend.append(el("span", "Cloud Sync " + data.cloud), el("span", "Free " + data.free));
+    plans.append(bar, legend);
+
+    const activity = el("div", null, "panel");
+    activity.append(el("h2", "Recent activity"));
+    const events = [];
+    for (const a of data.recent_audit || []) {
+      events.push({ at: a.at, text: (a.actor || "Someone") + " set " + a.email + " from " + (a.old_plan || "free") + " to " + (a.new_plan || "free") });
+    }
+    for (const s of data.recent_signins || []) {
+      events.push({ at: s.last_used_at, text: (s.email || "Account") + " signed in" + (s.device ? " · " + s.device : "") });
+    }
+    events.sort((a, b) => (b.at || 0) - (a.at || 0));
+    const feed = el("div", null, "activity");
+    if (!events.length) feed.append(el("p", "No plan changes or sign-ins yet.", "empty"));
+    else {
+      for (const ev of events.slice(0, 6)) {
+        const item = el("div", null, "item");
+        item.append(el("span", ev.text), el("span", date(ev.at), "muted"));
+        feed.append(item);
+      }
+    }
+    activity.append(feed);
+    side.append(plans, activity);
+
+    const dash = el("div", null, "dash");
+    dash.append(servers, side);
+    $("overview").replaceChildren(wrap, actions, dash);
   }
 
   function renderAccounts() {
@@ -334,7 +452,7 @@
     $("theme").textContent = light ? "Dark" : "Light";
     localStorage.setItem("pjdesk.admin.theme", light ? "light" : "dark");
   });
-  if (localStorage.getItem("pjdesk.admin.theme") === "light") {
+  if (params.get("theme") === "light" || localStorage.getItem("pjdesk.admin.theme") === "light") {
     document.body.classList.add("light");
     document.body.classList.remove("dark");
     $("theme").textContent = "Dark";

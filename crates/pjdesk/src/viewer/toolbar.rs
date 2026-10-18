@@ -35,6 +35,10 @@ pub enum Action {
     ViewSingle,
     /// Every display in one picture.
     ViewAll,
+    /// One local window per remote display.
+    ViewSeparate,
+    /// Close the screen window this bar belongs to.
+    CloseScreen,
 }
 
 /// Key combinations the "Send keys" menu can send to the host.
@@ -172,7 +176,7 @@ pub struct Toolbar {
     pub block_input: bool,
     displays: Vec<pjdesk_proto::layout::Screen>,
     current: u8,
-    view_all: bool,
+    view_mode: u8,
     screens_open: bool,
 }
 
@@ -210,7 +214,7 @@ impl Default for Toolbar {
             block_input: false,
             displays: Vec::new(),
             current: 0,
-            view_all: false,
+            view_mode: 0,
             screens_open: false,
         }
     }
@@ -223,11 +227,11 @@ fn owned(items: &[(&str, Action)]) -> Menu {
 }
 
 impl Toolbar {
-    /// The displays the host last published, and which one is showing.
-    pub fn sync(&mut self, displays: Vec<pjdesk_proto::layout::Screen>, current: u8, view_all: bool) {
+    /// The displays the host last published, which one is current, and the view mode.
+    pub fn sync(&mut self, displays: Vec<pjdesk_proto::layout::Screen>, current: u8, view_mode: u8) {
         self.displays = displays;
         self.current = current;
-        self.view_all = view_all;
+        self.view_mode = view_mode;
     }
 
     fn bar_rect(&self, win_w: usize) -> (f32, f32, f32, f32) {
@@ -267,7 +271,7 @@ impl Toolbar {
         let bi = self.buttons.iter().position(|b| matches!(b.kind, Kind::Screens))?;
         let (bx, by, _, bh) = self.bar_rect(win_w);
         let left = bx + self.buttons[bi].x;
-        let height = 8.0 + MAP_H + 8.0 + MODE_H + 8.0;
+        let height = 8.0 + MAP_H + 8.0 + MODE_H * 3.0 + 8.0;
         Some((left, by + bh + 4.0, MAP_W, height))
     }
 
@@ -290,8 +294,9 @@ impl Toolbar {
             return Some(None);
         }
         let mode_top = 8.0 + MAP_H + 8.0;
-        if local_y >= mode_top && local_y < mode_top + MODE_H {
-            let action = if local_x < MAP_W / 2.0 { Action::ViewSingle } else { Action::ViewAll };
+        if local_y >= mode_top && local_y < mode_top + MODE_H * 3.0 {
+            let row = ((local_y - mode_top) / MODE_H) as usize;
+            let action = [Action::ViewSingle, Action::ViewAll, Action::ViewSeparate][row.min(2)];
             return Some(Some(action));
         }
         Some(None)
@@ -523,10 +528,11 @@ impl Toolbar {
         if rects.is_empty() {
             draw_text(buf, win_w, win_h, mx + PAD, my + 28.0, "One screen", 0xFF_9a_a3_b5);
         }
+        let separate = self.view_mode == pjdesk_proto::peer::VIEW_SEPARATE;
+        let all = self.view_mode == pjdesk_proto::peer::VIEW_ALL;
         for r in &rects {
-            let on = !self.view_all && r.index == self.current;
-            let all = self.view_all;
-            if on || all {
+            let on = self.view_mode == pjdesk_proto::peer::VIEW_SINGLE && r.index == self.current;
+            if on || all || separate {
                 fill_round(buf, win_w, win_h, mx + r.x - 2.0, my + 8.0 + r.y - 2.0, r.w + 4.0, r.h + 4.0, 4.0, 0xFF_4d_9b_ff);
             }
             fill_round(buf, win_w, win_h, mx + r.x, my + 8.0 + r.y, r.w, r.h, 3.0, if on { 0xFF_2a_3c_52 } else { 0xFF_32_3b_4a });
@@ -543,63 +549,117 @@ impl Toolbar {
             );
         }
         let mode_y = my + 8.0 + MAP_H + 8.0;
-        let half = (MAP_W - 16.0) / 2.0;
-        let single_on = !self.view_all;
-        fill_round(
-            buf,
-            win_w,
-            win_h,
-            mx + 8.0,
-            mode_y,
-            half - 4.0,
-            MODE_H,
-            6.0,
-            if single_on { 0xFF_2a_3c_52 } else { 0xFF_2c_36_46 },
-        );
-        fill_round(
-            buf,
-            win_w,
-            win_h,
-            mx + 8.0 + half + 4.0,
-            mode_y,
-            half - 4.0,
-            MODE_H,
-            6.0,
-            if self.view_all { 0xFF_2a_3c_52 } else { 0xFF_2c_36_46 },
-        );
-        draw_text(buf, win_w, win_h, mx + 16.0, mode_y + 18.0, "One screen", 0xFF_e8_ec_f2);
-        draw_text(buf, win_w, win_h, mx + 16.0 + half, mode_y + 18.0, "All screens", 0xFF_e8_ec_f2);
+        let modes = [("One screen", 0u8), ("All screens", 1), ("Separate windows", 2)];
+        for (i, (label, mode)) in modes.iter().enumerate() {
+            let y = mode_y + i as f32 * MODE_H;
+            let on = self.view_mode == *mode;
+            fill_round(
+                buf,
+                win_w,
+                win_h,
+                mx + 8.0,
+                y,
+                MAP_W - 16.0,
+                MODE_H - 4.0,
+                6.0,
+                if on { 0xFF_2a_3c_52 } else { 0xFF_2c_36_46 },
+            );
+            draw_text(buf, win_w, win_h, mx + 16.0, y + 16.0, label, 0xFF_e8_ec_f2);
+        }
     }
 }
 
+const COMPACT_H: f32 = 36.0;
+
+/// Bottom bar on a separate screen window: the screen name, fullscreen, and close.
+pub fn compact_rect(win_w: usize, win_h: usize) -> (f32, f32, f32, f32) {
+    let w = 280.0_f32.min((win_w as f32 - 16.0).max(120.0));
+    let x = ((win_w as f32 - w) / 2.0).max(8.0);
+    let y = (win_h as f32 - COMPACT_H - 12.0).max(8.0);
+    (x, y, w, COMPACT_H)
+}
+
+pub fn compact_covers(px: f64, py: f64, win_w: usize, win_h: usize) -> bool {
+    let (x, y, w, h) = compact_rect(win_w, win_h);
+    px >= x as f64 && py >= y as f64 && px <= (x + w) as f64 && py <= (y + h) as f64
+}
+
+pub fn compact_click(px: f64, py: f64, win_w: usize, win_h: usize) -> Option<Action> {
+    let (x, y, w, h) = compact_rect(win_w, win_h);
+    if px < x as f64 || py < y as f64 || px > (x + w) as f64 || py > (y + h) as f64 {
+        return None;
+    }
+    let local = px as f32 - x;
+    if local >= w - 36.0 {
+        Some(Action::CloseScreen)
+    } else if local >= w - 118.0 {
+        Some(Action::Fullscreen)
+    } else {
+        None
+    }
+}
+
+pub fn draw_compact(buf: &mut [u32], win_w: usize, win_h: usize, label: &str) {
+    let (x, y, w, h) = compact_rect(win_w, win_h);
+    fill_round(buf, win_w, win_h, x, y, w, h, 10.0, 0xF2_14_18_22);
+    draw_text(buf, win_w, win_h, x + 12.0, y + 23.0, label, 0xFF_e8_ec_f2);
+    draw_text(buf, win_w, win_h, x + w - 110.0, y + 23.0, "Full", 0xFF_c5_d0_de);
+    draw_text(buf, win_w, win_h, x + w - 28.0, y + 23.0, "x", 0xFF_f0_8a_86);
+}
+
+pub fn draw_toast(buf: &mut [u32], win_w: usize, win_h: usize, text: &str) {
+    let tw = text_width(text) + 24.0;
+    let x = ((win_w as f32 - tw) / 2.0).max(8.0);
+    let y = (win_h as f32 * 0.72).min(win_h as f32 - 80.0).max(48.0);
+    fill_round(buf, win_w, win_h, x, y, tw, 32.0, 8.0, 0xF2_2a_24_18);
+    draw_text(buf, win_w, win_h, x + 12.0, y + 21.0, text, 0xFF_f2_b0_3a);
+}
+
+/// Icons share a 14×14 box and a 2px stroke so the bar reads as one set.
 fn draw_mark(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, mark: Mark, argb: u32) {
+    let hole = 0xFF_14_18_22;
     match mark {
         Mark::View => {
-            fill_rect(buf, w, h, x, y, 12.0, 9.0, argb);
-            fill_rect(buf, w, h, x + 2.0, y + 2.0, 8.0, 5.0, 0xFF_14_18_22);
+            fill_rect(buf, w, h, x, y + 4.0, 14.0, 6.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 6.0, 10.0, 2.0, hole);
+            fill_rect(buf, w, h, x + 5.0, y + 5.0, 4.0, 4.0, argb);
         }
         Mark::Keys => {
-            fill_rect(buf, w, h, x, y + 2.0, 12.0, 8.0, argb);
-            fill_rect(buf, w, h, x + 1.0, y + 3.0, 4.0, 2.0, 0xFF_14_18_22);
-            fill_rect(buf, w, h, x + 7.0, y + 3.0, 4.0, 2.0, 0xFF_14_18_22);
+            fill_rect(buf, w, h, x, y + 2.0, 14.0, 10.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 4.0, 10.0, 6.0, hole);
+            fill_rect(buf, w, h, x + 3.0, y + 5.0, 3.0, 2.0, argb);
+            fill_rect(buf, w, h, x + 8.0, y + 5.0, 3.0, 2.0, argb);
         }
-        Mark::Session => fill_circle(buf, w, h, x + 6.0, y + 5.0, 5.0, argb),
+        Mark::Session => {
+            fill_circle(buf, w, h, x + 7.0, y + 7.0, 6.0, argb);
+            fill_circle(buf, w, h, x + 7.0, y + 7.0, 3.0, hole);
+        }
         Mark::Files => {
-            fill_rect(buf, w, h, x + 2.0, y, 8.0, 11.0, argb);
-            fill_rect(buf, w, h, x + 4.0, y + 2.0, 4.0, 7.0, 0xFF_14_18_22);
+            fill_rect(buf, w, h, x + 1.0, y + 1.0, 12.0, 12.0, argb);
+            fill_rect(buf, w, h, x + 3.0, y + 4.0, 8.0, 7.0, hole);
+            fill_rect(buf, w, h, x + 3.0, y + 1.0, 5.0, 3.0, argb);
         }
         Mark::Chat => {
-            fill_rect(buf, w, h, x, y + 1.0, 12.0, 8.0, argb);
-            fill_rect(buf, w, h, x + 2.0, y + 8.0, 3.0, 3.0, argb);
+            fill_rect(buf, w, h, x, y + 1.0, 14.0, 9.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 3.0, 10.0, 5.0, hole);
+            fill_rect(buf, w, h, x + 3.0, y + 9.0, 3.0, 4.0, argb);
         }
-        Mark::End => fill_rect(buf, w, h, x + 2.0, y + 1.0, 8.0, 8.0, argb),
-        Mark::Collapse => {
-            fill_rect(buf, w, h, x, y + 5.0, 12.0, 2.0, argb);
+        Mark::End => {
+            fill_rect(buf, w, h, x + 2.0, y + 1.0, 10.0, 2.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 11.0, 10.0, 2.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 1.0, 2.0, 12.0, argb);
+            fill_rect(buf, w, h, x + 10.0, y + 1.0, 2.0, 12.0, argb);
+            fill_rect(buf, w, h, x + 5.0, y + 4.0, 4.0, 2.0, argb);
+            fill_rect(buf, w, h, x + 6.0, y + 4.0, 2.0, 6.0, argb);
         }
+        Mark::Collapse => fill_rect(buf, w, h, x + 1.0, y + 6.0, 12.0, 2.0, argb),
         Mark::Screens => {
-            fill_rect(buf, w, h, x, y + 2.0, 5.0, 4.0, argb);
-            fill_rect(buf, w, h, x + 6.0, y + 2.0, 5.0, 4.0, argb);
-            fill_rect(buf, w, h, x + 2.0, y + 7.0, 8.0, 4.0, argb);
+            fill_rect(buf, w, h, x, y + 1.0, 6.0, 5.0, argb);
+            fill_rect(buf, w, h, x + 8.0, y + 1.0, 6.0, 5.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 8.0, 10.0, 5.0, argb);
+            fill_rect(buf, w, h, x + 1.0, y + 2.0, 4.0, 3.0, hole);
+            fill_rect(buf, w, h, x + 9.0, y + 2.0, 4.0, 3.0, hole);
+            fill_rect(buf, w, h, x + 3.0, y + 9.0, 8.0, 3.0, hole);
         }
     }
 }
@@ -711,14 +771,15 @@ fn blend(dst: &mut u32, argb: u32, a: f32) {
 #[cfg(feature = "ui-shots")]
 pub(crate) fn render_monitor_shots(dir: &std::path::Path) {
     let _ = std::fs::create_dir_all(dir);
-    write_png(&dir.join("monitors-switcher.png"), 1100, 640, paint_switcher);
+    write_png(&dir.join("monitors-switcher.png"), 1100, 720, paint_switcher);
     write_png(&dir.join("monitors-all.png"), 1100, 640, paint_all_screens);
+    write_png(&dir.join("monitors-separate.png"), 1100, 640, paint_separate);
 }
 
 #[cfg(feature = "ui-shots")]
 fn sample_bar() -> Toolbar {
     let mut bar = Toolbar::default();
-    bar.sync(pjdesk_proto::layout::sample_layout(), 0, false);
+    bar.sync(pjdesk_proto::layout::sample_layout(), 0, 0);
     bar.visible = true;
     bar
 }
@@ -745,8 +806,29 @@ fn paint_all_screens(buf: &mut [u32], w: usize, h: usize) {
         draw_text(buf, w, h, r.x + 12.0, r.y + 28.0, &label, 0xFF_e8_ec_f2);
     }
     let mut bar = sample_bar();
-    bar.view_all = true;
+    bar.view_mode = pjdesk_proto::peer::VIEW_ALL;
     bar.draw(buf, w, h);
+}
+
+#[cfg(feature = "ui-shots")]
+fn paint_separate(buf: &mut [u32], w: usize, h: usize) {
+    buf.fill(0xFF_10_13_18);
+    let frames = [
+        (36.0_f32, 36.0, 500.0, 560.0, "Office PC — Screen 1", "Screen 1", 0xFF_2f_4a_68),
+        (564.0, 78.0, 500.0, 480.0, "Office PC — Screen 2", "Screen 2", 0xFF_2c_45_38),
+    ];
+    for (x, y, ww, hh, title, label, color) in frames {
+        fill_round(buf, w, h, x, y, ww, 32.0, 8.0, 0xFF_1c_22_2c);
+        draw_text(buf, w, h, x + 12.0, y + 21.0, title, 0xFF_e8_ec_f2);
+        fill_rect(buf, w, h, x, y + 32.0, ww, hh - 32.0, color);
+        let bar_w = 260.0;
+        let bx = x + (ww - bar_w) / 2.0;
+        let by = y + hh - 48.0;
+        fill_round(buf, w, h, bx, by, bar_w, 36.0, 10.0, 0xF2_14_18_22);
+        draw_text(buf, w, h, bx + 12.0, by + 23.0, label, 0xFF_e8_ec_f2);
+        draw_text(buf, w, h, bx + bar_w - 110.0, by + 23.0, "Full", 0xFF_c5_d0_de);
+        draw_text(buf, w, h, bx + bar_w - 28.0, by + 23.0, "x", 0xFF_f0_8a_86);
+    }
 }
 
 #[cfg(feature = "ui-shots")]
@@ -807,7 +889,7 @@ mod tests {
     #[test]
     fn screen_map_click_selects_the_display_under_the_pointer() {
         let mut bar = Toolbar::default();
-        bar.sync(pjdesk_proto::layout::sample_layout(), 0, false);
+        bar.sync(pjdesk_proto::layout::sample_layout(), 0, 0);
         let w = 1100;
         let screens = bar.buttons.iter().find(|b| matches!(b.kind, Kind::Screens)).unwrap();
         let (bx, by, _, _) = bar.bar_rect(w);
@@ -819,5 +901,19 @@ mod tests {
         let x = mx + left.x + left.w / 2.0;
         let y = my + 8.0 + left.y + left.h / 2.0;
         assert_eq!(bar.click(x as f64, y as f64, w), Some(Action::SelectDisplay(1)));
+    }
+
+    #[test]
+    fn screens_menu_offers_separate_windows() {
+        let mut bar = Toolbar::default();
+        bar.sync(pjdesk_proto::layout::sample_layout(), 0, 0);
+        let w = 1100usize;
+        let screens = bar.buttons.iter().find(|b| matches!(b.kind, Kind::Screens)).unwrap();
+        let (bx, by, _, _) = bar.bar_rect(w);
+        assert_eq!(bar.click((bx + screens.x + 8.0) as f64, (by + 12.0) as f64, w), None);
+        let (mx, my, _, _) = bar.screens_popup_rect(w).unwrap();
+        let mode_top = my + 8.0 + MAP_H + 8.0;
+        let y = mode_top + MODE_H * 2.0 + 8.0;
+        assert_eq!(bar.click((mx + 24.0) as f64, y as f64, w), Some(Action::ViewSeparate));
     }
 }

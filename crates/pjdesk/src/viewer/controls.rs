@@ -15,7 +15,7 @@ use pjdesk_proto::framing::{read_msg, MAX_CONTROL_FRAME};
 use pjdesk_proto::peer::{
     read_side_chunk, read_side_header, read_video_frame, write_side_chunk, write_side_header, Clipboard, ClipKind,
     ControlMsg, DisplayLayout, FileMsg, HostMsg, MonitorInfo, SideHeader, TunnelMsg, VideoHeader, AUDIO_MAGIC,
-    CLIP_MAGIC, FILE_MAGIC, MAX_CLIP_IMAGE, MAX_CLIP_TEXT, VIEW_ALL, VIEW_SINGLE,
+    AtlasTile, CLIP_MAGIC, FILE_MAGIC, MAX_CLIP_IMAGE, MAX_CLIP_TEXT, VIEW_ALL, VIEW_SEPARATE, VIEW_SINGLE,
 };
 use pjdesk_proto::perms::{self, has};
 use pjdesk_proto::quality;
@@ -45,6 +45,9 @@ pub struct Live {
     pub platform_version: String,
     pub view_mode: u8,
     pub current_display: u8,
+    pub atlas_w: u16,
+    pub atlas_h: u16,
+    pub atlas: Vec<AtlasTile>,
     pub remote_files: Vec<String>,
     pub transfers: Vec<Transfer>,
     pub chat: Vec<(bool, String)>,
@@ -72,6 +75,9 @@ impl Live {
             platform_version: String::new(),
             view_mode: VIEW_SINGLE,
             current_display: 0,
+            atlas_w: 0,
+            atlas_h: 0,
+            atlas: Vec::new(),
             remote_files: Vec::new(),
             transfers: Vec::new(),
             chat: Vec::new(),
@@ -109,6 +115,9 @@ impl Live {
             platform_version: self.platform_version.clone(),
             view_mode: self.view_mode,
             current_display: self.current_display,
+            atlas_w: self.atlas_w,
+            atlas_h: self.atlas_h,
+            atlas: self.atlas.clone(),
             remote_files: self.remote_files.clone(),
             transfers: self.transfers.clone(),
             chat: self.chat.clone(),
@@ -279,7 +288,11 @@ fn on_host(
             if first {
                 let mode = std::env::var("PJDESK_VIEW").ok().and_then(|s| s.parse().ok()).unwrap_or(VIEW_SINGLE);
                 let display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let mode = if mode == VIEW_ALL { VIEW_ALL } else { VIEW_SINGLE };
+                let mode = match mode {
+                    VIEW_ALL => VIEW_ALL,
+                    VIEW_SEPARATE => VIEW_SEPARATE,
+                    _ => VIEW_SINGLE,
+                };
                 let display = if g.displays.iter().any(|d| d.index == display) {
                     display
                 } else {
@@ -288,10 +301,18 @@ fn on_host(
                 g.view_mode = mode;
                 g.current_display = display;
                 let _ = control.send(ControlMsg::View { mode, display });
-                if mode == VIEW_SINGLE {
+                if mode == VIEW_SEPARATE {
+                    let displays: Vec<u8> = g.displays.iter().map(|d| d.index).collect();
+                    let _ = control.send(ControlMsg::Watch { displays });
+                } else if mode == VIEW_SINGLE {
                     let _ = control.send(ControlMsg::SelectMonitor { index: display });
                 }
             }
+        }
+        HostMsg::Atlas { width, height, tiles } => {
+            g.atlas_w = width;
+            g.atlas_h = height;
+            g.atlas = tiles;
         }
         HostMsg::Platform { family, version } => {
             g.platform_family = family.clone();

@@ -175,20 +175,19 @@ impl App {
         let p = theme::paint(ui);
         let id = row.id.clone();
         ui.horizontal(|ui| {
-            ui.set_min_height(36.0);
-            theme::icon_in(ui, os_icon(&row.os_family), 18.0, p.text);
+            ui.set_min_height(40.0);
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::hover());
+            super::icons::paint(ui.painter(), rect, os_icon(&row.os_family), p.text);
+            ui.add_space(8.0);
             if self.renaming.as_deref() == Some(id.as_str()) {
-                let edit = ui.add(egui::TextEdit::singleline(&mut self.rename_text).desired_width(180.0));
+                let edit = ui.add(egui::TextEdit::singleline(&mut self.rename_text).desired_width(COL_NAME));
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     *action = Some(RowCmd::CommitRename(id.clone()));
                 }
             } else {
-                ui.add_sized([180.0, 20.0], egui::Label::new(RichText::new(&row.name).color(p.text)));
+                left_cell(ui, COL_NAME, RichText::new(&row.name).color(p.text));
             }
-            ui.add_sized(
-                [120.0, 20.0],
-                egui::Label::new(RichText::new(format_id(&id)).monospace().color(p.muted)),
-            );
+            left_cell(ui, COL_ID, RichText::new(format_id(&id)).monospace().color(p.muted));
             if widgets::icon_button(ui, Icon::Copy, "Copy ID").clicked() {
                 ui.ctx().copy_text(format_id(&id));
                 self.toast.show("Copied");
@@ -392,13 +391,24 @@ fn ago(unix: u64) -> String {
     }
 }
 
+const COL_NAME: f32 = 210.0;
+const COL_ID: f32 = 156.0;
+
+fn left_cell(ui: &mut egui::Ui, width: f32, text: RichText) {
+    ui.allocate_ui_with_layout(Vec2::new(width, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.add(egui::Label::new(text).truncate());
+    });
+}
+
 fn header(ui: &mut egui::Ui) {
     let p = theme::paint(ui);
     ui.horizontal(|ui| {
-        ui.add_space(26.0);
-        for (w, label) in [(180.0, "Name"), (150.0, "ID"), (110.0, "Last connected"), (140.0, "System")] {
-            ui.add_sized([w, 16.0], egui::Label::new(RichText::new(label).size(12.0).color(p.muted).strong()));
-        }
+        ui.add_space(32.0);
+        left_cell(ui, COL_NAME, RichText::new("Name").size(12.0).color(p.muted).strong());
+        left_cell(ui, COL_ID, RichText::new("ID").size(12.0).color(p.muted).strong());
+        ui.add_space(28.0);
+        left_cell(ui, 110.0, RichText::new("Last connected").size(12.0).color(p.muted).strong());
+        left_cell(ui, 140.0, RichText::new("System").size(12.0).color(p.muted).strong());
     });
 }
 

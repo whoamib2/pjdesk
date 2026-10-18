@@ -119,11 +119,32 @@ pub struct PeerNote {
     pub os_family: String,
     #[serde(default)]
     pub os_version: String,
-    /// 0 = one display, 1 = all displays in one view. See `pjdesk_proto::peer::VIEW_*`.
+    /// 0 = one display, 1 = all displays, 2 = a window per display.
     #[serde(default)]
     pub view_mode: u8,
     #[serde(default)]
     pub last_display: u8,
+    /// Where each remote display's window sat, restored when those local
+    /// monitors are still attached.
+    #[serde(default)]
+    pub windows: Vec<SavedWindow>,
+}
+
+/// A separate-window placement for one remote display.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedWindow {
+    pub display: u8,
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    /// winit monitor name. Empty when the window had no monitor yet.
+    #[serde(default)]
+    pub monitor: String,
 }
 
 fn default_fps() -> u32 {

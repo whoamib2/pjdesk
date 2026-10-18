@@ -58,6 +58,30 @@ pub fn placement(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize, scale: 
     Layout { x, y, width, height }
 }
 
+/// Copies one atlas tile out of a decoded frame.
+///
+/// `atlas_w`/`atlas_h` are the capture size from the host. The decoded frame
+/// may be smaller, so the tile is scaled by the same factor as the picture.
+pub fn crop_tile(frame: &RgbFrame, atlas_w: u16, atlas_h: u16, tile_x: u16, tile_y: u16, tile_w: u16, tile_h: u16) -> Option<RgbFrame> {
+    if atlas_w == 0 || atlas_h == 0 || frame.width == 0 || frame.height == 0 || tile_w == 0 || tile_h == 0 {
+        return None;
+    }
+    let sx = frame.width as f32 / atlas_w as f32;
+    let sy = frame.height as f32 / atlas_h as f32;
+    let x0 = ((tile_x as f32 * sx).round() as isize).clamp(0, frame.width as isize - 1) as usize;
+    let y0 = ((tile_y as f32 * sy).round() as isize).clamp(0, frame.height as isize - 1) as usize;
+    let x1 = ((tile_x as f32 * sx + tile_w as f32 * sx).round() as isize).clamp(x0 as isize + 1, frame.width as isize) as usize;
+    let y1 = ((tile_y as f32 * sy + tile_h as f32 * sy).round() as isize).clamp(y0 as isize + 1, frame.height as isize) as usize;
+    let width = x1 - x0;
+    let height = y1 - y0;
+    let mut pixels = Vec::with_capacity(width * height);
+    for row in y0..y1 {
+        let start = row * frame.width + x0;
+        pixels.extend_from_slice(&frame.pixels[start..start + width]);
+    }
+    Some(RgbFrame { width, height, pixels })
+}
+
 /// Renders `frame` into the `dst_w`×`dst_h` buffer at `layout`, cropping to the
 /// window and filling everything outside the picture with the background.
 pub fn draw(frame: &RgbFrame, dst: &mut [u32], dst_w: usize, dst_h: usize, layout: Layout) {

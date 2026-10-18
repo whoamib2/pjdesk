@@ -116,7 +116,18 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         cmds,
         panel: super::panel::Panel::default(),
         restarting: false,
-        peer_id: host_id,
+        peer_id: host_id.clone(),
+        host_name,
+        extra: Vec::new(),
+        primary_display: std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
+        toast: None,
+        sent_watch: Vec::new(),
+        places: crate::config::Config::load()
+            .ok()
+            .and_then(|c| c.settings.peers.get(&host_id).map(|n| n.windows.clone()))
+            .unwrap_or_default(),
+        place_saved: Instant::now() - Duration::from_secs(5),
+        placed_primary: false,
     };
     if std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files") {
         app.panel.open = true;
@@ -275,6 +286,24 @@ struct App {
     panel: super::panel::Panel,
     restarting: bool,
     peer_id: String,
+    host_name: String,
+    extra: Vec<ExtraPane>,
+    primary_display: u8,
+    toast: Option<(String, Instant)>,
+    sent_watch: Vec<u8>,
+    places: Vec<crate::config::SavedWindow>,
+    place_saved: Instant,
+    placed_primary: bool,
+}
+
+struct ExtraPane {
+    display: u8,
+    window: Rc<Window>,
+    surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
+    layout: Layout,
+    cursor: (f64, f64),
+    /// True once a saved place or the first picture has set the window size.
+    sized: bool,
 }
 
 impl App {
@@ -355,25 +384,19 @@ impl App {
     }
 
     fn redraw(&mut self) {
-        if let Some(frame) = self.slot.latest.lock().unwrap().take() {
-            if let Some(old) = self.current.replace(frame) {
-                self.slot.spare.lock().unwrap().push(old.pixels);
-            }
-        }
+        self.pump_frame();
+        let separate = self.is_separate();
+        let display = self.primary_display;
+        let cropped = if separate { self.tile_picture(display) } else { None };
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else { return };
 
-        // On the first frame, size the window to the remote screen (within ours).
+        // On the first frame, size the window to this screen (the cropped tile
+        // in separate mode, the whole picture otherwise).
         if !self.sized_to_remote {
-            if let Some(frame) = &self.current {
+            let frame = if separate { cropped.as_ref() } else { self.current.as_ref() };
+            if let Some(frame) = frame {
                 self.sized_to_remote = true;
-                let monitor = window.current_monitor().map(|m| m.size()).unwrap_or(PhysicalSize::new(1920, 1080));
-                let scale = (monitor.width as f64 * 0.9 / frame.width as f64)
-                    .min(monitor.height as f64 * 0.85 / frame.height as f64)
-                    .min(1.0);
-                let _ = window.request_inner_size(PhysicalSize::new(
-                    (frame.width as f64 * scale) as u32,
-                    (frame.height as f64 * scale) as u32,
-                ));
+                Self::fit_remote(window, frame.width, frame.height);
             }
         }
 
@@ -384,20 +407,15 @@ impl App {
         }
         let (win_w, win_h) = (size.width as usize, size.height as usize);
         let Ok(mut buffer) = surface.buffer_mut() else { return };
-        match &self.current {
-            Some(frame) => {
-                let layout = match self.zoom {
-                    Zoom::Fit => render::fit(frame.width, frame.height, win_w, win_h),
-                    Zoom::Scale(scale) => render::placement(frame.width, frame.height, win_w, win_h, scale, self.pan),
-                };
-                self.layout = layout;
-                render::draw(frame, &mut buffer, win_w, win_h, layout);
-            }
-            None => buffer.fill(0x00_1e_1e_22),
+        let shown = if separate { cropped.as_ref() } else { self.current.as_ref() };
+        let layout = Self::paint_picture(&mut buffer, win_w, win_h, shown, self.zoom, self.pan);
+        self.layout = layout;
+        if separate && cropped.is_none() {
+            toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, 48.0, "Waiting for this screen", 0xFF_9a_a3_b5);
         }
         let snap = self.live.lock().unwrap().snapshot();
-        self.toolbar.sync(screens_of(&snap.displays), snap.current_display, snap.view_mode == pjdesk_proto::peer::VIEW_ALL);
-        self.toolbar.draw(&mut buffer, win_w, win_h);
+        self.toolbar.sync(screens_of(&snap.displays), snap.current_display, snap.view_mode);
+        Self::paint_overlay(&self.toolbar, &self.toast, &mut buffer, win_w, win_h, display, separate, true);
         self.panel.draw(&mut buffer, win_w, win_h, &snap);
         if snap.restart {
             self.restarting = true;
@@ -410,8 +428,7 @@ impl App {
         match action {
             Action::Fullscreen => {
                 if let Some(window) = &self.window {
-                    let on = window.fullscreen().is_none();
-                    window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
+                    Self::toggle_fullscreen(window);
                 }
             }
             Action::ZoomFit => {
@@ -473,6 +490,14 @@ impl App {
                 self.choose_view(pjdesk_proto::peer::VIEW_SINGLE, display);
             }
             Action::ViewAll => self.choose_view(pjdesk_proto::peer::VIEW_ALL, 0),
+            Action::ViewSeparate => {
+                let display = self.live.lock().unwrap().current_display;
+                self.primary_display = display;
+                self.sent_watch.clear();
+                self.placed_primary = false;
+                self.choose_view(pjdesk_proto::peer::VIEW_SEPARATE, display);
+            }
+            Action::CloseScreen => return self.close_primary_screen(),
         }
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -652,7 +677,7 @@ impl App {
         }
     }
 
-    fn on_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
+    fn on_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent, focused: Option<Rc<Window>>) {
         let PhysicalKey::Code(code) = event.physical_key else { return };
         let down = event.state == ElementState::Pressed;
 
@@ -686,10 +711,21 @@ impl App {
                 return;
             }
         }
+        if down && !event.repeat && code == KeyCode::F11 {
+            let window = focused.clone().or_else(|| self.window.clone());
+            if let Some(window) = window {
+                Self::toggle_fullscreen(&window);
+            }
+            return;
+        }
         if down && !event.repeat && self.modifiers.control_key() && self.modifiers.alt_key() {
             if let Some(n) = display_key(code) {
                 if let Some(index) = self.display_indexes().get(n).copied() {
-                    self.choose_view(pjdesk_proto::peer::VIEW_SINGLE, index);
+                    if self.is_separate() {
+                        self.focus_display(index);
+                    } else {
+                        self.choose_view(pjdesk_proto::peer::VIEW_SINGLE, index);
+                    }
                 }
                 return;
             }
@@ -699,9 +735,9 @@ impl App {
             }
         }
         if down && code == KeyCode::Enter && self.modifiers.control_key() && self.modifiers.alt_key() {
-            if let Some(window) = &self.window {
-                let fullscreen = window.fullscreen().is_none();
-                window.set_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
+            let window = focused.or_else(|| self.window.clone());
+            if let Some(window) = window {
+                Self::toggle_fullscreen(&window);
             }
             let _ = event_loop;
             return;
@@ -744,6 +780,21 @@ impl App {
             if over_bar {
                 return;
             }
+            if self.is_separate() && toolbar::compact_covers(position.x, position.y, win_w, window.inner_size().height as usize) {
+                window.request_redraw();
+                return;
+            }
+        }
+        if self.is_separate() {
+            if self.toolbar.block_input {
+                return;
+            }
+            let Some(window) = self.window.clone() else { return };
+            let size = window.inner_size();
+            if let Some((x, y)) = self.pointer_for(self.primary_display, position, size.width as f64, size.height as f64) {
+                self.send_pointer(self.primary_display, x, y);
+            }
+            return;
         }
         // When zoomed in past the window, pan to keep the pointer in sight: a
         // dead-zone near each edge nudges the picture along.
@@ -840,6 +891,449 @@ fn dot_cursor() -> Vec<u8> {
     rgba
 }
 
+impl App {
+    fn pump_frame(&mut self) {
+        if let Some(frame) = self.slot.latest.lock().unwrap().take() {
+            if let Some(old) = self.current.replace(frame) {
+                self.slot.spare.lock().unwrap().push(old.pixels);
+            }
+        }
+    }
+
+    fn is_separate(&self) -> bool {
+        self.live.lock().unwrap().view_mode == pjdesk_proto::peer::VIEW_SEPARATE
+    }
+
+    fn screen_named(&self, index: u8) -> String {
+        format!("{} — Screen {}", self.host_name, index + 1)
+    }
+
+    fn show_toast(&mut self, text: impl Into<String>) {
+        self.toast = Some((text.into(), Instant::now()));
+    }
+
+    fn tile_picture(&self, display: u8) -> Option<super::render::RgbFrame> {
+        let (aw, ah, tile) = {
+            let g = self.live.lock().unwrap();
+            if g.view_mode != pjdesk_proto::peer::VIEW_SEPARATE {
+                return None;
+            }
+            let tile = g.atlas.iter().copied().find(|t| t.index == display)?;
+            (g.atlas_w, g.atlas_h, tile)
+        };
+        let frame = self.current.as_ref()?;
+        super::render::crop_tile(frame, aw, ah, tile.x, tile.y, tile.width, tile.height)
+    }
+
+    fn paint_picture(buffer: &mut [u32], win_w: usize, win_h: usize, frame: Option<&super::render::RgbFrame>, zoom: Zoom, pan: (i32, i32)) -> Layout {
+        match frame {
+            Some(frame) => {
+                let layout = match zoom {
+                    Zoom::Fit => render::fit(frame.width, frame.height, win_w, win_h),
+                    Zoom::Scale(scale) => render::placement(frame.width, frame.height, win_w, win_h, scale, pan),
+                };
+                render::draw(frame, buffer, win_w, win_h, layout);
+                layout
+            }
+            None => {
+                buffer.fill(0x00_1e_1e_22);
+                Layout::default()
+            }
+        }
+    }
+
+    fn paint_overlay(
+        toolbar: &super::toolbar::Toolbar,
+        toast: &Option<(String, Instant)>,
+        buffer: &mut [u32],
+        win_w: usize,
+        win_h: usize,
+        display: u8,
+        separate: bool,
+        full_toolbar: bool,
+    ) {
+        if full_toolbar {
+            toolbar.draw(buffer, win_w, win_h);
+        }
+        if separate {
+            toolbar::draw_compact(buffer, win_w, win_h, &format!("Screen {}", display + 1));
+        }
+        if let Some((text, at)) = toast {
+            if at.elapsed() < Duration::from_secs(4) {
+                toolbar::draw_toast(buffer, win_w, win_h, text);
+            }
+        }
+    }
+
+    fn pointer_for(&self, display: u8, position: PhysicalPosition<f64>, win_w: f64, win_h: f64) -> Option<(u16, u16)> {
+        let screen = {
+            let g = self.live.lock().unwrap();
+            screens_of(&g.displays).into_iter().find(|s| s.index == display)?
+        };
+        pjdesk_proto::layout::window_to_pointer(screen, position.x as f32, position.y as f32, win_w as f32, win_h as f32)
+            .map(|(_, _, nx, ny)| (nx, ny))
+    }
+
+    fn send_pointer(&self, display: u8, x: u16, y: u16) {
+        let _ = self.control.send(ControlMsg::Pointer { display, x, y });
+    }
+
+    fn toggle_fullscreen(window: &Window) {
+        let on = window.fullscreen().is_none();
+        let target = on.then(|| Fullscreen::Borderless(window.current_monitor()));
+        window.set_fullscreen(target);
+    }
+
+    /// Restores a saved place when that local monitor is still attached.
+    /// Returns true when a saved size was applied, so the first picture does
+    /// not overwrite it.
+    fn apply_place(&self, event_loop: &ActiveEventLoop, window: &Window, display: u8) -> bool {
+        let Some(place) = self.places.iter().find(|p| p.display == display && !p.monitor.is_empty()) else {
+            return false;
+        };
+        let present = event_loop.available_monitors().filter_map(|m| m.name()).any(|n| n == place.monitor);
+        if !present {
+            return false;
+        }
+        let sized = place.width >= 320 && place.height >= 200;
+        if sized {
+            let _ = window.request_inner_size(PhysicalSize::new(place.width, place.height));
+        }
+        window.set_outer_position(PhysicalPosition::new(place.x, place.y));
+        sized
+    }
+
+    fn fit_remote(window: &Window, frame_w: usize, frame_h: usize) {
+        if frame_w == 0 || frame_h == 0 {
+            return;
+        }
+        let monitor = window.current_monitor().map(|m| m.size()).unwrap_or(PhysicalSize::new(1920, 1080));
+        let scale = (monitor.width as f64 * 0.9 / frame_w as f64)
+            .min(monitor.height as f64 * 0.85 / frame_h as f64)
+            .min(1.0);
+        let _ = window.request_inner_size(PhysicalSize::new(
+            ((frame_w as f64 * scale) as u32).max(320),
+            ((frame_h as f64 * scale) as u32).max(200),
+        ));
+    }
+
+    fn place_of(window: &Window, display: u8) -> Option<crate::config::SavedWindow> {
+        let pos = window.outer_position().ok()?;
+        let size = window.inner_size();
+        Some(crate::config::SavedWindow {
+            display,
+            x: pos.x,
+            y: pos.y,
+            width: size.width,
+            height: size.height,
+            monitor: window.current_monitor().and_then(|m| m.name()).unwrap_or_default(),
+        })
+    }
+
+    fn remember_places(&mut self, force: bool) {
+        if self.peer_id.is_empty() || !self.is_separate() {
+            return;
+        }
+        if !force && self.place_saved.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.place_saved = Instant::now();
+        let mut windows = Vec::new();
+        if let Some(window) = &self.window {
+            if let Some(place) = Self::place_of(window, self.primary_display) {
+                windows.push(place);
+            }
+        }
+        for pane in &self.extra {
+            if let Some(place) = Self::place_of(&pane.window, pane.display) {
+                windows.push(place);
+            }
+        }
+        self.places = windows.clone();
+        let id = self.peer_id.clone();
+        let mode = self.live.lock().unwrap().view_mode;
+        let display = self.primary_display;
+        std::thread::spawn(move || {
+            if let Ok(mut cfg) = crate::config::Config::load() {
+                let note = cfg.settings.peers.entry(id).or_default();
+                note.view_mode = mode;
+                note.last_display = display;
+                note.windows = windows;
+                let _ = cfg.save();
+            }
+        });
+    }
+
+    fn push_watch(&mut self) {
+        if !self.is_separate() {
+            return;
+        }
+        let mut displays = vec![self.primary_display];
+        displays.extend(self.extra.iter().map(|p| p.display));
+        displays.sort_unstable();
+        displays.dedup();
+        if displays == self.sent_watch {
+            return;
+        }
+        self.sent_watch = displays.clone();
+        let _ = self.control.send(ControlMsg::Watch { displays });
+    }
+
+    fn open_extra(&mut self, event_loop: &ActiveEventLoop, display: u8) {
+        let attributes = Window::default_attributes()
+            .with_title(self.screen_named(display))
+            .with_inner_size(PhysicalSize::new(960u32, 600u32));
+        let Ok(window) = event_loop.create_window(attributes) else { return };
+        let window = Rc::new(window);
+        let sized = self.apply_place(event_loop, &window, display);
+        if let Ok(source) = CustomCursor::from_rgba(dot_cursor(), 5, 5, 2, 2) {
+            window.set_cursor(event_loop.create_custom_cursor(source));
+        }
+        let Ok(context) = softbuffer::Context::new(window.clone()) else { return };
+        let Ok(surface) = softbuffer::Surface::new(&context, window.clone()) else { return };
+        window.request_redraw();
+        self.extra.push(ExtraPane { display, window, surface, layout: Layout::default(), cursor: (0.0, 0.0), sized });
+    }
+
+    fn promote(&mut self, pane: ExtraPane) {
+        self.primary_display = pane.display;
+        pane.window.set_title(&self.screen_named(pane.display));
+        self.window = Some(pane.window);
+        self.surface = Some(pane.surface);
+        self.sized_to_remote = pane.sized;
+    }
+
+    /// Closes the primary screen window. Returns true when that was the last
+    /// window and the session should end.
+    fn close_primary_screen(&mut self) -> bool {
+        self.remember_places(true);
+        if self.extra.is_empty() {
+            return true;
+        }
+        let pane = self.extra.remove(0);
+        let closed = self.primary_display;
+        self.promote(pane);
+        self.push_watch();
+        self.show_toast(format!("Screen {} closed", closed + 1));
+        false
+    }
+
+    fn sync_separate(&mut self, event_loop: &ActiveEventLoop) {
+        let (mode, displays) = {
+            let g = self.live.lock().unwrap();
+            (g.view_mode, g.displays.clone())
+        };
+        if mode != pjdesk_proto::peer::VIEW_SEPARATE {
+            if !self.extra.is_empty() || self.placed_primary {
+                self.extra.clear();
+                self.sent_watch.clear();
+                self.placed_primary = false;
+                if let Some(window) = &self.window {
+                    window.set_title(&self.title);
+                    window.request_redraw();
+                }
+            }
+            return;
+        }
+        let indexes: Vec<u8> = displays.iter().map(|d| d.index).collect();
+        if indexes.is_empty() {
+            return;
+        }
+        if self.sent_watch.is_empty() {
+            let current = self.live.lock().unwrap().current_display;
+            if indexes.contains(&current) {
+                self.primary_display = current;
+            } else if !indexes.contains(&self.primary_display) {
+                self.primary_display = indexes[0];
+            }
+        }
+        if !indexes.contains(&self.primary_display) {
+            let gone = self.primary_display;
+            self.show_toast(format!("Screen {} was disconnected", gone + 1));
+            if let Some(pos) = self.extra.iter().position(|p| indexes.contains(&p.display)) {
+                let pane = self.extra.remove(pos);
+                self.promote(pane);
+            } else {
+                self.primary_display = indexes[0];
+            }
+        }
+        let mut gone = Vec::new();
+        self.extra.retain(|p| {
+            if indexes.contains(&p.display) {
+                true
+            } else {
+                gone.push(p.display);
+                false
+            }
+        });
+        for display in gone {
+            self.show_toast(format!("Screen {} was disconnected", display + 1));
+        }
+        for &index in &indexes {
+            if index == self.primary_display || self.extra.iter().any(|p| p.display == index) {
+                continue;
+            }
+            self.open_extra(event_loop, index);
+        }
+        if !self.placed_primary {
+            if let Some(window) = self.window.clone() {
+                if self.apply_place(event_loop, &window, self.primary_display) {
+                    self.sized_to_remote = true;
+                }
+            }
+            self.placed_primary = true;
+        }
+        if let Some(window) = &self.window {
+            window.set_title(&self.screen_named(self.primary_display));
+        }
+        self.push_watch();
+    }
+
+    fn redraw_extra(&mut self, id: WindowId) {
+        self.pump_frame();
+        let Some(i) = self.extra.iter().position(|p| p.window.id() == id) else { return };
+        let display = self.extra[i].display;
+        let separate = self.is_separate();
+        let picture = self.tile_picture(display);
+        if !self.extra[i].sized {
+            if let Some(frame) = picture.as_ref() {
+                let window = self.extra[i].window.clone();
+                Self::fit_remote(&window, frame.width, frame.height);
+                self.extra[i].sized = true;
+            }
+        }
+        let toast = self.toast.clone();
+        let pane = &mut self.extra[i];
+        let size = pane.window.inner_size();
+        let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
+        if pane.surface.resize(width, height).is_err() {
+            return;
+        }
+        let (win_w, win_h) = (size.width as usize, size.height as usize);
+        let layout = {
+            let Ok(mut buffer) = pane.surface.buffer_mut() else { return };
+            let layout = Self::paint_picture(&mut buffer, win_w, win_h, picture.as_ref(), Zoom::Fit, (0, 0));
+            if picture.is_none() {
+                toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, 48.0, "Waiting for this screen", 0xFF_9a_a3_b5);
+            }
+            if separate {
+                toolbar::draw_compact(&mut buffer, win_w, win_h, &format!("Screen {}", display + 1));
+            }
+            if let Some((text, at)) = &toast {
+                if at.elapsed() < Duration::from_secs(4) {
+                    toolbar::draw_toast(&mut buffer, win_w, win_h, text);
+                }
+            }
+            let _ = buffer.present();
+            layout
+        };
+        pane.layout = layout;
+    }
+
+    fn extra_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let Some(display) = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.display) else {
+            return;
+        };
+        match event {
+            WindowEvent::CloseRequested => {
+                self.remember_places(true);
+                self.extra.retain(|p| p.window.id() != id);
+                self.push_watch();
+                self.show_toast(format!("Screen {} closed", display + 1));
+                if self.window.is_none() && self.extra.is_empty() {
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::RedrawRequested => self.redraw_extra(id),
+            WindowEvent::Resized(_) | WindowEvent::Moved(_) => {
+                self.remember_places(false);
+                if let Some(pane) = self.extra.iter().find(|p| p.window.id() == id) {
+                    pane.window.request_redraw();
+                }
+            }
+            WindowEvent::Focused(false) => self.release_all(),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
+                let focused = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.window.clone());
+                self.on_key(event_loop, event, focused);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(pane) = self.extra.iter_mut().find(|p| p.window.id() == id) {
+                    pane.cursor = (position.x, position.y);
+                }
+                let size = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.window.inner_size());
+                let Some(size) = size else { return };
+                let (w, h) = (size.width as usize, size.height as usize);
+                if toolbar::compact_covers(position.x, position.y, w, h) {
+                    if let Some(pane) = self.extra.iter().find(|p| p.window.id() == id) {
+                        pane.window.request_redraw();
+                    }
+                    return;
+                }
+                if self.toolbar.block_input {
+                    return;
+                }
+                if let Some((x, y)) = self.pointer_for(display, position, size.width as f64, size.height as f64) {
+                    self.send_pointer(display, x, y);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let size = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.window.inner_size());
+                let cursor = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.cursor).unwrap_or((0.0, 0.0));
+                let Some(size) = size else { return };
+                let (w, h) = (size.width as usize, size.height as usize);
+                if button == winit::event::MouseButton::Left && toolbar::compact_covers(cursor.0, cursor.1, w, h) {
+                    if state == ElementState::Pressed {
+                        if let Some(action) = toolbar::compact_click(cursor.0, cursor.1, w, h) {
+                            if action == Action::CloseScreen {
+                                self.remember_places(true);
+                                self.extra.retain(|p| p.window.id() != id);
+                                self.push_watch();
+                                self.show_toast(format!("Screen {} closed", display + 1));
+                            } else if action == Action::Fullscreen {
+                                if let Some(pane) = self.extra.iter().find(|p| p.window.id() == id) {
+                                    Self::toggle_fullscreen(&pane.window);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                if self.toolbar.block_input {
+                    return;
+                }
+                let button = match button {
+                    winit::event::MouseButton::Left => MouseButton::Left,
+                    winit::event::MouseButton::Right => MouseButton::Right,
+                    winit::event::MouseButton::Middle => MouseButton::Middle,
+                    winit::event::MouseButton::Back => MouseButton::Back,
+                    winit::event::MouseButton::Forward => MouseButton::Forward,
+                    winit::event::MouseButton::Other(_) => return,
+                };
+                self.send(InputEvent::MouseButton { button, down: state == ElementState::Pressed });
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if !self.toolbar.block_input {
+                    self.on_wheel(delta);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn focus_display(&self, index: u8) {
+        if index == self.primary_display {
+            if let Some(window) = &self.window {
+                window.focus_window();
+            }
+            return;
+        }
+        if let Some(pane) = self.extra.iter().find(|p| p.display == index) {
+            pane.window.focus_window();
+        }
+    }
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -873,19 +1367,31 @@ impl ApplicationHandler<UserEvent> for App {
         self.window = Some(window);
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         let Some(window) = self.window.clone() else { return };
         match event {
             UserEvent::Frame => {
                 if self.live.lock().unwrap().restart {
                     self.restarting = true;
-                    _event_loop.exit();
+                    event_loop.exit();
                     return;
                 }
+                self.sync_separate(event_loop);
                 window.request_redraw();
+                for pane in &self.extra {
+                    pane.window.request_redraw();
+                }
             }
             UserEvent::Title(text) => {
-                if !self.closed {
+                if self.closed {
+                    return;
+                }
+                if self.is_separate() {
+                    window.set_title(&self.screen_named(self.primary_display));
+                    for pane in &self.extra {
+                        pane.window.set_title(&self.screen_named(pane.display));
+                    }
+                } else {
                     window.set_title(&text);
                 }
             }
@@ -897,9 +1403,25 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if self.extra.iter().any(|p| p.window.id() == id) {
+            self.extra_event(event_loop, id, event);
+            return;
+        }
+        if matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_)) {
+            self.remember_places(false);
+        }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.remember_places(true);
+                if self.is_separate() {
+                    if self.close_primary_screen() {
+                        event_loop.exit();
+                    }
+                } else {
+                    event_loop.exit();
+                }
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(_) => {
                 if let Some(window) = &self.window {
@@ -909,7 +1431,7 @@ impl ApplicationHandler<UserEvent> for App {
             // Don't leave keys "held" on the host when we lose focus.
             WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
-            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.on_key(event_loop, event),
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.on_key(event_loop, event, self.window.clone()),
             WindowEvent::CursorMoved { position, .. } => self.on_cursor(position),
             WindowEvent::MouseInput { state, button, .. } => {
                 // Clicks on the toolbar (or its open menu) are handled locally.
@@ -928,13 +1450,31 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         return;
                     }
+                    if self.is_separate() && toolbar::compact_covers(self.cursor_px.0, self.cursor_px.1, win_w, win_h) {
+                        if state == ElementState::Pressed {
+                            if let Some(action) = toolbar::compact_click(self.cursor_px.0, self.cursor_px.1, win_w, win_h) {
+                                if self.perform(action) {
+                                    event_loop.exit();
+                                } else {
+                                    self.sync_separate(event_loop);
+                                }
+                            }
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                        return;
+                    }
                     if self.toolbar.covers(self.cursor_px.0, self.cursor_px.1, win_w) {
                         if state == ElementState::Pressed {
                             if let Some(action) = self.toolbar.click(self.cursor_px.0, self.cursor_px.1, win_w) {
                                 if self.perform(action) {
                                     event_loop.exit();
+                                } else {
+                                    self.sync_separate(event_loop);
                                 }
-                            } else if let Some(window) = &self.window {
+                            }
+                            if let Some(window) = &self.window {
                                 window.request_redraw();
                             }
                         }
