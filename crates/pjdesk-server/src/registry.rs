@@ -133,6 +133,7 @@ impl Registry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn group_of(&self, id: &str) -> Option<String> {
         self.data.devices.get(id).map(|d| d.group.clone())
     }

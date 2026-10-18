@@ -12,8 +12,6 @@
 //! The service keeps its own config and identity under
 //! `%ProgramData%\PJDesk\service`, locked to SYSTEM and Administrators.
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 
 pub const SERVICE_NAME: &str = "PJDesk";
@@ -82,7 +80,6 @@ pub fn clear_service_password() -> Result<()> {
 #[cfg(windows)]
 mod imp {
     use std::ffi::OsString;
-    use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
     use std::time::Duration;
 
@@ -107,7 +104,7 @@ mod imp {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     use windows_service::{define_windows_service, service_dispatcher};
 
-    use super::{DESCRIPTION, DISPLAY_NAME, FIREWALL_RULE, SERVICE_NAME};
+    use super::{DESCRIPTION, DISPLAY_NAME, SERVICE_NAME};
 
     fn manager(access: ServiceManagerAccess) -> Result<ServiceManager> {
         ServiceManager::local_computer(None::<&str>, access)
@@ -463,15 +460,10 @@ mod imp {
         }
     }
 
-    pub fn is_windows() -> bool {
-        true
-    }
-
-    pub fn _unused(_: &Path, _: PathBuf) {}
 }
 
 #[cfg(windows)]
-pub use imp::{install, is_windows, restart, run_dispatcher, start, status, stop, uninstall};
+pub use imp::{install, restart, run_dispatcher, start, status, stop, uninstall};
 
 /// The helper that actually hosts, launched by the service into a user session.
 /// Follows the input desktop and publishes a status file for the GUI.
@@ -778,8 +770,3 @@ pub fn status() -> (bool, bool) {
 }
 #[cfg(not(windows))]
 pub fn protect_service_dir() {}
-#[cfg(not(windows))]
-#[allow(dead_code)]
-fn _paths() -> PathBuf {
-    PathBuf::new()
-}

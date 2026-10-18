@@ -9,7 +9,7 @@ mod stream;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use pjdesk_proto::auth::generate_password;
 use pjdesk_proto::signal::{ClientMsg, ErrorCode, Policy, ServerMsg, SessionId};
 use pjdesk_proto::tls::TlsIdentity;
 use pjdesk_proto::udp::Role;
-use pjdesk_proto::{format_id, PEER_SERVER_NAME, PROTOCOL_VERSION};
+use pjdesk_proto::{format_id, PEER_SERVER_NAME};
 use quinn::{Connection, Endpoint};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -33,7 +33,7 @@ use crate::{p2p, HostArgs};
 /// Live status shared with a GUI (or any supervisor) while hosting.
 ///
 /// The host publishes its ID, current password and who is connected; the UI can
-/// ask for a new random password or set a specific one. All fields are safe to
+/// ask for a new random password. All fields are safe to
 /// read at any time; `None`/empty means "not known yet".
 #[derive(Default)]
 pub struct HostShared {
@@ -62,17 +62,22 @@ pub struct HostShared {
     chat: Mutex<Vec<(bool, String)>>,
     chat_out: Mutex<Vec<String>>,
     send_files: Mutex<Vec<std::path::PathBuf>>,
+    /// Lines for a transfer list. Nothing in the window reads them yet.
+    #[allow(dead_code)]
     transfers: Mutex<Vec<String>>,
-    session_perms: AtomicU32,
 }
 
 /// Shown when someone wants to connect and approval is set to prompt.
 #[derive(Clone, Debug)]
 pub struct ConsentAsk {
     pub id: u64,
+    /// Who asked, and from where. Stored for the approval prompt.
+    #[allow(dead_code)]
     pub from: String,
+    #[allow(dead_code)]
     pub ip: String,
     /// Permission bits the person may grant.
+    #[allow(dead_code)]
     pub offered: u32,
 }
 
@@ -104,10 +109,6 @@ impl HostShared {
     pub fn permanent_set(&self) -> bool {
         self.permanent_set.load(Ordering::SeqCst)
     }
-    /// Request a specific new password (used by the "set password" field).
-    pub fn request_password(&self, password: String) {
-        *self.set_password.lock().unwrap() = Some(password);
-    }
     /// Request a fresh random password.
     pub fn request_regenerate(&self) {
         self.regenerate.store(true, Ordering::SeqCst);
@@ -125,14 +126,6 @@ impl HostShared {
         *self.consent_reply.lock().unwrap() = None;
         *self.consent.lock().unwrap() = Some(ConsentAsk { id, from: from.to_string(), ip: ip.to_string(), offered });
         id
-    }
-
-    pub fn consent(&self) -> Option<ConsentAsk> {
-        self.consent.lock().unwrap().clone()
-    }
-
-    pub fn reply_consent(&self, reply: ConsentReply) {
-        *self.consent_reply.lock().unwrap() = Some(reply);
     }
 
     pub fn take_reply(&self, id: u64) -> Option<ConsentReply> {
@@ -175,10 +168,6 @@ impl HostShared {
         std::mem::take(&mut *self.chat_out.lock().unwrap())
     }
 
-    pub fn queue_send_file(&self, path: std::path::PathBuf) {
-        self.send_files.lock().unwrap().push(path);
-    }
-
     pub fn take_send_files(&self) -> Vec<std::path::PathBuf> {
         std::mem::take(&mut *self.send_files.lock().unwrap())
     }
@@ -192,17 +181,6 @@ impl HostShared {
         }
     }
 
-    pub fn transfers(&self) -> Vec<String> {
-        self.transfers.lock().unwrap().clone()
-    }
-
-    pub fn set_session_perms(&self, perms: u32) {
-        self.session_perms.store(perms, Ordering::SeqCst);
-    }
-
-    pub fn session_perms(&self) -> u32 {
-        self.session_perms.load(Ordering::SeqCst)
-    }
 }
 
 /// Connection requests that may be in setup at once. Only an authenticated
@@ -211,7 +189,7 @@ impl HostShared {
 const MAX_PENDING: usize = 3;
 
 /// Shared state of the hosting process.
-struct HostState {
+pub(crate) struct HostState {
     /// Certificate for the QUIC connection (its fingerprint goes to controllers).
     identity: TlsIdentity,
     /// The rotating one-time password, always available and shown in the app.

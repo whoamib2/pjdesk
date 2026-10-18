@@ -119,7 +119,7 @@ pub async fn change_password(server: &ServerAddr, config: &mut Config, new_passw
 /// Pushes the current address book to the server (best effort).
 pub async fn push_address_book(server: &ServerAddr, config: &mut Config) -> Result<()> {
     let token = config.account_token().context("not signed in")?;
-    let mut signal = open(server, config).await?;
+    let signal = open(server, config).await?;
     signal.send(ClientMsg::SaveAddressBook { token, entries: config.address_book.clone() })?;
     // Give the write a moment to reach the server before we drop the link.
     tokio::time::sleep(Duration::from_millis(300)).await;

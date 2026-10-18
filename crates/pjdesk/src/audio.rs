@@ -197,7 +197,7 @@ impl Player {
 fn play_wasapi(rx: std::sync::mpsc::Receiver<Vec<i16>>) {
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
-    let _ = unsafe { play_inner(rx) };
+    let _ = play_inner(rx);
     fn play_inner(rx: std::sync::mpsc::Receiver<Vec<i16>>) -> Result<()> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);

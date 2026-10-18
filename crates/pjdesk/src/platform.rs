@@ -302,7 +302,6 @@ fn privacy_thread(flag: &std::sync::atomic::AtomicBool) {
 #[cfg(windows)]
 fn privacy_window(flag: &std::sync::atomic::AtomicBool) {
     use std::sync::atomic::Ordering;
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::{CreateSolidBrush, GetStockObject, BLACK_BRUSH, HBRUSH};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -352,7 +351,7 @@ fn privacy_window(flag: &std::sync::atomic::AtomicBool) {
 
 #[cfg(windows)]
 unsafe extern "system" fn privacy_wndproc(hwnd: windows::Win32::Foundation::HWND, msg: u32, wparam: windows::Win32::Foundation::WPARAM, lparam: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::Graphics::Gdi::{DrawTextW, GetDC, ReleaseDC, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HDC, TRANSPARENT};
+    use windows::Win32::Graphics::Gdi::{DrawTextW, GetDC, ReleaseDC, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::*;
     if msg == WM_PAINT {

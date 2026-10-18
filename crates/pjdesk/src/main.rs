@@ -337,7 +337,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::UpdateTask { disable }) => service::set_update_task(!disable),
         Some(Cmd::Console) => interactive(config, cli.server),
         Some(Cmd::Service(cmd)) => service_command(cmd),
-        Some(Cmd::SessionHost { .. }) | Some(Cmd::Service(ServiceCommand::Run)) | None => {
+        Some(Cmd::SessionHost { .. }) | None => {
             unreachable!("handled in main")
         }
     }
@@ -600,7 +600,7 @@ fn init_gui_logging() {
             "info,quinn=warn,quinn_proto=warn,rustls=warn,wgpu=warn,naga=warn,eframe=warn,egui_wgpu=warn",
         )
     });
-    let mut builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
+    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
     if let Some(dir) = Config::path().parent() {
         let _ = std::fs::create_dir_all(dir);
         if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("pjdesk.log")) {

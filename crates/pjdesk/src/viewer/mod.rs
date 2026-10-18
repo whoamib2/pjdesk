@@ -62,7 +62,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         };
         let link = match link {
             Ok(link) => link,
-            Err(e) if waiting && tries < 40 => {
+            Err(_) if waiting && tries < 40 => {
                 tries += 1;
                 std::thread::sleep(Duration::from_secs(3));
                 continue;
