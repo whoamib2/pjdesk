@@ -239,7 +239,8 @@ impl HostArgs {
 #[derive(Args, Clone, Debug)]
 pub struct ConnectArgs {
     /// ID of the computer to control, with or without spaces ("123 456 789").
-    #[arg(required = true, num_args = 1..=9, value_name = "ID")]
+    /// Omit this when using --direct.
+    #[arg(required = false, num_args = 0..=9, value_name = "ID")]
     pub id: Vec<String>,
     /// Its password (asked interactively if omitted).
     #[arg(long, env = "PJDESK_PASSWORD", hide_env_values = true)]
@@ -247,6 +248,12 @@ pub struct ConnectArgs {
     /// Skip the direct (P2P) attempt and go straight through the server's relay.
     #[arg(long)]
     pub force_relay: bool,
+    /// Connect to this address instead of an ID (`192.168.1.20` or `192.168.1.20:21201`).
+    #[arg(long)]
+    pub direct: Option<String>,
+    /// Accept a new certificate for `--direct` and replace the saved pin.
+    #[arg(long)]
+    pub trust: bool,
     /// No window: receive and decode frames, print statistics and exit (testing).
     #[arg(long)]
     pub headless: bool,

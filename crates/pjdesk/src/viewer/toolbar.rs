@@ -22,7 +22,18 @@ pub enum Action {
     Keys(Combo),
     Fullscreen,
     Refresh,
+    /// Stop sending input from this window.
     ToggleBlockInput,
+    /// Ask the host to ignore its own keyboard and mouse.
+    ToggleBlockHost,
+    TogglePrivacy,
+    ToggleAudio,
+    ToggleRecord,
+    SendClipboard,
+    Restart,
+    Quality(&'static str),
+    /// Open the side panel on this tab: 0 files, 1 chat, 2 more.
+    OpenPanel(u8),
     Disconnect,
 }
 
@@ -60,7 +71,7 @@ struct Button {
 }
 
 struct Menu {
-    items: &'static [(&'static str, Action)],
+    items: Vec<(String, Action)>,
     width: f32,
 }
 
@@ -70,7 +81,7 @@ fn font() -> &'static FontRef<'static> {
 }
 
 /// Measures a label at the toolbar font size.
-fn text_width(text: &str) -> f32 {
+pub(crate) fn text_width(text: &str) -> f32 {
     let f = font().as_scaled(FONT_PX);
     let mut w = 0.0;
     let mut prev: Option<char> = None;
@@ -95,6 +106,22 @@ const ZOOM_ITEMS: &[(&str, Action)] = &[
     ("400%", Action::ZoomTo(400)),
     ("75%", Action::ZoomTo(75)),
     ("50%", Action::ZoomTo(50)),
+];
+
+const CONTROL_ITEMS: &[(&str, Action)] = &[
+    ("Full screen", Action::Fullscreen),
+    ("Refresh picture", Action::Refresh),
+    ("Block remote input", Action::ToggleBlockHost),
+    ("Privacy screen", Action::TogglePrivacy),
+    ("Audio", Action::ToggleAudio),
+    ("Send clipboard", Action::SendClipboard),
+    ("Record", Action::ToggleRecord),
+    ("Restart computer", Action::Restart),
+    ("Quality: smooth", Action::Quality("smooth")),
+    ("Quality: balanced", Action::Quality("balanced")),
+    ("Quality: sharp", Action::Quality("sharp")),
+    ("Quality: high", Action::Quality("high")),
+    ("Port forward, monitors…", Action::OpenPanel(2)),
 ];
 
 const KEY_ITEMS: &[(&str, Action)] = &[
@@ -126,17 +153,14 @@ pub struct Toolbar {
 
 impl Default for Toolbar {
     fn default() -> Self {
-        let menus = vec![
-            Menu { items: ZOOM_ITEMS, width: menu_width(ZOOM_ITEMS) },
-            Menu { items: KEY_ITEMS, width: menu_width(KEY_ITEMS) },
-        ];
+        let menus = vec![owned(ZOOM_ITEMS), owned(KEY_ITEMS), owned(CONTROL_ITEMS)];
         let spec: [(&'static str, Kind); 6] = [
-            ("Zoom \u{25be}", Kind::Menu(0)),
-            ("Send keys \u{25be}", Kind::Menu(1)),
-            ("Full screen", Kind::Act(Action::Fullscreen)),
-            ("Refresh", Kind::Act(Action::Refresh)),
-            ("Block input", Kind::Act(Action::ToggleBlockInput)),
-            ("Disconnect", Kind::Act(Action::Disconnect)),
+            ("View \u{25be}", Kind::Menu(0)),
+            ("Keys \u{25be}", Kind::Menu(1)),
+            ("Session \u{25be}", Kind::Menu(2)),
+            ("Files", Kind::Act(Action::OpenPanel(0))),
+            ("Chat", Kind::Act(Action::OpenPanel(1))),
+            ("End", Kind::Act(Action::Disconnect)),
         ];
         let mut buttons = Vec::new();
         let mut x = PAD;
@@ -145,12 +169,14 @@ impl Default for Toolbar {
             buttons.push(Button { label, kind, x, w });
             x += w;
         }
-        Toolbar { buttons, menus, width: x + PAD, visible: false, hovered_button: None, open: None, hovered_item: None, block_input: false }
+        Toolbar { buttons, menus, width: x + PAD, visible: true, hovered_button: None, open: None, hovered_item: None, block_input: false }
     }
 }
 
-fn menu_width(items: &[(&str, Action)]) -> f32 {
-    items.iter().map(|(l, _)| text_width(l)).fold(0.0_f32, f32::max) + PAD * 3.0
+fn owned(items: &[(&str, Action)]) -> Menu {
+    let items: Vec<(String, Action)> = items.iter().map(|(l, a)| ((*l).to_string(), *a)).collect();
+    let width = items.iter().map(|(l, _)| text_width(l)).fold(0.0_f32, f32::max) + PAD * 3.0;
+    Menu { items, width }
 }
 
 impl Toolbar {
@@ -264,7 +290,8 @@ impl Toolbar {
             if px >= mx as f64 && px <= (mx + mw) as f64 && py >= my as f64 && py <= (my + mh) as f64 {
                 let idx = ((py - my as f64) / ITEM_H as f64) as usize;
                 let m = self.menu_index(self.open.unwrap()).unwrap();
-                if let Some(&(_, action)) = self.menus[m].items.get(idx) {
+                if let Some((_, action)) = self.menus[m].items.get(idx) {
+                    let action = *action;
                     self.open = None;
                     return Some(action);
                 }
@@ -280,18 +307,27 @@ impl Toolbar {
             return;
         }
         let bx = self.bar_x(win_w);
-        fill_rect(buf, win_w, win_h, bx, 0.0, self.width, BAR_H, 0xF0_1b_20_28);
-        line(buf, win_w, win_h, bx, BAR_H, self.width, 0xFF_2a_30_3b);
+        fill_rect(buf, win_w, win_h, bx, 0.0, self.width, BAR_H, 0xF2_14_18_22);
+        fill_rect(buf, win_w, win_h, bx, 0.0, self.width, 2.0, 0xFF_4d_9b_ff);
+        line(buf, win_w, win_h, bx, BAR_H - 1.0, self.width, 0xFF_2a_30_3b);
 
         for (i, b) in self.buttons.iter().enumerate() {
+            let end = matches!(b.kind, Kind::Act(Action::Disconnect));
             let toggled = matches!(b.kind, Kind::Act(Action::ToggleBlockInput)) && self.block_input;
             let menu_open = self.open == Some(i);
             if self.hovered_button == Some(i) || menu_open {
-                fill_rect(buf, win_w, win_h, bx + b.x, 3.0, b.w, BAR_H - 6.0, 0xFF_30_38_46);
+                let hover = if end { 0xFF_5a_30_34 } else { 0xFF_2c_36_46 };
+                fill_rect(buf, win_w, win_h, bx + b.x + 2.0, 6.0, b.w - 4.0, BAR_H - 10.0, hover);
             } else if toggled {
-                fill_rect(buf, win_w, win_h, bx + b.x, 3.0, b.w, BAR_H - 6.0, 0xFF_3a_2a_2a);
+                fill_rect(buf, win_w, win_h, bx + b.x + 2.0, 6.0, b.w - 4.0, BAR_H - 10.0, 0xFF_3a_32_22);
             }
-            let color = if toggled { 0xFF_f2_b0_3a } else { 0xFF_e8_ec_f2 };
+            let color = if end {
+                0xFF_f0_8a_86
+            } else if toggled || menu_open {
+                0xFF_f2_b0_3a
+            } else {
+                0xFF_e8_ec_f2
+            };
             let tw = text_width(b.label);
             draw_text(buf, win_w, win_h, bx + b.x + (b.w - tw) / 2.0, 23.0, b.label, color);
         }
@@ -300,7 +336,7 @@ impl Toolbar {
             let m = self.menu_index(bi).unwrap();
             fill_rect(buf, win_w, win_h, mx, my, mw, mh, 0xF7_22_27_30);
             line(buf, win_w, win_h, mx, my + mh, mw, 0xFF_2a_30_3b);
-            for (idx, &(label, _)) in self.menus[m].items.iter().enumerate() {
+            for (idx, (label, _)) in self.menus[m].items.iter().enumerate() {
                 let iy = my + idx as f32 * ITEM_H;
                 if self.hovered_item == Some(idx) {
                     fill_rect(buf, win_w, win_h, mx + 2.0, iy + 2.0, mw - 4.0, ITEM_H - 4.0, 0xFF_32_3b_4a);
@@ -312,7 +348,7 @@ impl Toolbar {
 }
 
 /// Alpha-blends a solid rectangle (ARGB, alpha in the high byte) into `buf`.
-fn fill_rect(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, rw: f32, rh: f32, argb: u32) {
+pub(crate) fn fill_rect(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, rw: f32, rh: f32, argb: u32) {
     let (x0, y0) = (x.max(0.0) as usize, y.max(0.0) as usize);
     let x1 = ((x + rw) as usize).min(w);
     let y1 = ((y + rh) as usize).min(h);
@@ -337,7 +373,7 @@ fn line(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, len: f32, argb: u32
 }
 
 /// Rasterizes `text` with its baseline at `y`, left edge at `x`.
-fn draw_text(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, text: &str, argb: u32) {
+pub(crate) fn draw_text(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, text: &str, argb: u32) {
     let scaled = font().as_scaled(FONT_PX);
     let mut caret = x;
     let mut prev: Option<ab_glyph::GlyphId> = None;

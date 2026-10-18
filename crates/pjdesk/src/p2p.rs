@@ -181,12 +181,22 @@ pub fn host_endpoint(socket: UdpSocket, identity: &TlsIdentity) -> Result<quinn:
 
 /// QUIC endpoint for the controller, pinned to the host's certificate.
 pub fn controller_endpoint(socket: UdpSocket, host_fingerprint: Fingerprint) -> Result<quinn::Endpoint> {
-    let tls_config = tls::client_config(PinnedCertVerifier::new(Some(host_fingerprint)), ALPN_PEER)?;
+    Ok(controller_endpoint_pin(socket, Some(host_fingerprint))?.0)
+}
+
+/// Like [`controller_endpoint`], but `None` accepts the certificate on first use
+/// and returns the verifier so the caller can store the fingerprint it saw.
+pub fn controller_endpoint_pin(
+    socket: UdpSocket,
+    host_fingerprint: Option<Fingerprint>,
+) -> Result<(quinn::Endpoint, Arc<PinnedCertVerifier>)> {
+    let verifier = PinnedCertVerifier::new(host_fingerprint);
+    let tls_config = tls::client_config(verifier.clone(), ALPN_PEER)?;
     let mut client = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config)?));
     client.transport_config(transport_config());
     let mut endpoint = make_endpoint(None, socket)?;
     endpoint.set_default_client_config(client);
-    Ok(endpoint)
+    Ok((endpoint, verifier))
 }
 
 /// How the controller reached the host.

@@ -133,6 +133,27 @@ impl App {
                     .color(theme::MUTED)
                     .size(12.0),
             );
+            self.chat_box(ui);
+        });
+    }
+
+    fn chat_box(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.label(RichText::new("Chat during a session").color(theme::MUTED).size(12.0));
+        let lines = self.engine.shared.chat();
+        let start = lines.len().saturating_sub(6);
+        for (mine, line) in lines.iter().skip(start) {
+            let who = if *mine { "You" } else { "Them" };
+            ui.label(format!("{who}: {line}"));
+        }
+        ui.horizontal(|ui| {
+            let resp = ui.text_edit_singleline(&mut self.chat_draft);
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Send").clicked() || enter) && !self.chat_draft.trim().is_empty() {
+                let text = self.chat_draft.trim().to_string();
+                self.engine.shared.send_chat(text);
+                self.chat_draft.clear();
+            }
         });
     }
 
@@ -249,6 +270,29 @@ impl App {
                 let (id, pw) = (self.connect_id.clone(), self.connect_password.clone());
                 self.connect_to(&id, Some(pw));
                 self.connect_password.clear();
+            }
+
+            ui.add_space(12.0);
+            widgets::field_label(ui, "Or connect directly");
+            widgets::text_field(ui, &mut self.direct_addr, "192.168.1.20", false, false);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Connect to address").clicked() {
+                    let addr = self.direct_addr.clone();
+                    self.connect_direct(&addr);
+                }
+                if ui.button("Find on this network").clicked() {
+                    self.find_on_lan();
+                }
+            });
+            for (name, id, addr) in self.lan.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{name}  {}", pjdesk_proto::format_id(&id)));
+                    if ui.button("Connect").clicked() {
+                        self.direct_addr = addr.clone();
+                        self.connect_direct(&addr);
+                    }
+                });
             }
 
             ui.add_space(8.0);
@@ -413,6 +457,65 @@ impl App {
             let (tx, rx) = std::sync::mpsc::channel();
             self.login_rx = Some(rx);
             self.start_login(tx);
+        }
+    }
+
+    pub(super) fn change_password_window(&mut self, ctx: &egui::Context) {
+        if !self.show_change {
+            return;
+        }
+        let mut open = true;
+        let mut submit = false;
+        egui::Window::new("Change your password")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&self.password_notice).color(theme::WARN));
+                ui.add_space(8.0);
+                ui.label("New password");
+                widgets::password_field(ui, &mut self.change_pass, "at least 12 characters", &mut self.show_change_pass);
+                ui.add_space(4.0);
+                ui.label("Type it again");
+                let mut shown = self.show_change_pass;
+                widgets::password_field(ui, &mut self.change_pass2, "", &mut shown);
+                self.show_change_pass = shown;
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Change password").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Not now").clicked() {
+                        self.show_change = false;
+                    }
+                });
+            });
+        if !open {
+            self.show_change = false;
+        }
+        if submit {
+            if self.change_rx.is_some() {
+                return;
+            }
+            if self.change_pass != self.change_pass2 {
+                self.status = "The two passwords do not match.".into();
+                return;
+            }
+            let new_password = self.change_pass.clone();
+            let Some(server) = self.server_addr() else {
+                self.status = "Set your server in Settings first.".into();
+                return;
+            };
+            self.status = "Updating the password…".into();
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.change_rx = Some(rx);
+            let mut cfg = self.cfg.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let result = rt.block_on(crate::account::change_password(&server, &mut cfg, &new_password));
+                let _ = tx.send(result.map(|_| ()).map_err(|e| format!("{e:#}")));
+            });
         }
     }
 }

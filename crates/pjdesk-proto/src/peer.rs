@@ -155,6 +155,13 @@ pub enum FileMsg {
     Done { id: u64 },
     Cancel { id: u64 },
     Error { id: u64, reason: String },
+    /// Ask the host to list files in its receive folder. `path` must be empty;
+    /// the host does not browse the rest of the disk.
+    List { id: u64, path: String },
+    /// Names in that folder. `path` echoes the request.
+    Entries { id: u64, path: String, names: Vec<String> },
+    /// Ask the host to send one file from its receive folder.
+    Pull { id: u64, name: String },
 }
 
 /// A TCP forward. Data uses its own bidirectional QUIC stream, headed by the id.

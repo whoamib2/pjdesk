@@ -61,6 +61,9 @@ pub enum ClientMsg {
     GetAudit { token: String, limit: u32 },
     /// Version 3. Admin: change an account's role.
     SetRole { token: String, username: String, role: Role },
+    /// Version 3. The signed-in user replaces their own password. The server
+    /// drops saved tokens, so the client signs in again.
+    ChangePassword { token: String, new_password: String },
 }
 
 /// What a signed-in account is allowed to do on the server.

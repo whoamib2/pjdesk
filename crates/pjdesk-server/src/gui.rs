@@ -22,11 +22,17 @@ const WARN: Color32 = Color32::from_rgb(0xf2, 0xb0, 0x3a);
 const MUTED: Color32 = Color32::from_rgb(0x9a, 0xa2, 0xb1);
 const CARD: Color32 = Color32::from_rgb(0x1c, 0x20, 0x28);
 
-pub fn run(data_dir: PathBuf, port: u16) -> Result<()> {
+pub fn run(data_dir: PathBuf, port: u16, start_hidden: bool) -> Result<()> {
+    // One icon per user. A second launch asks the first window to show itself.
+    if !crate::tray::acquire_or_signal() {
+        return Ok(());
+    }
+    crate::tray::ensure_login_default();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([760.0, 720.0])
             .with_min_inner_size([620.0, 520.0])
+            .with_visible(!start_hidden)
             .with_title("PJDesk Server")
             .with_app_id("pjdesk-server")
             .with_icon(std::sync::Arc::new(egui::IconData {
@@ -212,6 +218,10 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
+                crate::tray::Action::ServiceStart => self.elevate_service("start"),
+                crate::tray::Action::ServiceStop => self.elevate_service("stop"),
+                crate::tray::Action::ServiceRestart => self.elevate_service("restart"),
+                crate::tray::Action::OpenLog => crate::tray::open_log_folder(&self.data_dir),
                 crate::tray::Action::CheckUpdates => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     let dir = self.data_dir.clone();
@@ -256,16 +266,21 @@ impl eframe::App for App {
         }
 
         if let Some(tray) = &self.tray {
-            let role = self.cloud.as_ref().map(|s| s.role.as_str()).filter(|s| !s.is_empty()).unwrap_or("off");
+            let (installed, running) = svc_status();
+            let role = self.cloud.as_ref().map(|s| s.role.as_str()).unwrap_or("");
             let epoch = self.cloud.as_ref().map(|s| s.epoch).unwrap_or(0);
-            let who = self.cloud.as_ref().map(|s| s.active_name.as_str()).filter(|s| !s.is_empty()).unwrap_or("none");
+            let who = self.cloud.as_ref().map(|s| s.active_name.as_str()).unwrap_or("");
             let upd = crate::self_update::UpdateStatus::load(&self.data_dir);
-            let available = if upd.available.is_empty() {
-                String::new()
-            } else {
-                format!("\nUpdate available: {}", upd.available)
-            };
-            tray.set_tooltip(&format!("PJDesk Server\nCloud sync: {role} · generation {epoch} · active: {who}{available}"));
+            tray.set_tooltip(&crate::tray_tip::format(&crate::tray_tip::Tip {
+                installed,
+                running,
+                hosts: self.online.len(),
+                role,
+                epoch,
+                active: who,
+                available: &upd.available,
+                last_result: &upd.last_result,
+            }));
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -439,6 +454,16 @@ impl App {
                 }
             });
             ui.add_space(8.0);
+            let mut tray_login = crate::tray::login_enabled();
+            if ui.checkbox(&mut tray_login, "Start tray at Windows sign-in").changed() {
+                crate::tray::set_login(tray_login);
+                self.status = if tray_login {
+                    "The tray icon will start when you sign in to Windows.".into()
+                } else {
+                    "The tray icon will no longer start at sign-in.".into()
+                };
+            }
+            ui.add_space(6.0);
             ui.label(RichText::new(format!("Listening port: {} (TCP + UDP)", self.port)).color(MUTED).size(12.0));
             ui.label(RichText::new(format!("Data folder: {}", self.data_dir.display())).color(MUTED).size(12.0));
             ui.add_space(4.0);
@@ -459,6 +484,14 @@ impl App {
     }
 
     /// Runs a service action in-process (the server always runs elevated).
+    fn elevate_service(&mut self, verb: &str) {
+        if run_elevated(&["service", verb]) {
+            self.status = format!("Asked Windows to {verb} the service. Approve the prompt if it appears.");
+        } else {
+            self.status = "Windows did not start the elevated service command.".into();
+        }
+    }
+
     fn run_service_action(&mut self, action: SvcAction) {
         let result = match action {
             SvcAction::Install => {

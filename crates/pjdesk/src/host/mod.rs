@@ -2,7 +2,7 @@
 
 pub mod capture;
 mod ctrl;
-mod direct;
+pub(crate) mod direct;
 mod encoder;
 mod input;
 mod stream;

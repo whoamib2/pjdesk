@@ -20,6 +20,8 @@ pub struct LoggedIn {
     pub display_name: String,
     pub is_admin: bool,
     pub address_book: Vec<AddressEntry>,
+    /// Set when an older password still works but should be replaced.
+    pub notice: String,
 }
 
 async fn open(server: &ServerAddr, config: &mut Config) -> Result<SignalClient> {
@@ -71,8 +73,10 @@ async fn finish_login(signal: &mut SignalClient, username: &str, config: &mut Co
         Ok(None) => bail!("the server closed the connection"),
         Err(_) => bail!("the server did not answer the sign-in"),
     };
-    let (token, display_name, is_admin) = match reply {
-        ServerMsg::LoginResult { ok: true, token, display_name, is_admin, .. } => (token, display_name, is_admin),
+    let (token, display_name, is_admin, notice) = match reply {
+        ServerMsg::LoginResult { ok: true, token, display_name, is_admin, message } => {
+            (token, display_name, is_admin, message)
+        }
         ServerMsg::LoginResult { ok: false, message, .. } => bail!("{message}"),
         ServerMsg::Error { message, .. } => bail!("{message}"),
         other => bail!("unexpected reply from the server: {other:?}"),
@@ -89,7 +93,27 @@ async fn finish_login(signal: &mut SignalClient, username: &str, config: &mut Co
     // Don't clobber the device identity the host thread may have just written.
     config.reload_identity_from_disk();
     config.save()?;
-    Ok(LoggedIn { display_name, is_admin, address_book: entries })
+    Ok(LoggedIn { display_name, is_admin, address_book: entries, notice })
+}
+
+/// Replaces the signed-in account's password, then signs in again with it.
+pub async fn change_password(server: &ServerAddr, config: &mut Config, new_password: &str) -> Result<LoggedIn> {
+    let username = config.account.as_ref().map(|a| a.username.clone()).context("not signed in")?;
+    let token = config.account_token().context("not signed in")?;
+    let mut signal = open(server, config).await?;
+    signal.send(ClientMsg::ChangePassword { token, new_password: new_password.to_string() })?;
+    let reply = match timeout(Duration::from_secs(15), signal.recv()).await {
+        Ok(Some(msg)) => msg,
+        Ok(None) => bail!("the server closed the connection"),
+        Err(_) => bail!("the server did not answer"),
+    };
+    match reply {
+        ServerMsg::LoginResult { ok: true, .. } => {}
+        ServerMsg::LoginResult { ok: false, message, .. } => bail!("{message}"),
+        ServerMsg::Error { message, .. } => bail!("{message}"),
+        other => bail!("unexpected reply from the server: {other:?}"),
+    }
+    login(server, config, &username, new_password).await
 }
 
 /// Pushes the current address book to the server (best effort).

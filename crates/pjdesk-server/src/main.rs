@@ -22,6 +22,7 @@ mod registry;
 mod relay;
 mod requests;
 mod self_update;
+mod tray_tip;
 #[cfg(windows)]
 mod tray;
 mod server;
@@ -39,6 +40,9 @@ use clap::{Args, Parser, Subcommand};
 struct Cli {
     #[command(flatten)]
     opts: ServerOpts,
+    /// Tray icon only, without opening the window. Windows starts this at sign-in.
+    #[arg(long, hide = true)]
+    tray: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -209,6 +213,8 @@ enum ServiceCommand {
     Start,
     /// Stop the running service.
     Stop,
+    /// Stop the service if it is running, then start it.
+    Restart,
     /// Entry point used by the Service Control Manager.
     #[command(hide = true)]
     Run,
@@ -217,7 +223,8 @@ enum ServiceCommand {
 fn main() -> Result<()> {
     // The SCM-launched `service run` has no console and sets up its own logging.
     let raw: Vec<String> = std::env::args().collect();
-    let is_background = raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run");
+    let is_background = (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"))
+        || raw.iter().any(|a| a == "--tray");
     if raw.len() > 1 && !is_background {
         ensure_console();
     }
@@ -227,10 +234,11 @@ fn main() -> Result<()> {
     match cli.command {
         None => {
             // Default: the management window on Windows; the console server
-            // elsewhere (the GUI is Windows-only).
+            // elsewhere (the GUI is Windows-only). `--tray` starts the same
+            // window hidden, so the icon is there after sign-in.
             #[cfg(windows)]
             {
-                if let Err(e) = gui::run(data_dir, cli.opts.port) {
+                if let Err(e) = gui::run(data_dir, cli.opts.port, cli.tray) {
                     fatal(&format!("PJDesk Server could not start: {e:#}"));
                 }
                 Ok(())
@@ -541,6 +549,7 @@ fn service_command(cmd: ServiceCommand, opts: ServerOpts, data_dir: PathBuf) -> 
         ServiceCommand::Uninstall => service::uninstall(),
         ServiceCommand::Start => service::start(),
         ServiceCommand::Stop => service::stop(),
+        ServiceCommand::Restart => service::restart(),
         ServiceCommand::Run => service::run_dispatcher(opts, data_dir),
     }
 }

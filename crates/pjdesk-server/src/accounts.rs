@@ -222,6 +222,16 @@ impl Accounts {
         self.save()
     }
 
+    /// Replaces the password of an existing account and drops its saved tokens.
+    pub fn set_password(&mut self, username: &str, password: &str) -> Result<()> {
+        let username = normalize_username(username);
+        crate::password_policy::require(password, &username)?;
+        let user = self.data.users.get_mut(&username).context("no such account")?;
+        user.password_hash = hash_password(password)?;
+        user.tokens.clear();
+        self.save()
+    }
+
     pub fn set_role(&mut self, username: &str, role: Role) -> Result<()> {
         let username = normalize_username(username);
         let user = self.data.users.get_mut(&username).context("no such account")?;

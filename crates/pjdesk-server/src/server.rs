@@ -789,6 +789,23 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             Some(_) => conn.error(ErrorCode::Unauthorized, "only an administrator can change roles"),
             None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
         },
+
+        ClientMsg::ChangePassword { token, new_password } => match st.accounts.user_for_token(&token) {
+            Some(username) => match st.accounts.set_password(&username, &new_password) {
+                Ok(()) => {
+                    crate::audit::AuditLog::open(&st.data_dir).record("password", &username, "changed their password");
+                    conn.send(ServerMsg::LoginResult {
+                        ok: true,
+                        token: String::new(),
+                        display_name: username,
+                        is_admin: false,
+                        message: "Password updated. Sign in again.".into(),
+                    });
+                }
+                Err(e) => conn.error(ErrorCode::BadRequest, e.to_string()),
+            },
+            None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
+        },
     }
 }
 

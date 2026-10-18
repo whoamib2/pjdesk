@@ -18,11 +18,15 @@ host, is listed in `docs/RUSTDESK-PARITY.md`.
   tunnels to ports you list. View-only and the server policy are ceilings.
   Someone at the computer is asked before a session starts, unless unattended
   access is allowed.
-* The viewer window in this release still sends the classic controls: the
-  picture, keyboard, mouse, and the existing toolbar (zoom, special keys,
-  refresh, disconnect). It does not yet offer file transfer, chat, clipboard
-  sync, recording, a monitor picker, or the other protocol 3 controls, so
-  those paths are not a working feature until a later release wires them in.
+* The viewer toolbar (View, Keys, Session, Files, Chat, End) sends those
+  controls. Files shows progress in both directions and resumes a partial
+  download. Chat, clipboard text and image, audio, monitors, quality, the
+  privacy screen, blocking the remote keyboard, and restart are on the bar or
+  the side panel. Restart asks twice, then the viewer reconnects. A direct
+  address and **Find on this network** are on the connect panel. The host's
+  permission grant is what decides which of these actually run.
+* Session recording writes an MP4 under `Videos\PJDesk`, using the size of the
+  picture. The Files list is the host's receive folder, not the whole disk.
 
 ### Cloud Sync: make this server the primary
 
@@ -78,16 +82,22 @@ host, is listed in `docs/RUSTDESK-PARITY.md`.
   an uppercase letter, a lowercase letter, a digit, and a symbol. It must not
   contain the username, start or end with a space, or match a short list of
   common passwords. The window shows a checklist and a strength meter while
-  you type. Existing passwords still sign in; a weak one gets a reminder.
+  you type. An older weak password still signs in. The app then opens
+  **Change your password** and shows the server's reason if the new one is refused.
 * This does not apply to the PJDesk Cloud sign-in on the server (pjdesk.com
   checks that password). One-time host passwords are unchanged.
 
 ### Server window
 
-* The tray tooltip shows the cloud role, generation, and active server, and
-  whether an update is available. The menu can open the window, check for
-  updates, promote, step down, sync, or exit. Closing or minimizing the window
-  leaves the tray running.
+* The tray starts when you sign in to Windows. That is on unless you turn it
+  off. The installer writes the Run key and starts the icon, so it is there
+  after install and after the next sign-in. A second launch signals the icon
+  that is already running instead of adding another.
+* The menu can open the window, start, stop, or restart the service (Windows
+  asks for administrator), check for updates, open the log folder, promote,
+  step down, sync, or exit. The tooltip names the service, how many computers
+  are connected, the cloud role, and the update status. Closing or minimizing
+  the window leaves the tray running.
 
 ## 0.3.7
 

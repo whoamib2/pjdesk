@@ -113,7 +113,7 @@ async fn announce(state: Arc<HostState>) {
 }
 
 /// Listens for LAN beacons for a few seconds. Used by the connect screen.
-pub fn discover_for(limit: Duration) -> Vec<LanBeacon> {
+pub fn discover_for(limit: Duration) -> Vec<(LanBeacon, SocketAddr)> {
     let socket = match std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], DISCOVERY_PORT))) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -125,10 +125,11 @@ pub fn discover_for(limit: Duration) -> Vec<LanBeacon> {
     let mut buf = [0u8; 512];
     while std::time::Instant::now() < deadline {
         match socket.recv_from(&mut buf) {
-            Ok((n, _)) => {
+            Ok((n, src)) => {
                 if let Ok(beacon) = discover::decode(&buf[..n]) {
-                    if !found.iter().any(|b: &LanBeacon| b.id == beacon.id && b.fingerprint == beacon.fingerprint) {
-                        found.push(beacon);
+                    if !found.iter().any(|(b, _): &(LanBeacon, SocketAddr)| b.id == beacon.id && b.fingerprint == beacon.fingerprint)
+                    {
+                        found.push((beacon, src));
                     }
                 }
             }

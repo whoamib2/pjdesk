@@ -1,7 +1,9 @@
 //! Controller mode: connect to a host by ID and show its screen.
 
 pub mod decoder;
+mod controls;
 mod keymap;
+mod panel;
 mod render;
 mod toolbar;
 mod window;
@@ -33,28 +35,53 @@ pub struct Link {
     pub host_name: String,
     pub host_id: String,
     pub path: LinkPath,
+    pub peer_proto: u16,
 }
 
 pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<()> {
+    let direct = args.direct.clone();
     let typed = args.id.join(" ");
     let target = normalize_id(&typed);
-    if !is_valid_id(&target) {
-        bail!("\"{typed}\" is not a PJDesk ID (IDs have 9 digits)");
+    if direct.is_none() && !is_valid_id(&target) {
+        bail!("\"{typed}\" is not a PJDesk ID (IDs have 9 digits). For a direct connection, pass --direct host:port.");
     }
+    let label = direct.clone().unwrap_or_else(|| format_id(&target));
     let password = match args.password.clone() {
         Some(password) => password,
-        None => rpassword::prompt_password(format!("Password for {}: ", format_id(&target)))?,
+        None => rpassword::prompt_password(format!("Password for {label}: "))?,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
-    let link = runtime.block_on(connect(&server, &mut config, &target, &password, args.force_relay))?;
-    println!("Connected to \"{}\" ({}, {})", link.host_name, format_id(&link.host_id), link.path);
-
-    if args.headless {
-        runtime.block_on(headless(link, args.frames))
-    } else {
-        window::run(runtime, link)
+    let mut waiting = false;
+    let mut tries = 0u32;
+    loop {
+        let link = if let Some(addr) = direct.clone() {
+            runtime.block_on(connect_direct(&mut config, &addr, &password, args.trust && !waiting))
+        } else {
+            runtime.block_on(connect(&server, &mut config, &target, &password, args.force_relay))
+        };
+        let link = match link {
+            Ok(link) => link,
+            Err(e) if waiting && tries < 40 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_secs(3));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        tries = 0;
+        println!("Connected to \"{}\" ({}, {})", link.host_name, format_id(&link.host_id), link.path);
+        if args.headless {
+            return runtime.block_on(headless(link, args.frames));
+        }
+        if !window::run(&runtime, link)? {
+            break;
+        }
+        waiting = true;
+        println!("Waiting for the computer to come back…");
+        std::thread::sleep(Duration::from_secs(5));
     }
+    Ok(())
 }
 
 /// Signaling → UDP binding → hole punching / relay → QUIC → password check.
@@ -132,6 +159,52 @@ async fn connect(
         host_name: if auth.peer_name.is_empty() { host_name } else { auth.peer_name },
         host_id: target.to_string(),
         path,
+        peer_proto: auth.peer_proto,
+    })
+}
+
+/// Direct IP: QUIC to `host:port` with the saved certificate pin (or first use).
+async fn connect_direct(config: &mut Config, addr: &str, password: &str, trust: bool) -> Result<Link> {
+    let socket_addr: SocketAddr = addr
+        .parse()
+        .or_else(|_| format!("{addr}:{}", pjdesk_proto::DIRECT_PORT).parse())
+        .with_context(|| format!("\"{addr}\" is not a host:port"))?;
+    let key = socket_addr.to_string();
+    let pinned = if trust {
+        None
+    } else {
+        config.settings.direct_pins.get(&key).and_then(|s| pjdesk_proto::tls::parse_fingerprint(s).ok())
+    };
+    let udp = std::net::UdpSocket::bind("0.0.0.0:0").context("opening a UDP socket")?;
+    let (endpoint, verifier) = p2p::controller_endpoint_pin(udp, pinned)?;
+    let connecting = endpoint.connect(socket_addr, pjdesk_proto::PEER_SERVER_NAME).context("starting the direct connection")?;
+    let connection = timeout(Duration::from_secs(8), connecting).await.context("the computer did not answer")??;
+    if verifier.mismatch() {
+        connection.close(1u32.into(), b"certificate mismatch");
+        bail!("this computer's key changed. Connect again and choose to trust it.");
+    }
+    if pinned.is_none() {
+        if let Some(fp) = verifier.observed() {
+            config.settings.direct_pins.insert(key, pjdesk_proto::tls::format_fingerprint(&fp));
+            let _ = config.save();
+        }
+    }
+    let auth = match session::controller_auth(&connection, password, &crate::hostname()).await {
+        Ok(auth) => auth,
+        Err(e) => {
+            connection.close(1u32.into(), b"authentication failed");
+            return Err(if e.is::<WrongPassword>() { anyhow!("wrong password") } else { e });
+        }
+    };
+    Ok(Link {
+        connection,
+        endpoint,
+        control_send: auth.send,
+        control_recv: auth.recv,
+        host_name: if auth.peer_name.is_empty() { socket_addr.to_string() } else { auth.peer_name },
+        host_id: "000000000".into(),
+        path: LinkPath::Direct(socket_addr),
+        peer_proto: auth.peer_proto,
     })
 }
 

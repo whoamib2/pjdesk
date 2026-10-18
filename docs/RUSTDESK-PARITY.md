@@ -4,10 +4,8 @@ PJDesk is a self-hosted remote desktop: an app (`pjdesk`) and a hub
 (`pjdesk-server`). This table is the RustDesk surface people actually use,
 what 0.3.7 already did, and what 0.4.0 changes. A row marked **shipped** is
 something you can use from the window or the command line. A row marked
-**host ready** is implemented on the computer being controlled and covered by
-tests or a Windows cross-compile, but the PJDesk viewer does not send it yet,
-so it is not a working feature in this release. Those paths are left in the
-tree so the next release can turn them on without another protocol change.
+**host ready** is implemented on the computer being controlled, but the viewer
+does not offer a control for it yet.
 
 A 0.3.7 peer still gets a classic desktop session. Protocol 3 messages are
 sent only after both sides agree. Account key derivation, device IDs, and the
@@ -21,26 +19,26 @@ sealed cloud-sync file list are unchanged.
 | Keyboard and mouse | shipped | shipped | |
 | Special keys (Ctrl+Alt+Del, Win, Alt+Tab, lock, Task Manager) | shipped | shipped | Toolbar still sends these as input, plus Ctrl+Alt+Del as a special command. |
 | Zoom, fit, fullscreen, refresh | shipped | shipped | |
-| View-only | setting only | host ready | The host strips keyboard, mouse, clipboard, files, restart, privacy, block-input, and tunnels. The viewer has no view-only switch for a live session. |
-| Per-permission grant | — | host ready | `Hello` negotiates a ceiling. The viewer does not send `Hello`. |
+| View-only | setting only | shipped | The host strips keyboard, mouse, clipboard, files, restart, privacy, block-input, and tunnels. The viewer keeps those controls disabled for that session. There is no separate "watch only" button on the viewer. |
+| Per-permission grant | — | shipped | The viewer sends `Hello` as soon as a protocol 3 session starts. The host grants only what its policy and the person at the computer allow. |
 | Connection approval | — | host ready | A GUI host waits for a reply; a service host writes `consent.json`. The management window does not yet show that prompt. Unattended access still accepts a permanent password when policy allows it. |
-| Unattended access | shipped | shipped | Permanent password, plus a server policy ceiling. |
-| File transfer, both ways, resume | — | host ready | Writes only under a folder the host chose. Names are checked. Nothing received is executed. No drag-and-drop and no viewer panel. |
-| Clipboard text | — | host ready | Refused in view-only. |
-| Clipboard image | — | host ready | PNG on a side stream, capped. |
+| Unattended access | shipped | shipped | Permanent password, plus a server policy ceiling. File transfer is not included in that default grant. |
+| File transfer, both ways, resume | — | shipped | Files panel, or drop a file on the viewer. Uploads go to the folder the host chose. Downloads go to `Downloads\PJDesk` and resume a partial file. Names are checked. Nothing received is executed. |
+| Clipboard text | — | shipped | Both ways, after the first sample, and only when the host allowed it. |
+| Clipboard image | — | shipped | Send clipboard, or a PNG side stream when the image is large. Capped. Refused when clipboard is not allowed. |
 | Clipboard files | — | deferred | Windows `CF_HDROP` is a different channel and is not implemented. |
-| Multi-monitor | — | host ready | The host can switch capture. The viewer shows one picture and has no monitor menu. |
-| Audio (system loopback) | — | host ready | WASAPI capture and a player exist. The viewer never asks for audio. Microphone and camera are out. |
-| Chat | — | host ready | |
-| Session recording | — | deferred | An MP4 writer exists in the protocol crate and is tested. Nothing calls it from a session, so recording is not a feature. |
-| Quality presets and adaptive bitrate | fps / bitrate settings | host ready | The host lowers bitrate when acks are late. The viewer does not send a preset. Codec stays H.264. |
-| Privacy mode (black screen) | — | host ready | A cover window on the host. The viewer cannot turn it on. |
-| Block local input | toolbar flag only | host ready | The toolbar toggle still only stops this window from sending input. It does not tell the host to block the local keyboard. |
-| Keyboard mode (map / translate) | — | host ready | |
-| Remote restart and reconnect | — | host ready | The host can restart Windows. The viewer does not request it or reconnect on its own. |
-| Direct IP (no ID server) | — | host ready | The host listens on UDP 21201 and pins the certificate. The connect window has no address field. |
-| LAN discovery | — | host ready | UDP beacon on 21202. No browse list in the window. |
-| TCP tunneling | — | host ready | Loopback ports listed on the host, unless policy allows other hosts. No viewer control. |
+| Multi-monitor | — | shipped | Session panel lists the host's monitors. The picture is the one you pick. |
+| Audio (system loopback) | — | shipped | Session menu, when the host allowed audio. Microphone and camera are out. |
+| Chat | — | shipped | Chat panel in the viewer. On the computer being shared, chat shows in the PJDesk window only when that window is the host, not when the background service is sharing. |
+| Session recording | — | shipped | Session menu. The file is an MP4 under `Videos\PJDesk`, sized to the picture. The host can turn recording off in policy. |
+| Quality presets and adaptive bitrate | fps / bitrate settings | shipped | Session menu: smooth, balanced, sharp, high. The host still lowers bitrate when acks are late. Codec stays H.264. |
+| Privacy mode (black screen) | — | shipped | Session menu, when the host allowed it. |
+| Block local input | toolbar flag only | shipped | Session menu **Block remote input** tells the host to ignore its own keyboard and mouse. This window can still control it. |
+| Keyboard mode (map / translate) | — | host ready | The host understands both. The viewer still sends scan codes. |
+| Remote restart and reconnect | — | shipped | Session menu, confirm by choosing it again. The viewer waits and reconnects. Needs the restart permission. |
+| Direct IP (no ID server) | — | shipped | Connect panel address field, and `pjdesk connect --direct host`. The certificate is pinned on first use. `--trust` replaces a changed pin. |
+| LAN discovery | — | shipped | **Find on this network** lists beacons and connects to the sender's address on UDP 21201. |
+| TCP tunneling | — | shipped | Session panel. The viewer listens on localhost and the host connects only to a listed port (loopback unless policy says otherwise). |
 | Wake-on-LAN | — | deferred | |
 | Remote terminal / shell | — | deferred | A shell as SYSTEM is a larger risk than this release should take. |
 | Printer, camera, microphone, whiteboard, plugins | — | deferred | |
@@ -67,7 +65,7 @@ sealed cloud-sync file list are unchanged.
 | --- | --- | --- | --- |
 | ID, signaling, hole punching, relay | shipped | shipped | Ports 21200 TCP and UDP. |
 | Accounts and address books | shipped | shipped | |
-| Password rules for new server passwords | 8 characters | shipped | 12 characters, upper, lower, digit, symbol, no username, no leading or trailing space, a short common-password list. Existing passwords still sign in; a weak one is flagged in the login message. The app does not show that message on a successful sign-in yet. |
+| Password rules for new server passwords | 8 characters | shipped | 12 characters, upper, lower, digit, symbol, no username, no leading or trailing space, a short common-password list. An older weak password still signs in, and the app then asks you to change it. A rejected new password is shown in the window. |
 | PJDesk Cloud sign-in on the server | shipped | unchanged | pjdesk.com checks that password. The server does not apply the new rules to it. |
 | Website account creation | shipped | shipped | The same rules run in the browser, before the key is derived. Sign-in on the site is not checked. |
 | Roles (user, operator, admin) | admin flag | shipped (CLI) | `pjdesk-server account role`. The window still has the administrator checkbox. |
@@ -77,13 +75,14 @@ sealed cloud-sync file list are unchanged.
 | Cloud Sync (account and R2) | shipped | shipped | |
 | Make this server the primary / step down | — | shipped | Window, tray, and `pjdesk-server cloud promote` / `cloud demote`. A generation number and `If-Match` keep two servers from both writing. |
 | Server auto-update | — | shipped | Off until you turn it on. See the changelog. Standby first, then primary, or 24 hours. |
-| Server tray | — | partial | Open, check for updates, promote, step down, sync, exit. Close and minimize hide the window. Not in this release: start/stop/restart from the tray, open the log folder, a host count in the tooltip, one tray per user, or starting the tray at sign-in. |
+| Server tray | — | shipped | Starts at Windows sign-in (on by default; the installer writes the Run key and starts it). One icon per user. Menu: open, start/stop/restart the service (UAC), check for updates, open the log folder, promote, step down, sync, exit. Tooltip: service, connected computers, cloud role, update status. Close and minimize hide the window. |
 | Web console, 2FA, OIDC, LDAP, custom client builder | — | deferred | RustDesk Pro features. Out of scope for a self-hosted build that keeps the current account format. |
 
 ## Left out on purpose
 
-* **Clipboard files, web client, extra codecs (NVENC, AV1, H.265), mobile, printer, camera, microphone, remote shell, plugins, whiteboard, IPv6, and a full remote file browser.** Each is a separate product surface. Shipping a button that fails halfway is worse than leaving it out.
-* **The viewer controls for protocol 3.** The host side is in place so a later viewer can use the same messages. Turning the buttons on without a Windows session to click through them would ship a half-working remote desktop. This release does not pretend those buttons exist.
+* **Clipboard files, web client, extra codecs (NVENC, AV1, H.265), mobile, printer, camera, microphone, remote shell, plugins, whiteboard, IPv6, and a whole-disk remote file browser.** The Files panel lists only the folder the host chose for received files. A browser of the rest of that disk is not included.
+* **Keyboard translate mode, and a viewer button that requests a view-only session.** The host already enforces both when they are set on that computer.
+* **Chat while the background service is the host.** The person connecting can chat. The PJDesk window on that computer shows chat only when the window itself is sharing.
 * **Code signing.** Still a manual step; the updater keeps requiring `SHA256SUMS`.
 * **Automatic failover when the primary is merely offline.** After the first promote, the generation is what decides who writes. The other server becomes primary only when someone promotes it, including while the old primary is off.
 
@@ -94,7 +93,8 @@ sealed cloud-sync file list are unchanged.
 * Re-seal unattended service passwords after the security fixes in 0.3.7, if that has not been done.
 * Both sides need 0.4.0 before any protocol 3 session behavior applies. 0.3.7 still connects for keyboard and mouse.
 * Forward UDP 21201 and 21202 only if you use direct IP or LAN discovery.
-* Pick a receive folder on the host before file transfer can write anything.
+* Pick a receive folder on the host before a file can be uploaded to it. Downloads from that folder land in `Downloads\PJDesk` on the computer you are connecting from.
+* The tray Run key is written for the Windows user who runs the installer. Other users on that PC do not get an icon until they open PJDesk Server once (the window then turns sign-in startup on).
 * A host running as SYSTEM still needs someone at the screen to approve a file transfer.
 * Server auto-update is off. Upgrading removes the old always-on “PJDesk Server Update” task. Turn the setting back on if you want it.
 * A 0.3.7 server that uploads a cloud copy drops the generation field. Fencing starts again the next time a 0.4 server is promoted.

@@ -73,6 +73,11 @@ Section "PJDesk Server (required)" SecCore
   ; every newer release on its own. The data folder under ProgramData is not
   ; touched: the key, accounts, cloud settings and the update preference stay.
   nsExec::Exec 'schtasks /Delete /TN "PJDesk Server Update" /F'
+  ; Tray icon for the user who installed, started now and at every sign-in.
+  ; The service itself cannot show a tray (it runs in session 0).
+  WriteRegDWORD HKCU "Software\PJDeskServer" "TrayAtLogin" 1
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "PJDesk Server" '"$INSTDIR\${EXE}" --tray'
+  Exec '"$INSTDIR\${EXE}" --tray'
   ; Restart the service if it was already installed. .onInstFailed starts it
   ; again when this install does not finish.
   nsExec::Exec 'net start PJDeskServer'
@@ -119,4 +124,7 @@ Section "Uninstall"
 
   DeleteRegKey HKLM "${ARP}"
   DeleteRegKey HKLM "Software\PJDeskServer"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "PJDesk Server"
+  DeleteRegValue HKCU "Software\PJDeskServer" "TrayAtLogin"
+  DeleteRegKey HKCU "Software\PJDeskServer"
 SectionEnd

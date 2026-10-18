@@ -76,6 +76,8 @@ pub struct Session {
     privacy: AtomicBool,
     blocked: AtomicBool,
     audio_stop: Arc<AtomicBool>,
+    clip_text: Mutex<Option<String>>,
+    clip_tick: AtomicU32,
     conn: Connection,
     shared: Option<Arc<HostShared>>,
     peer_name: String,
@@ -122,6 +124,8 @@ impl Session {
             privacy: AtomicBool::new(false),
             blocked: AtomicBool::new(false),
             audio_stop: Arc::new(AtomicBool::new(true)),
+            clip_text: Mutex::new(None),
+            clip_tick: AtomicU32::new(0),
             conn,
             shared,
             peer_name: grant.peer_name,
@@ -337,6 +341,7 @@ impl Session {
                 let Ok(text) = String::from_utf8(clip.bytes) else {
                     return self.deny(send, "clipboard", "clipboard text was not UTF-8").await;
                 };
+                *self.clip_text.lock().unwrap() = Some(text.clone());
                 crate::clip::set_text(&text);
             }
             ClipKind::ImagePng => {
@@ -423,9 +428,40 @@ impl Session {
                 self.outgoing.lock().unwrap().remove(&id);
                 self.note(&format!("Transfer {id} refused: {reason}"));
             }
-            FileMsg::Progress { .. } | FileMsg::Done { .. } | FileMsg::Error { .. } => {}
+            FileMsg::List { id, path } => self.list_receive(id, &path, send).await?,
+            FileMsg::Pull { name, .. } => {
+                let root = PathBuf::from(self.receive_dir.lock().unwrap().trim());
+                if let Ok(safe) = filesafe::sanitize_name(&name) {
+                    self.queue_send(send, root.join(safe)).await?;
+                }
+            }
+            FileMsg::Progress { .. } | FileMsg::Done { .. } | FileMsg::Error { .. } | FileMsg::Entries { .. } => {}
         }
         Ok(())
+    }
+
+    async fn list_receive(&self, id: u64, path: &str, send: &mut SendStream) -> Result<()> {
+        if !path.is_empty() {
+            return write_msg(send, &HostMsg::File(FileMsg::Error { id, reason: "only the receive folder can be listed".into() })).await;
+        }
+        let root = PathBuf::from(self.receive_dir.lock().unwrap().trim());
+        let mut names = Vec::new();
+        if root.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&root) {
+                for ent in rd.flatten() {
+                    let Ok(name) = ent.file_name().into_string() else { continue };
+                    if name.ends_with(".pjpart") || filesafe::sanitize_name(&name).is_err() {
+                        continue;
+                    }
+                    if ent.path().is_file() {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names.sort();
+        names.truncate(200);
+        write_msg(send, &HostMsg::File(FileMsg::Entries { id, path: String::new(), names })).await
     }
 
     async fn offer_in(&self, id: u64, name: &str, size: u64, resume_from: u64, send: &mut SendStream) -> Result<()> {
@@ -451,13 +487,17 @@ impl Session {
     }
 
     fn accept_out(&self, id: u64, resume_from: u64) {
-        let Some(job) = self.outgoing.lock().unwrap().get(&id).map(|j| OutFile {
+        let Some(mut job) = self.outgoing.lock().unwrap().get(&id).map(|j| OutFile {
             id: j.id,
             path: j.path.clone(),
             resume: resume_from,
         }) else {
             return;
         };
+        let len = std::fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+        if resume_from == 0 || resume_from > len {
+            job.resume = 0;
+        }
         let conn = self.conn.clone();
         let tx = self.host_tx.clone();
         tokio::spawn(async move {
@@ -480,7 +520,38 @@ impl Session {
                 self.queue_send(send, path).await?;
             }
         }
+        self.watch_clipboard(send).await?;
         Ok(())
+    }
+
+    async fn watch_clipboard(&self, send: &mut SendStream) -> Result<()> {
+        if !self.v3() || !self.allow(perms::CLIPBOARD) || self.view_only {
+            return Ok(());
+        }
+        let n = self.clip_tick.fetch_add(1, Ordering::Relaxed);
+        if n % 5 != 0 {
+            return Ok(());
+        }
+        let Some(text) = crate::clip::get_text() else { return Ok(()) };
+        if text.len() > MAX_CLIP_TEXT {
+            return Ok(());
+        }
+        // The guard must not live across the await below: the session task is spawned.
+        let send_it = {
+            let mut seen = self.clip_text.lock().unwrap();
+            let first = seen.is_none();
+            if seen.as_ref() == Some(&text) {
+                false
+            } else {
+                *seen = Some(text.clone());
+                !first && !text.is_empty()
+            }
+        };
+        if !send_it {
+            return Ok(());
+        }
+        let byte_len = text.len() as u32;
+        write_msg(send, &HostMsg::Clipboard(Clipboard { kind: ClipKind::Text, bytes: text.into_bytes(), byte_len })).await
     }
 
     async fn queue_send(&self, send: &mut SendStream, path: PathBuf) -> Result<()> {
@@ -668,7 +739,10 @@ fn file_id(msg: &FileMsg) -> u64 {
         | FileMsg::Progress { id, .. }
         | FileMsg::Done { id }
         | FileMsg::Cancel { id }
-        | FileMsg::Error { id, .. } => *id,
+        | FileMsg::Error { id, .. }
+        | FileMsg::List { id, .. }
+        | FileMsg::Entries { id, .. }
+        | FileMsg::Pull { id, .. } => *id,
     }
 }
 
