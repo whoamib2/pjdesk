@@ -32,7 +32,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname.startsWith("/api/")) return await api(request, env, url, ctx);
-      if (url.pathname.startsWith("/download/")) return await download(env, url, ctx);
+      if (url.pathname.startsWith("/download/")) return await download(env, url);
       return env.ASSETS.fetch(request);
     } catch (e) {
       if (e instanceof HttpError) return json({ error: e.message }, e.status);
@@ -173,7 +173,7 @@ async function api(request, env, url, ctx) {
   if (p === "/api/admin/accounts" && m === "GET") return adminAccounts(request, env);
   if (p === "/api/admin/sync" && m === "POST") return adminSetSync(request, env);
   if (p === "/api/release" && m === "GET") {
-    return json(await latestRelease(env, ctx), 200, { "cache-control": "public, max-age=300" });
+    return json(await latestRelease(env), 200, { "cache-control": "public, max-age=300" });
   }
   throw new HttpError(404, "Not found.");
 }
@@ -354,36 +354,65 @@ async function adminSetSync(request, env) {
 // ---------------------------------------------------------------------------
 // Releases and downloads (so the website never needs editing per release)
 
-async function latestRelease(env, ctx) {
-  const cache = caches.default;
-  const cacheKey = new Request("https://pjdesk-cloud.invalid/latest-release");
-  const hit = await cache.match(cacheKey);
-  if (hit) return hit.json();
-  const gh = await fetch(`https://api.github.com/repos/${env.RELEASE_REPO}/releases/latest`, {
+// The latest version comes from github.com's /releases/latest redirect, not the
+// GitHub API: the API's anonymous limit is shared by every Worker on the same
+// Cloudflare address and runs out. The installer names follow a fixed pattern.
+const RELEASE_TTL_MS = 10 * 60 * 1000;
+let releaseMemo = null; // { info, at } — kept for the life of this Worker instance
+
+function releaseInfo(repo, tag) {
+  const version = tag.replace(/^v/, "");
+  const base = `https://github.com/${repo}/releases/download/${tag}`;
+  return {
+    version,
+    client: `${base}/PJDesk-Setup-${version}.exe`,
+    server: `${base}/PJDesk-Server-Setup-${version}.exe`,
+    sums: `${base}/SHA256SUMS`,
+    notes: `https://github.com/${repo}/releases/tag/${tag}`,
+  };
+}
+
+async function latestTag(repo) {
+  const res = await fetch(`https://github.com/${repo}/releases/latest`, {
+    method: "HEAD",
+    redirect: "manual",
+    headers: { "user-agent": "pjdesk-cloud" },
+  });
+  const m = /\/releases\/tag\/([^/?#]+)/.exec(res.headers.get("location") || "");
+  if (m) return decodeURIComponent(m[1]);
+  // Fallback: the API (may be rate limited).
+  const api = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
     headers: { "user-agent": "pjdesk-cloud", accept: "application/vnd.github+json" },
   });
-  if (!gh.ok) throw new HttpError(502, "Couldn't reach GitHub for the latest release.");
-  const r = await gh.json();
-  const asset = (test) => (r.assets || []).find((a) => test(a.name))?.browser_download_url || null;
-  const info = {
-    version: String(r.tag_name || "").replace(/^v/, ""),
-    client: asset((n) => n.startsWith("PJDesk-Setup-") && n.endsWith(".exe")),
-    server: asset((n) => n.startsWith("PJDesk-Server-Setup-") && n.endsWith(".exe")),
-    sums: asset((n) => n === "SHA256SUMS"),
-    notes: r.html_url || null,
-  };
-  const res = new Response(JSON.stringify(info), {
-    headers: { "content-type": "application/json", "cache-control": "public, max-age=600" },
-  });
-  ctx.waitUntil(cache.put(cacheKey, res));
+  if (api.ok) {
+    const r = await api.json();
+    if (r.tag_name) return String(r.tag_name);
+  }
+  return null;
+}
+
+async function latestRelease(env) {
+  if (releaseMemo && Date.now() - releaseMemo.at < RELEASE_TTL_MS) return releaseMemo.info;
+  let tag = null;
+  try {
+    tag = await latestTag(env.RELEASE_REPO);
+  } catch (e) {
+    console.error("release lookup failed:", e && e.message);
+  }
+  if (!tag) {
+    if (releaseMemo) return releaseMemo.info; // stale is better than nothing
+    throw new HttpError(502, "Couldn't reach GitHub for the latest release.");
+  }
+  const info = releaseInfo(env.RELEASE_REPO, tag);
+  releaseMemo = { info, at: Date.now() };
   return info;
 }
 
-async function download(env, url, ctx) {
+async function download(env, url) {
   const what = url.pathname.split("/")[2] || "";
   let info = null;
   try {
-    info = await latestRelease(env, ctx);
+    info = await latestRelease(env);
   } catch {
     // Fall back to the releases page below.
   }
