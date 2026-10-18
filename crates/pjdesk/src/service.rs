@@ -517,8 +517,15 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
     // never written here.
     loop {
         let password = Some(shared.password()).filter(|p| !p.is_empty());
-        ServiceStatus::now(shared.id(), shared.is_online(), shared.connected_peer(), password, shared.permanent_set())
-            .write();
+        let mut status = ServiceStatus::now(
+            shared.id(),
+            shared.is_online(),
+            shared.connected_peer(),
+            password,
+            shared.permanent_set(),
+        );
+        status.rtt_ms = shared.rtt_ms();
+        status.write();
         std::thread::sleep(Duration::from_secs(2));
     }
 }

@@ -116,6 +116,10 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         panel: super::panel::Panel::default(),
         restarting: false,
     };
+    if std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files") {
+        app.panel.open = true;
+        app.panel.tab = 0;
+    }
     event_loop.run_app(&mut app)?;
 
     let restarting = app.restarting;

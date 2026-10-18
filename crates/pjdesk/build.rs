@@ -16,4 +16,23 @@ fn main() {
         }
     }
     println!("cargo:rerun-if-changed=assets/pjdesk.ico");
+    // openh264 is C++. rust-lld does not search GCC's directory for libstdc++.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.contains("linux") {
+        link_libstdcpp();
+    }
+}
+
+fn link_libstdcpp() {
+    let Ok(out) = std::process::Command::new("g++").arg("-print-file-name=libstdc++.so").output() else {
+        return;
+    };
+    let path = String::from_utf8_lossy(&out.stdout);
+    let path = path.trim();
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if dir != std::path::Path::new("") {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+    }
+    println!("cargo:rustc-link-lib=stdc++");
 }

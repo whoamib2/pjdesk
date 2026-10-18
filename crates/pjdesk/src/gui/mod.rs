@@ -1,21 +1,25 @@
 //! The PJDesk desktop app: the window you get by running `pjdesk` with no
 //! arguments (or double-clicking it).
 //!
-//! Left half shares this computer (your ID + password, served by a host thread
-//! running in the background); right half connects to another computer. A
-//! settings window and an optional sign-in to your server round it out. Each
-//! outgoing session opens in its own viewer process, so the window stays
-//! responsive.
+//! The left rail is this computer. The main column connects to another one.
+//! Each outgoing session opens in its own viewer process. Anything that can
+//! block (service control, scheduled tasks, the status file) runs on a
+//! background thread; the window only reads the latest snapshot.
 
+mod icons;
 mod panels;
+mod probe;
 mod settings;
 mod theme;
 mod tray;
 mod widgets;
 
+#[cfg(feature = "ui-shots")]
+mod shots;
+
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use eframe::egui;
@@ -27,10 +31,18 @@ use crate::host::{self, HostShared};
 use crate::signaling::ServerAddr;
 use crate::HostArgs;
 
+/// Which list is showing under the connect form.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeskTab {
+    Recent,
+    Favorites,
+    Address,
+    Lan,
+}
+
 /// Launches the app and blocks until the window is closed.
 pub fn run(server_flag: Option<String>) -> Result<()> {
     let mut config = Config::load().unwrap_or_default();
-    // A --server flag updates the saved server.
     if let Some(flag) = &server_flag {
         if let Ok(addr) = ServerAddr::parse(flag) {
             config.server = Some(addr.to_string());
@@ -40,8 +52,8 @@ pub fn run(server_flag: Option<String>) -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([940.0, 620.0])
-            .with_min_inner_size([760.0, 520.0])
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([1040.0, 680.0])
             .with_title("PJDesk")
             .with_app_id("pjdesk")
             .with_icon(std::sync::Arc::new(app_icon())),
@@ -53,14 +65,10 @@ pub fn run(server_flag: Option<String>) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// The window/taskbar icon, decoded from a raw 256×256 RGBA blob so no image
-/// decoder is needed at runtime.
 fn app_icon() -> egui::IconData {
     egui::IconData { rgba: include_bytes!("../../assets/icon_256.rgba").to_vec(), width: 256, height: 256 }
 }
 
-/// wgpu renders correctly on the broadest range of Windows GPUs here; glow is a
-/// fallback via `PJDESK_RENDERER=glow`.
 fn preferred_renderer() -> eframe::Renderer {
     match std::env::var("PJDESK_RENDERER").as_deref() {
         Ok("glow") => eframe::Renderer::Glow,
@@ -71,51 +79,58 @@ fn preferred_renderer() -> eframe::Renderer {
 /// Supervises the background host thread (the "share this computer" side).
 ///
 /// When the background service is running it hosts this computer, so the GUI
-/// stays out of the way (it would otherwise register the same device twice) and
-/// just shows the service's status.
+/// stays out of the way. The service check itself happens on the probe thread;
+/// this struct only reacts to the snapshot.
 struct Engine {
     shared: Arc<HostShared>,
     server: Option<ServerAddr>,
-    /// True when the background service is running and doing the hosting.
     service_running: bool,
+    /// False until the first probe snapshot. We do not start a host before that,
+    /// or we would register the same computer twice when the service is up.
+    ready: bool,
 }
 
 impl Engine {
-    /// Starts a host thread if a server is configured and the service isn't
-    /// already hosting; otherwise stays idle.
-    fn start(config: &Config) -> Self {
-        let service_running = crate::service::status().1;
-        let shared = Arc::new(HostShared::default());
-        let server = ServerAddr::parse(&config.effective_server()).ok();
-        if !service_running {
-            if let Some(server) = &server {
-                spawn_host(server.clone(), config.clone(), shared.clone());
-            }
+    fn idle(config: &Config) -> Self {
+        Self {
+            shared: Arc::new(HostShared::default()),
+            server: ServerAddr::parse(&config.effective_server()).ok(),
+            service_running: false,
+            ready: false,
         }
-        Self { shared, server, service_running }
     }
 
-    /// Restarts hosting with the current config (e.g. after the server or a
-    /// quality setting changed).
-    fn restart(&mut self, config: &Config) {
+    fn on_service(&mut self, config: &Config, running: bool) {
+        if !self.ready {
+            self.ready = true;
+            self.service_running = running;
+            if !running {
+                self.spawn(config);
+            }
+            return;
+        }
+        if running != self.service_running {
+            self.restart(config, running);
+        }
+    }
+
+    fn restart(&mut self, config: &Config, service_running: bool) {
         self.shared.request_stop();
-        self.service_running = crate::service::status().1;
+        self.ready = true;
+        self.service_running = service_running;
         let shared = Arc::new(HostShared::default());
         self.shared = shared.clone();
         self.server = ServerAddr::parse(&config.effective_server()).ok();
-        if !self.service_running {
-            if let Some(server) = &self.server {
-                spawn_host(server.clone(), config.clone(), shared);
+        if !service_running {
+            if let Some(server) = self.server.clone() {
+                spawn_host(server, config.clone(), shared);
             }
         }
     }
 
-    /// Re-checks whether the service is running; restarts the engine if that
-    /// changed (so the GUI starts or stops its own hosting to match).
-    fn refresh_service(&mut self, config: &Config) {
-        let running = crate::service::status().1;
-        if running != self.service_running {
-            self.restart(config);
+    fn spawn(&mut self, config: &Config) {
+        if let Some(server) = self.server.clone() {
+            spawn_host(server, config.clone(), self.shared.clone());
         }
     }
 }
@@ -132,7 +147,6 @@ fn spawn_host(server: ServerAddr, config: Config, shared: Arc<HostShared>) {
         .expect("spawn host thread");
 }
 
-/// Outcome of a background sign-in attempt.
 enum LoginMsg {
     Ok { display_name: String, notice: String },
     Err(String),
@@ -141,20 +155,16 @@ enum LoginMsg {
 pub struct App {
     cfg: Config,
     engine: Engine,
+    ctx: egui::Context,
 
-    // "Control remote" panel.
     connect_id: String,
     connect_password: String,
     remember: bool,
-
-    /// Reveal this computer's host password in the UI (masked by default).
     show_password: bool,
-    /// Input for setting a permanent password from the share panel.
     perm_input: String,
     show_perm_input: bool,
     show_connect_password: bool,
     show_login_pass: bool,
-    /// Direct address (`host` or `host:port`) and computers found on the LAN.
     direct_addr: String,
     lan: Vec<(String, String, String)>,
     lan_rx: Option<Receiver<Vec<(String, String, String)>>>,
@@ -166,46 +176,47 @@ pub struct App {
     change_rx: Option<Receiver<Result<(), String>>>,
     chat_draft: String,
 
-    // Account sign-in.
     show_login: bool,
     login_user: String,
     login_pass: String,
     login_busy: bool,
     login_rx: Option<Receiver<LoginMsg>>,
 
-    // Settings window.
     show_settings: bool,
     settings: settings::SettingsDraft,
-
-    // Add-to-address-book dialog.
     book_alias: String,
     book_target: Option<String>,
+    desk_tab: DeskTab,
+
+    /// Background service / scheduled-task snapshot. Never queried on this thread.
+    probe: Option<probe::Probe>,
+    scm_installed: bool,
+    scm_running: bool,
+    scm_known: bool,
+    svc_status: crate::syspaths::ServiceStatus,
 
     status: String,
     toast: widgets::Toast,
-    /// System-tray icon (minimize-to-tray); `None` if the system has no tray.
     tray: Option<tray::Tray>,
-    /// The app logo texture, shown in the header.
     logo: Option<egui::TextureHandle>,
-    /// Set when the user picks Quit from the tray, so the close isn't trapped.
     really_quit: bool,
-    /// Whether we've shown the "still running in the tray" hint once.
     told_tray: bool,
-    last_service_check: std::time::Instant,
-    /// Cached service status, refreshed on a timer so we don't read the status
-    /// file from disk on every repaint (which makes typing feel laggy).
-    svc_status: crate::syspaths::ServiceStatus,
-    svc_status_at: std::time::Instant,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, cfg: Config) -> Self {
-        theme::apply(&cc.egui_ctx);
-        let engine = Engine::start(&cfg);
-        let settings = settings::SettingsDraft::from_config(&cfg);
+        Self::create(cc, cfg, false)
+    }
+
+    fn create(cc: &eframe::CreationContext<'_>, cfg: Config, preview: bool) -> Self {
+        theme::install_fonts(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx, &cfg.settings.theme);
+        let engine = Engine::idle(&cfg);
+        let settings = settings::SettingsDraft::from_config(&cfg, None);
         let mut app = Self {
             cfg,
             engine,
+            ctx: cc.egui_ctx.clone(),
             connect_id: String::new(),
             connect_password: String::new(),
             remember: false,
@@ -233,6 +244,12 @@ impl App {
             settings,
             book_alias: String::new(),
             book_target: None,
+            desk_tab: DeskTab::Recent,
+            probe: if preview { None } else { Some(probe::Probe::start(cc.egui_ctx.clone())) },
+            scm_installed: false,
+            scm_running: false,
+            scm_known: false,
+            svc_status: crate::syspaths::ServiceStatus::default(),
             status: String::new(),
             toast: widgets::Toast::default(),
             tray: tray::Tray::new(&cc.egui_ctx),
@@ -243,22 +260,65 @@ impl App {
             )),
             really_quit: false,
             told_tray: false,
-            last_service_check: std::time::Instant::now(),
-            svc_status: crate::syspaths::ServiceStatus::load().unwrap_or_default(),
-            svc_status_at: std::time::Instant::now(),
         };
-        // Refresh a saved sign-in in the background.
         if app.cfg.account.is_some() {
             app.start_token_refresh();
         }
         app
     }
 
+    #[cfg(feature = "ui-shots")]
+    fn load_preview(&mut self, open_settings: bool) {
+        self.engine.ready = true;
+        self.engine.service_running = true;
+        self.scm_known = true;
+        self.scm_installed = true;
+        self.scm_running = true;
+        self.svc_status = crate::syspaths::ServiceStatus {
+            id: Some("902488771".into()),
+            online: true,
+            connected: None,
+            password: Some("a1b2c3d4".into()),
+            permanent_set: false,
+            rtt_ms: 18,
+            updated_unix: unix_now(),
+        };
+        self.connect_id = "123 456 789".into();
+        self.cfg.server = Some(pjdesk_proto::DEFAULT_SERVER.into());
+        self.cfg.address_book = vec![
+            pjdesk_proto::signal::AddressEntry {
+                id: "123456789".into(),
+                alias: "Office PC".into(),
+                password: Some("saved-secret".into()),
+                ..Default::default()
+            },
+            pjdesk_proto::signal::AddressEntry {
+                id: "555666777".into(),
+                alias: "Laptop".into(),
+                ..Default::default()
+            },
+        ];
+        let now = unix_now();
+        self.cfg.settings.peers.insert(
+            "123456789".into(),
+            crate::config::PeerNote { favorite: true, last_connected: now.saturating_sub(3600) },
+        );
+        self.cfg.settings.peers.insert(
+            "555666777".into(),
+            crate::config::PeerNote { favorite: false, last_connected: now.saturating_sub(86_400) },
+        );
+        self.desk_tab = DeskTab::Recent;
+        if open_settings {
+            self.settings = settings::SettingsDraft::from_config(&self.cfg, Some(true));
+            self.settings.preview_security();
+            self.show_settings = true;
+        }
+    }
+
     fn server_addr(&self) -> Option<ServerAddr> {
         ServerAddr::parse(&self.cfg.effective_server()).ok()
     }
 
-    /// Saves config without clobbering the identity the host thread owns.
     fn save_cfg(&mut self) {
         self.cfg.reload_identity_from_disk();
         if let Err(e) = self.cfg.save() {
@@ -266,8 +326,14 @@ impl App {
         }
     }
 
-    /// Sets a permanent password (kept in addition to the one-time password —
-    /// both let a controller in). Applies to the service too when it's hosting.
+    fn hosting_by_service(&self) -> bool {
+        if self.scm_known {
+            self.scm_running
+        } else {
+            self.engine.service_running
+        }
+    }
+
     fn set_permanent_password(&mut self, pw: &str) {
         let pw = pw.trim();
         if pw.is_empty() {
@@ -279,30 +345,92 @@ impl App {
         }
         self.cfg.settings.set_permanent_password(Some(pw));
         self.save_cfg();
-        if crate::service::status().0 {
+        if self.scm_known && self.scm_installed {
             crate::platform::run_elevated_with_password(&["service", "configure"], pw);
+            self.toast.show("Approve the administrator prompt, then the password is set");
         }
         let cfg = self.cfg.clone();
-        self.engine.restart(&cfg);
+        self.engine.restart(&cfg, self.hosting_by_service());
         self.perm_input.clear();
-        self.toast.show("Permanent password set");
+        if !(self.scm_known && self.scm_installed) {
+            self.toast.show("Permanent password set");
+        }
     }
 
-    /// Removes the permanent password, leaving only the rotating one-time
-    /// password. Clears it everywhere it's stored and restarts hosting.
     fn remove_permanent_password(&mut self) {
         self.cfg.settings.set_permanent_password(None);
         self.save_cfg();
-        // If the background service is the one hosting, clear its password too.
-        if crate::service::status().0 {
+        if self.scm_known && self.scm_installed {
             crate::platform::run_elevated(&["service", "configure", "--clear-password"]);
         }
         let cfg = self.cfg.clone();
-        self.engine.restart(&cfg);
+        self.engine.restart(&cfg, self.hosting_by_service());
         self.toast.show("Permanent password removed");
     }
 
-    // --- Account ----------------------------------------------------------
+    fn poll_probe(&mut self) {
+        let snap = {
+            let Some(probe) = &mut self.probe else { return };
+            if !probe.poll() {
+                return;
+            }
+            probe.latest.clone()
+        };
+        self.scm_installed = snap.installed;
+        self.scm_running = snap.running;
+        self.scm_known = true;
+        self.svc_status = snap.svc;
+        let cfg = self.cfg.clone();
+        self.engine.on_service(&cfg, snap.running);
+    }
+
+    fn share_rtt(&self) -> u64 {
+        if self.engine.service_running {
+            self.svc_status.rtt_ms
+        } else {
+            self.engine.shared.rtt_ms()
+        }
+    }
+
+    fn recent_ids(&self) -> Vec<String> {
+        let mut ids: Vec<(String, u64)> = self
+            .cfg
+            .settings
+            .peers
+            .iter()
+            .filter(|(_, note)| note.last_connected > 0)
+            .map(|(id, note)| (id.clone(), note.last_connected))
+            .collect();
+        ids.sort_by(|a, b| b.1.cmp(&a.1));
+        ids.into_iter().map(|(id, _)| id).collect()
+    }
+
+    fn saved_for(&self, id: &str) -> Option<String> {
+        self.cfg
+            .address_book
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.password.clone())
+            .filter(|p| !p.is_empty())
+            .or_else(|| self.cfg.saved_password(id))
+    }
+
+    fn mark_recent(&mut self, id: &str) {
+        let note = self.cfg.settings.peers.entry(id.to_string()).or_default();
+        note.last_connected = unix_now();
+        self.save_cfg();
+    }
+
+    fn toggle_favorite(&mut self, id: &str) {
+        let note = self.cfg.settings.peers.entry(id.to_string()).or_default();
+        note.favorite = !note.favorite;
+        let on = note.favorite;
+        if !on && note.last_connected == 0 {
+            self.cfg.settings.peers.remove(id);
+        }
+        self.save_cfg();
+        self.toast.show(if on { "Added to favorites" } else { "Removed from favorites" });
+    }
 
     fn start_token_refresh(&mut self) {
         let Some(server) = self.server_addr() else { return };
@@ -318,8 +446,6 @@ impl App {
                     return;
                 }
             };
-            // account::refresh persists the token + address book itself (with
-            // the identity guard), so we don't save the stale clone here.
             match rt.block_on(account::refresh(&server, &mut cfg)) {
                 Ok(Some(info)) => {
                     let _ = tx.send(LoginMsg::Ok { display_name: info.display_name, notice: info.notice });
@@ -348,7 +474,6 @@ impl App {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             match rt.block_on(account::login(&server, &mut cfg, &user, &pass)) {
                 Ok(info) => {
-                    // account::login already saved the token + address book.
                     let _ = tx.send(LoginMsg::Ok { display_name: info.display_name, notice: info.notice });
                 }
                 Err(e) => {
@@ -366,7 +491,6 @@ impl App {
                 self.login_rx = None;
                 self.show_login = false;
                 self.login_pass.clear();
-                // The worker saved the token + address book to disk; reload it.
                 let keep_id = (self.cfg.device_id.clone(), self.cfg.device_secret.clone());
                 if let Ok(fresh) = Config::load() {
                     self.cfg = fresh;
@@ -437,7 +561,6 @@ impl App {
         self.toast.show("Signed out");
     }
 
-    /// Pushes the address book to the server after a local change.
     fn sync_address_book(&mut self) {
         self.save_cfg();
         if self.cfg.account.is_none() {
@@ -451,17 +574,14 @@ impl App {
         });
     }
 
-    // --- Connecting -------------------------------------------------------
-
-    /// Launches a viewer process for `id`, using `password` (or a saved one).
-    fn connect_to(&mut self, id: &str, password: Option<String>) {
+    fn connect_to(&mut self, id: &str, password: Option<String>, files: bool) {
         let id = normalize_id(id);
         if !is_valid_id(&id) {
             self.status = "That isn't a 9-digit PJDesk ID.".into();
             return;
         }
         let server = self.cfg.effective_server();
-        let password = password.filter(|p| !p.is_empty()).or_else(|| self.cfg.saved_password(&id)).unwrap_or_default();
+        let password = password.filter(|p| !p.is_empty()).or_else(|| self.saved_for(&id)).unwrap_or_default();
 
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
@@ -475,15 +595,19 @@ impl App {
         if !password.is_empty() {
             cmd.env("PJDESK_PASSWORD", &password);
         }
-        // Don't let the spawned viewer flash a console window.
+        if files {
+            cmd.env("PJDESK_OPEN_PANEL", "files");
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            cmd.creation_flags(0x0800_0000);
         }
         match cmd.spawn() {
             Ok(_) => {
-                self.toast.show(format!("Opening {}", format_id(&id)));
+                self.mark_recent(&id);
+                let what = if files { "Opening file transfer for" } else { "Opening" };
+                self.toast.show(format!("{what} {}", format_id(&id)));
                 if self.remember && !password.is_empty() {
                     self.remember_password(&id, &password);
                 }
@@ -493,7 +617,6 @@ impl App {
     }
 
     fn remember_password(&mut self, id: &str, password: &str) {
-        // Prefer the synced address book when signed in; else the local store.
         if self.cfg.account.is_some() {
             if let Some(entry) = self.cfg.address_book.iter_mut().find(|e| e.id == id) {
                 entry.password = Some(password.to_string());
@@ -570,26 +693,27 @@ impl App {
                 format!("Found {} computer(s) on this network.", rows.len())
             };
             self.lan = rows;
+            if !self.lan.is_empty() {
+                self.desk_tab = DeskTab::Lan;
+            }
         }
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.ctx = ui.ctx().clone();
+        let ctx = self.ctx.clone();
         self.poll_login();
         self.poll_password();
-        if self.last_service_check.elapsed() > Duration::from_secs(3) {
-            self.last_service_check = std::time::Instant::now();
-            let cfg = self.cfg.clone();
-            self.engine.refresh_service(&cfg);
-        }
-        if self.svc_status_at.elapsed() > Duration::from_millis(900) {
-            self.svc_status_at = std::time::Instant::now();
-            self.svc_status = crate::syspaths::ServiceStatus::load().unwrap_or_default();
-        }
-        let ctx = ui.ctx().clone();
+        self.poll_probe();
 
-        // System tray: Show/Quit, and hide-to-tray when the window is closed.
+        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma)))
+            && !self.show_settings
+        {
+            self.open_settings();
+        }
+
         let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
         let has_tray = self.tray.is_some();
         for action in tray_actions {
@@ -613,20 +737,21 @@ impl eframe::App for App {
             }
         }
 
-        // Keep status (online/connected) fresh.
-        ctx.request_repaint_after(Duration::from_millis(400));
+        let pending = self.login_rx.is_some() || self.change_rx.is_some() || self.lan_rx.is_some() || !self.engine.ready;
+        ctx.request_repaint_after(Duration::from_millis(if pending { 50 } else { 400 }));
 
-        egui::Panel::top("topbar").show(ui, |ui| self.top_bar(ui));
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.columns(2, |cols| {
-                self.host_panel(&mut cols[0]);
-                self.control_panel(&mut cols[1]);
-            });
-            ui.add_space(8.0);
-            ui.separator();
-            self.address_book(ui);
-        });
+        let p = theme::paint_ctx(&ctx);
+        egui::Panel::top("topbar")
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .stroke(egui::Stroke::new(0.0, p.line)),
+            )
+            .show(ui, |ui| self.top_bar(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::same(16)))
+            .show(ui, |ui| self.body(ui));
 
         self.settings_window(&ctx);
         self.login_window(&ctx);
@@ -636,15 +761,21 @@ impl eframe::App for App {
         self.toast.render(&ctx);
 
         if !self.status.is_empty() {
-            egui::Panel::bottom("status").show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(theme::WARN, "⚠");
-                    ui.label(&self.status);
-                    if ui.small_button("✕").clicked() {
-                        self.status.clear();
-                    }
+            egui::Panel::bottom("status")
+                .frame(egui::Frame::NONE.fill(p.elev).inner_margin(egui::Margin::symmetric(16, 8)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        theme::icon_in(ui, icons::Icon::Alert, 16.0, p.warn);
+                        ui.label(&self.status);
+                        if widgets::icon_button(ui, icons::Icon::Close, "Dismiss").clicked() {
+                            self.status.clear();
+                        }
+                    });
                 });
-            });
         }
     }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }

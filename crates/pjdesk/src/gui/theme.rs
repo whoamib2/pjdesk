@@ -1,101 +1,206 @@
-//! A refined, cohesive dark theme — a calm "control room" look, so the app
-//! doesn't read as the default egui demo.
+//! Light and dark visuals. "system" follows the Windows theme.
+//!
+//! Spacing sits on an 8px grid. Cards use a 12px corner radius.
 
-use eframe::egui::{self, Color32};
+use std::sync::Arc;
 
-// Brand + semantic colors.
-pub const ACCENT: Color32 = Color32::from_rgb(0x4d, 0x9b, 0xff);
-pub const OK: Color32 = Color32::from_rgb(0x46, 0xd1, 0x7d);
-pub const WARN: Color32 = Color32::from_rgb(0xf2, 0xb0, 0x3a);
+use eframe::egui::{self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke, TextStyle};
 
-// Text + surfaces.
-pub const TEXT: Color32 = Color32::from_rgb(0xe9, 0xed, 0xf3);
-pub const MUTED: Color32 = Color32::from_rgb(0x8c, 0x95, 0xa6);
-pub const PANEL: Color32 = Color32::from_rgb(0x0d, 0x0f, 0x14);
-pub const CARD: Color32 = Color32::from_rgb(0x17, 0x1b, 0x23);
-pub const ELEV: Color32 = Color32::from_rgb(0x20, 0x25, 0x30);
-pub const LINE: Color32 = Color32::from_rgb(0x29, 0x30, 0x3c);
+use super::icons::{self, Icon};
 
-pub fn apply(ctx: &egui::Context) {
-    // Force dark, so the app looks the same whatever the OS theme is.
-    ctx.set_theme(egui::ThemePreference::Dark);
+pub const ACCENT_DARK: Color32 = Color32::from_rgb(0x4d, 0x9b, 0xff);
+pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(0x2f, 0x6f, 0xed);
 
-    let mut v = egui::Visuals::dark();
-    v.dark_mode = true;
-    v.override_text_color = Some(TEXT);
-    v.panel_fill = PANEL;
-    v.window_fill = CARD;
-    v.window_stroke = egui::Stroke::new(1.0, LINE);
-    v.extreme_bg_color = Color32::from_rgb(0x0a, 0x0c, 0x11);
-    v.faint_bg_color = ELEV;
-    v.hyperlink_color = ACCENT;
-    v.selection.bg_fill = ACCENT.linear_multiply(0.30);
-    v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+#[derive(Clone, Copy)]
+pub struct Paint {
+    pub accent: Color32,
+    pub ok: Color32,
+    pub warn: Color32,
+    pub text: Color32,
+    pub muted: Color32,
+    pub panel: Color32,
+    pub card: Color32,
+    pub elev: Color32,
+    pub line: Color32,
+    pub on_accent: Color32,
+    pub shadow: Color32,
+}
 
-    v.widgets.noninteractive.bg_stroke.color = LINE;
-    v.widgets.noninteractive.fg_stroke.color = TEXT;
+pub fn paint_dark() -> Paint {
+    Paint {
+        accent: ACCENT_DARK,
+        ok: Color32::from_rgb(0x46, 0xd1, 0x7d),
+        warn: Color32::from_rgb(0xf2, 0xb0, 0x3a),
+        text: Color32::from_rgb(0xe9, 0xed, 0xf3),
+        muted: Color32::from_rgb(0x9a, 0xa3, 0xb5),
+        panel: Color32::from_rgb(0x10, 0x13, 0x18),
+        card: Color32::from_rgb(0x18, 0x1c, 0x24),
+        elev: Color32::from_rgb(0x22, 0x28, 0x33),
+        line: Color32::from_rgb(0x2e, 0x36, 0x44),
+        on_accent: Color32::WHITE,
+        shadow: Color32::from_black_alpha(48),
+    }
+}
 
-    // Inputs / resting controls.
-    v.widgets.inactive.bg_fill = ELEV;
-    v.widgets.inactive.weak_bg_fill = ELEV;
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, LINE);
-    v.widgets.inactive.fg_stroke.color = TEXT;
+pub fn paint_light() -> Paint {
+    Paint {
+        accent: ACCENT_LIGHT,
+        ok: Color32::from_rgb(0x1c, 0x8a, 0x4c),
+        warn: Color32::from_rgb(0xb4, 0x6b, 0x00),
+        text: Color32::from_rgb(0x1c, 0x23, 0x30),
+        muted: Color32::from_rgb(0x5c, 0x67, 0x78),
+        panel: Color32::from_rgb(0xf3, 0xf5, 0xf8),
+        card: Color32::WHITE,
+        elev: Color32::from_rgb(0xe8, 0xec, 0xf2),
+        line: Color32::from_rgb(0xd5, 0xdb, 0xe3),
+        on_accent: Color32::WHITE,
+        shadow: Color32::from_black_alpha(22),
+    }
+}
 
-    v.widgets.hovered.bg_fill = Color32::from_rgb(0x2a, 0x31, 0x3e);
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x3b, 0x45, 0x56));
-    v.widgets.hovered.fg_stroke.color = Color32::WHITE;
+pub fn paint(ui: &egui::Ui) -> Paint {
+    if ui.visuals().dark_mode {
+        paint_dark()
+    } else {
+        paint_light()
+    }
+}
 
-    v.widgets.active.bg_fill = Color32::from_rgb(0x32, 0x3b, 0x4a);
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
-    v.widgets.active.fg_stroke.color = Color32::WHITE;
+pub fn paint_ctx(ctx: &egui::Context) -> Paint {
+    if ctx.global_style().visuals.dark_mode {
+        paint_dark()
+    } else {
+        paint_light()
+    }
+}
 
-    let r = egui::CornerRadius::same(9);
-    v.window_corner_radius = egui::CornerRadius::same(14);
+/// Loads Inter into this context. Missing glyphs fall through to egui's built-in font.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "Inter".to_owned(),
+        Arc::new(FontData::from_static(include_bytes!("../../assets/Inter-Regular.ttf"))),
+    );
+    fonts.font_data.insert(
+        "InterSemi".to_owned(),
+        Arc::new(FontData::from_static(include_bytes!("../../assets/Inter-SemiBold.ttf"))),
+    );
+    if let Some(prop) = fonts.families.get_mut(&FontFamily::Proportional) {
+        prop.insert(0, "Inter".to_owned());
+    }
+    fonts.families.insert(FontFamily::Name("InterSemi".into()), vec!["InterSemi".to_owned()]);
+    ctx.set_fonts(fonts);
+}
+
+/// `theme` is "dark", "light", or anything else (follow the system, which on
+/// Windows is the Windows app theme).
+pub fn apply(ctx: &egui::Context, theme: &str) {
+    let pref = match theme {
+        "dark" => egui::ThemePreference::Dark,
+        "light" => egui::ThemePreference::Light,
+        _ => egui::ThemePreference::System,
+    };
+    ctx.set_theme(pref);
+    ctx.set_visuals_of(egui::Theme::Dark, visuals(paint_dark(), true));
+    ctx.set_visuals_of(egui::Theme::Light, visuals(paint_light(), false));
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        style.spacing.window_margin = Margin::same(16);
+        style.spacing.menu_margin = Margin::same(8);
+        style.spacing.interact_size.y = 36.0;
+        style.text_styles.insert(TextStyle::Heading, FontId::new(22.0, FontFamily::Name("InterSemi".into())));
+        style.text_styles.insert(TextStyle::Body, FontId::new(14.5, FontFamily::Proportional));
+        style.text_styles.insert(TextStyle::Button, FontId::new(14.5, FontFamily::Proportional));
+        style.text_styles.insert(TextStyle::Small, FontId::new(12.5, FontFamily::Proportional));
+        style.text_styles.insert(TextStyle::Monospace, FontId::new(14.5, FontFamily::Monospace));
+    });
+}
+
+fn visuals(p: Paint, dark: bool) -> egui::Visuals {
+    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    v.dark_mode = dark;
+    v.override_text_color = Some(p.text);
+    v.panel_fill = p.panel;
+    v.window_fill = p.card;
+    v.window_stroke = Stroke::new(1.0, p.line);
+    v.extreme_bg_color = if dark { Color32::from_rgb(0x0b, 0x0d, 0x12) } else { Color32::from_rgb(0xe7, 0xeb, 0xf0) };
+    v.faint_bg_color = p.elev;
+    v.code_bg_color = p.elev;
+    v.hyperlink_color = p.accent;
+    v.selection.bg_fill = p.accent.linear_multiply(0.28);
+    v.selection.stroke = Stroke::new(1.0, p.accent);
+    v.warn_fg_color = p.warn;
+    v.error_fg_color = Color32::from_rgb(0xe0, 0x5a, 0x4f);
+
+    v.widgets.noninteractive.bg_stroke.color = p.line;
+    v.widgets.noninteractive.fg_stroke.color = p.text;
+    v.widgets.inactive.bg_fill = p.elev;
+    v.widgets.inactive.weak_bg_fill = p.elev;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, p.line);
+    v.widgets.inactive.fg_stroke.color = p.text;
+    let hover = if dark { Color32::from_rgb(0x2c, 0x34, 0x42) } else { Color32::from_rgb(0xdc, 0xe3, 0xee) };
+    v.widgets.hovered.bg_fill = hover;
+    v.widgets.hovered.weak_bg_fill = hover;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, p.accent.linear_multiply(0.8));
+    v.widgets.hovered.fg_stroke.color = p.text;
+    let active = if dark { Color32::from_rgb(0x34, 0x3e, 0x4e) } else { Color32::from_rgb(0xd0, 0xd8, 0xe6) };
+    v.widgets.active.bg_fill = active;
+    v.widgets.active.weak_bg_fill = active;
+    v.widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
+    v.widgets.active.fg_stroke.color = p.text;
+    v.widgets.open.bg_fill = p.card;
+    v.widgets.open.bg_stroke = Stroke::new(1.0, p.line);
+
+    let r = CornerRadius::same(10);
+    v.window_corner_radius = CornerRadius::same(12);
+    v.menu_corner_radius = CornerRadius::same(10);
     v.widgets.noninteractive.corner_radius = r;
     v.widgets.inactive.corner_radius = r;
     v.widgets.hovered.corner_radius = r;
     v.widgets.active.corner_radius = r;
-
-    ctx.set_visuals_of(egui::Theme::Dark, v.clone());
-    ctx.set_visuals(v);
-
-    ctx.all_styles_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-        style.spacing.button_padding = egui::vec2(14.0, 9.0);
-        style.spacing.window_margin = egui::Margin::same(16);
-        style.spacing.menu_margin = egui::Margin::same(8);
-        style.spacing.interact_size.y = 32.0;
-
-        use egui::{FontFamily::Proportional, FontId, TextStyle};
-        style.text_styles.insert(TextStyle::Heading, FontId::new(22.0, Proportional));
-        style.text_styles.insert(TextStyle::Body, FontId::new(14.5, Proportional));
-        style.text_styles.insert(TextStyle::Button, FontId::new(14.5, Proportional));
-        style.text_styles.insert(TextStyle::Small, FontId::new(12.0, Proportional));
-    });
+    v.widgets.open.corner_radius = r;
+    v.window_shadow = egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: p.shadow };
+    v
 }
 
-/// A rounded card container with a subtle fill + border, for a section.
+pub fn card_shadow(p: &Paint) -> egui::Shadow {
+    egui::Shadow { offset: [0, 1], blur: 8, spread: 0, color: p.shadow }
+}
+
+/// A rounded card that stays inside the width it is given.
 pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let p = paint(ui);
     egui::Frame::NONE
-        .fill(CARD)
-        .corner_radius(egui::CornerRadius::same(14))
-        .inner_margin(egui::Margin::same(18))
-        .stroke(egui::Stroke::new(1.0, LINE))
-        .show(ui, add)
+        .fill(p.card)
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::same(16))
+        .stroke(Stroke::new(1.0, p.line))
+        .shadow(card_shadow(&p))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        })
         .inner
 }
 
-/// A compact rounded "pill" with a tinted background, for status and tags.
 pub fn pill(ui: &mut egui::Ui, color: Color32, text: &str) {
+    let p = paint(ui);
     egui::Frame::NONE
-        .fill(color.linear_multiply(0.14))
-        .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin::symmetric(10, 5))
+        .fill(color.linear_multiply(if ui.visuals().dark_mode { 0.16 } else { 0.12 }))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 5))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.colored_label(color, egui::RichText::new("●").size(10.0));
-                ui.label(egui::RichText::new(text).color(TEXT).size(12.5));
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 4.0, color);
+                ui.label(egui::RichText::new(text).color(p.text).size(12.5));
             });
         });
+}
+
+pub fn icon_in(ui: &mut egui::Ui, icon: Icon, size: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    icons::paint(ui.painter(), rect.shrink(1.0), icon, color);
 }

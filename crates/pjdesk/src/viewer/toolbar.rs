@@ -1,9 +1,9 @@
-//! A small control bar drawn over the top of the viewer, like RustDesk's.
+//! Floating session toolbar drawn over the viewer.
 //!
-//! It auto-hides and appears when the pointer is near the top of the window.
-//! Two of its buttons ("Zoom" and "Send keys") open drop-down menus. Text is
-//! rasterized with `ab_glyph` straight into the softbuffer, so the viewer stays
-//! a lightweight winit + softbuffer window.
+//! It sits in a rounded bar near the top, collapses to a small pill, and shows
+//! a tooltip for the button under the pointer. Text is rasterized with
+//! `ab_glyph` into the softbuffer, and the icons are filled shapes so they do
+//! not depend on a font having a particular glyph.
 
 use std::sync::OnceLock;
 
@@ -12,17 +12,13 @@ use ab_glyph::{Font, FontRef, Glyph, ScaleFont};
 /// Actions a toolbar button or menu item can trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Fit the picture to the window (adaptive).
     ZoomFit,
-    /// Set an explicit zoom percentage (100 = pixel-for-pixel).
     ZoomTo(u16),
     ZoomIn,
     ZoomOut,
-    /// Send a key combination to the remote computer.
     Keys(Combo),
     Fullscreen,
     Refresh,
-    /// Ask the host to ignore its own keyboard and mouse.
     ToggleBlockHost,
     TogglePrivacy,
     ToggleAudio,
@@ -50,20 +46,35 @@ pub enum Combo {
     PrintScreen,
 }
 
-const BAR_H: f32 = 36.0;
-const ITEM_H: f32 = 28.0;
+const TOP: f32 = 10.0;
+const BAR_H: f32 = 40.0;
+const ITEM_H: f32 = 30.0;
 const PAD: f32 = 12.0;
-const FONT_PX: f32 = 15.0;
+const FONT_PX: f32 = 14.0;
+const RADIUS: f32 = 12.0;
+
+#[derive(Clone, Copy)]
+enum Mark {
+    View,
+    Keys,
+    Session,
+    Files,
+    Chat,
+    End,
+    Collapse,
+}
 
 enum Kind {
     Act(Action),
-    /// Opens the menu at this index in `menus`.
     Menu(usize),
+    Collapse,
 }
 
 struct Button {
     label: &'static str,
+    tip: &'static str,
     kind: Kind,
+    mark: Mark,
     x: f32,
     w: f32,
 }
@@ -78,7 +89,6 @@ fn font() -> &'static FontRef<'static> {
     FONT.get_or_init(|| FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).expect("valid bundled font"))
 }
 
-/// Measures a label at the toolbar font size.
 pub(crate) fn text_width(text: &str) -> f32 {
     let f = font().as_scaled(FONT_PX);
     let mut w = 0.0;
@@ -139,10 +149,12 @@ pub struct Toolbar {
     buttons: Vec<Button>,
     menus: Vec<Menu>,
     width: f32,
-    /// Shown now (pointer near the top, or a menu is open).
+    collapsed_w: f32,
+    /// Expanded bar is on screen (pointer near the top, or a menu is open).
     visible: bool,
+    /// User hid the bar. A pill stays so it can be opened again.
+    collapsed: bool,
     hovered_button: Option<usize>,
-    /// Index (into `buttons`) of the button whose menu is open.
     open: Option<usize>,
     hovered_item: Option<usize>,
     /// True while input forwarding is suppressed ("view only" from this side).
@@ -152,66 +164,107 @@ pub struct Toolbar {
 impl Default for Toolbar {
     fn default() -> Self {
         let menus = vec![owned(ZOOM_ITEMS), owned(KEY_ITEMS), owned(CONTROL_ITEMS)];
-        let spec: [(&'static str, Kind); 6] = [
-            ("View \u{25be}", Kind::Menu(0)),
-            ("Keys \u{25be}", Kind::Menu(1)),
-            ("Session \u{25be}", Kind::Menu(2)),
-            ("Files", Kind::Act(Action::OpenPanel(0))),
-            ("Chat", Kind::Act(Action::OpenPanel(1))),
-            ("End", Kind::Act(Action::Disconnect)),
+        let spec: [(&'static str, &'static str, Kind, Mark); 7] = [
+            ("View", "Zoom", Kind::Menu(0), Mark::View),
+            ("Keys", "Send special keys", Kind::Menu(1), Mark::Keys),
+            ("Session", "Audio, privacy, record, restart", Kind::Menu(2), Mark::Session),
+            ("Files", "Send and receive files", Kind::Act(Action::OpenPanel(0)), Mark::Files),
+            ("Chat", "Messages", Kind::Act(Action::OpenPanel(1)), Mark::Chat),
+            ("End", "Disconnect", Kind::Act(Action::Disconnect), Mark::End),
+            ("Hide", "Hide the toolbar", Kind::Collapse, Mark::Collapse),
         ];
         let mut buttons = Vec::new();
         let mut x = PAD;
-        for (label, kind) in spec {
-            let w = text_width(label) + PAD * 2.0;
-            buttons.push(Button { label, kind, x, w });
+        for (label, tip, kind, mark) in spec {
+            let w = 16.0 + 6.0 + text_width(label) + PAD * 2.0;
+            buttons.push(Button { label, tip, kind, mark, x, w });
             x += w;
         }
-        Toolbar { buttons, menus, width: x + PAD, visible: true, hovered_button: None, open: None, hovered_item: None, block_input: false }
+        let collapsed_w = text_width("PJDesk") + PAD * 2.0 + 8.0;
+        Toolbar {
+            buttons,
+            menus,
+            width: x + PAD,
+            collapsed_w,
+            visible: true,
+            collapsed: false,
+            hovered_button: None,
+            open: None,
+            hovered_item: None,
+            block_input: false,
+        }
     }
 }
 
 fn owned(items: &[(&str, Action)]) -> Menu {
     let items: Vec<(String, Action)> = items.iter().map(|(l, a)| ((*l).to_string(), *a)).collect();
-    let width = items.iter().map(|(l, _)| text_width(l)).fold(0.0_f32, f32::max) + PAD * 3.0;
+    let width = items.iter().map(|(l, _)| text_width(l)).fold(160.0_f32, f32::max) + PAD * 3.0;
     Menu { items, width }
 }
 
 impl Toolbar {
-    /// Left edge of the bar, centered in a window `win_w` pixels wide.
-    fn bar_x(&self, win_w: usize) -> f32 {
-        ((win_w as f32 - self.width) / 2.0).max(0.0)
+    fn bar_rect(&self, win_w: usize) -> (f32, f32, f32, f32) {
+        let w = if self.collapsed { self.collapsed_w } else { self.width };
+        let x = ((win_w as f32 - w) / 2.0).max(8.0);
+        (x, TOP, w, BAR_H)
     }
 
     pub fn is_visible(&self) -> bool {
-        self.visible
+        self.visible || self.collapsed
     }
 
     fn menu_index(&self, button: usize) -> Option<usize> {
-        match self.buttons[button].kind {
-            Kind::Menu(m) => Some(m),
-            Kind::Act(_) => None,
+        match self.buttons.get(button).map(|b| &b.kind) {
+            Some(Kind::Menu(m)) => Some(*m),
+            _ => None,
         }
     }
 
-    /// (left x, top y, width, height) of the currently open menu, if any.
     fn open_menu_rect(&self, win_w: usize) -> Option<(f32, f32, f32, f32)> {
+        if self.collapsed {
+            return None;
+        }
         let bi = self.open?;
         let m = self.menu_index(bi)?;
         let menu = &self.menus[m];
-        let left = self.bar_x(win_w) + self.buttons[bi].x;
-        let height = menu.items.len() as f32 * ITEM_H;
-        Some((left, BAR_H, menu.width, height))
+        let (bx, by, _, bh) = self.bar_rect(win_w);
+        let left = bx + self.buttons[bi].x;
+        let height = menu.items.len() as f32 * ITEM_H + 8.0;
+        Some((left, by + bh + 4.0, menu.width, height))
     }
 
-    /// Does `(px, py)` fall on the bar or the open menu? (Then the caller must
-    /// not forward that pointer event to the host.)
+    fn tooltip_rect(&self, win_w: usize) -> Option<(f32, f32, f32, f32)> {
+        if self.collapsed || !self.visible {
+            return None;
+        }
+        let i = self.hovered_button?;
+        let tip = self.buttons.get(i)?.tip;
+        let (bx, by, _, bh) = self.bar_rect(win_w);
+        let tw = text_width(tip) + 16.0;
+        let x = bx + self.buttons[i].x;
+        Some((x, by + bh + 6.0, tw, 22.0))
+    }
+
+    fn hit_button(&self, px: f64, py: f64, win_w: usize) -> Option<usize> {
+        let (bx, by, bw, bh) = self.bar_rect(win_w);
+        if px < bx as f64 || px > (bx + bw) as f64 || py < by as f64 || py > (by + bh) as f64 {
+            return None;
+        }
+        if self.collapsed {
+            return Some(0);
+        }
+        let local = px - bx as f64;
+        self.buttons.iter().position(|b| local >= b.x as f64 && local < (b.x + b.w) as f64)
+    }
+
     pub fn covers(&self, px: f64, py: f64, win_w: usize) -> bool {
+        if self.collapsed {
+            return self.hit_button(px, py, win_w).is_some();
+        }
         if !self.visible {
             return false;
         }
-        let bx = self.bar_x(win_w) as f64;
-        if py <= BAR_H as f64 && px >= bx && px <= bx + self.width as f64 {
+        if self.hit_button(px, py, win_w).is_some() {
             return true;
         }
         if let Some((mx, my, mw, mh)) = self.open_menu_rect(win_w) {
@@ -219,16 +272,24 @@ impl Toolbar {
                 return true;
             }
         }
+        if let Some((tx, ty, tw, th)) = self.tooltip_rect(win_w) {
+            if px >= tx as f64 && px <= (tx + tw) as f64 && py >= ty as f64 && py <= (ty + th) as f64 {
+                return true;
+            }
+        }
         false
     }
 
-    /// Updates hover/visibility for a pointer at `(px, py)`. Returns true if the
-    /// pointer is over the bar or open menu.
     pub fn on_pointer(&mut self, px: f64, py: f64, win_w: usize) -> bool {
-        let menu_bottom = self.open_menu_rect(win_w).map(|(_, my, _, mh)| my + mh).unwrap_or(BAR_H);
-        if py <= BAR_H as f64 + 4.0 {
+        if self.collapsed {
+            self.hovered_button = self.hit_button(px, py, win_w);
+            return self.hovered_button.is_some();
+        }
+        let menu_bottom = self.open_menu_rect(win_w).map(|(_, my, _, mh)| my + mh).unwrap_or(TOP + BAR_H);
+        let reveal = TOP + BAR_H + if self.hovered_button.is_some() { 32.0 } else { 8.0 };
+        if py <= reveal as f64 {
             self.visible = true;
-        } else if py > menu_bottom as f64 + 24.0 {
+        } else if py > menu_bottom as f64 + 16.0 {
             self.visible = false;
             self.open = None;
             self.hovered_button = None;
@@ -240,53 +301,52 @@ impl Toolbar {
         if !self.visible {
             return false;
         }
-        let bx = self.bar_x(win_w) as f64;
-        if py <= BAR_H as f64 {
-            if px >= bx && px <= bx + self.width as f64 {
-                let local = px - bx;
-                self.hovered_button = self.buttons.iter().position(|b| local >= b.x as f64 && local < (b.x + b.w) as f64);
-                return true;
-            }
-            return false;
+        if let Some(i) = self.hit_button(px, py, win_w) {
+            self.hovered_button = Some(i);
+            return true;
         }
         if let Some((mx, my, mw, mh)) = self.open_menu_rect(win_w) {
             if px >= mx as f64 && px <= (mx + mw) as f64 && py >= my as f64 && py <= (my + mh) as f64 {
-                self.hovered_item = Some(((py - my as f64) / ITEM_H as f64) as usize);
+                let idx = ((py - my as f64 - 4.0) / ITEM_H as f64) as usize;
+                self.hovered_item = Some(idx);
                 return true;
             }
         }
         false
     }
 
-    /// Handles a left-button press at `(px, py)`. Opens/closes a menu (returns
-    /// `None`) or yields the action to perform.
     pub fn click(&mut self, px: f64, py: f64, win_w: usize) -> Option<Action> {
+        if self.collapsed {
+            if self.hit_button(px, py, win_w).is_some() {
+                self.collapsed = false;
+                self.visible = true;
+            }
+            return None;
+        }
         if !self.visible {
             return None;
         }
-        let bx = self.bar_x(win_w) as f64;
-        if py <= BAR_H as f64 {
-            if px >= bx && px <= bx + self.width as f64 {
-                let local = px - bx;
-                if let Some(i) = self.buttons.iter().position(|b| local >= b.x as f64 && local < (b.x + b.w) as f64) {
-                    match self.buttons[i].kind {
-                        Kind::Menu(_) => {
-                            self.open = if self.open == Some(i) { None } else { Some(i) };
-                            return None;
-                        }
-                        Kind::Act(a) => {
-                            self.open = None;
-                            return Some(a);
-                        }
-                    }
+        if let Some(i) = self.hit_button(px, py, win_w) {
+            match self.buttons[i].kind {
+                Kind::Menu(_) => {
+                    self.open = if self.open == Some(i) { None } else { Some(i) };
+                    return None;
+                }
+                Kind::Collapse => {
+                    self.collapsed = true;
+                    self.open = None;
+                    self.visible = false;
+                    return None;
+                }
+                Kind::Act(a) => {
+                    self.open = None;
+                    return Some(a);
                 }
             }
-            self.open = None;
-            return None;
         }
         if let Some((mx, my, mw, mh)) = self.open_menu_rect(win_w) {
             if px >= mx as f64 && px <= (mx + mw) as f64 && py >= my as f64 && py <= (my + mh) as f64 {
-                let idx = ((py - my as f64) / ITEM_H as f64) as usize;
+                let idx = ((py - my as f64 - 4.0) / ITEM_H as f64) as usize;
                 let m = self.menu_index(self.open.unwrap()).unwrap();
                 if let Some((_, action)) = self.menus[m].items.get(idx) {
                     let action = *action;
@@ -299,53 +359,95 @@ impl Toolbar {
         None
     }
 
-    /// Draws the bar (and the open menu) into the ARGB `buf`.
     pub fn draw(&self, buf: &mut [u32], win_w: usize, win_h: usize) {
-        if !self.visible || win_h < BAR_H as usize {
+        if win_h < (TOP + BAR_H) as usize {
             return;
         }
-        let bx = self.bar_x(win_w);
-        fill_rect(buf, win_w, win_h, bx, 0.0, self.width, BAR_H, 0xF2_14_18_22);
-        fill_rect(buf, win_w, win_h, bx, 0.0, self.width, 2.0, 0xFF_4d_9b_ff);
-        line(buf, win_w, win_h, bx, BAR_H - 1.0, self.width, 0xFF_2a_30_3b);
+        let (bx, by, bw, bh) = self.bar_rect(win_w);
+        if self.collapsed {
+            fill_round(buf, win_w, win_h, bx, by, bw, bh, RADIUS, 0xF2_1c_22_2c);
+            let label = "PJDesk";
+            let tw = text_width(label);
+            draw_text(buf, win_w, win_h, bx + (bw - tw) / 2.0, by + 26.0, label, 0xFF_e8_ec_f2);
+            return;
+        }
+        if !self.visible {
+            return;
+        }
+        fill_round(buf, win_w, win_h, bx - 1.0, by - 1.0, bw + 2.0, bh + 2.0, RADIUS, 0xFF_2a_33_42);
+        fill_round(buf, win_w, win_h, bx, by, bw, bh, RADIUS, 0xF2_14_18_22);
 
         for (i, b) in self.buttons.iter().enumerate() {
             let end = matches!(b.kind, Kind::Act(Action::Disconnect));
-            let toggled = self.block_input;
             let menu_open = self.open == Some(i);
+            let session = matches!(b.mark, Mark::Session);
             if self.hovered_button == Some(i) || menu_open {
                 let hover = if end { 0xFF_5a_30_34 } else { 0xFF_2c_36_46 };
-                fill_rect(buf, win_w, win_h, bx + b.x + 2.0, 6.0, b.w - 4.0, BAR_H - 10.0, hover);
-            } else if toggled {
-                fill_rect(buf, win_w, win_h, bx + b.x + 2.0, 6.0, b.w - 4.0, BAR_H - 10.0, 0xFF_3a_32_22);
+                fill_round(buf, win_w, win_h, bx + b.x + 4.0, by + 6.0, b.w - 8.0, bh - 12.0, 8.0, hover);
+            } else if session && self.block_input {
+                fill_round(buf, win_w, win_h, bx + b.x + 4.0, by + 6.0, b.w - 8.0, bh - 12.0, 8.0, 0xFF_3a_32_22);
             }
             let color = if end {
                 0xFF_f0_8a_86
-            } else if toggled || menu_open {
+            } else if (session && self.block_input) || menu_open {
                 0xFF_f2_b0_3a
             } else {
                 0xFF_e8_ec_f2
             };
-            let tw = text_width(b.label);
-            draw_text(buf, win_w, win_h, bx + b.x + (b.w - tw) / 2.0, 23.0, b.label, color);
+            draw_mark(buf, win_w, win_h, bx + b.x + 10.0, by + 12.0, b.mark, color);
+            draw_text(buf, win_w, win_h, bx + b.x + 28.0, by + 26.0, b.label, color);
+        }
+
+        if let Some((tx, ty, tw, th)) = self.tooltip_rect(win_w) {
+            if self.open.is_none() {
+                if let Some(i) = self.hovered_button {
+                    fill_round(buf, win_w, win_h, tx, ty, tw, th, 6.0, 0xF2_22_27_30);
+                    draw_text(buf, win_w, win_h, tx + 8.0, ty + 15.0, self.buttons[i].tip, 0xFF_e8_ec_f2);
+                }
+            }
         }
 
         if let (Some((mx, my, mw, mh)), Some(bi)) = (self.open_menu_rect(win_w), self.open) {
             let m = self.menu_index(bi).unwrap();
-            fill_rect(buf, win_w, win_h, mx, my, mw, mh, 0xF7_22_27_30);
-            line(buf, win_w, win_h, mx, my + mh, mw, 0xFF_2a_30_3b);
+            fill_round(buf, win_w, win_h, mx, my, mw, mh, 10.0, 0xF7_22_27_30);
             for (idx, (label, _)) in self.menus[m].items.iter().enumerate() {
-                let iy = my + idx as f32 * ITEM_H;
+                let iy = my + 4.0 + idx as f32 * ITEM_H;
                 if self.hovered_item == Some(idx) {
-                    fill_rect(buf, win_w, win_h, mx + 2.0, iy + 2.0, mw - 4.0, ITEM_H - 4.0, 0xFF_32_3b_4a);
+                    fill_round(buf, win_w, win_h, mx + 4.0, iy + 2.0, mw - 8.0, ITEM_H - 4.0, 6.0, 0xFF_32_3b_4a);
                 }
-                draw_text(buf, win_w, win_h, mx + PAD * 1.5, iy + ITEM_H * 0.66, label, 0xFF_e8_ec_f2);
+                draw_text(buf, win_w, win_h, mx + PAD, iy + ITEM_H * 0.68, label, 0xFF_e8_ec_f2);
             }
         }
     }
 }
 
-/// Alpha-blends a solid rectangle (ARGB, alpha in the high byte) into `buf`.
+fn draw_mark(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, mark: Mark, argb: u32) {
+    match mark {
+        Mark::View => {
+            fill_rect(buf, w, h, x, y, 12.0, 9.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 2.0, 8.0, 5.0, 0xFF_14_18_22);
+        }
+        Mark::Keys => {
+            fill_rect(buf, w, h, x, y + 2.0, 12.0, 8.0, argb);
+            fill_rect(buf, w, h, x + 1.0, y + 3.0, 4.0, 2.0, 0xFF_14_18_22);
+            fill_rect(buf, w, h, x + 7.0, y + 3.0, 4.0, 2.0, 0xFF_14_18_22);
+        }
+        Mark::Session => fill_circle(buf, w, h, x + 6.0, y + 5.0, 5.0, argb),
+        Mark::Files => {
+            fill_rect(buf, w, h, x + 2.0, y, 8.0, 11.0, argb);
+            fill_rect(buf, w, h, x + 4.0, y + 2.0, 4.0, 7.0, 0xFF_14_18_22);
+        }
+        Mark::Chat => {
+            fill_rect(buf, w, h, x, y + 1.0, 12.0, 8.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 8.0, 3.0, 3.0, argb);
+        }
+        Mark::End => fill_rect(buf, w, h, x + 2.0, y + 1.0, 8.0, 8.0, argb),
+        Mark::Collapse => {
+            fill_rect(buf, w, h, x, y + 5.0, 12.0, 2.0, argb);
+        }
+    }
+}
+
 pub(crate) fn fill_rect(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, rw: f32, rh: f32, argb: u32) {
     let (x0, y0) = (x.max(0.0) as usize, y.max(0.0) as usize);
     let x1 = ((x + rw) as usize).min(w);
@@ -358,19 +460,65 @@ pub(crate) fn fill_rect(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, rw:
     }
 }
 
-fn line(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, len: f32, argb: u32) {
-    let yy = y as usize;
-    if yy >= h {
-        return;
-    }
-    let x0 = x.max(0.0) as usize;
-    let x1 = ((x + len) as usize).min(w);
-    for xx in x0..x1 {
-        buf[yy * w + xx] = argb & 0x00_ff_ff_ff | (argb & 0xff_00_00_00);
+fn fill_round(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, rw: f32, rh: f32, rad: f32, argb: u32) {
+    let rad = rad.min(rw / 2.0).min(rh / 2.0).max(0.0);
+    let (x0, y0) = (x.max(0.0) as usize, y.max(0.0) as usize);
+    let x1 = ((x + rw) as usize).min(w);
+    let y1 = ((y + rh) as usize).min(h);
+    let a = ((argb >> 24) & 0xff) as f32 / 255.0;
+    let right = x + rw;
+    let bottom = y + rh;
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let px = xx as f32 + 0.5;
+            let py = yy as f32 + 0.5;
+            if inside_round(px, py, x, y, right, bottom, rad) {
+                blend(&mut buf[yy * w + xx], argb, a);
+            }
+        }
     }
 }
 
-/// Rasterizes `text` with its baseline at `y`, left edge at `x`.
+fn inside_round(px: f32, py: f32, left: f32, top: f32, right: f32, bottom: f32, rad: f32) -> bool {
+    if px < left || px > right || py < top || py > bottom {
+        return false;
+    }
+    let cx = if px < left + rad {
+        left + rad
+    } else if px > right - rad {
+        right - rad
+    } else {
+        px
+    };
+    let cy = if py < top + rad {
+        top + rad
+    } else if py > bottom - rad {
+        bottom - rad
+    } else {
+        py
+    };
+    let dx = px - cx;
+    let dy = py - cy;
+    dx * dx + dy * dy <= rad * rad
+}
+
+fn fill_circle(buf: &mut [u32], w: usize, h: usize, cx: f32, cy: f32, r: f32, argb: u32) {
+    let r2 = r * r;
+    let x0 = (cx - r).max(0.0) as usize;
+    let y0 = (cy - r).max(0.0) as usize;
+    let x1 = ((cx + r) as usize + 1).min(w);
+    let y1 = ((cy + r) as usize + 1).min(h);
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let dx = xx as f32 + 0.5 - cx;
+            let dy = yy as f32 + 0.5 - cy;
+            if dx * dx + dy * dy <= r2 {
+                blend(&mut buf[yy * w + xx], argb, 1.0);
+            }
+        }
+    }
+}
+
 pub(crate) fn draw_text(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, text: &str, argb: u32) {
     let scaled = font().as_scaled(FONT_PX);
     let mut caret = x;
@@ -396,11 +544,48 @@ pub(crate) fn draw_text(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, tex
     }
 }
 
-/// Blends `argb` over `dst` with coverage/alpha `a` (0..1).
 fn blend(dst: &mut u32, argb: u32, a: f32) {
     let a = a.clamp(0.0, 1.0);
     let (sr, sg, sb) = ((argb >> 16) & 0xff, (argb >> 8) & 0xff, argb & 0xff);
     let (dr, dg, db) = ((*dst >> 16) & 0xff, (*dst >> 8) & 0xff, *dst & 0xff);
     let mix = |s: u32, d: u32| ((s as f32 * a + d as f32 * (1.0 - a)) as u32) & 0xff;
     *dst = 0xff00_0000 | (mix(sr, dr) << 16) | (mix(sg, dg) << 8) | mix(sb, db);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolbar_draws_icons_and_end_disconnects() {
+        let mut bar = Toolbar::default();
+        let w = 900;
+        let h = 200;
+        let mut buf = vec![0u32; w * h];
+        let (bx, by, _, _) = bar.bar_rect(w);
+        bar.on_pointer((bx + 20.0) as f64, (by + 10.0) as f64, w);
+        assert!(bar.is_visible());
+        bar.draw(&mut buf, w, h);
+        assert!(buf.iter().any(|p| *p != 0), "the floating bar should paint pixels");
+
+        let end = bar.buttons.iter().find(|b| matches!(b.kind, Kind::Act(Action::Disconnect))).unwrap();
+        let x = bx + end.x + 8.0;
+        let action = bar.click(x as f64, (by + 12.0) as f64, w);
+        assert_eq!(action, Some(Action::Disconnect));
+    }
+
+    #[test]
+    fn toolbar_collapse_keeps_a_pill() {
+        let mut bar = Toolbar::default();
+        let w = 900;
+        let (bx, by, bw, _) = bar.bar_rect(w);
+        let hide = bar.buttons.iter().find(|b| matches!(b.kind, Kind::Collapse)).unwrap();
+        let x = bx + hide.x + 8.0;
+        assert_eq!(bar.click(x as f64, (by + 12.0) as f64, w), None);
+        assert!(bar.collapsed);
+        assert!(bar.covers((bx + bw / 2.0) as f64, (by + 8.0) as f64, w) || bar.covers(w as f64 / 2.0, (by + 8.0) as f64, w));
+        let (cx, cy, _, _) = bar.bar_rect(w);
+        bar.click((cx + 8.0) as f64, (cy + 8.0) as f64, w);
+        assert!(!bar.collapsed);
+    }
 }

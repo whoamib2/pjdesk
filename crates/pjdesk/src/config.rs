@@ -70,7 +70,7 @@ pub struct Settings {
     /// Start PJDesk automatically when this user signs in to Windows.
     #[serde(default)]
     pub start_with_windows: bool,
-    /// "dark" or "light".
+    /// "system" follows Windows, or "dark" / "light".
     #[serde(default = "default_theme")]
     pub theme: String,
     /// "prompt" asks the person at this computer before a session starts.
@@ -98,7 +98,7 @@ fn yes() -> bool {
     true
 }
 fn default_theme() -> String {
-    "dark".into()
+    "system".into()
 }
 fn default_approval() -> String {
     "prompt".into()

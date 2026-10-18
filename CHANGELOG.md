@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0
+
+* The client window is a new layout: a left rail for this computer (ID, one-time password, status) and a main column to connect, with Recent, Favorites, Address book, and Discovered lists. Settings is a centered page with a sidebar, a scrolling body, and a fixed footer, so labels and Save stay on screen. Light and dark themes follow Windows unless you pick one. Icons are drawn shapes, so copy, show, refresh, and the check mark are no longer empty boxes. The in-session toolbar floats, collapses, and shows a tooltip on each button.
+* Opening Settings no longer waits on Windows. The scheduled-task query (`schtasks`) and the service-status query used to run on the UI thread inside the click, which is why the window sat there. Those reads now happen on a background thread. The window paints from the last answer and shows a spinner until it arrives.
+* A permanent password is still at least 8 characters. An account password is still the server's rule: 12 characters with upper and lower case, a digit, and a symbol. The hints say which is which.
+* Transfer file connects the same way as Connect and opens the viewer's file panel.
+
 ## 0.4.1
 
 * The Cloud Sync panel's backup-server note, and the README section **Backup server & moving the server**, describe the current switch: sign in on another PJDesk Server with the same account (it becomes the standby), then choose **Make this the primary** there, or use the tray, or `pjdesk-server cloud promote`. Computers still reach whichever server `pjdesk.spader.us` points to, so DNS and the port forward have to move if the new primary is on a different network.
