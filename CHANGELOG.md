@@ -2,7 +2,7 @@
 
 ## 0.4.1
 
-* The Cloud Sync panel's backup-server note describes the current switch: sign in on another PJDesk Server with the same account (it becomes the standby), then choose **Make this the primary** there, or use the tray, or `pjdesk-server cloud promote`. Computers still reach whichever server `pjdesk.spader.us` points to, so DNS and the port forward have to move if the new primary is on a different network.
+* The Cloud Sync panel's backup-server note, and the README section **Backup server & moving the server**, describe the current switch: sign in on another PJDesk Server with the same account (it becomes the standby), then choose **Make this the primary** there, or use the tray, or `pjdesk-server cloud promote`. Computers still reach whichever server `pjdesk.spader.us` points to, so DNS and the port forward have to move if the new primary is on a different network.
 * The installers read the workspace version from `Cargo.toml` when none is passed. `installer/build.sh` and both NSIS scripts no longer fall back to 0.2.0.
 * Unused imports and unused code the compiler warned about are removed. What the programs do is unchanged.
 

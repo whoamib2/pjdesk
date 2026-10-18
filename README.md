@@ -246,14 +246,15 @@ cd "C:\App Dev\PJDesk\dist"
 A PJDesk server's identity is a handful of files: its TLS key (which every
 client pins), the user accounts and address books, and the computer list.
 **Cloud Sync** keeps an encrypted copy of them in a Cloudflare R2 bucket (any
-S3-compatible bucket works), so a second server can take over just by
-pointing the server's DNS name at it.
+S3-compatible bucket works). A second server signed in to the same copy stays
+in sync as a **standby**. You make it the **primary** when you want it to
+take over.
 
 **With a PJDesk account (easiest).** In the PJDesk Server window, open
 **Cloud Sync & Backup Server** → **PJDesk account** and sign in (create the
-account at pjdesk.com/account). The first server you sign in is the main one;
-sign in on another PJDesk Server with the same account and it becomes the
-backup — nothing to copy between them. The password never leaves your servers:
+account at pjdesk.com/account). The first server you sign in is the primary.
+Sign in on another PJDesk Server with the same account and it becomes the
+standby — nothing to copy between them. The password never leaves your servers:
 they derive one key from it to sign in and another to encrypt the copy, so
 PJDesk Cloud can't read it. (`pjdesk-server cloud signin --email you@example.com`
 does the same from the command line.) See [cloud/README.md](cloud/README.md).
@@ -261,34 +262,36 @@ does the same from the command line.) See [cloud/README.md](cloud/README.md).
 **Your own bucket (advanced).** Prefer to keep the copy in your own Cloudflare
 R2 / S3 bucket? Choose **Your own bucket** instead:
 
-**Set up (main server).** In Cloudflare, create an R2 bucket and an R2 API
+**Set up (primary).** In Cloudflare, create an R2 bucket and an R2 API
 token with *Object Read & Write* on that bucket. In the PJDesk Server window,
 open **Cloud Sync & Backup Server**, choose *This is the main server*, paste
 the S3 endpoint, bucket, access key ID and secret, and click **Start
 syncing**. Then **Copy join code** and keep it somewhere safe (a password
 manager) — it holds the bucket key and the encryption key.
 
-**Add a backup server.** Install PJDesk Server on another computer (another
+**Add a standby.** Install PJDesk Server on another computer (another
 location is the point), choose *This is a backup server*, paste the join
 code, and click **Join**. It now has the same key fingerprint, accounts and
 computer IDs, and keeps them current while on standby.
 
-**Switch over** (planned move or outage):
+**Switch over** (planned move or outage). On the standby, choose **Make this
+the primary** in the Cloud Sync panel or the tray, or run
+`pjdesk-server cloud promote`. It downloads the latest copy first. The other
+server becomes the standby the next time it checks, even if that server is
+offline, so you do not stop it yourself. The primary can **Step down to
+standby** (`pjdesk-server cloud demote`); that does not promote the other
+server — you still choose **Make this the primary** there.
 
-1. At the backup's location, forward TCP + UDP 21200 to it.
-2. Point the DNS name (e.g. `pjdesk.spader.us`) at the backup's public IP.
-   A short TTL (1–5 minutes) makes this quick.
-3. Stop the old server if it's still running.
+Computers connect to whichever server the DNS name points to (for example
+`pjdesk.spader.us`). If the new primary is on a different network, forward
+TCP + UDP 21200 to it and point that name at its public IP. A short TTL
+(1–5 minutes) makes the change quick. Computers reconnect within a couple of
+minutes (a client that hears nothing from its server for 70 s reconnects and
+looks the name up again), keep their IDs, and need no changes of their own.
 
-Computers reconnect within a couple of minutes (a client that hears nothing
-from its server for 70 s reconnects and looks the name up again), keep their
-IDs, and need no changes. Roles are automatic: the server with computers
-connected is *active* and uploads changes (accounts right away, the computer
-list at most every five minutes); a server with none is on *standby* and
-downloads them.
-
-From the command line: `pjdesk-server cloud signin|signout|status|sync` (PJDesk
-account) or `cloud setup|join|code|off` (your own bucket).
+From the command line: `pjdesk-server cloud signin|signout|status|sync|promote|demote`
+(PJDesk account) or `cloud setup|join|code|off|promote|demote` (your own bucket).
+`--yes` skips the promote and demote prompt.
 
 The copy is sealed with ChaCha20-Poly1305 under a random key made at setup.
 The sync settings (bucket secret + key) are stored in the server's data
