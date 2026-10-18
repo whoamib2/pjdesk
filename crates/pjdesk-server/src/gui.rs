@@ -73,12 +73,27 @@ struct App {
     cloud_job: Option<std::sync::mpsc::Receiver<CloudJobResult>>,
 }
 
-/// Ok(Some(message)) = done; Ok(None) = the bucket already holds a copy, ask
-/// before replacing it; Err = what went wrong.
-type CloudJobResult = Result<Option<String>, String>;
+/// How a cloud job (network calls on a worker thread) ended.
+enum JobDone {
+    Message(String),
+    /// Own bucket: it already holds a copy; ask before replacing it.
+    BucketOccupied,
+    /// PJDesk account: it holds another server's copy; ask which way to go.
+    Ask { cfg: crate::cloud::CloudConfig, from: String, written_at: u64, readable: bool },
+}
+
+type CloudJobResult = Result<JobDone, String>;
 
 #[derive(Default)]
 struct CloudForm {
+    /// "Your own bucket" instead of a PJDesk account.
+    own_bucket: bool,
+    acct_email: String,
+    acct_password: String,
+    show_acct_password: bool,
+    /// Signed in, waiting for the user to choose backup vs. replace.
+    pending: Option<crate::cloud::CloudConfig>,
+    ask: Option<(String, u64, bool)>,
     joining: bool,
     endpoint: String,
     bucket: String,
@@ -92,11 +107,16 @@ struct CloudForm {
 }
 
 enum CloudAct {
+    SignIn,
+    Choose(crate::cloud::Choice),
+    CancelAsk,
+    CreateAccount,
     Setup { replace: bool },
     Join,
     SyncNow,
     CopyCode,
     Off,
+    SignInAgain,
 }
 
 impl App {
@@ -423,6 +443,7 @@ impl App {
             heading(ui, "CLOUD SYNC & BACKUP SERVER");
             if self.cloud_on {
                 let s = self.cloud.clone().unwrap_or_default();
+                let is_account = !s.account.is_empty();
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                 let fresh = s.updated_at + 90 >= now;
                 ui.horizontal(|ui| {
@@ -431,7 +452,7 @@ impl App {
                         ui.label("Sync is on, but the server isn't running, so nothing is syncing.");
                     } else if s.role == "active" {
                         ui.colored_label(OK, "●");
-                        ui.label("In use: computers connect here, and this server's data is uploaded to the cloud.");
+                        ui.label("In use: computers connect here, and this server's data is backed up to the cloud.");
                     } else {
                         ui.colored_label(ACCENT, "●");
                         ui.label("Standby: ready to take over with the main server's data.");
@@ -448,33 +469,47 @@ impl App {
                 } else {
                     format!("Synced from {} (its data from {})", s.applied_from, format_local(s.applied_written_at))
                 };
-                ui.label(RichText::new(format!("{detail} · bucket \"{}\"", s.bucket)).color(MUTED).size(12.0));
+                ui.label(RichText::new(format!("{detail} · {}", s.bucket)).color(MUTED).size(12.0));
+                let signed_out = s.error.contains("sign in again");
                 if !s.error.is_empty() {
                     ui.colored_label(WARN, format!("⚠ {}", s.error));
                 }
                 ui.add_space(6.0);
                 ui.add_enabled_ui(can_write && !busy, |ui| {
                     ui.horizontal(|ui| {
+                        if signed_out && ui.add(egui::Button::new("Sign in again").fill(ACCENT)).clicked() {
+                            act = Some(CloudAct::SignInAgain);
+                        }
                         if ui.button("Sync now").clicked() {
                             act = Some(CloudAct::SyncNow);
                         }
-                        if ui
-                            .button("Copy join code")
-                            .on_hover_text("Everything a backup server needs to join. Keep it like a password.")
-                            .clicked()
+                        if !is_account
+                            && ui
+                                .button("Copy join code")
+                                .on_hover_text("Everything a backup server needs to join. Keep it like a password.")
+                                .clicked()
                         {
                             act = Some(CloudAct::CopyCode);
                         }
-                        if ui.button("Turn off").on_hover_text("Stop syncing on this server (the cloud copy is kept)").clicked() {
+                        let (label, tip) = if is_account {
+                            ("Sign out", "Sign this server out of PJDesk Cloud (the cloud copy is kept)")
+                        } else {
+                            ("Turn off", "Stop syncing on this server (the cloud copy is kept)")
+                        };
+                        if ui.button(label).on_hover_text(tip).clicked() {
                             act = Some(CloudAct::Off);
                         }
                     });
                 });
                 ui.add_space(4.0);
+                let how_to_add = if is_account {
+                    format!("Backup server: install PJDesk Server on another computer and sign in there with {}.", s.account)
+                } else {
+                    "Backup server: install PJDesk Server on another computer, choose Your own bucket → This is a backup server, and paste the join code.".to_string()
+                };
                 ui.label(
                     RichText::new(format!(
-                        "Backup server: install PJDesk Server on another computer, open Cloud Sync there, choose \"This is a backup server\" and paste the join code. \
-                         To switch over: forward TCP + UDP {port} to that computer, point {dns} at it, and stop this server. Computers move over within a couple of minutes."
+                        "{how_to_add} To switch over: forward TCP + UDP {port} to that computer, point {dns} at it, and stop this server. Computers move over within a couple of minutes."
                     ))
                     .color(MUTED)
                     .size(11.0),
@@ -482,8 +517,8 @@ impl App {
             } else {
                 ui.label(
                     RichText::new(format!(
-                        "Keep an encrypted copy of this server (its key, user accounts, address books and computer list) in a Cloudflare R2 bucket. \
-                         A backup server added with the join code stays in sync and takes over when you point {dns} at it."
+                        "Keep an encrypted copy of this server (its key, user accounts, address books and computer list) in the cloud. \
+                         A backup server stays in sync and takes over when you point {dns} at it."
                     ))
                     .color(MUTED)
                     .size(12.0),
@@ -491,83 +526,172 @@ impl App {
                 ui.add_space(6.0);
                 let f = &mut self.cloud_form;
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(!f.joining, "This is the main server").clicked() {
-                        f.joining = false;
+                    if ui.selectable_label(!f.own_bucket, "PJDesk account").clicked() {
+                        f.own_bucket = false;
                     }
-                    if ui.selectable_label(f.joining, "This is a backup server").clicked() {
-                        f.joining = true;
+                    if ui.selectable_label(f.own_bucket, "Your own bucket (advanced)").clicked() {
+                        f.own_bucket = true;
                     }
                 });
                 ui.add_space(4.0);
                 ui.add_enabled_ui(can_write && !busy, |ui| {
-                    if !f.joining {
-                        egui::Grid::new("cloudsetup").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                            ui.label("S3 endpoint");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut f.endpoint)
-                                    .hint_text("https://<account-id>.r2.cloudflarestorage.com")
-                                    .desired_width(330.0),
+                    if !f.own_bucket {
+                        if let Some((from, written_at, readable)) = f.ask.clone() {
+                            if readable {
+                                ui.colored_label(
+                                    WARN,
+                                    format!(
+                                        "Your account already holds {from}'s data (from {}), and {online} computer(s) are connected to this server.",
+                                        format_local(written_at)
+                                    ),
+                                );
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(egui::Button::new("Make this server a backup").fill(ACCENT))
+                                        .on_hover_text(format!("Replace this server's key, accounts and computer list with {from}'s"))
+                                        .clicked()
+                                    {
+                                        act = Some(CloudAct::Choose(crate::cloud::Choice::Join));
+                                    }
+                                    if ui
+                                        .button("Use this server's data")
+                                        .on_hover_text("Replace the copy in the cloud with this server's data")
+                                        .clicked()
+                                    {
+                                        act = Some(CloudAct::Choose(crate::cloud::Choice::Replace));
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        act = Some(CloudAct::CancelAsk);
+                                    }
+                                });
+                            } else {
+                                ui.colored_label(WARN, "Your account's cloud copy was made with an older password, so it can't be opened.");
+                                ui.horizontal(|ui| {
+                                    if ui.add(egui::Button::new("Upload this server's data").fill(ACCENT)).clicked() {
+                                        act = Some(CloudAct::Choose(crate::cloud::Choice::Replace));
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        act = Some(CloudAct::CancelAsk);
+                                    }
+                                });
+                            }
+                        } else {
+                            egui::Grid::new("cloudacct").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                                ui.label("Email");
+                                ui.add(egui::TextEdit::singleline(&mut f.acct_email).desired_width(300.0));
+                                ui.end_row();
+                                ui.label("Password");
+                                ui.horizontal(|ui| {
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(&mut f.acct_password)
+                                            .password(!f.show_acct_password)
+                                            .desired_width(270.0),
+                                    );
+                                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        act = Some(CloudAct::SignIn);
+                                    }
+                                    reveal_toggle(ui, &mut f.show_acct_password);
+                                });
+                                ui.end_row();
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.add(egui::Button::new("Sign in").fill(ACCENT)).clicked() {
+                                    act = Some(CloudAct::SignIn);
+                                }
+                                ui.label(RichText::new("No account yet?").color(MUTED).size(12.0));
+                                if ui.link("Create one at pjdesk.com").clicked() {
+                                    act = Some(CloudAct::CreateAccount);
+                                }
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "The first server you sign in is the main one; sign in on another PJDesk Server with the same account to make it the backup. \
+                                     Your password never leaves this computer, and the copy is encrypted so only your servers can read it.",
+                                )
+                                .color(MUTED)
+                                .size(11.0),
                             );
-                            ui.end_row();
-                            ui.label("Bucket");
-                            ui.add(egui::TextEdit::singleline(&mut f.bucket).desired_width(330.0));
-                            ui.end_row();
-                            ui.label("Access key ID");
-                            ui.add(egui::TextEdit::singleline(&mut f.key_id).desired_width(330.0));
-                            ui.end_row();
-                            ui.label("Secret access key");
-                            ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(&mut f.secret).password(!f.show_secret).desired_width(300.0));
-                                reveal_toggle(ui, &mut f.show_secret);
-                            });
-                            ui.end_row();
-                        });
-                        ui.add_space(4.0);
-                        if f.confirm_replace {
-                            ui.colored_label(WARN, "This bucket already holds a PJDesk server copy. Replace it with this server's?");
-                            ui.horizontal(|ui| {
-                                if ui.add(egui::Button::new("Replace it").fill(ACCENT)).clicked() {
-                                    act = Some(CloudAct::Setup { replace: true });
-                                }
-                                if ui.button("Cancel").clicked() {
-                                    f.confirm_replace = false;
-                                }
-                            });
-                        } else if ui.add(egui::Button::new("Start syncing").fill(ACCENT)).clicked() {
-                            act = Some(CloudAct::Setup { replace: false });
                         }
                     } else {
                         ui.horizontal(|ui| {
-                            ui.label("Join code");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut f.code)
-                                    .password(!f.show_code)
-                                    .hint_text("pjdesk-sync-1:…")
-                                    .desired_width(330.0),
-                            );
-                            reveal_toggle(ui, &mut f.show_code);
+                            if ui.selectable_label(!f.joining, "This is the main server").clicked() {
+                                f.joining = false;
+                            }
+                            if ui.selectable_label(f.joining, "This is a backup server").clicked() {
+                                f.joining = true;
+                            }
                         });
-                        ui.label(
-                            RichText::new("Copy it from the main server (Cloud Sync → Copy join code). Joining replaces this server's key, accounts and computer list with the main server's.")
-                                .color(MUTED)
-                                .size(11.0),
-                        );
                         ui.add_space(4.0);
-                        if f.confirm_join {
-                            ui.colored_label(WARN, format!("{online} computer(s) are connected to this server right now. Join anyway?"));
+                        if !f.joining {
+                            egui::Grid::new("cloudsetup").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                                ui.label("S3 endpoint");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut f.endpoint)
+                                        .hint_text("https://<account-id>.r2.cloudflarestorage.com")
+                                        .desired_width(330.0),
+                                );
+                                ui.end_row();
+                                ui.label("Bucket");
+                                ui.add(egui::TextEdit::singleline(&mut f.bucket).desired_width(330.0));
+                                ui.end_row();
+                                ui.label("Access key ID");
+                                ui.add(egui::TextEdit::singleline(&mut f.key_id).desired_width(330.0));
+                                ui.end_row();
+                                ui.label("Secret access key");
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::TextEdit::singleline(&mut f.secret).password(!f.show_secret).desired_width(300.0));
+                                    reveal_toggle(ui, &mut f.show_secret);
+                                });
+                                ui.end_row();
+                            });
+                            ui.add_space(4.0);
+                            if f.confirm_replace {
+                                ui.colored_label(WARN, "This bucket already holds a PJDesk server copy. Replace it with this server's?");
+                                ui.horizontal(|ui| {
+                                    if ui.add(egui::Button::new("Replace it").fill(ACCENT)).clicked() {
+                                        act = Some(CloudAct::Setup { replace: true });
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        f.confirm_replace = false;
+                                    }
+                                });
+                            } else if ui.add(egui::Button::new("Start syncing").fill(ACCENT)).clicked() {
+                                act = Some(CloudAct::Setup { replace: false });
+                            }
+                        } else {
                             ui.horizontal(|ui| {
-                                if ui.add(egui::Button::new("Join anyway").fill(ACCENT)).clicked() {
+                                ui.label("Join code");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut f.code)
+                                        .password(!f.show_code)
+                                        .hint_text("pjdesk-sync-1:…")
+                                        .desired_width(330.0),
+                                );
+                                reveal_toggle(ui, &mut f.show_code);
+                            });
+                            ui.label(
+                                RichText::new("Copy it from the main server (Copy join code). Joining replaces this server's key, accounts and computer list with the main server's.")
+                                    .color(MUTED)
+                                    .size(11.0),
+                            );
+                            ui.add_space(4.0);
+                            if f.confirm_join {
+                                ui.colored_label(WARN, format!("{online} computer(s) are connected to this server right now. Join anyway?"));
+                                ui.horizontal(|ui| {
+                                    if ui.add(egui::Button::new("Join anyway").fill(ACCENT)).clicked() {
+                                        act = Some(CloudAct::Join);
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        f.confirm_join = false;
+                                    }
+                                });
+                            } else if ui.add(egui::Button::new("Join").fill(ACCENT)).clicked() {
+                                if online > 0 {
+                                    f.confirm_join = true;
+                                } else {
                                     act = Some(CloudAct::Join);
                                 }
-                                if ui.button("Cancel").clicked() {
-                                    f.confirm_join = false;
-                                }
-                            });
-                        } else if ui.add(egui::Button::new("Join").fill(ACCENT)).clicked() {
-                            if online > 0 {
-                                f.confirm_join = true;
-                            } else {
-                                act = Some(CloudAct::Join);
                             }
                         }
                     }
@@ -576,7 +700,7 @@ impl App {
             if busy {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new("Talking to cloud storage…").color(MUTED).size(12.0));
+                    ui.label(RichText::new("Talking to the cloud…").color(MUTED).size(12.0));
                 });
             }
         });
@@ -588,7 +712,41 @@ impl App {
     fn run_cloud_action(&mut self, act: CloudAct) {
         use crate::cloud::{self, CloudConfig};
         let dir = self.data_dir.clone();
+        let online = self.online.len();
         match act {
+            CloudAct::SignIn => {
+                let email = self.cloud_form.acct_email.trim().to_string();
+                let password = std::mem::take(&mut self.cloud_form.acct_password);
+                if email.is_empty() || password.is_empty() {
+                    self.status = "Enter your PJDesk account email and password.".into();
+                    return;
+                }
+                self.spawn_cloud_job(move || {
+                    let cfg = cloud::sign_in(&cloud::default_api(), &email, &password)?;
+                    finish_account(&dir, cfg, online, None)
+                });
+            }
+            CloudAct::Choose(choice) => {
+                self.cloud_form.ask = None;
+                let Some(cfg) = self.cloud_form.pending.take() else { return };
+                self.spawn_cloud_job(move || finish_account(&dir, cfg, online, Some(choice)));
+            }
+            CloudAct::CancelAsk => {
+                self.cloud_form.ask = None;
+                if let Some(cfg) = self.cloud_form.pending.take() {
+                    std::thread::spawn(move || cloud::discard_sign_in(&cfg));
+                }
+            }
+            CloudAct::CreateAccount => open_url(&format!("{}/account/#create", cloud::default_api())),
+            CloudAct::SignInAgain => {
+                if let Some(cfg) = CloudConfig::load(&dir) {
+                    self.cloud_form.acct_email = cfg.email.clone();
+                }
+                self.cloud_form.own_bucket = false;
+                cloud::turn_off(&dir);
+                self.status = "Enter your PJDesk account password to sign in again.".into();
+                self.refresh();
+            }
             CloudAct::SyncNow => {
                 self.status = match crate::requests::push(&dir, crate::requests::SYNC_FILE, "now") {
                     Ok(()) => "Syncing now.".into(),
@@ -603,8 +761,18 @@ impl App {
                 None => self.status = "Can't read the sync settings (restart as administrator).".into(),
             },
             CloudAct::Off => {
+                let was_account = self.cloud.as_ref().is_some_and(|s| !s.account.is_empty());
+                std::thread::spawn({
+                    let dir = dir.clone();
+                    move || cloud::sign_out(&dir)
+                });
+                // Remove the settings right away so the window updates.
                 cloud::turn_off(&dir);
-                self.status = "Cloud sync is off on this server. The copy in the bucket is kept.".into();
+                self.status = if was_account {
+                    "Signed out of PJDesk Cloud; cloud sync is off on this server. The cloud copy is kept.".into()
+                } else {
+                    "Cloud sync is off on this server. The copy in the bucket is kept.".into()
+                };
                 self.refresh();
             }
             CloudAct::Setup { replace } => {
@@ -619,11 +787,11 @@ impl App {
                 self.cloud_form.confirm_replace = false;
                 self.spawn_cloud_job(move || {
                     if !replace && matches!(cloud::check_bucket(&cfg)?, cloud::SetupCheck::Occupied) {
-                        return Ok(None);
+                        return Ok(JobDone::BucketOccupied);
                     }
                     cloud::setup(&dir, &cfg)?;
                     let _ = crate::requests::push(&dir, crate::requests::SYNC_FILE, "now");
-                    Ok(Some(
+                    Ok(JobDone::Message(
                         "Cloud sync is on and this server's data is uploaded. Next: Copy join code, then use it on your backup server."
                             .into(),
                     ))
@@ -641,7 +809,7 @@ impl App {
                 self.spawn_cloud_job(move || {
                     let from = cloud::join(&dir, &cfg)?;
                     let _ = crate::requests::push(&dir, crate::requests::RELOAD_FILE, "now");
-                    Ok(Some(format!(
+                    Ok(JobDone::Message(format!(
                         "Joined. This server now has the key, accounts and computer list from {from}, and stays in sync on standby."
                     )))
                 });
@@ -649,7 +817,7 @@ impl App {
         }
     }
 
-    fn spawn_cloud_job(&mut self, job: impl FnOnce() -> anyhow::Result<Option<String>> + Send + 'static) {
+    fn spawn_cloud_job(&mut self, job: impl FnOnce() -> anyhow::Result<JobDone> + Send + 'static) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(job().map_err(|e| format!("{e:#}")));
@@ -662,16 +830,22 @@ impl App {
         let Ok(result) = rx.try_recv() else { return };
         self.cloud_job = None;
         match result {
-            Ok(Some(msg)) => {
+            Ok(JobDone::Message(msg)) => {
                 self.status = msg;
                 let f = &mut self.cloud_form;
                 f.secret.clear();
                 f.code.clear();
+                f.acct_password.clear();
                 f.show_secret = false;
                 f.show_code = false;
+                f.show_acct_password = false;
                 self.refresh();
             }
-            Ok(None) => self.cloud_form.confirm_replace = true,
+            Ok(JobDone::BucketOccupied) => self.cloud_form.confirm_replace = true,
+            Ok(JobDone::Ask { cfg, from, written_at, readable }) => {
+                self.cloud_form.pending = Some(cfg);
+                self.cloud_form.ask = Some((from, written_at, readable));
+            }
             Err(e) => self.status = e,
         }
     }
@@ -794,6 +968,55 @@ impl App {
                 });
             }
         });
+    }
+}
+
+/// Finishes signing in to a PJDesk account: uploads, joins, or asks.
+fn finish_account(
+    dir: &std::path::Path,
+    cfg: crate::cloud::CloudConfig,
+    online: usize,
+    choice: Option<crate::cloud::Choice>,
+) -> anyhow::Result<JobDone> {
+    use crate::cloud::Connected;
+    let email = cfg.email.clone();
+    Ok(match crate::cloud::connect_account(dir, &cfg, online, choice)? {
+        Connected::Uploaded => {
+            let _ = crate::requests::push(dir, crate::requests::SYNC_FILE, "now");
+            JobDone::Message(format!(
+                "Signed in as {email}. This is the main server, and its data is backed up to PJDesk Cloud.                  To add a backup server, sign in on another PJDesk Server with the same account."
+            ))
+        }
+        Connected::Resumed => JobDone::Message(format!("Signed in as {email}. Syncing as before.")),
+        Connected::Joined { from } => {
+            let _ = crate::requests::push(dir, crate::requests::RELOAD_FILE, "now");
+            JobDone::Message(format!(
+                "Signed in as {email}. This server now has {from}'s key, accounts and computer list, and stays on standby to take over."
+            ))
+        }
+        Connected::Replaced => {
+            let _ = crate::requests::push(dir, crate::requests::SYNC_FILE, "now");
+            JobDone::Message(format!("Signed in as {email}. This server's data replaced the copy in PJDesk Cloud."))
+        }
+        Connected::Ask { from, written_at, readable } => JobDone::Ask { cfg, from, written_at, readable },
+    })
+}
+
+/// Opens a web page in the default browser.
+#[cfg(windows)]
+fn open_url(url: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    unsafe {
+        ShellExecuteW(
+            None,
+            &HSTRING::from("open"),
+            &HSTRING::from(url),
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
     }
 }
 

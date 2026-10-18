@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PJDesk admin</title>
+<meta name="robots" content="noindex">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="/site.css">
+</head>
+<body>
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="/"><span class="dot"></span>PJDesk</a>
+    <span class="spacer"></span>
+    <a class="link" href="/account/">Account</a>
+    <a class="link on" href="/admin/">Admin</a>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <h1>Accounts</h1>
+    <p class="sub">Turn Cloud Sync on for customers who have bought it. Administrators always have it.</p>
+    <div class="card">
+      <div class="row" style="margin-bottom:12px">
+        <input id="filter" type="text" placeholder="Filter by email" style="max-width:320px">
+        <span class="spacer"></span>
+        <span id="count" class="muted"></span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Email</th><th>Created</th><th>Last sign-in</th><th>Signed in</th><th>Last backup</th><th>Cloud Sync</th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div id="msg" class="msg"></div>
+    </div>
+  </div>
+</main>
+
+<script src="/app.js"></script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let accounts = [];
+
+  function cell(text, cls) {
+    const td = document.createElement("td");
+    td.textContent = text;
+    if (cls) td.className = cls;
+    return td;
+  }
+
+  function render() {
+    const q = $("filter").value.trim().toLowerCase();
+    const shown = accounts.filter((a) => !q || a.email.includes(q));
+    $("count").textContent = `${shown.length} of ${accounts.length}`;
+    $("rows").replaceChildren(...shown.map((a) => {
+      const tr = document.createElement("tr");
+      const email = cell(a.email);
+      if (a.is_admin) {
+        const b = document.createElement("span");
+        b.className = "pill on";
+        b.style.marginLeft = "8px";
+        b.textContent = "admin";
+        email.appendChild(b);
+      }
+      tr.append(
+        email,
+        cell(PJ.date(a.created_at), "muted"),
+        cell(PJ.date(a.last_login_at), "muted"),
+        cell(String(a.signed_in || 0), "muted"),
+        cell(a.synced_at ? `${PJ.date(a.synced_at)} · ${PJ.size(a.size)}` : "—", "muted"),
+      );
+      const td = document.createElement("td");
+      const label = document.createElement("label");
+      label.className = "switch";
+      label.style.margin = "0";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = a.sync_enabled;
+      box.disabled = a.is_admin;
+      box.setAttribute("aria-label", `Cloud Sync for ${a.email}`);
+      box.onchange = async () => {
+        box.disabled = true;
+        try {
+          await PJ.call("POST", "/api/admin/sync", { email: a.email, enabled: box.checked });
+          a.sync_enabled = box.checked;
+          PJ.message($("msg"), `Cloud Sync ${box.checked ? "turned on" : "turned off"} for ${a.email}.`, "ok");
+        } catch (e) {
+          box.checked = !box.checked;
+          PJ.message($("msg"), e.message, "err");
+        } finally {
+          box.disabled = a.is_admin;
+        }
+      };
+      label.append(box, document.createElement("span"));
+      td.appendChild(label);
+      tr.appendChild(td);
+      return tr;
+    }));
+  }
+
+  async function load() {
+    if (!PJ.token()) { location.href = "/account/"; return; }
+    try {
+      accounts = (await PJ.call("GET", "/api/admin/accounts")).accounts;
+      render();
+    } catch (e) {
+      if (e.status === 401) { PJ.setToken(null); location.href = "/account/"; return; }
+      PJ.message($("msg"), e.message, "err");
+    }
+  }
+
+  $("filter").addEventListener("input", render);
+  load();
+})();
+</script>
+</body>
+</html>

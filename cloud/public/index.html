@@ -1,5 +1,10 @@
-<title>PJDesk</title>
-<meta name="claude:viewport-fit-sides" content="cover">
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PJDesk — remote desktop you host yourself</title>
+<meta name="description" content="PJDesk is a self-hosted, open-source remote desktop for Windows: one app to share and control, and a server you run yourself.">
 <style>
   /* Layout: single dark "control-room" theme; centered 1040px column;
      hero pairs a thesis headline with a mock of the real PJDesk window. */
@@ -145,6 +150,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+</head>
+<body>
 
 <header>
   <div class="wrap nav">
@@ -153,6 +160,7 @@
     <a class="link hide-sm" href="#features">Features</a>
     <a class="link hide-sm" href="#how">How it works</a>
     <a class="link" href="https://github.com/whoamib2/pjdesk">GitHub</a>
+    <a class="link" href="/account/">Account</a>
     <a class="btn btn-primary" href="#download">Download</a>
   </div>
 </header>
@@ -288,7 +296,7 @@
           <span class="k">The app</span>
           <h3>PJDesk</h3>
           <p>Share this computer and control others. Install it on every machine you want to reach or connect from.</p>
-          <a class="btn btn-primary" href="PJDesk-Setup-0.3.5.exe" download>
+          <a class="btn btn-primary" href="/download/client">
             <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 1v9m0 0L4.5 6.5M8 10l3.5-3.5M2 13h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
             PJDesk-Setup.exe
           </a>
@@ -297,14 +305,14 @@
           <span class="k">The hub</span>
           <h3>PJDesk Server</h3>
           <p>Run this once, on a computer that stays on. Everything connects through it, and nothing leaves your network unless you want it to.</p>
-          <a class="btn btn-ghost" href="PJDesk-Server-Setup-0.3.5.exe" download>
+          <a class="btn btn-ghost" href="/download/server">
             <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 1v9m0 0L4.5 6.5M8 10l3.5-3.5M2 13h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
             PJDesk-Server-Setup.exe
           </a>
         </div>
       </div>
       <div class="dl-note">
-        <span>Version 0.3.5 · Windows 10/11, 64-bit · <a class="link" href="SHA256SUMS" style="color:var(--accent);text-decoration:none">SHA-256 checksums</a> · Prefer to build it yourself? Clone the repo and run <code>build.cmd</code>.</span>
+        <span><span id="dl-version">Latest version</span> · Windows 10/11, 64-bit · <a class="link" href="/download/sums" style="color:var(--accent);text-decoration:none">SHA-256 checksums</a> · Prefer to build it yourself? Clone the repo and run <code>build.cmd</code>.</span>
         <a class="link" href="https://github.com/whoamib2/pjdesk/releases" style="color:var(--accent);text-decoration:none">All releases →</a>
       </div>
     </div>
@@ -320,3 +328,10 @@
     <span>MIT licensed</span>
   </div>
 </footer>
+<script>
+  fetch("/api/release").then((r) => r.ok ? r.json() : null).then((r) => {
+    if (r && r.version) document.getElementById("dl-version").textContent = "Version " + r.version;
+  }).catch(() => {});
+</script>
+</body>
+</html>

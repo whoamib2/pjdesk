@@ -1,0 +1,15 @@
+{
+  "name": "pjdesk-cloud",
+  "private": true,
+  "description": "PJDesk Cloud: accounts and encrypted server sync (Cloudflare Worker + D1 + R2), and the pjdesk.com website.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "migrate:local": "wrangler d1 migrations apply pjdesk-cloud --local",
+    "migrate:remote": "wrangler d1 migrations apply pjdesk-cloud --remote",
+    "deploy": "wrangler d1 migrations apply pjdesk-cloud --remote && wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

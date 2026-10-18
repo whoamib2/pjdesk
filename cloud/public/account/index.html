@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your PJDesk account</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="/site.css">
+</head>
+<body>
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="/"><span class="dot"></span>PJDesk</a>
+    <span class="spacer"></span>
+    <a class="link" href="/#download">Download</a>
+    <a class="link on" href="/account/">Account</a>
+  </div>
+</header>
+
+<main>
+  <div class="wrap narrow">
+    <!-- Signed out -->
+    <section id="signed-out" class="hidden">
+      <h1>PJDesk account</h1>
+      <p class="sub">Your account turns on Cloud Sync: an encrypted copy of your PJDesk Server, so a backup server can take over.</p>
+      <div class="card">
+        <div class="tabs" role="tablist">
+          <button type="button" id="tab-in" class="on" role="tab">Sign in</button>
+          <button type="button" id="tab-up" role="tab">Create account</button>
+        </div>
+        <form id="auth-form" novalidate>
+          <label for="email">Email</label>
+          <input id="email" type="email" autocomplete="username" required>
+          <label for="password">Password</label>
+          <div class="field">
+            <input id="password" type="password" autocomplete="current-password" required>
+            <button type="button" class="btn btn-small" data-reveal="password">Show</button>
+          </div>
+          <div id="confirm-wrap" class="hidden">
+            <label for="password2">Password again</label>
+            <div class="field">
+              <input id="password2" type="password" autocomplete="new-password">
+              <button type="button" class="btn btn-small" data-reveal="password2">Show</button>
+            </div>
+          </div>
+          <div class="actions">
+            <button id="auth-submit" class="btn btn-primary" type="submit">Sign in</button>
+          </div>
+          <div id="auth-msg" class="msg"></div>
+        </form>
+        <p class="note" id="pw-note">Your password never leaves your browser or your server; PJDesk only receives a key made from it, and your server backups are encrypted with another key only your servers have. That also means PJDesk can't recover a forgotten password, so keep it in your password manager.</p>
+      </div>
+    </section>
+
+    <!-- Signed in -->
+    <section id="signed-in" class="hidden">
+      <h1>Your PJDesk account</h1>
+      <p class="sub" id="me-email"></p>
+
+      <div class="card">
+        <h2>Cloud Sync</h2>
+        <dl class="kv">
+          <dt>Status</dt><dd id="sync-status"></dd>
+          <dt>Last backup</dt><dd id="sync-last">—</dd>
+          <dt>Size</dt><dd id="sync-size">—</dd>
+        </dl>
+        <p class="note" id="sync-howto">To use it, open PJDesk Server → <b>Cloud Sync &amp; Backup Server</b> → <b>Sign in</b> with this account. The first server you sign in becomes the main one; sign in on another PJDesk Server to make it the backup.</p>
+      </div>
+
+      <div class="card">
+        <h2>Signed in</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Where</th><th>Signed in</th><th>Last active</th></tr></thead>
+            <tbody id="devices"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <details>
+          <summary>Change password</summary>
+          <form id="pw-form" novalidate>
+            <label for="old-pw">Current password</label>
+            <div class="field">
+              <input id="old-pw" type="password" autocomplete="current-password">
+              <button type="button" class="btn btn-small" data-reveal="old-pw">Show</button>
+            </div>
+            <label for="new-pw">New password</label>
+            <div class="field">
+              <input id="new-pw" type="password" autocomplete="new-password">
+              <button type="button" class="btn btn-small" data-reveal="new-pw">Show</button>
+            </div>
+            <label for="new-pw2">New password again</label>
+            <div class="field">
+              <input id="new-pw2" type="password" autocomplete="new-password">
+              <button type="button" class="btn btn-small" data-reveal="new-pw2">Show</button>
+            </div>
+            <p class="note">Changing it signs out your servers. Sign in again on your main server first; it uploads a fresh backup, then sign in on the backup server.</p>
+            <div class="actions"><button class="btn btn-primary" type="submit">Change password</button></div>
+            <div id="pw-msg" class="msg"></div>
+          </form>
+        </details>
+      </div>
+
+      <div class="actions">
+        <a id="admin-link" class="btn hidden" href="/admin/">Admin</a>
+        <button id="sign-out" class="btn" type="button">Sign out</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer><div class="wrap"><a href="/">pjdesk.com</a><a href="https://github.com/whoamib2/pjdesk">GitHub</a></div></footer>
+
+<script src="/app.js"></script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let creating = false;
+  PJ.revealToggles();
+
+  function setMode(create) {
+    creating = create;
+    $("tab-in").classList.toggle("on", !create);
+    $("tab-up").classList.toggle("on", create);
+    PJ.show($("confirm-wrap"), create);
+    $("auth-submit").textContent = create ? "Create account" : "Sign in";
+    $("password").autocomplete = create ? "new-password" : "current-password";
+    PJ.message($("auth-msg"), "");
+  }
+  $("tab-in").onclick = () => setMode(false);
+  $("tab-up").onclick = () => setMode(true);
+
+  $("auth-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const email = $("email").value.trim();
+    const pw = $("password").value;
+    const msg = $("auth-msg");
+    if (!email || !pw) return PJ.message(msg, "Enter your email and password.", "err");
+    if (creating) {
+      if (pw.length < 10) return PJ.message(msg, "Use at least 10 characters.", "err");
+      if (pw !== $("password2").value) return PJ.message(msg, "The passwords don't match.", "err");
+    }
+    const btn = $("auth-submit");
+    btn.disabled = true;
+    PJ.message(msg, creating ? "Creating your account…" : "Signing in…");
+    try {
+      const auth_key = await PJ.authKey(email, pw);
+      if (creating) await PJ.call("POST", "/api/signup", { email, auth_key });
+      const r = await PJ.call("POST", "/api/login", { email, auth_key, device: "Web browser" });
+      PJ.setToken(r.token);
+      $("password").value = $("password2").value = "";
+      await load();
+    } catch (e) {
+      PJ.message(msg, e.message, "err");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("pw-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const msg = $("pw-msg");
+    const oldPw = $("old-pw").value, newPw = $("new-pw").value;
+    if (newPw.length < 10) return PJ.message(msg, "Use at least 10 characters.", "err");
+    if (newPw !== $("new-pw2").value) return PJ.message(msg, "The new passwords don't match.", "err");
+    PJ.message(msg, "Changing…");
+    try {
+      const email = $("me-email").dataset.email;
+      const [old_auth_key, new_auth_key] = await Promise.all([PJ.authKey(email, oldPw), PJ.authKey(email, newPw)]);
+      await PJ.call("POST", "/api/password", { old_auth_key, new_auth_key });
+      $("old-pw").value = $("new-pw").value = $("new-pw2").value = "";
+      PJ.message(msg, "Password changed. Sign in again on your PJDesk servers, starting with the main one.", "ok");
+      load();
+    } catch (e) {
+      PJ.message(msg, e.message, "err");
+    }
+  });
+
+  $("sign-out").onclick = async () => {
+    try { await PJ.call("POST", "/api/logout"); } catch { /* already signed out */ }
+    PJ.setToken(null);
+    load();
+  };
+
+  async function load() {
+    if (!PJ.token()) {
+      PJ.show($("signed-in"), false);
+      PJ.show($("signed-out"), true);
+      return;
+    }
+    try {
+      const me = await PJ.call("GET", "/api/me");
+      $("me-email").textContent = "Signed in as " + me.email;
+      $("me-email").dataset.email = me.email;
+      $("sync-status").innerHTML = me.sync_enabled
+        ? '<span class="pill on">● On</span>'
+        : '<span class="pill off">Not turned on yet</span>';
+      $("sync-last").textContent = me.sync ? PJ.date(me.sync.updated_at) : "No backup yet";
+      $("sync-size").textContent = me.sync ? PJ.size(me.sync.size) : "—";
+      PJ.show($("sync-howto"), me.sync_enabled);
+      const rows = (me.devices || []).map((d) => {
+        const tr = document.createElement("tr");
+        for (const v of [d.device || "Unknown", PJ.date(d.created_at), PJ.date(d.last_used_at)]) {
+          const td = document.createElement("td");
+          td.textContent = v;
+          tr.appendChild(td);
+        }
+        return tr;
+      });
+      $("devices").replaceChildren(...rows);
+      PJ.show($("admin-link"), me.is_admin);
+      PJ.show($("signed-out"), false);
+      PJ.show($("signed-in"), true);
+    } catch (e) {
+      if (e.status === 401) {
+        PJ.setToken(null);
+        return load();
+      }
+      PJ.show($("signed-out"), true);
+      PJ.message($("auth-msg"), e.message, "err");
+    }
+  }
+
+  if (location.hash === "#create") setMode(true);
+  load();
+})();
+</script>
+</body>
+</html>

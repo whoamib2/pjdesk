@@ -249,6 +249,18 @@ client pins), the user accounts and address books, and the computer list.
 S3-compatible bucket works), so a second server can take over just by
 pointing the server's DNS name at it.
 
+**With a PJDesk account (easiest).** In the PJDesk Server window, open
+**Cloud Sync & Backup Server** → **PJDesk account** and sign in (create the
+account at pjdesk.com/account). The first server you sign in is the main one;
+sign in on another PJDesk Server with the same account and it becomes the
+backup — nothing to copy between them. The password never leaves your servers:
+they derive one key from it to sign in and another to encrypt the copy, so
+PJDesk Cloud can't read it. (`pjdesk-server cloud signin --email you@example.com`
+does the same from the command line.) See [cloud/README.md](cloud/README.md).
+
+**Your own bucket (advanced).** Prefer to keep the copy in your own Cloudflare
+R2 / S3 bucket? Choose **Your own bucket** instead:
+
 **Set up (main server).** In Cloudflare, create an R2 bucket and an R2 API
 token with *Object Read & Write* on that bucket. In the PJDesk Server window,
 open **Cloud Sync & Backup Server**, choose *This is the main server*, paste
@@ -275,7 +287,8 @@ connected is *active* and uploads changes (accounts right away, the computer
 list at most every five minutes); a server with none is on *standby* and
 downloads them.
 
-From the command line: `pjdesk-server cloud setup|join|code|status|sync|off`.
+From the command line: `pjdesk-server cloud signin|signout|status|sync` (PJDesk
+account) or `cloud setup|join|code|off` (your own bucket).
 
 The copy is sealed with ChaCha20-Poly1305 under a random key made at setup.
 The sync settings (bucket secret + key) are stored in the server's data

@@ -1,0 +1,29 @@
+# PJDesk Cloud — accounts + encrypted server sync, and the pjdesk.com website.
+# Deployed by Cloudflare's Git integration (Workers Builds) from this folder;
+# no GitHub Actions.
+name = "pjdesk-cloud"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+# The website (and account pages). The Worker handles /api/* and /download/*.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "404-page"
+run_worker_first = ["/api/*", "/download/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "pjdesk-cloud"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "SYNC"
+bucket_name = "pjdesk-sync"
+
+[vars]
+# Accounts that can open /admin and always have cloud sync.
+ADMIN_EMAILS = "ben@spader.us,pjdesk@spader.us"
+# Where releases (and so the download links) come from.
+RELEASE_REPO = "whoamib2/pjdesk"

@@ -111,8 +111,29 @@ enum AccountCommand {
 
 #[derive(Subcommand)]
 enum CloudCommand {
-    /// Turn on sync as the main server and upload now. Prints the join code
-    /// for backup servers.
+    /// Sign in to PJDesk Cloud with your PJDesk account. The first server
+    /// signed in to an account is the main one; another server signed in to
+    /// the same account becomes its backup.
+    Signin {
+        #[arg(long)]
+        email: String,
+        /// Prompted for if omitted.
+        #[arg(long)]
+        password: Option<String>,
+        /// PJDesk Cloud address (default https://pjdesk.com).
+        #[arg(long)]
+        api: Option<String>,
+        /// Take the account's copy even if computers are connected here.
+        #[arg(long, conflicts_with = "replace")]
+        backup: bool,
+        /// Replace the account's copy with this server's data.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Sign out of PJDesk Cloud and stop syncing.
+    Signout,
+    /// Use your own Cloudflare R2 / S3 bucket instead: turn on sync as the
+    /// main server and upload now. Prints the join code for backup servers.
     Setup {
         /// S3 endpoint from Cloudflare (https://<account-id>.r2.cloudflarestorage.com) or the account ID.
         #[arg(long)]
@@ -324,6 +345,53 @@ fn cloud_command(cmd: CloudCommand, data_dir: &std::path::Path) -> Result<()> {
             println!("Cloud sync is on; this server's state is uploaded to \"{}\".", cfg.bucket);
             println!("\nJoin code for a backup server (keep it like a password):\n\n{}\n", cfg.join_code());
         }
+        CloudCommand::Signin { email, password, api, backup, replace } => {
+            let password = match password {
+                Some(p) => p,
+                None => rpassword::prompt_password(format!("Password for {email}: "))?,
+            };
+            let api = api.unwrap_or_else(cloud::default_api);
+            let cfg = cloud::sign_in(&api, &email, &password)?;
+            let choice = if replace {
+                Some(cloud::Choice::Replace)
+            } else if backup {
+                Some(cloud::Choice::Join)
+            } else {
+                None
+            };
+            let online = cloud::computers_online(data_dir);
+            match cloud::connect_account(data_dir, &cfg, online, choice)? {
+                cloud::Connected::Uploaded => {
+                    let _ = requests::push(data_dir, requests::SYNC_FILE, "now");
+                    println!("Signed in as {}. This is the main server; its data is uploaded to PJDesk Cloud.", cfg.email);
+                }
+                cloud::Connected::Resumed => println!("Signed in as {}; syncing as before.", cfg.email),
+                cloud::Connected::Joined { from } => {
+                    let _ = requests::push(data_dir, requests::RELOAD_FILE, "now");
+                    println!("Signed in as {}. This server now has {from}'s key, accounts and computer list, and is on standby.", cfg.email);
+                }
+                cloud::Connected::Replaced => {
+                    let _ = requests::push(data_dir, requests::SYNC_FILE, "now");
+                    println!("Signed in as {}. This server's data replaced the copy in PJDesk Cloud.", cfg.email);
+                }
+                cloud::Connected::Ask { from, written_at, readable } => {
+                    cloud::discard_sign_in(&cfg);
+                    if readable {
+                        anyhow::bail!(
+                            "{} already holds {from}'s data (from {}) and {online} computer(s) are connected here. \
+                             Run again with --backup to make this server a backup of it, or --replace to upload this server's data instead.",
+                            cfg.email,
+                            registry::format_local(written_at)
+                        );
+                    }
+                    anyhow::bail!("the account's cloud copy was made with an older password; run again with --replace to upload this server's data");
+                }
+            }
+        }
+        CloudCommand::Signout => {
+            cloud::sign_out(data_dir);
+            println!("Signed out; cloud sync is off on this server.");
+        }
         CloudCommand::Join { code } => {
             let cfg = CloudConfig::from_join_code(&code)?;
             let from = cloud::join(data_dir, &cfg)?;
@@ -341,7 +409,11 @@ fn cloud_command(cmd: CloudCommand, data_dir: &std::path::Path) -> Result<()> {
             (None, _) => println!("Cloud sync is off."),
             (Some(cfg), status) => {
                 let s = status.unwrap_or_default();
-                println!("Bucket: {} ({})", cfg.bucket, cfg.endpoint);
+                if cfg.is_account() {
+                    println!("Signed in to PJDesk Cloud as {} ({})", cfg.email, cfg.api);
+                } else {
+                    println!("Bucket: {} ({})", cfg.bucket, cfg.endpoint);
+                }
                 println!("Role: {}", if s.role.is_empty() { "unknown (is the server running?)" } else { &s.role });
                 if s.last_upload_at > 0 {
                     println!("Last upload: {}", registry::format_local(s.last_upload_at));
