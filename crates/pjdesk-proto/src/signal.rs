@@ -50,6 +50,114 @@ pub enum ClientMsg {
     SaveAddressBook { token: String, entries: Vec<AddressEntry> },
     /// Keep-alive.
     Ping,
+    /// Version 3. Operator or admin: the registered computers.
+    ListDevices { token: String },
+    /// Version 3. Operator or admin: set or clear a computer's group.
+    SetDeviceGroup { token: String, device_id: String, group: String },
+    /// Version 3. Any signed-in user may read the policy; only an admin may change it.
+    GetPolicy { token: String },
+    SetPolicy { token: String, policy: Policy },
+    /// Version 3. Operator or admin: recent audit events.
+    GetAudit { token: String, limit: u32 },
+    /// Version 3. Admin: change an account's role.
+    SetRole { token: String, username: String, role: Role },
+    /// Version 3. The signed-in user replaces their own password. The server
+    /// drops saved tokens, so the client signs in again.
+    ChangePassword { token: String, new_password: String },
+}
+
+/// What a signed-in account is allowed to do on the server.
+///
+/// Stored next to the account. A file written by 0.3.x has no role; an admin
+/// flag still means [`Role::Admin`] and everyone else is [`Role::User`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    User,
+    Operator,
+    Admin,
+}
+
+impl Role {
+    pub fn is_admin(self) -> bool {
+        matches!(self, Role::Admin)
+    }
+
+    pub fn can_manage_devices(self) -> bool {
+        matches!(self, Role::Operator | Role::Admin)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Operator => "operator",
+            Role::Admin => "admin",
+        }
+    }
+}
+
+/// Rules the server pushes to hosts. A host applies them as a ceiling on
+/// whatever the person at the computer allows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Policy {
+    /// A permanent password may accept a session when nobody is there to click.
+    #[serde(default = "yes")]
+    pub unattended_allowed: bool,
+    /// Always show the approval prompt when someone is signed in at the console.
+    #[serde(default)]
+    pub force_prompt: bool,
+    /// Bits a session is allowed to grant. Missing on old files → everything.
+    #[serde(default = "all_perms")]
+    pub max_permissions: u32,
+    /// TCP ports a tunnel may target. Empty means no forwards.
+    #[serde(default)]
+    pub tunnel_ports: Vec<u16>,
+    #[serde(default = "yes")]
+    pub recording_allowed: bool,
+    /// When false, a forward may only target loopback on the host.
+    #[serde(default)]
+    pub tunnel_remote_hosts: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+fn all_perms() -> u32 {
+    crate::perms::ALL
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            unattended_allowed: true,
+            force_prompt: false,
+            max_permissions: crate::perms::ALL,
+            tunnel_ports: Vec::new(),
+            recording_allowed: true,
+            tunnel_remote_hosts: false,
+        }
+    }
+}
+
+/// One computer, for the management window and `ListDevices`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceBrief {
+    pub id: String,
+    pub hostname: String,
+    #[serde(default)]
+    pub group: String,
+    pub online: bool,
+    #[serde(default)]
+    pub version: String,
+    pub last_seen: u64,
+}
+
+/// One line of the server audit log. Passwords and tokens are never written here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub at: u64,
+    pub kind: String,
+    pub actor: String,
+    pub detail: String,
 }
 
 /// How a client proves who it is when signing in.
@@ -127,6 +235,13 @@ pub enum ServerMsg {
     /// To a host: run your update check now (the server operator asked for it).
     /// Added in 0.3.3; older clients never receive it.
     UpdateNow,
+    /// Version 3. The server's policy. Sent to a host after it registers, and
+    /// in reply to [`ClientMsg::GetPolicy`] / [`ClientMsg::SetPolicy`].
+    Policy(Policy),
+    /// Version 3. Reply to [`ClientMsg::ListDevices`].
+    DeviceList { devices: Vec<DeviceBrief> },
+    /// Version 3. Reply to [`ClientMsg::GetAudit`].
+    Audit { events: Vec<AuditEvent> },
 }
 
 /// Machine-readable error categories.
@@ -142,4 +257,44 @@ pub enum ErrorCode {
     /// Login failed, or an account-only request arrived without a valid token.
     Unauthorized,
     Internal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version2_messages_keep_their_indexes() {
+        let ping = postcard::to_stdvec(&ClientMsg::Ping).unwrap();
+        assert_eq!(ping[0], 8);
+        let update = postcard::to_stdvec(&ServerMsg::UpdateNow).unwrap();
+        assert_eq!(update[0], 8);
+        let back: ClientMsg = postcard::from_bytes(&ping).unwrap();
+        assert!(matches!(back, ClientMsg::Ping));
+    }
+
+    #[test]
+    fn version3_server_messages_roundtrip() {
+        let policy = Policy::default();
+        let msg = ServerMsg::Policy(policy.clone());
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+        match postcard::from_bytes(&bytes).unwrap() {
+            ServerMsg::Policy(p) => assert_eq!(p, policy),
+            other => panic!("{other:?}"),
+        }
+        let audit = ServerMsg::Audit {
+            events: vec![AuditEvent { at: 1, kind: "login".into(), actor: "ada".into(), detail: "ok".into() }],
+        };
+        let bytes = postcard::to_stdvec(&audit).unwrap();
+        assert!(matches!(postcard::from_bytes::<ServerMsg>(&bytes).unwrap(), ServerMsg::Audit { .. }));
+    }
+
+    #[test]
+    fn old_policy_defaults_allow_unattended() {
+        let p: Policy = serde_json::from_str("{}").unwrap();
+        assert!(p.unattended_allowed);
+        assert_eq!(p.max_permissions, crate::perms::ALL);
+        assert!(!p.force_prompt);
+        assert!(p.tunnel_ports.is_empty());
+    }
 }

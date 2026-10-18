@@ -15,6 +15,23 @@
   $("tab-in").onclick = () => setMode(false);
   $("tab-up").onclick = () => setMode(true);
 
+  // Checked here, before the password is turned into an auth key. The Worker
+  // never sees the password, so it cannot apply this itself. Sign-in is not
+  // checked: an existing account must keep working.
+  function passwordProblem(pw, email) {
+    if (pw !== pw.trim()) return "Don't start or end the password with a space.";
+    if (pw.length < 12) return "Use at least 12 characters.";
+    if (!/[a-z]/.test(pw) || !/[A-Z]/.test(pw) || !/[0-9]/.test(pw) || !/[^A-Za-z0-9\s]/.test(pw)) {
+      return "Use an uppercase letter, a lowercase letter, a digit, and a symbol.";
+    }
+    const local = (email.split("@")[0] || "").toLowerCase();
+    if (local.length >= 3 && pw.toLowerCase().includes(local)) return "Don't include your email name in the password.";
+    const common = ["password", "qwerty", "letmein", "welcome", "admin", "iloveyou", "monkey", "dragon", "master", "login", "abc123", "passw0rd", "p@ssw0rd"];
+    const fold = pw.toLowerCase().replace(/\s/g, "");
+    if (common.some((w) => fold === w || (w.length >= 6 && fold.includes(w)))) return "That password is too common.";
+    return "";
+  }
+
   $("auth-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const email = $("email").value.trim();
@@ -22,7 +39,8 @@
     const msg = $("auth-msg");
     if (!email || !pw) return PJ.message(msg, "Enter your email and password.", "err");
     if (creating) {
-      if (pw.length < 10) return PJ.message(msg, "Use at least 10 characters.", "err");
+      const problem = passwordProblem(pw, email);
+      if (problem) return PJ.message(msg, problem, "err");
       if (pw !== $("password2").value) return PJ.message(msg, "The passwords don't match.", "err");
     }
     const btn = $("auth-submit");
@@ -46,7 +64,8 @@
     ev.preventDefault();
     const msg = $("pw-msg");
     const oldPw = $("old-pw").value, newPw = $("new-pw").value;
-    if (newPw.length < 10) return PJ.message(msg, "Use at least 10 characters.", "err");
+    const problem = passwordProblem(newPw, $("me-email").dataset.email || "");
+    if (problem) return PJ.message(msg, problem, "err");
     if (newPw !== $("new-pw2").value) return PJ.message(msg, "The new passwords don't match.", "err");
     PJ.message(msg, "Changing…");
     try {

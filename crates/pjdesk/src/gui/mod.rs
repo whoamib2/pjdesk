@@ -134,7 +134,7 @@ fn spawn_host(server: ServerAddr, config: Config, shared: Arc<HostShared>) {
 
 /// Outcome of a background sign-in attempt.
 enum LoginMsg {
-    Ok { display_name: String },
+    Ok { display_name: String, notice: String },
     Err(String),
 }
 
@@ -154,6 +154,17 @@ pub struct App {
     show_perm_input: bool,
     show_connect_password: bool,
     show_login_pass: bool,
+    /// Direct address (`host` or `host:port`) and computers found on the LAN.
+    direct_addr: String,
+    lan: Vec<(String, String, String)>,
+    lan_rx: Option<Receiver<Vec<(String, String, String)>>>,
+    password_notice: String,
+    show_change: bool,
+    change_pass: String,
+    change_pass2: String,
+    show_change_pass: bool,
+    change_rx: Option<Receiver<Result<(), String>>>,
+    chat_draft: String,
 
     // Account sign-in.
     show_login: bool,
@@ -203,6 +214,16 @@ impl App {
             show_perm_input: false,
             show_connect_password: false,
             show_login_pass: false,
+            direct_addr: String::new(),
+            lan: Vec::new(),
+            lan_rx: None,
+            password_notice: String::new(),
+            show_change: false,
+            change_pass: String::new(),
+            change_pass2: String::new(),
+            show_change_pass: false,
+            change_rx: None,
+            chat_draft: String::new(),
             show_login: false,
             login_user: String::new(),
             login_pass: String::new(),
@@ -301,7 +322,7 @@ impl App {
             // the identity guard), so we don't save the stale clone here.
             match rt.block_on(account::refresh(&server, &mut cfg)) {
                 Ok(Some(info)) => {
-                    let _ = tx.send(LoginMsg::Ok { display_name: info.display_name });
+                    let _ = tx.send(LoginMsg::Ok { display_name: info.display_name, notice: info.notice });
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -328,7 +349,7 @@ impl App {
             match rt.block_on(account::login(&server, &mut cfg, &user, &pass)) {
                 Ok(info) => {
                     // account::login already saved the token + address book.
-                    let _ = tx.send(LoginMsg::Ok { display_name: info.display_name });
+                    let _ = tx.send(LoginMsg::Ok { display_name: info.display_name, notice: info.notice });
                 }
                 Err(e) => {
                     let _ = tx.send(LoginMsg::Err(format!("{e:#}")));
@@ -340,7 +361,7 @@ impl App {
     fn poll_login(&mut self) {
         let Some(rx) = &self.login_rx else { return };
         match rx.try_recv() {
-            Ok(LoginMsg::Ok { display_name, .. }) => {
+            Ok(LoginMsg::Ok { display_name, notice }) => {
                 self.login_busy = false;
                 self.login_rx = None;
                 self.show_login = false;
@@ -352,7 +373,13 @@ impl App {
                     self.cfg.device_id = self.cfg.device_id.clone().or(keep_id.0);
                     self.cfg.device_secret = self.cfg.device_secret.clone().or(keep_id.1);
                 }
-                self.toast.show(format!("Signed in as {display_name}"));
+                if notice.is_empty() {
+                    self.toast.show(format!("Signed in as {display_name}"));
+                } else {
+                    self.password_notice = notice;
+                    self.show_change = true;
+                    self.toast.show(format!("Signed in as {display_name}"));
+                }
             }
             Ok(LoginMsg::Err(e)) => {
                 self.login_busy = false;
@@ -363,6 +390,35 @@ impl App {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.login_busy = false;
                 self.login_rx = None;
+            }
+        }
+    }
+
+    fn poll_password(&mut self) {
+        let Some(rx) = &self.change_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.change_rx = None;
+                self.show_change = false;
+                self.change_pass.clear();
+                self.change_pass2.clear();
+                self.status.clear();
+                let keep_id = (self.cfg.device_id.clone(), self.cfg.device_secret.clone());
+                if let Ok(fresh) = Config::load() {
+                    self.cfg = fresh;
+                    self.cfg.device_id = self.cfg.device_id.clone().or(keep_id.0);
+                    self.cfg.device_secret = self.cfg.device_secret.clone().or(keep_id.1);
+                }
+                self.toast.show("Password updated");
+            }
+            Ok(Err(e)) => {
+                self.change_rx = None;
+                self.show_change = true;
+                self.status = e;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.change_rx = None;
             }
         }
     }
@@ -454,11 +510,74 @@ impl App {
             self.save_cfg();
         }
     }
+
+    fn connect_direct(&mut self, addr: &str) {
+        let addr = addr.trim().to_string();
+        if addr.is_empty() {
+            self.status = "Enter an address, such as 192.168.1.20.".into();
+            return;
+        }
+        let server = self.cfg.effective_server();
+        let password = self.connect_password.clone();
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                self.status = format!("Can't find the PJDesk program: {e}");
+                return;
+            }
+        };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--server").arg(server).arg("connect").arg("--direct").arg(&addr);
+        if !password.is_empty() {
+            cmd.env("PJDESK_PASSWORD", &password);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        match cmd.spawn() {
+            Ok(_) => self.toast.show(format!("Opening {addr}")),
+            Err(e) => self.status = format!("Could not open the viewer: {e}"),
+        }
+    }
+
+    fn find_on_lan(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.lan_rx = Some(rx);
+        self.status = "Looking for computers on this network…".into();
+        std::thread::spawn(move || {
+            let found = crate::host::direct::discover_for(std::time::Duration::from_secs(4));
+            let rows = found
+                .into_iter()
+                .map(|(b, src)| {
+                    let mut addr = src;
+                    addr.set_port(b.port);
+                    (if b.name.is_empty() { "Computer".into() } else { b.name }, b.id, addr.to_string())
+                })
+                .collect::<Vec<_>>();
+            let _ = tx.send(rows);
+        });
+    }
+
+    fn poll_lan(&mut self) {
+        let Some(rx) = &self.lan_rx else { return };
+        if let Ok(rows) = rx.try_recv() {
+            self.lan_rx = None;
+            self.status = if rows.is_empty() {
+                "No PJDesk computers answered on this network.".into()
+            } else {
+                format!("Found {} computer(s) on this network.", rows.len())
+            };
+            self.lan = rows;
+        }
+    }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_login();
+        self.poll_password();
         if self.last_service_check.elapsed() > Duration::from_secs(3) {
             self.last_service_check = std::time::Instant::now();
             let cfg = self.cfg.clone();
@@ -511,6 +630,8 @@ impl eframe::App for App {
 
         self.settings_window(&ctx);
         self.login_window(&ctx);
+        self.change_password_window(&ctx);
+        self.poll_lan();
         self.add_book_window(&ctx);
         self.toast.render(&ctx);
 

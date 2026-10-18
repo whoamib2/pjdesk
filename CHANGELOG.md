@@ -1,5 +1,104 @@
 # Changelog
 
+## 0.4.0
+
+Protocol 3. A 0.3.7 peer still connects for a classic desktop session (keyboard
+and mouse). Account key derivation, device IDs, and the sealed cloud-sync
+format are unchanged. The cloud bundle gained an `epoch` field that older
+servers ignore. What you can click in 0.4.0, and what is only prepared on the
+host, is listed in `docs/RUSTDESK-PARITY.md`.
+
+### Session (protocol 3)
+
+* The computer being controlled accepts the new messages when the other side
+  speaks protocol 3: a permission grant, file transfer in both directions
+  (resume, a folder you choose, nothing is executed), text and image clipboard,
+  chat, system-audio loopback, monitor choice, quality with adaptive bitrate,
+  a privacy screen, blocking local input, keyboard mode, restart, and TCP
+  tunnels to ports you list. View-only and the server policy are ceilings.
+  Someone at the computer is asked before a session starts, unless unattended
+  access is allowed.
+* The viewer toolbar (View, Keys, Session, Files, Chat, End) sends those
+  controls. Files shows progress in both directions and resumes a partial
+  download. Chat, clipboard text and image, audio, monitors, quality, the
+  privacy screen, blocking the remote keyboard, and restart are on the bar or
+  the side panel. Restart asks twice, then the viewer reconnects. A direct
+  address and **Find on this network** are on the connect panel. The host's
+  permission grant is what decides which of these actually run.
+* Session recording writes an MP4 under `Videos\PJDesk`, using the size of the
+  picture. The Files list is the host's receive folder, not the whole disk.
+
+### Cloud Sync: make this server the primary
+
+* On a standby, **Make this the primary** (Cloud Sync panel, tray, or
+  `pjdesk-server cloud promote`). It works whether or not the current primary
+  is online. Confirm explains that the other server becomes the standby.
+* The primary can **Step down to standby** (`pjdesk-server cloud demote`).
+* `--yes` skips the prompt. If the service is running, the command asks it to
+  do the switch. If it is not, the command does the switch itself.
+* Promote downloads the latest copy, applies it, adds one to a generation
+  number stored in the sealed copy, and writes that copy with this server's
+  id. Later uploads send `If-Match` (or `If-None-Match: *` when the object is
+  missing) and are skipped when the cloud generation is newer or already
+  belongs to another server. Two servers do not both write.
+* The previous primary notices the newer generation on its next check, stops
+  uploading, switches itself to standby, applies the cloud copy, and logs a
+  notice. The Cloud Sync panel, tray tooltip, and `cloud-status.json` show
+  the role, the generation, and which server is active.
+* Copies from 0.3.7 have no generation. Until someone promotes, those servers
+  keep the old "whoever has computers connected uploads" behavior.
+* PJDesk Cloud honors `If-Match` / `If-None-Match: *` and still accepts an
+  unconditional upload from an older server. It also stores a small health
+  record (`/api/sync/health`) so a primary can see a standby's version.
+  **Redeploy the website** (`cloud\deploy.cmd`) or account-mode fencing and
+  the standby health report stay on the old Worker. An own-bucket (R2) server
+  does not need that deploy: R2 already honors `If-Match`.
+
+### PJDesk Server updates
+
+* **Install server updates automatically** is off until you turn it on (server
+  window, or `pjdesk-server update-task`). `update-task --disable` turns it off.
+* `pjdesk-server update` checks and installs a newer release.
+  `pjdesk-server update --check` only reports. The tray has **Check for updates now**.
+* The check uses `https://pjdesk.com/api/release`, then GitHub if that is
+  unreachable. Pre-releases are skipped. An older version is never installed.
+* The installer is still verified with `SHA256SUMS` in a private directory,
+  and hashed again immediately before it is launched. The server installer
+  stops and restarts the service and does not delete the data folder. If the
+  install fails after the service was stopped, the installer starts it again.
+* While the setting is on, the service checks about once an hour (30–60
+  minutes, different on each server). A standby may update first. A primary
+  that can see a standby waits until that standby reports the new version and
+  the current generation, or until 24 hours pass, so both do not restart
+  together. An optional maintenance window defaults to any time.
+* The window shows the last check, the last result, and an available version.
+  A failed check or a failed launch leaves the service running.
+* The installer no longer registers the old always-on "PJDesk Server Update"
+  task. Upgrading removes that task. Turn updates on again if you want them.
+
+### Accounts
+
+* A new or changed server account password must be at least 12 characters, with
+  an uppercase letter, a lowercase letter, a digit, and a symbol. It must not
+  contain the username, start or end with a space, or match a short list of
+  common passwords. The window shows a checklist and a strength meter while
+  you type. An older weak password still signs in. The app then opens
+  **Change your password** and shows the server's reason if the new one is refused.
+* This does not apply to the PJDesk Cloud sign-in on the server (pjdesk.com
+  checks that password). One-time host passwords are unchanged.
+
+### Server window
+
+* The tray starts when you sign in to Windows. That is on unless you turn it
+  off. The installer writes the Run key and starts the icon, so it is there
+  after install and after the next sign-in. A second launch signals the icon
+  that is already running instead of adding another.
+* The menu can open the window, start, stop, or restart the service (Windows
+  asks for administrator), check for updates, open the log folder, promote,
+  step down, sync, or exit. The tooltip names the service, how many computers
+  are connected, the cloud role, and the update status. Closing or minimizing
+  the window leaves the tray running.
+
 ## 0.3.7
 
 Security fixes from a full review. The wire protocol is still version 2, and the

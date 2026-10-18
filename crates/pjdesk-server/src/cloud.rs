@@ -8,12 +8,17 @@
 //! * **Your own bucket** (`mode = "r2"`): any Cloudflare R2 / S3 bucket, shared
 //!   with backup servers through a join code.
 //!
-//! Roles are automatic:
-//! * A server with computers connected is **active**: it uploads its state
-//!   whenever it changes (the computer list at most every five minutes).
-//! * A server with none is on **standby**: it downloads the newest state and
-//!   applies it, so it already has the same key, accounts and IDs the moment
-//!   DNS sends the computers to it — at which point it becomes active.
+//! Roles:
+//! * Until someone forces a role, a server with computers connected is
+//!   **active** and one with none is on **standby** (the same as 0.3.x).
+//! * **Promote** (`cloud promote`, or "Make this the primary") pulls the
+//!   latest copy, applies it, and writes it back under a higher **epoch**
+//!   with this server's instance id. That epoch is a fencing token: uploads
+//!   are conditional on it, so two servers never both write. The previous
+//!   primary sees the newer epoch on its next check, stops uploading, and
+//!   becomes the standby.
+//! * **Demote** stops this server uploading. It does not make another server
+//!   the primary; that server has to be promoted.
 //!
 //! The copy is sealed with ChaCha20-Poly1305 — under the password-derived
 //! sync key (PJDesk Cloud), or a random key made at setup that travels in the
@@ -37,6 +42,9 @@ const STATE_FILE: &str = "cloud-state.json";
 const INSTANCE_FILE: &str = "cloud-instance.txt";
 /// The object in the bucket that holds the sealed state.
 pub const OBJECT: &str = "pjdesk-server.sync";
+/// Small JSON object each server updates with its version and role, so a
+/// primary can see that a standby is healthy before both restart for an update.
+const HEALTH_OBJECT: &str = "pjdesk-server.health";
 const MAGIC: &[u8; 8] = b"PJSYNC1\0";
 const JOIN_PREFIX: &str = "pjdesk-sync-1:";
 const FORMAT: u32 = 1;
@@ -449,12 +457,26 @@ fn s3_error(code: u16, body: &str) -> anyhow::Error {
 }
 
 fn signed(cfg: &CloudConfig, method: &str, payload: &[u8]) -> (String, String, String) {
+    signed_for(cfg, OBJECT, method, payload, &[])
+}
+
+/// Like [`signed`], for `object`, with extra signed headers (lower-case names).
+/// Conditional uploads sign `if-match` / `if-none-match`; leaving them out of
+/// the signature makes R2 reject the request.
+fn signed_for(cfg: &CloudConfig, object: &str, method: &str, payload: &[u8], extra: &[(&str, &str)]) -> (String, String, String) {
     let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let payload_sha256 = hex::encode(Sha256::digest(payload));
+    let mut headers = vec![
+        ("host", cfg.host()),
+        ("x-amz-content-sha256", payload_sha256.as_str()),
+        ("x-amz-date", amz_date.as_str()),
+    ];
+    headers.extend_from_slice(extra);
+    let path = format!("/{}/{}", uri_encode(&cfg.bucket), uri_encode(object));
     let auth = authorization(
         method,
-        &cfg.canonical_path(),
-        &[("host", cfg.host()), ("x-amz-content-sha256", &payload_sha256), ("x-amz-date", &amz_date)],
+        &path,
+        &headers,
         &payload_sha256,
         &amz_date,
         &cfg.region,
@@ -471,12 +493,44 @@ fn connect_error(cfg: &CloudConfig, e: ureq::Error) -> anyhow::Error {
     }
 }
 
-/// Uploads the sealed state. Returns the new ETag.
-fn put(cfg: &CloudConfig, body: &[u8]) -> Result<String> {
+/// How a write is allowed to land. Omitted headers stay unconditional, which
+/// is what a 0.3.x server sends.
+#[derive(Clone, Debug)]
+enum Guard {
+    /// Replace whatever is there.
+    None,
+    /// Replace only while the object still has this ETag.
+    IfMatch(String),
+    /// Create the object only when it is absent (`If-None-Match: *`).
+    IfAbsent,
+}
+
+/// The cloud copy changed between the read and the write. Another server won.
+#[derive(Debug)]
+struct LostRace;
+
+impl std::fmt::Display for LostRace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the cloud copy changed while this server was writing")
+    }
+}
+
+impl std::error::Error for LostRace {}
+
+fn lost_race(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<LostRace>().is_some()
+}
+
+/// Uploads `body` as `object`. Returns the new ETag.
+fn put_object(cfg: &CloudConfig, object: &str, body: &[u8], guard: &Guard) -> Result<String> {
     if cfg.is_account() {
-        api_put(cfg, body)
+        if object != OBJECT {
+            api_put_health_raw(cfg, body)
+        } else {
+            api_put(cfg, body, guard)
+        }
     } else {
-        s3_put(cfg, body)
+        s3_put(cfg, object, body, guard)
     }
 }
 
@@ -489,17 +543,30 @@ fn get(cfg: &CloudConfig, etag: Option<&str>) -> Result<Fetched> {
     }
 }
 
-fn s3_put(cfg: &CloudConfig, body: &[u8]) -> Result<String> {
-    let (amz_date, payload_sha256, auth) = signed(cfg, "PUT", body);
-    let resp = agent()
-        .put(&cfg.url())
+fn s3_put(cfg: &CloudConfig, object: &str, body: &[u8], guard: &Guard) -> Result<String> {
+    let extra: Vec<(&str, &str)> = match guard {
+        Guard::None => Vec::new(),
+        Guard::IfMatch(tag) => vec![("if-match", tag.as_str())],
+        Guard::IfAbsent => vec![("if-none-match", "*")],
+    };
+    let (amz_date, payload_sha256, auth) = signed_for(cfg, object, "PUT", body, &extra);
+    let path = format!("/{}/{}", uri_encode(&cfg.bucket), uri_encode(object));
+    let mut req = agent()
+        .put(&format!("{}{path}", cfg.endpoint))
         .set("x-amz-date", &amz_date)
         .set("x-amz-content-sha256", &payload_sha256)
         .set("Authorization", &auth)
-        .set("Content-Type", "application/octet-stream")
-        .send_bytes(body)
-        .map_err(|e| connect_error(cfg, e))?;
-    Ok(resp.header("ETag").unwrap_or_default().to_string())
+        .set("Content-Type", "application/octet-stream");
+    match guard {
+        Guard::None => {}
+        Guard::IfMatch(tag) => req = req.set("If-Match", tag),
+        Guard::IfAbsent => req = req.set("If-None-Match", "*"),
+    }
+    match req.send_bytes(body) {
+        Ok(resp) => Ok(resp.header("ETag").unwrap_or_default().to_string()),
+        Err(ureq::Error::Status(412 | 409, _)) => Err(LostRace.into()),
+        Err(e) => Err(connect_error(cfg, e)),
+    }
 }
 
 pub enum Fetched {
@@ -565,14 +632,33 @@ fn api_error(api: &str, email: &str, e: ureq::Error) -> anyhow::Error {
     }
 }
 
-fn api_put(cfg: &CloudConfig, body: &[u8]) -> Result<String> {
-    let resp = agent()
+fn api_put(cfg: &CloudConfig, body: &[u8], guard: &Guard) -> Result<String> {
+    let mut req = agent()
         .put(&format!("{}/api/sync", cfg.api))
         .set("authorization", &format!("Bearer {}", cfg.token))
-        .set("content-type", "application/octet-stream")
+        .set("content-type", "application/octet-stream");
+    match guard {
+        Guard::None => {}
+        Guard::IfMatch(tag) => req = req.set("If-Match", tag),
+        Guard::IfAbsent => req = req.set("If-None-Match", "*"),
+    }
+    match req.send_bytes(body) {
+        Ok(resp) => Ok(resp.header("ETag").unwrap_or_default().to_string()),
+        Err(ureq::Error::Status(412 | 409, _)) => Err(LostRace.into()),
+        Err(e) => Err(api_error(&cfg.api, &cfg.email, e)),
+    }
+}
+
+/// Account-mode health is a JSON document the Worker merges per instance.
+/// A 404 means the website has not been redeployed with the health route yet.
+fn api_put_health_raw(cfg: &CloudConfig, body: &[u8]) -> Result<String> {
+    agent()
+        .put(&format!("{}/api/sync/health", cfg.api))
+        .set("authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
         .send_bytes(body)
-        .map_err(|e| api_error(&cfg.api, &cfg.email, e))?;
-    Ok(resp.header("ETag").unwrap_or_default().to_string())
+        .map(|_| String::new())
+        .map_err(|e| api_error(&cfg.api, &cfg.email, e))
 }
 
 fn api_get(cfg: &CloudConfig, etag: Option<&str>) -> Result<Fetched> {
@@ -678,6 +764,10 @@ struct Bundle {
     /// Random ID of that server's data folder (so a server ignores its own upload).
     instance: String,
     version: String,
+    /// Fencing token. A promote adds one. Copies from before 0.4 omit it (0),
+    /// and a 0.3 server ignores the field when it reads a newer copy.
+    #[serde(default)]
+    epoch: u64,
     /// Relative path → base64 contents.
     files: BTreeMap<String, String>,
 }
@@ -844,6 +934,22 @@ struct SyncState {
     applied_written_at: u64,
     #[serde(default)]
     applied_from: String,
+    /// `""` follows whether computers are connected, `"active"` stays primary,
+    /// `"standby"` never uploads.
+    #[serde(default)]
+    desired: String,
+    /// Highest epoch this server has written or accepted.
+    #[serde(default)]
+    epoch: u64,
+    /// Instance id of the server that last wrote the copy we know about.
+    #[serde(default)]
+    active_instance: String,
+    /// Computer name of that server.
+    #[serde(default)]
+    active_name: String,
+    /// Shown in the window until the next role change replaces it.
+    #[serde(default)]
+    notice: String,
 }
 
 impl SyncState {
@@ -912,6 +1018,18 @@ pub struct CloudStatus {
     /// "the server isn't running").
     #[serde(default)]
     pub updated_at: u64,
+    /// Fencing generation of the cloud copy this server last saw.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Instance id of the server that owns that generation.
+    #[serde(default)]
+    pub active_instance: String,
+    /// Computer name of the server that owns that generation.
+    #[serde(default)]
+    pub active_name: String,
+    /// Takeover / step-down note for the window and the log.
+    #[serde(default)]
+    pub notice: String,
 }
 
 impl CloudStatus {
@@ -936,73 +1054,302 @@ pub enum Role {
     Standby,
 }
 
+/// What an upload is allowed to do, given the cloud copy's fencing token.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fence {
+    /// This instance may write.
+    MayUpload,
+    /// A newer epoch from another instance is primary. Stop writing and apply.
+    Superseded,
+    /// This epoch already belongs to another instance. Do not write.
+    Held,
+}
+
+/// `remote_present` is false when the object is missing. Epoch 0 is a copy
+/// from before fencing existed: either server may still upload, and the
+/// conditional put stops them writing at the same moment. Once the epoch is
+/// above zero, only the instance that owns it (or a promote that raises it)
+/// may write.
+pub fn fence(remote_present: bool, remote_epoch: u64, remote_instance: &str, mine: &str, local_epoch: u64) -> Fence {
+    if !remote_present || remote_instance.is_empty() || remote_instance == mine {
+        return Fence::MayUpload;
+    }
+    if remote_epoch > local_epoch {
+        return Fence::Superseded;
+    }
+    if remote_epoch > 0 && remote_epoch >= local_epoch {
+        return Fence::Held;
+    }
+    Fence::MayUpload
+}
+
+/// The epoch a promote writes. Always at least 1, and never wraps.
+pub fn next_epoch(remote_epoch: u64) -> u64 {
+    remote_epoch.saturating_add(1).max(1)
+}
+
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Active => "active",
+        Role::Standby => "standby",
+    }
+}
+
+fn effective_role(st: &SyncState, heuristic: Role) -> Role {
+    match st.desired.as_str() {
+        "active" => Role::Active,
+        "standby" => Role::Standby,
+        _ => heuristic,
+    }
+}
+
+/// True when the running server wrote `cloud-status.json` recently.
+pub fn status_is_fresh(data_dir: &Path) -> bool {
+    CloudStatus::load(data_dir).is_some_and(|s| s.updated_at + 90 >= now())
+}
+
 /// One sync pass, run by the server every 30 s (blocking; call from a worker
 /// thread). Returns true if a newer copy from another server was applied, in
 /// which case the caller reloads the key, accounts and computer list.
+///
+/// `role` is only the hint from "are any computers connected". A sticky
+/// promote or demote, and a newer cloud epoch, override it.
 pub fn sync_once(data_dir: &Path, role: Role, force_push: bool) -> bool {
     let Some(cfg) = CloudConfig::load(data_dir) else {
         let _ = std::fs::remove_file(data_dir.join(STATUS_FILE));
         return false;
     };
+    let mut applied = false;
+    let mut effective = effective_role(&SyncState::load(data_dir), role);
+    let result = (|| -> Result<()> {
+        match absorb(data_dir, &cfg)? {
+            Fence::Superseded => {
+                applied = true;
+                effective = Role::Standby;
+            }
+            Fence::Held => {
+                effective = Role::Standby;
+                if pull(data_dir, &cfg, false)? {
+                    applied = true;
+                }
+            }
+            Fence::MayUpload => {
+                effective = effective_role(&SyncState::load(data_dir), role);
+                match effective {
+                    Role::Standby => {
+                        if pull(data_dir, &cfg, false)? {
+                            applied = true;
+                        }
+                    }
+                    Role::Active => push(data_dir, &cfg, force_push)?,
+                }
+            }
+        }
+        Ok(())
+    })();
+    publish_health(data_dir, effective);
+    let st = SyncState::load(data_dir);
     let mut status = CloudStatus::load(data_dir).unwrap_or_default();
     status.enabled = true;
     status.bucket = cfg.describe();
     status.account = if cfg.is_account() { cfg.email.clone() } else { String::new() };
-    status.role = match role {
-        Role::Active => "active",
-        Role::Standby => "standby",
-    }
-    .into();
-    let result = match role {
-        Role::Active => push(data_dir, &cfg, force_push).map(|_| false),
-        Role::Standby => pull(data_dir, &cfg, false),
-    };
-    let st = SyncState::load(data_dir);
+    status.role = role_name(effective).into();
     status.last_upload_at = st.last_push_at;
     status.applied_from = st.applied_from.clone();
     status.applied_written_at = st.applied_written_at;
+    status.epoch = st.epoch;
+    status.active_instance = st.active_instance.clone();
+    status.active_name = st.active_name.clone();
+    status.notice = st.notice.clone();
     status.last_check_at = now();
     status.updated_at = now();
-    let applied = match result {
-        Ok(applied) => {
-            status.error.clear();
-            applied
-        }
+    match result {
+        Ok(()) => status.error.clear(),
         Err(e) => {
             tracing::warn!("cloud sync: {e:#}");
             status.error = format!("{e:#}");
-            false
+            applied = false;
         }
-    };
+    }
     status.save(data_dir);
     applied
 }
 
-/// Uploads this server's state if it changed (or `force`).
+/// Reads the cloud copy and steps down when another instance holds a newer
+/// generation, or the same non-zero generation.
+fn absorb(data_dir: &Path, cfg: &CloudConfig) -> Result<Fence> {
+    let mine = instance_id(data_dir);
+    let st = SyncState::load(data_dir);
+    let Remote::Copy { bundle, etag } = fetch(cfg, None)? else {
+        return Ok(Fence::MayUpload);
+    };
+    let decision = fence(true, bundle.epoch, &bundle.instance, &mine, st.epoch);
+    match decision {
+        Fence::Superseded => {
+            let name = bundle.written_by.clone();
+            let epoch = bundle.epoch;
+            apply_bundle(data_dir, &bundle, etag)?;
+            let mut st = SyncState::load(data_dir);
+            st.desired = "standby".into();
+            st.notice = format!(
+                "{name} is now the primary (generation {epoch}). This server switched to standby and will apply updates from the cloud."
+            );
+            st.save(data_dir);
+            tracing::warn!("{}", st.notice);
+            Ok(Fence::Superseded)
+        }
+        Fence::Held => {
+            let name = bundle.written_by.clone();
+            let epoch = bundle.epoch;
+            if should_apply(&st, bundle.written_at, &bundle.instance, &mine) {
+                apply_bundle(data_dir, &bundle, etag)?;
+            } else {
+                let mut st = SyncState::load(data_dir);
+                st.etag = etag;
+                st.epoch = epoch;
+                st.active_instance = bundle.instance.clone();
+                st.active_name = name.clone();
+                st.save(data_dir);
+            }
+            let mut st = SyncState::load(data_dir);
+            if st.desired == "active" {
+                st.desired = "standby".into();
+                st.notice = format!("{name} holds generation {epoch}. This server will not upload.");
+                tracing::warn!("{}", st.notice);
+            }
+            st.save(data_dir);
+            Ok(Fence::Held)
+        }
+        Fence::MayUpload => {
+            let mut st = SyncState::load(data_dir);
+            st.etag = etag;
+            if bundle.instance == mine {
+                st.epoch = bundle.epoch.max(st.epoch);
+                st.active_instance = mine;
+                st.active_name = bundle.written_by;
+            }
+            st.save(data_dir);
+            Ok(Fence::MayUpload)
+        }
+    }
+}
+
+/// Uploads this server's state if it changed (or `force`). The put matches
+/// the ETag just observed, and is skipped when that put loses the race.
 fn push(data_dir: &Path, cfg: &CloudConfig, force: bool) -> Result<()> {
     let files = collect(data_dir)?;
     let (core, devices) = hashes(&files);
-    let mut st = SyncState::load(data_dir);
+    let st = SyncState::load(data_dir);
     let now = now();
     if !force && !push_due(&st, &core, &devices, now) {
         return Ok(());
     }
+    let guard = if st.etag.is_empty() { Guard::IfAbsent } else { Guard::IfMatch(st.etag.clone()) };
+    match upload(data_dir, cfg, &files, core, devices, st.epoch, &guard) {
+        Err(e) if lost_race(&e) => {
+            tracing::info!("cloud sync: skipped an upload because the cloud copy changed");
+            let _ = absorb(data_dir, cfg);
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// Seals `files` at `epoch` and writes them. A follow-up read that does not
+/// show this instance at that epoch is [`LostRace`] (the other writer won).
+fn upload(
+    data_dir: &Path,
+    cfg: &CloudConfig,
+    files: &BTreeMap<String, Vec<u8>>,
+    core: String,
+    devices: String,
+    epoch: u64,
+    guard: &Guard,
+) -> Result<()> {
+    let now = now();
+    let mine = instance_id(data_dir);
     let bundle = Bundle {
         format: FORMAT,
         written_at: now,
         written_by: hostname(),
-        instance: instance_id(data_dir),
+        instance: mine.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
+        epoch,
         files: files.iter().map(|(k, v)| (k.clone(), b64().encode(v))).collect(),
     };
     let sealed = seal(&cfg.key_bytes()?, &serde_json::to_vec(&bundle)?)?;
-    let etag = put(cfg, &sealed)?;
-    st.last_push_at = now;
-    st.last_push_core = core;
-    st.last_push_devices = devices;
-    st.etag = etag;
+    let etag = put_object(cfg, OBJECT, &sealed, guard)?;
+    match fetch(cfg, None)? {
+        Remote::Copy { bundle: got, etag: got_etag } if got.instance == mine && got.epoch >= epoch => {
+            let mut st = SyncState::load(data_dir);
+            st.last_push_at = now;
+            st.last_push_core = core;
+            st.last_push_devices = devices;
+            st.etag = if got_etag.is_empty() { etag } else { got_etag };
+            st.epoch = got.epoch;
+            st.active_instance = got.instance;
+            st.active_name = got.written_by;
+            st.save(data_dir);
+            tracing::info!("cloud sync: uploaded this server's state to {} (generation {})", cfg.describe(), got.epoch);
+            Ok(())
+        }
+        _ => Err(LostRace.into()),
+    }
+}
+
+/// Pulls the latest copy, applies it when it came from another server, bumps
+/// the epoch, and writes this server as the primary. Usable whether or not
+/// the current primary is online. A lost race leaves this server on standby.
+pub fn promote(data_dir: &Path) -> Result<()> {
+    let cfg = CloudConfig::load(data_dir).context("Cloud sync is not set up on this server.")?;
+    let mine = instance_id(data_dir);
+    let (epoch, guard) = match fetch(&cfg, None)? {
+        Remote::Missing => (1, Guard::IfAbsent),
+        Remote::NotModified => bail!("could not read the cloud copy"),
+        Remote::Copy { bundle, etag } => {
+            if bundle.instance != mine {
+                apply_bundle(data_dir, &bundle, etag.clone())?;
+            }
+            (next_epoch(bundle.epoch), Guard::IfMatch(etag))
+        }
+    };
+    let files = collect(data_dir)?;
+    let (core, devices) = hashes(&files);
+    if let Err(e) = upload(data_dir, &cfg, &files, core, devices, epoch, &guard) {
+        if lost_race(&e) {
+            let _ = absorb(data_dir, &cfg);
+            let mut st = SyncState::load(data_dir);
+            st.desired = "standby".into();
+            st.notice = "Another server became the primary at the same time. This server stayed on standby.".into();
+            st.save(data_dir);
+            let _ = sync_status_now(data_dir, Role::Standby);
+            bail!("Another server became the primary at the same time. This server stayed on standby.");
+        }
+        return Err(e);
+    }
+    let mut st = SyncState::load(data_dir);
+    st.desired = "active".into();
+    st.notice = "This server is now the primary. The other server will switch to standby the next time it checks.".into();
     st.save(data_dir);
-    tracing::info!("cloud sync: uploaded this server's state to {}", cfg.describe());
+    let _ = sync_status_now(data_dir, Role::Active);
+    tracing::info!("{}", st.notice);
+    Ok(())
+}
+
+/// Stops this server uploading. The cloud copy stays as it is until some
+/// other server is promoted.
+pub fn demote(data_dir: &Path) -> Result<()> {
+    if CloudConfig::load(data_dir).is_none() {
+        bail!("Cloud sync is not set up on this server.");
+    }
+    let mut st = SyncState::load(data_dir);
+    st.desired = "standby".into();
+    st.notice =
+        "This server stepped down to standby and will not upload. Make another server the primary before relying on it."
+            .into();
+    st.save(data_dir);
+    let _ = sync_status_now(data_dir, Role::Standby);
+    tracing::info!("{}", st.notice);
     Ok(())
 }
 
@@ -1043,6 +1390,9 @@ fn apply_bundle(data_dir: &Path, bundle: &Bundle, etag: String) -> Result<()> {
     st.applied_at = now();
     st.applied_written_at = bundle.written_at;
     st.applied_from = bundle.written_by.clone();
+    st.epoch = bundle.epoch;
+    st.active_instance = bundle.instance.clone();
+    st.active_name = bundle.written_by.clone();
     // What we now hold is what's in the cloud: no need to upload it back.
     let (core, devices) = hashes(&files);
     st.last_push_core = core;
@@ -1125,12 +1475,18 @@ pub fn connect_account(data_dir: &Path, cfg: &CloudConfig, online: usize, choice
                 cfg.save(data_dir)?;
                 let mut st = SyncState::load(data_dir);
                 st.etag = etag;
+                st.epoch = bundle.epoch;
+                st.active_instance = bundle.instance.clone();
+                st.active_name = bundle.written_by.clone();
                 st.save(data_dir);
                 let _ = sync_status_now(data_dir, if online > 0 { Role::Active } else { Role::Standby });
                 Ok(Connected::Resumed)
             } else if choice == Some(Choice::Join) || (choice.is_none() && online == 0) {
                 let _ = std::fs::remove_file(data_dir.join(STATE_FILE));
                 apply_bundle(data_dir, &bundle, etag)?;
+                let mut st = SyncState::load(data_dir);
+                st.desired = "standby".into();
+                st.save(data_dir);
                 cfg.save(data_dir)?;
                 let _ = sync_status_now(data_dir, Role::Standby);
                 Ok(Connected::Joined { from: bundle.written_by })
@@ -1161,12 +1517,22 @@ pub fn check_bucket(cfg: &CloudConfig) -> Result<SetupCheck> {
     }
 }
 
-/// Turns sync on as the main server: saves the settings and uploads now.
+/// Turns sync on as the main server: saves the settings and uploads now,
+/// starting fencing at generation 1 (or one past whatever is already there).
 pub fn setup(data_dir: &Path, cfg: &CloudConfig) -> Result<()> {
     // A fresh setup starts fresh bookkeeping.
     let _ = std::fs::remove_file(data_dir.join(STATE_FILE));
     cfg.save(data_dir)?;
-    push(data_dir, cfg, true)?;
+    let (epoch, guard) = match fetch(cfg, None)? {
+        Remote::Missing | Remote::NotModified => (1, Guard::IfAbsent),
+        Remote::Copy { bundle, etag } => (next_epoch(bundle.epoch), Guard::IfMatch(etag)),
+    };
+    let files = collect(data_dir)?;
+    let (core, devices) = hashes(&files);
+    upload(data_dir, cfg, &files, core, devices, epoch, &guard)?;
+    let mut st = SyncState::load(data_dir);
+    st.desired = "active".into();
+    st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Active);
     Ok(())
 }
@@ -1179,6 +1545,9 @@ pub fn join(data_dir: &Path, cfg: &CloudConfig) -> Result<String> {
     let _ = std::fs::remove_file(data_dir.join(STATE_FILE));
     pull(data_dir, cfg, true)?;
     cfg.save(data_dir)?;
+    let mut st = SyncState::load(data_dir);
+    st.desired = "standby".into();
+    st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Standby);
     Ok(SyncState::load(data_dir).applied_from)
 }
@@ -1198,9 +1567,139 @@ fn sync_status_now(data_dir: &Path, role: Role) -> Option<()> {
         applied_written_at: st.applied_written_at,
         error: String::new(),
         updated_at: now(),
+        epoch: st.epoch,
+        active_instance: st.active_instance,
+        active_name: st.active_name,
+        notice: st.notice,
     }
     .save(data_dir);
     Some(())
+}
+
+// ---------------------------------------------------------------------------
+// Health reports (version + role), so a primary can see a standby before
+// both restart for an update. Failure here never fails a sync.
+
+/// One server's view of itself, published next to the sealed copy.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerHealth {
+    pub instance: String,
+    pub name: String,
+    pub version: String,
+    pub role: String,
+    pub epoch: u64,
+    pub healthy: bool,
+    pub at: u64,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct HealthDoc {
+    #[serde(default)]
+    peers: BTreeMap<String, PeerHealth>,
+}
+
+fn publish_health(data_dir: &Path, role: Role) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    let st = SyncState::load(data_dir);
+    let me = PeerHealth {
+        instance: instance_id(data_dir),
+        name: hostname(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        role: role_name(role).into(),
+        epoch: st.epoch,
+        healthy: true,
+        at: now(),
+    };
+    if let Err(e) = write_health(&cfg, &me) {
+        tracing::debug!("cloud health: {e:#}");
+    }
+}
+
+/// Other servers' health reports. Empty when sync is off or the website has
+/// not been redeployed with the health route yet.
+pub fn peer_health(data_dir: &Path) -> Vec<PeerHealth> {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return Vec::new() };
+    match read_health(&cfg) {
+        Ok(doc) => doc.peers.into_values().collect(),
+        Err(e) => {
+            tracing::debug!("cloud health: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+fn write_health(cfg: &CloudConfig, me: &PeerHealth) -> Result<()> {
+    if cfg.is_account() {
+        let _ = put_object(cfg, HEALTH_OBJECT, &serde_json::to_vec(me)?, &Guard::None)?;
+        return Ok(());
+    }
+    // Own bucket: one JSON document, updated with If-Match so two servers
+    // don't erase each other's rows. One retry covers the usual race.
+    for _ in 0..2 {
+        let (mut doc, etag) = read_health_doc(cfg)?;
+        let cutoff = now().saturating_sub(7 * 24 * 3600);
+        doc.peers.retain(|_, p| p.at >= cutoff);
+        doc.peers.insert(me.instance.clone(), me.clone());
+        let body = serde_json::to_vec(&doc)?;
+        let guard = match &etag {
+            Some(tag) if !tag.is_empty() => Guard::IfMatch(tag.clone()),
+            _ => Guard::IfAbsent,
+        };
+        match put_object(cfg, HEALTH_OBJECT, &body, &guard) {
+            Ok(_) => return Ok(()),
+            Err(e) if lost_race(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn read_health(cfg: &CloudConfig) -> Result<HealthDoc> {
+    if cfg.is_account() {
+        let text = match agent()
+            .get(&format!("{}/api/sync/health", cfg.api))
+            .set("authorization", &format!("Bearer {}", cfg.token))
+            .call()
+        {
+            Ok(resp) => resp.into_string().unwrap_or_default(),
+            Err(ureq::Error::Status(404, _)) => return Ok(HealthDoc::default()),
+            Err(e) => return Err(api_error(&cfg.api, &cfg.email, e)),
+        };
+        #[derive(Deserialize)]
+        struct Reply {
+            #[serde(default)]
+            peers: Vec<PeerHealth>,
+        }
+        let reply: Reply = serde_json::from_str(&text).unwrap_or(Reply { peers: Vec::new() });
+        let mut doc = HealthDoc::default();
+        for peer in reply.peers {
+            doc.peers.insert(peer.instance.clone(), peer);
+        }
+        return Ok(doc);
+    }
+    Ok(read_health_doc(cfg)?.0)
+}
+
+fn read_health_doc(cfg: &CloudConfig) -> Result<(HealthDoc, Option<String>)> {
+    let (amz_date, payload_sha256, auth) = signed_for(cfg, HEALTH_OBJECT, "GET", b"", &[]);
+    let path = format!("/{}/{}", uri_encode(&cfg.bucket), uri_encode(HEALTH_OBJECT));
+    match agent()
+        .get(&format!("{}{path}", cfg.endpoint))
+        .set("x-amz-date", &amz_date)
+        .set("x-amz-content-sha256", &payload_sha256)
+        .set("Authorization", &auth)
+        .call()
+    {
+        Ok(resp) => {
+            let etag = resp.header("ETag").unwrap_or_default().to_string();
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut resp.into_reader().take(1 << 20), &mut body)?;
+            let doc = serde_json::from_slice(&body).unwrap_or_default();
+            Ok((doc, Some(etag).filter(|t| !t.is_empty())))
+        }
+        Err(ureq::Error::Status(404, _)) => Ok((HealthDoc::default(), None)),
+        Err(e) => Err(connect_error(cfg, e)),
+    }
 }
 
 #[cfg(test)]
@@ -1349,5 +1848,63 @@ mod tests {
             pjdesk_proto::tls::TlsIdentity::load(&b.join("server-cert.pem"), &b.join("server-key.pem")).unwrap();
         assert_eq!(copied.fingerprint(), id.fingerprint());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fencing_token_lets_one_server_write() {
+        assert_eq!(fence(false, 0, "", "me", 0), Fence::MayUpload);
+        assert_eq!(fence(true, 4, "me", "me", 4), Fence::MayUpload);
+        assert_eq!(fence(true, 5, "other", "me", 4), Fence::Superseded);
+        assert_eq!(fence(true, 4, "other", "me", 4), Fence::Held);
+        // A pre-0.4 copy has no epoch. Either server may still upload.
+        assert_eq!(fence(true, 0, "other", "me", 0), Fence::MayUpload);
+        // We already hold a higher generation than the copy we just read.
+        assert_eq!(fence(true, 3, "other", "me", 4), Fence::MayUpload);
+        assert_eq!(next_epoch(0), 1);
+        assert_eq!(next_epoch(7), 8);
+        assert_eq!(next_epoch(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn old_bundle_epoch_defaults_to_zero() {
+        let json = r#"{"format":1,"written_at":1,"written_by":"a","instance":"abc","version":"0.3.7","files":{}}"#;
+        let bundle: Bundle = serde_json::from_str(json).unwrap();
+        assert_eq!(bundle.epoch, 0);
+    }
+
+    #[test]
+    fn if_match_is_part_of_the_signature() {
+        let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let with_match = authorization(
+            "PUT",
+            "/bucket/pjdesk-server.sync",
+            &[
+                ("host", "example.r2.cloudflarestorage.com"),
+                ("if-match", "\"abc\""),
+                ("x-amz-content-sha256", empty),
+                ("x-amz-date", "20130524T000000Z"),
+            ],
+            empty,
+            "20130524T000000Z",
+            "auto",
+            "AKID",
+            "SECRET",
+        );
+        let without = authorization(
+            "PUT",
+            "/bucket/pjdesk-server.sync",
+            &[
+                ("host", "example.r2.cloudflarestorage.com"),
+                ("x-amz-content-sha256", empty),
+                ("x-amz-date", "20130524T000000Z"),
+            ],
+            empty,
+            "20130524T000000Z",
+            "auto",
+            "AKID",
+            "SECRET",
+        );
+        assert!(with_match.contains("SignedHeaders=host;if-match;x-amz-content-sha256;x-amz-date"));
+        assert_ne!(with_match, without);
     }
 }

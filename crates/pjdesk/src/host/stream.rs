@@ -23,9 +23,11 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::capture::{self, Rect};
+use super::ctrl::{Grant, Session};
 use super::encoder::VideoEncoder;
 use super::input::InputInjector;
 use crate::color::{scaled_size, I420Buffer};
+use crate::host::HostShared;
 use crate::HostArgs;
 
 /// Frames sent but not yet decoded by the controller. Small = low latency.
@@ -98,6 +100,8 @@ pub async fn run(
     mut control_send: SendStream,
     mut control_recv: RecvStream,
     args: HostArgs,
+    grant: Grant,
+    ui: Option<Arc<HostShared>>,
 ) -> Result<()> {
     let shared = Arc::new(Shared {
         flow: Flow::new(),
@@ -106,11 +110,27 @@ pub async fn run(
     });
 
     let (frame_tx, mut frame_rx) = mpsc::channel::<EncodedFrame>(MAX_IN_FLIGHT as usize + 1);
+    let (host_tx, mut host_rx) = mpsc::unbounded_channel::<HostMsg>();
+    let session = Session::new(
+        args.fps,
+        args.bitrate,
+        args.max_width,
+        args.display,
+        args.view_only,
+        args.service_host,
+        grant,
+        connection.clone(),
+        host_tx,
+        ui,
+    );
+    session.spawn_side_loops();
+
     let capture_thread = {
         let shared = shared.clone();
+        let session = session.clone();
         let args = args.clone();
         std::thread::Builder::new().name("capture".into()).spawn(move || {
-            if let Err(e) = capture_loop(&args, &shared, &frame_tx) {
+            if let Err(e) = capture_loop(&args, &shared, &session, &frame_tx) {
                 warn!("Screen capture stopped: {e:#}");
             }
         })?
@@ -127,31 +147,36 @@ pub async fn run(
         Ok::<_, anyhow::Error>(())
     });
 
-    let mut injector = InputInjector::new(args.view_only);
+    let (mouse, keyboard) = session.initial_mouse_keyboard();
+    let mut injector = InputInjector::new(!mouse && !keyboard);
+    injector.set_allowed(mouse, keyboard);
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
     let result = loop {
         tokio::select! {
             msg = read_msg::<_, ControlMsg>(&mut control_recv, MAX_CONTROL_FRAME) => match msg {
-                Ok(ControlMsg::Input(event)) => {
+                Ok(msg) => {
+                    if let ControlMsg::FrameAck { seq } = &msg {
+                        shared.flow.ack(*seq);
+                    }
                     let display = *shared.display.lock().unwrap();
-                    injector.handle(event, display);
-                }
-                Ok(ControlMsg::FrameAck { seq }) => shared.flow.ack(seq),
-                Ok(ControlMsg::RequestKeyframe) => shared.keyframe_requested.store(true, Ordering::SeqCst),
-                Ok(ControlMsg::Special(cmd)) => {
-                    if !args.view_only {
-                        match cmd {
-                            pjdesk_proto::peer::SpecialCommand::CtrlAltDel => crate::platform::send_ctrl_alt_del(),
-                        }
+                    match session.handle(msg, &mut control_send, &mut injector, display, &shared.keyframe_requested).await {
+                        Ok(true) => break Ok(()),
+                        Ok(false) => {}
+                        Err(e) => break Err(e),
                     }
                 }
-                Ok(ControlMsg::Ping { t_us }) => {
-                    if let Err(e) = write_msg(&mut control_send, &HostMsg::Pong { t_us }).await {
-                        break Err(e);
-                    }
-                }
-                // The controller closed the stream or the connection.
                 Err(_) => break Ok(()),
             },
+            Some(out) = host_rx.recv() => {
+                if let Err(e) = write_msg(&mut control_send, &out).await {
+                    break Err(e);
+                }
+            }
+            _ = tick.tick() => {
+                if let Err(e) = session.poll_local(&mut control_send).await {
+                    break Err(e);
+                }
+            }
             done = &mut video_task => break match done {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e).context("sending video"),
@@ -162,6 +187,7 @@ pub async fn run(
     };
 
     shared.flow.stop();
+    session.release_privacy();
     injector.release_all();
     video_task.abort();
     let _ = tokio::task::spawn_blocking(move || capture_thread.join()).await;
@@ -183,7 +209,7 @@ fn scale_factor(width: usize, height: usize, max_width: usize) -> usize {
 }
 
 /// Capture → convert → encode loop (runs on its own thread).
-fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedFrame>) -> Result<()> {
+fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mpsc::Sender<EncodedFrame>) -> Result<()> {
     let _awake = KeepAwake::new();
     // Service helper: attach this capture thread to the input desktop so it can
     // see UAC prompts, the lock screen and the sign-in screen.
@@ -196,8 +222,10 @@ fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedF
     info!("Capturing {} with {}", describe(capturer.display_rect()), capturer.name());
     *shared.display.lock().unwrap() = capturer.display_rect();
 
-    let mut encoder = VideoEncoder::new(args.bitrate, args.fps)?;
-    let interval = Duration::from_secs_f64(1.0 / args.fps.clamp(1, 120) as f64);
+    let mut live_fps = session.fps.load(Ordering::SeqCst);
+    let mut live_bitrate = session.bitrate.load(Ordering::SeqCst);
+    let mut encoder = VideoEncoder::new(live_bitrate, live_fps)?;
+    let mut interval = Duration::from_secs_f64(1.0 / live_fps.clamp(1, 120) as f64);
     let mut next_due = Instant::now();
     let mut seq = 0u32;
     let mut picture = I420Buffer::default();
@@ -208,8 +236,31 @@ fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedF
     // When GDI is only a fallback, keep trying to get back to DXGI
     // (it may have been unavailable at start, e.g. during a UAC prompt).
     let mut next_dxgi_retry = Instant::now() + Duration::from_secs(10);
+    let mut args = args.clone();
 
     while !shared.flow.stopped() {
+        let want_display = session.display.load(Ordering::SeqCst);
+        if want_display != args.display {
+            args.display = want_display;
+            match capture::open(&args) {
+                Ok(next) => {
+                    info!("Switched to monitor {want_display}");
+                    capturer = next;
+                    *shared.display.lock().unwrap() = capturer.display_rect();
+                    shared.keyframe_requested.store(true, Ordering::SeqCst);
+                }
+                Err(e) => warn!("Could not switch monitor ({e:#})"),
+            }
+        }
+        let fps_now = session.fps.load(Ordering::SeqCst).clamp(1, 120);
+        let bitrate_now = session.bitrate.load(Ordering::SeqCst).clamp(200, 50_000);
+        if fps_now != live_fps || bitrate_now.abs_diff(live_bitrate) > live_bitrate / 10 {
+            live_fps = fps_now;
+            live_bitrate = bitrate_now;
+            encoder = VideoEncoder::new(live_bitrate, live_fps)?;
+            interval = Duration::from_secs_f64(1.0 / live_fps as f64);
+            shared.keyframe_requested.store(true, Ordering::SeqCst);
+        }
         // Follow desktop switches (UAC / lock / sign-in screen): re-attach this
         // thread and rebuild capture so it grabs the desktop now on screen.
         // An empty name means the read failed transiently — don't treat that as
@@ -223,7 +274,7 @@ fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedF
                 drop(capturer);
                 std::thread::sleep(Duration::from_millis(200));
                 capturer = loop {
-                    match capture::open(args) {
+                    match capture::open(&args) {
                         Ok(c) => break c,
                         Err(e) => {
                             if shared.flow.stopped() {
@@ -240,7 +291,7 @@ fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedF
         }
         if capturer.is_fallback() && Instant::now() >= next_dxgi_retry {
             next_dxgi_retry = Instant::now() + Duration::from_secs(10);
-            if let Some(better) = capture::try_preferred(args) {
+            if let Some(better) = capture::try_preferred(&args) {
                 info!("Switched back to {}", better.name());
                 capturer = better;
                 *shared.display.lock().unwrap() = capturer.display_rect();
@@ -259,7 +310,7 @@ fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedF
 
         let want_keyframe = shared.keyframe_requested.swap(false, Ordering::SeqCst);
         let to_i420 = |frame: capture::Frame<'_>, picture: &mut I420Buffer| {
-            let factor = scale_factor(frame.width, frame.height, args.max_width as usize);
+            let factor = scale_factor(frame.width, frame.height, session.max_width.load(Ordering::SeqCst) as usize);
             crate::color::bgra_to_i420(frame.data, frame.width, frame.height, frame.stride, factor, picture);
         };
 
@@ -285,7 +336,7 @@ fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedF
                 // before opening a new one: an output can only be duplicated once.
                 drop(capturer);
                 std::thread::sleep(Duration::from_millis(500));
-                capturer = capture::open(args)?;
+                capturer = capture::open(&args)?;
                 errors = 0;
                 shared.keyframe_requested.store(true, Ordering::SeqCst);
             }
@@ -332,6 +383,7 @@ fn capture_loop(args: &HostArgs, shared: &Shared, frames: &mpsc::Sender<EncodedF
             encode_us: started.elapsed().as_micros().min(u32::MAX as u128) as u32,
         };
         shared.flow.sent(seq);
+        session.note_sent(seq);
         if frames.blocking_send(EncodedFrame { header, data }).is_err() {
             break;
         }

@@ -1,19 +1,21 @@
 //! Host mode: stay online, show ID + password, stream to one controller at a time.
 
 pub mod capture;
+mod ctrl;
+pub(crate) mod direct;
 mod encoder;
 mod input;
 mod stream;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use pjdesk_proto::auth::generate_password;
-use pjdesk_proto::signal::{ClientMsg, ErrorCode, ServerMsg, SessionId};
+use pjdesk_proto::signal::{ClientMsg, ErrorCode, Policy, ServerMsg, SessionId};
 use pjdesk_proto::tls::TlsIdentity;
 use pjdesk_proto::udp::Role;
 use pjdesk_proto::{format_id, PEER_SERVER_NAME, PROTOCOL_VERSION};
@@ -53,6 +55,34 @@ pub struct HostShared {
     regenerate: AtomicBool,
     /// UI → host: stop hosting and return (e.g. the server changed).
     stop: AtomicBool,
+    /// A connection waiting for the person at this computer to accept it.
+    consent: Mutex<Option<ConsentAsk>>,
+    consent_reply: Mutex<Option<ConsentReply>>,
+    consent_seq: AtomicU64,
+    chat: Mutex<Vec<(bool, String)>>,
+    chat_out: Mutex<Vec<String>>,
+    send_files: Mutex<Vec<std::path::PathBuf>>,
+    transfers: Mutex<Vec<String>>,
+    session_perms: AtomicU32,
+}
+
+/// Shown when someone wants to connect and approval is set to prompt.
+#[derive(Clone, Debug)]
+pub struct ConsentAsk {
+    pub id: u64,
+    pub from: String,
+    pub ip: String,
+    /// Permission bits the person may grant.
+    pub offered: u32,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ConsentReply {
+    pub id: u64,
+    pub accept: bool,
+    pub permissions: u32,
+    #[serde(default)]
+    pub receive_dir: String,
 }
 
 impl HostShared {
@@ -89,6 +119,90 @@ impl HostShared {
     pub fn stopping(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
+
+    pub fn begin_consent(&self, from: &str, ip: &str, offered: u32) -> u64 {
+        let id = self.consent_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.consent_reply.lock().unwrap() = None;
+        *self.consent.lock().unwrap() = Some(ConsentAsk { id, from: from.to_string(), ip: ip.to_string(), offered });
+        id
+    }
+
+    pub fn consent(&self) -> Option<ConsentAsk> {
+        self.consent.lock().unwrap().clone()
+    }
+
+    pub fn reply_consent(&self, reply: ConsentReply) {
+        *self.consent_reply.lock().unwrap() = Some(reply);
+    }
+
+    pub fn take_reply(&self, id: u64) -> Option<ConsentReply> {
+        let mut slot = self.consent_reply.lock().unwrap();
+        if slot.as_ref().is_some_and(|r| r.id == id) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    pub fn clear_consent(&self, id: u64) {
+        let mut slot = self.consent.lock().unwrap();
+        if slot.as_ref().is_some_and(|c| c.id == id) {
+            *slot = None;
+        }
+    }
+
+    pub fn push_chat(&self, from_me: bool, text: &str) {
+        let mut chat = self.chat.lock().unwrap();
+        chat.push((from_me, text.to_string()));
+        if chat.len() > 200 {
+            let drop_n = chat.len() - 200;
+            chat.drain(0..drop_n);
+        }
+    }
+
+    pub fn chat(&self) -> Vec<(bool, String)> {
+        self.chat.lock().unwrap().clone()
+    }
+
+    pub fn send_chat(&self, text: String) {
+        if !text.trim().is_empty() {
+            self.push_chat(true, text.trim());
+            self.chat_out.lock().unwrap().push(text.trim().to_string());
+        }
+    }
+
+    pub fn take_chat_out(&self) -> Vec<String> {
+        std::mem::take(&mut *self.chat_out.lock().unwrap())
+    }
+
+    pub fn queue_send_file(&self, path: std::path::PathBuf) {
+        self.send_files.lock().unwrap().push(path);
+    }
+
+    pub fn take_send_files(&self) -> Vec<std::path::PathBuf> {
+        std::mem::take(&mut *self.send_files.lock().unwrap())
+    }
+
+    pub fn note_transfer(&self, text: &str) {
+        let mut lines = self.transfers.lock().unwrap();
+        lines.push(text.to_string());
+        if lines.len() > 40 {
+            let n = lines.len() - 40;
+            lines.drain(0..n);
+        }
+    }
+
+    pub fn transfers(&self) -> Vec<String> {
+        self.transfers.lock().unwrap().clone()
+    }
+
+    pub fn set_session_perms(&self, perms: u32) {
+        self.session_perms.store(perms, Ordering::SeqCst);
+    }
+
+    pub fn session_perms(&self) -> u32 {
+        self.session_perms.load(Ordering::SeqCst)
+    }
 }
 
 /// Connection requests that may be in setup at once. Only an authenticated
@@ -111,11 +225,19 @@ struct HostState {
     pending: AtomicUsize,
     /// Routes the server's PeerInfo messages to the session waiting for them.
     peer_info_routes: Mutex<HashMap<SessionId, mpsc::UnboundedSender<ServerMsg>>>,
+    /// Permission ceiling and receive folder chosen when the session was approved.
+    ceilings: Mutex<HashMap<SessionId, (u32, String)>>,
     failures: Mutex<Failures>,
     args: HostArgs,
     name: String,
     /// Optional status channel to a GUI/supervisor.
     shared: Option<Arc<HostShared>>,
+    /// Rules pushed by a version-3 server. Defaults allow the classic session.
+    policy: Mutex<Policy>,
+    /// Protocol the server accepted for this registration.
+    server_proto: AtomicU16,
+    /// This computer's ID, once the server has assigned it (also used by LAN beacons).
+    device_id: Mutex<String>,
 }
 
 impl HostState {
@@ -234,11 +356,23 @@ async fn host_main(
         streaming: AtomicBool::new(false),
         pending: AtomicUsize::new(0),
         peer_info_routes: Mutex::new(HashMap::new()),
+        ceilings: Mutex::new(HashMap::new()),
         failures: Mutex::new(Failures::default()),
         name: crate::hostname(),
-        args,
-        shared,
+        args: args.clone(),
+        shared: shared.clone(),
+        policy: Mutex::new(Policy::default()),
+        server_proto: AtomicU16::new(pjdesk_proto::PROTOCOL_VERSION),
+        device_id: Mutex::new(String::new()),
     });
+    if args.allow_direct {
+        let direct = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = direct::serve(direct).await {
+                warn!("Direct connections stopped: {e:#}");
+            }
+        });
+    }
     state.publish_password();
 
     let mut delay = Duration::from_secs(2);
@@ -280,8 +414,9 @@ async fn host_main(
 async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<HostState>) -> Result<()> {
     let mut signal = SignalClient::connect(server, config).await?;
     let device_secret = config.device_secret()?;
+    let register_proto = state.server_proto.load(Ordering::SeqCst);
     signal.send(ClientMsg::Register {
-        proto: PROTOCOL_VERSION,
+        proto: register_proto,
         device_id: config.device_id.clone(),
         device_secret,
         hostname: state.name.clone(),
@@ -295,11 +430,18 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
             config.save()?;
             bail!("{message}; a new ID will be requested");
         }
-        Ok(Some(ServerMsg::Error { message, .. })) => bail!("the server refused registration: {message}"),
+        Ok(Some(ServerMsg::Error { message, .. })) => {
+            if pjdesk_proto::version_rejected(&message) && register_proto > pjdesk_proto::MIN_PROTOCOL_VERSION {
+                state.server_proto.store(pjdesk_proto::MIN_PROTOCOL_VERSION, Ordering::SeqCst);
+                bail!("the server speaks an older protocol; reconnecting");
+            }
+            bail!("the server refused registration: {message}");
+        }
         Ok(Some(other)) => bail!("unexpected reply from the server: {other:?}"),
         Ok(None) => bail!("the server closed the connection"),
         Err(_) => bail!("the server did not answer"),
     };
+    *state.device_id.lock().unwrap() = device_id.clone();
     if config.device_id.as_deref() != Some(device_id.as_str()) {
         config.device_id = Some(device_id.clone());
         config.save()?;
@@ -351,8 +493,21 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                             signal.send(ClientMsg::SessionResponse { session_id, accept: false, reason })?;
                             continue;
                         }
+                        let approved = match approve(state, &controller_name, &controller_ip).await {
+                            Some(bits) => bits,
+                            None => {
+                                info!("Declined connection from \"{controller_name}\" ({controller_ip})");
+                                signal.send(ClientMsg::SessionResponse {
+                                    session_id,
+                                    accept: false,
+                                    reason: "the person at this computer declined".into(),
+                                })?;
+                                continue;
+                            }
+                        };
                         state.pending.fetch_add(1, Ordering::SeqCst);
                         signal.send(ClientMsg::SessionResponse { session_id, accept: true, reason: String::new() })?;
+                        state.ceilings.lock().unwrap().insert(session_id, approved);
                         let (tx, rx) = mpsc::unbounded_channel();
                         state.peer_info_routes.lock().unwrap().insert(session_id, tx);
                         let server_udp = SocketAddr::new(server_ip, udp_port);
@@ -371,6 +526,10 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                         if let Some(tx) = state.peer_info_routes.lock().unwrap().get(&session_id) {
                             let _ = tx.send(msg);
                         }
+                    }
+                    ServerMsg::Policy(policy) => {
+                        info!("Server policy applied (unattended {}, recording {})", policy.unattended_allowed, policy.recording_allowed);
+                        *state.policy.lock().unwrap() = policy;
                     }
                     ServerMsg::Pong => {}
                     ServerMsg::UpdateNow => {
@@ -435,6 +594,7 @@ async fn run_session(
         state.pending.fetch_sub(1, Ordering::SeqCst);
     }
     state.peer_info_routes.lock().unwrap().remove(&session_id);
+    state.ceilings.lock().unwrap().remove(&session_id);
 }
 
 async fn session_inner(
@@ -483,7 +643,31 @@ async fn session_inner(
     if let Some(shared) = &state.shared {
         *shared.connected.lock().unwrap() = Some(auth.peer_name.clone());
     }
-    let result = stream::run(connection.clone(), auth.send, auth.recv, state.args.clone()).await;
+    let (mut ceiling, receive_dir) = state
+        .ceilings
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .cloned()
+        .unwrap_or((pjdesk_proto::perms::CLASSIC, state.args.receive_dir.clone()));
+    let policy = state.policy.lock().unwrap().clone();
+    ceiling &= policy.max_permissions;
+    if !policy.recording_allowed {
+        ceiling &= !pjdesk_proto::perms::RECORD;
+    }
+    let mut ports = state.args.tunnel_ports.clone();
+    ports.extend(policy.tunnel_ports.iter().copied());
+    ports.sort_unstable();
+    ports.dedup();
+    let grant = ctrl::Grant {
+        ceiling,
+        peer_proto: auth.peer_proto,
+        peer_name: auth.peer_name.clone(),
+        tunnel_remote: policy.tunnel_remote_hosts,
+        tunnel_ports: ports,
+        receive_dir,
+    };
+    let result = stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
     state.streaming.store(false, Ordering::SeqCst);
     if let Some(shared) = &state.shared {
         *shared.connected.lock().unwrap() = None;
@@ -568,4 +752,82 @@ fn platform_init() {
             }
         }
     }
+}
+
+/// Asks the person at this computer before a session starts. `None` declines.
+/// The tuple is the granted permission bits and the folder received files may
+/// be written into (empty unless file transfer was allowed).
+async fn approve(state: &Arc<HostState>, name: &str, ip: &str) -> Option<(u32, String)> {
+    use pjdesk_proto::perms::{self, grant};
+    let policy = state.policy.lock().unwrap().clone();
+    let prompt = state.args.approval != "unattended" || policy.force_prompt;
+    let restricted = grant(perms::UNATTENDED_DEFAULT, policy.max_permissions, state.args.view_only) & !perms::FILE;
+    let permanent = state.permanent.lock().unwrap().is_some();
+    let unattended_ok = permanent && policy.unattended_allowed && !policy.force_prompt;
+
+    if !prompt {
+        return unattended_ok.then_some((restricted, String::new()));
+    }
+
+    if let Some(shared) = &state.shared {
+        let id = shared.begin_consent(name, ip, policy.max_permissions);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        loop {
+            if let Some(reply) = shared.take_reply(id) {
+                shared.clear_consent(id);
+                return consent_grant(&policy, reply);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                shared.clear_consent(id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    } else if state.args.service_host {
+        if let Some(answer) = service_consent(state, name, ip, policy.max_permissions).await {
+            return Some(answer);
+        }
+    }
+
+    unattended_ok.then_some((restricted, String::new()))
+}
+
+fn consent_grant(policy: &Policy, reply: ConsentReply) -> Option<(u32, String)> {
+    use pjdesk_proto::perms;
+    if !reply.accept {
+        return None;
+    }
+    let mut bits = reply.permissions & policy.max_permissions;
+    let dir = if bits & perms::FILE != 0 { reply.receive_dir } else { String::new() };
+    if dir.is_empty() {
+        bits &= !perms::FILE;
+    }
+    Some((bits, dir))
+}
+
+/// The service host has no window. It leaves `consent.json` for the signed-in
+/// user's PJDesk window and waits for `consent-reply.json`.
+async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) -> Option<(u32, String)> {
+    let dir = crate::syspaths::service_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let ask_path = dir.join("consent.json");
+    let reply_path = dir.join("consent-reply.json");
+    let _ = std::fs::remove_file(&reply_path);
+    let ask = serde_json::json!({ "from": name, "ip": ip, "offered": offered });
+    std::fs::write(&ask_path, ask.to_string()).ok()?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let reply = loop {
+        if let Ok(bytes) = std::fs::read(&reply_path) {
+            if let Ok(reply) = serde_json::from_slice::<ConsentReply>(&bytes) {
+                break Some(reply);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let _ = std::fs::remove_file(&ask_path);
+    let _ = std::fs::remove_file(&reply_path);
+    consent_grant(&state.policy.lock().unwrap(), reply?)
 }

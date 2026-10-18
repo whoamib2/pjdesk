@@ -70,6 +70,47 @@ pub struct Settings {
     /// Start PJDesk automatically when this user signs in to Windows.
     #[serde(default)]
     pub start_with_windows: bool,
+    /// "dark" or "light".
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// "prompt" asks the person at this computer before a session starts.
+    /// "unattended" accepts on the password alone, with a restricted permission set.
+    #[serde(default = "default_approval")]
+    pub approval: String,
+    /// Folder received files are written into. Empty means file transfer is refused.
+    #[serde(default)]
+    pub receive_dir: String,
+    /// Listen for direct IP connections and announce this computer on the LAN.
+    #[serde(default = "yes")]
+    pub allow_direct: bool,
+    /// Host ports a remote session may forward to (loopback only unless the server policy says otherwise).
+    #[serde(default)]
+    pub tunnel_ports: Vec<u16>,
+    /// Local notes for computers (favorites, last connection). Not synced.
+    #[serde(default)]
+    pub peers: BTreeMap<String, PeerNote>,
+    /// Pinned QUIC fingerprints for direct IP connections, keyed by `host:port`.
+    #[serde(default)]
+    pub direct_pins: BTreeMap<String, String>,
+}
+
+fn yes() -> bool {
+    true
+}
+fn default_theme() -> String {
+    "dark".into()
+}
+fn default_approval() -> String {
+    "prompt".into()
+}
+
+/// Remembered locally, not part of the synced address book.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerNote {
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default)]
+    pub last_connected: u64,
 }
 
 fn default_fps() -> u32 {
@@ -92,6 +133,13 @@ impl Default for Settings {
             view_only: false,
             permanent_password: None,
             start_with_windows: false,
+            theme: default_theme(),
+            approval: default_approval(),
+            receive_dir: String::new(),
+            allow_direct: true,
+            tunnel_ports: Vec::new(),
+            peers: BTreeMap::new(),
+            direct_pins: BTreeMap::new(),
         }
     }
 }

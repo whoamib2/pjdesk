@@ -14,8 +14,14 @@ pub const UPDATE_FILE: &str = "update-requests.json";
 pub const FORGET_FILE: &str = "forget-requests.json";
 /// Run a cloud sync pass now.
 pub const SYNC_FILE: &str = "sync-requests.json";
+/// Make this server the cloud primary.
+pub const PROMOTE_FILE: &str = "promote-requests.json";
+/// Stop this server uploading to the cloud.
+pub const DEMOTE_FILE: &str = "demote-requests.json";
 /// Reload the key, accounts and computer list from disk (after joining).
 pub const RELOAD_FILE: &str = "reload-requests.json";
+/// Assign a group: `deviceId=Group name` (an empty name clears it).
+pub const GROUP_FILE: &str = "group-requests.json";
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
@@ -25,7 +31,8 @@ pub fn acceptable_target(file: &str, target: &str) -> bool {
     match file {
         UPDATE_FILE => target == "*" || pjdesk_proto::is_valid_id(target),
         FORGET_FILE => pjdesk_proto::is_valid_id(target),
-        SYNC_FILE | RELOAD_FILE => target == "now",
+        SYNC_FILE | RELOAD_FILE | PROMOTE_FILE | DEMOTE_FILE => target == "now",
+        GROUP_FILE => parse_group_target(target).is_some(),
         _ => false,
     }
 }
@@ -56,7 +63,7 @@ fn read_list(path: &Path) -> Vec<String> {
     serde_json::from_slice::<Vec<String>>(&bytes)
         .unwrap_or_default()
         .into_iter()
-        .filter(|t| t.len() <= 16)
+        .filter(|t| t.len() <= 64)
         .take(64)
         .collect()
 }
@@ -73,6 +80,18 @@ pub fn take(data_dir: &Path, file: &str) -> Vec<String> {
     let list = read_list(&taken);
     let _ = std::fs::remove_file(&taken);
     list.into_iter().filter(|t| acceptable_target(file, t)).collect()
+}
+
+/// `123456789=Office` or `123456789=` to clear. The group is a label, not a path.
+pub fn parse_group_target(target: &str) -> Option<(String, String)> {
+    let (id, group) = target.split_once('=')?;
+    if !pjdesk_proto::is_valid_id(id) || group.chars().count() > 40 {
+        return None;
+    }
+    if group.chars().any(|c| c.is_control() || c == '/' || c == '\\') {
+        return None;
+    }
+    Some((id.to_string(), group.to_string()))
 }
 
 /// Forgets a device: removes it from `devices.json` now (enough when the

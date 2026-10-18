@@ -38,6 +38,8 @@ arboard = { version = "3", default-features = false }
 # Viewer toolbar text (font bytes are already in the tree via egui).
 ab_glyph = "0.2"
 epaint_default_fonts = "0.36"
+# Clipboard images are PNG. Text stays on the control stream.
+png = "0.17"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
@@ -64,6 +66,11 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
+    "Win32_System_Shutdown",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Media_Audio",
 ]
 
 [target.'cfg(windows)'.dependencies]

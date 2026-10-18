@@ -15,6 +15,11 @@
 //   POST /api/password          (Bearer) {old_auth_key, new_auth_key}
 //   GET  /api/sync              (Bearer, sync on) sealed copy; ETag / If-None-Match
 //   PUT  /api/sync              (Bearer, sync on) sealed copy
+//                               If-Match / If-None-Match: * → 412 when the
+//                               precondition fails. Omitting both is the
+//                               unconditional put older servers send.
+//   GET  /api/sync/health       (Bearer, sync on) { peers: [...] }
+//   PUT  /api/sync/health       (Bearer, sync on) one server's version/role
 //   GET  /api/admin/accounts    (Bearer, admin)
 //   POST /api/admin/sync        (Bearer, admin) {email, enabled}
 //   GET  /api/release           latest release info (from GitHub)
@@ -185,6 +190,8 @@ async function api(request, env, url, ctx) {
   if (p === "/api/password" && m === "POST") return changePassword(request, env);
   if (p === "/api/sync" && m === "GET") return syncGet(request, env);
   if (p === "/api/sync" && m === "PUT") return syncPut(request, env);
+  if (p === "/api/sync/health" && m === "GET") return syncHealthGet(request, env);
+  if (p === "/api/sync/health" && m === "PUT") return syncHealthPut(request, env);
   if (p === "/api/admin/accounts" && m === "GET") return adminAccounts(request, env);
   if (p === "/api/admin/sync" && m === "POST") return adminSetSync(request, env);
   if (p === "/api/release" && m === "GET") {
@@ -348,6 +355,13 @@ async function readLimited(request, max) {
   return buf;
 }
 
+function etagNorm(s) {
+  return String(s || "")
+    .trim()
+    .replace(/^W\//i, "")
+    .replace(/^"+|"+$/g, "");
+}
+
 async function syncPut(request, env) {
   const s = await session(request, env);
   requireSync(s);
@@ -357,9 +371,24 @@ async function syncPut(request, env) {
   if (buf.byteLength < 64 || String.fromCharCode(...head) !== SEAL_MAGIC) {
     throw new HttpError(400, "That isn't a sealed PJDesk server copy.");
   }
-  const obj = await env.SYNC.put(objectKey(s.accountId), buf.buffer, {
+  const key = objectKey(s.accountId);
+  const ifMatch = request.headers.get("if-match");
+  const ifNone = request.headers.get("if-none-match");
+  // No precondition header: the unconditional put a 0.3.x server sends.
+  let onlyIf;
+  if (ifMatch) {
+    onlyIf = request.headers;
+  } else if (ifNone && etagNorm(ifNone) === "*") {
+    const existing = await env.SYNC.head(key);
+    if (existing) return json({ error: "The cloud copy changed." }, 412);
+    onlyIf = request.headers;
+  }
+  const obj = await env.SYNC.put(key, buf.buffer, {
     httpMetadata: { contentType: "application/octet-stream" },
+    onlyIf,
   });
+  // R2 returns null when onlyIf fails. That is the fence: the other server won.
+  if (!obj) return json({ error: "The cloud copy changed." }, 412);
   await env.DB.prepare(
     `INSERT INTO sync_meta (account_id, size, etag, updated_at) VALUES (?, ?, ?, ?)
      ON CONFLICT(account_id) DO UPDATE SET size = excluded.size, etag = excluded.etag, updated_at = excluded.updated_at`,
@@ -367,6 +396,51 @@ async function syncPut(request, env) {
     .bind(s.accountId, buf.byteLength, obj.httpEtag, now())
     .run();
   return json({ ok: true, etag: obj.httpEtag }, 200, { etag: obj.httpEtag });
+}
+
+function healthKey(accountId, instance) {
+  return `${objectKey(accountId)}/health/${instance}`;
+}
+
+function validInstance(id) {
+  return typeof id === "string" && /^[0-9a-f]{32}$/.test(id);
+}
+
+async function syncHealthPut(request, env) {
+  const s = await session(request, env);
+  requireSync(s);
+  const body = await readJson(request);
+  if (!validInstance(body.instance)) throw new HttpError(400, "Bad request.");
+  const record = {
+    instance: body.instance,
+    name: String(body.name || "").slice(0, 64),
+    version: String(body.version || "").slice(0, 32),
+    role: body.role === "active" ? "active" : "standby",
+    epoch: Number.isFinite(body.epoch) ? body.epoch : 0,
+    healthy: !!body.healthy,
+    at: now(),
+  };
+  await env.SYNC.put(healthKey(s.accountId, record.instance), JSON.stringify(record), {
+    httpMetadata: { contentType: "application/json" },
+  });
+  return json({ ok: true });
+}
+
+async function syncHealthGet(request, env) {
+  const s = await session(request, env);
+  requireSync(s);
+  const listed = await env.SYNC.list({ prefix: `${objectKey(s.accountId)}/health/` });
+  const peers = [];
+  for (const obj of listed.objects || []) {
+    const got = await env.SYNC.get(obj.key);
+    if (!got) continue;
+    try {
+      peers.push(await got.json());
+    } catch {
+      // A damaged row is skipped; it must not hide the others.
+    }
+  }
+  return json({ peers });
 }
 
 async function requireAdmin(request, env) {

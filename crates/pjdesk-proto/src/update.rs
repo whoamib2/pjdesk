@@ -64,10 +64,36 @@ pub fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-/// True if `candidate` is a strictly newer version than `current`.
+/// True when `s` is a pre-release (`1.2.3-rc.1`). Build metadata (`1.2.3+g1`)
+/// is not a pre-release. Automatic update skips these.
+pub fn is_prerelease(s: &str) -> bool {
+    let s = s.trim().trim_start_matches('v');
+    s.split('+').next().unwrap_or(s).contains('-')
+}
+
+/// True if `candidate` is a strictly newer release than `current`.
+///
+/// A pre-release candidate is never newer (those are skipped). A final
+/// release is newer than a pre-release of the same numbers (`0.4.0` after
+/// `0.4.0-rc1`). A smaller tuple is never newer, so a server does not
+/// downgrade.
 pub fn is_newer(current: &str, candidate: &str) -> bool {
+    if is_prerelease(candidate) {
+        return false;
+    }
     match (parse_version(current), parse_version(candidate)) {
-        (Some(c), Some(n)) => n > c,
+        (Some(c), Some(n)) => n > c || (n == c && is_prerelease(current)),
+        _ => false,
+    }
+}
+
+/// True when `have` is a final release at least as new as `need`.
+pub fn version_at_least(have: &str, need: &str) -> bool {
+    if is_prerelease(have) {
+        return false;
+    }
+    match (parse_version(have), parse_version(need)) {
+        (Some(h), Some(n)) => h >= n,
         _ => false,
     }
 }
@@ -269,6 +295,74 @@ pub fn run_installer(_path: &std::path::Path) -> Result<()> {
     bail!("installing updates is only supported on Windows")
 }
 
+#[derive(Deserialize)]
+struct SiteRelease {
+    version: String,
+    #[serde(default)]
+    server: String,
+    #[serde(default)]
+    sums: String,
+}
+
+/// Looks up the latest server installer. Tries `https://pjdesk.com/api/release`
+/// first and, if that request fails, the GitHub latest release. A reachable
+/// site that simply has nothing newer is authoritative: GitHub is not asked
+/// again. Pre-releases are ignored.
+pub fn check_server(current: &str) -> Result<Option<Available>> {
+    match check_site(current) {
+        Ok(found) => Ok(found),
+        Err(_) => check(crate::UPDATE_REPO, current, "PJDesk-Server-Setup"),
+    }
+}
+
+fn check_site(current: &str) -> Result<Option<Available>> {
+    let body = http_get("https://pjdesk.com/api/release")?;
+    let release: SiteRelease = serde_json::from_slice(&body).context("parsing the PJDesk release")?;
+    if release.version.is_empty() || release.server.is_empty() || release.sums.is_empty() {
+        bail!("the PJDesk release feed did not name a server installer");
+    }
+    if is_prerelease(&release.version) || !is_newer(current, &release.version) {
+        return Ok(None);
+    }
+    let installer_name = release
+        .server
+        .rsplit('/')
+        .next()
+        .filter(|n| n.starts_with("PJDesk-Server-Setup") && n.ends_with(".exe"))
+        .context("the release feed did not name a PJDesk Server installer")?
+        .to_string();
+    Ok(Some(Available {
+        version: release.version.trim_start_matches('v').to_string(),
+        installer_name,
+        installer_url: release.server,
+        sums_url: Some(release.sums),
+    }))
+}
+
+/// Downloads, verifies, re-hashes the file on disk, and launches the installer.
+pub fn install_available(update: &Available) -> Result<()> {
+    let path = download_verified(update)?;
+    // Read the bytes we are about to execute one more time. `download_verified`
+    // already did this; repeating it here is the last step before the process
+    // is created, so a swap in between is still refused.
+    let sums_url = update.sums_url.as_deref().context(
+        "this release has no SHA256SUMS file, so it was not installed. Publish SHA256SUMS next to the installer.",
+    )?;
+    if !trusted_download_url(sums_url) {
+        bail!("the release points at a download outside GitHub, so it was not installed");
+    }
+    let sums = String::from_utf8(http_get(sums_url)?).unwrap_or_default();
+    let want = expected_checksum(&sums, &update.installer_name)
+        .with_context(|| format!("no checksum for {} in SHA256SUMS", update.installer_name))?;
+    let again = std::fs::read(&path).with_context(|| format!("reading back {}", path.display()))?;
+    if sha256_hex(&again) != want {
+        let _ = std::fs::remove_file(&path);
+        bail!("the installer changed on disk after its checksum was verified");
+    }
+    run_installer(&path)?;
+    Ok(())
+}
+
 /// The whole flow: check, and unless `check_only`, download + verify + launch.
 pub fn perform(repo: &str, current: &str, installer_prefix: &str, check_only: bool) -> Result<Outcome> {
     match check(repo, current, installer_prefix)? {
@@ -277,8 +371,7 @@ pub fn perform(repo: &str, current: &str, installer_prefix: &str, check_only: bo
             if check_only {
                 return Ok(Outcome::Found(update.version));
             }
-            let path = download_verified(&update)?;
-            run_installer(&path)?;
+            install_available(&update)?;
             Ok(Outcome::Installing(update.version))
         }
     }
@@ -298,6 +391,19 @@ mod tests {
         assert!(!is_newer("0.2.0", "garbage"));
         assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
         assert_eq!(parse_version("0.2.0-rc1"), Some((0, 2, 0)));
+        // Never install a pre-release, and never move to an older release.
+        assert!(is_prerelease("v0.4.0-rc.1"));
+        assert!(is_prerelease("0.4.0-rc1"));
+        assert!(!is_prerelease("0.4.0"));
+        assert!(!is_prerelease("0.4.0+gabcdef"));
+        assert!(!is_newer("0.3.0", "0.4.0-rc1"));
+        assert!(!is_newer("0.4.0", "0.4.0-rc1"));
+        assert!(is_newer("0.4.0-rc1", "0.4.0"));
+        assert!(!is_newer("0.4.1", "0.4.0"));
+        assert!(version_at_least("0.4.1", "0.4.0"));
+        assert!(version_at_least("0.4.0", "0.4.0"));
+        assert!(!version_at_least("0.4.0-rc1", "0.4.0"));
+        assert!(!version_at_least("0.3.9", "0.4.0"));
     }
 
     #[test]

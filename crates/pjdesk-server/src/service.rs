@@ -257,10 +257,24 @@ pub fn status() -> (bool, bool) {
 
 pub fn stop() -> Result<()> {
     let manager = manager(ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP).context("the service is not installed")?;
-    service.stop()?;
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS).context("the service is not installed")?;
+    if service.query_status()?.current_state != ServiceState::Stopped {
+        service.stop()?;
+        for _ in 0..50 {
+            if service.query_status()?.current_state == ServiceState::Stopped {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
     println!("Stopped {SERVICE_NAME}.");
     Ok(())
+}
+
+/// Stops the service if it is running, then starts it. One elevation covers both.
+pub fn restart() -> Result<()> {
+    let _ = stop();
+    start()
 }
 
 /// One program-based inbound rule covers both TCP and UDP.

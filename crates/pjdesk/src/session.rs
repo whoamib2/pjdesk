@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use pjdesk_proto::auth;
 use pjdesk_proto::framing::{read_msg, write_msg, MAX_CONTROL_FRAME};
 use pjdesk_proto::peer::AuthMsg;
-use pjdesk_proto::PROTOCOL_VERSION;
+use pjdesk_proto::{protocol_ok, version_rejected, PROTOCOL_VERSION};
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::time::timeout;
 
@@ -30,6 +30,8 @@ pub struct Authenticated {
     pub send: SendStream,
     pub recv: RecvStream,
     pub peer_name: String,
+    /// Protocol version the peer offered. Version 2 is the 0.3.x session.
+    pub peer_proto: u16,
 }
 
 /// TLS keying material unique to this QUIC connection (channel binding).
@@ -48,6 +50,15 @@ const AUTH_SLOTS: usize = 2;
 
 /// Controller side: prove we know one of the host's passwords.
 pub async fn controller_auth(connection: &Connection, password: &str, my_name: &str) -> Result<Authenticated> {
+    controller_auth_version(connection, password, my_name, PROTOCOL_VERSION).await
+}
+
+pub async fn controller_auth_version(
+    connection: &Connection,
+    password: &str,
+    my_name: &str,
+    proto: u16,
+) -> Result<Authenticated> {
     let (mut send, mut recv) = connection.open_bi().await?;
     let binding = channel_binding(connection)?;
 
@@ -59,14 +70,19 @@ pub async fn controller_auth(connection: &Connection, password: &str, my_name: &
         exchanges.push(exchange);
         spakes.push(spake);
     }
-    write_msg(&mut send, &AuthMsg::Start { proto: PROTOCOL_VERSION, spakes, controller_name: my_name.into() }).await?;
+    write_msg(&mut send, &AuthMsg::Start { proto, spakes, controller_name: my_name.into() }).await?;
 
     let reply: AuthMsg = timeout(Duration::from_secs(15), read_msg(&mut recv, MAX_CONTROL_FRAME))
         .await
         .context("the host did not answer")??;
     let (host_spakes, host_confirms) = match reply {
         AuthMsg::Challenge { spakes, confirms } => (spakes, confirms),
-        AuthMsg::Result { ok: false, message, .. } => bail!("the host refused the connection: {message}"),
+        AuthMsg::Result { ok: false, message, .. } => {
+            if version_rejected(&message) {
+                bail!(message);
+            }
+            bail!("the host refused the connection: {message}");
+        }
         other => bail!("unexpected message from the host: {other:?}"),
     };
 
@@ -99,7 +115,9 @@ pub async fn controller_auth(connection: &Connection, password: &str, my_name: &
         .await
         .context("the host did not answer")??;
     match verdict {
-        AuthMsg::Result { ok: true, host_name, .. } => Ok(Authenticated { send, recv, peer_name: host_name }),
+        AuthMsg::Result { ok: true, host_name, .. } => {
+            Ok(Authenticated { send, recv, peer_name: host_name, peer_proto: proto })
+        }
         AuthMsg::Result { ok: false, message, .. } => bail!("the host refused the connection: {message}"),
         other => bail!("unexpected message from the host: {other:?}"),
     }
@@ -126,13 +144,14 @@ pub async fn host_auth(
         AuthMsg::Start { proto, spakes, controller_name } => (proto, spakes, controller_name),
         other => bail!("unexpected message from the controller: {other:?}"),
     };
-    if proto != PROTOCOL_VERSION {
+    if !protocol_ok(proto) {
         let message = format!("version mismatch (host speaks protocol {PROTOCOL_VERSION}, controller {proto})");
         let _ =
             write_msg(&mut send, &AuthMsg::Result { ok: false, message: message.clone(), host_name: String::new() })
                 .await;
         bail!(message);
     }
+    let peer_proto = proto;
 
     if attempt_used.swap(true, Ordering::SeqCst) {
         bail!("only one password attempt is allowed per connection request");
@@ -176,5 +195,5 @@ pub async fn host_auth(
         return Err(WrongPassword.into());
     }
     write_msg(&mut send, &AuthMsg::Result { ok: true, message: String::new(), host_name: my_name.into() }).await?;
-    Ok(Authenticated { send, recv, peer_name: controller_name })
+    Ok(Authenticated { send, recv, peer_name: controller_name, peer_proto })
 }

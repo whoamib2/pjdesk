@@ -45,6 +45,11 @@ Function un.onInit
   System::Call 'kernel32::SetDllDirectoryA(t "")'
 FunctionEnd
 
+; If the install stops after the service was stopped, bring it back.
+Function .onInstFailed
+  nsExec::Exec 'net start PJDeskServer'
+FunctionEnd
+
 !define ARP "Software\Microsoft\Windows\CurrentVersion\Uninstall\PJDeskServer"
 
 Section "PJDesk Server (required)" SecCore
@@ -63,10 +68,18 @@ Section "PJDesk Server (required)" SecCore
   WriteRegStr HKLM "Software\PJDeskServer" "InstallDir" "$INSTDIR"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  ; Auto-update check every 30 minutes, as SYSTEM (short path avoids quoting the spaces).
-  GetFullPathName /SHORT $0 "$INSTDIR\${EXE}"
-  nsExec::Exec 'schtasks /Create /TN "PJDesk Server Update" /TR "$0 update" /SC MINUTE /MO 30 /RU SYSTEM /RL HIGHEST /F'
-  ; Restart the service if it was already installed.
+  ; Automatic updates are off until an administrator turns them on
+  ; (`pjdesk-server update-task`). Drop a task left by 0.3.x, which installed
+  ; every newer release on its own. The data folder under ProgramData is not
+  ; touched: the key, accounts, cloud settings and the update preference stay.
+  nsExec::Exec 'schtasks /Delete /TN "PJDesk Server Update" /F'
+  ; Tray icon for the user who installed, started now and at every sign-in.
+  ; The service itself cannot show a tray (it runs in session 0).
+  WriteRegDWORD HKCU "Software\PJDeskServer" "TrayAtLogin" 1
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "PJDesk Server" '"$INSTDIR\${EXE}" --tray'
+  Exec '"$INSTDIR\${EXE}" --tray'
+  ; Restart the service if it was already installed. .onInstFailed starts it
+  ; again when this install does not finish.
   nsExec::Exec 'net start PJDeskServer'
 
   CreateDirectory "$SMPROGRAMS\${APPNAME}"
@@ -111,4 +124,7 @@ Section "Uninstall"
 
   DeleteRegKey HKLM "${ARP}"
   DeleteRegKey HKLM "Software\PJDeskServer"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "PJDesk Server"
+  DeleteRegValue HKCU "Software\PJDeskServer" "TrayAtLogin"
+  DeleteRegKey HKCU "Software\PJDeskServer"
 SectionEnd

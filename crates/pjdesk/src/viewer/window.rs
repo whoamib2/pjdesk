@@ -64,7 +64,7 @@ struct Stats {
     encode_us: AtomicU64,
 }
 
-pub fn run(runtime: Runtime, link: Link) -> Result<()> {
+pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let slot = Arc::new(FrameSlot::default());
@@ -72,25 +72,28 @@ pub fn run(runtime: Runtime, link: Link) -> Result<()> {
     let (control_tx, control_rx) = mpsc::unbounded_channel::<ControlMsg>();
     let (frame_tx, frame_rx) = std::sync::mpsc::channel::<(VideoHeader, Vec<u8>)>();
 
-    let Link { connection, endpoint, control_send, mut control_recv, host_name, host_id, path } = link;
+    let Link { connection, endpoint, control_send, control_recv, host_name, host_id, path, peer_proto } = link;
     let title = format!("{host_name} ({}) — PJDesk, {path}", format_id(&host_id));
 
     runtime.spawn(send_control(control_send, control_rx));
-    runtime.spawn(async move {
-        // Host → controller messages (pongs, notices).
-        while let Ok(msg) = read_msg::<_, HostMsg>(&mut control_recv, MAX_CONTROL_FRAME).await {
-            if let HostMsg::Notice(text) = msg {
-                info!("Host: {text}");
-            }
-        }
-    });
-    runtime.spawn(receive_video(connection.clone(), frame_tx, stats.clone(), proxy.clone()));
+    let wake_proxy = proxy.clone();
+    let (live, cmds, recorder) = super::controls::start(
+        connection.clone(),
+        control_recv,
+        control_tx.clone(),
+        frame_tx,
+        peer_proto,
+        move || {
+            let _ = wake_proxy.send_event(UserEvent::Frame);
+        },
+    );
     runtime.spawn(report_stats(connection.clone(), stats.clone(), proxy.clone(), title.clone()));
     {
-        let (slot, control_tx, proxy, stats) = (slot.clone(), control_tx.clone(), proxy.clone(), stats.clone());
-        std::thread::Builder::new()
-            .name("decoder".into())
-            .spawn(move || decode_loop(frame_rx, slot, control_tx, proxy, stats))?;
+        let (slot, control_tx, proxy, stats, recorder) =
+            (slot.clone(), control_tx.clone(), proxy.clone(), stats.clone(), recorder.clone());
+        std::thread::Builder::new().name("decoder".into()).spawn(move || {
+            decode_loop(frame_rx, slot, control_tx, proxy, stats, recorder)
+        })?;
     }
 
     let mut app = App {
@@ -111,15 +114,21 @@ pub fn run(runtime: Runtime, link: Link) -> Result<()> {
         toolbar: toolbar::Toolbar::default(),
         zoom: Zoom::Fit,
         pan: (0, 0),
+        live,
+        cmds,
+        panel: super::panel::Panel::default(),
+        restarting: false,
     };
     event_loop.run_app(&mut app)?;
 
-    // Window closed: say goodbye so the host stops streaming immediately.
-    connection.close(0u32.into(), b"viewer closed");
+    let restarting = app.restarting;
+    if !restarting {
+        connection.close(0u32.into(), b"viewer closed");
+    }
     runtime.block_on(async {
         let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
     });
-    Ok(())
+    Ok(restarting)
 }
 
 /// Writes queued control messages, batching whatever is pending.
@@ -206,6 +215,7 @@ fn decode_loop(
     control: mpsc::UnboundedSender<ControlMsg>,
     proxy: EventLoopProxy<UserEvent>,
     stats: Arc<Stats>,
+    recorder: Arc<Mutex<super::controls::RecorderSlot>>,
 ) {
     let mut decoder = match VideoDecoder::new() {
         Ok(decoder) => decoder,
@@ -218,6 +228,19 @@ fn decode_loop(
     let mut last_request = Instant::now() - Duration::from_secs(10);
 
     while let Ok((header, data)) = frames.recv() {
+        let finished = {
+            let mut guard = recorder.lock().unwrap();
+            if guard.push(&data, header.keyframe, header.width, header.height).is_err() {
+                guard.stop()
+            } else {
+                None
+            }
+        };
+        if let Some(done) = finished {
+            let _ = done.finish();
+        }
+        stats.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        stats.encode_us.store(header.encode_us as u64, Ordering::Relaxed);
         if waiting_for_keyframe && !header.keyframe {
             let _ = control.send(ControlMsg::FrameAck { seq: header.seq });
             continue;
@@ -277,6 +300,10 @@ struct App {
     zoom: Zoom,
     /// Pan offset in window pixels when the picture is zoomed past the window.
     pan: (i32, i32),
+    live: Arc<Mutex<super::controls::Live>>,
+    cmds: mpsc::UnboundedSender<super::controls::Cmd>,
+    panel: super::panel::Panel,
+    restarting: bool,
 }
 
 impl App {
@@ -333,6 +360,11 @@ impl App {
             None => buffer.fill(0x00_1e_1e_22),
         }
         self.toolbar.draw(&mut buffer, win_w, win_h);
+        let snap = self.live.lock().unwrap().snapshot();
+        self.panel.draw(&mut buffer, win_w, win_h, &snap);
+        if snap.restart {
+            self.restarting = true;
+        }
         let _ = buffer.present();
     }
 
@@ -358,8 +390,48 @@ impl App {
             }
             Action::ToggleBlockInput => {
                 self.toolbar.block_input = !self.toolbar.block_input;
-                // Don't leave anything held on the host when we stop sending.
                 self.release_all();
+            }
+            Action::ToggleBlockHost => self.toggle_host(pjdesk_proto::perms::BLOCK_INPUT, |on| ControlMsg::BlockInput { enabled: on }),
+            Action::TogglePrivacy => self.toggle_host(pjdesk_proto::perms::PRIVACY, |on| ControlMsg::Privacy { enabled: on }),
+            Action::ToggleAudio => self.toggle_host(pjdesk_proto::perms::AUDIO, |on| ControlMsg::Audio { enabled: on }),
+            Action::ToggleRecord => {
+                let on = !self.live.lock().unwrap().recording;
+                let _ = self.cmds.send(super::controls::Cmd::Record(on));
+            }
+            Action::SendClipboard => {
+                self.send_clip_text();
+                let _ = self.cmds.send(super::controls::Cmd::ClipboardImage);
+            }
+            Action::Restart => {
+                if !self.panel.confirm_restart {
+                    self.panel.confirm_restart = true;
+                    self.panel.open = true;
+                    self.panel.tab = 2;
+                    self.live.lock().unwrap().notices.push("Choose Restart again to restart the other computer.".into());
+                } else if self.live.lock().unwrap().allowed(pjdesk_proto::perms::RESTART) {
+                    self.panel.confirm_restart = false;
+                    self.restarting = true;
+                    let _ = self.control.send(ControlMsg::Restart);
+                } else {
+                    self.live.lock().unwrap().notices.push("The host did not allow a restart for this session.".into());
+                }
+            }
+            Action::Quality(name) => {
+                if let Some(q) = pjdesk_proto::quality::preset(name) {
+                    if self.live.lock().unwrap().v3 {
+                        let _ = self.control.send(ControlMsg::SetQuality(q));
+                    }
+                }
+            }
+            Action::OpenPanel(tab) => {
+                if self.panel.open && self.panel.tab == tab {
+                    self.panel.open = false;
+                } else {
+                    self.panel.open = true;
+                    self.panel.tab = tab;
+                    self.panel.focus = if tab == 1 { 1 } else { 0 };
+                }
             }
             Action::Disconnect => return true,
         }
@@ -411,6 +483,97 @@ impl App {
     /// Sends a key combination to the host: presses the keys in order, then
     /// releases them in reverse. Ctrl+Alt+Del goes through the host's secure
     /// path, since it can't be injected as plain keystrokes.
+    fn toggle_host(&mut self, bit: u32, msg: impl FnOnce(bool) -> ControlMsg) {
+        let mut g = self.live.lock().unwrap();
+        if !g.v3 {
+            g.notices.push("These controls need PJDesk 0.4 on both computers.".into());
+            return;
+        }
+        if !g.allowed(bit) {
+            g.notices.push("The host did not allow that for this session.".into());
+            return;
+        }
+        let on = if bit == pjdesk_proto::perms::BLOCK_INPUT {
+            g.block_host = !g.block_host;
+            g.block_host
+        } else if bit == pjdesk_proto::perms::PRIVACY {
+            g.privacy = !g.privacy;
+            g.privacy
+        } else if bit == pjdesk_proto::perms::AUDIO {
+            g.audio = !g.audio;
+            g.audio
+        } else {
+            true
+        };
+        drop(g);
+        let _ = self.control.send(msg(on));
+    }
+
+    fn send_clip_text(&mut self) {
+        let mut g = self.live.lock().unwrap();
+        if !g.v3 {
+            g.notices.push("Clipboard sync needs PJDesk 0.4 on both computers.".into());
+            return;
+        }
+        if !g.allowed(pjdesk_proto::perms::CLIPBOARD) {
+            g.notices.push("Clipboard sync was not allowed for this session.".into());
+            return;
+        }
+        drop(g);
+        let Some(text) = crate::clip::get_text() else { return };
+        if text.len() > pjdesk_proto::peer::MAX_CLIP_TEXT {
+            self.live.lock().unwrap().notices.push("That clipboard text is too long.".into());
+            return;
+        }
+        self.live.lock().unwrap().remember_clip(&text);
+        self.live.lock().unwrap().notices.push("Sent the clipboard.".into());
+        let byte_len = text.len() as u32;
+        let _ = self.control.send(ControlMsg::Clipboard(pjdesk_proto::peer::Clipboard {
+            kind: pjdesk_proto::peer::ClipKind::Text,
+            bytes: text.into_bytes(),
+            byte_len,
+        }));
+    }
+
+    fn apply_panel(&mut self, cmd: super::panel::PanelCmd) {
+        use super::controls::Cmd;
+        use super::panel::PanelCmd;
+        match cmd {
+            PanelCmd::SendFile(path) => {
+                let _ = self.cmds.send(Cmd::SendFile(std::path::PathBuf::from(path)));
+            }
+            PanelCmd::Accept(id) => {
+                let _ = self.cmds.send(Cmd::Accept(id));
+            }
+            PanelCmd::Pull(name) => {
+                let _ = self.cmds.send(Cmd::Pull(name));
+            }
+            PanelCmd::List => {
+                let _ = self.cmds.send(Cmd::ListRemote);
+            }
+            PanelCmd::Chat(text) => {
+                let mut g = self.live.lock().unwrap();
+                if !g.v3 {
+                    g.notices.push("Chat needs PJDesk 0.4 on both computers.".into());
+                } else if !g.allowed(pjdesk_proto::perms::CHAT) {
+                    g.notices.push("Chat was not allowed for this session.".into());
+                } else {
+                    g.chat.push((true, text.clone()));
+                    drop(g);
+                    let _ = self.control.send(ControlMsg::Chat { text });
+                }
+            }
+            PanelCmd::Tunnel { local, host, port } => {
+                let _ = self.cmds.send(Cmd::Tunnel { local, host, port });
+            }
+            PanelCmd::Monitor(index) => {
+                if self.live.lock().unwrap().v3 {
+                    let _ = self.control.send(ControlMsg::SelectMonitor { index });
+                }
+            }
+        }
+    }
+
     fn send_combo(&mut self, combo: Combo) {
         if combo == Combo::CtrlAltDel {
             let _ = self.control.send(ControlMsg::Special(SpecialCommand::CtrlAltDel));
@@ -454,6 +617,36 @@ impl App {
         let PhysicalKey::Code(code) = event.physical_key else { return };
         let down = event.state == ElementState::Pressed;
 
+        if self.panel.focus != 0 && down {
+            if code == KeyCode::Escape {
+                self.panel.focus = 0;
+                return;
+            }
+            if code == KeyCode::Backspace {
+                self.panel.backspace();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                return;
+            }
+            if code == KeyCode::Enter && self.panel.focus == 1 {
+                if let Some(cmd) = self.panel.submit_chat() {
+                    self.apply_panel(cmd);
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                return;
+            }
+            if let Some(text) = &event.text {
+                let text = text.to_string();
+                self.panel.type_text(&text);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                return;
+            }
+        }
         if down && code == KeyCode::Enter && self.modifiers.control_key() && self.modifiers.alt_key() {
             if let Some(window) = &self.window {
                 let fullscreen = window.fullscreen().is_none();
@@ -488,7 +681,12 @@ impl App {
         if let Some(window) = self.window.clone() {
             let win_w = window.inner_size().width as usize;
             let was_visible = self.toolbar.is_visible();
+            let over_panel = self.panel.covers(position.x, position.y, win_w, window.inner_size().height as usize);
             let over_bar = self.toolbar.on_pointer(position.x, position.y, win_w);
+            if over_panel {
+                window.request_redraw();
+                return;
+            }
             if self.toolbar.is_visible() || was_visible {
                 window.request_redraw();
             }
@@ -627,7 +825,14 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         let Some(window) = self.window.clone() else { return };
         match event {
-            UserEvent::Frame => window.request_redraw(),
+            UserEvent::Frame => {
+                if self.live.lock().unwrap().restart {
+                    self.restarting = true;
+                    _event_loop.exit();
+                    return;
+                }
+                window.request_redraw();
+            }
             UserEvent::Title(text) => {
                 if !self.closed {
                     window.set_title(&text);
@@ -659,6 +864,19 @@ impl ApplicationHandler<UserEvent> for App {
                 // Clicks on the toolbar (or its open menu) are handled locally.
                 if button == winit::event::MouseButton::Left {
                     let win_w = self.window.as_ref().map(|w| w.inner_size().width as usize).unwrap_or(0);
+                    let win_h = self.window.as_ref().map(|w| w.inner_size().height as usize).unwrap_or(0);
+                    if self.panel.covers(self.cursor_px.0, self.cursor_px.1, win_w, win_h) {
+                        if state == ElementState::Pressed {
+                            let snap = self.live.lock().unwrap().snapshot();
+                            if let Some(cmd) = self.panel.click(self.cursor_px.0, self.cursor_px.1, win_w, win_h, &snap) {
+                                self.apply_panel(cmd);
+                            }
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                        return;
+                    }
                     if self.toolbar.covers(self.cursor_px.0, self.cursor_px.1, win_w) {
                         if state == ElementState::Pressed {
                             if let Some(action) = self.toolbar.click(self.cursor_px.0, self.cursor_px.1, win_w) {
@@ -684,6 +902,14 @@ impl ApplicationHandler<UserEvent> for App {
                     winit::event::MouseButton::Other(_) => return,
                 };
                 self.send(InputEvent::MouseButton { button, down: state == ElementState::Pressed });
+            }
+            WindowEvent::DroppedFile(path) => {
+                let _ = self.cmds.send(super::controls::Cmd::SendFile(path));
+                self.panel.open = true;
+                self.panel.tab = 0;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.modifiers.control_key() {
