@@ -94,6 +94,17 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         })?;
     }
 
+    let loaded = crate::config::Config::load().ok();
+    let theme_name = loaded.as_ref().map(|c| c.settings.theme.clone()).unwrap_or_default();
+    let mut toolbar = toolbar::Toolbar::default();
+    let follow_system_theme = theme_name != "light" && theme_name != "dark";
+    if theme_name == "light" {
+        toolbar.set_light(true);
+    }
+    let places = loaded
+        .as_ref()
+        .and_then(|c| c.settings.peers.get(&host_id).map(|n| n.windows.clone()))
+        .unwrap_or_default();
     let mut app = App {
         title,
         window: None,
@@ -109,7 +120,7 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         cursor_px: (0.0, 0.0),
         wheel: (0.0, 0.0),
         closed: false,
-        toolbar: toolbar::Toolbar::default(),
+        toolbar,
         zoom: Zoom::Fit,
         pan: (0, 0),
         live,
@@ -122,12 +133,10 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         primary_display: std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
         toast: None,
         sent_watch: Vec::new(),
-        places: crate::config::Config::load()
-            .ok()
-            .and_then(|c| c.settings.peers.get(&host_id).map(|n| n.windows.clone()))
-            .unwrap_or_default(),
+        places,
         place_saved: Instant::now() - Duration::from_secs(5),
         placed_primary: false,
+        follow_system_theme,
     };
     if std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files") {
         app.panel.open = true;
@@ -293,8 +302,10 @@ struct App {
     sent_watch: Vec<u8>,
     places: Vec<crate::config::SavedWindow>,
     place_saved: Instant,
-    placed_primary: bool,
-}
+        placed_primary: bool,
+        /// Settings left the theme on "system", so the window follows the OS.
+        follow_system_theme: bool,
+    }
 
 struct ExtraPane {
     display: u8,
@@ -389,6 +400,8 @@ impl App {
         let display = self.primary_display;
         let cropped = if separate { self.tile_picture(display) } else { None };
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else { return };
+        let snap = self.live.lock().unwrap().snapshot();
+        self.toolbar.sync(screens_of(&snap.displays), snap.current_display, snap.view_mode);
 
         // On the first frame, size the window to this screen (the cropped tile
         // in separate mode, the whole picture otherwise).
@@ -396,7 +409,8 @@ impl App {
             let frame = if separate { cropped.as_ref() } else { self.current.as_ref() };
             if let Some(frame) = frame {
                 self.sized_to_remote = true;
-                Self::fit_remote(window, frame.width, frame.height);
+                let extra = self.toolbar.tab_height() as u32;
+                Self::fit_remote(window, frame.width, frame.height, extra);
             }
         }
 
@@ -408,13 +422,12 @@ impl App {
         let (win_w, win_h) = (size.width as usize, size.height as usize);
         let Ok(mut buffer) = surface.buffer_mut() else { return };
         let shown = if separate { cropped.as_ref() } else { self.current.as_ref() };
-        let layout = Self::paint_picture(&mut buffer, win_w, win_h, shown, self.zoom, self.pan);
+        let origin = self.toolbar.tab_height() as usize;
+        let layout = Self::paint_picture(&mut buffer, win_w, win_h, shown, self.zoom, self.pan, origin, self.toolbar.letterbox());
         self.layout = layout;
         if separate && cropped.is_none() {
-            toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, 48.0, "Waiting for this screen", 0xFF_9a_a3_b5);
+            toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, origin as f32 + 48.0, "Waiting for this screen", 0xFF_9a_a3_b5);
         }
-        let snap = self.live.lock().unwrap().snapshot();
-        self.toolbar.sync(screens_of(&snap.displays), snap.current_display, snap.view_mode);
         Self::paint_overlay(&self.toolbar, &self.toast, &mut buffer, win_w, win_h, display, separate, true);
         self.panel.draw(&mut buffer, win_w, win_h, &snap);
         if snap.restart {
@@ -515,9 +528,17 @@ impl App {
 
     /// The scale "fit to window" is using right now.
     fn fit_scale(&self) -> f32 {
-        let (Some(window), Some(frame)) = (&self.window, &self.current) else { return 1.0 };
+        let (Some(_window), Some(frame)) = (&self.window, &self.current) else { return 1.0 };
+        let (ww, wh, _) = self.content_extent();
+        (ww as f32 / frame.width.max(1) as f32).min(wh as f32 / frame.height.max(1) as f32)
+    }
+
+    /// Picture area below the tab strip: width, height, and the strip's height.
+    fn content_extent(&self) -> (i32, i32, i32) {
+        let Some(window) = &self.window else { return (1, 1, 0) };
         let size = window.inner_size();
-        (size.width as f32 / frame.width.max(1) as f32).min(size.height as f32 / frame.height.max(1) as f32)
+        let origin = self.toolbar.tab_height() as i32;
+        (size.width as i32, (size.height as i32 - origin).max(1), origin)
     }
 
     fn set_scale(&mut self, scale: f32) {
@@ -526,11 +547,10 @@ impl App {
         let old_zoom = self.zoom;
         let old_pan = self.pan;
         // Keep the spot under the window centre fixed as the scale changes.
-        if let (Some(window), Some((fw, fh))) =
+        if let (Some(_window), Some((fw, fh))) =
             (self.window.clone(), self.current.as_ref().map(|f| (f.width, f.height)))
         {
-            let size = window.inner_size();
-            let (ww, wh) = (size.width as i32, size.height as i32);
+            let (ww, wh, _) = self.content_extent();
             let old_layout = match old_zoom {
                 Zoom::Fit => render::fit(fw, fh, ww as usize, wh as usize),
                 Zoom::Scale(_) => render::placement(fw, fh, ww as usize, wh as usize, old, old_pan),
@@ -799,8 +819,8 @@ impl App {
         // When zoomed in past the window, pan to keep the pointer in sight: a
         // dead-zone near each edge nudges the picture along.
         if let (Zoom::Scale(_), Some(window)) = (self.zoom, self.window.clone()) {
-            let size = window.inner_size();
-            let (ww, wh) = (size.width as i32, size.height as i32);
+            let _ = window;
+            let (ww, wh, origin) = self.content_extent();
             let (iw, ih) = (self.layout.width as i32, self.layout.height as i32);
             let mut moved = false;
             if iw > ww {
@@ -817,7 +837,7 @@ impl App {
             }
             if ih > wh {
                 let margin = wh / 6;
-                let cy = position.y as i32;
+                let cy = position.y as i32 - origin;
                 if cy < margin {
                     self.pan.1 += margin - cy;
                     moved = true;
@@ -925,18 +945,29 @@ impl App {
         super::render::crop_tile(frame, aw, ah, tile.x, tile.y, tile.width, tile.height)
     }
 
-    fn paint_picture(buffer: &mut [u32], win_w: usize, win_h: usize, frame: Option<&super::render::RgbFrame>, zoom: Zoom, pan: (i32, i32)) -> Layout {
+    fn paint_picture(
+        buffer: &mut [u32],
+        win_w: usize,
+        win_h: usize,
+        frame: Option<&super::render::RgbFrame>,
+        zoom: Zoom,
+        pan: (i32, i32),
+        origin_y: usize,
+        background: u32,
+    ) -> Layout {
+        let content_h = win_h.saturating_sub(origin_y).max(1);
         match frame {
             Some(frame) => {
-                let layout = match zoom {
-                    Zoom::Fit => render::fit(frame.width, frame.height, win_w, win_h),
-                    Zoom::Scale(scale) => render::placement(frame.width, frame.height, win_w, win_h, scale, pan),
+                let mut layout = match zoom {
+                    Zoom::Fit => render::fit(frame.width, frame.height, win_w, content_h),
+                    Zoom::Scale(scale) => render::placement(frame.width, frame.height, win_w, content_h, scale, pan),
                 };
-                render::draw(frame, buffer, win_w, win_h, layout);
+                layout.y += origin_y as i32;
+                render::draw_on(frame, buffer, win_w, win_h, layout, background);
                 layout
             }
             None => {
-                buffer.fill(0x00_1e_1e_22);
+                buffer.fill(background);
                 Layout::default()
             }
         }
@@ -954,6 +985,7 @@ impl App {
     ) {
         if full_toolbar {
             toolbar.draw(buffer, win_w, win_h);
+            toolbar.draw_tabs(buffer, win_w, win_h);
         }
         if separate {
             toolbar::draw_compact(buffer, win_w, win_h, &format!("Screen {}", display + 1));
@@ -970,7 +1002,9 @@ impl App {
             let g = self.live.lock().unwrap();
             screens_of(&g.displays).into_iter().find(|s| s.index == display)?
         };
-        pjdesk_proto::layout::window_to_pointer(screen, position.x as f32, position.y as f32, win_w as f32, win_h as f32)
+        let origin = self.toolbar.tab_height() as f32;
+        let content_h = (win_h as f32 - origin).max(1.0);
+        pjdesk_proto::layout::window_to_pointer(screen, position.x as f32, position.y as f32 - origin, win_w as f32, content_h)
             .map(|(_, _, nx, ny)| (nx, ny))
     }
 
@@ -1003,7 +1037,7 @@ impl App {
         sized
     }
 
-    fn fit_remote(window: &Window, frame_w: usize, frame_h: usize) {
+    fn fit_remote(window: &Window, frame_w: usize, frame_h: usize, extra_h: u32) {
         if frame_w == 0 || frame_h == 0 {
             return;
         }
@@ -1013,7 +1047,7 @@ impl App {
             .min(1.0);
         let _ = window.request_inner_size(PhysicalSize::new(
             ((frame_w as f64 * scale) as u32).max(320),
-            ((frame_h as f64 * scale) as u32).max(200),
+            ((frame_h as f64 * scale) as u32).max(200) + extra_h,
         ));
     }
 
@@ -1198,11 +1232,12 @@ impl App {
         if !self.extra[i].sized {
             if let Some(frame) = picture.as_ref() {
                 let window = self.extra[i].window.clone();
-                Self::fit_remote(&window, frame.width, frame.height);
+                Self::fit_remote(&window, frame.width, frame.height, 0);
                 self.extra[i].sized = true;
             }
         }
         let toast = self.toast.clone();
+        let background = self.toolbar.letterbox();
         let pane = &mut self.extra[i];
         let size = pane.window.inner_size();
         let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
@@ -1212,7 +1247,7 @@ impl App {
         let (win_w, win_h) = (size.width as usize, size.height as usize);
         let layout = {
             let Ok(mut buffer) = pane.surface.buffer_mut() else { return };
-            let layout = Self::paint_picture(&mut buffer, win_w, win_h, picture.as_ref(), Zoom::Fit, (0, 0));
+            let layout = Self::paint_picture(&mut buffer, win_w, win_h, picture.as_ref(), Zoom::Fit, (0, 0), 0, background);
             if picture.is_none() {
                 toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, 48.0, "Waiting for this screen", 0xFF_9a_a3_b5);
             }
@@ -1363,6 +1398,9 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         }
+        if self.follow_system_theme {
+            self.toolbar.set_light(matches!(window.theme(), Some(winit::window::Theme::Light)));
+        }
         window.request_redraw();
         self.window = Some(window);
     }
@@ -1430,6 +1468,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
             // Don't leave keys "held" on the host when we lose focus.
             WindowEvent::Focused(false) => self.release_all(),
+            WindowEvent::ThemeChanged(theme) => {
+                if self.follow_system_theme {
+                    self.toolbar.set_light(matches!(theme, winit::window::Theme::Light));
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.on_key(event_loop, event, self.window.clone()),
             WindowEvent::CursorMoved { position, .. } => self.on_cursor(position),
