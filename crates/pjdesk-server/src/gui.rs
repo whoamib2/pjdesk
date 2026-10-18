@@ -98,6 +98,13 @@ struct App {
     /// Screenshots inject the service state. The real window asks Windows.
     svc_override: Option<(bool, bool)>,
     preview_locked: bool,
+    /// Headless shot of the computer list.
+    preview_devices: bool,
+    /// Latest client release from pjdesk.com, fetched off this thread.
+    latest_release: Option<String>,
+    release_at: Option<Instant>,
+    release_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    check_release: bool,
 }
 
 /// How a cloud job (network calls on a worker thread) ended.
@@ -187,6 +194,11 @@ impl App {
             opened_at: Instant::now(),
             svc_override: None,
             preview_locked: false,
+            preview_devices: false,
+            latest_release: None,
+            release_at: None,
+            release_rx: None,
+            check_release: spawn_probe,
         };
         if let crate::self_update::Loaded::Present(update) = crate::self_update::Settings::read(&app.data_dir) {
             app.update_start = update.window_start;
@@ -272,6 +284,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(if self.waiting_for_service() { Duration::from_millis(50) } else { Duration::from_secs(1) });
         self.poll_cloud_job();
+        self.poll_release();
 
         // System tray: Show/Quit, and hide-to-tray when the window is closed.
         let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
@@ -383,6 +396,12 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                 }
 
+                if self.preview_devices {
+                    ui.label(RichText::new(format!("This server  v{}", env!("CARGO_PKG_VERSION"))).strong().size(18.0));
+                    ui.add_space(8.0);
+                    self.devices_card(ui);
+                    return;
+                }
                 self.service_card(ui);
                 ui.add_space(8.0);
                 self.updates_card(ui);
@@ -520,8 +539,11 @@ impl App {
                 ui_widgets::dot(ui, c);
                 ui.label(t);
             });
-            let version = self.live.as_ref().map(|s| s.version.as_str()).unwrap_or(env!("CARGO_PKG_VERSION"));
-            ui.label(RichText::new(format!("Version {version}")).color(p(ui).muted).size(12.0));
+            let version = self.live.as_ref().map(|s| s.version.clone()).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+            ui.label(RichText::new(format!("This server  v{version}")).strong().size(18.0).color(p(ui).text));
+            if let Some(peer) = self.peer_version_line() {
+                ui.label(RichText::new(peer).color(p(ui).muted));
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if !installed {
@@ -850,6 +872,9 @@ impl App {
                         ui.label(format!("Standby. Primary: {who} (generation {}).", s.epoch));
                     }
                 });
+                if let Some(peer) = self.peer_version_line() {
+                    ui.label(RichText::new(peer).color(p(ui).muted));
+                }
                 if !s.notice.is_empty() {
                     ui.colored_label(p(ui).warn, s.notice.clone());
                 }
@@ -1322,38 +1347,86 @@ impl App {
     }
 
     fn devices_card(&mut self, ui: &mut egui::Ui) {
-        if self.access != Access::Readable {
+        let locked = self.access != Access::Readable;
+        if locked && self.live.as_ref().map(|s| s.devices.is_empty()).unwrap_or(true) {
             card(ui, |ui| {
                 heading(ui, "REGISTERED COMPUTERS");
                 self.locked_line(ui);
             });
             return;
         }
+        let rows = self.device_rows();
         let mut remove: Option<String> = None;
         let mut update: Option<String> = None;
         let mut update_all = false;
+        let online = rows.iter().filter(|r| r.online).count();
         card(ui, |ui| {
-            let online = self.online.len();
             ui.horizontal(|ui| {
-                heading(ui, &format!("REGISTERED COMPUTERS ({}, {online} online)", self.devices.len()));
+                heading(ui, &format!("REGISTERED COMPUTERS ({}, {online} online)", rows.len()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if online > 0
+                    if !locked
+                        && online > 0
                         && ui.small_button("Update all online").on_hover_text("Tell every online computer to update now").clicked()
                     {
                         update_all = true;
                     }
                 });
             });
-            if self.devices.is_empty() {
+            if locked {
+                ui.label(RichText::new("From the running service. Restart as administrator to change this list.").color(p(ui).muted).size(12.0));
+            }
+            if rows.is_empty() {
                 ui.label(RichText::new("No computers have registered yet.").color(p(ui).muted));
             }
-            egui::ScrollArea::vertical().max_height(200.0).id_salt("devices").show(ui, |ui| {
-                for d in &self.devices {
-                    let live = self.online.get(&d.id);
+            ui.horizontal(|ui| {
+                ui.add_sized([130.0, 16.0], egui::Label::new(RichText::new("ID").size(11.0).color(p(ui).muted).strong()));
+                ui.add_sized([140.0, 16.0], egui::Label::new(RichText::new("Name").size(11.0).color(p(ui).muted).strong()));
+                ui.add_sized([150.0, 16.0], egui::Label::new(RichText::new("Version").size(11.0).color(p(ui).muted).strong()));
+                ui.label(RichText::new("Status").size(11.0).color(p(ui).muted).strong());
+            });
+            egui::ScrollArea::vertical().max_height(220.0).id_salt("devices").show(ui, |ui| {
+                for d in &rows {
+                    let behind = update_available(self.latest_release.as_deref(), &d.version);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(pjdesk_proto::format_id(&d.id)).monospace().color(p(ui).text));
-                        ui.label(RichText::new(&d.hostname).color(p(ui).muted));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_sized(
+                            [130.0, 18.0],
+                            egui::Label::new(RichText::new(pjdesk_proto::format_id(&d.id)).monospace().color(p(ui).text)),
+                        );
+                        ui.add_sized([140.0, 18.0], egui::Label::new(RichText::new(&d.hostname).color(p(ui).text)));
+                        ui.add_sized(
+                            [150.0, 18.0],
+                            egui::Label::new(RichText::new(version_text(&d.version)).color(p(ui).text)),
+                        );
+                        if behind {
+                            ui.label(
+                                RichText::new("update available")
+                                    .size(11.0)
+                                    .color(p(ui).warn)
+                                    .background_color(p(ui).elev),
+                            );
+                        }
+                        let seen = if d.last_seen == 0 {
+                            String::new()
+                        } else if d.first_seen > 0 {
+                            format!("Last seen {} ({})\nFirst registered {}", format_local(d.last_seen), ago(d.last_seen), format_local(d.first_seen))
+                        } else {
+                            format!("Last seen {}", format_local(d.last_seen))
+                        };
+                        if d.online {
+                            ui.horizontal(|ui| {
+                                ui_widgets::dot(ui, p(ui).ok);
+                                ui.label(RichText::new("online").color(p(ui).ok).size(11.0));
+                            })
+                            .response
+                            .on_hover_text(seen);
+                        } else if d.last_seen > 0 {
+                            ui.label(RichText::new(format!("last seen {}", format_local(d.last_seen))).color(p(ui).muted).size(11.0))
+                                .on_hover_text(seen);
+                        }
+                        if !locked {
+                            if d.online && ui.small_button("Update").on_hover_text("Update this computer now").clicked() {
+                                update = Some(d.id.clone());
+                            }
                             if ui
                                 .small_button("Forget")
                                 .on_hover_text("Remove from this list. If this computer connects again, it comes back with the same ID.")
@@ -1361,33 +1434,7 @@ impl App {
                             {
                                 remove = Some(d.id.clone());
                             }
-                            if live.is_some() && ui.small_button("Update").on_hover_text("Update this computer now").clicked() {
-                                update = Some(d.id.clone());
-                            }
-                            let version = live.cloned().unwrap_or_else(|| d.version.clone());
-                            let vtext = if version.is_empty() { String::new() } else { format!(" · v{version}") };
-                            let details = format!(
-                                "Last seen {} ({})\nFirst registered {}",
-                                format_local(d.last_seen),
-                                ago(d.last_seen),
-                                format_local(d.first_seen)
-                            );
-                            if live.is_some() {
-                                ui.horizontal(|ui| {
-                                    ui_widgets::dot(ui, p(ui).ok);
-                                    ui.label(RichText::new(format!("online now{vtext}")).color(p(ui).ok).size(11.0));
-                                })
-                                    .response
-                                    .on_hover_text(details);
-                            } else {
-                                ui.label(
-                                    RichText::new(format!("last seen {}{vtext}", format_local(d.last_seen)))
-                                        .color(p(ui).muted)
-                                        .size(11.0),
-                                )
-                                .on_hover_text(details);
-                            }
-                        });
+                        }
                     });
                 }
             });
@@ -1401,6 +1448,83 @@ impl App {
         if let Some(id) = update {
             self.request_update(&id);
         }
+    }
+
+    fn device_rows(&self) -> Vec<ShownDevice> {
+        if self.access != Access::Readable {
+            return self
+                .live
+                .as_ref()
+                .map(|s| {
+                    s.devices
+                        .iter()
+                        .map(|d| ShownDevice {
+                            id: d.id.clone(),
+                            hostname: d.hostname.clone(),
+                            version: d.version.clone(),
+                            online: d.online,
+                            last_seen: 0,
+                            first_seen: 0,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        self.devices
+            .iter()
+            .map(|d| {
+                let live = self.online.get(&d.id);
+                ShownDevice {
+                    id: d.id.clone(),
+                    hostname: d.hostname.clone(),
+                    version: live.cloned().unwrap_or_else(|| d.version.clone()),
+                    online: live.is_some(),
+                    last_seen: d.last_seen,
+                    first_seen: d.first_seen,
+                }
+            })
+            .collect()
+    }
+
+    fn peer_version_line(&self) -> Option<String> {
+        let (name, version, role) = if let Some(s) = &self.cloud {
+            (s.peer_name.clone(), s.peer_version.clone(), s.peer_role.clone())
+        } else if let Some(s) = &self.live {
+            (s.peer_name.clone(), s.peer_version.clone(), s.peer_role.clone())
+        } else {
+            return None;
+        };
+        if version.is_empty() {
+            return None;
+        }
+        let who = if name.is_empty() { "Other server".to_string() } else { name };
+        let role = if role.is_empty() { String::new() } else { format!(" ({role})") };
+        Some(format!("{who}{role}  v{version}"))
+    }
+
+    fn poll_release(&mut self) {
+        if let Some(rx) = &self.release_rx {
+            if let Ok(v) = rx.try_recv() {
+                self.release_rx = None;
+                if v.is_some() {
+                    self.latest_release = v;
+                }
+                self.release_at = Some(Instant::now());
+            }
+        }
+        if !self.check_release || self.release_rx.is_some() {
+            return;
+        }
+        let due = self.release_at.map(|t| t.elapsed() > Duration::from_secs(600)).unwrap_or(true);
+        if !due {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.release_rx = Some(rx);
+        self.release_at = Some(Instant::now());
+        std::thread::spawn(move || {
+            let _ = tx.send(pjdesk_proto::update::site_version().ok());
+        });
     }
 
     /// Forgets a device. Goes through the running server (which keeps the
@@ -1517,6 +1641,36 @@ fn open_url(url: &str) {
 /// A show/hide toggle for a password field. The label is a word, not an icon.
 fn reveal_toggle(ui: &mut egui::Ui, shown: &mut bool) {
     ui_widgets::reveal(ui, shown);
+}
+
+struct ShownDevice {
+    id: String,
+    hostname: String,
+    version: String,
+    online: bool,
+    last_seen: u64,
+    first_seen: u64,
+}
+
+fn version_text(version: &str) -> String {
+    if version.trim().is_empty() {
+        "unknown (<0.5.2)".into()
+    } else {
+        version.to_string()
+    }
+}
+
+/// Empty reported versions are behind whenever a release is known. `is_newer`
+/// is false for a version it cannot parse, so an old client that sent nothing
+/// still gets the badge.
+fn update_available(latest: Option<&str>, reported: &str) -> bool {
+    let Some(latest) = latest.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if reported.trim().is_empty() {
+        return true;
+    }
+    pjdesk_proto::update::is_newer(reported, latest)
 }
 
 fn heading(ui: &mut egui::Ui, text: &str) {

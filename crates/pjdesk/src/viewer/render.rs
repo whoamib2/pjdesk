@@ -16,8 +16,6 @@ pub struct Layout {
     pub height: usize,
 }
 
-const BACKGROUND: u32 = 0x00_1e_1e_22;
-
 /// A decoded remote picture in 0RGB pixels.
 pub struct RgbFrame {
     pub width: usize,
@@ -58,11 +56,35 @@ pub fn placement(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize, scale: 
     Layout { x, y, width, height }
 }
 
+/// Copies one atlas tile out of a decoded frame.
+///
+/// `atlas_w`/`atlas_h` are the capture size from the host. The decoded frame
+/// may be smaller, so the tile is scaled by the same factor as the picture.
+pub fn crop_tile(frame: &RgbFrame, atlas_w: u16, atlas_h: u16, tile_x: u16, tile_y: u16, tile_w: u16, tile_h: u16) -> Option<RgbFrame> {
+    if atlas_w == 0 || atlas_h == 0 || frame.width == 0 || frame.height == 0 || tile_w == 0 || tile_h == 0 {
+        return None;
+    }
+    let sx = frame.width as f32 / atlas_w as f32;
+    let sy = frame.height as f32 / atlas_h as f32;
+    let x0 = ((tile_x as f32 * sx).round() as isize).clamp(0, frame.width as isize - 1) as usize;
+    let y0 = ((tile_y as f32 * sy).round() as isize).clamp(0, frame.height as isize - 1) as usize;
+    let x1 = ((tile_x as f32 * sx + tile_w as f32 * sx).round() as isize).clamp(x0 as isize + 1, frame.width as isize) as usize;
+    let y1 = ((tile_y as f32 * sy + tile_h as f32 * sy).round() as isize).clamp(y0 as isize + 1, frame.height as isize) as usize;
+    let width = x1 - x0;
+    let height = y1 - y0;
+    let mut pixels = Vec::with_capacity(width * height);
+    for row in y0..y1 {
+        let start = row * frame.width + x0;
+        pixels.extend_from_slice(&frame.pixels[start..start + width]);
+    }
+    Some(RgbFrame { width, height, pixels })
+}
+
 /// Renders `frame` into the `dst_w`×`dst_h` buffer at `layout`, cropping to the
-/// window and filling everything outside the picture with the background.
-pub fn draw(frame: &RgbFrame, dst: &mut [u32], dst_w: usize, dst_h: usize, layout: Layout) {
+/// window and filling everything outside the picture with `background`.
+pub fn draw_on(frame: &RgbFrame, dst: &mut [u32], dst_w: usize, dst_h: usize, layout: Layout, background: u32) {
     if frame.width == 0 || frame.height == 0 || layout.width == 0 || layout.height == 0 {
-        dst[..dst_w * dst_h].fill(BACKGROUND);
+        dst[..dst_w * dst_h].fill(background);
         return;
     }
     // Visible slice of the picture, in window pixels.
@@ -74,10 +96,10 @@ pub fn draw(frame: &RgbFrame, dst: &mut [u32], dst_w: usize, dst_h: usize, layou
     // Background: whole rows above/below the picture, and the side margins.
     for (row, line) in dst.chunks_exact_mut(dst_w).enumerate().take(dst_h) {
         if row < vy0 || row >= vy1 {
-            line.fill(BACKGROUND);
+            line.fill(background);
         } else {
-            line[..vx0.min(dst_w)].fill(BACKGROUND);
-            line[vx1.min(dst_w)..].fill(BACKGROUND);
+            line[..vx0.min(dst_w)].fill(background);
+            line[vx1.min(dst_w)..].fill(background);
         }
     }
     if vx1 <= vx0 || vy1 <= vy0 {
@@ -145,6 +167,8 @@ fn source_at(i: i32, dst_len: usize, src_len: usize) -> (usize, u32) {
 mod tests {
     use super::*;
 
+    const BACKGROUND: u32 = 0x00_1e_1e_22;
+
     #[test]
     fn fit_keeps_aspect_ratio() {
         assert_eq!(fit(1920, 1080, 1920, 1080), Layout { x: 0, y: 0, width: 1920, height: 1080 });
@@ -169,7 +193,7 @@ mod tests {
         let mut dst = vec![0u32; 8 * 8];
         let layout = fit(4, 2, 8, 8);
         assert_eq!(layout, Layout { x: 0, y: 2, width: 8, height: 4 });
-        draw(&frame, &mut dst, 8, 8, layout);
+        draw_on(&frame, &mut dst, 8, 8, layout, BACKGROUND);
         assert_eq!(dst[0], BACKGROUND);
         assert_eq!(dst[3 * 8 + 4], 0xFF0000);
         assert_eq!(dst[7 * 8], BACKGROUND);
@@ -181,7 +205,7 @@ mod tests {
         // left by 4px: only the right half of the (8x8) scaled picture shows.
         let frame = RgbFrame { width: 4, height: 4, pixels: vec![0x00FF00; 16] };
         let mut dst = vec![0u32; 8 * 8];
-        draw(&frame, &mut dst, 8, 8, Layout { x: -4, y: 0, width: 8, height: 8 });
+        draw_on(&frame, &mut dst, 8, 8, Layout { x: -4, y: 0, width: 8, height: 8 }, BACKGROUND);
         assert_eq!(dst[0], 0x00FF00); // left half of the window is inside the picture
         assert_eq!(dst[3], 0x00FF00);
         assert_eq!(dst[7], BACKGROUND); // right half is past the left-shifted picture

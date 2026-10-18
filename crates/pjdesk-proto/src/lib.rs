@@ -19,6 +19,7 @@ pub mod discover;
 pub mod filesafe;
 pub mod framing;
 pub mod handoff;
+pub mod layout;
 pub mod peer;
 pub mod perms;
 pub mod quality;

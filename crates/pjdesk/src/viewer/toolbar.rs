@@ -29,6 +29,16 @@ pub enum Action {
     /// Open the side panel on this tab: 0 files, 1 chat, 2 more.
     OpenPanel(u8),
     Disconnect,
+    /// Switch to one remote display. The number is the host's display index.
+    SelectDisplay(u8),
+    /// One display at a time.
+    ViewSingle,
+    /// Every display in one picture.
+    ViewAll,
+    /// One local window per remote display.
+    ViewSeparate,
+    /// Close the screen window this bar belongs to.
+    CloseScreen,
 }
 
 /// Key combinations the "Send keys" menu can send to the host.
@@ -48,8 +58,13 @@ pub enum Combo {
 
 const TOP: f32 = 10.0;
 const BAR_H: f32 = 40.0;
+/// Persistent screen tabs. Hidden when the remote has a single display.
+pub const TAB_H: f32 = 40.0;
 const ITEM_H: f32 = 30.0;
 const PAD: f32 = 12.0;
+const MAP_W: f32 = 280.0;
+const MAP_H: f32 = 148.0;
+const MODE_H: f32 = 28.0;
 const FONT_PX: f32 = 14.0;
 const RADIUS: f32 = 12.0;
 
@@ -62,12 +77,14 @@ enum Mark {
     Chat,
     End,
     Collapse,
+    Screens,
 }
 
 enum Kind {
     Act(Action),
     Menu(usize),
     Collapse,
+    Screens,
 }
 
 struct Button {
@@ -159,13 +176,21 @@ pub struct Toolbar {
     hovered_item: Option<usize>,
     /// True while input forwarding is suppressed ("view only" from this side).
     pub block_input: bool,
+    displays: Vec<pjdesk_proto::layout::Screen>,
+    current: u8,
+    view_mode: u8,
+    screens_open: bool,
+    /// Light client theme. The tab strip follows this; the floating bar stays dark glass.
+    light: bool,
+    hovered_slot: Option<usize>,
 }
 
 impl Default for Toolbar {
     fn default() -> Self {
         let menus = vec![owned(ZOOM_ITEMS), owned(KEY_ITEMS), owned(CONTROL_ITEMS)];
-        let spec: [(&'static str, &'static str, Kind, Mark); 7] = [
+        let spec: [(&'static str, &'static str, Kind, Mark); 8] = [
             ("View", "Zoom", Kind::Menu(0), Mark::View),
+            ("Screens", "Switch display", Kind::Screens, Mark::Screens),
             ("Keys", "Send special keys", Kind::Menu(1), Mark::Keys),
             ("Session", "Audio, privacy, record, restart", Kind::Menu(2), Mark::Session),
             ("Files", "Send and receive files", Kind::Act(Action::OpenPanel(0)), Mark::Files),
@@ -192,8 +217,81 @@ impl Default for Toolbar {
             open: None,
             hovered_item: None,
             block_input: false,
+            displays: Vec::new(),
+            current: 0,
+            view_mode: 0,
+            screens_open: false,
+            light: false,
+            hovered_slot: None,
         }
     }
+}
+
+struct Chrome {
+    panel: u32,
+    card: u32,
+    elev: u32,
+    line: u32,
+    text: u32,
+    muted: u32,
+    accent: u32,
+}
+
+fn chrome(light: bool) -> Chrome {
+    if light {
+        Chrome {
+            panel: 0xFF_f3_f5_f8,
+            card: 0xFF_ff_ff_ff,
+            elev: 0xFF_e8_ec_f2,
+            line: 0xFF_d5_db_e3,
+            text: 0xFF_1c_23_30,
+            muted: 0xFF_5c_67_78,
+            accent: 0xFF_2f_6f_ed,
+        }
+    } else {
+        Chrome {
+            panel: 0xFF_10_13_18,
+            card: 0xFF_18_1c_24,
+            elev: 0xFF_22_28_33,
+            line: 0xFF_2e_36_44,
+            text: 0xFF_e9_ed_f3,
+            muted: 0xFF_9a_a3_b5,
+            accent: 0xFF_4d_9b_ff,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotKind {
+    Display(u8),
+    All,
+    Separate,
+}
+
+struct Slot {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    kind: SlotKind,
+    label: String,
+    tip: String,
+    active: bool,
+}
+
+fn tooltip_rect_of(slot: &Slot) -> Option<(f32, f32, f32, f32)> {
+    if slot.tip.is_empty() {
+        return None;
+    }
+    let tw = text_width(&slot.tip) + 16.0;
+    Some((slot.x, TAB_H + 6.0, tw, 22.0))
+}
+
+fn draw_windows_icon(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, color: u32, hole: u32) {
+    fill_rect(buf, w, h, x + 4.0, y, 10.0, 8.0, color);
+    fill_rect(buf, w, h, x + 5.0, y + 1.0, 8.0, 6.0, hole);
+    fill_rect(buf, w, h, x, y + 5.0, 10.0, 8.0, color);
+    fill_rect(buf, w, h, x + 1.0, y + 6.0, 8.0, 6.0, hole);
 }
 
 fn owned(items: &[(&str, Action)]) -> Menu {
@@ -203,10 +301,164 @@ fn owned(items: &[(&str, Action)]) -> Menu {
 }
 
 impl Toolbar {
+    /// The displays the host last published, which one is current, and the view mode.
+    pub fn sync(&mut self, displays: Vec<pjdesk_proto::layout::Screen>, current: u8, view_mode: u8) {
+        self.displays = displays;
+        self.current = current;
+        self.view_mode = view_mode;
+    }
+
+    pub fn set_light(&mut self, light: bool) {
+        self.light = light;
+    }
+
+    pub fn letterbox(&self) -> u32 {
+        chrome(self.light).panel
+    }
+
+    /// Height reserved at the top when the remote has more than one display.
+    pub fn tab_height(&self) -> f32 {
+        if self.shows_tabs() { TAB_H } else { 0.0 }
+    }
+
+    fn shows_tabs(&self) -> bool {
+        self.displays.len() >= 2
+    }
+
     fn bar_rect(&self, win_w: usize) -> (f32, f32, f32, f32) {
         let w = if self.collapsed { self.collapsed_w } else { self.width };
         let x = ((win_w as f32 - w) / 2.0).max(8.0);
-        (x, TOP, w, BAR_H)
+        // Leave room under the tabs for a resolution tooltip.
+        let y = if self.shows_tabs() { TAB_H + 36.0 } else { TOP };
+        (x, y, w, BAR_H)
+    }
+
+    /// One tab per display, then All screens, then the separate-windows button.
+    fn tab_slots(&self, win_w: usize) -> Vec<Slot> {
+        if !self.shows_tabs() || win_w < 120 {
+            return Vec::new();
+        }
+        let y = 6.0;
+        let h = 28.0;
+        let right = 28.0;
+        let limit = win_w as f32 - right - 16.0;
+        let mut order: Vec<usize> = (0..self.displays.len()).collect();
+        order.sort_by_key(|&i| self.displays[i].index);
+        let mut slots = Vec::new();
+        let mut x = 8.0;
+        for i in order {
+            let screen = &self.displays[i];
+            let label = format!("Screen {}", screen.index + 1);
+            let w = (text_width(&label) + 28.0).max(88.0);
+            if x + w > limit {
+                break;
+            }
+            let tip = if screen.width > 0 && screen.height > 0 {
+                format!("{} × {}", screen.width, screen.height)
+            } else {
+                String::new()
+            };
+            slots.push(Slot {
+                x,
+                y,
+                w,
+                h,
+                kind: SlotKind::Display(screen.index),
+                label,
+                tip,
+                active: self.view_mode == pjdesk_proto::peer::VIEW_SINGLE && screen.index == self.current,
+            });
+            x += w + 4.0;
+        }
+        let label = "All screens".to_string();
+        let w = text_width(&label) + 28.0;
+        if x + w <= limit {
+            slots.push(Slot {
+                x,
+                y,
+                w,
+                h,
+                kind: SlotKind::All,
+                label,
+                tip: "Every display in one picture".into(),
+                active: self.view_mode == pjdesk_proto::peer::VIEW_ALL,
+            });
+        }
+        slots.push(Slot {
+            x: win_w as f32 - right - 8.0,
+            y,
+            w: right,
+            h,
+            kind: SlotKind::Separate,
+            label: String::new(),
+            tip: "Separate windows".into(),
+            active: self.view_mode == pjdesk_proto::peer::VIEW_SEPARATE,
+        });
+        slots
+    }
+
+    fn point_in(px: f64, py: f64, s: &Slot) -> bool {
+        px >= s.x as f64 && py >= s.y as f64 && px <= (s.x + s.w) as f64 && py <= (s.y + s.h) as f64
+    }
+
+    fn slot_at(&self, px: f64, py: f64, win_w: usize) -> Option<usize> {
+        let slots = self.tab_slots(win_w);
+        if let Some(i) = self.hovered_slot {
+            if let Some(tip) = tooltip_rect_of(slots.get(i)?) {
+                if px >= tip.0 as f64 && py >= tip.1 as f64 && px <= (tip.0 + tip.2) as f64 && py <= (tip.1 + tip.3) as f64 {
+                    return Some(i);
+                }
+            }
+        }
+        slots.iter().position(|s| Self::point_in(px, py, s))
+    }
+
+    fn tab_action(&self, px: f64, py: f64, win_w: usize) -> Option<Action> {
+        let slots = self.tab_slots(win_w);
+        let s = slots.iter().find(|s| Self::point_in(px, py, s))?;
+        Some(match s.kind {
+            SlotKind::Display(index) => Action::SelectDisplay(index),
+            SlotKind::All => Action::ViewAll,
+            SlotKind::Separate => Action::ViewSeparate,
+        })
+    }
+
+    pub fn draw_tabs(&self, buf: &mut [u32], win_w: usize, win_h: usize) {
+        let slots = self.tab_slots(win_w);
+        if slots.is_empty() || win_h < TAB_H as usize {
+            return;
+        }
+        let c = chrome(self.light);
+        fill_rect(buf, win_w, win_h, 0.0, 0.0, win_w as f32, TAB_H, c.panel);
+        fill_rect(buf, win_w, win_h, 0.0, TAB_H - 1.0, win_w as f32, 1.0, c.line);
+        for (i, slot) in slots.iter().enumerate() {
+            let hover = self.hovered_slot == Some(i);
+            let fill = if slot.active { Some(c.card) } else if hover { Some(c.elev) } else { None };
+            if let Some(color) = fill {
+                fill_round(buf, win_w, win_h, slot.x, slot.y, slot.w, slot.h, 8.0, color);
+            }
+            if slot.active {
+                fill_rect(buf, win_w, win_h, slot.x + 12.0, slot.y + slot.h - 2.0, slot.w - 24.0, 2.0, c.accent);
+            }
+            let color = if slot.active { c.text } else if hover { c.text } else { c.muted };
+            if slot.kind == SlotKind::Separate {
+                let hole = fill.unwrap_or(c.panel);
+                draw_windows_icon(buf, win_w, win_h, slot.x + (slot.w - 14.0) / 2.0, slot.y + 7.0, color, hole);
+            } else {
+                let tw = text_width(&slot.label);
+                draw_text(buf, win_w, win_h, slot.x + (slot.w - tw) / 2.0, slot.y + 19.0, &slot.label, color);
+            }
+        }
+        if let Some(i) = self.hovered_slot {
+            if let Some(slot) = slots.get(i) {
+                if let Some((x, y, tw, th)) = tooltip_rect_of(slot) {
+                    let x = x.min((win_w as f32 - tw - 8.0).max(8.0));
+                    fill_round(buf, win_w, win_h, x, y, tw, th, 6.0, c.card);
+                    fill_rect(buf, win_w, win_h, x, y, tw, 1.0, c.line);
+                    draw_text(buf, win_w, win_h, x + 8.0, y + 15.0, &slot.tip, c.text);
+                }
+            }
+        }
     }
 
     pub fn is_visible(&self) -> bool {
@@ -231,6 +483,44 @@ impl Toolbar {
         let left = bx + self.buttons[bi].x;
         let height = menu.items.len() as f32 * ITEM_H + 8.0;
         Some((left, by + bh + 4.0, menu.width, height))
+    }
+
+    fn screens_popup_rect(&self, win_w: usize) -> Option<(f32, f32, f32, f32)> {
+        if self.collapsed || !self.visible || !self.screens_open {
+            return None;
+        }
+        let bi = self.buttons.iter().position(|b| matches!(b.kind, Kind::Screens))?;
+        let (bx, by, _, bh) = self.bar_rect(win_w);
+        let left = bx + self.buttons[bi].x;
+        let height = 8.0 + MAP_H + 8.0 + MODE_H * 3.0 + 8.0;
+        Some((left, by + bh + 4.0, MAP_W, height))
+    }
+
+    /// `Some` when the pointer is inside the display map. The inner value is
+    /// the action, or `None` for a click that only dismisses the map.
+    fn screens_click(&self, px: f64, py: f64, win_w: usize) -> Option<Option<Action>> {
+        let (mx, my, mw, mh) = self.screens_popup_rect(win_w)?;
+        if px < mx as f64 || px > (mx + mw) as f64 || py < my as f64 || py > (my + mh) as f64 {
+            return None;
+        }
+        let local_x = px as f32 - mx;
+        let local_y = py as f32 - my;
+        if local_y >= 8.0 && local_y < 8.0 + MAP_H {
+            let rects = pjdesk_proto::layout::map_rects(&self.displays, MAP_W, MAP_H, 8.0);
+            for r in rects {
+                if local_x >= r.x && local_x < r.x + r.w && local_y >= 8.0 + r.y && local_y < 8.0 + r.y + r.h {
+                    return Some(Some(Action::SelectDisplay(r.index)));
+                }
+            }
+            return Some(None);
+        }
+        let mode_top = 8.0 + MAP_H + 8.0;
+        if local_y >= mode_top && local_y < mode_top + MODE_H * 3.0 {
+            let row = ((local_y - mode_top) / MODE_H) as usize;
+            let action = [Action::ViewSingle, Action::ViewAll, Action::ViewSeparate][row.min(2)];
+            return Some(Some(action));
+        }
+        Some(None)
     }
 
     fn tooltip_rect(&self, win_w: usize) -> Option<(f32, f32, f32, f32)> {
@@ -258,6 +548,12 @@ impl Toolbar {
     }
 
     pub fn covers(&self, px: f64, py: f64, win_w: usize) -> bool {
+        if self.shows_tabs() && py >= 0.0 && py <= TAB_H as f64 && px >= 0.0 && px <= win_w as f64 {
+            return true;
+        }
+        if self.slot_at(px, py, win_w).is_some() {
+            return true;
+        }
         if self.collapsed {
             return self.hit_button(px, py, win_w).is_some();
         }
@@ -272,6 +568,11 @@ impl Toolbar {
                 return true;
             }
         }
+        if let Some((mx, my, mw, mh)) = self.screens_popup_rect(win_w) {
+            if px >= mx as f64 && px <= (mx + mw) as f64 && py >= my as f64 && py <= (my + mh) as f64 {
+                return true;
+            }
+        }
         if let Some((tx, ty, tw, th)) = self.tooltip_rect(win_w) {
             if px >= tx as f64 && px <= (tx + tw) as f64 && py >= ty as f64 && py <= (ty + th) as f64 {
                 return true;
@@ -281,17 +582,34 @@ impl Toolbar {
     }
 
     pub fn on_pointer(&mut self, px: f64, py: f64, win_w: usize) -> bool {
+        if let Some(i) = self.slot_at(px, py, win_w) {
+            self.hovered_slot = Some(i);
+            self.hovered_button = None;
+            return true;
+        }
+        self.hovered_slot = None;
+        if self.shows_tabs() && py >= 0.0 && py <= TAB_H as f64 && px >= 0.0 && px <= win_w as f64 {
+            self.hovered_button = None;
+            return true;
+        }
         if self.collapsed {
             self.hovered_button = self.hit_button(px, py, win_w);
             return self.hovered_button.is_some();
         }
-        let menu_bottom = self.open_menu_rect(win_w).map(|(_, my, _, mh)| my + mh).unwrap_or(TOP + BAR_H);
-        let reveal = TOP + BAR_H + if self.hovered_button.is_some() { 32.0 } else { 8.0 };
+        let (_, by, _, bh) = self.bar_rect(win_w);
+        let menu_bottom = self
+            .open_menu_rect(win_w)
+            .map(|(_, my, _, mh)| my + mh)
+            .into_iter()
+            .chain(self.screens_popup_rect(win_w).map(|(_, my, _, mh)| my + mh))
+            .fold(by + bh, f32::max);
+        let reveal = by + bh + if self.hovered_button.is_some() { 32.0 } else { 8.0 };
         if py <= reveal as f64 {
             self.visible = true;
         } else if py > menu_bottom as f64 + 16.0 {
             self.visible = false;
             self.open = None;
+            self.screens_open = false;
             self.hovered_button = None;
             self.hovered_item = None;
             return false;
@@ -312,10 +630,20 @@ impl Toolbar {
                 return true;
             }
         }
+        if self.screens_popup_rect(win_w).is_some_and(|(mx, my, mw, mh)| {
+            px >= mx as f64 && px <= (mx + mw) as f64 && py >= my as f64 && py <= (my + mh) as f64
+        }) {
+            return true;
+        }
         false
     }
 
     pub fn click(&mut self, px: f64, py: f64, win_w: usize) -> Option<Action> {
+        if let Some(action) = self.tab_action(px, py, win_w) {
+            self.open = None;
+            self.screens_open = false;
+            return Some(action);
+        }
         if self.collapsed {
             if self.hit_button(px, py, win_w).is_some() {
                 self.collapsed = false;
@@ -326,20 +654,32 @@ impl Toolbar {
         if !self.visible {
             return None;
         }
+        if let Some(hit) = self.screens_click(px, py, win_w) {
+            self.screens_open = false;
+            return hit;
+        }
         if let Some(i) = self.hit_button(px, py, win_w) {
             match self.buttons[i].kind {
                 Kind::Menu(_) => {
+                    self.screens_open = false;
                     self.open = if self.open == Some(i) { None } else { Some(i) };
+                    return None;
+                }
+                Kind::Screens => {
+                    self.open = None;
+                    self.screens_open = !self.screens_open;
                     return None;
                 }
                 Kind::Collapse => {
                     self.collapsed = true;
                     self.open = None;
+                    self.screens_open = false;
                     self.visible = false;
                     return None;
                 }
                 Kind::Act(a) => {
                     self.open = None;
+                    self.screens_open = false;
                     return Some(a);
                 }
             }
@@ -356,6 +696,7 @@ impl Toolbar {
             }
         }
         self.open = None;
+        self.screens_open = false;
         None
     }
 
@@ -379,7 +720,7 @@ impl Toolbar {
 
         for (i, b) in self.buttons.iter().enumerate() {
             let end = matches!(b.kind, Kind::Act(Action::Disconnect));
-            let menu_open = self.open == Some(i);
+            let menu_open = self.open == Some(i) || (self.screens_open && matches!(b.kind, Kind::Screens));
             let session = matches!(b.mark, Mark::Session);
             if self.hovered_button == Some(i) || menu_open {
                 let hover = if end { 0xFF_5a_30_34 } else { 0xFF_2c_36_46 };
@@ -399,7 +740,7 @@ impl Toolbar {
         }
 
         if let Some((tx, ty, tw, th)) = self.tooltip_rect(win_w) {
-            if self.open.is_none() {
+            if self.open.is_none() && !self.screens_open {
                 if let Some(i) = self.hovered_button {
                     fill_round(buf, win_w, win_h, tx, ty, tw, th, 6.0, 0xF2_22_27_30);
                     draw_text(buf, win_w, win_h, tx + 8.0, ty + 15.0, self.buttons[i].tip, 0xFF_e8_ec_f2);
@@ -418,32 +759,150 @@ impl Toolbar {
                 draw_text(buf, win_w, win_h, mx + PAD, iy + ITEM_H * 0.68, label, 0xFF_e8_ec_f2);
             }
         }
+        self.draw_screens(buf, win_w, win_h);
+    }
+
+    fn draw_screens(&self, buf: &mut [u32], win_w: usize, win_h: usize) {
+        let Some((mx, my, mw, mh)) = self.screens_popup_rect(win_w) else {
+            return;
+        };
+        fill_round(buf, win_w, win_h, mx, my, mw, mh, 10.0, 0xF7_22_27_30);
+        let rects = pjdesk_proto::layout::map_rects(&self.displays, MAP_W, MAP_H, 8.0);
+        if rects.is_empty() {
+            draw_text(buf, win_w, win_h, mx + PAD, my + 28.0, "One screen", 0xFF_9a_a3_b5);
+        }
+        let separate = self.view_mode == pjdesk_proto::peer::VIEW_SEPARATE;
+        let all = self.view_mode == pjdesk_proto::peer::VIEW_ALL;
+        for r in &rects {
+            let on = self.view_mode == pjdesk_proto::peer::VIEW_SINGLE && r.index == self.current;
+            if on || all || separate {
+                fill_round(buf, win_w, win_h, mx + r.x - 2.0, my + 8.0 + r.y - 2.0, r.w + 4.0, r.h + 4.0, 4.0, 0xFF_4d_9b_ff);
+            }
+            fill_round(buf, win_w, win_h, mx + r.x, my + 8.0 + r.y, r.w, r.h, 3.0, if on { 0xFF_2a_3c_52 } else { 0xFF_32_3b_4a });
+            let label = (r.index + 1).to_string();
+            let tw = text_width(&label);
+            draw_text(
+                buf,
+                win_w,
+                win_h,
+                mx + r.x + (r.w - tw) / 2.0,
+                my + 8.0 + r.y + r.h / 2.0 + 5.0,
+                &label,
+                0xFF_e8_ec_f2,
+            );
+        }
+        let mode_y = my + 8.0 + MAP_H + 8.0;
+        let modes = [("One screen", 0u8), ("All screens", 1), ("Separate windows", 2)];
+        for (i, (label, mode)) in modes.iter().enumerate() {
+            let y = mode_y + i as f32 * MODE_H;
+            let on = self.view_mode == *mode;
+            fill_round(
+                buf,
+                win_w,
+                win_h,
+                mx + 8.0,
+                y,
+                MAP_W - 16.0,
+                MODE_H - 4.0,
+                6.0,
+                if on { 0xFF_2a_3c_52 } else { 0xFF_2c_36_46 },
+            );
+            draw_text(buf, win_w, win_h, mx + 16.0, y + 16.0, label, 0xFF_e8_ec_f2);
+        }
     }
 }
 
+const COMPACT_H: f32 = 36.0;
+
+/// Bottom bar on a separate screen window: the screen name, fullscreen, and close.
+pub fn compact_rect(win_w: usize, win_h: usize) -> (f32, f32, f32, f32) {
+    let w = 280.0_f32.min((win_w as f32 - 16.0).max(120.0));
+    let x = ((win_w as f32 - w) / 2.0).max(8.0);
+    let y = (win_h as f32 - COMPACT_H - 12.0).max(8.0);
+    (x, y, w, COMPACT_H)
+}
+
+pub fn compact_covers(px: f64, py: f64, win_w: usize, win_h: usize) -> bool {
+    let (x, y, w, h) = compact_rect(win_w, win_h);
+    px >= x as f64 && py >= y as f64 && px <= (x + w) as f64 && py <= (y + h) as f64
+}
+
+pub fn compact_click(px: f64, py: f64, win_w: usize, win_h: usize) -> Option<Action> {
+    let (x, y, w, h) = compact_rect(win_w, win_h);
+    if px < x as f64 || py < y as f64 || px > (x + w) as f64 || py > (y + h) as f64 {
+        return None;
+    }
+    let local = px as f32 - x;
+    if local >= w - 36.0 {
+        Some(Action::CloseScreen)
+    } else if local >= w - 118.0 {
+        Some(Action::Fullscreen)
+    } else {
+        None
+    }
+}
+
+pub fn draw_compact(buf: &mut [u32], win_w: usize, win_h: usize, label: &str) {
+    let (x, y, w, h) = compact_rect(win_w, win_h);
+    fill_round(buf, win_w, win_h, x, y, w, h, 10.0, 0xF2_14_18_22);
+    draw_text(buf, win_w, win_h, x + 12.0, y + 23.0, label, 0xFF_e8_ec_f2);
+    draw_text(buf, win_w, win_h, x + w - 110.0, y + 23.0, "Full", 0xFF_c5_d0_de);
+    draw_text(buf, win_w, win_h, x + w - 28.0, y + 23.0, "x", 0xFF_f0_8a_86);
+}
+
+pub fn draw_toast(buf: &mut [u32], win_w: usize, win_h: usize, text: &str) {
+    let tw = text_width(text) + 24.0;
+    let x = ((win_w as f32 - tw) / 2.0).max(8.0);
+    let y = (win_h as f32 * 0.72).min(win_h as f32 - 80.0).max(48.0);
+    fill_round(buf, win_w, win_h, x, y, tw, 32.0, 8.0, 0xF2_2a_24_18);
+    draw_text(buf, win_w, win_h, x + 12.0, y + 21.0, text, 0xFF_f2_b0_3a);
+}
+
+/// Icons share a 14×14 box and a 2px stroke so the bar reads as one set.
 fn draw_mark(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, mark: Mark, argb: u32) {
+    let hole = 0xFF_14_18_22;
     match mark {
         Mark::View => {
-            fill_rect(buf, w, h, x, y, 12.0, 9.0, argb);
-            fill_rect(buf, w, h, x + 2.0, y + 2.0, 8.0, 5.0, 0xFF_14_18_22);
+            fill_rect(buf, w, h, x, y + 4.0, 14.0, 6.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 6.0, 10.0, 2.0, hole);
+            fill_rect(buf, w, h, x + 5.0, y + 5.0, 4.0, 4.0, argb);
         }
         Mark::Keys => {
-            fill_rect(buf, w, h, x, y + 2.0, 12.0, 8.0, argb);
-            fill_rect(buf, w, h, x + 1.0, y + 3.0, 4.0, 2.0, 0xFF_14_18_22);
-            fill_rect(buf, w, h, x + 7.0, y + 3.0, 4.0, 2.0, 0xFF_14_18_22);
+            fill_rect(buf, w, h, x, y + 2.0, 14.0, 10.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 4.0, 10.0, 6.0, hole);
+            fill_rect(buf, w, h, x + 3.0, y + 5.0, 3.0, 2.0, argb);
+            fill_rect(buf, w, h, x + 8.0, y + 5.0, 3.0, 2.0, argb);
         }
-        Mark::Session => fill_circle(buf, w, h, x + 6.0, y + 5.0, 5.0, argb),
+        Mark::Session => {
+            fill_circle(buf, w, h, x + 7.0, y + 7.0, 6.0, argb);
+            fill_circle(buf, w, h, x + 7.0, y + 7.0, 3.0, hole);
+        }
         Mark::Files => {
-            fill_rect(buf, w, h, x + 2.0, y, 8.0, 11.0, argb);
-            fill_rect(buf, w, h, x + 4.0, y + 2.0, 4.0, 7.0, 0xFF_14_18_22);
+            fill_rect(buf, w, h, x + 1.0, y + 1.0, 12.0, 12.0, argb);
+            fill_rect(buf, w, h, x + 3.0, y + 4.0, 8.0, 7.0, hole);
+            fill_rect(buf, w, h, x + 3.0, y + 1.0, 5.0, 3.0, argb);
         }
         Mark::Chat => {
-            fill_rect(buf, w, h, x, y + 1.0, 12.0, 8.0, argb);
-            fill_rect(buf, w, h, x + 2.0, y + 8.0, 3.0, 3.0, argb);
+            fill_rect(buf, w, h, x, y + 1.0, 14.0, 9.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 3.0, 10.0, 5.0, hole);
+            fill_rect(buf, w, h, x + 3.0, y + 9.0, 3.0, 4.0, argb);
         }
-        Mark::End => fill_rect(buf, w, h, x + 2.0, y + 1.0, 8.0, 8.0, argb),
-        Mark::Collapse => {
-            fill_rect(buf, w, h, x, y + 5.0, 12.0, 2.0, argb);
+        Mark::End => {
+            fill_rect(buf, w, h, x + 2.0, y + 1.0, 10.0, 2.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 11.0, 10.0, 2.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 1.0, 2.0, 12.0, argb);
+            fill_rect(buf, w, h, x + 10.0, y + 1.0, 2.0, 12.0, argb);
+            fill_rect(buf, w, h, x + 5.0, y + 4.0, 4.0, 2.0, argb);
+            fill_rect(buf, w, h, x + 6.0, y + 4.0, 2.0, 6.0, argb);
+        }
+        Mark::Collapse => fill_rect(buf, w, h, x + 1.0, y + 6.0, 12.0, 2.0, argb),
+        Mark::Screens => {
+            fill_rect(buf, w, h, x, y + 1.0, 6.0, 5.0, argb);
+            fill_rect(buf, w, h, x + 8.0, y + 1.0, 6.0, 5.0, argb);
+            fill_rect(buf, w, h, x + 2.0, y + 8.0, 10.0, 5.0, argb);
+            fill_rect(buf, w, h, x + 1.0, y + 2.0, 4.0, 3.0, hole);
+            fill_rect(buf, w, h, x + 9.0, y + 2.0, 4.0, 3.0, hole);
+            fill_rect(buf, w, h, x + 3.0, y + 9.0, 8.0, 3.0, hole);
         }
     }
 }
@@ -552,6 +1011,138 @@ fn blend(dst: &mut u32, argb: u32, a: f32) {
     *dst = 0xff00_0000 | (mix(sr, dr) << 16) | (mix(sg, dg) << 8) | mix(sb, db);
 }
 
+#[cfg(feature = "ui-shots")]
+pub(crate) fn render_monitor_shots(dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(dir);
+    write_png(&dir.join("monitors-switcher.png"), 1100, 720, paint_switcher);
+    write_png(&dir.join("monitors-all.png"), 1100, 640, paint_all_screens);
+    write_png(&dir.join("monitors-separate.png"), 1100, 640, paint_separate);
+    write_png(&dir.join("tabs-2-dark.png"), 1100, 640, paint_tabs_2_dark);
+    write_png(&dir.join("tabs-2-light.png"), 1100, 640, paint_tabs_2_light);
+    write_png(&dir.join("tabs-3-dark.png"), 1100, 640, paint_tabs_3_dark);
+    write_png(&dir.join("tabs-3-light.png"), 1100, 640, paint_tabs_3_light);
+}
+
+#[cfg(feature = "ui-shots")]
+fn sample_bar() -> Toolbar {
+    let mut bar = Toolbar::default();
+    bar.sync(pjdesk_proto::layout::sample_layout(), 0, 0);
+    bar.visible = true;
+    bar
+}
+
+#[cfg(feature = "ui-shots")]
+fn paint_switcher(buf: &mut [u32], w: usize, h: usize) {
+    buf.fill(0xFF_14_18_22);
+    let mut bar = sample_bar();
+    bar.screens_open = true;
+    let (bx, _, _, _) = bar.bar_rect(w);
+    let _ = bx;
+    bar.draw(buf, w, h);
+}
+
+#[cfg(feature = "ui-shots")]
+fn paint_all_screens(buf: &mut [u32], w: usize, h: usize) {
+    buf.fill(0xFF_10_13_18);
+    let screens = pjdesk_proto::layout::sample_layout();
+    let rects = pjdesk_proto::layout::map_rects(&screens, w as f32, h as f32, 36.0);
+    let colors = [0xFF_2f_4a_68, 0xFF_2c_45_38, 0xFF_4a_3c_2a];
+    for (i, r) in rects.iter().enumerate() {
+        fill_rect(buf, w, h, r.x, r.y, r.w, r.h, colors[i % colors.len()]);
+        let label = format!("{}", r.index + 1);
+        draw_text(buf, w, h, r.x + 12.0, r.y + 28.0, &label, 0xFF_e8_ec_f2);
+    }
+    let mut bar = sample_bar();
+    bar.view_mode = pjdesk_proto::peer::VIEW_ALL;
+    bar.draw(buf, w, h);
+}
+
+#[cfg(feature = "ui-shots")]
+fn paint_separate(buf: &mut [u32], w: usize, h: usize) {
+    buf.fill(0xFF_10_13_18);
+    let frames = [
+        (36.0_f32, 36.0, 500.0, 560.0, "Office PC — Screen 1", "Screen 1", 0xFF_2f_4a_68),
+        (564.0, 78.0, 500.0, 480.0, "Office PC — Screen 2", "Screen 2", 0xFF_2c_45_38),
+    ];
+    for (x, y, ww, hh, title, label, color) in frames {
+        fill_round(buf, w, h, x, y, ww, 32.0, 8.0, 0xFF_1c_22_2c);
+        draw_text(buf, w, h, x + 12.0, y + 21.0, title, 0xFF_e8_ec_f2);
+        fill_rect(buf, w, h, x, y + 32.0, ww, hh - 32.0, color);
+        let bar_w = 260.0;
+        let bx = x + (ww - bar_w) / 2.0;
+        let by = y + hh - 48.0;
+        fill_round(buf, w, h, bx, by, bar_w, 36.0, 10.0, 0xF2_14_18_22);
+        draw_text(buf, w, h, bx + 12.0, by + 23.0, label, 0xFF_e8_ec_f2);
+        draw_text(buf, w, h, bx + bar_w - 110.0, by + 23.0, "Full", 0xFF_c5_d0_de);
+        draw_text(buf, w, h, bx + bar_w - 28.0, by + 23.0, "x", 0xFF_f0_8a_86);
+    }
+}
+
+#[cfg(feature = "ui-shots")]
+fn paint_tabs_2_dark(buf: &mut [u32], w: usize, h: usize) {
+    paint_tabs(buf, w, h, 2, false);
+}
+
+#[cfg(feature = "ui-shots")]
+fn paint_tabs_2_light(buf: &mut [u32], w: usize, h: usize) {
+    paint_tabs(buf, w, h, 2, true);
+}
+
+#[cfg(feature = "ui-shots")]
+fn paint_tabs_3_dark(buf: &mut [u32], w: usize, h: usize) {
+    paint_tabs(buf, w, h, 3, false);
+}
+
+#[cfg(feature = "ui-shots")]
+fn paint_tabs_3_light(buf: &mut [u32], w: usize, h: usize) {
+    paint_tabs(buf, w, h, 3, true);
+}
+
+#[cfg(feature = "ui-shots")]
+fn paint_tabs(buf: &mut [u32], w: usize, h: usize, count: usize, light: bool) {
+    let page = chrome(light);
+    buf.fill(page.panel);
+    let wall = if light { 0xFF_d5_e3_f4 } else { 0xFF_1a_28_38 };
+    fill_rect(buf, w, h, 0.0, TAB_H, w as f32, (h as f32 - TAB_H).max(0.0), wall);
+    let desk = if light { 0xFF_ff_ff_ff } else { 0xFF_24_30_3c };
+    fill_round(buf, w, h, 36.0, TAB_H + 28.0, w as f32 - 72.0, (h as f32 - TAB_H - 72.0).max(40.0), 10.0, desk);
+    fill_rect(buf, w, h, 0.0, h as f32 - 28.0, w as f32, 28.0, if light { 0xFF_ff_ff_ff } else { 0xFF_14_18_22 });
+    let mut bar = Toolbar::default();
+    bar.set_light(light);
+    let displays = if count >= 3 {
+        pjdesk_proto::layout::sample_layout()
+    } else {
+        vec![
+            pjdesk_proto::layout::Screen { index: 0, x: 0, y: 0, width: 1920, height: 1080, dpi: 96 },
+            pjdesk_proto::layout::Screen { index: 1, x: 1920, y: 0, width: 2560, height: 1440, dpi: 96 },
+        ]
+    };
+    let current = if count >= 3 { 1 } else { 0 };
+    bar.sync(displays, current, pjdesk_proto::peer::VIEW_SINGLE);
+    if let Some(slot) = bar.tab_slots(w).into_iter().rev().find(|s| matches!(s.kind, SlotKind::Display(_))) {
+        bar.on_pointer((slot.x + slot.w / 2.0) as f64, (slot.y + 8.0) as f64, w);
+    }
+    bar.draw_tabs(buf, w, h);
+}
+
+#[cfg(feature = "ui-shots")]
+fn write_png(path: &std::path::Path, w: u32, h: u32, paint: fn(&mut [u32], usize, usize)) {
+    let mut pixels = vec![0u32; w as usize * h as usize];
+    paint(&mut pixels, w as usize, h as usize);
+    let mut rgba = Vec::with_capacity(pixels.len() * 4);
+    for p in pixels {
+        rgba.push(((p >> 16) & 0xff) as u8);
+        rgba.push(((p >> 8) & 0xff) as u8);
+        rgba.push((p & 0xff) as u8);
+        rgba.push(255);
+    }
+    let file = std::fs::File::create(path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+    let mut encoder = png::Encoder::new(file, w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header().and_then(|mut wr| wr.write_image_data(&rgba)).unwrap_or_else(|e| panic!("png {}: {e}", path.display()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,5 +1178,102 @@ mod tests {
         let (cx, cy, _, _) = bar.bar_rect(w);
         bar.click((cx + 8.0) as f64, (cy + 8.0) as f64, w);
         assert!(!bar.collapsed);
+    }
+
+    #[test]
+    fn screen_map_click_selects_the_display_under_the_pointer() {
+        let mut bar = Toolbar::default();
+        bar.sync(pjdesk_proto::layout::sample_layout(), 0, 0);
+        let w = 1100;
+        let screens = bar.buttons.iter().find(|b| matches!(b.kind, Kind::Screens)).unwrap();
+        let (bx, by, _, _) = bar.bar_rect(w);
+        assert_eq!(bar.click((bx + screens.x + 8.0) as f64, (by + 12.0) as f64, w), None);
+        assert!(bar.screens_open);
+        let (mx, my, _, _) = bar.screens_popup_rect(w).unwrap();
+        let rects = pjdesk_proto::layout::map_rects(&bar.displays, MAP_W, MAP_H, 8.0);
+        let left = rects.iter().find(|r| r.index == 1).unwrap();
+        let x = mx + left.x + left.w / 2.0;
+        let y = my + 8.0 + left.y + left.h / 2.0;
+        assert_eq!(bar.click(x as f64, y as f64, w), Some(Action::SelectDisplay(1)));
+    }
+
+    #[test]
+    fn screens_menu_offers_separate_windows() {
+        let mut bar = Toolbar::default();
+        bar.sync(pjdesk_proto::layout::sample_layout(), 0, 0);
+        let w = 1100usize;
+        let screens = bar.buttons.iter().find(|b| matches!(b.kind, Kind::Screens)).unwrap();
+        let (bx, by, _, _) = bar.bar_rect(w);
+        assert_eq!(bar.click((bx + screens.x + 8.0) as f64, (by + 12.0) as f64, w), None);
+        let (mx, my, _, _) = bar.screens_popup_rect(w).unwrap();
+        let mode_top = my + 8.0 + MAP_H + 8.0;
+        let y = mode_top + MODE_H * 2.0 + 8.0;
+        assert_eq!(bar.click((mx + 24.0) as f64, y as f64, w), Some(Action::ViewSeparate));
+    }
+
+    fn two_screens() -> Vec<pjdesk_proto::layout::Screen> {
+        vec![
+            pjdesk_proto::layout::Screen { index: 0, x: 0, y: 0, width: 1920, height: 1080, dpi: 96 },
+            pjdesk_proto::layout::Screen { index: 1, x: 1920, y: 0, width: 2560, height: 1440, dpi: 144 },
+        ]
+    }
+
+    #[test]
+    fn tab_strip_is_hidden_when_the_remote_has_one_display() {
+        let mut bar = Toolbar::default();
+        bar.sync(vec![two_screens().remove(0)], 0, 0);
+        assert!(bar.tab_slots(1100).is_empty());
+        assert!(!bar.covers(40.0, 12.0, 1100));
+        assert_eq!(bar.click(40.0, 12.0, 1100), None);
+    }
+
+    #[test]
+    fn tab_strip_switches_display_all_screens_and_separate_windows() {
+        let mut bar = Toolbar::default();
+        bar.sync(two_screens(), 0, 0);
+        let w = 1100usize;
+        let slots = bar.tab_slots(w);
+        assert_eq!(slots.iter().filter(|s| matches!(s.kind, SlotKind::Display(_))).count(), 2);
+        let screen2 = slots.iter().find(|s| matches!(s.kind, SlotKind::Display(1))).unwrap();
+        assert_eq!(bar.click((screen2.x + 10.0) as f64, (screen2.y + 8.0) as f64, w), Some(Action::SelectDisplay(1)));
+        let all = slots.iter().find(|s| matches!(s.kind, SlotKind::All)).unwrap();
+        assert_eq!(bar.click((all.x + 10.0) as f64, (all.y + 8.0) as f64, w), Some(Action::ViewAll));
+        let separate = slots.iter().find(|s| matches!(s.kind, SlotKind::Separate)).unwrap();
+        assert_eq!(bar.click((separate.x + 8.0) as f64, (separate.y + 8.0) as f64, w), Some(Action::ViewSeparate));
+    }
+
+    #[test]
+    fn tab_strip_highlights_the_active_tab() {
+        let mut bar = Toolbar::default();
+        bar.sync(pjdesk_proto::layout::sample_layout(), 2, pjdesk_proto::peer::VIEW_SINGLE);
+        let slots = bar.tab_slots(1100);
+        assert_eq!(slots.iter().filter(|s| matches!(s.kind, SlotKind::Display(_))).count(), 3);
+        assert!(slots.iter().any(|s| matches!(s.kind, SlotKind::Display(2)) && s.active));
+        assert_eq!(slots.iter().filter(|s| s.active).count(), 1);
+
+        bar.sync(pjdesk_proto::layout::sample_layout(), 0, pjdesk_proto::peer::VIEW_ALL);
+        let slots = bar.tab_slots(1100);
+        assert!(slots.iter().any(|s| matches!(s.kind, SlotKind::All) && s.active));
+        assert!(slots.iter().all(|s| !matches!(s.kind, SlotKind::Display(_)) || !s.active));
+
+        bar.sync(pjdesk_proto::layout::sample_layout(), 0, pjdesk_proto::peer::VIEW_SEPARATE);
+        let slots = bar.tab_slots(1100);
+        assert!(slots.iter().any(|s| matches!(s.kind, SlotKind::Separate) && s.active));
+    }
+
+    #[test]
+    fn active_tab_uses_the_theme_accent() {
+        let mut bar = Toolbar::default();
+        bar.sync(two_screens(), 0, 0);
+        let w = 1100;
+        let h = 80;
+        let mut buf = vec![0u32; w * h];
+        bar.draw_tabs(&mut buf, w, h);
+        assert!(buf.contains(&0xFF_4d_9b_ff), "dark accent underline");
+        bar.set_light(true);
+        buf.fill(0);
+        bar.draw_tabs(&mut buf, w, h);
+        assert!(buf.contains(&0xFF_2f_6f_ed), "light accent underline");
+        assert!(buf.contains(&0xFF_f3_f5_f8), "light strip");
     }
 }

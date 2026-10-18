@@ -7,39 +7,74 @@
 <meta name="robots" content="noindex">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
-<link rel="stylesheet" href="/site.css">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="/admin/admin.css">
 </head>
-<body>
-<header>
-  <div class="wrap nav">
+<body class="dark">
+<div class="shell">
+  <aside class="side">
     <a class="brand" href="/"><span class="dot"></span>PJDesk</a>
-    <span class="spacer"></span>
-    <a class="link" href="/account/">Account</a>
-    <a class="link on" href="/admin/">Admin</a>
-  </div>
-</header>
-
-<main>
-  <div class="wrap">
-    <h1>Accounts</h1>
-    <p class="sub">Turn Cloud Sync on for customers who have bought it. Administrators always have it.</p>
-    <div class="card">
-      <div class="row" style="margin-bottom:12px">
-        <input id="filter" type="text" placeholder="Filter by email" style="max-width:320px">
-        <span class="spacer"></span>
-        <span id="count" class="muted"></span>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Email</th><th>Created</th><th>Last sign-in</th><th>Signed in</th><th>Last backup</th><th>Cloud Sync</th></tr></thead>
-          <tbody id="rows"></tbody>
-        </table>
-      </div>
-      <div id="msg" class="msg"></div>
+    <nav>
+      <button type="button" data-page="overview" class="on">Overview</button>
+      <button type="button" data-page="accounts">Accounts</button>
+      <button type="button" data-page="servers">Servers &amp; devices</button>
+      <button type="button" data-page="plans">Plans</button>
+      <button type="button" data-page="audit">Audit log</button>
+    </nav>
+    <div class="side-foot">
+      <button type="button" id="theme" class="ghost">Light</button>
+      <a href="/account/">Account</a>
     </div>
-  </div>
-</main>
+  </aside>
+  <main>
+    <header class="top">
+      <h1 id="title">Overview</h1>
+      <p id="sub">Cloud Sync grants for pjdesk.com accounts.</p>
+    </header>
+    <section id="overview" class="page"></section>
+    <section id="accounts" class="page hidden"></section>
+    <section id="servers" class="page hidden"></section>
+    <section id="plans" class="page hidden"></section>
+    <section id="audit" class="page hidden"></section>
+  </main>
+</div>
+
+<div id="grant" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="grant-title">
+  <form class="dialog">
+    <h2 id="grant-title">Grant a plan</h2>
+    <p id="grant-who" class="muted"></p>
+    <label>Plan
+      <select id="grant-plan" name="plan">
+        <option value="free">Free</option>
+        <option value="cloud">Cloud Sync</option>
+      </select>
+    </label>
+    <label>Expires (optional)
+      <input id="grant-expires" name="expires" type="date">
+    </label>
+    <label>Note (optional)
+      <input id="grant-note" name="note" type="text" maxlength="500" placeholder="Why this grant">
+    </label>
+    <p id="grant-msg" class="msg"></p>
+    <div class="row">
+      <button type="button" id="grant-cancel" class="ghost">Cancel</button>
+      <span class="spacer"></span>
+      <button type="submit" id="grant-save" class="primary">Save plan</button>
+    </div>
+  </form>
+</div>
+
+<div id="confirm" class="modal hidden" role="dialog" aria-modal="true">
+  <form class="dialog">
+    <h2>Change this plan?</h2>
+    <p id="confirm-text"></p>
+    <div class="row">
+      <button type="button" id="confirm-no" class="ghost">Cancel</button>
+      <span class="spacer"></span>
+      <button type="submit" id="confirm-yes" class="danger">Change plan</button>
+    </div>
+  </form>
+</div>
 
 <script src="/app.js"></script>
 <script src="/admin/admin.js"></script>

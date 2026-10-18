@@ -27,7 +27,13 @@ pub const RECORD: u32 = 1 << 9;
 /// TCP port forwards. Off unless the host listed the port.
 pub const TUNNEL: u32 = 1 << 10;
 
-/// Every bit this version defines. Unknown high bits are ignored.
+/// Not a permission. A 0.5.2 controller sets this on Hello so the host knows
+/// it can send display-layout and platform messages. It is intentionally
+/// absent from [`ALL`], so [`grant`] clears it and an older host never sees it
+/// as something the person allowed.
+pub const LAYOUT: u32 = 1 << 11;
+
+/// Every permission bit this version defines. Unknown high bits are ignored.
 pub const ALL: u32 = KEYBOARD | MOUSE | CLIPBOARD | FILE | AUDIO | RESTART | PRIVACY | BLOCK_INPUT | CHAT | RECORD | TUNNEL;
 
 /// What a version-2 controller is allowed: the original remote desktop.
@@ -110,5 +116,12 @@ mod tests {
     #[test]
     fn unknown_bits_are_cleared() {
         assert_eq!(grant(1 << 30 | MOUSE, ALL, false), MOUSE);
+    }
+
+    #[test]
+    fn layout_bit_is_not_a_permission() {
+        assert_eq!(grant(ALL | LAYOUT, ALL | LAYOUT, false), ALL);
+        assert!(!has(ALL, LAYOUT));
+        assert_eq!(name(LAYOUT), "unknown");
     }
 }

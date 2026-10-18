@@ -7,7 +7,8 @@
     "dev": "wrangler dev",
     "migrate:local": "wrangler d1 migrations apply pjdesk-cloud --local",
     "migrate:remote": "wrangler d1 migrations apply pjdesk-cloud --remote",
-    "deploy": "wrangler d1 migrations apply pjdesk-cloud --remote && wrangler deploy"
+    "deploy": "wrangler d1 migrations apply pjdesk-cloud --remote && wrangler deploy",
+    "test": "node --test test/plans.test.js"
   },
   "devDependencies": {
     "wrangler": "^4"

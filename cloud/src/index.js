@@ -21,10 +21,16 @@
 //   GET  /api/sync/health       (Bearer, sync on) { peers: [...] }
 //   PUT  /api/sync/health       (Bearer, sync on) one server's version/role
 //   GET  /api/admin/accounts    (Bearer, admin)
-//   POST /api/admin/sync        (Bearer, admin) {email, enabled}
+//   GET  /api/admin/overview    (Bearer, admin)
+//   GET  /api/admin/servers     (Bearer, admin) health reports + sign-ins
+//   GET  /api/admin/audit       (Bearer, admin)
+//   POST /api/admin/plan        (Bearer, admin) {email, plan, expires_at, note}
+//   POST /api/admin/sync        (Bearer, admin) {email, enabled}  (audited; same as a plan grant)
 //   GET  /api/release           latest release info (from GitHub)
 //   GET  /download/{client,server,sums}  → the latest release's files
 // Everything else is the static website in ./public.
+
+import { effectivePlan, isPlan } from "./plans.js";
 
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 const AUTH_HASH_ITERATIONS = 100000; // the Workers PBKDF2 maximum
@@ -155,7 +161,8 @@ async function session(request, env) {
   if (!m) throw new HttpError(401, "Please sign in.");
   const tokenHash = await sha256Hex(m[1]);
   const row = await env.DB.prepare(
-    `SELECT s.account_id, s.created_at, s.last_used_at, a.email, a.sync_enabled
+    `SELECT s.account_id, s.created_at, s.last_used_at, a.email, a.sync_enabled,
+            a.plan, a.plan_expires_at
        FROM sessions s JOIN accounts a ON a.id = s.account_id
       WHERE s.token_hash = ?`,
   )
@@ -171,7 +178,24 @@ async function session(request, env) {
     await env.DB.prepare("UPDATE sessions SET last_used_at = ? WHERE token_hash = ?").bind(now(), tokenHash).run();
   }
   const admin = isAdmin(env, row.email);
-  return { accountId: row.account_id, email: row.email, admin, sync: admin || !!row.sync_enabled, tokenHash };
+  const eff = effectivePlan({
+    plan: row.plan,
+    expiresAt: row.plan_expires_at,
+    isAdmin: admin,
+    now: t,
+  });
+  if (eff.expired) {
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE accounts SET plan = 'free', sync_enabled = 0, plan_expires_at = NULL WHERE id = ?",
+      ).bind(row.account_id),
+      env.DB.prepare(
+        `INSERT INTO plan_audit (at, actor, email, old_plan, new_plan, expires_at, note)
+         VALUES (?, 'expiry', ?, 'cloud', 'free', ?, 'Cloud Sync grant expired')`,
+      ).bind(t, row.email, row.plan_expires_at),
+    ]);
+  }
+  return { accountId: row.account_id, email: row.email, admin, sync: eff.sync, plan: eff.plan, tokenHash };
 }
 
 const objectKey = (accountId) => `sync/${accountId}/server.sync`;
@@ -193,6 +217,10 @@ async function api(request, env, url, ctx) {
   if (p === "/api/sync/health" && m === "GET") return syncHealthGet(request, env);
   if (p === "/api/sync/health" && m === "PUT") return syncHealthPut(request, env);
   if (p === "/api/admin/accounts" && m === "GET") return adminAccounts(request, env);
+  if (p === "/api/admin/overview" && m === "GET") return adminOverview(request, env);
+  if (p === "/api/admin/servers" && m === "GET") return adminServers(request, env);
+  if (p === "/api/admin/audit" && m === "GET") return adminAudit(request, env);
+  if (p === "/api/admin/plan" && m === "POST") return adminSetPlan(request, env);
   if (p === "/api/admin/sync" && m === "POST") return adminSetSync(request, env);
   if (p === "/api/release" && m === "GET") {
     return json(await latestRelease(env), 200, { "cache-control": "public, max-age=300" });
@@ -423,6 +451,28 @@ async function syncHealthPut(request, env) {
   await env.SYNC.put(healthKey(s.accountId, record.instance), JSON.stringify(record), {
     httpMetadata: { contentType: "application/json" },
   });
+  await env.DB.prepare(
+    `INSERT INTO server_health (account_id, instance, name, version, role, epoch, healthy, reported_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(account_id, instance) DO UPDATE SET
+       name = excluded.name,
+       version = excluded.version,
+       role = excluded.role,
+       epoch = excluded.epoch,
+       healthy = excluded.healthy,
+       reported_at = excluded.reported_at`,
+  )
+    .bind(
+      s.accountId,
+      record.instance,
+      record.name,
+      record.version,
+      record.role,
+      record.epoch,
+      record.healthy ? 1 : 0,
+      record.at,
+    )
+    .run();
   return json({ ok: true });
 }
 
@@ -449,31 +499,170 @@ async function requireAdmin(request, env) {
   return s;
 }
 
+function accountView(env, r) {
+  const admin = isAdmin(env, r.email);
+  const eff = effectivePlan({
+    plan: r.plan,
+    expiresAt: r.plan_expires_at,
+    isAdmin: admin,
+    now: now(),
+  });
+  return {
+    email: r.email,
+    created_at: r.created_at,
+    last_login_at: r.last_login_at,
+    signed_in: r.signed_in || 0,
+    size: r.size,
+    synced_at: r.synced_at,
+    is_admin: admin,
+    plan: eff.plan,
+    plan_expires_at: eff.expired ? null : r.plan_expires_at,
+    plan_note: r.plan_note || "",
+    sync_enabled: eff.sync,
+    expired: eff.expired,
+  };
+}
+
 async function adminAccounts(request, env) {
   await requireAdmin(request, env);
   const rows = await env.DB.prepare(
-    `SELECT a.email, a.sync_enabled, a.created_at, a.last_login_at, m.size, m.updated_at AS synced_at,
+    `SELECT a.email, a.sync_enabled, a.plan, a.plan_expires_at, a.plan_note, a.created_at, a.last_login_at,
+            m.size, m.updated_at AS synced_at,
             (SELECT COUNT(*) FROM sessions s WHERE s.account_id = a.id) AS signed_in
        FROM accounts a LEFT JOIN sync_meta m ON m.account_id = a.id
       ORDER BY a.created_at DESC LIMIT 1000`,
   ).all();
+  return json({ accounts: rows.results.map((r) => accountView(env, r)) });
+}
+
+async function adminOverview(request, env) {
+  await requireAdmin(request, env);
+  const accounts = await env.DB.prepare(
+    "SELECT email, plan, plan_expires_at, sync_enabled, created_at FROM accounts",
+  ).all();
+  const at = now();
+  const week = at - 7 * 86400;
+  const day = at - 86400;
+  let cloud = 0;
+  let free = 0;
+  let fresh = 0;
+  for (const r of accounts.results) {
+    const eff = effectivePlan({
+      plan: r.plan,
+      expiresAt: r.plan_expires_at,
+      isAdmin: isAdmin(env, r.email),
+      now: at,
+    });
+    if (eff.plan === "cloud") cloud += 1;
+    else free += 1;
+    if (Number(r.created_at) >= week) fresh += 1;
+  }
+  const servers = await env.DB.prepare("SELECT COUNT(*) AS n FROM server_health").first();
+  const signins = await env.DB.prepare("SELECT COUNT(*) AS n FROM sessions").first();
+  const active = await env.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE last_used_at >= ?").bind(day).first();
+  const audit = await env.DB.prepare("SELECT COUNT(*) AS n FROM plan_audit").first();
+  const serverList = await env.DB.prepare(
+    `SELECT a.email, h.name, h.version, h.role, h.healthy, h.reported_at
+       FROM server_health h JOIN accounts a ON a.id = h.account_id
+      ORDER BY h.reported_at DESC LIMIT 8`,
+  ).all();
+  const recentAudit = await env.DB.prepare(
+    `SELECT at, actor, email, old_plan, new_plan, note FROM plan_audit ORDER BY id DESC LIMIT 8`,
+  ).all();
+  const recentSignins = await env.DB.prepare(
+    `SELECT a.email, s.device, s.last_used_at
+       FROM sessions s JOIN accounts a ON a.id = s.account_id
+      ORDER BY s.last_used_at DESC LIMIT 8`,
+  ).all();
   return json({
-    accounts: rows.results.map((r) => {
-      const admin = isAdmin(env, r.email);
-      return { ...r, is_admin: admin, sync_enabled: admin || !!r.sync_enabled };
-    }),
+    accounts: accounts.results.length,
+    cloud,
+    free,
+    new_accounts_7d: fresh,
+    servers: servers?.n || 0,
+    signins: signins?.n || 0,
+    active_today: active?.n || 0,
+    audit: audit?.n || 0,
+    server_list: serverList.results,
+    recent_audit: recentAudit.results,
+    recent_signins: recentSignins.results,
   });
 }
 
-async function adminSetSync(request, env) {
+async function adminServers(request, env) {
   await requireAdmin(request, env);
-  const { email: rawEmail, enabled } = await readJson(request);
-  const email = normEmail(rawEmail);
-  const res = await env.DB.prepare("UPDATE accounts SET sync_enabled = ? WHERE email = ?")
-    .bind(enabled ? 1 : 0, email)
-    .run();
-  if (!res.meta.changes) throw new HttpError(404, "No account with that email.");
+  const servers = await env.DB.prepare(
+    `SELECT a.email, h.name, h.version, h.role, h.epoch, h.healthy, h.reported_at, h.instance
+       FROM server_health h JOIN accounts a ON a.id = h.account_id
+      ORDER BY h.reported_at DESC LIMIT 500`,
+  ).all();
+  const signins = await env.DB.prepare(
+    `SELECT a.email, s.device, s.created_at, s.last_used_at
+       FROM sessions s JOIN accounts a ON a.id = s.account_id
+      ORDER BY s.last_used_at DESC LIMIT 500`,
+  ).all();
+  return json({
+    servers: servers.results,
+    signins: signins.results,
+    note: "Desktop client versions are on each PJDesk Server window. This page lists servers that reported a Cloud Sync health record, and account sign-ins. Sign-ins do not include a client version.",
+  });
+}
+
+async function adminAudit(request, env) {
+  await requireAdmin(request, env);
+  const rows = await env.DB.prepare(
+    `SELECT at, actor, email, old_plan, new_plan, expires_at, note
+       FROM plan_audit ORDER BY id DESC LIMIT 200`,
+  ).all();
+  return json({ audit: rows.results });
+}
+
+async function adminSetPlan(request, env) {
+  const admin = await requireAdmin(request, env);
+  const body = await readJson(request);
+  const email = normEmail(body.email);
+  if (!isPlan(body.plan)) throw new HttpError(400, "Plan must be free or cloud.");
+  const note = String(body.note || "").slice(0, 500);
+  let expires = null;
+  if (body.expires_at != null && body.expires_at !== "") {
+    expires = Number(body.expires_at);
+    if (!Number.isFinite(expires) || expires < 0) throw new HttpError(400, "Expiry must be a time.");
+  }
+  const row = await env.DB.prepare(
+    "SELECT id, plan, plan_expires_at, email FROM accounts WHERE email = ?",
+  )
+    .bind(email)
+    .first();
+  if (!row) throw new HttpError(404, "No account with that email.");
+  const sync = body.plan === "cloud" && !(expires && expires <= now()) ? 1 : 0;
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE accounts SET plan = ?, plan_expires_at = ?, plan_note = ?, sync_enabled = ? WHERE id = ?",
+    ).bind(body.plan, expires, note, sync, row.id),
+    env.DB.prepare(
+      `INSERT INTO plan_audit (at, actor, email, old_plan, new_plan, expires_at, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(now(), admin.email, email, row.plan || "free", body.plan, expires, note),
+  ]);
   return json({ ok: true });
+}
+
+async function adminSetSync(request, env) {
+  const body = await readJson(request);
+  const email = normEmail(body.email);
+  return adminSetPlan(
+    new Request(request.url, {
+      method: "POST",
+      headers: request.headers,
+      body: JSON.stringify({
+        email,
+        plan: body.enabled ? "cloud" : "free",
+        expires_at: null,
+        note: "Changed from the Cloud Sync switch",
+      }),
+    }),
+    env,
+  );
 }
 
 // ---------------------------------------------------------------------------

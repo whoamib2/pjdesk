@@ -50,6 +50,14 @@ impl InputInjector {
         }
     }
 
+    /// Moves the pointer onto one display. `display` may start at a negative
+    /// virtual-desktop coordinate.
+    pub fn move_on(&mut self, display: Rect, x: u16, y: u16) {
+        if self.allow_mouse {
+            platform::mouse_move(display, x, y);
+        }
+    }
+
     pub fn handle(&mut self, event: InputEvent, display: Rect) {
         match event {
             InputEvent::MouseMove { x, y } => {

@@ -8,6 +8,7 @@
 
 mod icons;
 mod panels;
+mod saved;
 mod probe;
 mod settings;
 mod theme;
@@ -30,6 +31,13 @@ use crate::config::Config;
 use crate::host::{self, HostShared};
 use crate::signaling::ServerAddr;
 use crate::HostArgs;
+
+/// Connect form, or the saved-computers page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MainPage {
+    Connect,
+    Saved,
+}
 
 /// Which list is showing under the connect form.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -187,6 +195,21 @@ pub struct App {
     book_alias: String,
     book_target: Option<String>,
     desk_tab: DeskTab,
+    page: MainPage,
+    saved_query: String,
+    saved_sort: saved::SavedSort,
+    saved_favorites: bool,
+    renaming: Option<String>,
+    rename_text: String,
+    confirm_remove: Option<String>,
+    prompt_open: bool,
+    prompt_id: String,
+    prompt_password: String,
+    prompt_show: bool,
+    prompt_remember: bool,
+    prompt_files: bool,
+    prompt_rejected: bool,
+    viewer_rx: Vec<Receiver<(String, i32, bool)>>,
 
     /// Background service / scheduled-task snapshot. Never queried on this thread.
     probe: Option<probe::Probe>,
@@ -213,13 +236,14 @@ impl App {
         theme::apply(&cc.egui_ctx, &cfg.settings.theme);
         let engine = Engine::idle(&cfg);
         let settings = settings::SettingsDraft::from_config(&cfg, None);
+        let remember = cfg.settings.remember_passwords;
         let mut app = Self {
             cfg,
             engine,
             ctx: cc.egui_ctx.clone(),
             connect_id: String::new(),
             connect_password: String::new(),
-            remember: false,
+            remember,
             show_password: false,
             perm_input: String::new(),
             show_perm_input: false,
@@ -245,6 +269,21 @@ impl App {
             book_alias: String::new(),
             book_target: None,
             desk_tab: DeskTab::Recent,
+            page: MainPage::Connect,
+            saved_query: String::new(),
+            saved_sort: saved::SavedSort::Recent,
+            saved_favorites: false,
+            renaming: None,
+            rename_text: String::new(),
+            confirm_remove: None,
+            prompt_open: false,
+            prompt_id: String::new(),
+            prompt_password: String::new(),
+            prompt_show: false,
+            prompt_remember: false,
+            prompt_files: false,
+            prompt_rejected: false,
+            viewer_rx: Vec::new(),
             probe: if preview { None } else { Some(probe::Probe::start(cc.egui_ctx.clone())) },
             scm_installed: false,
             scm_running: false,
@@ -301,11 +340,23 @@ impl App {
         let now = unix_now();
         self.cfg.settings.peers.insert(
             "123456789".into(),
-            crate::config::PeerNote { favorite: true, last_connected: now.saturating_sub(3600) },
+            crate::config::PeerNote {
+                favorite: true,
+                last_connected: now.saturating_sub(3600),
+                os_family: "windows".into(),
+                os_version: "10.0.26100".into(),
+                ..Default::default()
+            },
         );
         self.cfg.settings.peers.insert(
             "555666777".into(),
-            crate::config::PeerNote { favorite: false, last_connected: now.saturating_sub(86_400) },
+            crate::config::PeerNote {
+                favorite: false,
+                last_connected: now.saturating_sub(86_400),
+                os_family: "linux".into(),
+                os_version: "24.04".into(),
+                ..Default::default()
+            },
         );
         self.desk_tab = DeskTab::Recent;
         if open_settings {
@@ -313,6 +364,55 @@ impl App {
             self.settings.preview_security();
             self.show_settings = true;
         }
+    }
+
+    #[cfg(feature = "ui-shots")]
+    fn load_saved_preview(&mut self) {
+        self.load_preview(false);
+        self.cfg.address_book.push(pjdesk_proto::signal::AddressEntry {
+            id: "444555666".into(),
+            alias: "Studio".into(),
+            ..Default::default()
+        });
+        self.cfg.address_book.push(pjdesk_proto::signal::AddressEntry {
+            id: "777888999".into(),
+            alias: "Phone".into(),
+            ..Default::default()
+        });
+        self.cfg.settings.peers.insert(
+            "444555666".into(),
+            crate::config::PeerNote {
+                favorite: true,
+                last_connected: unix_now().saturating_sub(7200),
+                os_family: "macos".into(),
+                os_version: "15.1".into(),
+                ..Default::default()
+            },
+        );
+        self.cfg.settings.peers.insert(
+            "777888999".into(),
+            crate::config::PeerNote {
+                os_family: "android".into(),
+                os_version: "14".into(),
+                last_connected: unix_now().saturating_sub(400_000),
+                ..Default::default()
+            },
+        );
+        self.cfg.remember_password("123456789", Some("saved-secret"));
+        self.lan = vec![("Office PC".into(), "123456789".into(), "192.168.1.20:21201".into())];
+        self.page = MainPage::Saved;
+        self.saved_query.clear();
+    }
+
+    #[cfg(feature = "ui-shots")]
+    fn load_password_preview(&mut self) {
+        self.load_preview(false);
+        self.prompt_open = true;
+        self.prompt_id = "555666777".into();
+        self.prompt_password = "correct horse".into();
+        self.prompt_show = false;
+        self.prompt_remember = true;
+        self.prompt_rejected = false;
     }
 
     fn server_addr(&self) -> Option<ServerAddr> {
@@ -580,9 +680,33 @@ impl App {
             self.status = "That isn't a 9-digit PJDesk ID.".into();
             return;
         }
-        let server = self.cfg.effective_server();
-        let password = password.filter(|p| !p.is_empty()).or_else(|| self.saved_for(&id)).unwrap_or_default();
+        let typed = password.unwrap_or_default();
+        let from_store = typed.trim().is_empty();
+        let password = if from_store { self.cfg.saved_password(&id).unwrap_or_default() } else { typed };
+        if password.is_empty() {
+            self.open_prompt(&id, files, false);
+            return;
+        }
+        let remember = !from_store && self.remember;
+        self.spawn_viewer(&id, &password, files, remember, from_store);
+    }
 
+    fn open_prompt(&mut self, id: &str, files: bool, rejected: bool) {
+        self.prompt_open = true;
+        self.prompt_id = id.to_string();
+        self.prompt_password.clear();
+        self.prompt_show = false;
+        self.prompt_remember = self.cfg.settings.remember_passwords;
+        self.prompt_files = files;
+        self.prompt_rejected = rejected;
+    }
+
+    /// Starts the viewer. A remembered password is written by the viewer only
+    /// after the other computer accepts it (`PJDESK_REMEMBER`). A password that
+    /// came from storage is marked `PJDESK_SAVED`; if it is rejected the viewer
+    /// exits 3 and this window asks again.
+    fn spawn_viewer(&mut self, id: &str, password: &str, files: bool, remember: bool, from_store: bool) {
+        let server = self.cfg.effective_server();
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(e) => {
@@ -591,12 +715,22 @@ impl App {
             }
         };
         let mut cmd = std::process::Command::new(exe);
-        cmd.arg("--server").arg(server).arg("connect").arg(&id);
+        cmd.arg("--server").arg(server).arg("connect").arg(id);
         if !password.is_empty() {
-            cmd.env("PJDESK_PASSWORD", &password);
+            cmd.env("PJDESK_PASSWORD", password);
         }
         if files {
             cmd.env("PJDESK_OPEN_PANEL", "files");
+        }
+        if from_store {
+            cmd.env("PJDESK_SAVED", "1");
+        }
+        if remember {
+            cmd.env("PJDESK_REMEMBER", "1");
+        }
+        if let Some(note) = self.cfg.settings.peers.get(id) {
+            cmd.env("PJDESK_VIEW", note.view_mode.to_string());
+            cmd.env("PJDESK_DISPLAY", note.last_display.to_string());
         }
         #[cfg(windows)]
         {
@@ -604,33 +738,35 @@ impl App {
             cmd.creation_flags(0x0800_0000);
         }
         match cmd.spawn() {
-            Ok(_) => {
-                self.mark_recent(&id);
+            Ok(mut child) => {
+                self.mark_recent(id);
                 let what = if files { "Opening file transfer for" } else { "Opening" };
-                self.toast.show(format!("{what} {}", format_id(&id)));
-                if self.remember && !password.is_empty() {
-                    self.remember_password(&id, &password);
-                }
+                self.toast.show(format!("{what} {}", format_id(id)));
+                let (tx, rx) = std::sync::mpsc::channel();
+                let id = id.to_string();
+                std::thread::spawn(move || {
+                    let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+                    let _ = tx.send((id, code, files));
+                });
+                self.viewer_rx.push(rx);
             }
             Err(e) => self.status = format!("Could not open the viewer: {e}"),
         }
     }
 
-    fn remember_password(&mut self, id: &str, password: &str) {
-        if self.cfg.account.is_some() {
-            if let Some(entry) = self.cfg.address_book.iter_mut().find(|e| e.id == id) {
-                entry.password = Some(password.to_string());
-            } else {
-                self.cfg.address_book.push(pjdesk_proto::signal::AddressEntry {
-                    id: id.to_string(),
-                    password: Some(password.to_string()),
-                    ..Default::default()
-                });
+    fn poll_viewers(&mut self) {
+        let pending = std::mem::take(&mut self.viewer_rx);
+        let mut reopen = None;
+        for rx in pending {
+            match rx.try_recv() {
+                Ok((id, code, files)) if code == 3 => reopen = Some((id, files)),
+                Ok(_) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.viewer_rx.push(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
             }
-            self.sync_address_book();
-        } else {
-            self.cfg.remember_password(id, Some(password));
-            self.save_cfg();
+        }
+        if let Some((id, files)) = reopen {
+            self.open_prompt(&id, files, true);
         }
     }
 
@@ -707,6 +843,7 @@ impl eframe::App for App {
         self.poll_login();
         self.poll_password();
         self.poll_probe();
+        self.poll_viewers();
 
         if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma)))
             && !self.show_settings
@@ -737,7 +874,11 @@ impl eframe::App for App {
             }
         }
 
-        let pending = self.login_rx.is_some() || self.change_rx.is_some() || self.lan_rx.is_some() || !self.engine.ready;
+        let pending = self.login_rx.is_some()
+            || self.change_rx.is_some()
+            || self.lan_rx.is_some()
+            || !self.viewer_rx.is_empty()
+            || !self.engine.ready;
         ctx.request_repaint_after(Duration::from_millis(if pending { 50 } else { 400 }));
 
         let p = theme::paint_ctx(&ctx);
@@ -754,6 +895,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.body(ui));
 
         self.settings_window(&ctx);
+        self.password_prompt(&ctx);
         self.login_window(&ctx);
         self.change_password_window(&ctx);
         self.poll_lan();

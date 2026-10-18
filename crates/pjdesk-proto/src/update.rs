@@ -328,6 +328,17 @@ pub fn check_server(current: &str) -> Result<Option<Available>> {
     }
 }
 
+/// The version string published at `https://pjdesk.com/api/release`.
+/// Callers cache this; it performs a network request.
+pub fn site_version() -> Result<String> {
+    let body = http_get("https://pjdesk.com/api/release")?;
+    let release: SiteRelease = serde_json::from_slice(&body).context("parsing the PJDesk release")?;
+    if release.version.is_empty() {
+        bail!("the PJDesk release feed did not name a version");
+    }
+    Ok(release.version)
+}
+
 fn check_site(current: &str) -> Result<Option<Available>> {
     let body = http_get("https://pjdesk.com/api/release")?;
     let release: SiteRelease = serde_json::from_slice(&body).context("parsing the PJDesk release")?;

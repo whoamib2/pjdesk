@@ -20,6 +20,16 @@ pub enum Icon {
     Close,
     Check,
     Alert,
+    /// Four panes of a window. Not a colored logo.
+    OsWindows,
+    /// A laptop. Not an apple.
+    OsMac,
+    /// A terminal window. Not a penguin.
+    OsLinux,
+    /// A phone. Not a robot.
+    OsAndroid,
+    /// A monitor with a question mark.
+    OsUnknown,
 }
 
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -105,7 +115,79 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.line_segment([c + Vec2::new(0.0, -s * 0.08), c + Vec2::new(0.0, s * 0.08)], stroke);
             painter.circle_filled(c + Vec2::new(0.0, s * 0.18), s * 0.045, color);
         }
+        Icon::OsWindows => four_panes(painter, c, s, color),
+        Icon::OsMac => laptop(painter, c, s, stroke, color),
+        Icon::OsLinux => terminal(painter, c, s, stroke, color),
+        Icon::OsAndroid => phone(painter, c, s, stroke, color),
+        Icon::OsUnknown => unknown_monitor(painter, c, s, stroke, color),
     }
+}
+
+fn four_panes(painter: &egui::Painter, c: Pos2, s: f32, color: Color32) {
+    let gap = (s * 0.08).max(1.5);
+    let pane = ((s * 0.82) - gap) / 2.0;
+    let origin = c - Vec2::splat(pane + gap / 2.0);
+    for row in 0..2 {
+        for col in 0..2 {
+            let r = Rect::from_min_size(
+                origin + Vec2::new(col as f32 * (pane + gap), row as f32 * (pane + gap)),
+                Vec2::splat(pane),
+            );
+            painter.rect_filled(r, CornerRadius::same(2), color);
+        }
+    }
+}
+
+fn laptop(painter: &egui::Painter, c: Pos2, s: f32, stroke: Stroke, color: Color32) {
+    let screen = Rect::from_center_size(c + Vec2::new(0.0, -s * 0.08), Vec2::new(s * 0.62, s * 0.42));
+    painter.rect_stroke(screen, CornerRadius::same(2), stroke, StrokeKind::Inside);
+    painter.rect_stroke(screen.shrink(s * 0.1), CornerRadius::same(1), Stroke::new(stroke.width * 0.6, color), StrokeKind::Inside);
+    painter.line_segment(
+        [c + Vec2::new(-s * 0.42, s * 0.24), c + Vec2::new(s * 0.42, s * 0.24)],
+        Stroke::new(stroke.width * 1.4, color),
+    );
+    painter.line_segment(
+        [c + Vec2::new(-s * 0.16, s * 0.24), c + Vec2::new(-s * 0.28, s * 0.34)],
+        stroke,
+    );
+    painter.line_segment(
+        [c + Vec2::new(s * 0.16, s * 0.24), c + Vec2::new(s * 0.28, s * 0.34)],
+        stroke,
+    );
+}
+
+fn terminal(painter: &egui::Painter, c: Pos2, s: f32, stroke: Stroke, color: Color32) {
+    let frame = Rect::from_center_size(c, Vec2::new(s * 0.78, s * 0.62));
+    painter.rect_stroke(frame, CornerRadius::same(3), stroke, StrokeKind::Inside);
+    let left = Pos2::new(frame.left() + s * 0.14, c.y + s * 0.02);
+    painter.line_segment([left + Vec2::new(0.0, -s * 0.12), left + Vec2::new(s * 0.12, 0.0)], stroke);
+    painter.line_segment([left + Vec2::new(s * 0.12, 0.0), left + Vec2::new(0.0, s * 0.12)], stroke);
+    painter.line_segment(
+        [left + Vec2::new(s * 0.2, s * 0.12), left + Vec2::new(s * 0.42, s * 0.12)],
+        Stroke::new(stroke.width, color),
+    );
+}
+
+fn phone(painter: &egui::Painter, c: Pos2, s: f32, stroke: Stroke, color: Color32) {
+    let body = Rect::from_center_size(c, Vec2::new(s * 0.46, s * 0.78));
+    painter.rect_stroke(body, CornerRadius::same((s * 0.1) as u8), stroke, StrokeKind::Inside);
+    painter.circle_stroke(c + Vec2::new(0.0, s * 0.24), s * 0.06, stroke);
+    painter.line_segment(
+        [Pos2::new(body.center().x - s * 0.08, body.top() + s * 0.08), Pos2::new(body.center().x + s * 0.08, body.top() + s * 0.08)],
+        stroke,
+    );
+    let _ = color;
+}
+
+fn unknown_monitor(painter: &egui::Painter, c: Pos2, s: f32, stroke: Stroke, color: Color32) {
+    let screen = Rect::from_center_size(c + Vec2::new(0.0, -s * 0.06), Vec2::new(s * 0.74, s * 0.5));
+    painter.rect_stroke(screen, CornerRadius::same(2), stroke, StrokeKind::Inside);
+    let q = screen.center();
+    arc(painter, q + Vec2::new(0.0, -s * 0.04), s * 0.1, 0.4, 3.4, stroke);
+    painter.line_segment([q + Vec2::new(s * 0.02, s * 0.02), q + Vec2::new(0.0, s * 0.08)], stroke);
+    painter.circle_filled(q + Vec2::new(0.0, s * 0.16), s * 0.035, color);
+    painter.line_segment([c + Vec2::new(0.0, s * 0.2), c + Vec2::new(0.0, s * 0.32)], stroke);
+    painter.line_segment([c + Vec2::new(-s * 0.16, s * 0.32), c + Vec2::new(s * 0.16, s * 0.32)], stroke);
 }
 
 fn eye(painter: &egui::Painter, c: Pos2, s: f32, color: Color32, stroke: Stroke, slashed: bool) {
