@@ -125,5 +125,8 @@ class GestureMapTest {
         assertTrue(us.spader.pjdesk.core.permanentOk("12345678"))
         assertTrue(us.spader.pjdesk.core.permanentOk("  a longer phrase  "))
         assertTrue(!us.spader.pjdesk.core.permanentOk("        "))
+        assertEquals("Use at least 8 characters.", us.spader.pjdesk.core.permanentIssue("short", "short"))
+        assertEquals("Those passwords do not match.", us.spader.pjdesk.core.permanentIssue("12345678", "12345679"))
+        assertNull(us.spader.pjdesk.core.permanentIssue("12345678", "12345678"))
     }
 }

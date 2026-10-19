@@ -36,6 +36,16 @@
                 android:value="Keeps this phone reachable as a PJDesk host and shows when it is being controlled." />
         </service>
 
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="us.spader.pjdesk.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
         <service
             android:name=".a11y.PjAccessibilityService"
             android:exported="false"

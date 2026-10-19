@@ -49,3 +49,13 @@ data class SavedComputer(
 
 fun permanentOk(password: String): Boolean =
     password.trim().codePointCount(0, password.trim().length) >= 8
+
+/** Empty when the password can be saved. Same 8-character rule as Windows. */
+fun permanentIssue(password: String, confirm: String): String? {
+    val pw = password.trim()
+    val again = confirm.trim()
+    if (pw.isEmpty()) return "Enter a password."
+    if (!permanentOk(pw)) return "Use at least 8 characters."
+    if (pw != again) return "Those passwords do not match."
+    return null
+}

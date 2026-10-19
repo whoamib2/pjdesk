@@ -87,8 +87,6 @@ class ScreenshotTest {
             onTheme = {},
             onServer = {},
             onResetFingerprint = {},
-            onPermanent = {},
-            onApproval = {},
         )
     }
 

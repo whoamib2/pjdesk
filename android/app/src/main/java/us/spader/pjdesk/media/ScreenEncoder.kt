@@ -38,24 +38,35 @@ class ScreenEncoder(
     private var bitrate = 6_000_000
     @Volatile private var running = true
 
-    fun start() {
+    fun start(onReady: () -> Unit, onFailed: (String) -> Unit) {
         handler.post {
-            val encoder = openEncoder()
-            codec = encoder
-            val input = encoder.createInputSurface()
-            surface = input
-            encoder.start()
-            display = projection.createVirtualDisplay(
-                "pjdesk",
-                width,
-                height,
-                dpi.coerceAtLeast(1),
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                input,
-                null,
-                handler,
-            )
-            drain()
+            try {
+                val encoder = openEncoder()
+                codec = encoder
+                val input = encoder.createInputSurface()
+                surface = input
+                encoder.start()
+                display = projection.createVirtualDisplay(
+                    "pjdesk",
+                    width,
+                    height,
+                    dpi.coerceAtLeast(1),
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    input,
+                    null,
+                    handler,
+                )
+                if (display == null) {
+                    onFailed("Screen capture did not start")
+                    return@post
+                }
+                Log.i(TAG, "encoder started ${width}x$height")
+                onReady()
+                drain()
+            } catch (e: Exception) {
+                Log.e(TAG, "encoder failed", e)
+                onFailed(e.message ?: "Screen capture failed")
+            }
         }
     }
 
@@ -169,7 +180,7 @@ class ScreenEncoder(
     }
 
     companion object {
-        private const val TAG = "pjdesk"
+        private const val TAG = "PJDesk"
 
         /** Even dimensions, capped by the quality preset's max width. */
         fun fit(srcW: Int, srcH: Int, maxWidth: Int): Pair<Int, Int> {

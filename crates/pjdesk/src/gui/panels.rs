@@ -352,7 +352,6 @@ impl App {
             if connect || files || enter {
                 let (id, pw) = (self.connect_id.clone(), self.connect_password.clone());
                 self.connect_to(&id, Some(pw), files);
-                self.connect_password.clear();
             }
 
             ui.add_space(12.0);

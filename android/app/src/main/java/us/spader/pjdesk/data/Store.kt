@@ -19,6 +19,11 @@ class Store(context: Context) {
         get() = prefs.getBoolean("onboarded", false)
         set(value) { prefs.edit().putBoolean("onboarded", value).apply() }
 
+    /** The screen-share prompt was completed once. Android 14+ still asks again for each session. */
+    var captureTried: Boolean
+        get() = prefs.getBoolean("captureTried", false)
+        set(value) { prefs.edit().putBoolean("captureTried", value).apply() }
+
     var theme: String
         get() = prefs.getString("theme", "system") ?: "system"
         set(value) { prefs.edit().putString("theme", value).apply() }

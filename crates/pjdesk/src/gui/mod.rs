@@ -8,8 +8,8 @@
 
 mod icons;
 mod panels;
-mod saved;
 mod probe;
+mod saved;
 mod settings;
 mod theme;
 mod tray;
@@ -331,11 +331,7 @@ impl App {
                 password: Some("saved-secret".into()),
                 ..Default::default()
             },
-            pjdesk_proto::signal::AddressEntry {
-                id: "555666777".into(),
-                alias: "Laptop".into(),
-                ..Default::default()
-            },
+            pjdesk_proto::signal::AddressEntry { id: "555666777".into(), alias: "Laptop".into(), ..Default::default() },
         ];
         let now = unix_now();
         self.cfg.settings.peers.insert(
@@ -759,8 +755,24 @@ impl App {
         let mut reopen = None;
         for rx in pending {
             match rx.try_recv() {
-                Ok((id, code, files)) if code == 3 => reopen = Some((id, files)),
-                Ok(_) => {}
+                Ok((id, code, files)) => {
+                    if code != 0 {
+                        let reason = last_session_reason().unwrap_or_else(|| {
+                            if code == 3 {
+                                "Wrong password".into()
+                            } else {
+                                "The session ended before it could start.".into()
+                            }
+                        });
+                        self.status = reason;
+                        // A saved password was rejected. Ask once, in the prompt.
+                        // Any other failure stays on this page with the reason,
+                        // and the password already typed is left in the field.
+                        if code == 3 {
+                            reopen = Some((id, files));
+                        }
+                    }
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => self.viewer_rx.push(rx),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
             }
@@ -836,6 +848,13 @@ impl App {
     }
 }
 
+fn last_session_reason() -> Option<String> {
+    let path = crate::config::Config::path().parent()?.join("last-session.txt");
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.ctx = ui.ctx().clone();
@@ -845,7 +864,8 @@ impl eframe::App for App {
         self.poll_probe();
         self.poll_viewers();
 
-        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma)))
+        if ctx
+            .input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma)))
             && !self.show_settings
         {
             self.open_settings();

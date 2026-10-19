@@ -35,6 +35,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.flow.MutableStateFlow
 import us.spader.pjdesk.a11y.PjAccessibilityService
+import us.spader.pjdesk.core.permanentIssue
 import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.media.ScreenDecoder
 import us.spader.pjdesk.service.HostService
@@ -47,23 +48,47 @@ import us.spader.pjdesk.ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
     private val captureReady = MutableStateFlow(HostService.capturing)
-    private var pendingAccept = false
+    private var pendingAccept by mutableStateOf(false)
     private var decoder: ScreenDecoder? = null
 
     private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     private val projection = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val data = result.data
+        val acceptAfter = pendingAccept
         if (result.resultCode == RESULT_OK && data != null) {
-            HostService.capture(this, result.resultCode, data)
-            captureReady.value = true
-            if (pendingAccept) {
+            if (acceptAfter) {
+                AppLog.i("screen-share consent granted for an incoming connection")
+                HostService.onCapture = { ok, reason ->
+                    runOnUiThread {
+                        HostService.onCapture = null
+                        pendingAccept = false
+                        if (ok) {
+                            captureReady.value = true
+                            app.engine.accept()
+                        } else {
+                            captureReady.value = false
+                            val text = reason.ifBlank { "Screen capture permission denied" }
+                            app.engine.showError(text)
+                            app.engine.decline(text)
+                        }
+                    }
+                }
+                HostService.capture(this, result.resultCode, data)
+            } else {
+                // The consent token is single-use on Android 14+. Remember that the
+                // prompt works, and ask again when a session actually starts.
                 pendingAccept = false
-                app.engine.accept()
+                app.store.captureTried = true
+                captureReady.value = true
+                AppLog.i("screen-share prompt completed during setup")
             }
-        } else if (pendingAccept) {
+        } else if (acceptAfter) {
             pendingAccept = false
-            app.engine.decline()
+            val text = "Screen capture permission denied"
+            AppLog.e(text)
+            app.engine.showError(text)
+            app.engine.decline(text)
         }
     }
 
@@ -73,6 +98,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         HostService.arm(this)
+        captureReady.value = HostService.capturing || app.store.captureTried
         val engine = app.engine
         engine.onVideo = { data, w, h, key -> decoder?.submit(data, w, h, key) }
         setContent {
@@ -85,6 +111,7 @@ class MainActivity : ComponentActivity() {
             var query by remember { mutableStateOf("") }
             var saved by remember { mutableStateOf(app.store.saved()) }
             var showOnboarding by remember { mutableStateOf(!app.store.onboarded) }
+            var showPermanent by remember { mutableStateOf(false) }
             val capture by captureReady.collectAsState()
             LaunchedEffect(state.error) {
                 val text = state.error ?: return@LaunchedEffect
@@ -169,6 +196,23 @@ class MainActivity : ComponentActivity() {
                                     onCopyPassword = { copy(state.password) },
                                     onRegenerate = engine::regenerate,
                                     onStop = { HostService.stop(this@MainActivity) },
+                                    showPermanent = showPermanent,
+                                    onShowPermanent = { showPermanent = it },
+                                    onSavePermanent = { password, confirm, unattended ->
+                                        val issue = permanentIssue(password, confirm)
+                                        if (issue != null) {
+                                            engine.showError(issue)
+                                        } else {
+                                            engine.setPermanent(password.trim())
+                                            engine.setApproval(if (unattended) "unattended" else "prompt")
+                                            showPermanent = false
+                                        }
+                                    },
+                                    onClearPermanent = {
+                                        engine.setPermanent("")
+                                        engine.setApproval("prompt")
+                                    },
+                                    onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
                                 )
                                 1 -> SavedScreen(
                                     computers = saved,
@@ -192,23 +236,39 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onServer = engine::setServer,
                                     onResetFingerprint = engine::resetFingerprint,
-                                    onPermanent = engine::setPermanent,
-                                    onApproval = engine::setApproval,
+                                    onSavePermanent = { password, confirm, unattended ->
+                                        val issue = permanentIssue(password, confirm)
+                                        if (issue != null) {
+                                            engine.showError(issue)
+                                        } else {
+                                            engine.setPermanent(password.trim())
+                                            engine.setApproval(if (unattended) "unattended" else "prompt")
+                                        }
+                                    },
+                                    onClearPermanent = {
+                                        engine.setPermanent("")
+                                        engine.setApproval("prompt")
+                                    },
+                                    onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
+                                    onShareLogs = { AppLog.share(this@MainActivity) },
                                 )
                             }
                         }
                     }
                 }
-                state.incoming?.let { incoming ->
+                val incoming = state.incoming
+                if (incoming != null && !pendingAccept) {
                     AlertDialog(
-                        onDismissRequest = { engine.decline() },
+                        onDismissRequest = { if (!pendingAccept) engine.decline() },
                         title = { Text("Allow control?") },
                         text = { Text("${incoming.name.ifBlank { "Someone" }} (${incoming.ip}) wants to control this phone.") },
                         confirmButton = {
                             TextButton(onClick = { askProjection(acceptAfter = true) }) { Text("Allow") }
                         },
                         dismissButton = {
-                            TextButton(onClick = { engine.decline() }) { Text("Decline") }
+                            TextButton(onClick = {
+                                if (!pendingAccept) engine.decline()
+                            }) { Text("Decline") }
                         },
                     )
                 }
@@ -218,7 +278,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        captureReady.value = HostService.capturing
+        captureReady.value = HostService.capturing || app.store.captureTried
     }
 
     override fun onDestroy() {
@@ -236,11 +296,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun askProjection(acceptAfter: Boolean) {
-        if (HostService.capturing) {
-            if (acceptAfter) app.engine.accept()
-            return
-        }
+        // Android 14 and later consume each consent on one virtual display.
+        // Always ask again for a real session, including when setup already did.
         pendingAccept = acceptAfter
+        AppLog.i(if (acceptAfter) "asking to share the screen for an incoming connection" else "asking to share the screen during setup")
         val manager = getSystemService(MediaProjectionManager::class.java)
         projection.launch(manager.createScreenCaptureIntent())
     }

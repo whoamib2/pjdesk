@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-* Android app (`android/`, version 0.6.0) is a host and a controller. It shares `pjdesk-proto` and the relay through `pjdesk-link` and `pjdesk-mobile`. Video stays H.264 Annex-B: MediaCodec encodes on Android, and the Windows client keeps decoding with OpenH264. Android hosts accept taps, swipes, pinch, Back, Home, Recents, volume, and typed text. The Windows viewer maps mouse and scroll onto those gestures when the remote reports `android`.
+* Android 0.6.1. The debug build no longer installs a second launcher icon. Home and Settings have Set permanent password (confirm field, Show/Hide, at least 8 characters) and Accept with password without asking. A Windows connection asks for screen sharing when you tap Allow, keeps the session up after that consent, and shows the real reason if it ends. Logs are tag `PJDesk` and a file you can share from Settings. The Windows viewer writes the same failures to `%APPDATA%\PJDesk\pjdesk.log` and does not ask for the password again unless it was wrong.
+* Android app (`android/`, version 0.6.1) is a host and a controller. It shares `pjdesk-proto` and the relay through `pjdesk-link` and `pjdesk-mobile`. Video stays H.264 Annex-B: MediaCodec encodes on Android, and the Windows client keeps decoding with OpenH264. Android hosts accept taps, swipes, pinch, Back, Home, Recents, volume, and typed text. The Windows viewer maps mouse and scroll onto those gestures when the remote reports `android`.
 
 ## 0.5.2
 

@@ -24,7 +24,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.DeskState
-import us.spader.pjdesk.core.permanentOk
 
 @Composable
 fun SettingsScreen(
@@ -33,11 +32,12 @@ fun SettingsScreen(
     onTheme: (String) -> Unit,
     onServer: (String) -> Unit,
     onResetFingerprint: () -> Unit,
-    onPermanent: (String) -> Unit,
-    onApproval: (String) -> Unit,
+    onSavePermanent: (String, String, Boolean) -> Unit = { _, _, _ -> },
+    onClearPermanent: () -> Unit = {},
+    onUnattended: (Boolean) -> Unit = {},
+    onShareLogs: () -> Unit = {},
 ) {
     var server by rememberSaveable(state.server) { mutableStateOf(state.server) }
-    var permanent by rememberSaveable { mutableStateOf("") }
     Column(
         Modifier
             .fillMaxSize()
@@ -65,33 +65,14 @@ fun SettingsScreen(
             TextButton(onClick = onResetFingerprint) { Text("Forget pinned key") }
         }
         Section("Security") {
-            Text(
-                "One-time password is on the home screen. A permanent password lets you leave this phone unattended. It has to be at least 8 characters.",
-                color = pjMuted(),
+            Text("Set permanent password", style = MaterialTheme.typography.titleMedium)
+            PermanentPasswordForm(
+                hasPermanent = state.hasPermanent,
+                unattended = state.approval == "unattended",
+                onSave = onSavePermanent,
+                onClear = onClearPermanent,
+                onUnattended = onUnattended,
             )
-            SecretField(value = permanent, onValueChange = { permanent = it }, label = "Permanent password")
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { onPermanent(permanent) }, enabled = permanentOk(permanent)) { Text("Save") }
-                TextButton(onClick = { permanent = ""; onPermanent("") }) { Text("Clear") }
-            }
-            if (permanent.isNotEmpty() && !permanentOk(permanent)) {
-                Text("Use at least 8 characters.", color = MaterialTheme.colorScheme.error)
-            }
-            Text(if (state.hasPermanent) "A permanent password is set." else "No permanent password.", color = pjMuted())
-            Text("When someone connects", style = MaterialTheme.typography.titleMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(
-                    selected = state.approval != "unattended",
-                    onClick = { onApproval("prompt") },
-                    label = { Text("Ask me") },
-                )
-                FilterChip(
-                    selected = state.approval == "unattended",
-                    onClick = { onApproval("unattended") },
-                    enabled = state.hasPermanent,
-                    label = { Text("Use the permanent password") },
-                )
-            }
         }
         Section("Display") {
             Text("Theme", color = pjMuted())
@@ -102,11 +83,12 @@ fun SettingsScreen(
             }
         }
         Section("About") {
-            Text("PJDesk 0.6.0", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.1", style = MaterialTheme.typography.titleMedium)
             Text(
                 "Android host and controller. Video is H.264 Annex-B from the hardware encoder, the same stream the Windows client decodes with OpenH264. The server default is pjdesk.spader.us:21200.",
                 color = pjMuted(),
             )
+            TextButton(onClick = onShareLogs) { Text("Share logs") }
         }
     }
 }

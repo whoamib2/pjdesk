@@ -322,7 +322,9 @@ fn main() {
         Some(_) => {
             init_logging();
             if let Err(e) = run(cli) {
-                eprintln!("\nError: {e:#}");
+                let text = format!("{e:#}");
+                note_failure(&text);
+                eprintln!("\nError: {text}");
                 std::process::exit(1);
             }
         }
@@ -597,20 +599,19 @@ fn interactive(mut config: Config, server_flag: Option<String>) -> Result<()> {
 }
 
 fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn,quinn_proto=warn,rustls=warn"));
-    let _ =
-        tracing_subscriber::fmt().with_env_filter(filter).with_target(false).with_writer(std::io::stderr).try_init();
+    init_log_file("info,quinn=warn,quinn_proto=warn,rustls=warn");
 }
 
 /// GUI logging goes to a rolling file under the config folder, since there may
-/// be no console attached.
+/// be no console attached. The viewer process uses the same file, so a failed
+/// connection shows up in `%APPDATA%\\PJDesk\\pjdesk.log`.
 fn init_gui_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(
-            "info,quinn=warn,quinn_proto=warn,rustls=warn,wgpu=warn,naga=warn,eframe=warn,egui_wgpu=warn",
-        )
-    });
+    init_log_file("info,quinn=warn,quinn_proto=warn,rustls=warn,wgpu=warn,naga=warn,eframe=warn,egui_wgpu=warn");
+}
+
+fn init_log_file(default_filter: &str) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
     let builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
     if let Some(dir) = Config::path().parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -620,6 +621,15 @@ fn init_gui_logging() {
         }
     }
     let _ = builder.with_writer(std::io::stderr).try_init();
+}
+
+/// Writes the reason a viewer or connect command stopped, next to pjdesk.log.
+fn note_failure(text: &str) {
+    tracing::error!("session failed: {text}");
+    if let Some(dir) = Config::path().parent() {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(dir.join("last-session.txt"), text);
+    }
 }
 
 /// Best-effort name of this computer, shown to the other side.

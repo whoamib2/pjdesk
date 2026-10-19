@@ -33,6 +33,11 @@ fun HomeScreen(
     onCopyPassword: () -> Unit,
     onRegenerate: () -> Unit,
     onStop: () -> Unit,
+    showPermanent: Boolean = false,
+    onShowPermanent: (Boolean) -> Unit = {},
+    onSavePermanent: (String, String, Boolean) -> Unit = { _, _, _ -> },
+    onClearPermanent: () -> Unit = {},
+    onUnattended: (Boolean) -> Unit = {},
 ) {
     Column(
         modifier = Modifier
@@ -74,7 +79,19 @@ fun HomeScreen(
                     TextButton(onClick = onRegenerate) { Text("New password") }
                 }
                 if (state.hasPermanent) {
-                    Text("A permanent password is also set.", color = pjMuted(), style = MaterialTheme.typography.bodyMedium)
+                    Text("A permanent password is set.", color = pjMuted(), style = MaterialTheme.typography.bodyMedium)
+                }
+                TextButton(onClick = { onShowPermanent(!showPermanent) }) {
+                    Text(if (showPermanent) "Hide permanent password" else "Set permanent password")
+                }
+                if (showPermanent) {
+                    PermanentPasswordForm(
+                        hasPermanent = state.hasPermanent,
+                        unattended = state.approval == "unattended",
+                        onSave = onSavePermanent,
+                        onClear = onClearPermanent,
+                        onUnattended = onUnattended,
+                    )
                 }
             }
         }

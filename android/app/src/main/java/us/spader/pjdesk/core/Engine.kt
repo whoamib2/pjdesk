@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import us.spader.pjdesk.AppLog
 import us.spader.pjdesk.data.Store
 import us.spader.pjdesk.input.GestureMap
 import us.spader.pjdesk.service.RemoteControl
@@ -57,9 +58,25 @@ class Engine(context: Context) : EngineListener {
         JSONObject().put("cmd", "connect").put("id", id).put("password", password).toString(),
     )
 
-    fun accept() = command("""{"cmd":"accept"}""")
-    fun decline() = command("""{"cmd":"decline"}""")
-    fun stop() = command("""{"cmd":"stop"}""")
+    fun accept() {
+        AppLog.i("accepting incoming connection")
+        command("""{"cmd":"accept"}""")
+    }
+
+    fun decline(reason: String = "the person at this phone declined") {
+        AppLog.i("declining incoming connection: $reason")
+        command(JSONObject().put("cmd", "decline").put("reason", reason).toString())
+    }
+
+    fun stop(reason: String = "stopped") {
+        AppLog.i("stopping the session: $reason")
+        command(JSONObject().put("cmd", "stop").put("reason", reason).toString())
+    }
+
+    fun showError(text: String) {
+        AppLog.e(text)
+        update { it.copy(error = text, status = text) }
+    }
 
     fun gesture(g: GestureMap.Gesture) {
         val x = JSONArray()
@@ -132,7 +149,10 @@ class Engine(context: Context) : EngineListener {
     }
 
     private fun apply(event: JSONObject) {
-        when (event.optString("event")) {
+        val kind = event.optString("event")
+        if (kind != "log") AppLog.i("event $kind ${event.optString("text")} ${event.optString("reason")}")
+        when (kind) {
+            "log" -> AppLog.i(event.optString("text"))
             "registered" -> update {
                 it.copy(
                     id = event.optString("id"),

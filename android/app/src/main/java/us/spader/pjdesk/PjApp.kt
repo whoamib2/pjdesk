@@ -12,6 +12,7 @@ class PjApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        AppLog.init(this)
         store = Store(this)
         engine = Engine(this)
         engine.start()

@@ -56,7 +56,7 @@ fun OnboardingScreen(
         Step(
             index = "3",
             title = "Screen sharing",
-            body = "The picture is captured with MediaProjection, inside a foreground service. Android shows a system consent. The consent does not survive a reboot: open PJDesk again and allow the screen once more.",
+            body = "Android shows a system consent. On Android 14 and later that consent is used once, so PJDesk asks again when someone connects. This step only checks that the prompt appears.",
             done = captureReady,
             action = "Share the screen",
             onAction = onCapture,

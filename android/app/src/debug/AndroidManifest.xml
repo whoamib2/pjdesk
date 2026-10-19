@@ -1,15 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Compose screenshot tests launch this empty activity. It is debug-only. -->
+    <!--
+      Compose screenshot tests start this empty activity with Robolectric.
+      It is not a launcher. A MAIN/LAUNCHER filter here shows a second PJDesk
+      icon on a real phone, which is the debug APK people sideload.
+    -->
     <application>
         <activity
             android:name="androidx.activity.ComponentActivity"
-            android:exported="true"
-            android:theme="@style/Theme.PjDesk">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+            android:exported="false"
+            android:theme="@style/Theme.PjDesk" />
     </application>
 </manifest>

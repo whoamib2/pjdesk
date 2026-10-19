@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use pjdesk_link::p2p::{self, LinkPath};
 use pjdesk_link::session::{self, WrongPassword};
 use pjdesk_link::signal::{ServerAddr, SignalClient};
@@ -33,7 +33,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.0";
+pub const APP_VERSION: &str = "0.6.1";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -79,7 +79,8 @@ struct State {
     capture: Mutex<(u16, u16)>,
     /// Bumped to end the current session. The host registration keeps running.
     gen: AtomicU64,
-    approval_tx: Mutex<Option<oneshot::Sender<bool>>>,
+    approval_tx: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
+    end_reason: Mutex<String>,
     control: Mutex<Option<mpsc::UnboundedSender<ControlMsg>>>,
     video: Mutex<Option<Arc<VideoOut>>>,
     app_stop: AtomicBool,
@@ -130,6 +131,7 @@ impl Engine {
             capture: Mutex::new((1080, 2400)),
             gen: AtomicU64::new(1),
             approval_tx: Mutex::new(None),
+            end_reason: Mutex::new(String::new()),
             control: Mutex::new(None),
             video: Mutex::new(None),
             app_stop: AtomicBool::new(false),
@@ -246,6 +248,12 @@ fn emit(cb: &Arc<dyn Callbacks>, value: &Value) {
     cb.on_event(&value.to_string());
 }
 
+fn log_line(cb: &Arc<dyn Callbacks>, text: impl AsRef<str>) {
+    let text = text.as_ref();
+    info!("{text}");
+    emit(cb, &json!({"event":"log","text": text}));
+}
+
 async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
     let name = cmd.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
     match name {
@@ -318,20 +326,27 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             });
         }
         "accept" => {
+            log_line(cb, "approval: allow");
             if let Some(tx) = state.approval_tx.lock().unwrap().take() {
-                let _ = tx.send(true);
+                let _ = tx.send(Ok(()));
             }
         }
         "decline" => {
+            let reason = cmd.get("reason").and_then(|v| v.as_str()).unwrap_or("the person at this phone declined");
+            let reason = reason.chars().take(200).collect::<String>();
+            log_line(cb, format!("approval: decline ({reason})"));
             if let Some(tx) = state.approval_tx.lock().unwrap().take() {
-                let _ = tx.send(false);
+                let _ = tx.send(Err(reason));
             }
         }
         "stop" => {
+            let reason = cmd.get("reason").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("stopped");
+            let reason = reason.chars().take(200).collect::<String>();
+            *state.end_reason.lock().unwrap() = reason.clone();
             state.gen.fetch_add(1, Ordering::SeqCst);
             *state.control.lock().unwrap() = None;
             *state.video.lock().unwrap() = None;
-            emit(cb, &json!({"event":"disconnected","role":"session","reason":"stopped"}));
+            emit(cb, &json!({"event":"disconnected","role":"session","reason": reason}));
         }
         "text" => {
             let chars = cmd.get("chars").and_then(|v| v.as_str()).unwrap_or("");
@@ -482,36 +497,46 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
                 let Some(msg) = msg else { return Ok(()) };
                 match msg {
                     ServerMsg::Registered { device_id } => {
-                        *state.device_id.lock().unwrap() = Some(device_id);
+                        *state.device_id.lock().unwrap() = Some(device_id.clone());
                         persist(&state);
                         publish(&state, &cb);
+                        log_line(&cb, format!("registered as {}", format_id(&device_id)));
                         emit(&cb, &json!({"event":"status","text":"Online"}));
                     }
                     ServerMsg::Policy(policy) => {
                         *state.policy.lock().unwrap() = policy;
                     }
                     ServerMsg::IncomingSession { session_id, token, udp_port, controller_name, controller_ip } => {
+                        log_line(&cb, format!("incoming connection from {controller_name} ({controller_ip})"));
                         let approved = match approve(&state, &cb, &controller_name, &controller_ip).await {
-                            Some(bits) => bits,
-                            None => {
+                            Approval::Yes(bits) => bits,
+                            Approval::No(reason) => {
+                                log_line(&cb, format!("incoming connection refused: {reason}"));
                                 let _ = signal.send(ClientMsg::SessionResponse {
                                     session_id,
                                     accept: false,
-                                    reason: "the person at this phone declined".into(),
+                                    reason,
                                 });
                                 continue;
                             }
                         };
+                        log_line(&cb, "incoming connection accepted, opening the media session");
                         signal.send(ClientMsg::SessionResponse { session_id, accept: true, reason: String::new() })?;
                         let (tx, rx) = mpsc::unbounded_channel();
                         let server_udp = SocketAddr::new(server_ip, udp_port);
                         let (state, cb, signal_tx) = (state.clone(), cb.clone(), signal.sender());
                         routes.insert(session_id, tx);
                         tokio::spawn(async move {
-                            if let Err(e) = host_session(state, cb.clone(), signal_tx, rx, session_id, token, server_udp, approved).await {
-                                warn!("android host session: {e:#}");
-                                emit(&cb, &json!({"event":"disconnected","role":"host","reason": format!("{e:#}")}));
-                            }
+                            let ended = host_session(state.clone(), cb.clone(), signal_tx, rx, session_id, token, server_udp, approved).await;
+                            let reason = match &ended {
+                                Ok(()) => {
+                                    let saved = state.end_reason.lock().unwrap().clone();
+                                    if saved.is_empty() { "session ended".to_string() } else { saved }
+                                }
+                                Err(e) => format!("{e:#}"),
+                            };
+                            log_line(&cb, format!("host session ended: {reason}"));
+                            emit(&cb, &json!({"event":"disconnected","role":"host","reason": reason}));
                         });
                     }
                     ServerMsg::PeerInfo { session_id, public_addr, local_addrs, cert_fingerprint } => {
@@ -532,7 +557,12 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
     }
 }
 
-async fn approve(state: &State, cb: &Arc<dyn Callbacks>, name: &str, ip: &str) -> Option<u32> {
+enum Approval {
+    Yes(u32),
+    No(String),
+}
+
+async fn approve(state: &State, cb: &Arc<dyn Callbacks>, name: &str, ip: &str) -> Approval {
     let policy = state.policy.lock().unwrap().clone();
     let permanent = state.permanent.lock().unwrap().is_some();
     let unattended_mode = state.approval.lock().unwrap().as_str() == "unattended";
@@ -540,10 +570,16 @@ async fn approve(state: &State, cb: &Arc<dyn Callbacks>, name: &str, ip: &str) -
     let restricted = grant(perms::UNATTENDED_DEFAULT, policy.max_permissions, false);
     let unattended_ok = permanent && policy.unattended_allowed && !policy.force_prompt;
     if !prompt {
-        return unattended_ok.then_some(restricted);
+        return if unattended_ok {
+            log_line(cb, "accepting with the permanent password, without asking");
+            Approval::Yes(restricted)
+        } else {
+            Approval::No("unattended access is not allowed".into())
+        };
     }
     let (tx, rx) = oneshot::channel();
     *state.approval_tx.lock().unwrap() = Some(tx);
+    log_line(cb, format!("waiting for approval from {name}"));
     emit(
         cb,
         &json!({
@@ -552,12 +588,21 @@ async fn approve(state: &State, cb: &Arc<dyn Callbacks>, name: &str, ip: &str) -
             "ip": ip,
         }),
     );
-    let answer = tokio::time::timeout(Duration::from_secs(45), rx).await;
+    // Long enough to cover the Allow button and the Android screen-share consent.
+    let answer = tokio::time::timeout(Duration::from_secs(90), rx).await;
     *state.approval_tx.lock().unwrap() = None;
     match answer {
-        Ok(Ok(true)) => Some(grant(perms::KEYBOARD | perms::MOUSE, policy.max_permissions, false)),
-        Ok(Ok(false)) => None,
-        _ => unattended_ok.then_some(restricted),
+        Ok(Ok(Ok(()))) => Approval::Yes(grant(perms::KEYBOARD | perms::MOUSE, policy.max_permissions, false)),
+        Ok(Ok(Err(reason))) => Approval::No(reason),
+        Ok(Err(_)) => Approval::No("the approval prompt closed".into()),
+        Err(_) => {
+            if unattended_ok {
+                log_line(cb, "approval timed out; accepting with the permanent password");
+                Approval::Yes(restricted)
+            } else {
+                Approval::No("nobody approved the connection in time".into())
+            }
+        }
     }
 }
 
@@ -573,6 +618,7 @@ async fn host_session(
     ceiling: u32,
 ) -> Result<()> {
     let gen = state.gen.load(Ordering::SeqCst);
+    *state.end_reason.lock().unwrap() = String::new();
     let binding = p2p::bind_udp(server_udp, session_id, token, Role::Host).await?;
     let endpoint = p2p::host_endpoint(binding.socket, &state.identity)?;
     signal.send(ClientMsg::UdpReady {
@@ -587,9 +633,18 @@ async fn host_session(
     let targets = p2p::candidates(peer_public, &peer_local);
     let punching = p2p::spawn_punching(binding.punch_socket, targets, session_id, Duration::from_secs(8));
     let passwords = auth_passwords(&state);
+    log_line(
+        &cb,
+        format!("checking the password ({} slot{})", passwords.len(), if passwords.len() == 1 { "" } else { "s" }),
+    );
     let accepted = accept_authenticated(&endpoint, &passwords, &state.hostname).await;
     punching.abort();
-    let (connection, auth) = accepted?;
+    let (connection, auth) = match accepted {
+        Ok(done) => done,
+        Err(e) if e.is::<WrongPassword>() => bail!("Wrong password"),
+        Err(e) => return Err(e),
+    };
+    log_line(&cb, format!("password accepted for {}", auth.peer_name));
     if state.gen.load(Ordering::SeqCst) != gen {
         connection.close(0u32.into(), b"stopped");
         bail!("stopped");
@@ -652,7 +707,14 @@ async fn host_session(
         .await;
         let msg = match msg {
             Ok(Ok(msg)) => msg,
-            Ok(Err(_)) => break Ok(()),
+            Ok(Err(e)) => {
+                let reason = if connection.close_reason().is_some() {
+                    "the other computer closed the session".to_string()
+                } else {
+                    format!("the control stream closed: {e:#}")
+                };
+                break Err(anyhow!(reason));
+            }
             Err(_) => {
                 // Idle phones still send frames. A quiet control stream is fine
                 // as long as the QUIC connection is up.
@@ -712,7 +774,6 @@ async fn host_session(
     video_task.abort();
     *state.video.lock().unwrap() = None;
     connection.close(0u32.into(), b"session ended");
-    emit(&cb, &json!({"event":"disconnected","role":"host","reason":"session ended"}));
     result
 }
 
@@ -862,6 +923,7 @@ async fn controller_session(
     password: &str,
     gen: u64,
 ) -> Result<()> {
+    *state.end_reason.lock().unwrap() = String::new();
     emit(&cb, &json!({"event":"status","text": format!("Connecting to {}", format_id(target))}));
     let server = ServerAddr::parse(&state.server.lock().unwrap())?;
     let pinned = state.fingerprint.lock().unwrap().clone().and_then(|s| pjdesk_proto::tls::parse_fingerprint(&s).ok());
@@ -879,9 +941,10 @@ async fn controller_session(
         if state.gen.load(Ordering::SeqCst) != gen {
             bail!("stopped");
         }
-        match tokio::time::timeout(Duration::from_secs(30), signal.recv()).await {
+        match tokio::time::timeout(Duration::from_secs(90), signal.recv()).await {
             Ok(Some(ServerMsg::SessionReady { session_id, token, udp_port, host_name })) => {
-                break (session_id, token, udp_port, host_name)
+                log_line(&cb, format!("the other computer accepted, session {session_id:x}"));
+                break (session_id, token, udp_port, host_name);
             }
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
             Ok(Some(_)) => continue,
@@ -988,9 +1051,10 @@ async fn controller_session(
     });
     let mut platform = String::new();
     let mut layout = false;
-    loop {
+    let end_reason = loop {
         if state.gen.load(Ordering::SeqCst) != gen || state.app_stop.load(Ordering::SeqCst) {
-            break;
+            let saved = state.end_reason.lock().unwrap().clone();
+            break if saved.is_empty() { "stopped".to_string() } else { saved };
         }
         match read_msg::<_, HostMsg>(&mut control_recv, MAX_CONTROL_FRAME).await {
             Ok(HostMsg::Platform { family, version }) => {
@@ -1021,14 +1085,21 @@ async fn controller_session(
                 emit(&cb, &json!({"event":"status","text": format!("{what}: {reason}")}))
             }
             Ok(_) => {}
-            Err(_) => break,
+            Err(e) => {
+                break if connection.close_reason().is_some() {
+                    "the other computer closed the session".to_string()
+                } else {
+                    format!("the control stream closed: {e:#}")
+                };
+            }
         }
-    }
+    };
     writer.abort();
     video_task.abort();
     *state.control.lock().unwrap() = None;
     connection.close(0u32.into(), b"viewer closed");
-    emit(&cb, &json!({"event":"disconnected","role":"controller","reason":"session ended"}));
+    log_line(&cb, format!("controller session ended: {end_reason}"));
+    emit(&cb, &json!({"event":"disconnected","role":"controller","reason": end_reason}));
     Ok(())
 }
 
