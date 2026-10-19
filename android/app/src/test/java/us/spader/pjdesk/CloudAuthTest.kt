@@ -3,6 +3,7 @@ package us.spader.pjdesk
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -13,6 +14,15 @@ import us.spader.pjdesk.core.SavedComputer
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
 class CloudAuthTest {
+    @Test
+    fun onlyTheOwnerWithAPinnedServerIsOfferedThatServer() {
+        val fp = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        assertTrue(CloudAuth.offerCurrentServer("owner", "pjdesk.spader.us:21200", fp))
+        assertFalse(CloudAuth.offerCurrentServer("member", "pjdesk.spader.us:21200", fp))
+        assertFalse(CloudAuth.offerCurrentServer("owner", "", fp))
+        assertFalse(CloudAuth.offerCurrentServer("owner", "pjdesk.spader.us:21200", ""))
+    }
+
     @Test
     fun canonicalMatchesTheSharedFixture() {
         val text = CloudAuth.canonical(

@@ -246,7 +246,11 @@ pub struct App {
     net_busy: bool,
     net_error: String,
     show_net_sign_in: bool,
-    net_rx: Option<Receiver<Result<crate::network::Session, String>>>,
+    /// The signed-in account owns an empty network and this computer already has a server.
+    net_offer: bool,
+    /// Login token for that offer. Not saved and not logged.
+    net_login: String,
+    net_rx: Option<Receiver<Result<crate::network::SignIn, String>>>,
     /// Network key waiting in the import dialog. Not logged.
     import_blob: Option<String>,
     import_pass: String,
@@ -344,6 +348,8 @@ impl App {
             net_busy: false,
             net_error: String::new(),
             show_net_sign_in: false,
+            net_offer: false,
+            net_login: String::new(),
             net_rx: None,
             import_blob: None,
             import_pass: String::new(),
@@ -490,6 +496,17 @@ impl App {
         self.net_show = false;
         self.net_mode = 0;
         self.show_net_sign_in = true;
+    }
+
+    #[cfg(feature = "ui-shots")]
+    fn load_empty_network_preview(&mut self) {
+        self.load_sign_in_preview();
+        self.cfg.server = Some(pjdesk_proto::LEGACY_REGISTERED_SERVER.into());
+        self.cfg.device_id = Some("123456789".into());
+        self.cfg.server_fingerprint = Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into());
+        self.net_error = crate::network::NO_SERVER.into();
+        self.net_offer = true;
+        self.net_login = "preview".into();
     }
 
     #[cfg(feature = "ui-shots")]
@@ -743,9 +760,20 @@ impl App {
     fn poll_network(&mut self) {
         let Some(rx) = &self.net_rx else { return };
         match rx.try_recv() {
-            Ok(Ok(session)) => {
+            Ok(Ok(crate::network::SignIn::NoServer { role, login_token })) => {
                 self.net_busy = false;
                 self.net_rx = None;
+                self.net_error = crate::network::NO_SERVER.to_string();
+                let server = self.cfg.effective_server();
+                let fingerprint = self.cfg.server_fingerprint.clone().unwrap_or_default();
+                self.net_offer = crate::network::offer_current_server(&role, &server, &fingerprint);
+                self.net_login = if self.net_offer { login_token } else { String::new() };
+            }
+            Ok(Ok(crate::network::SignIn::Ready(session))) => {
+                self.net_busy = false;
+                self.net_rx = None;
+                self.net_offer = false;
+                self.net_login.clear();
                 if let Some(blob) = self.pending_blob.take().or_else(|| pjdesk_proto::netkey::blob_from_text(&self.net_blob)) {
                     self.cfg.network_key = Some(blob);
                     crate::network::clear_installer_network_key();
@@ -790,6 +818,8 @@ impl App {
                     self.net_mode = 2;
                     self.net_key_account = true;
                 }
+                self.net_offer = false;
+                self.net_login.clear();
                 self.net_error = e;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -810,12 +840,14 @@ impl App {
         self.net_rx = Some(rx);
         self.net_busy = true;
         self.net_error.clear();
+        self.net_offer = false;
+        self.net_login.clear();
         if self.net_mode == 1 {
             let code = self.net_code.clone();
             std::thread::Builder::new()
                 .name("network-sign-in".into())
                 .spawn(move || {
-                    let result = crate::network::enroll(&code, &device, &name).map_err(|e| e.to_string());
+                    let result = crate::network::enroll(&code, &device, &name).map(crate::network::SignIn::Ready).map_err(|e| e.to_string());
                     let _ = tx.send(result);
                 })
                 .ok();
@@ -832,7 +864,7 @@ impl App {
                 .name("network-sign-in".into())
                 .spawn(move || {
                     let creds = if account { Some((email.as_str(), password.as_str())) } else { None };
-                    let result = crate::network::redeem(&blob, &passphrase, &device, &name, creds).map_err(|e| e.to_string());
+                    let result = crate::network::redeem(&blob, &passphrase, &device, &name, creds).map(crate::network::SignIn::Ready).map_err(|e| e.to_string());
                     let _ = tx.send(result);
                 })
                 .ok();
@@ -847,6 +879,30 @@ impl App {
                 })
                 .ok();
         }
+    }
+
+    fn claim_current_server(&mut self) {
+        if self.net_busy || self.net_login.is_empty() {
+            return;
+        }
+        let token = std::mem::take(&mut self.net_login);
+        let address = self.cfg.effective_server();
+        let fingerprint = self.cfg.server_fingerprint.clone().unwrap_or_default();
+        let device = self.cfg.network_device();
+        let name = crate::hostname();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.net_rx = Some(rx);
+        self.net_busy = true;
+        self.net_error.clear();
+        std::thread::Builder::new()
+            .name("network-claim".into())
+            .spawn(move || {
+                let result = crate::network::claim_current_server(&token, &address, &fingerprint, &device, &name)
+                    .map(crate::network::SignIn::Ready)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            })
+            .ok();
     }
 
     /// Applies a network key carried by the installer file name or `--config`.

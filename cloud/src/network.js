@@ -63,6 +63,119 @@ export function canonical({ email, networkId, fingerprints, deviceId, exp }) {
 
 /** Mirrors the server's admit() for the pure cases the Worker can see. */
 /** Why a network key cannot be redeemed. Null means it can. Matches pjdesk-proto. */
+export const NO_SERVER_MESSAGE =
+  "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Admin → My network.";
+
+function hostOf(address) {
+  const text = String(address || "").trim();
+  if (!text) return "";
+  if (text.startsWith("[")) {
+    const end = text.indexOf("]");
+    return end > 1 ? text.slice(1, end) : "";
+  }
+  const v4 = text.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/);
+  if (v4) return v4[1];
+  if (text.includes(":") && /^\d+$/.test(text.slice(text.lastIndexOf(":") + 1))) {
+    return text.slice(0, text.lastIndexOf(":"));
+  }
+  return text;
+}
+
+/** A hostname is not private. A LAN, loopback, link-local, or CGNAT address is. */
+export function isPrivateAddress(address) {
+  const host = hostOf(address);
+  if (!host) return false;
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const n = m.slice(1).map(Number);
+    if (n.some((part) => part > 255)) return true;
+    const [a, b] = n;
+    if (a === 0 || a === 10 || a === 127 || a === 255) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    return false;
+  }
+  const lower = host.toLowerCase();
+  if (lower === "::1" || lower === "::") return true;
+  if (lower.startsWith("fe80:") || lower.startsWith("fc") || lower.startsWith("fd")) return true;
+  return false;
+}
+
+/**
+ * What an owner's server may write. A non-owner never writes. A different
+ * fingerprint is kept unless `replace` is set. A private address is kept
+ * unless `confirm` is set. Moving off a slot this server already holds is
+ * applied even when the new slot needs confirmation.
+ */
+export function planRegistration({
+  owner,
+  role,
+  address,
+  fingerprint,
+  confirm,
+  replace,
+  activeAddress,
+  activeFingerprint,
+  standbyAddress,
+  standbyFingerprint,
+}) {
+  const slot = role === "standby" ? "standby" : role === "active" ? "active" : "";
+  if (!slot) return { status: 400, error: "Say whether this server is active or on standby." };
+  if (!owner) return { status: 403, error: "Only the network owner can register a server." };
+  const fp = normalizeFingerprint(fingerprint);
+  if (!fp) return { status: 400, error: "This server has no key fingerprint." };
+  const nextAddress = String(address || "").trim().slice(0, 200);
+  if (!nextAddress) return { status: 400, error: "Set the public address in the PJDesk Server window." };
+  if (isPrivateAddress(nextAddress) && !confirm) {
+    return {
+      status: 400,
+      error: "Confirm the public address in the PJDesk Server window. A local network address is not published on its own.",
+    };
+  }
+  const current = {
+    activeAddress: String(activeAddress || ""),
+    activeFingerprint: normalizeFingerprint(activeFingerprint),
+    standbyAddress: String(standbyAddress || ""),
+    standbyFingerprint: normalizeFingerprint(standbyFingerprint),
+  };
+  const next = { ...current };
+  const changes = [];
+  const other = slot === "active" ? "standby" : "active";
+  const otherFp = current[`${other}Fingerprint`];
+  if (otherFp && otherFp === fp) {
+    next[`${other}Address`] = "";
+    next[`${other}Fingerprint`] = "";
+    changes.push({ action: `clear-${other}`, detail: "This server changed role." });
+  }
+  const slotAddr = current[`${slot}Address`].trim();
+  const slotFp = current[`${slot}Fingerprint`];
+  const differentFp = slotFp !== "" && slotFp !== fp;
+  const differentAddr = slotAddr !== "" && slotAddr !== nextAddress;
+  if (!replace && (differentFp || (slotFp === "" && differentAddr))) {
+    return {
+      status: changes.length ? 200 : 409,
+      needsConfirm: true,
+      error: "My network already lists a different server. Confirm in the PJDesk Server window to replace it.",
+      changed: changes.length > 0,
+      next,
+      changes,
+    };
+  }
+  next[`${slot}Address`] = nextAddress;
+  next[`${slot}Fingerprint`] = fp;
+  const changed =
+    next.activeAddress !== current.activeAddress ||
+    next.activeFingerprint !== current.activeFingerprint ||
+    next.standbyAddress !== current.standbyAddress ||
+    next.standbyFingerprint !== current.standbyFingerprint;
+  if (next[`${slot}Address`] !== current[`${slot}Address`] || next[`${slot}Fingerprint`] !== current[`${slot}Fingerprint`]) {
+    changes.unshift({ action: `register-${slot}`, detail: nextAddress });
+  }
+  return { status: 200, changed, next, changes };
+}
+
 export function inviteError({ revoked, expiresAt, uses, maxUses, now, boundEmail, callerEmail }) {
   if (revoked) return "This network key was revoked.";
   if (expiresAt != null && now >= expiresAt) return "This network key has expired.";
@@ -273,7 +386,7 @@ function validDevice(id) {
 
 async function issue(env, account, network, deviceId, deviceName, computers) {
   if (!validDevice(deviceId)) throw new HttpError(400, "This device needs an id.");
-  if (!network.active_address) throw new HttpError(400, "Set the server address in My network first.");
+  if (!network.active_address) throw new HttpError(400, NO_SERVER_MESSAGE);
   const { access, exp } = await signToken(env, { email: account.email, network, deviceId });
   const refresh = randomHex(32);
   const refreshHash = await sha256Hex(refresh);
@@ -302,7 +415,12 @@ export async function route(request, env, url) {
   try {
     return await handle(request, env, url);
   } catch (e) {
-    if (e instanceof HttpError) return json({ error: e.message }, e.status);
+    if (e instanceof HttpError) {
+      return json(
+        { error: e.message, code: e.code || "", role: e.role || "", needs_confirm: !!e.needsConfirm },
+        e.status,
+      );
+    }
     throw e;
   }
 }
@@ -324,6 +442,7 @@ async function handle(request, env, url) {
 
   if (p === "/api/network" && m === "GET") return getNetwork(env, account);
   if (p === "/api/network" && m === "PUT") return putNetwork(request, env, account);
+  if (p === "/api/network/register" && m === "POST") return registerServer(request, env, account);
   if (p === "/api/network/members" && m === "POST") return addMember(request, env, account);
   if (p === "/api/network/members" && m === "DELETE") return removeMember(request, env, account);
   if (p === "/api/network/revoke-device" && m === "POST") return revokeDevice(request, env, account);
@@ -356,6 +475,7 @@ async function getNetwork(env, account) {
     body.members = members.results || [];
     body.devices = devices.results || [];
     body.invites = await invitesFor(env, network.id);
+    body.changes = await changesFor(env, network.id);
     body.note = "Computers that have not signed in are listed in the PJDesk Server window until you turn on Require signed-in accounts.";
   }
   return json(body);
@@ -390,7 +510,58 @@ async function putNetwork(request, env, account) {
   )
     .bind(next.name, next.active_address, next.active_fingerprint, next.standby_address, next.standby_fingerprint, next.require_accounts, row.id)
     .run();
+  const edited = [];
+  if (next.active_address !== row.active_address || next.active_fingerprint !== row.active_fingerprint) edited.push("active server");
+  if (next.standby_address !== row.standby_address || next.standby_fingerprint !== row.standby_fingerprint) edited.push("standby server");
+  if (next.require_accounts !== row.require_accounts) edited.push("signed-in accounts");
+  if (edited.length) await logChange(env, row.id, account.email, "edit", edited.join(", "));
   return getNetwork(env, account);
+}
+
+async function registerServer(request, env, account) {
+  const body = await readJson(request);
+  let row = await owned(env, account.accountId);
+  if (!row) {
+    const member = await membership(env, account.email);
+    if (member) throw new HttpError(403, "Only the network owner can register a server.");
+    const id = `net_${randomHex(8)}`;
+    await env.DB.prepare(
+      `INSERT INTO networks (id, owner_id, name, active_address, active_fingerprint, standby_address, standby_fingerprint, require_accounts, created_at)
+       VALUES (?, ?, '', '', '', '', '', 0, ?)`,
+    )
+      .bind(id, account.accountId, now())
+      .run();
+    row = await owned(env, account.accountId);
+  }
+  const plan = planRegistration({
+    owner: true,
+    role: body.role,
+    address: body.address,
+    fingerprint: body.fingerprint,
+    confirm: !!body.confirm,
+    replace: !!body.replace,
+    activeAddress: row.active_address,
+    activeFingerprint: row.active_fingerprint,
+    standbyAddress: row.standby_address,
+    standbyFingerprint: row.standby_fingerprint,
+  });
+  if (plan.changed) {
+    await writeSlots(env, row, plan.next);
+    for (const change of plan.changes || []) await logChange(env, row.id, account.email, change.action, change.detail);
+  }
+  if (plan.status !== 200) {
+    const err = new HttpError(plan.status, plan.error);
+    err.needsConfirm = !!plan.needsConfirm;
+    throw err;
+  }
+  const fresh = await owned(env, account.accountId);
+  return json({
+    ok: true,
+    changed: !!plan.changed,
+    needs_confirm: !!plan.needsConfirm,
+    error: plan.needsConfirm ? plan.error : "",
+    network: networkView(fresh),
+  });
 }
 
 async function addMember(request, env, account) {
@@ -441,8 +612,49 @@ async function revokeDevice(request, env, account) {
 async function token(request, env, account) {
   const body = await readJson(request);
   const found = await networkFor(env, account);
-  if (!found.network) throw new HttpError(403, "This account is not on a network.");
+  if (!found.network || !found.network.active_address) {
+    const err = new HttpError(400, NO_SERVER_MESSAGE);
+    err.code = "no_server";
+    err.role = found.role || "owner";
+    throw err;
+  }
   return json(await issue(env, account, found.network, String(body.device_id || ""), body.device_name, body.computers));
+}
+
+async function logChange(env, networkId, actor, action, detail) {
+  try {
+    await env.DB.prepare(
+      "INSERT INTO network_changes (network_id, at, actor, action, detail) VALUES (?, ?, ?, ?, ?)",
+    )
+      .bind(networkId, now(), String(actor || "").slice(0, 254), String(action || "").slice(0, 40), String(detail || "").slice(0, 300))
+      .run();
+  } catch (err) {
+    const message = String(err?.message || err);
+    if (!/no such table/i.test(message)) throw err;
+  }
+}
+
+async function changesFor(env, networkId) {
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT at, actor, action, detail FROM network_changes WHERE network_id = ? ORDER BY id DESC LIMIT 20",
+    )
+      .bind(networkId)
+      .all();
+    return results || [];
+  } catch (err) {
+    const message = String(err?.message || err);
+    if (/no such table/i.test(message)) return [];
+    throw err;
+  }
+}
+
+async function writeSlots(env, row, next) {
+  await env.DB.prepare(
+    `UPDATE networks SET active_address = ?, active_fingerprint = ?, standby_address = ?, standby_fingerprint = ? WHERE id = ?`,
+  )
+    .bind(next.activeAddress, next.activeFingerprint, next.standbyAddress, next.standbyFingerprint, row.id)
+    .run();
 }
 
 async function refresh(request, env) {

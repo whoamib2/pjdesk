@@ -49,6 +49,8 @@ fun SignInScreen(
     onImportPass: (String) -> Unit = {},
     onAcceptImport: () -> Unit = {},
     onDismissImport: () -> Unit = {},
+    offerCurrent: Boolean = false,
+    onUseCurrent: () -> Unit = {},
 ) {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -119,6 +121,11 @@ fun SignInScreen(
                     Text("From pjdesk.com → My network. One device, one hour.", color = pjMuted())
                 }
                 if (error.isNotEmpty()) Text(error, color = MaterialTheme.colorScheme.error)
+                if (offerCurrent) {
+                    Button(onClick = onUseCurrent, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                        Text("Use this computer's current server for my network")
+                    }
+                }
                 Button(onClick = onSubmit, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
                     Text(if (busy) "Signing in…" else if (useKey) "Use network key" else "Sign in")
                 }

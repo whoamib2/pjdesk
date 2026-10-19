@@ -57,6 +57,9 @@
         { id: "123456789", name: "Office", os_family: "windows", os_version: "11" },
         { id: "555000111", name: "Pixel", os_family: "android", os_version: "15" },
       ],
+      changes: [
+        { at: 1728200000, actor: "ben@spader.us", action: "register-active", detail: "office.example:21200" },
+      ],
       invites: [
         {
           id: "ink_office01",
@@ -534,7 +537,7 @@
     };
     const form = el("form", null, "panel");
     form.append(el("h2", "Servers"));
-    form.append(el("p", "Clients get this address and key when they sign in. Nothing is typed by hand on the computer.", "muted"));
+    form.append(el("p", "Signing in to PJDesk Server on the server computer fills the active or standby address and its key. You can still edit them here.", "muted"));
     form.append(field("Name", "net-name", net.name));
     form.append(field("Active server (host or host:port)", "net-active", net.active_address));
     form.append(field("Active server key fingerprint", "net-active-fp", net.active_fingerprint));
@@ -576,6 +579,26 @@
       }
     });
     root.append(form);
+
+    const changes = data.changes || [];
+    if (changes.length) {
+      const log = el("div", null, "panel");
+      log.append(el("h2", "Changes"));
+      log.append(el("p", "Who set or cleared a server. A different key is not replaced unless you confirm it.", "muted"));
+      for (const change of changes) {
+        const when = change.at ? new Date(change.at * 1000).toLocaleString() : "";
+        const what = {
+          "register-active": "set the active server",
+          "register-standby": "set the standby server",
+          "clear-active": "cleared the active server",
+          "clear-standby": "cleared the standby server",
+          edit: "edited the network",
+        }[change.action] || change.action;
+        const detail = change.detail ? ` (${change.detail})` : "";
+        log.append(el("p", `${when} — ${change.actor} ${what}${detail}`));
+      }
+      root.append(log);
+    }
 
     const people = el("div", null, "panel");
     people.append(el("h2", "People"));

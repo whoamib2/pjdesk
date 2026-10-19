@@ -192,6 +192,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     // or leak its key. Harmless if the service path already did it.
     #[cfg(windows)]
     crate::service::repair_data_dir(&data_dir);
+    crate::public_addr::remember_port(&data_dir, opts.port);
     let identity = load_identity(&data_dir)?;
     crate::access::remember_fingerprint(&data_dir, &identity.fingerprint());
     let registry = Registry::load(data_dir.join("devices.json"))?;

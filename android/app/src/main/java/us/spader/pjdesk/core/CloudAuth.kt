@@ -17,6 +17,12 @@ import javax.crypto.spec.SecretKeySpec
  */
 object CloudAuth {
     const val API = "https://pjdesk.com"
+    const val NO_SERVER =
+        "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Admin → My network."
+
+    /** The owner of an empty network can publish the server this phone already uses. */
+    fun offerCurrentServer(role: String, server: String, fingerprint: String): Boolean =
+        role == "owner" && server.isNotBlank() && normalizeFingerprint(fingerprint).length == 64
 
     fun canonical(email: String, networkId: String, fingerprints: List<String>, deviceId: String, exp: Long): String {
         val fps = fingerprints.map { normalizeFingerprint(it) }.filter { it.isNotEmpty() }.toSortedSet().joinToString(",")
@@ -50,12 +56,37 @@ object CloudAuth {
             JSONObject().put("email", email.trim().lowercase()).put("auth_key", auth).put("device", "PJDesk on $deviceName"),
         )
         val token = login.getString("token")
+        try {
+            val reply = post(
+                "$API/api/network/token",
+                token,
+                JSONObject().put("device_id", deviceId).put("device_name", deviceName),
+            )
+            return session(email.trim().lowercase(), deviceId, reply)
+        } catch (e: CloudAuthException) {
+            if (e.code == "no_server") throw CloudAuthException(e.message ?: NO_SERVER, e.code, e.role, token)
+            throw e
+        }
+    }
+
+    /** Publishes the server this phone already uses, then finishes sign-in. The token is not stored. */
+    fun claimCurrentServer(loginToken: String, address: String, fingerprint: String, deviceId: String, deviceName: String): Session {
+        post(
+            "$API/api/network/register",
+            loginToken,
+            JSONObject()
+                .put("role", "active")
+                .put("address", address)
+                .put("fingerprint", fingerprint)
+                .put("confirm", true)
+                .put("replace", true),
+        )
         val reply = post(
             "$API/api/network/token",
-            token,
+            loginToken,
             JSONObject().put("device_id", deviceId).put("device_name", deviceName),
         )
-        return session(email.trim().lowercase(), deviceId, reply)
+        return session("", deviceId, reply)
     }
 
     fun refresh(refresh: String, deviceId: String, computers: JSONArray? = null): Session {
@@ -121,7 +152,7 @@ object CloudAuth {
     private fun session(email: String, deviceId: String, reply: JSONObject): Session {
         val network = reply.optJSONObject("network") ?: throw CloudAuthException("This account has no network yet.")
         val address = network.optString("active_address")
-        if (address.isBlank()) throw CloudAuthException("Set the server address on pjdesk.com, then sign in again.")
+        if (address.isBlank()) throw CloudAuthException(NO_SERVER)
         val computers = mutableListOf<SavedComputer>()
         val list = reply.optJSONArray("computers")
         if (list != null) {
@@ -165,14 +196,24 @@ object CloudAuth {
         val code = conn.responseCode
         val text = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText().orEmpty()
         if (code !in 200..299) {
-            val message = runCatching { JSONObject(text).optString("error") }.getOrDefault("")
-            throw CloudAuthException(message.ifBlank { "Could not sign in ($code)." })
+            val parsed = runCatching { JSONObject(text) }.getOrNull()
+            val message = parsed?.optString("error").orEmpty()
+            throw CloudAuthException(
+                message.ifBlank { "Could not sign in ($code)." },
+                parsed?.optString("code").orEmpty(),
+                parsed?.optString("role").orEmpty(),
+            )
         }
         return JSONObject(text)
     }
 }
 
-class CloudAuthException(message: String) : Exception(message)
+class CloudAuthException(
+    message: String,
+    val code: String = "",
+    val role: String = "",
+    val loginToken: String = "",
+) : Exception(message)
 
 data class Session(
     val email: String,

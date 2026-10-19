@@ -53,9 +53,12 @@ fn client_shots() {
         ("servercfg-light", egui::Theme::Light, Prep::ServerConfig),
         ("import-offer-dark", egui::Theme::Dark, Prep::ImportOffer),
         ("import-offer-light", egui::Theme::Light, Prep::ImportOffer),
+        ("empty-net-dark", egui::Theme::Dark, Prep::EmptyNetwork),
+        ("empty-net-light", egui::Theme::Light, Prep::EmptyNetwork),
     ] {
+        let height = if matches!(prep, Prep::EmptyNetwork) { 980.0 } else { 760.0 };
         let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(1180.0, 760.0))
+            .with_size(egui::vec2(1180.0, height))
             .with_pixels_per_point(1.0)
             .with_theme(theme)
             .wgpu()
@@ -74,6 +77,7 @@ fn client_shots() {
                     Prep::NetworkKey => app.load_network_key_preview(),
                     Prep::ServerConfig => app.load_server_config_preview(),
                     Prep::ImportOffer => app.load_import_offer_preview(),
+                    Prep::EmptyNetwork => app.load_empty_network_preview(),
                 }
                 app
             });
@@ -95,4 +99,5 @@ enum Prep {
     NetworkKey,
     ServerConfig,
     ImportOffer,
+    EmptyNetwork,
 }

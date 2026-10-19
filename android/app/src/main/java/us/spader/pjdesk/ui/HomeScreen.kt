@@ -41,6 +41,7 @@ fun HomeScreen(
     onSavePermanent: (String, String) -> Boolean = { _, _ -> false },
     onClearPermanent: () -> Unit = {},
     onUnattended: (Boolean) -> Unit = {},
+    onSignIn: (() -> Unit)? = null,
 ) {
     Column(
         modifier = Modifier
@@ -49,6 +50,14 @@ fun HomeScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        if (onSignIn != null) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Sign in to your PJDesk account so this phone keeps working after signed-in accounts are required.")
+                    Button(onClick = onSignIn) { Text("Sign in") }
+                }
+            }
+        }
         Text("This phone", style = MaterialTheme.typography.titleLarge)
         Text(state.status, color = pjMuted(), style = MaterialTheme.typography.bodyMedium)
         if (state.hosting) {

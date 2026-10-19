@@ -18,6 +18,7 @@ mod audit;
 mod cloud;
 mod handoff;
 mod password_policy;
+mod public_addr;
 mod gui;
 mod registry;
 mod relay;

@@ -41,6 +41,7 @@ import kotlinx.coroutines.withContext
 import androidx.compose.runtime.rememberCoroutineScope
 import org.json.JSONObject
 import us.spader.pjdesk.core.CloudAuth
+import us.spader.pjdesk.core.CloudAuthException
 import us.spader.pjdesk.core.NetKey
 import us.spader.pjdesk.ui.SignInScreen
 import java.util.UUID
@@ -132,6 +133,9 @@ class MainActivity : ComponentActivity() {
             var netScan by remember { mutableStateOf(false) }
             var netBusy by remember { mutableStateOf(false) }
             var netError by remember { mutableStateOf("") }
+            var signingIn by remember { mutableStateOf(false) }
+            var netOffer by remember { mutableStateOf(false) }
+            var netLogin by remember { mutableStateOf("") }
             var importOffer by remember { mutableStateOf<String?>(null) }
             var importPass by remember { mutableStateOf("") }
             var importFromPaste by remember { mutableStateOf(true) }
@@ -279,7 +283,7 @@ class MainActivity : ComponentActivity() {
                         },
                         onClose = { netScan = false },
                     )
-                } else if (account.isEmpty() && state.server.isEmpty()) {
+                } else if (account.isEmpty() && (state.server.isEmpty() || signingIn)) {
                     SignInScreen(
                         email = netEmail,
                         password = netPass,
@@ -316,6 +320,39 @@ class MainActivity : ComponentActivity() {
                             applyImported(blob, importPass, bound)
                         },
                         onDismissImport = { importOffer = null; importPass = "" },
+                        offerCurrent = netOffer,
+                        onUseCurrent = {
+                            val token = netLogin
+                            val address = state.server
+                            val fingerprint = state.fingerprint
+                            val device = app.store.networkDeviceId.ifBlank {
+                                UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
+                            }
+                            if (token.isBlank() || address.isBlank() || fingerprint.isBlank()) return@SignInScreen
+                            netBusy = true
+                            netError = ""
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) {
+                                    runCatching { CloudAuth.claimCurrentServer(token, address, fingerprint, device, "Android") }
+                                }
+                                netBusy = false
+                                result.onSuccess { session ->
+                                    val email = session.email.ifBlank { netEmail.trim() }
+                                    app.store.networkEmail = email
+                                    app.store.networkDeviceId = session.deviceId
+                                    app.store.saveNetworkRefresh(session.refresh)
+                                    engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
+                                    engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
+                                    app.store.mergeCloud(session.computers)
+                                    netPass = ""
+                                    netLogin = ""
+                                    netOffer = false
+                                    account = email
+                                    signingIn = false
+                                    saved = app.store.saved()
+                                }.onFailure { netError = it.message ?: "Could not sign in." }
+                            }
+                        },
                         onSubmit = {
                             val device = app.store.networkDeviceId.ifBlank {
                                 UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
@@ -361,8 +398,16 @@ class MainActivity : ComponentActivity() {
                                     netKeyPass = ""
                                     netBlob = ""
                                     account = email
+                                    signingIn = false
+                                    netOffer = false
+                                    netLogin = ""
                                     saved = app.store.saved()
-                                }.onFailure { netError = it.message ?: "Could not sign in." }
+                                }.onFailure { err ->
+                                    val cloud = err as? CloudAuthException
+                                    netOffer = cloud != null && CloudAuth.offerCurrentServer(cloud.role, state.server, state.fingerprint)
+                                    netLogin = if (netOffer) cloud?.loginToken.orEmpty() else ""
+                                    netError = err.message ?: "Could not sign in."
+                                }
                             }
                         },
                     )
@@ -428,6 +473,11 @@ class MainActivity : ComponentActivity() {
                                         engine.setApproval("prompt")
                                     },
                                     onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
+                                    onSignIn = if (account.isEmpty() && state.server.isNotEmpty()) {
+                                        { signingIn = true }
+                                    } else {
+                                        null
+                                    },
                                 )
                                 1 -> SavedScreen(
                                     computers = saved,

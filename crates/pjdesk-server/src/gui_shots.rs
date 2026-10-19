@@ -50,6 +50,11 @@ fn server_shots() {
                 )
                 .unwrap();
                 app.refresh();
+                app.pub_addr = "pjdesk.spader.us:21200".into();
+                app.pub_addr_ready = true;
+                app.pub_addr_confirmed = true;
+                app.pub_addr_needs_confirm = false;
+                app.pub_addr_note = "Published as the active server.".into();
                 app
             });
         harness.step();

@@ -119,6 +119,12 @@ struct App {
     nk_invites: Vec<crate::cloud::NetworkInvite>,
     nk_loaded: bool,
     nk_list_rx: Option<std::sync::mpsc::Receiver<Result<Vec<crate::cloud::NetworkInvite>, String>>>,
+    pub_addr: String,
+    pub_addr_ready: bool,
+    pub_addr_note: String,
+    pub_addr_needs_confirm: bool,
+    pub_addr_confirmed: bool,
+    pub_guess_rx: Option<std::sync::mpsc::Receiver<crate::public_addr::PublicAddress>>,
     /// Latest client release from pjdesk.com, fetched off this thread.
     latest_release: Option<String>,
     release_at: Option<Instant>,
@@ -231,6 +237,12 @@ impl App {
             nk_invites: Vec::new(),
             nk_loaded: false,
             nk_list_rx: None,
+            pub_addr: String::new(),
+            pub_addr_ready: false,
+            pub_addr_note: String::new(),
+            pub_addr_needs_confirm: false,
+            pub_addr_confirmed: false,
+            pub_guess_rx: None,
             latest_release: None,
             release_at: None,
             release_rx: None,
@@ -240,11 +252,55 @@ impl App {
             app.update_start = update.window_start;
             app.update_end = update.window_end;
         }
+        crate::public_addr::remember_port(&app.data_dir, port);
         app.refresh();
         if spawn_probe {
             app.probe = spawn_status_probe(&cc.egui_ctx);
+            app.start_address_guess();
         }
         app
+    }
+
+    fn start_address_guess(&mut self) {
+        if self.pub_guess_rx.is_some() || crate::public_addr::load(&self.data_dir).is_some_and(|saved| !saved.address.trim().is_empty()) {
+            return;
+        }
+        let dir = self.data_dir.clone();
+        let port = self.port;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::public_addr::ensure(&dir, port));
+        });
+        self.pub_guess_rx = Some(rx);
+    }
+
+    fn poll_public_address(&mut self) {
+        if let Some(rx) = &self.pub_guess_rx {
+            if let Ok(record) = rx.try_recv() {
+                self.pub_guess_rx = None;
+                if self.pub_addr.trim().is_empty() {
+                    self.pub_addr = record.address;
+                    self.pub_addr_note = record.note;
+                    self.pub_addr_needs_confirm = record.needs_confirm;
+                    self.pub_addr_confirmed = record.confirmed;
+                }
+            }
+        }
+        if !self.pub_addr_ready {
+            if let Some(saved) = crate::public_addr::load(&self.data_dir) {
+                self.pub_addr = saved.address;
+                self.pub_addr_note = saved.note;
+                self.pub_addr_needs_confirm = saved.needs_confirm;
+                self.pub_addr_confirmed = saved.confirmed;
+            }
+            self.pub_addr_ready = true;
+        } else if let Some(saved) = crate::public_addr::load(&self.data_dir) {
+            if saved.address.trim() == self.pub_addr.trim() {
+                self.pub_addr_note = saved.note;
+                self.pub_addr_needs_confirm = saved.needs_confirm;
+                self.pub_addr_confirmed = saved.confirmed;
+            }
+        }
     }
 
     fn service_state(&self) -> (bool, bool) {
@@ -1427,7 +1483,40 @@ impl App {
             .collect();
         let mut require = policy.require_accounts;
         let mut changed = false;
+        self.poll_public_address();
+        let saved_address = crate::public_addr::load(&self.data_dir).map(|saved| saved.address).unwrap_or_default();
+        let dirty = self.pub_addr.trim() != saved_address.trim();
+        let mut publish = false;
+        let mut replace = false;
         card(ui, |ui| {
+            heading(ui, "PUBLIC ADDRESS");
+            ui.label(RichText::new(
+                "The address computers use to reach this server. A guess is filled in from the name they already use, or from this server's public address.",
+            ).color(p(ui).muted));
+            ui.add_space(6.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pub_addr)
+                    .hint_text("host or host:port")
+                    .desired_width(360.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            if !self.pub_addr_note.is_empty() {
+                let color = if self.pub_addr_needs_confirm || crate::public_addr::is_private_address(self.pub_addr.trim()) && !self.pub_addr_confirmed {
+                    p(ui).warn
+                } else {
+                    p(ui).muted
+                };
+                ui.label(RichText::new(&self.pub_addr_note).color(color).size(12.0));
+            }
+            if self.can_write && self.pub_addr_needs_confirm && ui.button("Replace the server on My network").clicked() {
+                publish = true;
+                replace = true;
+            } else if self.can_write && !self.pub_addr_confirmed && !self.pub_addr.trim().is_empty() && ui.button("Confirm this address").clicked() {
+                publish = true;
+            } else if self.can_write && dirty && !self.pub_addr.trim().is_empty() && ui.button("Update My network").clicked() {
+                publish = true;
+            }
+            ui.add_space(12.0);
             heading(ui, "SIGNED-IN ACCOUNTS");
             ui.label(RichText::new(
                 "Off by default, so an update does not take a computer offline. Turn this on only after every computer below has signed in.",
@@ -1521,6 +1610,46 @@ impl App {
                 std::thread::spawn(move || crate::cloud::push_require_accounts(&dir, require));
             }
         }
+        if publish {
+            self.publish_public_address(replace);
+        }
+    }
+
+    fn publish_public_address(&mut self, replace: bool) {
+        let address = self.pub_addr.trim().to_string();
+        if address.is_empty() {
+            self.pub_addr_note = "Type the public address computers use to reach this server.".into();
+            return;
+        }
+        let mut record = crate::public_addr::load(&self.data_dir).unwrap_or(crate::public_addr::PublicAddress {
+            address: String::new(),
+            confirmed: false,
+            source: String::new(),
+            needs_confirm: false,
+            note: String::new(),
+        });
+        if record.address.trim() != address {
+            record.source = "manual".into();
+        }
+        record.address = address;
+        record.confirmed = true;
+        record.needs_confirm = false;
+        let signed_in = crate::cloud::CloudConfig::load(&self.data_dir).is_some_and(|cfg| cfg.is_account() && !cfg.token.is_empty());
+        record.note = if signed_in {
+            "Publishing this address…".into()
+        } else {
+            "Sign in to PJDesk Cloud on this server to publish this address.".into()
+        };
+        crate::public_addr::save(&self.data_dir, &record);
+        self.pub_addr_confirmed = true;
+        self.pub_addr_needs_confirm = false;
+        self.pub_addr_note = record.note.clone();
+        if !signed_in {
+            return;
+        }
+        let dir = self.data_dir.clone();
+        let online = self.online.len();
+        std::thread::spawn(move || crate::cloud::publish_network(&dir, online, replace));
     }
 
     fn ensure_invites(&mut self) {
@@ -1985,19 +2114,25 @@ fn finish_account(
     let email = cfg.email.clone();
     Ok(match crate::cloud::connect_account(dir, &cfg, online, choice)? {
         Connected::Uploaded => {
+            crate::cloud::publish_network(dir, online, false);
             let _ = crate::requests::push(dir, crate::requests::SYNC_FILE, "now");
             JobDone::Message(format!(
                 "Signed in as {email}. This is the main server, and its data is backed up to PJDesk Cloud.                  To add a backup server, sign in on another PJDesk Server with the same account."
             ))
         }
-        Connected::Resumed => JobDone::Message(format!("Signed in as {email}. Syncing as before.")),
+        Connected::Resumed => {
+            crate::cloud::publish_network(dir, online, false);
+            JobDone::Message(format!("Signed in as {email}. Syncing as before."))
+        }
         Connected::Joined { from } => {
+            crate::cloud::publish_network(dir, online, false);
             let _ = crate::requests::push(dir, crate::requests::RELOAD_FILE, "now");
             JobDone::Message(format!(
                 "Signed in as {email}. This server now has {from}'s key, accounts and computer list, and stays on standby to take over."
             ))
         }
         Connected::Replaced => {
+            crate::cloud::publish_network(dir, online, false);
             let _ = crate::requests::push(dir, crate::requests::SYNC_FILE, "now");
             JobDone::Message(format!("Signed in as {email}. This server's data replaced the copy in PJDesk Cloud."))
         }

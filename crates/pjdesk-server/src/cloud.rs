@@ -1327,6 +1327,7 @@ pub fn promote(data_dir: &Path) -> Result<()> {
     st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Active);
     tracing::info!("{}", st.notice);
+    register_network(data_dir, Role::Active, true);
     Ok(())
 }
 
@@ -1344,6 +1345,7 @@ pub fn demote(data_dir: &Path) -> Result<()> {
     st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Standby);
     tracing::info!("{}", st.notice);
+    register_network(data_dir, Role::Standby, false);
     Ok(())
 }
 
@@ -1626,6 +1628,7 @@ fn publish_health(data_dir: &Path, role: Role) {
     if let Err(e) = pull_network_policy(data_dir, &cfg) {
         tracing::debug!("network policy: {e:#}");
     }
+    register_network(data_dir, role, false);
 }
 
 /// Copies the account's network policy into `network-access.json`. The local
@@ -1666,6 +1669,94 @@ fn pull_network_policy(data_dir: &Path, cfg: &CloudConfig) -> Result<()> {
     policy.revoked_devices = reply.revoked_devices;
     policy.save(data_dir).context("saving network policy")?;
     Ok(())
+}
+
+/// Publishes this server into the owner's network using the role it has now.
+/// `online` is how many computers are connected, used only when no role has
+/// been chosen yet. `replace` is the owner's confirmation that a different
+/// server already listed there should be overwritten.
+pub fn publish_network(data_dir: &Path, online: usize, replace: bool) {
+    let hint = if online > 0 { Role::Active } else { Role::Standby };
+    let role = effective_role(&SyncState::load(data_dir), hint);
+    register_network(data_dir, role, replace);
+}
+
+/// Registers this server's fingerprint and public address in the slot for
+/// `role`. A missing cloud sign-in, a private address that has not been
+/// confirmed, and a network error leave the local note for the Server window.
+fn register_network(data_dir: &Path, role: Role, replace: bool) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return;
+    }
+    let Some(identity) = crate::server::read_identity(data_dir) else { return };
+    let fingerprint = pjdesk_proto::tls::format_fingerprint(&identity.fingerprint());
+    let port = crate::public_addr::remembered_port(data_dir);
+    let mut record = crate::public_addr::ensure(data_dir, port);
+    if record.address.trim().is_empty() {
+        record.note = "Type the public address computers use to reach this server.".into();
+        crate::public_addr::save(data_dir, &record);
+        return;
+    }
+    if crate::public_addr::is_private_address(&record.address) && !record.confirmed {
+        record.needs_confirm = false;
+        record.note = "This is a local network address. Confirm it before it is published. It is not sent until you do.".into();
+        crate::public_addr::save(data_dir, &record);
+        return;
+    }
+    let body = serde_json::json!({
+        "role": role_name(role),
+        "address": record.address.trim(),
+        "fingerprint": fingerprint,
+        "confirm": record.confirmed || !crate::public_addr::is_private_address(&record.address),
+        "replace": replace,
+    });
+    let result = agent()
+        .post(&format!("{}/api/network/register", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string());
+    match result {
+        Ok(resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            let needs = value.get("needs_confirm").and_then(|v| v.as_bool()).unwrap_or(false);
+            record.needs_confirm = needs;
+            record.note = if needs {
+                value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("My network already lists a different server. Confirm in the PJDesk Server window to replace it.")
+                    .to_string()
+            } else if role == Role::Active {
+                "Published as the active server.".into()
+            } else {
+                "Published as the standby server.".into()
+            };
+            crate::public_addr::save(data_dir, &record);
+            if !needs {
+                tracing::info!("network: published this server as {}", role_name(role));
+            }
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            let message = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Could not publish this server.")
+                .to_string();
+            record.needs_confirm = value.get("needs_confirm").and_then(|v| v.as_bool()).unwrap_or(code == 409);
+            record.note = message;
+            crate::public_addr::save(data_dir, &record);
+            tracing::debug!("network register: {code}");
+        }
+        Err(e) => {
+            record.note = "Could not reach pjdesk.com to publish this server.".into();
+            crate::public_addr::save(data_dir, &record);
+            tracing::debug!("network register: {e}");
+        }
+    }
 }
 
 /// Tells pjdesk.com that this server now requires (or no longer requires) a

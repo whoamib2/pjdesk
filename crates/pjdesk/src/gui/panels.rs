@@ -251,6 +251,9 @@ impl App {
                     ui.colored_label(p.warn, &self.net_error);
                     ui.add_space(6.0);
                 }
+                if self.net_offer && !self.net_busy && ui.button("Use this computer's current server for my network").clicked() {
+                    self.claim_current_server();
+                }
                 let label = if self.net_busy {
                     "Signing in…"
                 } else if self.net_mode == 2 {
@@ -266,14 +269,20 @@ impl App {
                     if self.net_mode != 0 && ui.button("Use email and password").clicked() && !self.net_busy {
                         self.net_mode = 0;
                         self.net_error.clear();
+                        self.net_offer = false;
+                        self.net_login.clear();
                     }
                     if self.net_mode != 1 && ui.button("I have an enrollment code").clicked() && !self.net_busy {
                         self.net_mode = 1;
                         self.net_error.clear();
+                        self.net_offer = false;
+                        self.net_login.clear();
                     }
                     if self.net_mode != 2 && ui.button("Use a network key").clicked() && !self.net_busy {
                         self.net_mode = 2;
                         self.net_error.clear();
+                        self.net_offer = false;
+                        self.net_login.clear();
                     }
                     if self.show_net_sign_in && !self.cfg.effective_server().is_empty() && ui.button("Cancel").clicked() {
                         cancel = true;

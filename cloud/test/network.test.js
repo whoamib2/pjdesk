@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonical, decide, inviteError, normalizeFingerprint } from "../src/network.js";
+import { canonical, decide, inviteError, isPrivateAddress, normalizeFingerprint, planRegistration } from "../src/network.js";
 
 test("canonical matches the shared fixture", () => {
   const text = canonical({
@@ -58,6 +58,101 @@ test("a network key is refused when it is expired, revoked, or used up", () => {
     "This network key is for a specific account. Sign in as that account.",
   );
   assert.equal(inviteError({ uses: 0, now: 10, boundEmail: "ben@spader.us", callerEmail: "ben@spader.us" }), null);
+});
+
+test("an owner server fills an empty slot and does not overwrite a different key", () => {
+  const empty = planRegistration({
+    owner: true,
+    role: "active",
+    address: "pjdesk.spader.us:21200",
+    fingerprint: "ab-cd",
+    confirm: false,
+    replace: false,
+    activeAddress: "",
+    activeFingerprint: "",
+    standbyAddress: "",
+    standbyFingerprint: "",
+  });
+  assert.equal(empty.status, 200);
+  assert.equal(empty.next.activeAddress, "pjdesk.spader.us:21200");
+  assert.equal(empty.next.activeFingerprint, "abcd");
+
+  const same = planRegistration({
+    owner: true,
+    role: "standby",
+    address: "cabin.example:21200",
+    fingerprint: "abcd",
+    activeAddress: "pjdesk.spader.us:21200",
+    activeFingerprint: "abcd",
+    standbyAddress: "",
+    standbyFingerprint: "",
+  });
+  assert.equal(same.status, 200);
+  assert.equal(same.next.activeAddress, "");
+  assert.equal(same.next.standbyAddress, "cabin.example:21200");
+
+  const blocked = planRegistration({
+    owner: true,
+    role: "active",
+    address: "other.example:21200",
+    fingerprint: "ffff",
+    activeAddress: "pjdesk.spader.us:21200",
+    activeFingerprint: "abcd",
+    standbyAddress: "",
+    standbyFingerprint: "",
+  });
+  assert.equal(blocked.status, 409);
+  assert.equal(blocked.needsConfirm, true);
+  assert.equal(blocked.next.activeAddress, "pjdesk.spader.us:21200");
+
+  const replaced = planRegistration({
+    owner: true,
+    role: "active",
+    address: "other.example:21200",
+    fingerprint: "ffff",
+    replace: true,
+    activeAddress: "pjdesk.spader.us:21200",
+    activeFingerprint: "abcd",
+    standbyAddress: "",
+    standbyFingerprint: "",
+  });
+  assert.equal(replaced.status, 200);
+  assert.equal(replaced.next.activeFingerprint, "ffff");
+
+  const stranger = planRegistration({
+    owner: false,
+    role: "active",
+    address: "other.example:21200",
+    fingerprint: "ffff",
+    replace: true,
+    confirm: true,
+    activeAddress: "pjdesk.spader.us:21200",
+    activeFingerprint: "abcd",
+  });
+  assert.equal(stranger.status, 403);
+
+  assert.equal(isPrivateAddress("192.168.1.20:21200"), true);
+  assert.equal(isPrivateAddress("pjdesk.spader.us:21200"), false);
+  const lan = planRegistration({
+    owner: true,
+    role: "active",
+    address: "192.168.1.20:21200",
+    fingerprint: "abcd",
+    confirm: false,
+    activeAddress: "",
+    activeFingerprint: "",
+  });
+  assert.equal(lan.status, 400);
+  const confirmedLan = planRegistration({
+    owner: true,
+    role: "active",
+    address: "192.168.1.20:21200",
+    fingerprint: "abcd",
+    confirm: true,
+    activeAddress: "",
+    activeFingerprint: "",
+  });
+  assert.equal(confirmedLan.status, 200);
 });
 
 test("a saved computer has no password field in the canonical record", () => {

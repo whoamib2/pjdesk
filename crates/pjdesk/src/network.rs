@@ -16,6 +16,20 @@ use crate::config::{Config, PeerNote};
 
 const DEFAULT_API: &str = "https://pjdesk.com";
 
+pub const NO_SERVER: &str =
+    "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Admin → My network.";
+
+/// The owner of an empty network can publish the server this computer already uses.
+pub fn offer_current_server(role: &str, server: &str, fingerprint: &str) -> bool {
+    role == "owner" && !server.trim().is_empty() && pjdesk_proto::tls::parse_fingerprint(fingerprint).is_ok()
+}
+
+/// Account sign-in finished, or the account's network has no server yet.
+pub enum SignIn {
+    Ready(Session),
+    NoServer { role: String, login_token: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedComputer {
     pub id: String,
@@ -92,6 +106,16 @@ struct ComputerBody {
 struct ErrorBody {
     #[serde(default)]
     error: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    role: String,
+}
+
+struct ApiFail {
+    message: String,
+    code: String,
+    role: String,
 }
 
 fn api_base() -> String {
@@ -106,38 +130,41 @@ fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(Duration::from_secs(25)).build()
 }
 
-fn error_text(err: ureq::Error) -> String {
-    match err {
-        ureq::Error::Status(code, resp) => {
-            let text = resp.into_string().unwrap_or_default();
-            let message = serde_json::from_str::<ErrorBody>(&text).map(|b| b.error).unwrap_or_default();
-            if !message.is_empty() {
-                message
-            } else if code == 401 {
-                "Wrong email or password.".into()
-            } else {
-                format!("PJDesk could not sign in ({code}).")
-            }
-        }
-        ureq::Error::Transport(_) => "Could not reach pjdesk.com.".into(),
-    }
+fn post_json(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> Result<String> {
+    post_api(url, bearer, body).map_err(|fail| anyhow::anyhow!(fail.message))
 }
 
-fn post_json(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> Result<String> {
+fn post_api(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> std::result::Result<String, ApiFail> {
     let mut req = agent().post(url).set("content-type", "application/json");
     if let Some(token) = bearer {
         req = req.set("Authorization", &format!("Bearer {token}"));
     }
     match req.send_string(&body.to_string()) {
         Ok(resp) => Ok(resp.into_string().unwrap_or_default()),
-        Err(e) => bail!(error_text(e)),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let parsed: ErrorBody = serde_json::from_str(&text).unwrap_or(ErrorBody { error: String::new(), code: String::new(), role: String::new() });
+            let message = if !parsed.error.is_empty() {
+                parsed.error
+            } else if code == 401 {
+                "Wrong email or password.".into()
+            } else {
+                format!("PJDesk could not sign in ({code}).")
+            };
+            Err(ApiFail { message, code: parsed.code, role: parsed.role })
+        }
+        Err(ureq::Error::Transport(_)) => Err(ApiFail {
+            message: "Could not reach pjdesk.com.".into(),
+            code: String::new(),
+            role: String::new(),
+        }),
     }
 }
 
 fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Session> {
     let network = reply.network.context("the account has no network")?;
     if network.active_address.trim().is_empty() {
-        bail!("Set the server address on pjdesk.com → My network, then sign in again.");
+        bail!(NO_SERVER);
     }
     Ok(Session {
         email: email.to_string(),
@@ -164,7 +191,9 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
 }
 
 /// Signs in with the PJDesk account password and fetches the private server.
-pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) -> Result<Session> {
+/// An empty network returns [`SignIn::NoServer`] so the owner can publish the
+/// server this computer already uses. The login token stays in memory only.
+pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) -> Result<SignIn> {
     let email = email.trim().to_lowercase();
     if email.is_empty() || password.is_empty() {
         bail!("Enter your email and password.");
@@ -180,13 +209,44 @@ pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) 
         }),
     )?)
     .context("unexpected reply from PJDesk")?;
-    let text = post_json(
+    match post_api(
         &format!("{}/api/network/token", api_base()),
         Some(&login.token),
         &serde_json::json!({ "device_id": device_id, "device_name": device_name }),
+    ) {
+        Ok(text) => {
+            let reply: NetworkReply = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
+            Ok(SignIn::Ready(session_from(&email, device_id, reply)?))
+        }
+        Err(fail) if fail.code == "no_server" => Ok(SignIn::NoServer { role: fail.role, login_token: login.token }),
+        Err(fail) => bail!(fail.message),
+    }
+}
+
+/// Publishes this computer's current server for an empty network, then signs in.
+/// The login token is the one from the sign-in that found no server.
+pub fn claim_current_server(login_token: &str, address: &str, fingerprint: &str, device_id: &str, device_name: &str) -> Result<Session> {
+    if login_token.is_empty() || address.trim().is_empty() || pjdesk_proto::tls::parse_fingerprint(fingerprint).is_err() {
+        bail!(NO_SERVER);
+    }
+    post_json(
+        &format!("{}/api/network/register", api_base()),
+        Some(login_token),
+        &serde_json::json!({
+            "role": "active",
+            "address": address.trim(),
+            "fingerprint": fingerprint,
+            "confirm": true,
+            "replace": true,
+        }),
+    )?;
+    let text = post_json(
+        &format!("{}/api/network/token", api_base()),
+        Some(login_token),
+        &serde_json::json!({ "device_id": device_id, "device_name": device_name }),
     )?;
     let reply: NetworkReply = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
-    session_from(&email, device_id, reply)
+    session_from("", device_id, reply)
 }
 
 /// Exchanges a still-valid refresh token for a new access token.
@@ -434,5 +494,18 @@ mod tests {
         assert_eq!(name, "");
         assert_eq!(uploaded["computers"][0]["hostname"].as_str().unwrap(), "BEN-PC");
         assert!(!uploaded.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn only_the_owner_with_a_pinned_server_is_offered_that_server() {
+        let fp = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        assert!(offer_current_server("owner", "pjdesk.spader.us:21200", fp));
+        assert!(!offer_current_server("member", "pjdesk.spader.us:21200", fp));
+        assert!(!offer_current_server("owner", "", fp));
+        assert!(!offer_current_server("owner", "pjdesk.spader.us:21200", ""));
+        assert_eq!(
+            NO_SERVER,
+            "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Admin → My network."
+        );
     }
 }
