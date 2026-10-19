@@ -34,7 +34,8 @@ pub const TUNNEL: u32 = 1 << 10;
 pub const LAYOUT: u32 = 1 << 11;
 
 /// Every permission bit this version defines. Unknown high bits are ignored.
-pub const ALL: u32 = KEYBOARD | MOUSE | CLIPBOARD | FILE | AUDIO | RESTART | PRIVACY | BLOCK_INPUT | CHAT | RECORD | TUNNEL;
+pub const ALL: u32 =
+    KEYBOARD | MOUSE | CLIPBOARD | FILE | AUDIO | RESTART | PRIVACY | BLOCK_INPUT | CHAT | RECORD | TUNNEL;
 
 /// What a version-2 controller is allowed: the original remote desktop.
 pub const CLASSIC: u32 = KEYBOARD | MOUSE;

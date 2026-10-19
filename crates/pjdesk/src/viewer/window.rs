@@ -89,9 +89,9 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
     {
         let (slot, control_tx, proxy, stats, recorder) =
             (slot.clone(), control_tx.clone(), proxy.clone(), stats.clone(), recorder.clone());
-        std::thread::Builder::new().name("decoder".into()).spawn(move || {
-            decode_loop(frame_rx, slot, control_tx, proxy, stats, recorder)
-        })?;
+        std::thread::Builder::new()
+            .name("decoder".into())
+            .spawn(move || decode_loop(frame_rx, slot, control_tx, proxy, stats, recorder))?;
     }
 
     let loaded = crate::config::Config::load().ok();
@@ -101,10 +101,8 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
     if theme_name == "light" {
         toolbar.set_light(true);
     }
-    let places = loaded
-        .as_ref()
-        .and_then(|c| c.settings.peers.get(&host_id).map(|n| n.windows.clone()))
-        .unwrap_or_default();
+    let places =
+        loaded.as_ref().and_then(|c| c.settings.peers.get(&host_id).map(|n| n.windows.clone())).unwrap_or_default();
     let mut app = App {
         title,
         window: None,
@@ -137,6 +135,10 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         place_saved: Instant::now() - Duration::from_secs(5),
         placed_primary: false,
         follow_system_theme,
+        noted_platform: String::new(),
+        remote_size: None,
+        android_stroke: pjdesk_proto::gesture::StrokeTracker::default(),
+        pointer_down: false,
     };
     if std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files") {
         app.panel.open = true;
@@ -302,10 +304,15 @@ struct App {
     sent_watch: Vec<u8>,
     places: Vec<crate::config::SavedWindow>,
     place_saved: Instant,
-        placed_primary: bool,
-        /// Settings left the theme on "system", so the window follows the OS.
-        follow_system_theme: bool,
-    }
+    placed_primary: bool,
+    /// Settings left the theme on "system", so the window follows the OS.
+    follow_system_theme: bool,
+    noted_platform: String,
+    remote_size: Option<(usize, usize)>,
+    /// Press on an Android picture, turned into a tap or a swipe on release.
+    android_stroke: pjdesk_proto::gesture::StrokeTracker,
+    pointer_down: bool,
+}
 
 struct ExtraPane {
     display: u8,
@@ -402,12 +409,20 @@ impl App {
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else { return };
         let snap = self.live.lock().unwrap().snapshot();
         self.toolbar.sync(screens_of(&snap.displays), snap.current_display, snap.view_mode);
+        self.toolbar.set_android(snap.platform_family == "android");
+        if !snap.platform_family.is_empty() && snap.platform_family != self.noted_platform {
+            self.noted_platform = snap.platform_family.clone();
+            let (id, family, version) =
+                (self.peer_id.clone(), snap.platform_family.clone(), snap.platform_version.clone());
+            std::thread::spawn(move || crate::config::Config::remember_platform(&id, &family, &version));
+        }
 
-        // On the first frame, size the window to this screen (the cropped tile
-        // in separate mode, the whole picture otherwise).
-        if !self.sized_to_remote {
-            let frame = if separate { cropped.as_ref() } else { self.current.as_ref() };
-            if let Some(frame) = frame {
+        // Size the window to the picture, and again when it rotates or the
+        // selected display has a different size.
+        if let Some(frame) = if separate { cropped.as_ref() } else { self.current.as_ref() } {
+            let size = (frame.width, frame.height);
+            if self.remote_size != Some(size) {
+                self.remote_size = Some(size);
                 self.sized_to_remote = true;
                 let extra = self.toolbar.tab_height() as u32;
                 Self::fit_remote(window, frame.width, frame.height, extra);
@@ -423,10 +438,27 @@ impl App {
         let Ok(mut buffer) = surface.buffer_mut() else { return };
         let shown = if separate { cropped.as_ref() } else { self.current.as_ref() };
         let origin = self.toolbar.tab_height() as usize;
-        let layout = Self::paint_picture(&mut buffer, win_w, win_h, shown, self.zoom, self.pan, origin, self.toolbar.letterbox());
+        let layout = Self::paint_picture(
+            &mut buffer,
+            win_w,
+            win_h,
+            shown,
+            self.zoom,
+            self.pan,
+            origin,
+            self.toolbar.letterbox(),
+        );
         self.layout = layout;
         if separate && cropped.is_none() {
-            toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, origin as f32 + 48.0, "Waiting for this screen", 0xFF_9a_a3_b5);
+            toolbar::draw_text(
+                &mut buffer,
+                win_w,
+                win_h,
+                24.0,
+                origin as f32 + 48.0,
+                "Waiting for this screen",
+                0xFF_9a_a3_b5,
+            );
         }
         Self::paint_overlay(&self.toolbar, &self.toast, &mut buffer, win_w, win_h, display, separate, true);
         self.panel.draw(&mut buffer, win_w, win_h, &snap);
@@ -455,8 +487,12 @@ impl App {
             Action::Refresh => {
                 let _ = self.control.send(ControlMsg::RequestKeyframe);
             }
-            Action::ToggleBlockHost => self.toggle_host(pjdesk_proto::perms::BLOCK_INPUT, |on| ControlMsg::BlockInput { enabled: on }),
-            Action::TogglePrivacy => self.toggle_host(pjdesk_proto::perms::PRIVACY, |on| ControlMsg::Privacy { enabled: on }),
+            Action::ToggleBlockHost => {
+                self.toggle_host(pjdesk_proto::perms::BLOCK_INPUT, |on| ControlMsg::BlockInput { enabled: on })
+            }
+            Action::TogglePrivacy => {
+                self.toggle_host(pjdesk_proto::perms::PRIVACY, |on| ControlMsg::Privacy { enabled: on })
+            }
             Action::ToggleAudio => self.toggle_host(pjdesk_proto::perms::AUDIO, |on| ControlMsg::Audio { enabled: on }),
             Action::ToggleRecord => {
                 let on = !self.live.lock().unwrap().recording;
@@ -471,7 +507,11 @@ impl App {
                     self.panel.confirm_restart = true;
                     self.panel.open = true;
                     self.panel.tab = 2;
-                    self.live.lock().unwrap().notices.push("Choose Restart again to restart the other computer.".into());
+                    self.live
+                        .lock()
+                        .unwrap()
+                        .notices
+                        .push("Choose Restart again to restart the other computer.".into());
                 } else if self.live.lock().unwrap().allowed(pjdesk_proto::perms::RESTART) {
                     self.panel.confirm_restart = false;
                     self.restarting = true;
@@ -511,6 +551,7 @@ impl App {
                 self.choose_view(pjdesk_proto::peer::VIEW_SEPARATE, display);
             }
             Action::CloseScreen => return self.close_primary_screen(),
+            Action::Android(which) => self.send_android(which),
         }
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -766,6 +807,10 @@ impl App {
         if self.toolbar.block_input {
             return;
         }
+        if self.remote_is_android() {
+            self.send_android_key(&event, code, down);
+            return;
+        }
         let Some(mut scan) = keymap::scancode(code) else { return };
         if down {
             // Numpad keys typed as digits here (NumLock on) are sent as digits,
@@ -800,7 +845,9 @@ impl App {
             if over_bar {
                 return;
             }
-            if self.is_separate() && toolbar::compact_covers(position.x, position.y, win_w, window.inner_size().height as usize) {
+            if self.is_separate()
+                && toolbar::compact_covers(position.x, position.y, win_w, window.inner_size().height as usize)
+            {
                 window.request_redraw();
                 return;
             }
@@ -811,7 +858,9 @@ impl App {
             }
             let Some(window) = self.window.clone() else { return };
             let size = window.inner_size();
-            if let Some((x, y)) = self.pointer_for(self.primary_display, position, size.width as f64, size.height as f64) {
+            if let Some((x, y)) =
+                self.pointer_for(self.primary_display, position, size.width as f64, size.height as f64)
+            {
                 self.send_pointer(self.primary_display, x, y);
             }
             return;
@@ -862,6 +911,22 @@ impl App {
         let fx = ((position.x - layout.x as f64) / (layout.width.max(2) - 1) as f64).clamp(0.0, 1.0);
         let fy = ((position.y - layout.y as f64) / (layout.height.max(2) - 1) as f64).clamp(0.0, 1.0);
         let point = ((fx * 65535.0).round() as u16, (fy * 65535.0).round() as u16);
+        if self.remote_is_android() {
+            // A click or drag is one gesture, sent when the button comes up.
+            // Moving the mouse with the button up does not hover the phone.
+            if self.pointer_down {
+                self.android_stroke.move_to(point.0, point.1);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                if let Some(gesture) = self.android_stroke.poll_long_press(now) {
+                    self.send(gesture.to_event());
+                }
+            }
+            self.last_position = Some(point);
+            return;
+        }
         if self.last_position != Some(point) {
             self.last_position = Some(point);
             self.send(InputEvent::MouseMove { x: point.0, y: point.1 });
@@ -881,10 +946,89 @@ impl App {
         self.wheel.0 -= dx;
         self.wheel.1 -= dy;
         if dx != 0.0 || dy != 0.0 {
-            self.send(InputEvent::Wheel {
-                dx: dx.clamp(i16::MIN as f64, i16::MAX as f64) as i16,
-                dy: dy.clamp(i16::MIN as f64, i16::MAX as f64) as i16,
-            });
+            if self.remote_is_android() {
+                let (x, y) = self.last_position.unwrap_or((32768, 32768));
+                let notches = (dy / 120.0).round() as i32;
+                if notches != 0 {
+                    self.send(pjdesk_proto::gesture::wheel_swipe(x, y, notches).to_event());
+                }
+            } else {
+                self.send(InputEvent::Wheel {
+                    dx: dx.clamp(i16::MIN as f64, i16::MAX as f64) as i16,
+                    dy: dy.clamp(i16::MIN as f64, i16::MAX as f64) as i16,
+                });
+            }
+        }
+    }
+
+    fn remote_is_android(&self) -> bool {
+        self.live.lock().unwrap().platform_family == "android"
+    }
+
+    fn on_android_button(&mut self, down: bool) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if down {
+            let Some(point) = self.pointer_norm() else { return };
+            self.pointer_down = true;
+            self.android_stroke.down(now, point.0, point.1);
+            self.last_position = Some(point);
+        } else if self.pointer_down {
+            self.pointer_down = false;
+            if let Some(gesture) = self.android_stroke.up(now) {
+                self.send(gesture.to_event());
+            }
+        }
+    }
+
+    fn send_android(&mut self, which: u8) {
+        use pjdesk_proto::peer::SpecialCommand;
+        let cmd = match which {
+            0 => SpecialCommand::Back,
+            1 => SpecialCommand::Home,
+            2 => SpecialCommand::Recents,
+            3 => SpecialCommand::VolumeUp,
+            4 => SpecialCommand::VolumeDown,
+            _ => SpecialCommand::Power,
+        };
+        let _ = self.control.send(ControlMsg::Special(cmd));
+    }
+
+    fn pointer_norm(&self) -> Option<(u16, u16)> {
+        let layout = self.layout;
+        if layout.width < 2 || layout.height < 2 {
+            return None;
+        }
+        let placed = pjdesk_proto::gesture::Letterbox {
+            x: layout.x,
+            y: layout.y,
+            width: layout.width as u32,
+            height: layout.height as u32,
+        };
+        pjdesk_proto::gesture::view_to_norm(placed, self.cursor_px.0 as f32, self.cursor_px.1 as f32)
+    }
+
+    /// Android has no scan-code keyboard. Printable keys and Enter/Backspace
+    /// go as text; the host types them into the focused field.
+    fn send_android_key(&mut self, event: &KeyEvent, code: KeyCode, down: bool) {
+        if !down {
+            return;
+        }
+        if code == KeyCode::Backspace {
+            let _ = self.control.send(ControlMsg::Text { chars: "\u{8}".into() });
+            return;
+        }
+        if code == KeyCode::Enter {
+            let _ = self.control.send(ControlMsg::Text { chars: "\n".into() });
+            return;
+        }
+        if let Some(text) = &event.text {
+            let text = text.to_string();
+            if !text.is_empty() && !text.chars().all(|c| c.is_control()) {
+                let _ = self.control.send(ControlMsg::Text { chars: text });
+            }
         }
     }
 }
@@ -1004,8 +1148,14 @@ impl App {
         };
         let origin = self.toolbar.tab_height() as f32;
         let content_h = (win_h as f32 - origin).max(1.0);
-        pjdesk_proto::layout::window_to_pointer(screen, position.x as f32, position.y as f32 - origin, win_w as f32, content_h)
-            .map(|(_, _, nx, ny)| (nx, ny))
+        pjdesk_proto::layout::window_to_pointer(
+            screen,
+            position.x as f32,
+            position.y as f32 - origin,
+            win_w as f32,
+            content_h,
+        )
+        .map(|(_, _, nx, ny)| (nx, ny))
     }
 
     fn send_pointer(&self, display: u8, x: u16, y: u16) {
@@ -1042,9 +1192,8 @@ impl App {
             return;
         }
         let monitor = window.current_monitor().map(|m| m.size()).unwrap_or(PhysicalSize::new(1920, 1080));
-        let scale = (monitor.width as f64 * 0.9 / frame_w as f64)
-            .min(monitor.height as f64 * 0.85 / frame_h as f64)
-            .min(1.0);
+        let scale =
+            (monitor.width as f64 * 0.9 / frame_w as f64).min(monitor.height as f64 * 0.85 / frame_h as f64).min(1.0);
         let _ = window.request_inner_size(PhysicalSize::new(
             ((frame_w as f64 * scale) as u32).max(320),
             ((frame_h as f64 * scale) as u32).max(200) + extra_h,
@@ -1247,7 +1396,8 @@ impl App {
         let (win_w, win_h) = (size.width as usize, size.height as usize);
         let layout = {
             let Ok(mut buffer) = pane.surface.buffer_mut() else { return };
-            let layout = Self::paint_picture(&mut buffer, win_w, win_h, picture.as_ref(), Zoom::Fit, (0, 0), 0, background);
+            let layout =
+                Self::paint_picture(&mut buffer, win_w, win_h, picture.as_ref(), Zoom::Fit, (0, 0), 0, background);
             if picture.is_none() {
                 toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, 48.0, "Waiting for this screen", 0xFF_9a_a3_b5);
             }
@@ -1477,7 +1627,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
-            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.on_key(event_loop, event, self.window.clone()),
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
+                self.on_key(event_loop, event, self.window.clone())
+            }
             WindowEvent::CursorMoved { position, .. } => self.on_cursor(position),
             WindowEvent::MouseInput { state, button, .. } => {
                 // Clicks on the toolbar (or its open menu) are handled locally.
@@ -1487,7 +1639,8 @@ impl ApplicationHandler<UserEvent> for App {
                     if self.panel.covers(self.cursor_px.0, self.cursor_px.1, win_w, win_h) {
                         if state == ElementState::Pressed {
                             let snap = self.live.lock().unwrap().snapshot();
-                            if let Some(cmd) = self.panel.click(self.cursor_px.0, self.cursor_px.1, win_w, win_h, &snap) {
+                            if let Some(cmd) = self.panel.click(self.cursor_px.0, self.cursor_px.1, win_w, win_h, &snap)
+                            {
                                 self.apply_panel(cmd);
                             }
                             if let Some(window) = &self.window {
@@ -1498,7 +1651,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     if self.is_separate() && toolbar::compact_covers(self.cursor_px.0, self.cursor_px.1, win_w, win_h) {
                         if state == ElementState::Pressed {
-                            if let Some(action) = toolbar::compact_click(self.cursor_px.0, self.cursor_px.1, win_w, win_h) {
+                            if let Some(action) =
+                                toolbar::compact_click(self.cursor_px.0, self.cursor_px.1, win_w, win_h)
+                            {
                                 if self.perform(action) {
                                     event_loop.exit();
                                 } else {
@@ -1538,7 +1693,13 @@ impl ApplicationHandler<UserEvent> for App {
                     winit::event::MouseButton::Forward => MouseButton::Forward,
                     winit::event::MouseButton::Other(_) => return,
                 };
-                self.send(InputEvent::MouseButton { button, down: state == ElementState::Pressed });
+                if self.remote_is_android() {
+                    if button == MouseButton::Left {
+                        self.on_android_button(state == ElementState::Pressed);
+                    }
+                } else {
+                    self.send(InputEvent::MouseButton { button, down: state == ElementState::Pressed });
+                }
             }
             WindowEvent::DroppedFile(path) => {
                 let _ = self.cmds.send(super::controls::Cmd::SendFile(path));

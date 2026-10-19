@@ -250,6 +250,23 @@ impl Config {
         }
     }
 
+    /// Records the operating system a host reported, reloading first so a
+    /// change the window saved while the viewer was open is not overwritten.
+    pub fn remember_platform(id: &str, family: &str, version: &str) {
+        if id.is_empty() || family.is_empty() {
+            return;
+        }
+        let path = Self::path();
+        let mut cfg = Self::load_from(&path).unwrap_or_default();
+        let note = cfg.settings.peers.entry(id.to_string()).or_default();
+        if note.os_family == family && note.os_version == version {
+            return;
+        }
+        note.os_family = family.to_string();
+        note.os_version = version.to_string();
+        let _ = cfg.save_to(&path);
+    }
+
     pub fn save(&self) -> Result<()> {
         self.save_to(&Self::path())
     }

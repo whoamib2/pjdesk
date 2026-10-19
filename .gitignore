@@ -5,3 +5,10 @@
 /installer/build/
 /installer/*.exe
 /installer/SHA256SUMS
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/app/src/main/jniLibs/
+/android/local.properties
+*.keystore
+*.jks

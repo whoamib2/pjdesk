@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 pjdesk-proto = { path = "../pjdesk-proto" }
+pjdesk-link = { path = "../pjdesk-link" }
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true

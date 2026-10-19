@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PJDesk</string>
+    <string name="a11y_desc">PJDesk uses this service only while a remote session is controlling this phone. It performs taps, swipes, and key presses you approved. It does not read your screen for itself.</string>
+    <string name="being_controlled">PJDesk is being controlled</string>
+    <string name="being_controlled_body">Someone is viewing and controlling this phone. Tap Stop to end it.</string>
+    <string name="host_online">PJDesk is online</string>
+    <string name="host_online_body">This phone can accept a remote desktop session.</string>
+    <string name="channel_online">Host status</string>
+    <string name="channel_live">Being controlled</string>
+    <string name="stop">Stop</string>
+</resources>

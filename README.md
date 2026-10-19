@@ -90,14 +90,15 @@ PJDesk/
 │   │       ├── relay.rs            UDP rendezvous + packet relay
 │   │       ├── registry.rs         persistent ID registry (devices.json)
 │   │       └── service.rs          Windows service install/uninstall/run
-│   └── pjdesk/                   the client (host + controller)
+│   ├── pjdesk-link/              shared signaling, hole punch, and SPAKE2
+│   ├── pjdesk-mobile/            Android engine (JNI, libpjdesk_mobile)
+│   └── pjdesk/                   the Windows client (host + controller)
 │       └── src/
 │           ├── main.rs             CLI + double-click interactive mode
 │           ├── config.rs           %APPDATA%\PJDesk\client.json
 │           ├── signaling.rs        TLS connection to the server (TOFU pinning)
-│           ├── p2p.rs              UDP binding, hole punching, QUIC, relay fallback
-│           ├── udp_fallback.rs     plain-UDP socket for unusual network stacks
-│           ├── session.rs          password authentication over QUIC
+│           ├── p2p.rs              re-exports pjdesk-link
+│           ├── session.rs          re-exports pjdesk-link
 │           ├── color.rs            BGRA ⇄ I420 conversion (multi-threaded)
 │           ├── host/
 │           │   ├── mod.rs          online loop, ID/password, session handling
@@ -115,6 +116,9 @@ PJDesk/
 │               ├── decoder.rs      OpenH264 decoder
 │               ├── render.rs       letterboxing + bilinear scaling
 │               └── keymap.rs       physical keys → PC scan codes
+└── android/                      Kotlin + Jetpack Compose app
+    ├── build.sh                  cargo-ndk + Gradle → dist/PJDesk-Android-<ver>.apk
+    └── README.md                 permissions, codec, how to build
 ```
 
 ---

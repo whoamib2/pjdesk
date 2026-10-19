@@ -5,8 +5,8 @@ pub(crate) fn render_monitor_shots(dir: &std::path::Path) {
     toolbar::render_monitor_shots(dir);
 }
 
-pub mod decoder;
 mod controls;
+pub mod decoder;
 mod keymap;
 mod panel;
 mod render;
@@ -80,13 +80,15 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
                         entry.password = None;
                     }
                     let _ = config.save();
+                    crate::note_failure(&format!("{e:#}"));
                     std::process::exit(3);
                 }
                 return Err(e);
             }
         };
         tries = 0;
-        if std::env::var("PJDESK_REMEMBER").ok().as_deref() == Some("1") && !password.is_empty() && is_valid_id(&target) {
+        if std::env::var("PJDESK_REMEMBER").ok().as_deref() == Some("1") && !password.is_empty() && is_valid_id(&target)
+        {
             config.remember_password(&target, Some(&password));
             if let Some(entry) = config.address_book.iter_mut().find(|e| e.id == target) {
                 entry.password = None;
@@ -115,6 +117,7 @@ async fn connect(
     password: &str,
     force_relay: bool,
 ) -> Result<Link> {
+    tracing::info!("Connecting to {} through {server}", format_id(target));
     println!("Connecting to {} through {server}...", format_id(target));
     let mut signal = SignalClient::connect(server, config).await?;
     signal.send(ClientMsg::Connect {
@@ -123,10 +126,12 @@ async fn connect(
         controller_name: crate::hostname(),
     })?;
 
+    tracing::info!("Waiting for {} to allow the connection", format_id(target));
     let (session_id, token, udp_port, host_name) = loop {
-        match timeout(Duration::from_secs(30), signal.recv()).await {
+        match timeout(Duration::from_secs(90), signal.recv()).await {
             Ok(Some(ServerMsg::SessionReady { session_id, token, udp_port, host_name })) => {
-                break (session_id, token, udp_port, host_name)
+                tracing::info!("Host accepted session {session_id:x}");
+                break (session_id, token, udp_port, host_name);
             }
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
             Ok(Some(_)) => continue,
@@ -165,15 +170,19 @@ async fn connect(
     punching.abort();
     let (connection, path) = connected?;
 
+    tracing::info!("Checking the password with {}", format_id(target));
     let auth = match session::controller_auth(&connection, password, &crate::hostname()).await {
         Ok(auth) => auth,
         Err(e) => {
             // Hang up properly so the host is free again right away.
             connection.close(1u32.into(), b"authentication failed");
             let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
-            return Err(if e.is::<WrongPassword>() { anyhow!("wrong password for {}", format_id(target)) } else { e });
+            let err = if e.is::<WrongPassword>() { anyhow!("wrong password for {}", format_id(target)) } else { e };
+            tracing::error!("session failed: {err:#}");
+            return Err(err);
         }
     };
+    tracing::info!("Password accepted by {}", auth.peer_name);
     Ok(Link {
         connection,
         endpoint,
@@ -200,7 +209,8 @@ async fn connect_direct(config: &mut Config, addr: &str, password: &str, trust: 
     };
     let udp = std::net::UdpSocket::bind("0.0.0.0:0").context("opening a UDP socket")?;
     let (endpoint, verifier) = p2p::controller_endpoint_pin(udp, pinned)?;
-    let connecting = endpoint.connect(socket_addr, pjdesk_proto::PEER_SERVER_NAME).context("starting the direct connection")?;
+    let connecting =
+        endpoint.connect(socket_addr, pjdesk_proto::PEER_SERVER_NAME).context("starting the direct connection")?;
     let connection = timeout(Duration::from_secs(8), connecting).await.context("the computer did not answer")??;
     if verifier.mismatch() {
         connection.close(1u32.into(), b"certificate mismatch");
