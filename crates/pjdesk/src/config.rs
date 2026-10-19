@@ -170,6 +170,15 @@ pub struct PeerNote {
     pub os_family: String,
     #[serde(default)]
     pub os_version: String,
+    /// Last interactive user reported by that computer. Empty until one is known.
+    #[serde(default)]
+    pub console_user: String,
+    /// When the account's server last saw this computer. 0 until then.
+    #[serde(default)]
+    pub last_seen: u64,
+    /// True when the account's server says this computer is connected.
+    #[serde(default)]
+    pub reported_online: bool,
     /// 0 = one display, 1 = all displays, 2 = a window per display.
     #[serde(default)]
     pub view_mode: u8,
@@ -353,6 +362,13 @@ impl Config {
             } else if note.os_version.is_empty() && note.os_family == src.os_family && !src.os_version.is_empty() {
                 note.os_version = src.os_version.clone();
             }
+            if note.console_user.trim().is_empty() && !src.console_user.trim().is_empty() {
+                note.console_user = src.console_user.clone();
+            }
+            if src.last_seen > note.last_seen {
+                note.last_seen = src.last_seen;
+                note.reported_online = src.reported_online;
+            }
             if src.last_connected > note.last_connected {
                 note.last_connected = src.last_connected;
             }
@@ -381,9 +397,31 @@ impl Config {
                     note.os_version = src.os_version.clone();
                 }
             }
+            if !src.console_user.trim().is_empty() {
+                note.console_user = src.console_user.clone();
+            }
+            if src.last_seen > note.last_seen {
+                note.last_seen = src.last_seen;
+            }
+            note.reported_online = src.reported_online;
             if src.last_connected > note.last_connected {
                 note.last_connected = src.last_connected;
             }
+        }
+        for entry in &disk.address_book {
+            let id = pjdesk_proto::normalize_id(&entry.id);
+            if !pjdesk_proto::is_valid_id(&id) {
+                continue;
+            }
+            if self.address_book.iter().any(|e| e.id == id) {
+                continue;
+            }
+            self.address_book.push(AddressEntry {
+                id,
+                alias: entry.alias.clone(),
+                password: None,
+                tags: entry.tags.clone(),
+            });
         }
     }
 
@@ -499,6 +537,39 @@ impl Config {
             self.network_standby_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         }
         self.merge_computers(&session.computers);
+        self.merge_presence(&session.presence);
+    }
+
+    /// Adds computers the account's server has seen, including ones saved
+    /// earlier with no name. A nickname already typed here is left as it is.
+    /// An empty hostname or user does not erase one already stored.
+    pub fn merge_presence(&mut self, rows: &[crate::network::HostPresence]) {
+        for row in rows {
+            let id = pjdesk_proto::normalize_id(&row.id);
+            if !pjdesk_proto::is_valid_id(&id) {
+                continue;
+            }
+            let note = self.settings.peers.entry(id.clone()).or_default();
+            if !row.hostname.trim().is_empty() {
+                note.hostname = row.hostname.trim().to_string();
+            }
+            if !row.os_family.trim().is_empty() {
+                note.os_family = row.os_family.trim().to_string();
+            }
+            if !row.os_version.trim().is_empty() {
+                note.os_version = row.os_version.trim().to_string();
+            }
+            if !row.console_user.trim().is_empty() {
+                note.console_user = row.console_user.trim().to_string();
+            }
+            if row.last_seen > note.last_seen {
+                note.last_seen = row.last_seen;
+            }
+            note.reported_online = row.online;
+            if !self.address_book.iter().any(|e| e.id == id) {
+                self.address_book.push(AddressEntry { id, alias: String::new(), ..Default::default() });
+            }
+        }
     }
 
     /// Adds the account's saved computers. Local passwords are left as they are.
@@ -756,6 +827,46 @@ mod tests {
         }]);
         assert_eq!(c.saved_password("123456789").as_deref(), Some("correct horse"));
         assert!(c.address_book.iter().all(|e| e.password.is_none()));
+    }
+
+    #[test]
+    fn presence_fills_a_blank_row_and_keeps_the_nickname_and_user() {
+        let mut c = Config::default();
+        c.address_book = vec![AddressEntry { id: "386626882".into(), alias: "Pixel".into(), ..Default::default() }];
+        c.settings.peers.insert(
+            "386626882".into(),
+            PeerNote { console_user: "Ben".into(), hostname: "Pixel 11".into(), ..Default::default() },
+        );
+        c.merge_presence(&[
+            crate::network::HostPresence {
+                id: "386 626 882".into(),
+                hostname: String::new(),
+                os_family: "android".into(),
+                os_version: "16".into(),
+                console_user: String::new(),
+                last_seen: 20,
+                online: true,
+            },
+            crate::network::HostPresence {
+                id: "692996394".into(),
+                hostname: "BENLENOVODESK".into(),
+                os_family: "windows".into(),
+                os_version: "11".into(),
+                console_user: "SPADER\\Ben".into(),
+                last_seen: 50,
+                online: false,
+            },
+        ]);
+        assert_eq!(c.address_book.iter().find(|e| e.id == "386626882").unwrap().alias, "Pixel");
+        let pixel = c.settings.peers.get("386626882").unwrap();
+        assert_eq!(pixel.hostname, "Pixel 11");
+        assert_eq!(pixel.console_user, "Ben");
+        assert_eq!(pixel.os_family, "android");
+        assert!(pixel.reported_online);
+        let desk = c.settings.peers.get("692996394").unwrap();
+        assert_eq!(desk.hostname, "BENLENOVODESK");
+        assert_eq!(desk.console_user, "SPADER\\Ben");
+        assert!(c.address_book.iter().any(|e| e.id == "692996394" && e.alias.is_empty()));
     }
 
     #[test]

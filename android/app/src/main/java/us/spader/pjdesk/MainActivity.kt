@@ -485,6 +485,13 @@ class MainActivity : ComponentActivity() {
                                     } else {
                                         null
                                     },
+                                    accountEmail = account,
+                                    onSignOut = {
+                                        app.store.networkEmail = ""
+                                        app.store.saveNetworkRefresh("")
+                                        engine.command(JSONObject().put("cmd", "accessToken").put("token", "").toString())
+                                        account = ""
+                                    },
                                 )
                                 1 -> SavedScreen(
                                     computers = saved,
@@ -502,6 +509,7 @@ class MainActivity : ComponentActivity() {
                                         app.store.saveComputerPassword(it.id, "")
                                         saved = app.store.saved()
                                     },
+                                    selfId = state.id,
                                     onRename = { computer, nickname ->
                                         app.store.rename(computer.id, nickname)
                                         saved = app.store.saved()

@@ -1633,6 +1633,72 @@ fn publish_health(data_dir: &Path, role: Role) {
     }
     let _ = crate::public_addr::poll_public_ip(data_dir, now());
     register_network(data_dir, role, false);
+    publish_presence(data_dir);
+}
+
+/// Uploads this server's computer list to the owner's account. The user name
+/// is in the body the account API stores; it is not written to the log.
+fn publish_presence(data_dir: &Path) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return;
+    }
+    let Ok(reg) = crate::registry::Registry::load(data_dir.join("devices.json")) else { return };
+    let online = online_ids(data_dir);
+    let now = now();
+    let mut devices = Vec::new();
+    for row in reg.presence() {
+        if row.last_seen == 0 || now.saturating_sub(row.last_seen) > 90 * 24 * 3600 {
+            continue;
+        }
+        devices.push(serde_json::json!({
+            "id": row.id,
+            "hostname": row.hostname,
+            "os_family": row.os_family,
+            "os_version": row.os_version,
+            "console_user": row.console_user,
+            "last_seen": row.last_seen,
+            "online": online.contains(&row.id),
+            "signed_in": row.signed_in,
+        }));
+        if devices.len() >= 500 {
+            break;
+        }
+    }
+    let body = serde_json::json!({ "devices": devices });
+    let stamp = data_dir.join("presence-publish.json");
+    if let Ok(prev) = std::fs::read(&stamp) {
+        if serde_json::from_slice::<serde_json::Value>(&prev).ok().as_ref() == Some(&body) {
+            return;
+        }
+    }
+    let result = agent()
+        .post(&format!("{}/api/network/presence", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string());
+    match result {
+        Ok(_) => {
+            if let Ok(bytes) = serde_json::to_vec(&body) {
+                let _ = std::fs::write(&stamp, bytes);
+            }
+            tracing::info!("presence: published {} computers", devices.len());
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            tracing::debug!("presence: the account did not accept the list ({code})");
+        }
+        Err(_) => tracing::debug!("presence: could not reach the account"),
+    }
+}
+
+fn online_ids(data_dir: &Path) -> std::collections::HashSet<String> {
+    let Ok(bytes) = std::fs::read(data_dir.join("online.json")) else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) else {
+        return std::collections::HashSet::new();
+    };
+    rows.into_iter().filter_map(|row| row.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())).collect()
 }
 
 /// Copies the account's network policy into `network-access.json`. The local

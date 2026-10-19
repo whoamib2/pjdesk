@@ -610,6 +610,9 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                     if conn.proto >= 3 {
                         conn.send(ServerMsg::Policy(st.accounts.policy()));
                     }
+                    if crate::registry::supports_host_report(&app_version) {
+                        conn.send(ServerMsg::WantHostReport);
+                    }
                     crate::audit::AuditLog::open(&st.data_dir).record(
                         "register",
                         &hostname,
@@ -852,6 +855,18 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             Some(_) => conn.error(ErrorCode::Unauthorized, "only an administrator can change roles"),
             None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
         },
+
+        ClientMsg::ReportHost { hostname, os_family, os_version, console_user } => {
+            let Some(id) = conn.host_id.clone() else { return };
+            let hostname = hostname.chars().filter(|c| !c.is_control()).take(64).collect::<String>();
+            st.registry.note_report(&id, &hostname, &os_family, &os_version, &console_user);
+            if !hostname.is_empty() {
+                if let Some(host) = st.online.get_mut(&id) {
+                    host.hostname = hostname.clone();
+                }
+            }
+            info!("Host {} reported {}", format_id(&id), if hostname.is_empty() { "its system".into() } else { hostname });
+        }
 
         ClientMsg::ChangePassword { token, new_password } => match st.accounts.user_for_token(&token) {
             Some(username) => match st.accounts.set_password(&username, &new_password) {

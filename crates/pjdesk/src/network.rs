@@ -49,6 +49,19 @@ pub struct SavedComputer {
     pub os_version: String,
 }
 
+/// A computer registered on the account's server. The user name is present only
+/// for the signed-in owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPresence {
+    pub id: String,
+    pub hostname: String,
+    pub os_family: String,
+    pub os_version: String,
+    pub console_user: String,
+    pub last_seen: u64,
+    pub online: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub email: String,
@@ -63,6 +76,7 @@ pub struct Session {
     pub lan: Vec<String>,
     pub public_ip: String,
     pub computers: Vec<SavedComputer>,
+    pub presence: Vec<HostPresence>,
 }
 
 /// A hostname is kept when a later update only has the raw IP it points at.
@@ -111,6 +125,8 @@ struct NetworkReply {
     network: Option<NetworkBody>,
     #[serde(default)]
     computers: Vec<ComputerBody>,
+    #[serde(default)]
+    presence: Vec<PresenceBody>,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +157,24 @@ struct ComputerBody {
     os_family: String,
     #[serde(default)]
     os_version: String,
+}
+
+#[derive(Deserialize)]
+struct PresenceBody {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    hostname: String,
+    #[serde(default)]
+    os_family: String,
+    #[serde(default)]
+    os_version: String,
+    #[serde(default)]
+    console_user: String,
+    #[serde(default)]
+    last_seen: u64,
+    #[serde(default)]
+    online: bool,
 }
 
 #[derive(Deserialize)]
@@ -228,6 +262,19 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
                 hostname: c.hostname,
                 os_family: c.os_family,
                 os_version: c.os_version,
+            })
+            .collect(),
+        presence: reply
+            .presence
+            .into_iter()
+            .map(|c| HostPresence {
+                id: c.id,
+                hostname: c.hostname,
+                os_family: c.os_family,
+                os_version: c.os_version,
+                console_user: c.console_user,
+                last_seen: c.last_seen,
+                online: c.online,
             })
             .collect(),
     })

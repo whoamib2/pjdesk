@@ -33,7 +33,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.3";
+pub const APP_VERSION: &str = "0.6.4";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -64,9 +64,19 @@ struct Outgoing {
     encode_us: u32,
 }
 
+#[derive(Clone, Default)]
+struct HostFacts {
+    hostname: String,
+    os_family: String,
+    os_version: String,
+    console_user: String,
+}
+
 struct State {
     dir: PathBuf,
     hostname: String,
+    /// OS and the Android profile name, filled by the app before registration.
+    facts: Mutex<HostFacts>,
     secret: [u8; 32],
     identity: TlsIdentity,
     device_id: Mutex<Option<String>>,
@@ -131,6 +141,7 @@ impl Engine {
         let state = Arc::new(State {
             dir,
             hostname: if hostname.trim().is_empty() { "Android".into() } else { hostname },
+            facts: Mutex::new(HostFacts::default()),
             secret,
             identity,
             device_id: Mutex::new((!stored.device_id.is_empty()).then_some(stored.device_id)),
@@ -301,6 +312,21 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         "regenerate" => {
             *state.otp.lock().unwrap() = generate_password();
             publish(state, cb);
+        }
+        "hostFacts" => {
+            let mut facts = state.facts.lock().unwrap();
+            if let Some(host) = cmd.get("hostname").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                facts.hostname = host.chars().take(64).collect();
+            }
+            if let Some(family) = cmd.get("os_family").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                facts.os_family = family.chars().take(32).collect();
+            }
+            if let Some(version) = cmd.get("os_version").and_then(|v| v.as_str()).map(str::trim) {
+                facts.os_version = version.chars().take(40).collect();
+            }
+            if let Some(user) = cmd.get("console_user").and_then(|v| v.as_str()).map(str::trim) {
+                facts.console_user = user.chars().filter(|c| !c.is_control()).take(80).collect();
+            }
         }
         "accessToken" => {
             let token = cmd.get("token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -523,7 +549,10 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
         proto: PROTOCOL_VERSION,
         device_id,
         device_secret: state.secret,
-        hostname: state.hostname.clone(),
+        hostname: {
+            let reported = state.facts.lock().unwrap().hostname.clone();
+            if reported.trim().is_empty() { state.hostname.clone() } else { reported }
+        },
         app_version: APP_VERSION.into(),
     })?;
     let server_ip = signal.server_addr.ip();
@@ -531,12 +560,23 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
     ping.tick().await;
     let mut routes: HashMap<u64, mpsc::UnboundedSender<ServerMsg>> = HashMap::new();
     let mut saw_registered = false;
+    let mut report_host = false;
+    let mut since_report = 0u32;
     loop {
         if state.app_stop.load(Ordering::SeqCst) {
             return Ok(());
         }
         tokio::select! {
-            _ = ping.tick() => { signal.send(ClientMsg::Ping)?; }
+            _ = ping.tick() => {
+                signal.send(ClientMsg::Ping)?;
+                if report_host {
+                    since_report += 1;
+                    if since_report >= 5 {
+                        since_report = 0;
+                        let _ = signal.send(host_report(&state));
+                    }
+                }
+            }
             msg = signal.recv() => {
                 let Some(msg) = msg else {
                     if presented && !saw_registered {
@@ -603,11 +643,27 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
                     ServerMsg::Error { message, .. } => {
                         emit(&cb, &json!({"event":"status","text": message}));
                     }
+                    ServerMsg::WantHostReport => {
+                        report_host = true;
+                        since_report = 0;
+                        let _ = signal.send(host_report(&state));
+                    }
                     ServerMsg::Pong | ServerMsg::UpdateNow => {}
                     _ => {}
                 }
             }
         }
+    }
+}
+
+fn host_report(state: &State) -> ClientMsg {
+    let facts = state.facts.lock().unwrap().clone();
+    let hostname = if facts.hostname.trim().is_empty() { state.hostname.clone() } else { facts.hostname };
+    ClientMsg::ReportHost {
+        hostname,
+        os_family: if facts.os_family.is_empty() { "android".into() } else { facts.os_family },
+        os_version: facts.os_version,
+        console_user: facts.console_user,
     }
 }
 
@@ -1251,6 +1307,7 @@ mod tests {
         Arc::new(State {
             dir: dir.to_path_buf(),
             hostname: "Pixel".into(),
+            facts: Mutex::new(HostFacts::default()),
             secret: [7u8; 32],
             identity,
             device_id: Mutex::new(None),

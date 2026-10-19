@@ -19,6 +19,7 @@ mod config;
 mod gui;
 mod handoff;
 mod host;
+mod hostfacts;
 mod identity;
 mod network;
 mod p2p;

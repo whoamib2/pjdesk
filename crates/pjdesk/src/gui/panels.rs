@@ -38,6 +38,7 @@ impl App {
             if ui.selectable_label(saved_on, "Saved computers").clicked() {
                 self.page = super::MainPage::Saved;
                 self.reload_peer_reports();
+                self.request_saved_refresh();
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -45,30 +46,25 @@ impl App {
                     self.open_settings();
                 }
                 ui.separator();
-                match &self.cfg.account {
-                    Some(acct) => {
-                        let who = if acct.display_name.is_empty() {
-                            acct.username.clone()
-                        } else {
-                            acct.display_name.clone()
-                        };
+                let email = self.cfg.network_email.clone().unwrap_or_default();
+                if !email.trim().is_empty() {
+                    ui.menu_button(RichText::new(email.trim()).color(p.ok), |ui| {
                         if ui.button("Sign out").clicked() {
-                            self.sign_out();
+                            self.sign_out_network();
+                            ui.close();
                         }
-                        theme::icon_in(ui, Icon::User, 16.0, p.ok);
-                        ui.label(RichText::new(who).color(p.ok));
+                    });
+                    theme::icon_in(ui, Icon::User, 16.0, p.ok);
+                } else {
+                    if ui
+                        .button("Sign in")
+                        .on_hover_text("Sign in with your PJDesk account for this network and its servers.")
+                        .clicked()
+                    {
+                        self.show_net_sign_in = true;
+                        self.status.clear();
                     }
-                    None => {
-                        if ui
-                            .button("Sign in")
-                            .on_hover_text("Older local account on this server. Not the password for a computer.")
-                            .clicked()
-                        {
-                            self.show_login = true;
-                            self.status.clear();
-                        }
-                        theme::icon_in(ui, Icon::User, 16.0, p.muted);
-                    }
+                    theme::icon_in(ui, Icon::User, 16.0, p.muted);
                 }
             });
         });

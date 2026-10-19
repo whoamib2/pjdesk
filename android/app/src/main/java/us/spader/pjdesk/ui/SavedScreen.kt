@@ -35,6 +35,7 @@ fun SavedScreen(
     onForget: (SavedComputer) -> Unit,
     onRemovePassword: (SavedComputer) -> Unit = {},
     onRename: (SavedComputer, String) -> Unit = { _, _ -> },
+    selfId: String = "",
 ) {
     val q = query.trim()
     val shown = computers.filter { matches(it, q) }
@@ -61,7 +62,8 @@ fun SavedScreen(
                 val host = computer.hostname.trim()
                 val title = nick.ifBlank { host.ifBlank { "No name yet" } }
                 val system = osLabel(computer.osFamily).ifBlank { "Unknown" }
-                Card(Modifier.fillMaxWidth().clickable { onOpen(computer) }) {
+                val mine = selfId.isNotBlank() && computer.id == selfId.filter { it.isDigit() }
+                Card(Modifier.fillMaxWidth().clickable(enabled = !mine) { onOpen(computer) }) {
                     Row(
                         Modifier.padding(12.dp).fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -76,6 +78,18 @@ fun SavedScreen(
                             )
                             if (nick.isNotBlank() && host.isNotBlank()) {
                                 Text(host, color = pjMuted(), style = MaterialTheme.typography.bodySmall)
+                            }
+                            if (computer.consoleUser.isNotBlank()) {
+                                Text(computer.consoleUser, color = pjMuted(), style = MaterialTheme.typography.bodySmall)
+                            }
+                            val status = when {
+                                mine -> "This phone"
+                                computer.online -> "Online"
+                                computer.lastSeen > 0 -> "Offline"
+                                else -> ""
+                            }
+                            if (status.isNotEmpty()) {
+                                Text(status, color = pjMuted(), style = MaterialTheme.typography.bodySmall)
                             }
                             val detail = buildString {
                                 append(computer.id.chunked(3).joinToString(" "))
@@ -127,5 +141,6 @@ private fun matches(computer: SavedComputer, query: String): Boolean {
         || computer.hostname.lowercase().contains(q)
         || (qid.isNotEmpty() && id.contains(qid))
         || computer.osFamily.lowercase().contains(q)
+        || computer.consoleUser.lowercase().contains(q)
         || system.lowercase().contains(q)
 }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonical, decide, inviteError, isPrivateAddress, normalizeFingerprint, planRegistration, requireAccountsOn } from "../src/network.js";
+import { applyPresence, canonical, decide, inviteError, isPrivateAddress, normalizeFingerprint, planRegistration, presenceView, requireAccountsOn } from "../src/network.js";
 
 test("canonical matches the shared fixture", () => {
   const text = canonical({
@@ -216,6 +216,23 @@ test("an owner server fills an empty slot and does not overwrite a different key
     activeFingerprint: "",
   });
   assert.equal(confirmedLan.status, 200);
+});
+
+test("an empty host report does not erase the name or the user", () => {
+  const kept = applyPresence(
+    { hostname: "BENLENOVODESK", os_family: "windows", os_version: "11", console_user: "SPADER\\Ben", last_seen: 10 },
+    { hostname: "", os_family: "", os_version: "", console_user: "", last_seen: 4, online: false },
+  );
+  assert.equal(kept.hostname, "BENLENOVODESK");
+  assert.equal(kept.console_user, "SPADER\\Ben");
+  assert.equal(kept.os_family, "windows");
+  assert.equal(kept.last_seen, 10);
+  const newer = applyPresence(kept, { hostname: "BEN-SURFACE-9", console_user: "Ben", last_seen: 20, online: true, os_family: "windows", os_version: "11" });
+  assert.equal(newer.hostname, "BEN-SURFACE-9");
+  assert.equal(newer.console_user, "Ben");
+  assert.equal(newer.online, 1);
+  assert.equal(presenceView(newer, "owner").console_user, "Ben");
+  assert.equal(presenceView(newer, "member").console_user, "");
 });
 
 test("a saved computer has no password field in the canonical record", () => {

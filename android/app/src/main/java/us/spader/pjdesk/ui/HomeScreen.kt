@@ -43,6 +43,8 @@ fun HomeScreen(
     onClearPermanent: () -> Unit = {},
     onUnattended: (Boolean) -> Unit = {},
     onSignIn: (() -> Unit)? = null,
+    accountEmail: String = "",
+    onSignOut: (() -> Unit)? = null,
 ) {
     Column(
         modifier = Modifier
@@ -51,6 +53,16 @@ fun HomeScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        if (accountEmail.isNotBlank()) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Signed in as $accountEmail")
+                    if (onSignOut != null) {
+                        TextButton(onClick = onSignOut) { Text("Sign out") }
+                    }
+                }
+            }
+        }
         if (onSignIn != null) {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {

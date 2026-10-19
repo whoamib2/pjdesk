@@ -1,8 +1,10 @@
 package us.spader.pjdesk.core
 
 import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.UserManager
 import android.provider.Settings
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -38,13 +40,22 @@ class Engine(context: Context) : EngineListener {
     fun start() {
         if (!Native.loaded || handle.get() != 0L) return
         val androidId = Settings.Secure.getString(app.contentResolver, Settings.Secure.ANDROID_ID) ?: ""
-        val host = android.os.Build.MODEL ?: "Android"
+        val host = deviceName(app)
         val created = Native.nativeCreate(app.filesDir.absolutePath, androidId, host, this)
         handle.set(created)
         if (created == 0L) {
             update { it.copy(status = "The PJDesk engine did not start.", error = "nativeCreate returned 0") }
             return
         }
+        command(
+            JSONObject()
+                .put("cmd", "hostFacts")
+                .put("hostname", host)
+                .put("os_family", "android")
+                .put("os_version", Build.VERSION.RELEASE ?: "")
+                .put("console_user", profileName(app))
+                .toString(),
+        )
         pushPermanent()
         command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
     }
@@ -315,6 +326,25 @@ class Engine(context: Context) : EngineListener {
                     ),
                 )
             }
+        }
+    }
+
+    private fun deviceName(context: Context): String {
+        val named = runCatching {
+            Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)
+        }.getOrNull()?.trim().orEmpty()
+        if (named.isNotEmpty()) return named.take(64)
+        return (Build.MODEL ?: "Android").take(64)
+    }
+
+    /** The Android user profile, when the system allows it. Blank otherwise. */
+    private fun profileName(context: Context): String {
+        return try {
+            val manager = context.getSystemService(UserManager::class.java) ?: return ""
+            val method = UserManager::class.java.getMethod("getUserName")
+            (method.invoke(manager) as? String)?.trim()?.take(80).orEmpty()
+        } catch (_: Throwable) {
+            ""
         }
     }
 

@@ -251,6 +251,8 @@ pub struct App {
     /// Login token for that offer. Not saved and not logged.
     net_login: String,
     net_rx: Option<Receiver<Result<crate::network::SignIn, String>>>,
+    /// Fills Saved computers from the account without opening a connection.
+    saved_rx: Option<Receiver<()>>,
     /// Network key waiting in the import dialog. Not logged.
     import_blob: Option<String>,
     import_pass: String,
@@ -351,6 +353,7 @@ impl App {
             net_offer: false,
             net_login: String::new(),
             net_rx: None,
+            saved_rx: None,
             import_blob: None,
             import_pass: String::new(),
             import_show: false,
@@ -1062,6 +1065,48 @@ impl App {
         }
     }
 
+    /// Leaves the PJDesk account. The server address, saved computers, and
+    /// per-computer passwords stay on this computer.
+    fn sign_out_network(&mut self) {
+        self.cfg.reload_identity_from_disk();
+        self.cfg.network_email = None;
+        self.cfg.network_refresh = None;
+        self.cfg.network_access = None;
+        self.cfg.network_access_exp = 0;
+        self.show_net_sign_in = false;
+        if let Err(e) = self.cfg.save() {
+            self.status = format!("Could not save settings: {e}");
+        }
+        self.toast.show("Signed out");
+    }
+
+    fn request_saved_refresh(&mut self) {
+        if self.saved_rx.is_some() || self.cfg.network_refresh_token().is_empty() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.saved_rx = Some(rx);
+        std::thread::spawn(move || {
+            if let Ok(mut cfg) = crate::config::Config::load() {
+                crate::network::refresh_config_now(&mut cfg);
+            }
+            let _ = tx.send(());
+        });
+    }
+
+    fn poll_saved_refresh(&mut self) {
+        let Some(rx) = &self.saved_rx else { return };
+        match rx.try_recv() {
+            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.saved_rx = None;
+                if let Ok(disk) = crate::config::Config::load() {
+                    self.cfg.take_peer_reports_from(&disk);
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     fn sign_out(&mut self) {
         if let Some(server) = self.server_addr() {
             let mut cfg = self.cfg.clone();
@@ -1311,6 +1356,7 @@ impl eframe::App for App {
         let ctx = self.ctx.clone();
         self.poll_login();
         self.poll_network();
+        self.poll_saved_refresh();
         self.poll_password();
         self.poll_probe();
         self.poll_viewers();
@@ -1349,6 +1395,7 @@ impl eframe::App for App {
         let pending = self.login_rx.is_some()
             || self.change_rx.is_some()
             || self.net_rx.is_some()
+            || self.saved_rx.is_some()
             || self.lan_rx.is_some()
             || !self.viewer_rx.is_empty()
             || !self.engine.ready;

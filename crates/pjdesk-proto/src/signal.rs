@@ -68,6 +68,15 @@ pub enum ClientMsg {
     /// that have one, before Register or Connect. Older servers cannot decode
     /// this variant and drop the connection; those clients retry once without it.
     PresentAccess { token: String },
+    /// 0.6.2+. Hostname, operating system, and the last interactive user.
+    /// Sent only after [`ServerMsg::WantHostReport`]. The user name is stored
+    /// for the account owner. It is not forwarded to other peers.
+    ReportHost {
+        hostname: String,
+        os_family: String,
+        os_version: String,
+        console_user: String,
+    },
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -246,6 +255,9 @@ pub enum ServerMsg {
     DeviceList { devices: Vec<DeviceBrief> },
     /// Version 3. Reply to [`ClientMsg::GetAudit`].
     Audit { events: Vec<AuditEvent> },
+    /// 0.6.2+. Asks a host that understands it to send [`ClientMsg::ReportHost`].
+    /// A server sends this only when the host's app version can decode it.
+    WantHostReport,
 }
 
 /// Machine-readable error categories.
@@ -275,6 +287,16 @@ mod tests {
         assert_eq!(update[0], 8);
         let access = postcard::to_stdvec(&ClientMsg::PresentAccess { token: "t".into() }).unwrap();
         assert_eq!(access[0], 16, "PresentAccess is appended after ChangePassword");
+        let report = postcard::to_stdvec(&ClientMsg::ReportHost {
+            hostname: "PC".into(),
+            os_family: "windows".into(),
+            os_version: "11".into(),
+            console_user: "BEN".into(),
+        })
+        .unwrap();
+        assert_eq!(report[0], 17, "ReportHost is appended after PresentAccess");
+        let ask = postcard::to_stdvec(&ServerMsg::WantHostReport).unwrap();
+        assert_eq!(ask[0], 12, "WantHostReport is appended after Audit");
         let back: ClientMsg = postcard::from_bytes(&ping).unwrap();
         assert!(matches!(back, ClientMsg::Ping));
     }

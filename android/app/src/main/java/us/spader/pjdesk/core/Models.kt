@@ -50,6 +50,10 @@ data class SavedComputer(
     val passwordSaved: Boolean = false,
     /** Hostname the remote computer reported. Empty before the first time it was seen. */
     val hostname: String = "",
+    /** Last person signed in on that computer. Empty when the account did not share one. */
+    val consoleUser: String = "",
+    val lastSeen: Long = 0,
+    val online: Boolean = false,
 )
 
 fun compactId(text: String): String = text.filter { !it.isWhitespace() }

@@ -492,6 +492,8 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
     let mut ping = tokio::time::interval(Duration::from_secs(25));
     ping.tick().await;
     let mut ui_tick = tokio::time::interval(Duration::from_millis(300));
+    let mut report_host = false;
+    let mut since_report = 0u32;
     // The server answers every ping. If it goes quiet (its computer died, or
     // DNS now points to a backup server), reconnect, which looks the server's
     // name up again.
@@ -513,6 +515,13 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                 }
                 signal.send(ClientMsg::Ping)?;
                 ping_at = Some(Instant::now());
+                if report_host {
+                    since_report += 1;
+                    if since_report >= 5 {
+                        since_report = 0;
+                        signal.send(crate::hostfacts::report())?;
+                    }
+                }
             }
             msg = signal.recv() => {
                 let Some(msg) = msg else {
@@ -582,6 +591,11 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                                 .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
                                 .spawn();
                         }
+                    }
+                    ServerMsg::WantHostReport => {
+                        report_host = true;
+                        since_report = 0;
+                        signal.send(crate::hostfacts::report())?;
                     }
                     ServerMsg::Error { message, .. } => warn!("Server: {message}"),
                     other => debug!("ignoring {other:?}"),

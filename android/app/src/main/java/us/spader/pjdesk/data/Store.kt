@@ -79,6 +79,9 @@ class Store(context: Context) {
                             osVersion = o.optString("osVersion"),
                             passwordSaved = computerPassword(id).isNotEmpty(),
                             hostname = hostname,
+                            consoleUser = o.optString("consoleUser"),
+                            lastSeen = o.optLong("lastSeen"),
+                            online = o.optBoolean("online"),
                         ),
                     )
                 }
@@ -103,9 +106,12 @@ class Store(context: Context) {
             val cur = local[index]
             local[index] = cur.copy(
                 name = cur.nickname().ifBlank { incoming.nickname() },
-                hostname = cur.hostname.ifBlank { incoming.hostname },
-                osFamily = cur.osFamily.ifBlank { incoming.osFamily },
-                osVersion = cur.osVersion.ifBlank { incoming.osVersion },
+                hostname = incoming.hostname.ifBlank { cur.hostname },
+                osFamily = incoming.osFamily.ifBlank { cur.osFamily },
+                osVersion = incoming.osVersion.ifBlank { cur.osVersion },
+                consoleUser = incoming.consoleUser.ifBlank { cur.consoleUser },
+                lastSeen = maxOf(cur.lastSeen, incoming.lastSeen),
+                online = if (incoming.lastSeen > 0 || incoming.online) incoming.online else cur.online,
             )
         }
         writeSaved(local)
@@ -145,7 +151,10 @@ class Store(context: Context) {
                     .put("name", c.nickname())
                     .put("hostname", c.hostname)
                     .put("osFamily", c.osFamily)
-                    .put("osVersion", c.osVersion),
+                    .put("osVersion", c.osVersion)
+                    .put("consoleUser", c.consoleUser)
+                    .put("lastSeen", c.lastSeen)
+                    .put("online", c.online),
             )
         }
         savedFile.writeText(array.toString())

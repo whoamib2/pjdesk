@@ -36,6 +36,27 @@ struct DeviceRecord {
     /// Missing in files written before 0.6.0, which means not signed in.
     #[serde(default)]
     signed_in: bool,
+    /// "windows", "android", or empty until the host reports it. Missing before 0.6.2.
+    #[serde(default)]
+    os_family: String,
+    #[serde(default)]
+    os_version: String,
+    /// Last interactive user. Empty is not a replacement for a name already stored.
+    /// Missing before 0.6.2. Shown only to the account owner, not to other peers.
+    #[serde(default)]
+    console_user: String,
+}
+
+/// One computer for the account's saved list. The user name stays on this server
+/// and is uploaded only to the owner's account.
+pub struct PresenceRow {
+    pub id: String,
+    pub hostname: String,
+    pub os_family: String,
+    pub os_version: String,
+    pub console_user: String,
+    pub last_seen: u64,
+    pub signed_in: bool,
 }
 
 /// A registered device, for the management window.
@@ -76,6 +97,33 @@ impl std::error::Error for RegisterError {}
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn clip(text: &str, max: usize) -> String {
+    text.trim().chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
+/// True when this app version can decode [`pjdesk_proto::signal::ServerMsg::WantHostReport`].
+///
+/// Desktop 0.6.2 can. Android 0.6.3 is already in use and cannot, so 0.6.3 is
+/// excluded. Android 0.6.4 and every later desktop and Android build can.
+pub fn supports_host_report(app_version: &str) -> bool {
+    let v = parse_version(app_version);
+    v == (0, 6, 2) || v >= (0, 6, 4)
+}
+
+fn parse_version(text: &str) -> (u32, u32, u32) {
+    let text = text.trim().trim_start_matches('v');
+    let mut parts = text.split('.');
+    let major = parts.next().and_then(|s| leading_u32(s)).unwrap_or(0);
+    let minor = parts.next().and_then(|s| leading_u32(s)).unwrap_or(0);
+    let patch = parts.next().and_then(|s| leading_u32(s)).unwrap_or(0);
+    (major, minor, patch)
+}
+
+fn leading_u32(text: &str) -> Option<u32> {
+    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() { None } else { digits.parse().ok() }
 }
 
 impl Registry {
@@ -241,6 +289,9 @@ impl Registry {
                 last_seen: now,
                 group: String::new(),
                 signed_in: false,
+                os_family: String::new(),
+                os_version: String::new(),
+                console_user: String::new(),
             },
         );
         self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
@@ -275,6 +326,48 @@ impl Registry {
             }
         }
         stale.len()
+    }
+
+    /// Stores a host report. An empty hostname or user leaves the previous value.
+    pub fn note_report(&mut self, id: &str, hostname: &str, os_family: &str, os_version: &str, console_user: &str) {
+        let Some(record) = self.data.devices.get_mut(id) else { return };
+        let hostname = clip(hostname, 64);
+        if !hostname.is_empty() {
+            record.hostname = hostname;
+        }
+        let os_family = clip(os_family, 32);
+        if !os_family.is_empty() {
+            record.os_family = os_family;
+        }
+        let os_version = clip(os_version, 40);
+        if !os_version.is_empty() {
+            record.os_version = os_version;
+        }
+        let console_user = clip(console_user, 80);
+        if !console_user.is_empty() {
+            record.console_user = console_user;
+        }
+        record.last_seen = now();
+        if let Err(e) = self.save() {
+            tracing::warn!("could not save a host report: {e}");
+        }
+    }
+
+    /// Every registered computer, for the account list. Online is decided by the caller.
+    pub fn presence(&self) -> Vec<PresenceRow> {
+        self.data
+            .devices
+            .iter()
+            .map(|(id, d)| PresenceRow {
+                id: id.clone(),
+                hostname: d.hostname.clone(),
+                os_family: d.os_family.clone(),
+                os_version: d.os_version.clone(),
+                console_user: d.console_user.clone(),
+                last_seen: d.last_seen,
+                signed_in: d.signed_in,
+            })
+            .collect()
     }
 
     /// Records that these devices are connected right now (their last-seen
@@ -423,6 +516,30 @@ mod tests {
         let reg = Registry::load(path.clone()).unwrap();
         assert_eq!(reg.list()[0].group, "Office");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_blank_report_does_not_erase_the_user_or_the_name() {
+        let (path, mut reg) = fresh("report");
+        let id = reg.register(None, &[6u8; 32], "BENLENOVODESK", "0.6.2").unwrap();
+        reg.note_report(&id, "BENLENOVODESK", "windows", "11 24H2", "SPADER\\Ben");
+        reg.note_report(&id, "", "", "", "");
+        let row = reg.presence().into_iter().find(|r| r.id == id).unwrap();
+        assert_eq!(row.hostname, "BENLENOVODESK");
+        assert_eq!(row.os_family, "windows");
+        assert_eq!(row.console_user, "SPADER\\Ben");
+        let reg = Registry::load(path.clone()).unwrap();
+        assert_eq!(reg.presence()[0].console_user, "SPADER\\Ben");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn only_builds_that_understand_the_ask_are_asked() {
+        assert!(!supports_host_report("0.6.1"));
+        assert!(supports_host_report("0.6.2"));
+        assert!(!supports_host_report("0.6.3"));
+        assert!(supports_host_report("0.6.4"));
+        assert!(supports_host_report("0.7.0"));
     }
 
     #[test]

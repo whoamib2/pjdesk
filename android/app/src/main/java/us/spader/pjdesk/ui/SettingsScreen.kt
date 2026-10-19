@@ -114,7 +114,7 @@ fun SettingsScreen(
             }
         }
         Section("About") {
-            Text("PJDesk 0.6.3", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.4", style = MaterialTheme.typography.titleMedium)
             Text(
                 "Android host and controller. Video is H.264 Annex-B from the hardware encoder, the same stream the Windows client decodes with OpenH264. The server comes from your PJDesk account after you sign in.",
                 color = pjMuted(),

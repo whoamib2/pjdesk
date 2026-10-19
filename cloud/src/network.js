@@ -443,6 +443,87 @@ function validDevice(id) {
   return typeof id === "string" && /^[A-Za-z0-9._-]{1,80}$/.test(id);
 }
 
+export function cleanLabel(value, max) {
+  return String(value || "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim()
+    .slice(0, max);
+}
+
+/** A later report fills blanks and never erases a hostname or user with an empty one. */
+export function applyPresence(prev, next) {
+  const hostname = cleanLabel(next.hostname, 64);
+  const osFamily = cleanLabel(next.os_family, 32);
+  const osVersion = cleanLabel(next.os_version, 40);
+  const user = cleanLabel(next.console_user, 80);
+  const last = Number(next.last_seen) || 0;
+  return {
+    hostname: hostname || prev.hostname || "",
+    os_family: osFamily || prev.os_family || "",
+    os_version: osVersion || prev.os_version || "",
+    console_user: user || prev.console_user || "",
+    last_seen: Math.max(Number(prev.last_seen) || 0, last),
+    online: next.online ? 1 : 0,
+    signed_in: next.signed_in ? 1 : 0,
+  };
+}
+
+/** The last signed-in user is visible only to the network owner. */
+export function presenceView(row, role) {
+  return {
+    id: String(row.id || ""),
+    hostname: row.hostname || "",
+    os_family: row.os_family || "",
+    os_version: row.os_version || "",
+    console_user: role === "owner" ? row.console_user || "" : "",
+    last_seen: Number(row.last_seen) || 0,
+    online: !!row.online,
+    signed_in: !!row.signed_in,
+  };
+}
+
+function missingPresence(err) {
+  const message = String(err?.message || err);
+  return /no such table/i.test(message);
+}
+
+async function presenceFor(env, networkId, role) {
+  try {
+    const cutoff = now() - 90 * 24 * 3600;
+    const { results } = await env.DB.prepare(
+      `SELECT pjdesk_id, hostname, os_family, os_version, console_user, last_seen, online, signed_in
+         FROM network_presence WHERE network_id = ? AND last_seen >= ? ORDER BY last_seen DESC LIMIT 500`,
+    )
+      .bind(networkId, cutoff)
+      .all();
+    return (results || []).map((row) =>
+      presenceView(
+        {
+          id: row.pjdesk_id,
+          hostname: row.hostname,
+          os_family: row.os_family,
+          os_version: row.os_version,
+          console_user: row.console_user,
+          last_seen: row.last_seen,
+          online: row.online,
+          signed_in: row.signed_in,
+        },
+        role,
+      ),
+    );
+  } catch (err) {
+    if (missingPresence(err)) return [];
+    throw err;
+  }
+}
+
+async function accountRole(env, network, account) {
+  if (network.owner_id && account.accountId && network.owner_id === account.accountId) return "owner";
+  if (!network.owner_id) return "member";
+  const owner = await env.DB.prepare("SELECT email FROM accounts WHERE id = ?").bind(network.owner_id).first();
+  return owner?.email === account.email ? "owner" : "member";
+}
+
 async function issue(env, account, network, deviceId, deviceName, computers) {
   if (!validDevice(deviceId)) throw new HttpError(400, "This device needs an id.");
   if (!network.active_address) throw new HttpError(400, NO_SERVER_MESSAGE);
@@ -460,6 +541,8 @@ async function issue(env, account, network, deviceId, deviceName, computers) {
     .run();
   if (computers) await saveComputers(env, network.id, account.accountId, computers);
   const saved = await computersFor(env, network.id, account.accountId);
+  const role = await accountRole(env, network, account);
+  const presence = await presenceFor(env, network.id, role);
   return {
     access,
     exp,
@@ -467,6 +550,7 @@ async function issue(env, account, network, deviceId, deviceName, computers) {
     device_id: deviceId,
     network: networkView(network),
     computers: saved,
+    presence,
   };
 }
 
@@ -508,6 +592,7 @@ async function handle(request, env, url) {
   if (p === "/api/network/token" && m === "POST") return token(request, env, account);
   if (p === "/api/network/computers" && m === "GET") return listComputers(env, account);
   if (p === "/api/network/computers" && m === "PUT") return putComputers(request, env, account);
+  if (p === "/api/network/presence" && m === "POST") return postPresence(request, env, account);
   if (p === "/api/network/enroll-code" && m === "POST") return enrollCode(env, account);
   if (p === "/api/network/invites" && m === "POST") return createInvite(request, env, account);
   if (p === "/api/network/invites/revoke" && m === "POST") return revokeInvite(request, env, account);
@@ -789,6 +874,8 @@ async function refresh(request, env) {
   const { access, exp } = await signToken(env, { email: account.email, network: row, deviceId });
   if (body.computers) await saveComputers(env, row.id, account.accountId, body.computers);
   const saved = await computersFor(env, row.id, account.accountId);
+  const role = owner?.email === row.email ? "owner" : "member";
+  const presence = await presenceFor(env, row.id, role);
   return json({
     access,
     exp,
@@ -796,7 +883,60 @@ async function refresh(request, env) {
     device_id: deviceId,
     network: networkView(row),
     computers: saved,
+    presence,
   });
+}
+
+async function postPresence(request, env, account) {
+  const found = await networkFor(env, account);
+  if (!found.network || found.role !== "owner") {
+    throw new HttpError(403, "Only the network owner can publish computers.");
+  }
+  const body = await readJson(request);
+  const devices = Array.isArray(body.devices) ? body.devices.slice(0, 500) : [];
+  const cutoff = now() - 90 * 24 * 3600;
+  const stmts = [];
+  for (const raw of devices) {
+    const id = String(raw.id || "").replace(/\D/g, "");
+    if (!/^\d{9}$/.test(id)) continue;
+    const last = Number(raw.last_seen) || now();
+    if (last < cutoff) continue;
+    const next = applyPresence({}, raw);
+    next.last_seen = last;
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO network_presence
+           (network_id, pjdesk_id, hostname, os_family, os_version, console_user, last_seen, online, signed_in)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(network_id, pjdesk_id) DO UPDATE SET
+           hostname = CASE WHEN excluded.hostname != '' THEN excluded.hostname ELSE network_presence.hostname END,
+           os_family = CASE WHEN excluded.os_family != '' THEN excluded.os_family ELSE network_presence.os_family END,
+           os_version = CASE WHEN excluded.os_version != '' THEN excluded.os_version ELSE network_presence.os_version END,
+           console_user = CASE WHEN excluded.console_user != '' THEN excluded.console_user ELSE network_presence.console_user END,
+           last_seen = CASE WHEN excluded.last_seen > network_presence.last_seen THEN excluded.last_seen ELSE network_presence.last_seen END,
+           online = excluded.online,
+           signed_in = excluded.signed_in`,
+      ).bind(
+        found.network.id,
+        id,
+        next.hostname,
+        next.os_family,
+        next.os_version,
+        next.console_user,
+        next.last_seen,
+        next.online,
+        next.signed_in,
+      ),
+    );
+  }
+  if (!stmts.length) return json({ ok: true, count: 0 });
+  try {
+    await env.DB.batch(stmts);
+  } catch (err) {
+    if (missingPresence(err)) return json({ ok: false, count: 0 });
+    throw err;
+  }
+  return json({ ok: true, count: stmts.length });
 }
 
 async function listComputers(env, account) {

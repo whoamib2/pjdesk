@@ -173,6 +173,24 @@ object CloudAuth {
                 )
             }
         }
+        val presence = mutableListOf<SavedComputer>()
+        val seen = reply.optJSONArray("presence")
+        if (seen != null) {
+            for (i in 0 until seen.length()) {
+                val o = seen.getJSONObject(i)
+                presence.add(
+                    SavedComputer(
+                        id = o.optString("id").filter { it.isDigit() },
+                        hostname = o.optString("hostname"),
+                        osFamily = o.optString("os_family"),
+                        osVersion = o.optString("os_version"),
+                        consoleUser = o.optString("console_user"),
+                        lastSeen = o.optLong("last_seen"),
+                        online = o.optBoolean("online"),
+                    ),
+                )
+            }
+        }
         return Session(
             email = email,
             access = reply.optString("access"),
@@ -183,8 +201,31 @@ object CloudAuth {
             fingerprint = network.optString("active_fingerprint"),
             standbyAddress = network.optString("standby_address"),
             standbyFingerprint = network.optString("standby_fingerprint"),
-            computers = computers,
+            computers = mergePresence(computers, presence),
         )
+    }
+
+    /** Presence fills a saved row and adds computers that were never saved by hand. */
+    private fun mergePresence(computers: List<SavedComputer>, presence: List<SavedComputer>): List<SavedComputer> {
+        val merged = computers.toMutableList()
+        for (incoming in presence) {
+            if (incoming.id.length != 9) continue
+            val index = merged.indexOfFirst { it.id == incoming.id }
+            if (index < 0) {
+                merged.add(incoming)
+                continue
+            }
+            val cur = merged[index]
+            merged[index] = cur.copy(
+                hostname = incoming.hostname.ifBlank { cur.hostname },
+                osFamily = incoming.osFamily.ifBlank { cur.osFamily },
+                osVersion = incoming.osVersion.ifBlank { cur.osVersion },
+                consoleUser = incoming.consoleUser.ifBlank { cur.consoleUser },
+                lastSeen = maxOf(cur.lastSeen, incoming.lastSeen),
+                online = incoming.online,
+            )
+        }
+        return merged
     }
 
     private fun post(url: String, bearer: String?, body: JSONObject): JSONObject {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.2
+
+Saved computers shows the real computer name, the last signed-in user, the operating system, and whether the computer is online. Desktop and server are 0.6.2. Android is 0.6.4. Run `cloud\deploy.cmd` from your PC so migration `0008_presence.sql` is applied and the worker that stores the list is deployed. Do that before expecting the Windows computers to appear. No tag, no release, and no GitHub Actions.
+
+* Each computer reports its hostname (Windows `COMPUTERNAME`; Android device name, or the model if the device name is unavailable), its operating system, and the last interactive user. On Windows that is the person at the console (`DOMAIN\user`, or just the user). On Android it is the profile name when Android provides one. The name stays when nobody is signed in. It is stored for the account owner only. A connection to some other computer does not receive it.
+* Saved computers, after you are signed in, includes every computer registered on your server, not only ones you saved by hand. A row that was saved with no name is filled in. The nickname stays the main line, with the real hostname under it. The User column is the last signed-in person. The System column is the operating system. Online and offline come from the server. This computer is marked **This computer** and Connect is not offered for it.
+* The header shows the PJDesk account you are signed in as, with **Sign out**. **Sign in** is shown only when you are not signed in. Signing out leaves the server address, the saved list, and the per-computer passwords on this computer.
+* A 0.6.1 desktop and a 0.6.3 Android keep working. The server asks for the new report only from a build that understands it (desktop 0.6.2, Android 0.6.4 and later). Hostnames already stored on the server show up after the server and the worker are updated, before each computer is updated. The user and the operating system fill in as each computer is updated.
+
 ## 0.6.1
 
 Fixes the 0.6.0 upgrade that turned **Require signed-in accounts** on, published both servers as standby, and emptied the active slot. Desktop and server are 0.6.1. Android stays 0.6.3. Run `cloud\deploy.cmd` from your PC (it applies `0007_reach.sql` and deploys the worker). Do not deploy from CI, and do not turn **Require signed-in accounts** on until every computer has signed in.
