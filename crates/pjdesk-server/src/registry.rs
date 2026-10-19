@@ -110,11 +110,21 @@ fn clip(text: &str, max: usize) -> String {
 
 /// True when this app version can decode [`pjdesk_proto::signal::ServerMsg::WantHostReport`].
 ///
-/// Desktop 0.6.2 can. Android 0.6.3 is already in use and cannot, so 0.6.3 is
-/// excluded. Android 0.6.4 and every later desktop and Android build can.
+/// Desktop 0.6.2 can. Android 0.6.3 cannot. A desktop that updated from 0.6.2
+/// to 0.6.3 already has an operating system on its record, and that record is
+/// not Android, so it is asked. A 0.6.3 with no operating system, or Android,
+/// is not asked. Android 0.6.4 and every later build can.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn supports_host_report(app_version: &str) -> bool {
+    supports_host_report_for(app_version, "")
+}
+
+pub fn supports_host_report_for(app_version: &str, os_family: &str) -> bool {
     let v = parse_version(app_version);
-    v == (0, 6, 2) || v >= (0, 6, 4)
+    if v == (0, 6, 2) || v >= (0, 6, 4) {
+        return true;
+    }
+    v == (0, 6, 3) && !os_family.is_empty() && !os_family.eq_ignore_ascii_case("android")
 }
 
 fn parse_version(text: &str) -> (u32, u32, u32) {
@@ -197,6 +207,11 @@ impl Registry {
     #[cfg(test)]
     pub fn group_of(&self, id: &str) -> Option<String> {
         self.data.devices.get(id).map(|d| d.group.clone())
+    }
+
+    /// Operating system last reported by this computer. Empty until a host report.
+    pub fn os_family(&self, id: &str) -> String {
+        self.data.devices.get(id).map(|d| d.os_family.clone()).unwrap_or_default()
     }
 
     /// Marks whether the latest registration presented a valid network token.
@@ -555,6 +570,9 @@ mod tests {
         assert!(!supports_host_report("0.6.1"));
         assert!(supports_host_report("0.6.2"));
         assert!(!supports_host_report("0.6.3"));
+        assert!(!supports_host_report_for("0.6.3", ""));
+        assert!(!supports_host_report_for("0.6.3", "android"));
+        assert!(supports_host_report_for("0.6.3", "windows"));
         assert!(supports_host_report("0.6.4"));
         assert!(supports_host_report("0.7.0"));
     }

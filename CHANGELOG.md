@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.3
+
+The PJDesk Server window stays usable after an update without Administrator rights. Desktop and server are 0.6.3. Android stays 0.6.5. No new database migration. No tag, no release, and no GitHub Actions.
+
+* Saving settings, signing in and out of the pjdesk.com account, the network address, the public-IP watch, Require signed-in accounts, promote, demote, sync, check for updates, install an update, and restarting the service go through the running PJDesk service. The window does not need to be elevated for those.
+* The service accepts a command when the caller is an administrator (including a normal Windows sign-in whose administrator rights are filtered by UAC) or the request carries a valid pjdesk.com access token for the same account the server is signed in to. Other local users are denied. Every command is written to the audit log. Passwords and tokens are not.
+* Install, uninstall, and stop still ask Windows to approve that one action. Restart as administrator stays as a link.
+* After an automatic update the window and tray open in the user session, as before. When the service answers, the window says **Managed through the PJDesk service.** instead of the administrator warning.
+* Sign-in stays across the update. The saved account is not removed.
+* A desktop 0.6.3 that already told the server its operating system is asked for the computer name. Android 0.6.3, and a 0.6.3 with no operating system stored, are not asked.
+
 ## 0.6.2
 
 Saved computers shows the real computer name, the last signed-in user, the operating system, and whether the computer is online. Desktop and server are 0.6.2. Android is 0.6.5. Run `cloud\deploy.cmd` from your PC so migrations `0008_presence.sql`, `0009_saved_order.sql`, and `0010_display_name.sql` are applied and the worker is deployed. Do that before expecting the Windows computers to appear. No tag, no release, and no GitHub Actions.

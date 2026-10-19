@@ -69,6 +69,8 @@ struct App {
     port: u16,
     fingerprint: String,
     can_write: bool,
+    /// The running service accepted a management command from this user.
+    control_ready: bool,
     accounts: Vec<accounts::AccountInfo>,
     devices: Vec<DeviceRow>,
     /// Live online devices (id → reported version), from the server's online.json.
@@ -146,6 +148,13 @@ enum JobDone {
         written_at: u64,
         readable: bool,
     },
+    /// The service is holding the sign-in until this window chooses.
+    ServiceAsk {
+        pending: String,
+        from: String,
+        written_at: u64,
+        readable: bool,
+    },
 }
 
 type CloudJobResult = Result<JobDone, String>;
@@ -159,6 +168,8 @@ struct CloudForm {
     show_acct_password: bool,
     /// Signed in, waiting for the user to choose backup vs. replace.
     pending: Option<crate::cloud::CloudConfig>,
+    /// Sign-in held by the service until this window chooses join or replace.
+    service_pending: String,
     ask: Option<(String, u64, bool)>,
     joining: bool,
     endpoint: String,
@@ -205,6 +216,7 @@ impl App {
             port,
             fingerprint: String::new(),
             can_write: false,
+            control_ready: false,
             accounts: Vec::new(),
             devices: Vec::new(),
             online: HashMap::new(),
@@ -324,12 +336,18 @@ impl App {
         self.access != Access::Readable && self.live.is_none() && self.opened_at.elapsed() < Duration::from_secs(2)
     }
 
+    fn via_service(&self) -> bool {
+        self.control_ready && !self.can_write
+    }
+
     fn refresh(&mut self) {
         if self.preview_locked {
             self.access = Access::Locked;
             self.can_write = false;
+            self.control_ready = false;
             return;
         }
+        self.control_ready = crate::control::ready();
         self.access = status_view::access(&self.data_dir);
         if self.access == Access::Missing && std::fs::create_dir_all(&self.data_dir).is_ok() {
             self.access = status_view::access(&self.data_dir);
@@ -402,17 +420,30 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                crate::tray::Action::ServiceStart => self.elevate_service("start"),
-                crate::tray::Action::ServiceStop => self.elevate_service("stop"),
-                crate::tray::Action::ServiceRestart => self.elevate_service("restart"),
+                crate::tray::Action::ServiceStart => self.elevate_service(&["service", "start"]),
+                crate::tray::Action::ServiceStop => self.elevate_service(&["service", "stop"]),
+                crate::tray::Action::ServiceRestart => {
+                    if self.control_ready {
+                        self.ask_service(crate::control::Request { cmd: "restart".into(), ..Default::default() });
+                    } else {
+                        self.elevate_service(&["service", "restart"]);
+                    }
+                }
                 crate::tray::Action::OpenLog => crate::tray::open_log_folder(&self.data_dir),
                 crate::tray::Action::CheckUpdates => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    let dir = self.data_dir.clone();
-                    self.status = "Checking for updates…".into();
-                    std::thread::spawn(move || {
-                        let _ = crate::self_update::check_now(&dir);
-                    });
+                    if self.via_service() {
+                        self.status = "Checking for updates…".into();
+                        self.spawn_cloud_job(|| {
+                            service_job(crate::control::Request { cmd: "check".into(), ..Default::default() })
+                        });
+                    } else {
+                        let dir = self.data_dir.clone();
+                        self.status = "Checking for updates…".into();
+                        std::thread::spawn(move || {
+                            let _ = crate::self_update::check_now(&dir);
+                        });
+                    }
                 }
                 crate::tray::Action::Promote => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -425,10 +456,14 @@ impl eframe::App for App {
                     self.cloud_form.confirm_promote = false;
                 }
                 crate::tray::Action::SyncNow => {
-                    self.status = match crate::requests::push(&self.data_dir, crate::requests::SYNC_FILE, "now") {
-                        Ok(()) => "Syncing now.".into(),
-                        Err(e) => format!("Could not ask the server to sync: {e}"),
-                    };
+                    if self.via_service() {
+                        self.ask_service(crate::control::Request { cmd: "sync".into(), ..Default::default() });
+                    } else {
+                        self.status = match crate::requests::push(&self.data_dir, crate::requests::SYNC_FILE, "now") {
+                            Ok(()) => "Syncing now.".into(),
+                            Err(e) => format!("Could not ask the server to sync: {e}"),
+                        };
+                    }
                 }
                 crate::tray::Action::Quit => {
                     self.really_quit = true;
@@ -496,11 +531,24 @@ impl eframe::App for App {
                 });
                 ui.add_space(8.0);
 
-                if !self.can_write {
+                if self.via_service() {
+                    card(ui, |ui| {
+                        ui.label("Managed through the PJDesk service.");
+                        ui.label(
+                            RichText::new("Install, uninstall, and stop still ask Windows to approve that one action.")
+                                .color(p(ui).muted)
+                                .size(12.0),
+                        );
+                        if ui.link("Restart as administrator").clicked() && run_elevated(&[]) {
+                            std::process::exit(0);
+                        }
+                    });
+                    ui.add_space(8.0);
+                } else if !self.can_write {
                     card(ui, |ui| {
                         ui.horizontal(|ui| {
                             glyph(ui, Icon::Alert, p(ui).warn);
-                            ui.label("Running without Administrator rights. You can look. Install, stop, and uninstall need a Windows administrator. PJDesk settings use the signed-in account once this window can write the data folder. There is no separate PJDesk password.");
+                            ui.label("Running without Administrator rights. You can look. Install, stop, and uninstall need a Windows administrator. PJDesk settings use the signed-in account once this window can write the data folder, or once the PJDesk service can take those actions. There is no separate PJDesk password.");
                         });
                         ui.add_space(8.0);
                         if ui_widgets::accent_button(ui, "Restart as administrator") && run_elevated(&[]) {
@@ -563,6 +611,7 @@ enum SvcAction {
     Uninstall,
     Start,
     Stop,
+    Restart,
 }
 
 impl App {
@@ -710,6 +759,9 @@ impl App {
                         action = Some(SvcAction::Uninstall);
                     }
                     if running {
+                        if ui.button("Restart").clicked() {
+                            action = Some(SvcAction::Restart);
+                        }
                         if ui.button("Stop").clicked() {
                             action = Some(SvcAction::Stop);
                         }
@@ -719,7 +771,7 @@ impl App {
                 }
             });
             ui.label(
-                RichText::new("Install, stop, and uninstall need a Windows administrator.")
+                RichText::new("Install, stop, and uninstall ask Windows to approve that one action. Restart goes through the running service.")
                     .color(p(ui).muted)
                     .size(11.0),
             );
@@ -763,16 +815,38 @@ impl App {
         }
     }
 
-    /// Runs a service action in-process (the server always runs elevated).
-    fn elevate_service(&mut self, verb: &str) {
-        if run_elevated(&["service", verb]) {
-            self.status = format!("Asked Windows to {verb} the service. Approve the prompt if it appears.");
+    /// Asks Windows to elevate one service command. This window stays as it is.
+    fn elevate_service(&mut self, args: &[&str]) {
+        if run_elevated(args) {
+            self.status = "Asked Windows to approve that action. This window stays open.".into();
         } else {
-            self.status = "Windows did not start the elevated service command.".into();
+            self.status = "Windows did not start the elevated action.".into();
         }
     }
 
+    fn ask_service(&mut self, req: crate::control::Request) {
+        self.status = match crate::control::call(&req) {
+            Some(response) => response.message,
+            None => "The PJDesk service did not answer.".into(),
+        };
+    }
+
     fn run_service_action(&mut self, action: SvcAction) {
+        if matches!(action, SvcAction::Restart) && self.control_ready {
+            self.ask_service(crate::control::Request { cmd: "restart".into(), ..Default::default() });
+            return;
+        }
+        if !self.can_write {
+            let args: &[&str] = match action {
+                SvcAction::Install => &["service", "install", "--firewall"],
+                SvcAction::Uninstall => &["service", "uninstall"],
+                SvcAction::Start => &["service", "start"],
+                SvcAction::Stop => &["service", "stop"],
+                SvcAction::Restart => &["service", "restart"],
+            };
+            self.elevate_service(args);
+            return;
+        }
         let result = match action {
             SvcAction::Install => {
                 let opts = crate::ServerOpts {
@@ -785,6 +859,7 @@ impl App {
             SvcAction::Uninstall => crate::service::uninstall().map(|_| "Service removed."),
             SvcAction::Start => crate::service::start().map(|_| "Service started."),
             SvcAction::Stop => crate::service::stop().map(|_| "Service stopped."),
+            SvcAction::Restart => crate::service::restart().map(|_| "Service restarted."),
         };
         self.status = match result {
             Ok(msg) => msg.to_string(),
@@ -813,6 +888,8 @@ impl App {
     }
 
     fn updates_locked(&mut self, ui: &mut egui::Ui) {
+        let mut check_now = false;
+        let mut install_now = false;
         card(ui, |ui| {
             heading(ui, "UPDATES");
             let Some(snap) = self.live.clone() else {
@@ -823,15 +900,25 @@ impl App {
                 self.locked_line(ui);
                 return;
             }
+            let managed = self.control_ready;
             let mut auto = snap.update_auto;
-            ui.add_enabled_ui(false, |ui| {
-                ui_widgets::checkbox(ui, &mut auto, "Install server updates automatically");
-            });
-            ui.label(
-                RichText::new("Shown from the running service. Restart as administrator to change it.")
-                    .color(p(ui).muted)
-                    .size(12.0),
-            );
+            let changed = ui
+                .add_enabled_ui(managed, |ui| ui_widgets::checkbox(ui, &mut auto, "Install server updates automatically"))
+                .inner;
+            if changed && managed {
+                self.ask_service(crate::control::Request {
+                    cmd: "set_update".into(),
+                    auto: Some(auto),
+                    ..Default::default()
+                });
+            }
+            if !managed {
+                ui.label(
+                    RichText::new("Shown from the running service. Restart as administrator to change it.")
+                        .color(p(ui).muted)
+                        .size(12.0),
+                );
+            }
             if !snap.window_start.is_empty() || !snap.window_end.is_empty() {
                 ui.label(format!("Maintenance window {} to {}", snap.window_start, snap.window_end));
             }
@@ -848,7 +935,47 @@ impl App {
             if !snap.update_error.is_empty() {
                 ui.colored_label(p(ui).warn, &snap.update_error);
             }
+            if managed {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Check for updates now").clicked() {
+                        check_now = true;
+                    }
+                    if !snap.update_available.is_empty() && ui.button("Install this update").clicked() {
+                        install_now = true;
+                    }
+                });
+                if self.update_start.is_empty() && !snap.window_start.is_empty() {
+                    self.update_start = snap.window_start.clone();
+                }
+                if self.update_end.is_empty() && !snap.window_end.is_empty() {
+                    self.update_end = snap.window_end.clone();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Maintenance window");
+                    ui.add(egui::TextEdit::singleline(&mut self.update_start).hint_text("any time").desired_width(70.0));
+                    ui.label("to");
+                    ui.add(egui::TextEdit::singleline(&mut self.update_end).hint_text("HH:MM").desired_width(70.0));
+                    if ui.button("Save").clicked() {
+                        self.ask_service(crate::control::Request {
+                            cmd: "set_window".into(),
+                            window_start: self.update_start.clone(),
+                            window_end: self.update_end.clone(),
+                            ..Default::default()
+                        });
+                    }
+                });
+            }
         });
+        if check_now {
+            self.status = "Checking for updates…".into();
+            self.spawn_cloud_job(|| service_job(crate::control::Request { cmd: "check".into(), ..Default::default() }));
+        } else if install_now {
+            self.status = "Installing the update…".into();
+            self.spawn_cloud_job(|| {
+                service_job(crate::control::Request { cmd: "update_now".into(), ..Default::default() })
+            });
+        }
     }
 
     fn cloud_locked(&mut self, ui: &mut egui::Ui) {
@@ -864,7 +991,9 @@ impl App {
             }
             if !snap.cloud_on {
                 ui.label("Cloud sync is off.");
-                ui.label(RichText::new("Restart as administrator to sign in.").color(p(ui).muted).size(12.0));
+                if !self.control_ready {
+                    ui.label(RichText::new("Restart as administrator to sign in.").color(p(ui).muted).size(12.0));
+                }
                 return;
             }
             ui.horizontal(|ui| {
@@ -889,11 +1018,26 @@ impl App {
             if !snap.cloud_error.is_empty() {
                 ui.colored_label(p(ui).warn, &snap.cloud_error);
             }
-            ui.label(
-                RichText::new("Shown from the running service. Restart as administrator to change cloud sync.")
-                    .color(p(ui).muted)
-                    .size(12.0),
-            );
+            if self.control_ready {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Become the primary").clicked() {
+                        self.ask_service(crate::control::Request { cmd: "promote".into(), ..Default::default() });
+                    }
+                    if ui.button("Step down to standby").clicked() {
+                        self.ask_service(crate::control::Request { cmd: "demote".into(), ..Default::default() });
+                    }
+                    if ui.button("Sync now").clicked() {
+                        self.ask_service(crate::control::Request { cmd: "sync".into(), ..Default::default() });
+                    }
+                });
+            } else {
+                ui.label(
+                    RichText::new("Shown from the running service. Restart as administrator to change cloud sync.")
+                        .color(p(ui).muted)
+                        .size(12.0),
+                );
+            }
         });
     }
 
@@ -975,12 +1119,17 @@ impl App {
         let role_line = self.account_role_line();
         let mut act: Option<CloudAct> = None;
         let busy = self.cloud_job.is_some();
-        let can_write = self.can_write;
+        let can_act = self.can_write || self.control_ready;
         let readable = self.access == Access::Readable;
+        let cloud_on = if readable {
+            self.cloud_on
+        } else {
+            self.live.as_ref().is_some_and(|s| s.cloud_on) || !email.is_empty()
+        };
         let choosing_bucket = self.cloud_form.own_bucket;
         card(ui, |ui| {
             heading(ui, "PJDESK ACCOUNT");
-            if !readable {
+            if !readable && !self.control_ready {
                 if email.is_empty() {
                     ui.label("Not signed in.");
                 } else {
@@ -1019,7 +1168,7 @@ impl App {
                 );
                 return;
             }
-            if !email.is_empty() && self.cloud_on {
+            if !email.is_empty() && cloud_on {
                 ui.label(RichText::new(format!("Signed in as {email}")).strong().size(20.0).color(p(ui).text));
                 if !role_line.is_empty() {
                     ui.add_space(2.0);
@@ -1034,7 +1183,7 @@ impl App {
                     .size(12.0),
                 );
                 ui.add_space(8.0);
-                ui.add_enabled_ui(can_write && !busy, |ui| {
+                ui.add_enabled_ui(can_act && !busy, |ui| {
                     ui.horizontal(|ui| {
                         if ui
                             .button("Sign out")
@@ -1052,7 +1201,7 @@ impl App {
                         }
                     });
                 });
-                if !can_write {
+                if !can_act {
                     ui.label(
                         RichText::new("Restart as administrator to sign out. Windows protects the saved sign-in.")
                             .color(p(ui).muted)
@@ -1070,7 +1219,7 @@ impl App {
             );
             ui.add_space(6.0);
             let online = self.online.len();
-            ui.add_enabled_ui(can_write && !busy, |ui| {
+            ui.add_enabled_ui(can_act && !busy, |ui| {
                 let f = &mut self.cloud_form;
                 if let Some((from, written_at, readable_copy)) = f.ask.clone() {
                     if readable_copy {
@@ -1137,7 +1286,7 @@ impl App {
                     }
                 }
             });
-            if !can_write {
+            if !can_act {
                 ui.label(
                     RichText::new("Restart as administrator to sign in. Windows protects the data folder. There is no separate PJDesk password.")
                         .color(p(ui).muted)
@@ -1513,6 +1662,15 @@ impl App {
                     self.status = "Enter your PJDesk account email and password.".into();
                     return;
                 }
+                if self.via_service() {
+                    self.spawn_cloud_job(move || service_job(crate::control::Request {
+                        cmd: "sign_in".into(),
+                        email,
+                        password,
+                        ..Default::default()
+                    }));
+                    return;
+                }
                 self.spawn_cloud_job(move || {
                     let cfg = cloud::sign_in(&cloud::default_api(), &email, &password)?;
                     finish_account(&dir, cfg, online, None)
@@ -1520,19 +1678,52 @@ impl App {
             }
             CloudAct::Choose(choice) => {
                 self.cloud_form.ask = None;
+                let pending = std::mem::take(&mut self.cloud_form.service_pending);
+                if !pending.is_empty() {
+                    let choice = match choice {
+                        crate::cloud::Choice::Join => "join",
+                        crate::cloud::Choice::Replace => "replace",
+                    };
+                    self.spawn_cloud_job(move || {
+                        service_job(crate::control::Request {
+                            cmd: "sign_in_choose".into(),
+                            pending,
+                            choice: choice.into(),
+                            ..Default::default()
+                        })
+                    });
+                    return;
+                }
                 let Some(cfg) = self.cloud_form.pending.take() else { return };
                 self.spawn_cloud_job(move || finish_account(&dir, cfg, online, Some(choice)));
             }
             CloudAct::CancelAsk => {
                 self.cloud_form.ask = None;
+                let pending = std::mem::take(&mut self.cloud_form.service_pending);
+                if !pending.is_empty() {
+                    self.ask_service(crate::control::Request {
+                        cmd: "sign_in_cancel".into(),
+                        pending,
+                        ..Default::default()
+                    });
+                }
                 if let Some(cfg) = self.cloud_form.pending.take() {
                     std::thread::spawn(move || cloud::discard_sign_in(&cfg));
                 }
             }
             CloudAct::CreateAccount => open_url(&format!("{}/account/#create", cloud::default_api())),
             CloudAct::SignInAgain => {
-                if !self.can_write {
+                if !self.can_write && !self.control_ready {
                     self.status = "Restart as administrator to sign in again. Windows protects the saved sign-in. There is no separate PJDesk password.".into();
+                    return;
+                }
+                if self.via_service() {
+                    if self.cloud_form.acct_email.trim().is_empty() {
+                        self.cloud_form.acct_email = self.signed_in_email();
+                    }
+                    self.ask_service(crate::control::Request { cmd: "sign_out".into(), ..Default::default() });
+                    self.cloud_form.own_bucket = false;
+                    self.status = "Enter your PJDesk account password to sign in again.".into();
                     return;
                 }
                 if let Some(cfg) = CloudConfig::load(&dir) {
@@ -1544,12 +1735,20 @@ impl App {
                 self.refresh();
             }
             CloudAct::SyncNow => {
+                if self.via_service() {
+                    self.ask_service(crate::control::Request { cmd: "sync".into(), ..Default::default() });
+                    return;
+                }
                 self.status = match crate::requests::push(&dir, crate::requests::SYNC_FILE, "now") {
                     Ok(()) => "Syncing now.".into(),
                     Err(e) => format!("Could not ask the server to sync: {e}"),
                 };
             }
             CloudAct::Promote => {
+                if self.via_service() {
+                    self.ask_service(crate::control::Request { cmd: "promote".into(), ..Default::default() });
+                    return;
+                }
                 if crate::cloud::status_is_fresh(&dir) {
                     self.status = match crate::requests::push(&dir, crate::requests::PROMOTE_FILE, "now") {
                         Ok(()) => "Asking the running server to become the primary.".into(),
@@ -1565,6 +1764,10 @@ impl App {
                 }
             }
             CloudAct::Demote => {
+                if self.via_service() {
+                    self.ask_service(crate::control::Request { cmd: "demote".into(), ..Default::default() });
+                    return;
+                }
                 if crate::cloud::status_is_fresh(&dir) {
                     self.status = match crate::requests::push(&dir, crate::requests::DEMOTE_FILE, "now") {
                         Ok(()) => "Asking the running server to step down to standby.".into(),
@@ -1585,8 +1788,18 @@ impl App {
                 None => self.status = "Can't read the sync settings (restart as administrator).".into(),
             },
             CloudAct::Off | CloudAct::Switch => {
-                if !self.can_write {
+                if !self.can_write && !self.control_ready {
                     self.status = "Restart as administrator to sign out. Windows protects the saved sign-in. There is no separate PJDesk password.".into();
+                    return;
+                }
+                if self.via_service() {
+                    let switching = matches!(act, CloudAct::Switch);
+                    self.ask_service(crate::control::Request { cmd: "sign_out".into(), ..Default::default() });
+                    self.cloud_form.own_bucket = false;
+                    self.cloud_form.acct_password.clear();
+                    if switching {
+                        self.status = "Signed out. Sign in with the PJDesk account this server should use.".into();
+                    }
                     return;
                 }
                 let switching = matches!(act, CloudAct::Switch);
@@ -1680,11 +1893,20 @@ impl App {
                 self.cloud_form.pending = Some(cfg);
                 self.cloud_form.ask = Some((from, written_at, readable));
             }
+            Ok(JobDone::ServiceAsk { pending, from, written_at, readable }) => {
+                self.cloud_form.service_pending = pending;
+                self.cloud_form.ask = Some((from, written_at, readable));
+                self.status = "Choose which copy to keep.".into();
+            }
             Err(e) => self.status = e,
         }
     }
 
     fn network_card(&mut self, ui: &mut egui::Ui) {
+        if self.access != Access::Readable && self.control_ready {
+            self.network_managed(ui);
+            return;
+        }
         if self.access != Access::Readable {
             card(ui, |ui| {
                 heading(ui, "SIGNED-IN ACCOUNTS");
@@ -1894,6 +2116,106 @@ impl App {
         }
         if publish {
             self.publish_public_address(replace);
+        }
+    }
+
+    fn network_managed(&mut self, ui: &mut egui::Ui) {
+        if self.pub_addr.is_empty() {
+            if let Some(live) = &self.live {
+                if !live.public_address.is_empty() {
+                    self.pub_addr = live.public_address.clone();
+                    self.pub_addr_note = live.public_note.clone();
+                    self.pub_addr_needs_confirm = live.public_needs_confirm;
+                    self.pub_addr_confirmed = live.public_confirmed;
+                }
+            }
+        }
+        let live = self.live.clone();
+        let mut require = live.as_ref().map(|s| s.require_accounts).unwrap_or(false);
+        let watch_known = live.as_ref().is_some_and(|s| s.public_watch_known);
+        let mut watch = live.as_ref().is_some_and(|s| s.public_watch);
+        let ip_line = live.as_ref().map(|s| s.public_ip_line.clone()).unwrap_or_default();
+        let hostname = crate::public_addr::is_hostname(self.pub_addr.trim());
+        let mut changed = false;
+        let mut watch_changed = false;
+        let mut publish = false;
+        let mut replace = false;
+        let address = self.pub_addr.clone();
+        card(ui, |ui| {
+            heading(ui, "PUBLIC ADDRESS");
+            ui.label(RichText::new(
+                "Saved by the PJDesk service. The address computers use to reach this server.",
+            ).color(p(ui).muted));
+            ui.add_space(6.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pub_addr)
+                    .hint_text("host or host:port")
+                    .desired_width(360.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            if !ip_line.is_empty() {
+                ui.label(RichText::new(&ip_line).color(p(ui).muted).size(12.0));
+            }
+            if hostname {
+                ui.label(RichText::new(
+                    "This address is a hostname, so a public IP change does not replace it.",
+                ).color(p(ui).muted).size(12.0));
+            } else if watch_known && ui.checkbox(&mut watch, "Update the address when my public IP changes").changed() {
+                watch_changed = true;
+            }
+            if !self.pub_addr_note.is_empty() {
+                ui.label(RichText::new(&self.pub_addr_note).color(p(ui).muted).size(12.0));
+            }
+            if self.pub_addr_needs_confirm && ui.button("Replace the server on My network").clicked() {
+                publish = true;
+                replace = true;
+            } else if !self.pub_addr.trim().is_empty() && self.pub_addr.trim() != address.trim() && ui.button("Update My network").clicked()
+            {
+                publish = true;
+            }
+            ui.add_space(12.0);
+            heading(ui, "SIGNED-IN ACCOUNTS");
+            ui.add_space(6.0);
+            if ui.checkbox(&mut require, "Require signed-in accounts").changed() {
+                changed = true;
+            }
+            ui.label(RichText::new(
+                "Off by default, so an update does not take a computer offline. Turn this on only after every computer has signed in.",
+            ).color(p(ui).muted).size(12.0));
+            if let Some(live) = &live {
+                let waiting: Vec<_> = live.devices.iter().filter(|d| !d.signed_in).cloned().collect();
+                ui.add_space(6.0);
+                ui.label(RichText::new("Not signed in yet").strong());
+                if waiting.is_empty() {
+                    ui.label(RichText::new("No computer is waiting to sign in.").color(p(ui).muted));
+                } else {
+                    for d in waiting {
+                        ui.label(format!("{}  {}", pjdesk_proto::format_id(&d.id), d.hostname));
+                    }
+                }
+            }
+        });
+        if changed {
+            self.ask_service(crate::control::Request {
+                cmd: "set_require".into(),
+                require_accounts: Some(require),
+                ..Default::default()
+            });
+        }
+        if watch_changed {
+            self.ask_service(crate::control::Request {
+                cmd: "set_watch".into(),
+                watch_auto: Some(watch),
+                ..Default::default()
+            });
+        }
+        if publish {
+            self.ask_service(crate::control::Request {
+                cmd: "set_address".into(),
+                address: self.pub_addr.trim().to_string(),
+                replace,
+                ..Default::default()
+            });
         }
     }
 
@@ -2430,6 +2752,20 @@ impl App {
                 });
             }
         });
+    }
+}
+
+fn service_job(req: crate::control::Request) -> anyhow::Result<JobDone> {
+    match crate::control::call(&req) {
+        Some(response) if response.code == "ask" => Ok(JobDone::ServiceAsk {
+            pending: response.pending,
+            from: response.from,
+            written_at: response.written_at,
+            readable: response.readable,
+        }),
+        Some(response) if response.ok => Ok(JobDone::Message(response.message)),
+        Some(response) => Err(anyhow::anyhow!(response.message)),
+        None => Err(anyhow::anyhow!("The PJDesk service did not answer.")),
     }
 }
 

@@ -417,7 +417,7 @@ fn authorization(
     )
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build()
 }
 

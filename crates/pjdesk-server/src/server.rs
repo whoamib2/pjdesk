@@ -248,6 +248,10 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         let _ = std::thread::Builder::new().name("status-pipe".into()).spawn(move || {
             crate::status_pipe::serve(pipe_dir, pipe_port);
         });
+        let control_dir = data_dir.clone();
+        let _ = std::thread::Builder::new().name("control-pipe".into()).spawn(move || {
+            crate::control::serve(control_dir);
+        });
     }
     crate::self_update::retire_legacy_task_if_disabled(&data_dir);
     let budget = Arc::new(Mutex::new(ConnBudget::default()));
@@ -610,7 +614,8 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                     if conn.proto >= 3 {
                         conn.send(ServerMsg::Policy(st.accounts.policy()));
                     }
-                    if crate::registry::supports_host_report(&app_version) {
+                    let os = st.registry.os_family(&id);
+                    if crate::registry::supports_host_report_for(&app_version, &os) {
                         conn.send(ServerMsg::WantHostReport);
                     }
                     crate::audit::AuditLog::open(&st.data_dir).record(

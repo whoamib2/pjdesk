@@ -24,6 +24,10 @@ pub fn stop() -> Result<()> {
     anyhow::bail!("the Windows service is only available on Windows")
 }
 
+pub fn restart() -> Result<()> {
+    anyhow::bail!("the Windows service is only available on Windows")
+}
+
 pub fn status() -> (bool, bool) {
     (false, false)
 }

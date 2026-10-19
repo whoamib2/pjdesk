@@ -16,6 +16,7 @@ mod access;
 mod accounts;
 mod audit;
 mod cloud;
+mod control;
 mod handoff;
 mod password_policy;
 mod public_addr;
