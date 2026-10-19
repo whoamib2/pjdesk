@@ -83,7 +83,7 @@ pub fn report() -> ClientMsg {
     }
 }
 
-fn console_user() -> String {
+pub(crate) fn console_user() -> String {
     let path = crate::config::Config::path().with_file_name("console-user.txt");
     remember_console_user(&path, &live_console_user())
 }

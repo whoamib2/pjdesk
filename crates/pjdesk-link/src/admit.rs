@@ -23,7 +23,9 @@ pub fn after_password(
     policy: &Policy,
     view_only: bool,
 ) -> Admit {
-    let restricted = grant(perms::UNATTENDED_DEFAULT, policy.max_permissions, view_only) & !perms::FILE;
+    // File transfer stays inside the host's receive folder (the Desktop when
+    // that folder was left blank). View-only still loses it via `grant`.
+    let restricted = grant(perms::UNATTENDED_DEFAULT | perms::FILE, policy.max_permissions, view_only);
     let password_access = policy.unattended_allowed && !policy.force_prompt;
     if matched_permanent && password_access {
         return Admit::Open(restricted);
@@ -71,5 +73,18 @@ mod tests {
         let mut forced = policy.clone();
         forced.force_prompt = true;
         assert!(matches!(after_password("unattended", true, true, &forced, false), Admit::Ask));
+    }
+
+    #[test]
+    fn an_unattended_session_can_receive_files_unless_it_is_view_only() {
+        let policy = Policy::default();
+        match after_password("unattended", true, true, &policy, false) {
+            Admit::Open(bits) => assert!(perms::has(bits, perms::FILE)),
+            Admit::Ask => panic!("expected the session to open"),
+        }
+        match after_password("unattended", true, true, &policy, true) {
+            Admit::Open(bits) => assert!(!perms::has(bits, perms::FILE)),
+            Admit::Ask => panic!("expected the session to open"),
+        }
     }
 }

@@ -141,28 +141,57 @@ fn serve_once() -> bool {
             let _ = windows::Win32::Foundation::CloseHandle(pipe);
             return false;
         }
-        // Confirm a local caller, then drop back to SYSTEM before any download.
-        let allowed = ImpersonateNamedPipeClient(pipe).is_ok();
-        let _ = RevertToSelf();
+        // Read first. Impersonating before any bytes arrive fails for a normal
+        // window (often Win32 1368) and used to reject the request with no log.
         let mut buf = vec![0u8; 4096];
         let mut n = 0u32;
         let read = ReadFile(pipe, Some(&mut buf), Some(&mut n), None);
-        let request = if !allowed {
-            None
-        } else if read.is_err() || n == 0 || n as usize >= buf.len() {
-            None
-        } else {
-            serde_json::from_slice::<Incoming>(&buf[..n as usize]).ok()
+        let caller = match ImpersonateNamedPipeClient(pipe) {
+            Ok(()) => {
+                let _ = RevertToSelf();
+                "local user".to_string()
+            }
+            Err(e) => {
+                let _ = RevertToSelf();
+                let note = format!("could not impersonate the caller ({e})");
+                tracing::warn!("{note}");
+                note
+            }
         };
-        let cmd = request.as_ref().map(|r| r.cmd.trim().to_string()).unwrap_or_default();
         let write_line = |body: Outgoing| {
             if let Ok(mut bytes) = serde_json::to_vec(&body) {
                 bytes.push(b'\n');
                 let _ = WriteFile(pipe, Some(&bytes), None, None);
             }
         };
-        if !allowed || request.is_none() {
-            write_line(Outgoing { progress: "", done: true, ok: false, message: "That update request was not accepted." });
+        let request = if let Err(e) = read {
+            let reason = format!("Could not read the update request ({e}).");
+            tracing::warn!("{reason} caller={caller}");
+            Err(reason)
+        } else if n == 0 {
+            let reason = "The update request was empty.".to_string();
+            tracing::warn!("{reason} caller={caller}");
+            Err(reason)
+        } else if n as usize >= buf.len() {
+            let reason = "The update request was too large.".to_string();
+            tracing::warn!("{reason} caller={caller}");
+            Err(reason)
+        } else {
+            match serde_json::from_slice::<Incoming>(&buf[..n as usize]) {
+                Ok(req) => {
+                    tracing::info!("update request {:?} from {caller}", req.cmd);
+                    Ok(req)
+                }
+                Err(e) => {
+                    let reason = format!("The update request was not understood ({e}).");
+                    tracing::warn!("{reason} caller={caller}");
+                    Err(reason)
+                }
+            }
+        };
+        let cmd = request.as_ref().map(|r| r.cmd.trim().to_string()).unwrap_or_default();
+        if let Err(reason) = request {
+            write_line(Outgoing { progress: "", done: true, ok: false, message: &reason });
         } else if cmd == "ping" {
             write_line(Outgoing { progress: "", done: true, ok: true, message: "ready" });
         } else if cmd == "update" {
@@ -174,18 +203,28 @@ fn serve_once() -> bool {
                     message: "An update is already running.",
                 });
             } else {
+                let last_line = std::sync::Mutex::new(String::new());
                 let outcome = pjdesk_proto::update::install_client_as_service(env!("CARGO_PKG_VERSION"), &|line| {
                     tracing::info!("{line}");
+                    *last_line.lock().unwrap() = line.to_string();
                     write_line(Outgoing { progress: line, done: false, ok: false, message: "" });
                 });
                 BUSY.store(false, Ordering::SeqCst);
                 match outcome {
-                    Ok(pjdesk_proto::update::Outcome::UpToDate(version)) => write_line(Outgoing {
-                        progress: "",
-                        done: true,
-                        ok: true,
-                        message: &format!("PJDesk {version} is up to date."),
-                    }),
+                    Ok(pjdesk_proto::update::Outcome::UpToDate(version)) => {
+                        let saved = last_line.lock().unwrap().clone();
+                        let message = if saved.contains("GitHub latest") {
+                            saved
+                        } else {
+                            format!("PJDesk {version} is up to date.")
+                        };
+                        write_line(Outgoing {
+                            progress: "",
+                            done: true,
+                            ok: true,
+                            message: &message,
+                        });
+                    }
                     Ok(pjdesk_proto::update::Outcome::Installing(version)) => write_line(Outgoing {
                         progress: "",
                         done: true,
@@ -210,7 +249,9 @@ fn serve_once() -> bool {
                 }
             }
         } else {
-            write_line(Outgoing { progress: "", done: true, ok: false, message: "That command was not understood." });
+            let reason = format!("That command was not understood ({cmd}).");
+            tracing::warn!("{reason} caller={caller}");
+            write_line(Outgoing { progress: "", done: true, ok: false, message: &reason });
         }
         let _ = DisconnectNamedPipe(pipe);
         let _ = windows::Win32::Foundation::CloseHandle(pipe);
@@ -225,6 +266,7 @@ pub fn request_update(progress: &(dyn Fn(&str) + Sync)) -> Option<UpdateReply> {
     use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        SECURITY_IMPERSONATION, SECURITY_SQOS_PRESENT,
     };
     use windows::Win32::System::Pipes::WaitNamedPipeW;
 
@@ -240,7 +282,7 @@ pub fn request_update(progress: &(dyn Fn(&str) + Sync)) -> Option<UpdateReply> {
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION,
             None,
         )
         .ok()?;

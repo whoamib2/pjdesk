@@ -50,6 +50,14 @@ pub struct NeedsApproval {
     pub recv: RecvStream,
     pub peer_name: String,
     pub peer_proto: u16,
+    /// pjdesk.com account, when the controller is signed in. Empty for Ask the person.
+    pub account: String,
+    /// Controller computer name.
+    pub computer: String,
+    /// Controller device id, digits only. Empty when unknown.
+    pub id: String,
+    /// True for a view request. Ask the person leaves this false.
+    pub view: bool,
 }
 
 impl fmt::Display for NeedsApproval {
@@ -212,6 +220,35 @@ pub async fn controller_auth_version(
     }
 }
 
+/// Ask the host to show "wants to view your screen" instead of checking a password.
+///
+/// `account` is empty when this computer is not signed in to pjdesk.com.
+pub async fn controller_ask_view(connection: &Connection, account: &str, computer: &str, id: &str) -> Result<Authenticated> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let account: String = account.trim().chars().filter(|c| !c.is_control()).take(80).collect();
+    let computer: String = computer.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+    let id: String = id.chars().filter(|c| c.is_ascii_digit()).take(32).collect();
+    write_msg(&mut send, &AuthMsg::AskView { proto: PROTOCOL_VERSION, account, computer, id }).await?;
+    let verdict = match timeout(VERDICT_WAIT, read_msg::<_, AuthMsg>(&mut recv, MAX_CONTROL_FRAME)).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(_)) => {
+            bail!("The phone closed the view request. Update that phone to PJDesk 0.6.8, then try again.")
+        }
+        Err(_) => bail!("Timed out. No one at that phone answered the request to view the screen."),
+    };
+    match verdict {
+        AuthMsg::Result { ok: true, host_name, .. } => Ok(Authenticated {
+            send,
+            recv,
+            peer_name: host_name,
+            peer_proto: PROTOCOL_VERSION,
+            password_slot: 0,
+        }),
+        AuthMsg::Result { ok: false, message, .. } => Err(auth_refusal(&message)),
+        other => bail!("unexpected message from the host: {other:?}"),
+    }
+}
+
 /// Ask the person at the host instead of sending a password.
 pub async fn controller_ask_person(connection: &Connection, my_name: &str) -> Result<Authenticated> {
     let (mut send, mut recv) = connection.open_bi().await?;
@@ -260,7 +297,32 @@ pub async fn host_auth(
             if attempt_used.swap(true, Ordering::SeqCst) {
                 bail!("only one password attempt is allowed per connection request");
             }
-            return Err(NeedsApproval { send, recv, peer_name: controller_name, peer_proto: proto }.into());
+            return Err(NeedsApproval {
+                send,
+                recv,
+                peer_name: controller_name.clone(),
+                peer_proto: proto,
+                account: String::new(),
+                computer: controller_name,
+                id: String::new(),
+                view: false,
+            }
+            .into());
+        }
+        AuthMsg::AskView { proto, account, computer, id } => {
+            if !protocol_ok(proto) {
+                let message = format!("version mismatch (host speaks protocol {PROTOCOL_VERSION}, controller {proto})");
+                let _ = refuse_auth(&mut send, &message).await;
+                bail!(message);
+            }
+            if attempt_used.swap(true, Ordering::SeqCst) {
+                bail!("only one password attempt is allowed per connection request");
+            }
+            let account: String = account.trim().chars().filter(|c| !c.is_control()).take(80).collect();
+            let computer: String = computer.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+            let id: String = id.chars().filter(|c| c.is_ascii_digit()).take(32).collect();
+            let peer_name = if !account.is_empty() { account.clone() } else if !computer.is_empty() { computer.clone() } else { id.clone() };
+            return Err(NeedsApproval { send, recv, peer_name, peer_proto: proto, account, computer, id, view: true }.into());
         }
         AuthMsg::Start { proto, spakes, controller_name } => (proto, spakes, controller_name),
         other => bail!("unexpected message from the controller: {other:?}"),

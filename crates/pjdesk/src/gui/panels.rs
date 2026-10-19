@@ -555,6 +555,14 @@ impl App {
                 let id = self.connect_id.clone();
                 self.connect_to(&id, None, false);
             }
+            if ui.button("Request view access").clicked() {
+                let id = self.connect_id.clone();
+                self.request_view(&id);
+            }
+            ui.label(widgets::muted(
+                ui,
+                "Request view access asks that phone to allow the screen. It uses your pjdesk.com account when you are signed in.",
+            ));
 
             ui.add_space(12.0);
             widgets::field_label(ui, "Or connect directly");

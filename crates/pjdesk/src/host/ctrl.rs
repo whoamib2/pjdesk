@@ -350,6 +350,10 @@ impl Session {
             }
             ControlMsg::Tunnel(msg) => self.tunnel(msg, send).await?,
             ControlMsg::Audio { enabled } => self.audio(enabled, send).await?,
+            ControlMsg::Visitor { account, computer, user, id } => {
+                info!("Connected: account={account:?} computer={computer:?} user={user:?} id={id}");
+                super::notice::update(&account, &computer, &user, &id);
+            }
         }
         Ok(false)
     }
@@ -384,6 +388,9 @@ impl Session {
         let monitors = super::capture::monitor_infos();
         info!("{} granted: {}", self.peer_name, perms::describe(granted));
         write_msg(send, &HostMsg::Welcome { permissions: granted, monitors, proto: PROTOCOL_VERSION }).await?;
+        if requested & pjdesk_proto::perms::VISITOR != 0 {
+            write_msg(send, &HostMsg::AskVisitor).await?;
+        }
         if wants_layout {
             self.publish_layout(send, true).await?;
         }

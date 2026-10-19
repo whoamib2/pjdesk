@@ -389,3 +389,107 @@ unsafe extern "system" fn privacy_wndproc(hwnd: windows::Win32::Foundation::HWND
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
+
+/// True when this process token is elevated. Explorer is usually not, and
+/// Windows then refuses to drop files onto the window.
+#[cfg(windows)]
+pub fn process_is_elevated() -> bool {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elev = TOKEN_ELEVATION::default();
+        let mut ret = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elev as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret,
+        );
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+        ok.is_ok() && elev.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn process_is_elevated() -> bool {
+    false
+}
+
+/// If this `connect` process is elevated, start the same command again with
+/// the unelevated linked token and return true so the elevated process exits.
+/// File drops from Explorer work at medium integrity. A failure leaves this
+/// process running elevated.
+#[cfg(windows)]
+pub fn relaunch_medium_if_elevated() -> bool {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenLinkedToken, TOKEN_LINKED_TOKEN, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Environment::{GetCommandLineW, GetEnvironmentStringsW, FreeEnvironmentStringsW};
+    use windows::Win32::System::Threading::{
+        CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    if std::env::var("PJDESK_NO_ELEVATION").ok().as_deref() == Some("1") || !process_is_elevated() {
+        return false;
+    }
+    std::env::set_var("PJDESK_NO_ELEVATION", "1");
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut linked = TOKEN_LINKED_TOKEN::default();
+        let mut ret = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenLinkedToken,
+            Some(&mut linked as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+            &mut ret,
+        );
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+        if ok.is_err() || linked.LinkedToken.is_invalid() {
+            return false;
+        }
+        let cmd = GetCommandLineW();
+        let mut wide: Vec<u16> = cmd.as_wide().to_vec();
+        wide.push(0);
+        let env = GetEnvironmentStringsW();
+        let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..STARTUPINFOW::default() };
+        let mut pi = PROCESS_INFORMATION::default();
+        let created = CreateProcessWithTokenW(
+            linked.LinkedToken,
+            windows::Win32::System::Threading::CREATE_PROCESS_LOGON_FLAGS(0),
+            None,
+            Some(windows::core::PWSTR(wide.as_mut_ptr())),
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            Some(env.0 as *const _),
+            None,
+            &si,
+            &mut pi,
+        );
+        let _ = FreeEnvironmentStringsW(env);
+        let _ = windows::Win32::Foundation::CloseHandle(linked.LinkedToken);
+        if created.is_err() {
+            tracing::warn!("Could not reopen the viewer without administrator rights; file drops from Explorer may be refused");
+            return false;
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
+        let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
+        let _ = si;
+        tracing::info!("Reopened the viewer without administrator rights so files can be dropped onto it");
+        true
+    }
+}
+
+#[cfg(not(windows))]
+pub fn relaunch_medium_if_elevated() -> bool {
+    false
+}

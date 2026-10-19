@@ -317,6 +317,11 @@ fn main() {
     let raw: Vec<String> = std::env::args().collect();
     let is_connect = raw.iter().any(|a| a == "connect");
     if is_connect {
+        // An elevated viewer cannot take a file drop from Explorer. Open the
+        // same command again at medium integrity, then leave this process.
+        if platform::relaunch_medium_if_elevated() {
+            return;
+        }
         // The viewer window needs the main thread in the STA apartment before
         // DPAPI or QUIC touch COM. Doing that later made create_window fail
         // with no log line and no window after the password was accepted.

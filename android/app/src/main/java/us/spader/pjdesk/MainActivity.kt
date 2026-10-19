@@ -137,6 +137,8 @@ class MainActivity : ComponentActivity() {
             var connectPassword by remember { mutableStateOf("") }
             var query by remember { mutableStateOf("") }
             var saved by remember { mutableStateOf(app.store.saved()) }
+            var trustedAccounts by remember { mutableStateOf(app.store.trustedAccounts()) }
+            var trustedComputers by remember { mutableStateOf(app.store.trustedComputers()) }
             var showOnboarding by remember { mutableStateOf(!app.store.onboarded) }
             var account by remember { mutableStateOf(app.store.networkEmail) }
             var netEmail by remember { mutableStateOf(app.store.networkEmail) }
@@ -402,8 +404,11 @@ class MainActivity : ComponentActivity() {
                 snackbar.showSnackbar(text)
                 engine.dismissNotice()
             }
-            LaunchedEffect(state.hosting) {
-                HostService.controlled(this@MainActivity, state.hosting)
+            LaunchedEffect(state.hosting, state.hostWho) {
+                HostService.controlled(this@MainActivity, state.hosting, state.hostWho)
+            }
+            LaunchedEffect(account) {
+                engine.command(org.json.JSONObject().put("cmd", "account").put("email", account).toString())
             }
             LaunchedEffect(state.session?.id, state.session?.peer, state.session?.platform, state.session?.version) {
                 val session = state.session ?: return@LaunchedEffect
@@ -723,6 +728,21 @@ class MainActivity : ComponentActivity() {
                                         engine.setApproval("prompt")
                                     },
                                     onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
+                                    trustedAccounts = trustedAccounts,
+                                    trustedComputers = trustedComputers,
+                                    onAllowAccount = {
+                                        engine.allowAccount(it)
+                                        trustedAccounts = app.store.trustedAccounts()
+                                    },
+                                    onAllowComputer = {
+                                        engine.allowComputer(it)
+                                        trustedComputers = app.store.trustedComputers()
+                                    },
+                                    onForgetTrusted = { kind, value ->
+                                        engine.forgetTrusted(kind, value)
+                                        trustedAccounts = app.store.trustedAccounts()
+                                        trustedComputers = app.store.trustedComputers()
+                                    },
                                     onShareLogs = { AppLog.share(this@MainActivity) },
                                     onCheckUpdate = { engine.checkForUpdate() },
                                     onImportConfig = {
@@ -829,7 +849,7 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 val incoming = state.incoming
-                if (incoming != null && !pendingAccept) {
+                if (incoming != null && !incoming.view && !pendingAccept) {
                     AlertDialog(
                         onDismissRequest = { if (!pendingAccept) engine.decline() },
                         title = { Text("Allow control?") },

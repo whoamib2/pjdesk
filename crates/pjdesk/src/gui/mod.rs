@@ -238,6 +238,8 @@ pub struct App {
     ask_path: Option<std::path::PathBuf>,
     ask_alive: bool,
     ask_person_next: bool,
+    ask_view_next: bool,
+    ask_view_label: String,
     viewer_rx: Vec<Receiver<(String, i32, bool)>>,
 
     /// Background service / scheduled-task snapshot. Never queried on this thread.
@@ -370,6 +372,8 @@ impl App {
             ask_path: None,
             ask_alive: false,
             ask_person_next: false,
+            ask_view_next: false,
+            ask_view_label: String::new(),
             viewer_rx: Vec::new(),
             probe: if preview { None } else { Some(probe::Probe::start(cc.egui_ctx.clone())) },
             scm_installed: false,
@@ -1553,6 +1557,20 @@ impl App {
         });
     }
 
+    /// Asks the other computer to show a view prompt. No password is sent.
+    fn request_view(&mut self, id: &str) {
+        let id = normalize_id(id);
+        if !is_valid_id(&id) {
+            self.status = "That isn't a 9-digit PJDesk ID.".into();
+            return;
+        }
+        let label = self.row_title(&id);
+        self.status = format!("Waiting for {label} to accept");
+        self.ask_view_label = label;
+        self.ask_view_next = true;
+        self.spawn_viewer(&id, "", false, false, false);
+    }
+
     fn connect_to(&mut self, id: &str, password: Option<String>, files: bool) {
         let id = normalize_id(id);
         if !is_valid_id(&id) {
@@ -1614,6 +1632,13 @@ impl App {
             cmd.env("PJDESK_ASK_PERSON", "1");
             self.ask_person_next = false;
         }
+        if self.ask_view_next {
+            cmd.env("PJDESK_ASK_VIEW", "1");
+            if !self.ask_view_label.trim().is_empty() {
+                cmd.env("PJDESK_PEER_LABEL", self.ask_view_label.trim());
+            }
+            self.ask_view_next = false;
+        }
         if remember {
             cmd.env("PJDESK_REMEMBER", "1");
             if self.temp.is_some() {
@@ -1625,6 +1650,9 @@ impl App {
             if !token.is_empty() {
                 cmd.env("PJDESK_ACCESS", token);
             }
+        }
+        if !self.net_email.trim().is_empty() {
+            cmd.env("PJDESK_ACCOUNT", self.net_email.trim());
         }
         if let Some(note) = self.cfg.settings.peers.get(id) {
             cmd.env("PJDESK_VIEW", note.view_mode.to_string());
@@ -1798,6 +1826,9 @@ impl App {
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("--server").arg(server).arg("connect").arg("--direct").arg(addr);
         cmd.env("PJDESK_PASSWORD", password);
+        if !self.net_email.trim().is_empty() {
+            cmd.env("PJDESK_ACCOUNT", self.net_email.trim());
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -1831,6 +1862,9 @@ impl App {
         cmd.arg("--server").arg(server).arg("connect").arg("--direct").arg(addr);
         if let Some(path) = &self.ask_path {
             cmd.env("PJDESK_ASK", path);
+        }
+        if !self.net_email.trim().is_empty() {
+            cmd.env("PJDESK_ACCOUNT", self.net_email.trim());
         }
         #[cfg(windows)]
         {

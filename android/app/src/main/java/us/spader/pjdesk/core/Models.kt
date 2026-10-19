@@ -11,6 +11,9 @@ data class DisplayInfo(
 data class IncomingCall(
     val name: String,
     val ip: String,
+    val view: Boolean = false,
+    /** Trusted account, trusted computer, or the permanent password. Skip the PJDesk prompt. */
+    val bypass: Boolean = false,
 )
 
 data class SessionInfo(
@@ -36,6 +39,7 @@ data class DeskState(
     val status: String = "Connecting…",
     val incoming: IncomingCall? = null,
     val hosting: Boolean = false,
+    val hostWho: String = "",
     val session: SessionInfo? = null,
     val error: String? = null,
     val notice: String? = null,

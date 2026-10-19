@@ -378,6 +378,10 @@ impl App {
         });
         fixed(ui, W_MENU, |ui| {
             ui.menu_button("Menu", |ui| {
+                if !row.this_computer && ui.button("Request view access").clicked() {
+                    *action = Some(RowCmd::View(id.clone()));
+                    ui.close();
+                }
                 if ui.button("Rename").clicked() {
                     *action = Some(RowCmd::Rename(id.clone()));
                     ui.close();
@@ -425,6 +429,7 @@ impl App {
     fn apply_saved(&mut self, cmd: RowCmd) {
         match cmd {
             RowCmd::Connect(id) => self.connect_to(&id, None, false),
+            RowCmd::View(id) => self.request_view(&id),
             RowCmd::Files(id) => self.connect_to(&id, None, false),
             RowCmd::Save(id) => self.save_computer(&id),
             RowCmd::Favorite(id) => self.toggle_favorite(&id),
@@ -685,6 +690,7 @@ impl App {
 
 enum RowCmd {
     Connect(String),
+    View(String),
     Files(String),
     Save(String),
     Favorite(String),

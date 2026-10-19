@@ -5,6 +5,7 @@ mod ctrl;
 pub(crate) mod direct;
 mod encoder;
 mod input;
+mod notice;
 mod stream;
 
 use std::collections::HashMap;
@@ -906,10 +907,11 @@ async fn open_session(
             admit::after_password(&state.args.approval, matched, permanent_set, &policy, state.args.view_only)
         {
             grant_auth(&mut auth.send, &state.name).await?;
-            return Ok((bits, String::new()));
+            return Ok((bits, crate::resolve_receive_dir(&state.args.receive_dir)));
         }
     }
-    match approve(state, controller_name, controller_ip).await {
+    let who = if auth.password_slot == ASK_SLOT && !auth.peer_name.trim().is_empty() { auth.peer_name.as_str() } else { controller_name };
+    match approve(state, who, controller_ip).await {
         Person::Yes(bits, dir) => {
             grant_auth(&mut auth.send, &state.name).await?;
             Ok((bits, dir))

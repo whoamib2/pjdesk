@@ -203,7 +203,7 @@ pub fn start(
     if peer_proto >= 3 {
         let saved_display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0u8);
         let _ = control.send(ControlMsg::Hello {
-            permissions: perms::ALL | perms::LAYOUT,
+            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR,
             monitor: saved_display,
             quality: quality::preset("balanced").unwrap_or_default(),
         });
@@ -408,10 +408,31 @@ fn on_host(
                 let _ = control.send(ControlMsg::File(FileMsg::Accept { id, resume_from: resume }));
             }
         }
+        HostMsg::AskVisitor => {
+            let _ = control.send(this_visitor());
+        }
         HostMsg::Pong { .. } | HostMsg::Tunnel(TunnelMsg::Open { .. }) => {}
     }
     drop(g);
     wake();
+}
+
+/// Account email when this computer is signed in to pjdesk.com, otherwise blank.
+/// The computer name, the person at this computer, and this computer's ID travel with it.
+fn this_visitor() -> ControlMsg {
+    let cfg = crate::config::Config::load().unwrap_or_default();
+    let from_parent = std::env::var("PJDESK_ACCOUNT").unwrap_or_default();
+    let email = if !from_parent.trim().is_empty() { from_parent } else { cfg.network_email.clone().unwrap_or_default() };
+    let signed_in = !email.trim().is_empty()
+        || !cfg.network_refresh_token().trim().is_empty()
+        || !std::env::var("PJDESK_ACCESS").unwrap_or_default().trim().is_empty();
+    let account = if signed_in { email.trim().chars().filter(|c| !c.is_control()).take(80).collect() } else { String::new() };
+    ControlMsg::Visitor {
+        account,
+        computer: crate::hostname(),
+        user: crate::hostfacts::console_user(),
+        id: cfg.device_id.clone().unwrap_or_default(),
+    }
 }
 
 fn remember_platform(host_id: &str, family: &str, version: &str) {

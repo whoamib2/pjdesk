@@ -61,6 +61,30 @@ class Engine(context: Context) : EngineListener {
         )
         pushPermanent()
         command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
+        pushTrusted()
+    }
+
+    fun pushTrusted() {
+        val accounts = JSONArray()
+        store.trustedAccounts().forEach { accounts.put(it) }
+        val computers = JSONArray()
+        store.trustedComputers().forEach { computers.put(it) }
+        command(JSONObject().put("cmd", "setTrusted").put("accounts", accounts).put("computers", computers).toString())
+    }
+
+    fun allowAccount(email: String) {
+        store.allowAccount(email)
+        pushTrusted()
+    }
+
+    fun allowComputer(name: String) {
+        store.allowComputer(name)
+        pushTrusted()
+    }
+
+    fun forgetTrusted(kind: String, value: String) {
+        store.forgetTrusted(kind, value)
+        pushTrusted()
     }
 
     fun command(json: String) {
@@ -306,13 +330,32 @@ class Engine(context: Context) : EngineListener {
                 val text = event.optString("text")
                 it.copy(error = text, status = text, askPassword = false, askNote = "")
             }
-            "incoming" -> update {
-                it.copy(
-                    incoming = IncomingCall(event.optString("name"), event.optString("ip")),
-                    status = "Waiting for approval",
-                )
+            "incoming" -> {
+                val name = event.optString("name")
+                val view = event.optBoolean("view")
+                val bypass = event.optBoolean("bypass")
+                val who = name.ifBlank { "Someone" }
+                update {
+                    it.copy(
+                        incoming = IncomingCall(name, event.optString("ip"), view, bypass),
+                        status = if (view) "$who wants to view your screen" else "Waiting for approval",
+                    )
+                }
+                if (view) {
+                    if (bypass && us.spader.pjdesk.service.HostService.capturing) {
+                        accept()
+                    } else {
+                        us.spader.pjdesk.service.ViewPrompt.show(app, who, bypass)
+                    }
+                }
             }
-            "hosting" -> update { it.copy(hosting = true, incoming = null, status = "Being controlled by ${event.optString("peer")}") }
+            "hosting" -> {
+                us.spader.pjdesk.service.ViewPrompt.cancel(app)
+                update {
+                    val who = event.optString("who").ifBlank { event.optString("peer") }
+                    it.copy(hosting = true, incoming = null, hostWho = who, status = "Being controlled by $who")
+                }
+            }
             "controlling" -> update {
                 it.copy(
                     askPassword = false,
@@ -353,11 +396,13 @@ class Engine(context: Context) : EngineListener {
             "keyframe" -> onKeyframe?.invoke()
             "input" -> RemoteControl.handle(event)
             "disconnected" -> {
+                us.spader.pjdesk.service.ViewPrompt.cancel(app)
                 val role = event.optString("role")
                 val reason = event.optString("reason").ifBlank { "the session ended" }
                 update {
                     it.copy(
                         hosting = if (role == "host" || role == "session") false else it.hosting,
+                        hostWho = if (role == "host" || role == "session") "" else it.hostWho,
                         session = if (role == "controller" || role == "session") null else it.session,
                         incoming = null,
                         status = "Ended: $reason",

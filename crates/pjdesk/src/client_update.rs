@@ -92,7 +92,10 @@ fn finish(outcome: Result<pjdesk_proto::update::Outcome, String>) {
             set_note(&format!("Installing PJDesk {version}. PJDesk will close and open again."));
         }
         Ok(pjdesk_proto::update::Outcome::UpToDate(version)) => {
-            set_note(&format!("PJDesk {version} is up to date."));
+            let existing = note();
+            if !existing.contains("GitHub latest") {
+                set_note(&format!("PJDesk {version} is up to date."));
+            }
             RUNNING.store(false, Ordering::SeqCst);
         }
         Ok(pjdesk_proto::update::Outcome::Found(version)) => {

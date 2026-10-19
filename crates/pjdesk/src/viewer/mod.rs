@@ -7,6 +7,7 @@ pub(crate) fn render_monitor_shots(dir: &std::path::Path) {
 
 mod controls;
 pub mod decoder;
+mod filedrop;
 mod keymap;
 mod panel;
 mod render;
@@ -211,7 +212,13 @@ async fn connect(
     let endpoint = p2p::controller_endpoint(binding.socket, fingerprint)?;
     let candidates = p2p::candidates(peer_public, &peer_local);
     let ask_person = std::env::var("PJDESK_ASK_PERSON").ok().as_deref() == Some("1");
-    let mut attempt = if ask_person {
+    let ask_view = std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1");
+    let mut attempt = if ask_view {
+        let label = std::env::var("PJDESK_PEER_LABEL").unwrap_or_default();
+        let label = if label.trim().is_empty() { host_name.clone() } else { label };
+        crate::note_status(&format!("Waiting for {label} to accept"));
+        Asked::View
+    } else if ask_person {
         Asked::Person
     } else if let Some(path) = ask {
         wait_asked_password(path, &host_name).await?
@@ -230,6 +237,12 @@ async fn connect(
         }
         let (connection, path) = connected?;
         let authed = match &attempt {
+            Asked::View => {
+                tracing::info!("Requesting view access to {}", format_id(target));
+                let account = signed_in_account(config);
+                let id = config.device_id.clone().unwrap_or_default();
+                session::controller_ask_view(&connection, &account, &crate::hostname(), &id).await
+            }
             Asked::Person => {
                 tracing::info!("Asking the person at {}", format_id(target));
                 session::controller_ask_person(&connection, &crate::hostname()).await
@@ -284,12 +297,14 @@ async fn connect(
             }
         }
     };
-    tracing::info!("Password accepted by {} ({path}). Starting the picture.", auth.peer_name);
+    let opened = if matches!(attempt, Asked::View) {
+        format!("{} accepted the view. Starting the picture ({path}).", auth.peer_name)
+    } else {
+        format!("Password accepted by {}. Starting the picture ({path}).", auth.peer_name)
+    };
+    tracing::info!("{opened}");
     tracing::info!("{}", crate::host_log_hint());
-    crate::note_status(&format!(
-        "Password accepted by {}. Starting the picture ({path}).",
-        auth.peer_name
-    ));
+    crate::note_status(&opened);
     tokio::time::sleep(Duration::from_millis(50)).await;
     if let Some(reason) = connection.close_reason() {
         let text = format!(
@@ -322,6 +337,18 @@ fn ask_reply_path(path: &std::path::Path) -> std::path::PathBuf {
 enum Asked {
     Password(String),
     Person,
+    View,
+}
+
+/// The pjdesk.com account when this computer is signed in. Empty otherwise,
+/// so the phone names this computer instead.
+fn signed_in_account(cfg: &crate::config::Config) -> String {
+    let from_parent = std::env::var("PJDESK_ACCOUNT").unwrap_or_default();
+    let email = if !from_parent.trim().is_empty() { from_parent } else { cfg.network_email.clone().unwrap_or_default() };
+    let signed_in = !email.trim().is_empty()
+        || !cfg.network_refresh_token().trim().is_empty()
+        || !std::env::var("PJDESK_ACCESS").unwrap_or_default().trim().is_empty();
+    if signed_in { email.trim().chars().filter(|c| !c.is_control()).take(80).collect() } else { String::new() }
 }
 
 /// Blocks until the window writes a password, asks the person, or cancels.
@@ -408,6 +435,11 @@ async fn connect_direct(
     }
     let authed = match &asked {
         Asked::Person => session::controller_ask_person(&connection, &crate::hostname()).await,
+        Asked::View => {
+            let account = signed_in_account(config);
+            let id = config.device_id.clone().unwrap_or_default();
+            session::controller_ask_view(&connection, &account, &crate::hostname(), &id).await
+        }
         Asked::Password(password) => session::controller_auth(&connection, password, &crate::hostname()).await,
     };
     let auth = match authed {

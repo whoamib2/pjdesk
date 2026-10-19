@@ -67,6 +67,49 @@ class Store(context: Context) {
         get() = prefs.getString("approval", "prompt") ?: "prompt"
         set(value) { prefs.edit().putString("approval", value).commit() }
 
+    fun trustedAccounts(): List<String> = readTrusted("trustedAccounts")
+
+    fun trustedComputers(): List<String> = readTrusted("trustedComputers")
+
+    fun allowAccount(email: String) {
+        val cleaned = email.trim().filter { !it.isISOControl() }.take(80)
+        if (cleaned.isEmpty() || !cleaned.contains("@")) return
+        val current = readTrusted("trustedAccounts")
+        if (current.any { it.equals(cleaned, ignoreCase = true) }) return
+        writeTrusted("trustedAccounts", current + cleaned)
+    }
+
+    fun allowComputer(name: String) {
+        val cleaned = name.trim().filter { !it.isISOControl() }.take(64)
+        if (cleaned.isEmpty()) return
+        val current = readTrusted("trustedComputers")
+        if (current.any { it.equals(cleaned, ignoreCase = true) }) return
+        writeTrusted("trustedComputers", current + cleaned)
+    }
+
+    /** `kind` is "account" or "computer". */
+    fun forgetTrusted(kind: String, value: String) {
+        val key = if (kind == "account") "trustedAccounts" else "trustedComputers"
+        writeTrusted(key, readTrusted(key).filterNot { it.equals(value, ignoreCase = true) })
+    }
+
+    private fun readTrusted(key: String): List<String> {
+        val raw = prefs.getString(key, "[]") ?: "[]"
+        val array = runCatching { JSONArray(raw) }.getOrElse { return emptyList() }
+        return buildList {
+            for (i in 0 until array.length()) {
+                val item = array.optString(i).trim()
+                if (item.isNotEmpty() && none { it.equals(item, ignoreCase = true) }) add(item)
+            }
+        }
+    }
+
+    private fun writeTrusted(key: String, values: List<String>) {
+        val array = JSONArray()
+        values.forEach { array.put(it) }
+        prefs.edit().putString(key, array.toString()).commit()
+    }
+
     fun saved(): List<SavedComputer> {
         if (!savedFile.exists()) return emptyList()
         return runCatching {

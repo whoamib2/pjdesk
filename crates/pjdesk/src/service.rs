@@ -622,9 +622,13 @@ fn maybe_client_update() {
     if now < next {
         return;
     }
+    if !crate::client_update::start_from_service() {
+        tracing::info!("Skipped the update check because one is already running");
+        NEXT.store(now.saturating_add(60), Ordering::Relaxed);
+        return;
+    }
     NEXT.store(now.saturating_add(30 * 60), Ordering::Relaxed);
     tracing::info!("Checking for a PJDesk update from the service");
-    let _ = crate::client_update::start_from_service();
 }
 
 #[cfg(not(windows))]

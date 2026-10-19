@@ -111,6 +111,7 @@ pub async fn run(
 
     let (frame_tx, mut frame_rx) = mpsc::channel::<EncodedFrame>(MAX_IN_FLIGHT as usize + 1);
     let (host_tx, mut host_rx) = mpsc::unbounded_channel::<HostMsg>();
+    let peer_name = grant.peer_name.clone();
     let session = Session::new(
         args.fps,
         args.bitrate,
@@ -124,6 +125,7 @@ pub async fn run(
         ui,
     );
     session.spawn_side_loops();
+    let _notice = super::notice::Guard::begin(&peer_name);
 
     let (cap_err_tx, mut cap_err_rx) = mpsc::channel::<String>(1);
     let capture_thread = {
@@ -177,6 +179,11 @@ pub async fn run(
                 }
             }
             _ = tick.tick() => {
+                if super::notice::disconnect_requested() {
+                    info!("The person at this computer disconnected the session");
+                    let _ = write_msg(&mut control_send, &HostMsg::Notice("The person at this computer disconnected".into())).await;
+                    break Ok(());
+                }
                 if let Err(e) = session.poll_local(&mut control_send).await {
                     break Err(e);
                 }

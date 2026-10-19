@@ -43,6 +43,11 @@ pub enum AuthMsg {
     /// Controller → host: skip the password and ask the person at the computer.
     /// Appended after [`AuthMsg::Result`]. An older host cannot decode it.
     AskPerson { proto: u16, controller_name: String },
+    /// Controller → host: ask to view the screen, without a password.
+    /// `account` is the pjdesk.com account when the controller is signed in.
+    /// Otherwise it is empty and the host uses `computer`, then `id`.
+    /// Appended after [`AuthMsg::AskPerson`]. An older host cannot decode it.
+    AskView { proto: u16, account: String, computer: String, id: String },
 }
 
 /// Controller → host messages after authentication.
@@ -114,6 +119,14 @@ pub enum ControlMsg {
         display: u8,
         x: u16,
         y: u16,
+    },
+    /// 0.6.8. Who is at the controller. Sent only after [`HostMsg::AskVisitor`].
+    /// An older host never sends that, so it never receives this variant.
+    Visitor {
+        account: String,
+        computer: String,
+        user: String,
+        id: String,
     },
 }
 
@@ -352,6 +365,9 @@ pub enum HostMsg {
         height: u16,
         tiles: Vec<AtlasTile>,
     },
+    /// 0.6.8. The host can show who connected. Sent only when Hello carried
+    /// [`crate::perms::VISITOR`]. An older controller never sets that bit.
+    AskVisitor,
 }
 
 /// Input from the controller, replayed on the host with `SendInput`.
@@ -465,6 +481,50 @@ where
     Ok(header)
 }
 
+/// Lines for the "someone connected" notice.
+///
+/// The headline is the pjdesk.com account when the controller is signed in.
+/// Otherwise it is the controller's computer name, then its ID. The computer
+/// name is a second line only when the account is the headline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisitorCard {
+    pub headline: String,
+    pub secondary: String,
+    pub detail: String,
+}
+
+fn visitor_label(text: &str, max: usize) -> String {
+    text.trim().chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
+pub fn visitor_card(account: &str, computer: &str, user: &str, id: &str) -> VisitorCard {
+    let account = visitor_label(account, 80);
+    let computer = visitor_label(computer, 64);
+    let user = visitor_label(user, 80);
+    let id_raw = visitor_label(id, 32);
+    let id_shown = if crate::is_valid_id(&id_raw) { crate::format_id(&id_raw) } else { id_raw.clone() };
+    let headline = if !account.is_empty() {
+        account.clone()
+    } else if !computer.is_empty() {
+        computer.clone()
+    } else {
+        id_shown.clone()
+    };
+    let secondary = if !account.is_empty() && !computer.is_empty() && !computer.eq_ignore_ascii_case(&headline) {
+        computer
+    } else {
+        String::new()
+    };
+    let mut parts = Vec::new();
+    if !user.is_empty() {
+        parts.push(user);
+    }
+    if !id_shown.is_empty() && !id_shown.eq_ignore_ascii_case(&headline) && !id_raw.eq_ignore_ascii_case(&headline) {
+        parts.push(id_shown);
+    }
+    VisitorCard { headline, secondary, detail: parts.join(" · ") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +535,14 @@ mod tests {
         assert_eq!(result[0], 3);
         let ask = postcard::to_stdvec(&AuthMsg::AskPerson { proto: 3, controller_name: "Ben".into() }).unwrap();
         assert_eq!(ask[0], 4, "AskPerson is appended after Result");
+        let view = postcard::to_stdvec(&AuthMsg::AskView {
+            proto: 3,
+            account: "ben@spader.us".into(),
+            computer: "BENLENOVODESK".into(),
+            id: "692996394".into(),
+        })
+        .unwrap();
+        assert_eq!(view[0], 5, "AskView is appended after AskPerson");
     }
 
     #[tokio::test]
@@ -500,6 +568,24 @@ mod tests {
     }
 
     #[test]
+    fn the_connect_notice_names_the_account_then_the_computer_then_the_id() {
+        let signed = visitor_card("ben@spader.us", "BENLENOVODESK", "Ben", "692996394");
+        assert_eq!(signed.headline, "ben@spader.us");
+        assert_eq!(signed.secondary, "BENLENOVODESK");
+        assert!(signed.detail.contains("Ben"));
+        assert!(signed.detail.contains("692 996 394"));
+        let named = visitor_card("Ben Spader", "BENLENOVODESK", "", "692996394");
+        assert_eq!(named.headline, "Ben Spader");
+        assert_eq!(named.secondary, "BENLENOVODESK");
+        let local = visitor_card("", "BENLENOVODESK", "Ben", "692996394");
+        assert_eq!(local.headline, "BENLENOVODESK");
+        assert!(local.secondary.is_empty());
+        let only_id = visitor_card("  ", "", "", "692996394");
+        assert_eq!(only_id.headline, "692 996 394");
+        assert!(only_id.detail.is_empty());
+    }
+
+    #[test]
     fn existing_variants_keep_their_indexes() {
         // Postcard encodes the variant index first. These indexes are the
         // version-2 contract. New variants are appended after them.
@@ -517,6 +603,17 @@ mod tests {
         assert_eq!(postcard::to_stdvec(&ControlMsg::Watch { displays: vec![0, 2] }).unwrap()[0], 19);
         assert_eq!(postcard::to_stdvec(&ControlMsg::Pointer { display: 1, x: 0, y: 0 }).unwrap()[0], 20);
         assert_eq!(postcard::to_stdvec(&HostMsg::Atlas { width: 1, height: 1, tiles: vec![] }).unwrap()[0], 12);
+        assert_eq!(postcard::to_stdvec(&HostMsg::AskVisitor).unwrap()[0], 13);
+        assert_eq!(
+            postcard::to_stdvec(&ControlMsg::Visitor {
+                account: String::new(),
+                computer: String::new(),
+                user: String::new(),
+                id: String::new(),
+            })
+            .unwrap()[0],
+            21
+        );
         assert_eq!(postcard::to_stdvec(&InputEvent::ReleaseAll).unwrap()[0], 4);
         assert_eq!(
             postcard::to_stdvec(&InputEvent::Gesture { kind: 0, duration_ms: 40, x: [0; 4], y: [0; 4] }).unwrap()[0],

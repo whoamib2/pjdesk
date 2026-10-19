@@ -109,6 +109,8 @@ fn http_get_progress(url: &str, progress: &dyn Fn(u64, Option<u64>)) -> Result<V
         .user_agent(USER_AGENT)
         .build()
         .get(url)
+        .set("Cache-Control", "no-cache")
+        .set("Pragma", "no-cache")
         .call()
         .with_context(|| format!("fetching {url}"))?;
     let total = resp.header("Content-Length").and_then(|h| h.parse().ok()).filter(|n: &u64| *n > 0);
@@ -178,20 +180,11 @@ fn pick_client_asset(assets: &[Asset]) -> Option<&Asset> {
 
 /// Latest client installer. Prefers `PJDesk-Client-Setup`, then `PJDesk-Setup`.
 pub fn check_client(repo: &str, current: &str) -> Result<Option<Available>> {
-    let body = http_get(&format!("https://api.github.com/repos/{repo}/releases/latest"))?;
-    let release: Release = serde_json::from_slice(&body).context("parsing the GitHub release")?;
+    let release = fetch_latest(repo)?;
     if !is_newer(current, &release.tag_name) {
         return Ok(None);
     }
-    let installer = pick_client_asset(&release.assets)
-        .with_context(|| format!("release {} has no PJDesk client installer", release.tag_name))?;
-    let sums_url = release.assets.iter().find(|a| a.name == "SHA256SUMS").map(|a| a.browser_download_url.clone());
-    Ok(Some(Available {
-        version: release.tag_name.trim_start_matches('v').to_string(),
-        installer_name: installer.name.clone(),
-        installer_url: installer.browser_download_url.clone(),
-        sums_url,
-    }))
+    available_from_release(&release).map(Some)
 }
 
 /// Looks up the repo's latest release and the installer whose name starts with
@@ -519,23 +512,38 @@ pub fn install_client_as_service(current: &str, progress: &dyn Fn(&str)) -> Resu
 
 fn install_client_reporting_lock(current: &str, progress: &dyn Fn(&str), lock_acl: bool) -> Result<Outcome> {
     progress("Checking for updates…");
-    match check_client(crate::UPDATE_REPO, current)? {
-        None => {
-            let line = format!("PJDesk {current} is up to date.");
-            progress(&line);
-            Ok(Outcome::UpToDate(current.to_string()))
-        }
-        Some(update) => {
-            let path = download_verified_progress(&update, progress, lock_acl)?;
-            let line = format!("Installing PJDesk {}. PJDesk will close and open again.", update.version);
-            progress(&line);
-            // One beat so the window can paint that line before the installer
-            // closes this process.
-            std::thread::sleep(Duration::from_millis(600));
-            run_installer(&path)?;
-            Ok(Outcome::Installing(update.version))
-        }
+    let release = fetch_latest(crate::UPDATE_REPO)?;
+    if !is_newer(current, &release.tag_name) {
+        let line = format!("PJDesk {current} is up to date. GitHub latest is {}.", release.tag_name.trim());
+        progress(&line);
+        return Ok(Outcome::UpToDate(current.to_string()));
     }
+    let update = available_from_release(&release)?;
+    let path = download_verified_progress(&update, progress, lock_acl)?;
+    let line = format!("Installing PJDesk {}. PJDesk will close and open again.", update.version);
+    progress(&line);
+    // One beat so the window can paint that line before the installer
+    // closes this process.
+    std::thread::sleep(Duration::from_millis(600));
+    run_installer(&path)?;
+    Ok(Outcome::Installing(update.version))
+}
+
+fn fetch_latest(repo: &str) -> Result<Release> {
+    let body = http_get(&format!("https://api.github.com/repos/{repo}/releases/latest"))?;
+    serde_json::from_slice(&body).context("parsing the GitHub release")
+}
+
+fn available_from_release(release: &Release) -> Result<Available> {
+    let installer = pick_client_asset(&release.assets)
+        .with_context(|| format!("release {} has no PJDesk client installer", release.tag_name))?;
+    let sums_url = release.assets.iter().find(|a| a.name == "SHA256SUMS").map(|a| a.browser_download_url.clone());
+    Ok(Available {
+        version: release.tag_name.trim_start_matches('v').to_string(),
+        installer_name: installer.name.clone(),
+        installer_url: installer.browser_download_url.clone(),
+        sums_url,
+    })
 }
 
 /// Client self-update. Prefers `PJDesk-Client-Setup` and still accepts `PJDesk-Setup`.

@@ -36,6 +36,11 @@ fun SettingsScreen(
     onSavePermanent: (String, String) -> Boolean = { _, _ -> false },
     onClearPermanent: () -> Unit = {},
     onUnattended: (Boolean) -> Unit = {},
+    trustedAccounts: List<String> = emptyList(),
+    trustedComputers: List<String> = emptyList(),
+    onAllowAccount: (String) -> Unit = {},
+    onAllowComputer: (String) -> Unit = {},
+    onForgetTrusted: (String, String) -> Unit = { _, _ -> },
     onShareLogs: () -> Unit = {},
     onImportConfig: () -> Unit = {},
     onExportConfig: () -> Unit = {},
@@ -125,6 +130,13 @@ fun SettingsScreen(
                 unattended = state.approval == "unattended",
                 onUnattended = onUnattended,
             )
+            TrustedViewAccess(
+                accounts = trustedAccounts,
+                computers = trustedComputers,
+                onAllowAccount = onAllowAccount,
+                onAllowComputer = onAllowComputer,
+                onForget = onForgetTrusted,
+            )
         }
         Section("Display") {
             Text("Theme", color = pjMuted())
@@ -152,7 +164,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.7", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.8", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }

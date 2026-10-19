@@ -44,6 +44,8 @@ enum UserEvent {
     Title(String),
     /// The connection ended.
     Closed(String),
+    /// Files dragged onto the viewer from Explorer.
+    Files(Vec<std::path::PathBuf>),
 }
 
 /// Hand-off point between the decoder thread and the window.
@@ -150,6 +152,7 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         saw_picture: Arc::new(AtomicBool::new(false)),
         failed_open: None,
         window_shown: Arc::new(AtomicBool::new(false)),
+        proxy: proxy.clone(),
     };
     let saw_watch = app.saw_picture.clone();
     let host_for_watch = app.host_name.clone();
@@ -361,6 +364,7 @@ struct App {
     saw_picture: Arc<AtomicBool>,
     failed_open: Option<String>,
     window_shown: Arc<AtomicBool>,
+    proxy: EventLoopProxy<UserEvent>,
 }
 
 struct ExtraPane {
@@ -1133,6 +1137,36 @@ impl App {
         self.toast = Some((text.into(), Instant::now()));
     }
 
+    fn hook_drops(&self, window: &Window) {
+        let proxy = self.proxy.clone();
+        super::filedrop::attach(window, move |paths| {
+            let _ = proxy.send_event(UserEvent::Files(paths));
+        });
+    }
+
+    /// Sends every dropped file, and the files inside a dropped folder, to the host.
+    fn accept_dropped(&mut self, paths: Vec<std::path::PathBuf>) {
+        let mut n = 0usize;
+        for path in &paths {
+            for file in expand_drop(path) {
+                let _ = self.cmds.send(super::controls::Cmd::SendFile(file));
+                n += 1;
+            }
+        }
+        self.panel.open = true;
+        self.panel.tab = 0;
+        if n == 0 {
+            self.show_toast("That drop had no files to send");
+        } else if n == 1 {
+            self.show_toast("Sending 1 file to the other computer");
+        } else {
+            self.show_toast(format!("Sending {n} files to the other computer"));
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn tile_picture(&self, display: u8) -> Option<super::render::RgbFrame> {
         let (aw, ah, tile) = {
             let g = self.live.lock().unwrap();
@@ -1332,6 +1366,7 @@ impl App {
         let Ok(context) = softbuffer::Context::new(window.clone()) else { return };
         let Ok(surface) = softbuffer::Surface::new(&context, window.clone()) else { return };
         window.request_redraw();
+        self.hook_drops(&window);
         self.extra.push(ExtraPane { display, window, surface, layout: Layout::default(), cursor: (0.0, 0.0), sized });
     }
 
@@ -1598,6 +1633,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         info!("Viewer window is open");
+        self.hook_drops(&window);
         crate::note_status("Viewer window is open. Waiting for the picture.");
         self.window_shown.store(true, Ordering::SeqCst);
         window.focus_window();
@@ -1653,6 +1689,7 @@ impl ApplicationHandler<UserEvent> for App {
                     window.set_title(&text);
                 }
             }
+            UserEvent::Files(paths) => self.accept_dropped(paths),
             UserEvent::Closed(reason) => {
                 self.closed = true;
                 info!("Disconnected: {reason}");
@@ -1773,16 +1810,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.send(InputEvent::MouseButton { button, down: state == ElementState::Pressed });
                 }
             }
-            WindowEvent::DroppedFile(path) => {
-                for file in expand_drop(&path) {
-                    let _ = self.cmds.send(super::controls::Cmd::SendFile(file));
-                }
-                self.panel.open = true;
-                self.panel.tab = 0;
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
+            WindowEvent::DroppedFile(path) => self.accept_dropped(vec![path]),
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.modifiers.control_key() {
                     // Ctrl + wheel zooms the view locally instead of scrolling

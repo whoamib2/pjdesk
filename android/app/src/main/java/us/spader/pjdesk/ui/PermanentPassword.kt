@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -100,6 +101,69 @@ fun WhenSomeoneConnects(
                 color = pjMuted(),
                 style = MaterialTheme.typography.bodySmall,
             )
+        }
+    }
+}
+
+/**
+ * Accounts and computers that may view this phone without the PJDesk prompt.
+ * Android's own screen-share consent still appears when capture is not already running.
+ */
+@Composable
+fun TrustedViewAccess(
+    accounts: List<String>,
+    computers: List<String>,
+    onAllowAccount: (String) -> Unit,
+    onAllowComputer: (String) -> Unit,
+    onForget: (String, String) -> Unit,
+) {
+    var account by rememberSaveable { mutableStateOf("") }
+    var computer by rememberSaveable { mutableStateOf("") }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Trusted view access", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Always allow a pjdesk.com account or a computer to view this phone without the Allow prompt. A permanent password with Use the permanent password does the same for every request. Android may still ask to share the screen the first time, and again after sharing stops.",
+            color = pjMuted(),
+        )
+        OutlinedTextField(
+            value = account,
+            onValueChange = { account = it.take(80) },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Account, such as ben@spader.us") },
+        )
+        Button(
+            onClick = {
+                onAllowAccount(account)
+                account = ""
+            },
+            enabled = account.contains("@"),
+        ) { Text("Always allow this account") }
+        accounts.forEach { saved ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(saved, modifier = Modifier.weight(1f))
+                TextButton(onClick = { onForget("account", saved) }) { Text("Remove") }
+            }
+        }
+        OutlinedTextField(
+            value = computer,
+            onValueChange = { computer = it.take(64) },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Computer name or ID") },
+        )
+        Button(
+            onClick = {
+                onAllowComputer(computer)
+                computer = ""
+            },
+            enabled = computer.isNotBlank(),
+        ) { Text("Always allow this computer") }
+        computers.forEach { saved ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(saved, modifier = Modifier.weight(1f))
+                TextButton(onClick = { onForget("computer", saved) }) { Text("Remove") }
+            }
         }
     }
 }

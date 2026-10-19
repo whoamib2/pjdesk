@@ -35,7 +35,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.7";
+pub const APP_VERSION: &str = "0.6.8";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -100,6 +100,11 @@ struct State {
     video: Mutex<Option<Arc<VideoOut>>>,
     app_stop: AtomicBool,
     access_token: Mutex<String>,
+    /// pjdesk.com account email while this phone is signed in. Empty otherwise.
+    account: Mutex<String>,
+    trusted_accounts: Mutex<Vec<String>>,
+    trusted_computers: Mutex<Vec<String>>,
+    view_ask: Mutex<ViewAsk>,
     /// Set when a server from before 0.6.0 drops the connection after PresentAccess.
     suppress_token: AtomicBool,
 }
@@ -166,6 +171,10 @@ impl Engine {
             video: Mutex::new(None),
             app_stop: AtomicBool::new(false),
             access_token: Mutex::new(stored.access_token.clone()),
+            account: Mutex::new(String::new()),
+            trusted_accounts: Mutex::new(Vec::new()),
+            trusted_computers: Mutex::new(Vec::new()),
+            view_ask: Mutex::new(ViewAsk::default()),
             suppress_token: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::unbounded_channel();
@@ -344,6 +353,14 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             *state.access_token.lock().unwrap() = token;
             state.suppress_token.store(false, Ordering::SeqCst);
             persist(state);
+        }
+        "account" => {
+            let email = cmd.get("email").and_then(|v| v.as_str()).unwrap_or("").trim();
+            *state.account.lock().unwrap() = email.chars().filter(|c| !c.is_control()).take(80).collect();
+        }
+        "setTrusted" => {
+            *state.trusted_accounts.lock().unwrap() = trusted_list(cmd.get("accounts"));
+            *state.trusted_computers.lock().unwrap() = trusted_list(cmd.get("computers"));
         }
         "server" => {
             let address = cmd.get("address").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -754,6 +771,51 @@ enum Approval {
     No(String),
 }
 
+#[derive(Clone, Debug, Default)]
+struct ViewAsk {
+    view: bool,
+    account: String,
+    computer: String,
+    id: String,
+}
+
+fn trusted_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().chars().filter(|c| !c.is_control()).take(80).collect::<String>())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A view request skips the PJDesk prompt when this account or computer is
+/// trusted, or when unattended mode is using the permanent password.
+fn view_is_preapproved(state: &State, ask: &ViewAsk) -> bool {
+    let approval = state.approval.lock().unwrap().clone();
+    let permanent = state.permanent.lock().unwrap().clone().unwrap_or_default();
+    if approval == "unattended" && !permanent.trim().is_empty() {
+        return true;
+    }
+    let account = ask.account.trim();
+    if !account.is_empty() && state.trusted_accounts.lock().unwrap().iter().any(|saved| saved.eq_ignore_ascii_case(account)) {
+        return true;
+    }
+    let computer = ask.computer.trim();
+    let id = ask.id.trim();
+    state.trusted_computers.lock().unwrap().iter().any(|saved| {
+        let saved = saved.trim();
+        if saved.is_empty() {
+            return false;
+        }
+        (!computer.is_empty() && saved.eq_ignore_ascii_case(computer)) || (!id.is_empty() && saved.chars().filter(|c| c.is_ascii_digit()).eq(id.chars()))
+    })
+}
+
 enum TypedAuth {
     Password(String),
     AskPerson,
@@ -762,7 +824,7 @@ enum TypedAuth {
 
 const ASK_SLOT: u8 = 255;
 
-async fn approve(state: &State, cb: &Arc<dyn Callbacks>, name: &str, ip: &str) -> Approval {
+async fn approve(state: &State, cb: &Arc<dyn Callbacks>, name: &str, ip: &str, view: bool, bypass: bool) -> Approval {
     let policy = state.policy.lock().unwrap().clone();
     let (tx, rx) = oneshot::channel();
     *state.approval_tx.lock().unwrap() = Some(tx);
@@ -773,15 +835,19 @@ async fn approve(state: &State, cb: &Arc<dyn Callbacks>, name: &str, ip: &str) -
             "event": "incoming",
             "name": name,
             "ip": ip,
+            "view": view,
+            "bypass": bypass,
         }),
     );
-    // Long enough to cover the Allow button and the Android screen-share consent.
-    let answer = tokio::time::timeout(Duration::from_secs(45), rx).await;
+    // Long enough for Allow and for Android's own screen-share consent.
+    let wait = if view { Duration::from_secs(90) } else { Duration::from_secs(45) };
+    let answer = tokio::time::timeout(wait, rx).await;
     *state.approval_tx.lock().unwrap() = None;
     match answer {
         Ok(Ok(Ok(()))) => Approval::Yes(grant(perms::KEYBOARD | perms::MOUSE, policy.max_permissions, false)),
         Ok(Ok(Err(reason))) => Approval::No(reason),
         Ok(Err(_)) => Approval::No("the approval prompt closed".into()),
+        Err(_) if view => Approval::No(format!("Timed out. No one at {} answered the request to view the screen", state.hostname)),
         Err(_) => Approval::No(format!("No one at {} answered the request", state.hostname)),
     }
 }
@@ -820,7 +886,7 @@ async fn host_session(
     );
     let accepted = accept_authenticated(&state, &cb, &endpoint, &passwords, &state.hostname, server_udp.ip(), peer_public, &controller_ip, &controller_name).await;
     punching.abort();
-    let (connection, mut auth) = match accepted {
+    let (connection, mut auth, ask) = match accepted {
         Ok(done) => done,
         Err(e) if e.is::<WrongPassword>() => bail!("Wrong password"),
         Err(e) => return Err(e),
@@ -832,8 +898,14 @@ async fn host_session(
         controller_ip.parse().ok(),
         &controller_name,
     );
+    *state.view_ask.lock().unwrap() = ask.clone();
     let ceiling = if auth.password_slot == ASK_SLOT {
-        match approve(&state, &cb, &controller_name, &controller_ip).await {
+        let who = if ask.view && !auth.peer_name.trim().is_empty() { auth.peer_name.clone() } else { controller_name.clone() };
+        let bypass = ask.view && view_is_preapproved(&state, &ask);
+        if bypass {
+            log_line(&cb, format!("view request from {who} is pre-approved"));
+        }
+        match approve(&state, &cb, &who, &controller_ip, ask.view, bypass).await {
             Approval::Yes(bits) => {
                 grant_auth(&mut auth.send, &state.hostname).await?;
                 bits
@@ -855,7 +927,7 @@ async fn host_session(
                 grant_auth(&mut auth.send, &state.hostname).await?;
                 bits
             }
-            Admit::Ask => match approve(&state, &cb, &controller_name, &controller_ip).await {
+            Admit::Ask => match approve(&state, &cb, &controller_name, &controller_ip, false, false).await {
                 Approval::Yes(bits) => {
                     grant_auth(&mut auth.send, &state.hostname).await?;
                     bits
@@ -985,6 +1057,15 @@ async fn host_session(
             ControlMsg::Ping { t_us } => {
                 let _ = write_msg(&mut control_send, &HostMsg::Pong { t_us }).await;
             }
+            ControlMsg::Visitor { account, computer, user, id } => {
+                let card = pjdesk_proto::peer::visitor_card(&account, &computer, &user, &id);
+                let who = if card.secondary.is_empty() {
+                    card.headline
+                } else {
+                    format!("{} ({})", card.headline, card.secondary)
+                };
+                emit(&cb, &json!({"event":"hosting","peer": who, "who": who}));
+            }
             ControlMsg::SelectMonitor { .. } | ControlMsg::View { .. } => {
                 emit(&cb, &json!({"event":"keyframe"}));
             }
@@ -1026,6 +1107,9 @@ async fn send_welcome(
     let (w, h) = *state.capture.lock().unwrap();
     let monitors = vec![MonitorInfo { index: 0, width: w, height: h, primary: true, name: "Screen".into() }];
     write_msg(send, &HostMsg::Welcome { permissions: granted, monitors, proto: PROTOCOL_VERSION }).await?;
+    if requested & perms::VISITOR != 0 {
+        write_msg(send, &HostMsg::AskVisitor).await?;
+    }
     if requested & perms::LAYOUT != 0 {
         let displays = vec![DisplayLayout {
             index: 0,
@@ -1045,6 +1129,16 @@ async fn send_welcome(
 
 fn android_version() -> String {
     std::env::var("PJDESK_ANDROID_VERSION").unwrap_or_default().chars().take(64).collect()
+}
+
+/// The pjdesk.com account when this phone is signed in, otherwise a blank account
+/// so the other computer names this phone instead.
+fn android_visitor(state: &State) -> ControlMsg {
+    let account = state.account.lock().unwrap().clone();
+    let facts = state.facts.lock().unwrap().clone();
+    let computer = if !facts.hostname.trim().is_empty() { facts.hostname } else { state.hostname.clone() };
+    let id = state.device_id.lock().unwrap().clone().unwrap_or_default();
+    ControlMsg::Visitor { account, computer, user: facts.console_user, id }
 }
 
 fn forward_input(cb: &Arc<dyn Callbacks>, adapter: &mut PointerAdapter, event: InputEvent) {
@@ -1117,10 +1211,10 @@ async fn accept_authenticated(
     peer_public: SocketAddr,
     controller_ip: &str,
     controller_name: &str,
-) -> Result<(quinn::Connection, session::Authenticated)> {
+) -> Result<(quinn::Connection, session::Authenticated, ViewAsk)> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let attempt_used = Arc::new(AtomicBool::new(false));
-    let mut pending: JoinSet<Result<(quinn::Connection, session::Authenticated)>> = JoinSet::new();
+    let mut pending: JoinSet<Result<(quinn::Connection, session::Authenticated, ViewAsk)>> = JoinSet::new();
     let mut accepted = 0usize;
     loop {
         tokio::select! {
@@ -1161,16 +1255,27 @@ async fn accept_authenticated(
                         if status.locked { lockout::message(status.minutes) } else { "wrong password".into() }
                     };
                     match session::host_auth(&connection, &passwords, &my_name, &attempt_used, &fail).await {
-                        Ok(auth) => Ok((connection, auth)),
+                        Ok(auth) => Ok((connection, auth, ViewAsk::default())),
                         Err(e) if e.is::<NeedsApproval>() => {
                             let wait = e.downcast::<NeedsApproval>().unwrap();
-                            Ok((connection, session::Authenticated {
-                                send: wait.send,
-                                recv: wait.recv,
-                                peer_name: wait.peer_name,
-                                peer_proto: wait.peer_proto,
-                                password_slot: ASK_SLOT,
-                            }))
+                            let ask = ViewAsk {
+                                view: wait.view,
+                                account: wait.account.clone(),
+                                computer: wait.computer.clone(),
+                                id: wait.id.clone(),
+                            };
+                            let peer_name = if wait.peer_name.trim().is_empty() { controller_name } else { wait.peer_name };
+                            Ok((
+                                connection,
+                                session::Authenticated {
+                                    send: wait.send,
+                                    recv: wait.recv,
+                                    peer_name,
+                                    peer_proto: wait.peer_proto,
+                                    password_slot: ASK_SLOT,
+                                },
+                                ask,
+                            ))
                         }
                         Err(e) => Err(e),
                     }
@@ -1347,7 +1452,7 @@ async fn controller_session(
     *state.control.lock().unwrap() = Some(control_tx.clone());
     if auth.peer_proto >= 3 {
         let _ = control_tx.send(ControlMsg::Hello {
-            permissions: perms::ALL | perms::LAYOUT,
+            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR,
             monitor: 0,
             quality: quality::preset("balanced").unwrap_or(StreamQuality::default()),
         });
@@ -1419,6 +1524,9 @@ async fn controller_session(
                 );
             }
             Ok(HostMsg::Notice(text)) => emit(&cb, &json!({"event":"status","text": text})),
+            Ok(HostMsg::AskVisitor) => {
+                let _ = control_tx.send(android_visitor(&state));
+            }
             Ok(HostMsg::Denied { what, reason }) => {
                 emit(&cb, &json!({"event":"status","text": format!("{what}: {reason}")}))
             }
@@ -1511,6 +1619,28 @@ mod tests {
     }
 
     #[test]
+    fn a_trusted_account_or_computer_or_permanent_password_skips_the_view_prompt() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-trust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir);
+        let ben = ViewAsk { view: true, account: "ben@spader.us".into(), computer: "BENLENOVODESK".into(), id: "692996394".into() };
+        assert!(!view_is_preapproved(&state, &ben));
+        *state.trusted_accounts.lock().unwrap() = vec!["Ben@Spader.us".into()];
+        assert!(view_is_preapproved(&state, &ben));
+        *state.trusted_accounts.lock().unwrap() = vec![];
+        *state.trusted_computers.lock().unwrap() = vec!["386 626 882".into()];
+        let pixel = ViewAsk { view: true, account: String::new(), computer: "Pixel".into(), id: "386626882".into() };
+        assert!(view_is_preapproved(&state, &pixel));
+        assert!(!view_is_preapproved(&state, &ben));
+        *state.trusted_computers.lock().unwrap() = vec![];
+        *state.approval.lock().unwrap() = "unattended".into();
+        *state.permanent.lock().unwrap() = Some("long-enough-password".into());
+        assert!(view_is_preapproved(&state, &ben));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn disk_round_trip_ignores_unknown_future_fields() {
         let raw = r#"{"server":"office.example:21200","fingerprint":"abcd","device_id":"123456789","extra":1}"#;
         let disk: Disk = serde_json::from_str(raw).unwrap();
@@ -1549,6 +1679,10 @@ mod tests {
             video: Mutex::new(None),
             app_stop: AtomicBool::new(false),
             access_token: Mutex::new(String::new()),
+            account: Mutex::new(String::new()),
+            trusted_accounts: Mutex::new(Vec::new()),
+            trusted_computers: Mutex::new(Vec::new()),
+            view_ask: Mutex::new(ViewAsk::default()),
             suppress_token: AtomicBool::new(false),
         })
     }
