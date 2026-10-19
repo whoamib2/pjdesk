@@ -40,6 +40,9 @@ pub enum AuthMsg {
     Confirm { slot: u8, confirm: [u8; 32] },
     /// Host → controller: final verdict.
     Result { ok: bool, message: String, host_name: String },
+    /// Controller → host: skip the password and ask the person at the computer.
+    /// Appended after [`AuthMsg::Result`]. An older host cannot decode it.
+    AskPerson { proto: u16, controller_name: String },
 }
 
 /// Controller → host messages after authentication.
@@ -465,6 +468,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_person_is_appended_after_the_auth_result() {
+        let result = postcard::to_stdvec(&AuthMsg::Result { ok: false, message: "wrong password".into(), host_name: String::new() }).unwrap();
+        assert_eq!(result[0], 3);
+        let ask = postcard::to_stdvec(&AuthMsg::AskPerson { proto: 3, controller_name: "Ben".into() }).unwrap();
+        assert_eq!(ask[0], 4, "AskPerson is appended after Result");
+    }
 
     #[tokio::test]
     async fn video_frame_roundtrip() {

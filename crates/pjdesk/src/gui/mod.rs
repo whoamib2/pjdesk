@@ -234,6 +234,7 @@ pub struct App {
     /// Viewer is waiting for a password after the other computer answered.
     ask_path: Option<std::path::PathBuf>,
     ask_alive: bool,
+    ask_person_next: bool,
     viewer_rx: Vec<Receiver<(String, i32, bool)>>,
 
     /// Background service / scheduled-task snapshot. Never queried on this thread.
@@ -362,6 +363,7 @@ impl App {
             prompt_direct: None,
             ask_path: None,
             ask_alive: false,
+            ask_person_next: false,
             viewer_rx: Vec::new(),
             probe: if preview { None } else { Some(probe::Probe::start(cc.egui_ctx.clone())) },
             scm_installed: false,
@@ -1534,6 +1536,10 @@ impl App {
         if from_store {
             cmd.env("PJDESK_SAVED", "1");
         }
+        if self.ask_person_next {
+            cmd.env("PJDESK_ASK_PERSON", "1");
+            self.ask_person_next = false;
+        }
         if remember {
             cmd.env("PJDESK_REMEMBER", "1");
             if self.temp.is_some() {
@@ -1572,6 +1578,14 @@ impl App {
         }
     }
 
+    fn poll_client_update(&mut self) {
+        let note = crate::client_update::note();
+        if note.is_empty() || note == self.status {
+            return;
+        }
+        self.status = note;
+    }
+
     fn poll_viewers(&mut self) {
         let pending = std::mem::take(&mut self.viewer_rx);
         let mut reopen = None;
@@ -1593,6 +1607,10 @@ impl App {
                         // and the password already typed is left in the field.
                         if code == 3 {
                             reopen = Some((id, files));
+                        } else if code == 4 {
+                            self.prompt_open = false;
+                            self.prompt_checking = false;
+                            self.ask_alive = false;
                         }
                     }
                 }
@@ -1808,6 +1826,77 @@ impl App {
     }
 }
 
+impl App {
+    /// Allow or Decline for a connection that still needs the person here.
+    /// The in-process host posts it on the shared state. The service writes
+    /// `consent.json` for this window.
+    fn consent_prompt(&mut self, ctx: &egui::Context) {
+        let shared = self.engine.shared.pending_consent();
+        let file = read_service_consent();
+        let (from, ip, id, from_file) = if let Some(ask) = shared {
+            (ask.from, ask.ip, ask.id, false)
+        } else if let Some(ask) = file {
+            (ask.from, ask.ip, ask.id, true)
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(400));
+            return;
+        };
+        let mut allow = false;
+        let mut decline = false;
+        egui::Window::new("Allow this connection?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("{from} ({ip}) wants to control this computer."));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Decline").clicked() {
+                        decline = true;
+                    }
+                    if widgets::accent_button(ui, "Allow", egui::Vec2::new(120.0, 36.0)) {
+                        allow = true;
+                    }
+                });
+            });
+        if allow || decline {
+            if from_file {
+                write_service_consent(allow);
+            } else {
+                self.engine.shared.answer_consent(id, allow);
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(200));
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ServiceConsent {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    ip: String,
+}
+
+fn read_service_consent() -> Option<ServiceConsent> {
+    let path = crate::syspaths::service_dir().join("consent.json");
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_service_consent(accept: bool) {
+    let path = crate::syspaths::service_dir().join("consent-reply.json");
+    let body = serde_json::json!({
+        "id": 1,
+        "accept": accept,
+        "permissions": if accept { pjdesk_proto::perms::KEYBOARD | pjdesk_proto::perms::MOUSE } else { 0 },
+        "receive_dir": "",
+    });
+    let _ = std::fs::write(path, body.to_string());
+}
+
 fn last_session_reason() -> Option<String> {
     let path = crate::config::Config::path().parent()?.join("last-session.txt");
     let text = std::fs::read_to_string(path).ok()?;
@@ -1832,6 +1921,7 @@ impl eframe::App for App {
         self.poll_probe();
         self.poll_ask();
         self.poll_viewers();
+        self.poll_client_update();
         self.notice_sign_in_paste(&ctx);
 
         if ctx
@@ -1848,6 +1938,13 @@ impl eframe::App for App {
                 tray::Action::Show => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                tray::Action::Update => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.show_settings = true;
+                    self.settings.show_about();
+                    crate::client_update::start();
                 }
                 tray::Action::Quit => {
                     self.really_quit = true;
@@ -1868,7 +1965,8 @@ impl eframe::App for App {
             }
         }
 
-        let pending = self.login_rx.is_some()
+        let pending = crate::client_update::running()
+            || self.login_rx.is_some()
             || self.change_rx.is_some()
             || self.net_rx.is_some()
             || self.saved_rx.is_some()
@@ -1894,6 +1992,7 @@ impl eframe::App for App {
         self.temporary_warning(&ctx);
         self.import_prompt(&ctx);
         self.password_prompt(&ctx);
+        self.consent_prompt(&ctx);
         self.login_window(&ctx);
         self.change_password_window(&ctx);
         self.poll_lan();

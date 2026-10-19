@@ -4,6 +4,8 @@
 //! Screen capture and the window stay in each client. This crate is the part
 //! that has to stay identical, including on Android.
 
+pub mod admit;
+pub mod lockout;
 pub mod p2p;
 pub mod session;
 pub mod signal;

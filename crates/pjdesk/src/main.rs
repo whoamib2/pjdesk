@@ -13,6 +13,7 @@
 
 mod account;
 mod audio;
+mod client_update;
 mod clip;
 mod color;
 mod config;

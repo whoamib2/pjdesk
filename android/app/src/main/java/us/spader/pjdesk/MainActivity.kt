@@ -724,6 +724,7 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
                                     onShareLogs = { AppLog.share(this@MainActivity) },
+                                    onCheckUpdate = { engine.checkForUpdate() },
                                     onImportConfig = {
                                         val text = clipboardText()
                                         val blob = NetKey.blobIn(text)
@@ -787,8 +788,10 @@ class MainActivity : ComponentActivity() {
                         title = { Text("Password for ${state.askName.ifBlank { "this computer" }}") },
                         text = {
                             Column {
-                                if (state.askRejected) {
-                                    Text("That password was rejected. Enter the current one for this computer.")
+                                if (state.askNote.isNotBlank()) {
+                                    Text(state.askNote)
+                                } else if (state.askRejected) {
+                                    Text("Incorrect password. Enter the current one for this computer.")
                                 }
                                 OutlinedTextField(
                                     value = askedPassword,
@@ -815,7 +818,13 @@ class MainActivity : ComponentActivity() {
                             }) { Text("Connect") }
                         },
                         dismissButton = {
-                            TextButton(onClick = { engine.cancelPassword(); askedPassword = "" }) { Text("Cancel") }
+                            Row {
+                                TextButton(onClick = {
+                                    askedPassword = ""
+                                    engine.askPerson()
+                                }) { Text("Ask the person instead") }
+                                TextButton(onClick = { engine.cancelPassword(); askedPassword = "" }) { Text("Cancel") }
+                            }
                         },
                     )
                 }

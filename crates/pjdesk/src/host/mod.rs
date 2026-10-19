@@ -25,8 +25,12 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use pjdesk_link::admit::{self, Admit};
+use pjdesk_link::lockout::{self, Lockout};
+use pjdesk_link::session::{grant_auth, refuse_auth, refuse_before_password, NeedsApproval};
+
 use crate::config::Config;
-use crate::session::{self, Authenticated, WrongPassword};
+use crate::session::{self, Authenticated, LockedOut, WrongPassword};
 use crate::signaling::{ServerAddr, SignalClient};
 use crate::{p2p, HostArgs};
 
@@ -154,6 +158,28 @@ impl HostShared {
         }
     }
 
+    pub fn pending_consent(&self) -> Option<ConsentAsk> {
+        self.consent.lock().unwrap().clone()
+    }
+
+    /// The window's Allow or Decline. `offered` bits are granted on Allow.
+    pub fn answer_consent(&self, id: u64, accept: bool) {
+        let offered = self
+            .consent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|ask| ask.id == id)
+            .map(|ask| ask.offered)
+            .unwrap_or(pjdesk_proto::perms::KEYBOARD | pjdesk_proto::perms::MOUSE);
+        *self.consent_reply.lock().unwrap() = Some(ConsentReply {
+            id,
+            accept,
+            permissions: if accept { offered } else { 0 },
+            receive_dir: String::new(),
+        });
+    }
+
     pub fn push_chat(&self, from_me: bool, text: &str) {
         let mut chat = self.chat.lock().unwrap();
         chat.push((from_me, text.to_string()));
@@ -215,7 +241,9 @@ pub(crate) struct HostState {
     peer_info_routes: Mutex<HashMap<SessionId, mpsc::UnboundedSender<ServerMsg>>>,
     /// Permission ceiling and receive folder chosen when the session was approved.
     ceilings: Mutex<HashMap<SessionId, (u32, String)>>,
-    failures: Mutex<Failures>,
+    lockout: Mutex<Lockout>,
+    /// Wrong passwords since the one-time password last changed.
+    otp_misses: AtomicUsize,
     args: HostArgs,
     name: String,
     /// Optional status channel to a GUI/supervisor.
@@ -269,14 +297,10 @@ impl HostState {
     }
 }
 
-#[derive(Default)]
-struct Failures {
-    count: u32,
-    locked_until: Option<Instant>,
-}
-
 impl HostState {
     /// Why a new session can't be accepted right now, if it can't.
+    /// A password lockout is not one of these: the controller still connects
+    /// and is told how long to wait.
     fn refuse_reason(&self) -> Option<String> {
         if self.streaming.load(Ordering::SeqCst) {
             return Some("this computer is already in a remote session".into());
@@ -284,38 +308,39 @@ impl HostState {
         if self.pending.load(Ordering::SeqCst) >= MAX_PENDING {
             return Some("too many connection attempts in progress; try again shortly".into());
         }
-        let failures = self.failures.lock().unwrap();
-        match failures.locked_until {
-            Some(until) if Instant::now() < until => {
-                Some("too many wrong passwords; try again in a few minutes".into())
-            }
-            _ => None,
-        }
+        None
     }
 
-    /// Counts a wrong password. The one-time password is replaced every three
-    /// misses (so an overheard or guessed one stops working); if a permanent
-    /// password is also set, five misses lock out new sessions for five
-    /// minutes to slow brute-forcing it.
-    fn record_failure(&self) {
-        let has_permanent = self.permanent.lock().unwrap().is_some();
-        let mut failures = self.failures.lock().unwrap();
-        failures.count += 1;
-        let rotate = failures.count % 3 == 0;
-        if has_permanent && failures.count >= 5 {
-            failures.count = 0;
-            failures.locked_until = Some(Instant::now() + Duration::from_secs(5 * 60));
-            warn!("Too many wrong passwords; refusing connections for five minutes");
-        }
-        drop(failures);
-        if rotate {
+    /// Counts a wrong password. Returns the text to send the controller.
+    fn note_wrong_password(&self, source: &str) -> String {
+        let status = self.lockout.lock().unwrap().fail(source, Instant::now());
+        let misses = self.otp_misses.fetch_add(1, Ordering::SeqCst) + 1;
+        if misses % 3 == 0 {
             *self.password.lock().unwrap() = generate_password();
             self.publish_password();
         }
+        if status.locked {
+            self.log_lock(source, &status);
+            lockout::message(status.minutes)
+        } else {
+            "wrong password".into()
+        }
     }
 
-    fn reset_failures(&self) {
-        self.failures.lock().unwrap().count = 0;
+    fn note_success(&self, source: &str) {
+        self.lockout.lock().unwrap().succeed(source);
+        self.otp_misses.store(0, Ordering::SeqCst);
+    }
+
+    fn log_lock(&self, source: &str, status: &lockout::Status) {
+        if !status.fresh {
+            return;
+        }
+        if status.global {
+            warn!("Locked out all connections for {} minutes after repeated wrong passwords", status.minutes);
+        } else {
+            warn!("Locked out {source} for {} minutes after repeated wrong passwords", status.minutes);
+        }
     }
 }
 
@@ -345,7 +370,8 @@ async fn host_main(
         pending: AtomicUsize::new(0),
         peer_info_routes: Mutex::new(HashMap::new()),
         ceilings: Mutex::new(HashMap::new()),
-        failures: Mutex::new(Failures::default()),
+        lockout: Mutex::new(Lockout::default()),
+        otp_misses: AtomicUsize::new(0),
         name: crate::hostname(),
         args: args.clone(),
         shared: shared.clone(),
@@ -537,21 +563,11 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                             signal.send(ClientMsg::SessionResponse { session_id, accept: false, reason })?;
                             continue;
                         }
-                        let approved = match approve(state, &controller_name, &controller_ip).await {
-                            Some(bits) => bits,
-                            None => {
-                                info!("Declined connection from \"{controller_name}\" ({controller_ip})");
-                                signal.send(ClientMsg::SessionResponse {
-                                    session_id,
-                                    accept: false,
-                                    reason: "the person at this computer declined".into(),
-                                })?;
-                                continue;
-                            }
-                        };
+                        // Accept the signaling session before any Allow prompt so the
+                        // controller can offer a password. The prompt, if one is
+                        // needed, happens after that password is checked.
                         state.pending.fetch_add(1, Ordering::SeqCst);
                         signal.send(ClientMsg::SessionResponse { session_id, accept: true, reason: String::new() })?;
-                        state.ceilings.lock().unwrap().insert(session_id, approved);
                         let (tx, rx) = mpsc::unbounded_channel();
                         state.peer_info_routes.lock().unwrap().insert(session_id, tx);
                         let server_udp = SocketAddr::new(server_ip, udp_port);
@@ -583,14 +599,9 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                         }
                     }
                     ServerMsg::UpdateNow => {
-                        info!("Server requested an update; running the update task now");
-                        #[cfg(windows)]
-                        {
-                            use std::os::windows::process::CommandExt;
-                            let _ = std::process::Command::new("schtasks")
-                                .args(["/Run", "/TN", crate::service::UPDATE_TASK])
-                                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-                                .spawn();
+                        info!("Server asked this computer to update now");
+                        if !crate::client_update::start() {
+                            info!("An update is already running");
                         }
                     }
                     ServerMsg::WantHostReport => {
@@ -638,11 +649,25 @@ async fn run_session(
 ) {
     info!("Connection request from \"{controller_name}\" ({controller_ip})");
     let mut still_pending = true;
-    match session_inner(&state, signal, peer_info, session_id, token, server_udp, &mut still_pending).await {
+    match session_inner(
+        &state,
+        signal,
+        peer_info,
+        session_id,
+        token,
+        server_udp,
+        &controller_name,
+        &controller_ip,
+        &mut still_pending,
+    )
+    .await
+    {
         Ok(()) => info!("Remote session ended"),
         Err(e) if e.is::<WrongPassword>() => {
             warn!("\"{controller_name}\" ({controller_ip}) entered a wrong password");
-            state.record_failure();
+        }
+        Err(e) if e.is::<LockedOut>() => {
+            warn!("\"{controller_name}\" ({controller_ip}) is locked out: {e}");
         }
         Err(e) => warn!("Connection from \"{controller_name}\" ended: {e:#}"),
     }
@@ -660,6 +685,8 @@ async fn session_inner(
     session_id: SessionId,
     token: [u8; 16],
     server_udp: SocketAddr,
+    controller_name: &str,
+    controller_ip: &str,
     still_pending: &mut bool,
 ) -> Result<()> {
     let binding = p2p::bind_udp(server_udp, session_id, token, Role::Host).await?;
@@ -680,10 +707,26 @@ async fn session_inner(
     let punching = p2p::spawn_punching(binding.punch_socket, targets, session_id, Duration::from_secs(8));
 
     let passwords = state.auth_passwords();
-    let accepted = accept_authenticated(&endpoint, &passwords, &state.name, Duration::from_secs(90)).await;
+    let permanent = state.permanent.lock().unwrap().clone();
+    let accepted = accept_authenticated(
+        &endpoint,
+        state,
+        server_udp.ip(),
+        peer_public,
+        controller_ip,
+        controller_name,
+        &passwords,
+        Duration::from_secs(90),
+    )
+    .await;
     punching.abort();
-    let (connection, auth) = accepted?;
-    state.reset_failures();
+    let (connection, mut auth) = accepted?;
+    let source = source_for(&connection, server_udp.ip(), peer_public, controller_ip, controller_name);
+    if auth.password_slot != ASK_SLOT {
+        state.note_success(&source);
+    }
+    let (mut ceiling, receive_dir) =
+        open_session(state, &mut auth, &passwords, permanent.as_deref(), controller_name, controller_ip).await?;
 
     // Authenticated: this session takes the screen, unless another one got there first.
     state.pending.fetch_sub(1, Ordering::SeqCst);
@@ -706,13 +749,6 @@ async fn session_inner(
     if let Some(shared) = &state.shared {
         *shared.connected.lock().unwrap() = Some(auth.peer_name.clone());
     }
-    let (mut ceiling, receive_dir) = state
-        .ceilings
-        .lock()
-        .unwrap()
-        .get(&session_id)
-        .cloned()
-        .unwrap_or((pjdesk_proto::perms::CLASSIC, state.args.receive_dir.clone()));
     let policy = state.policy.lock().unwrap().clone();
     ceiling &= policy.max_permissions;
     if !policy.recording_allowed {
@@ -740,13 +776,37 @@ async fn session_inner(
     result
 }
 
+/// Password slot used when the controller asked for the person at this computer.
+const ASK_SLOT: u8 = 255;
+
+fn source_for(
+    connection: &Connection,
+    relay_ip: std::net::IpAddr,
+    peer_public: SocketAddr,
+    controller_ip: &str,
+    controller_name: &str,
+) -> String {
+    lockout::source_key(
+        connection.remote_address().ip(),
+        Some(relay_ip),
+        Some(peer_public.ip()),
+        controller_ip.parse().ok(),
+        controller_name,
+    )
+}
+
 /// Accepts QUIC connections until one authenticates. The controller may try
 /// several addresses at once, so several connections can arrive, but only
-/// one password attempt is allowed per session.
+/// one password attempt is allowed per session. A lockout is answered here,
+/// before any Allow prompt.
 async fn accept_authenticated(
     endpoint: &Endpoint,
+    state: &Arc<HostState>,
+    relay_ip: std::net::IpAddr,
+    peer_public: SocketAddr,
+    controller_ip: &str,
+    controller_name: &str,
     passwords: &[String],
-    my_name: &str,
     limit: Duration,
 ) -> Result<(Connection, Authenticated)> {
     const MAX_CONNECTIONS: usize = 8;
@@ -764,21 +824,45 @@ async fn accept_authenticated(
                     incoming.refuse();
                     continue;
                 }
-                let (passwords, my_name, attempt_used) = (passwords.to_vec(), my_name.to_owned(), attempt_used.clone());
+                let (passwords, my_name, attempt_used) = (passwords.to_vec(), state.name.clone(), attempt_used.clone());
+                let (state, controller_ip, controller_name) = (state.clone(), controller_ip.to_string(), controller_name.to_string());
                 pending.spawn(async move {
                     let connection = incoming.await?;
-                    let auth = session::host_auth(&connection, &passwords, &my_name, &attempt_used).await?;
-                    Ok((connection, auth))
+                    let source = source_for(&connection, relay_ip, peer_public, &controller_ip, &controller_name);
+                    let locked = state.lockout.lock().unwrap().check(&source, Instant::now());
+                    if locked.locked {
+                        state.log_lock(&source, &locked);
+                        refuse_before_password(&connection, &lockout::message(locked.minutes)).await?;
+                        return Err(LockedOut { minutes: locked.minutes }.into());
+                    }
+                    let fail_state = state.clone();
+                    let fail_source = source.clone();
+                    let fail = move || fail_state.note_wrong_password(&fail_source);
+                    match session::host_auth(&connection, &passwords, &my_name, &attempt_used, &fail).await {
+                        Ok(auth) => Ok((connection, auth)),
+                        Err(e) if e.is::<NeedsApproval>() => {
+                            let wait = e.downcast::<NeedsApproval>().unwrap();
+                            Ok((connection, Authenticated {
+                                send: wait.send,
+                                recv: wait.recv,
+                                peer_name: wait.peer_name,
+                                peer_proto: wait.peer_proto,
+                                password_slot: ASK_SLOT,
+                            }))
+                        }
+                        Err(e) => Err(e),
+                    }
                 });
             }
             Some(joined) = pending.join_next(), if !pending.is_empty() => match joined {
                 Ok(Ok(done)) => return Ok(done),
+                Ok(Err(e)) if e.is::<LockedOut>() => return Err(e),
                 Ok(Err(e)) if e.is::<WrongPassword>() => {
                     // The person can correct the password without asking this
                     // computer to allow the session again.
                     attempt_used.store(false, Ordering::SeqCst);
                     wrong += 1;
-                    if wrong >= 5 {
+                    if wrong >= 8 {
                         return Err(e);
                     }
                 }
@@ -786,6 +870,49 @@ async fn accept_authenticated(
                 Err(_) => {}
             },
             _ = tokio::time::sleep_until(deadline) => bail!("the controller did not connect in time"),
+        }
+    }
+}
+
+enum Person {
+    Yes(u32, String),
+    No,
+    TimedOut,
+}
+
+async fn open_session(
+    state: &Arc<HostState>,
+    auth: &mut Authenticated,
+    passwords: &[String],
+    permanent: Option<&str>,
+    controller_name: &str,
+    controller_ip: &str,
+) -> Result<(u32, String)> {
+    if auth.password_slot != ASK_SLOT {
+        let matched = admit::matched_permanent(passwords, auth.password_slot, permanent);
+        let permanent_set = permanent.map(str::trim).is_some_and(|p| !p.is_empty());
+        let policy = state.policy.lock().unwrap().clone();
+        if let Admit::Open(bits) =
+            admit::after_password(&state.args.approval, matched, permanent_set, &policy, state.args.view_only)
+        {
+            grant_auth(&mut auth.send, &state.name).await?;
+            return Ok((bits, String::new()));
+        }
+    }
+    match approve(state, controller_name, controller_ip).await {
+        Person::Yes(bits, dir) => {
+            grant_auth(&mut auth.send, &state.name).await?;
+            Ok((bits, dir))
+        }
+        Person::No => {
+            let message = "the person at this computer declined";
+            let _ = refuse_auth(&mut auth.send, message).await;
+            bail!(message)
+        }
+        Person::TimedOut => {
+            let message = format!("No one at {} answered the request", state.name);
+            let _ = refuse_auth(&mut auth.send, &message).await;
+            bail!(message)
         }
     }
 }
@@ -826,42 +953,32 @@ fn platform_init() {
     }
 }
 
-/// Asks the person at this computer before a session starts. `None` declines.
-/// The tuple is the granted permission bits and the folder received files may
-/// be written into (empty unless file transfer was allowed).
-async fn approve(state: &Arc<HostState>, name: &str, ip: &str) -> Option<(u32, String)> {
-    use pjdesk_proto::perms::{self, grant};
+/// Asks the person at this computer. Called only after a password was accepted
+/// and the host's mode still requires approval, or the controller chose
+/// "Ask the person instead". A timeout is not a decline.
+async fn approve(state: &Arc<HostState>, name: &str, ip: &str) -> Person {
     let policy = state.policy.lock().unwrap().clone();
-    let prompt = state.args.approval != "unattended" || policy.force_prompt;
-    let restricted = grant(perms::UNATTENDED_DEFAULT, policy.max_permissions, state.args.view_only) & !perms::FILE;
-    let permanent = state.permanent.lock().unwrap().is_some();
-    let unattended_ok = permanent && policy.unattended_allowed && !policy.force_prompt;
-
-    if !prompt {
-        return unattended_ok.then_some((restricted, String::new()));
-    }
-
     if let Some(shared) = &state.shared {
-        let id = shared.begin_consent(name, ip, policy.max_permissions);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-        loop {
-            if let Some(reply) = shared.take_reply(id) {
-                shared.clear_consent(id);
-                return consent_grant(&policy, reply);
+        if !state.args.service_host {
+            let id = shared.begin_consent(name, ip, policy.max_permissions);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+            loop {
+                if let Some(reply) = shared.take_reply(id) {
+                    shared.clear_consent(id);
+                    return match consent_grant(&policy, reply) {
+                        Some(answer) => Person::Yes(answer.0, answer.1),
+                        None => Person::No,
+                    };
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    shared.clear_consent(id);
+                    return Person::TimedOut;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            if tokio::time::Instant::now() >= deadline {
-                shared.clear_consent(id);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    } else if state.args.service_host {
-        if let Some(answer) = service_consent(state, name, ip, policy.max_permissions).await {
-            return Some(answer);
         }
     }
-
-    unattended_ok.then_some((restricted, String::new()))
+    service_consent(state, name, ip, policy.max_permissions).await
 }
 
 fn consent_grant(policy: &Policy, reply: ConsentReply) -> Option<(u32, String)> {
@@ -884,14 +1001,18 @@ fn consent_grant(policy: &Policy, reply: ConsentReply) -> Option<(u32, String)> 
 
 /// The service host has no window. It leaves `consent.json` for the signed-in
 /// user's PJDesk window and waits for `consent-reply.json`.
-async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) -> Option<(u32, String)> {
+async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) -> Person {
     let dir = crate::syspaths::service_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Person::TimedOut;
+    }
     let ask_path = dir.join("consent.json");
     let reply_path = dir.join("consent-reply.json");
     let _ = std::fs::remove_file(&reply_path);
-    let ask = serde_json::json!({ "from": name, "ip": ip, "offered": offered });
-    std::fs::write(&ask_path, ask.to_string()).ok()?;
+    let ask = serde_json::json!({ "id": 1, "from": name, "ip": ip, "offered": offered });
+    if std::fs::write(&ask_path, ask.to_string()).is_err() {
+        return Person::TimedOut;
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     let reply = loop {
         if let Ok(bytes) = std::fs::read(&reply_path) {
@@ -906,5 +1027,11 @@ async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) 
     };
     let _ = std::fs::remove_file(&ask_path);
     let _ = std::fs::remove_file(&reply_path);
-    consent_grant(&state.policy.lock().unwrap(), reply?)
+    let Some(reply) = reply else {
+        return Person::TimedOut;
+    };
+    match consent_grant(&state.policy.lock().unwrap(), reply) {
+        Some(answer) => Person::Yes(answer.0, answer.1),
+        None => Person::No,
+    }
 }

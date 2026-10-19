@@ -51,6 +51,10 @@ pub struct SettingsDraft {
 }
 
 impl SettingsDraft {
+    pub(super) fn show_about(&mut self) {
+        self.tab = Tab::About;
+    }
+
     /// `update_task` is the cached probe result. `None` means "still checking"
     /// — this function does not ask Windows.
     pub fn from_config(cfg: &Config, update_task: Option<bool>) -> Self {
@@ -469,6 +473,8 @@ fn general_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
         ui,
         "Downloads new versions from the project's GitHub releases, verifies them, and installs silently. Changing this asks for Administrator rights.",
     ));
+    ui.add_space(8.0);
+    update_now_button(ui);
 }
 
 fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, running: bool, known: bool) {
@@ -667,7 +673,26 @@ fn about_tab(ui: &mut egui::Ui) {
         ui.hyperlink_to("Source on GitHub", "https://github.com/whoamib2/pjdesk");
     });
     ui.add_space(12.0);
+    update_now_button(ui);
+    ui.add_space(8.0);
     ui.label(widgets::muted(ui, "Keyboard: Enter connects, Ctrl+, opens Settings."));
+}
+
+/// Settings → General → Updates, and Settings → About. Also on the tray menu.
+fn update_now_button(ui: &mut egui::Ui) {
+    let note = crate::client_update::note();
+    if !note.is_empty() {
+        ui.label(RichText::new(&note).color(theme::paint(ui).text));
+        ui.add_space(4.0);
+    }
+    let busy = crate::client_update::running();
+    if ui.add_enabled(!busy, egui::Button::new("Check for updates now")).clicked() {
+        crate::client_update::start();
+    }
+    ui.label(widgets::muted(
+        ui,
+        "Downloads the latest release, checks it, installs it, and opens PJDesk again.",
+    ));
 }
 
 fn parse_ports(text: &str) -> Result<Vec<u16>, String> {

@@ -42,6 +42,8 @@ data class DeskState(
     val askPassword: Boolean = false,
     val askName: String = "",
     val askRejected: Boolean = false,
+    /** Why the password dialog is open again, or empty on the first ask. */
+    val askNote: String = "",
 )
 
 data class SavedComputer(

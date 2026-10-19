@@ -508,6 +508,7 @@ impl App {
         }
         let mut close = false;
         let mut go = false;
+        let mut ask_person = false;
         let name = if self.prompt_direct.is_some() {
             self.prompt_id.clone()
         } else {
@@ -523,7 +524,12 @@ impl App {
                 ui.label(RichText::new(id_line).monospace().color(theme::paint(ui).muted));
                 if self.prompt_rejected {
                     ui.add_space(4.0);
-                    ui.label("That password was rejected. Enter the current one for this computer.");
+                    let line = if self.status.starts_with("Incorrect password") {
+                        self.status.clone()
+                    } else {
+                        format!("Incorrect password for {}.", format_id(&self.prompt_id))
+                    };
+                    ui.label(RichText::new(line).color(theme::paint(ui).warn));
                 }
                 if self.prompt_checking {
                     ui.add_space(4.0);
@@ -549,6 +555,9 @@ impl App {
                         go = true;
                     }
                 });
+                if !self.prompt_checking && ui.link("Ask the person instead").clicked() {
+                    ask_person = true;
+                }
             });
         if close {
             self.write_ask_reply("cancel\n");
@@ -556,6 +565,20 @@ impl App {
             self.prompt_checking = false;
             self.ask_alive = false;
             self.ask_path = None;
+        }
+        if ask_person {
+            if self.ask_alive {
+                self.write_ask_reply("ask\n");
+                self.prompt_checking = true;
+                self.prompt_rejected = false;
+            } else {
+                let (id, files) = (self.prompt_id.clone(), self.prompt_files);
+                self.prompt_open = false;
+                self.prompt_checking = false;
+                self.ask_person_next = true;
+                self.spawn_viewer(&id, "", files, false, false);
+                // The viewer asks the person after the computer answers, with no password.
+            }
         }
         if go {
             let pw = self.prompt_password.clone();

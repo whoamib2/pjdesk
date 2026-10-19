@@ -2513,8 +2513,8 @@ impl App {
                     if !locked
                         && online > 0
                         && ui
-                            .small_button("Update all online")
-                            .on_hover_text("Tell every online computer to update now")
+                            .small_button("Update all online computers")
+                            .on_hover_text("Tell every online PJDesk client to download and install the latest release now")
                             .clicked()
                     {
                         update_all = true;

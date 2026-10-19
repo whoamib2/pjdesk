@@ -154,7 +154,7 @@ async fn connect(
     };
     signal.send(connect.clone())?;
 
-    tracing::info!("Waiting for {} to allow the connection", format_id(target));
+    tracing::info!("Waiting for {} to answer", format_id(target));
     let mut retried_without_token = false;
     let (session_id, token, udp_port, host_name) = loop {
         match timeout(Duration::from_secs(90), signal.recv()).await {
@@ -204,11 +204,15 @@ async fn connect(
 
     let endpoint = p2p::controller_endpoint(binding.socket, fingerprint)?;
     let candidates = p2p::candidates(peer_public, &peer_local);
-    let mut password = if let Some(path) = ask {
+    let ask_person = std::env::var("PJDESK_ASK_PERSON").ok().as_deref() == Some("1");
+    let mut attempt = if ask_person {
+        Asked::Person
+    } else if let Some(path) = ask {
         wait_asked_password(path, &host_name).await?
     } else {
-        password.to_string()
+        Asked::Password(password.to_string())
     };
+    let mut from_store = std::env::var("PJDESK_SAVED").ok().as_deref() == Some("1");
     let mut tries = 0u32;
     let (connection, path, auth) = loop {
         let punching = binding.punch_socket.try_clone().ok().map(|sock| {
@@ -219,28 +223,58 @@ async fn connect(
             punching.abort();
         }
         let (connection, path) = connected?;
-        tracing::info!("Checking the password with {}", format_id(target));
-        match session::controller_auth(&connection, &password, &crate::hostname()).await {
+        let authed = match &attempt {
+            Asked::Person => {
+                tracing::info!("Asking the person at {}", format_id(target));
+                session::controller_ask_person(&connection, &crate::hostname()).await
+            }
+            Asked::Password(password) => {
+                tracing::info!("Checking the password with {}", format_id(target));
+                session::controller_auth(&connection, password, &crate::hostname()).await
+            }
+        };
+        match authed {
             Ok(auth) => {
                 if let Some(path) = ask {
                     let _ = std::fs::write(path, "accepted\n");
                 }
                 break (connection, path, auth);
             }
-            Err(e) if e.is::<WrongPassword>() && ask.is_some() && tries < 4 => {
+            Err(e) if e.is::<session::LockedOut>() => {
+                connection.close(1u32.into(), b"locked out");
+                let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+                crate::note_failure(&e.to_string());
+                std::process::exit(4);
+            }
+            Err(e) if e.is::<session::WrongPassword>() && ask.is_some() && tries < 4 => {
                 connection.close(1u32.into(), b"authentication failed");
                 tries += 1;
                 let path = ask.unwrap();
                 let _ = std::fs::write(path, format!("rejected\n{host_name}\n"));
                 let _ = std::fs::remove_file(ask_reply_path(path));
-                password = wait_asked_password(path, &host_name).await?;
+                from_store = false;
+                attempt = wait_asked_password(path, &host_name).await?;
+            }
+            Err(e) if e.is::<session::WrongPassword>() => {
+                connection.close(1u32.into(), b"authentication failed");
+                let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+                let mut text = format!("Incorrect password for {}", format_id(target));
+                if from_store && is_valid_id(target) {
+                    config.remember_password(target, None);
+                    if let Some(entry) = config.address_book.iter_mut().find(|e| e.id == target) {
+                        entry.password = None;
+                    }
+                    let _ = config.save();
+                    text.push_str(". The saved password on this computer was cleared.");
+                }
+                crate::note_failure(&text);
+                std::process::exit(3);
             }
             Err(e) => {
                 connection.close(1u32.into(), b"authentication failed");
                 let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
-                let err = if e.is::<WrongPassword>() { anyhow!("wrong password for {}", format_id(target)) } else { e };
-                tracing::error!("session failed: {err:#}");
-                return Err(err);
+                tracing::error!("session failed: {e:#}");
+                return Err(e);
             }
         }
     };
@@ -265,9 +299,14 @@ fn ask_reply_path(path: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
-/// Blocks until the window writes a password or cancel into the ask reply file.
-/// The host has already accepted; this is the only password prompt for the attempt.
-async fn wait_asked_password(path: &std::path::Path, host_name: &str) -> Result<String> {
+enum Asked {
+    Password(String),
+    Person,
+}
+
+/// Blocks until the window writes a password, asks the person, or cancels.
+/// The host has already answered; this is the only password prompt for the attempt.
+async fn wait_asked_password(path: &std::path::Path, host_name: &str) -> Result<Asked> {
     let current = std::fs::read_to_string(path).unwrap_or_default();
     if !current.starts_with("rejected") {
         let _ = std::fs::write(path, format!("ready\n{host_name}\n"));
@@ -283,11 +322,14 @@ async fn wait_asked_password(path: &std::path::Path, host_name: &str) -> Result<
             if text.starts_with("cancel") {
                 bail!("cancelled");
             }
+            if text.starts_with("ask") {
+                return Ok(Asked::Person);
+            }
             if let Some(hexed) = text.strip_prefix("password\n") {
                 let bytes = hex::decode(hexed.trim()).unwrap_or_default();
                 if let Ok(password) = String::from_utf8(bytes) {
                     if !password.is_empty() {
-                        return Ok(password);
+                        return Ok(Asked::Password(password));
                     }
                 }
             }
@@ -329,7 +371,11 @@ async fn connect_direct(
     if let Some(path) = ask {
         let _ = std::fs::write(path, format!("ready\n{label}\n"));
     }
-    let password = if let Some(path) = ask { wait_asked_password(path, &label).await? } else { password.to_string() };
+    let asked = if let Some(path) = ask {
+        wait_asked_password(path, &label).await?
+    } else {
+        Asked::Password(password.to_string())
+    };
     if verifier.mismatch() {
         connection.close(1u32.into(), b"certificate mismatch");
         bail!("this computer's key changed. Connect again and choose to trust it.");
@@ -340,12 +386,21 @@ async fn connect_direct(
             let _ = config.save();
         }
     }
-    let auth = match session::controller_auth(&connection, &password, &crate::hostname()).await {
+    let authed = match &asked {
+        Asked::Person => session::controller_ask_person(&connection, &crate::hostname()).await,
+        Asked::Password(password) => session::controller_auth(&connection, password, &crate::hostname()).await,
+    };
+    let auth = match authed {
         Ok(auth) => {
             if let Some(path) = ask {
                 let _ = std::fs::write(path, "accepted\n");
             }
             auth
+        }
+        Err(e) if e.is::<session::LockedOut>() => {
+            connection.close(1u32.into(), b"locked out");
+            crate::note_failure(&e.to_string());
+            std::process::exit(4);
         }
         Err(e) => {
             connection.close(1u32.into(), b"authentication failed");

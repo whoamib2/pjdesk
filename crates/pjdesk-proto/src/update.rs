@@ -99,6 +99,11 @@ pub fn version_at_least(have: &str, need: &str) -> bool {
 }
 
 fn http_get(url: &str) -> Result<Vec<u8>> {
+    http_get_progress(url, &|_, _| {})
+}
+
+/// Downloads `url`. `progress` is `(bytes so far, Content-Length if the server sent one)`.
+fn http_get_progress(url: &str, progress: &dyn Fn(u64, Option<u64>)) -> Result<Vec<u8>> {
     let resp = ureq::builder()
         .timeout(Duration::from_secs(60))
         .user_agent(USER_AGENT)
@@ -106,8 +111,18 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
         .get(url)
         .call()
         .with_context(|| format!("fetching {url}"))?;
+    let total = resp.header("Content-Length").and_then(|h| h.parse().ok()).filter(|n: &u64| *n > 0);
+    let mut reader = resp.into_reader().take(200 * 1024 * 1024);
     let mut buf = Vec::new();
-    resp.into_reader().take(200 * 1024 * 1024).read_to_end(&mut buf)?;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut chunk).with_context(|| format!("reading {url}"))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        progress(buf.len() as u64, total);
+    }
     Ok(buf)
 }
 
@@ -119,6 +134,39 @@ pub fn is_client_installer(name: &str) -> bool {
         return false;
     }
     name.starts_with("PJDesk-Client-Setup") || name.starts_with("PJDesk-Setup")
+}
+
+fn pick_android_asset(assets: &[Asset]) -> Option<&Asset> {
+    assets.iter().filter(|a| is_android_apk(&a.name)).min_by_key(|a| {
+        if a.name.starts_with("PJDesk-Android-") { 0u8 } else { 1 }
+    })
+}
+
+/// A release APK, not a debug build and not the Windows installer.
+pub fn is_android_apk(name: &str) -> bool {
+    let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".apk") && lower.contains("pjdesk") && !lower.contains("debug")
+}
+
+/// Latest Android APK from the GitHub release, when it is newer than `current`.
+pub fn check_android(repo: &str, current: &str) -> Result<Option<Available>> {
+    let body = http_get(&format!("https://api.github.com/repos/{repo}/releases/latest"))?;
+    let release: Release = serde_json::from_slice(&body).context("parsing the GitHub release")?;
+    if !is_newer(current, &release.tag_name) {
+        return Ok(None);
+    }
+    let apk = pick_android_asset(&release.assets)
+        .with_context(|| format!("release {} has no Android apk", release.tag_name))?;
+    if !trusted_download_url(&apk.browser_download_url) {
+        bail!("the release points at a download outside GitHub, so it was not offered");
+    }
+    Ok(Some(Available {
+        version: release.tag_name.trim_start_matches('v').to_string(),
+        installer_name: apk.name.clone(),
+        installer_url: apk.browser_download_url.clone(),
+        sums_url: None,
+    }))
 }
 
 fn pick_client_asset(assets: &[Asset]) -> Option<&Asset> {
@@ -285,13 +333,30 @@ fn safe_version(version: &str) -> String {
 /// refused: HTTPS to GitHub is necessary, and the checksum catches a truncated
 /// or swapped download before anything is executed.
 pub fn download_verified(update: &Available) -> Result<PathBuf> {
+    download_verified_progress(update, &|_| {})
+}
+
+fn download_verified_progress(update: &Available, progress: &dyn Fn(&str)) -> Result<PathBuf> {
     let sums_url = update.sums_url.as_deref().context(
         "this release has no SHA256SUMS file, so it was not installed. Publish SHA256SUMS next to the installer.",
     )?;
     if !trusted_download_url(&update.installer_url) || !trusted_download_url(sums_url) {
         bail!("the release points at a download outside GitHub, so it was not installed");
     }
-    let bytes = http_get(&update.installer_url)?;
+    let version = update.version.clone();
+    let last_pct = std::cell::Cell::new(999u64);
+    let bytes = http_get_progress(&update.installer_url, &|got, total| {
+        let pct = total.map(|total| (got.saturating_mul(100) / total).min(100)).unwrap_or(0);
+        if pct / 5 != last_pct.get() / 5 {
+            last_pct.set(pct);
+            if total.is_some() {
+                progress(&format!("Downloading PJDesk {version}… {pct}%"));
+            } else {
+                progress(&format!("Downloading PJDesk {version}…"));
+            }
+        }
+    })?;
+    progress("Verifying the download…");
     let sums = String::from_utf8(http_get(sums_url)?).unwrap_or_default();
     let want = expected_checksum(&sums, &update.installer_name)
         .with_context(|| format!("no checksum for {} in SHA256SUMS", update.installer_name))?;
@@ -422,6 +487,32 @@ pub fn install_available(update: &Available) -> Result<()> {
     Ok(())
 }
 
+/// Checks, downloads, verifies, and launches the latest client installer.
+///
+/// `progress` is a short line for the window: checking, a download percent,
+/// verifying, then the install. The installer closes PJDesk and `update-handoff`
+/// opens it again, so the last line is shown before the installer starts.
+pub fn install_client_reporting(current: &str, progress: &dyn Fn(&str)) -> Result<Outcome> {
+    progress("Checking for updates…");
+    match check_client(crate::UPDATE_REPO, current)? {
+        None => {
+            let line = format!("PJDesk {current} is up to date.");
+            progress(&line);
+            Ok(Outcome::UpToDate(current.to_string()))
+        }
+        Some(update) => {
+            let path = download_verified_progress(&update, progress)?;
+            let line = format!("Installing PJDesk {}. PJDesk will close and open again.", update.version);
+            progress(&line);
+            // One beat so the window can paint that line before the installer
+            // closes this process.
+            std::thread::sleep(Duration::from_millis(600));
+            run_installer(&path)?;
+            Ok(Outcome::Installing(update.version))
+        }
+    }
+}
+
 /// Client self-update. Prefers `PJDesk-Client-Setup` and still accepts `PJDesk-Setup`.
 pub fn perform_client(repo: &str, current: &str, check_only: bool) -> Result<Outcome> {
     match check_client(repo, current)? {
@@ -511,6 +602,19 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa *PJDesk-Server-
         assert!(!trusted_download_url("https://evil.example/github.com/a.exe"));
         assert!(!trusted_download_url("https://user:pass@github.com/a.exe"));
         assert!(!trusted_download_url("https://github.com\r\nX: y/a.exe"));
+    }
+
+    #[test]
+    fn an_android_apk_is_chosen_and_a_debug_build_is_not() {
+        assert!(is_android_apk("PJDesk-Android-0.6.7.apk"));
+        assert!(!is_android_apk("PJDesk-Android-0.6.7-debug.apk"));
+        assert!(!is_android_apk("PJDesk-Client-Setup-0.6.7.exe"));
+        let assets = vec![
+            Asset { name: "PJDesk-Client-Setup-0.6.7.exe".into(), browser_download_url: "exe".into() },
+            Asset { name: "PJDesk-Android-0.6.7-debug.apk".into(), browser_download_url: "debug".into() },
+            Asset { name: "PJDesk-Android-0.6.7.apk".into(), browser_download_url: "apk".into() },
+        ];
+        assert_eq!(pick_android_asset(&assets).map(|a| a.browser_download_url.as_str()), Some("apk"));
     }
 
     #[test]

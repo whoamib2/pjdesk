@@ -520,6 +520,7 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
     let shared = Arc::new(HostShared::default());
     let mut args = crate::HostArgs::from_settings(&config.settings);
     args.follow_desktop = true;
+    args.service_host = true;
 
     let host_shared = shared.clone();
     std::thread::Builder::new().name("host".into()).spawn(move || {

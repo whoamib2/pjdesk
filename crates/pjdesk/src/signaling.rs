@@ -111,11 +111,11 @@ impl SignalClient {
         let pinned = config.pinned_fingerprint();
         let expected = config.server_fingerprint.clone();
         let ready = if lan.is_empty() {
-            handshake(public_addr, "Internet", PUBLIC_HANDSHAKE, &server.to_string(), pinned, expected.as_deref()).await?
+            handshake(public_addr, path_label(public_addr), PUBLIC_HANDSHAKE, &server.to_string(), pinned, expected.as_deref()).await?
         } else if prefer_lan(&config.network_public_ip, &lan).await {
             race_paths(&lan, public_addr, &server.to_string(), pinned, expected.as_deref()).await?
         } else {
-            handshake(public_addr, "Internet", PUBLIC_HANDSHAKE, &server.to_string(), pinned, expected.as_deref()).await?
+            handshake(public_addr, path_label(public_addr), PUBLIC_HANDSHAKE, &server.to_string(), pinned, expected.as_deref()).await?
         };
 
         if pinned.is_none() {
@@ -291,7 +291,7 @@ async fn race_paths(
     let label = server_label.to_string();
     set.spawn(async move {
         tokio::time::sleep(PUBLIC_DELAY).await;
-        handshake(public_addr, "Internet", PUBLIC_HANDSHAKE, &label, pinned, expected.as_deref()).await
+        handshake(public_addr, path_label(public_addr), PUBLIC_HANDSHAKE, &label, pinned, expected.as_deref()).await
     });
     let mut mismatch = None;
     let mut other = None;
@@ -307,6 +307,12 @@ async fn race_paths(
         }
     }
     Err(mismatch.or(other).unwrap_or_else(|| anyhow!("could not reach the server at {server_label}")))
+}
+
+/// A hostname that resolves to a private address is the LAN, even when it was
+/// the published server name (`pjdesk.spader.us` → `192.168.0.231`).
+fn path_label(addr: SocketAddr) -> &'static str {
+    if crate::p2p::is_lan_ip(addr.ip()) { "LAN" } else { "Internet" }
 }
 
 async fn handshake(
@@ -381,5 +387,14 @@ mod tests {
         assert!(!same_public_ip(Some("68.234.75.68"), "204.248.122.44"));
         assert!(!same_public_ip(None, "204.248.122.44"));
         assert!(!same_public_ip(Some("204.248.122.44"), ""));
+    }
+
+    #[test]
+    fn a_private_resolved_address_is_lan() {
+        assert_eq!(path_label("192.168.0.231:21200".parse().unwrap()), "LAN");
+        assert_eq!(path_label("10.1.2.3:21200".parse().unwrap()), "LAN");
+        assert_eq!(path_label("172.16.0.4:21200".parse().unwrap()), "LAN");
+        assert_eq!(path_label("169.254.1.1:21200".parse().unwrap()), "LAN");
+        assert_eq!(path_label("203.0.113.8:21200".parse().unwrap()), "Internet");
     }
 }

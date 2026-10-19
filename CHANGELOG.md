@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.4
+
+A published 0.6.3 showed the Allow prompt before any password, so an unattended computer with a permanent password could not be reached. Desktop and server are 0.6.4. Android is 0.6.7. Install the server before the clients. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. On the server PC, in cloud\, run `cloud\deploy.cmd` so migrations 0008–0011 are applied before relying on installer display names. The PJDesk Server account sign-in stays persistent. No tag, no release, and no GitHub Actions.
+
+* The host answers first with what it requires, and does not show Allow yet. The client uses the saved password or asks once. A valid permanent password starts the session with no on-device prompt when password access is allowed. Unattended mode (Android: Use the permanent password) does the same for any valid password once a permanent password is set. Allow is shown only when the mode still requires a person, when you choose Ask the person instead, or when the computer has no permanent password.
+* A wrong permanent password is answered at once with Incorrect password for the ID. The password dialog opens again for a retype. A saved password that was wrong is removed, and the dialog says so. A right password never falls through to Allow.
+* Five wrong passwords from one source, or twenty from any mix of sources, within about 20 minutes lock password checks for about 20 minutes. While locked, the host says locked out, try again in N minutes, and the client shows that with the time left. A correct password clears that source. The lock follows the address the relay saw, or the controller's name when no address is available. Lockouts are written to the host log.
+* If nobody answers an Allow prompt, the client says No one at that computer answered the request. An explicit decline stays a decline.
+* A server address that resolves to a private LAN address is labeled LAN.
+* **Check for updates now** is in Settings → General → Updates, Settings → About, and the tray menu. It downloads the latest release, shows the progress, installs it, and opens PJDesk again. **Update all online computers** on the server tells every online client to do that immediately, including when automatic updates are off. Android Settings → About has **Check for updates**, which opens the latest APK. A server push opens that download on the phone too.
+
 ## 0.6.3
 
 The PJDesk Server window stays usable after an update without Administrator rights. Signing in on a client adds that computer to the account, and the sign-in checkbox starts checked so the visit does not stay on someone else's computer. Desktop and server are 0.6.3. Android is 0.6.6. Run `cloud\deploy.cmd` from your PC so migration `0011_saved_display_name.sql` is applied and the worker is deployed. Do that before expecting the installer name to sync. No tag, no release, and no GitHub Actions.

@@ -49,6 +49,7 @@ fun SettingsScreen(
     onComputerName: (String) -> Unit = {},
     tempIdleMinutes: Int = 30,
     onTempIdleMinutes: (Int) -> Unit = {},
+    onCheckUpdate: () -> Unit = {},
 ) {
     var server by rememberSaveable(state.server) { mutableStateOf(state.server) }
     var name by rememberSaveable(computerName) { mutableStateOf(computerName) }
@@ -151,7 +152,10 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.6", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.7", style = MaterialTheme.typography.titleMedium)
+            OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
+                Text("Check for updates")
+            }
             Text(
                 "Android host and controller. Video is H.264 Annex-B from the hardware encoder, the same stream the Windows client decodes with OpenH264. The server comes from your PJDesk account after you sign in.",
                 color = pjMuted(),

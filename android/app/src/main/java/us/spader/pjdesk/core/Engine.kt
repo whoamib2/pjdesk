@@ -1,6 +1,8 @@
 package us.spader.pjdesk.core
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -76,6 +78,17 @@ class Engine(context: Context) : EngineListener {
     )
 
     fun cancelPassword() = command("""{"cmd":"cancelPassword"}""")
+
+    fun checkForUpdate() {
+        update { it.copy(status = "Checking for updates…") }
+        command("""{"cmd":"checkUpdate"}""")
+    }
+
+    /** Ask the person at the other computer instead of sending a password. */
+    fun askPerson() {
+        update { it.copy(askPassword = false, askNote = "", status = "Asking the person at that computer") }
+        command("""{"cmd":"askPerson"}""")
+    }
 
     /** Blank clears the friendly name so other computers see the device name. */
     fun setDisplayName(name: String) {
@@ -266,15 +279,33 @@ class Engine(context: Context) : EngineListener {
                 if (text == "Ready" && (it.hosting || it.incoming != null || it.session != null)) it
                 else it.copy(status = text)
             }
+            "openUrl" -> {
+                val url = event.optString("url")
+                val text = event.optString("text").ifBlank { "Opening the download." }
+                update { it.copy(status = text, notice = text) }
+                if (url.startsWith("https://")) {
+                    val view = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    runCatching { app.startActivity(view) }.onFailure { failure ->
+                        update { it.copy(error = "Couldn't open the update: ${failure.message}") }
+                    }
+                }
+            }
             "needPassword" -> update {
                 it.copy(
                     askPassword = true,
                     askName = event.optString("name"),
                     askRejected = event.optBoolean("rejected"),
-                    error = if (event.optBoolean("rejected")) "That password was rejected." else it.error,
+                    askNote = event.optString("message"),
                 )
             }
-            "error" -> update { it.copy(error = event.optString("text"), askPassword = false) }
+            "clearSaved" -> {
+                val id = event.optString("id")
+                if (id.isNotBlank()) store.saveComputerPassword(id, "")
+            }
+            "error" -> update {
+                val text = event.optString("text")
+                it.copy(error = text, status = text, askPassword = false, askNote = "")
+            }
             "incoming" -> update {
                 it.copy(
                     incoming = IncomingCall(event.optString("name"), event.optString("ip")),

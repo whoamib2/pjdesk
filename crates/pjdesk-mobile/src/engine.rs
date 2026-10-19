@@ -10,8 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use pjdesk_link::admit::{self, Admit};
+use pjdesk_link::lockout::{self, Lockout};
 use pjdesk_link::p2p::{self, LinkPath};
-use pjdesk_link::session::{self, WrongPassword};
+use pjdesk_link::session::{self, grant_auth, refuse_auth, refuse_before_password, LockedOut, NeedsApproval, WrongPassword};
 use pjdesk_link::signal::{ServerAddr, SignalClient};
 use pjdesk_proto::auth::generate_password;
 use pjdesk_proto::framing::{read_msg, write_msg, MAX_CONTROL_FRAME};
@@ -33,7 +35,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.5";
+pub const APP_VERSION: &str = "0.6.7";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -91,7 +93,8 @@ struct State {
     /// Bumped to end the current session. The host registration keeps running.
     gen: AtomicU64,
     approval_tx: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
-    password_tx: Mutex<Option<oneshot::Sender<String>>>,
+    password_tx: Mutex<Option<oneshot::Sender<TypedAuth>>>,
+    lockout: Mutex<Lockout>,
     end_reason: Mutex<String>,
     control: Mutex<Option<mpsc::UnboundedSender<ControlMsg>>>,
     video: Mutex<Option<Arc<VideoOut>>>,
@@ -157,6 +160,7 @@ impl Engine {
             gen: AtomicU64::new(1),
             approval_tx: Mutex::new(None),
             password_tx: Mutex::new(None),
+            lockout: Mutex::new(Lockout::default()),
             end_reason: Mutex::new(String::new()),
             control: Mutex::new(None),
             video: Mutex::new(None),
@@ -387,12 +391,23 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         "submitPassword" => {
             let password = cmd.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if let Some(tx) = state.password_tx.lock().unwrap().take() {
-                let _ = tx.send(password);
+                let _ = tx.send(TypedAuth::Password(password));
             }
         }
         "cancelPassword" => {
             if let Some(tx) = state.password_tx.lock().unwrap().take() {
-                let _ = tx.send(String::new());
+                let _ = tx.send(TypedAuth::Cancel);
+            }
+        }
+        "checkUpdate" => {
+            let cb = cb.clone();
+            tokio::spawn(async move {
+                offer_android_update(&cb, false).await;
+            });
+        }
+        "askPerson" => {
+            if let Some(tx) = state.password_tx.lock().unwrap().take() {
+                let _ = tx.send(TypedAuth::AskPerson);
             }
         }
         "accept" => {
@@ -613,26 +628,25 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
                     }
                     ServerMsg::IncomingSession { session_id, token, udp_port, controller_name, controller_ip } => {
                         log_line(&cb, format!("incoming connection from {controller_name} ({controller_ip})"));
-                        let approved = match approve(&state, &cb, &controller_name, &controller_ip).await {
-                            Approval::Yes(bits) => bits,
-                            Approval::No(reason) => {
-                                log_line(&cb, format!("incoming connection refused: {reason}"));
-                                let _ = signal.send(ClientMsg::SessionResponse {
-                                    session_id,
-                                    accept: false,
-                                    reason,
-                                });
-                                continue;
-                            }
-                        };
-                        log_line(&cb, "incoming connection accepted, opening the media session");
+                        log_line(&cb, "incoming connection accepted, checking the password before any prompt");
                         signal.send(ClientMsg::SessionResponse { session_id, accept: true, reason: String::new() })?;
                         let (tx, rx) = mpsc::unbounded_channel();
                         let server_udp = SocketAddr::new(server_ip, udp_port);
                         let (state, cb, signal_tx) = (state.clone(), cb.clone(), signal.sender());
                         routes.insert(session_id, tx);
                         tokio::spawn(async move {
-                            let ended = host_session(state.clone(), cb.clone(), signal_tx, rx, session_id, token, server_udp, approved).await;
+                            let ended = host_session(
+                                state.clone(),
+                                cb.clone(),
+                                signal_tx,
+                                rx,
+                                session_id,
+                                token,
+                                server_udp,
+                                controller_name,
+                                controller_ip,
+                            )
+                            .await;
                             let reason = match &ended {
                                 Ok(()) => {
                                     let saved = state.end_reason.lock().unwrap().clone();
@@ -664,11 +678,58 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
                         let _ = signal.send(host_report(&state));
                         let _ = signal.send(display_name_report(&state));
                     }
-                    ServerMsg::Pong | ServerMsg::UpdateNow => {}
+                    ServerMsg::Pong => {}
+                    ServerMsg::UpdateNow => {
+                        log_line(&cb, "the server asked this phone to update");
+                        let cb = cb.clone();
+                        tokio::spawn(async move {
+                            offer_android_update(&cb, true).await;
+                        });
+                    }
                     _ => {}
                 }
             }
         }
+    }
+}
+
+async fn offer_android_update(cb: &Arc<dyn Callbacks>, from_server: bool) {
+    if from_server {
+        emit(cb, &json!({"event":"status","text":"The server asked this phone to update. Checking…"}));
+    } else {
+        emit(cb, &json!({"event":"status","text":"Checking for updates…"}));
+    }
+    let found = tokio::task::spawn_blocking(|| pjdesk_proto::update::check_android(pjdesk_proto::UPDATE_REPO, APP_VERSION)).await;
+    match found {
+        Ok(Ok(Some(update))) => {
+            emit(
+                cb,
+                &json!({
+                    "event": "openUrl",
+                    "url": update.installer_url,
+                    "text": format!("Downloading PJDesk {}", update.version),
+                }),
+            );
+        }
+        Ok(Ok(None)) => {
+            emit(cb, &json!({"event":"notice","text": format!("PJDesk {APP_VERSION} is up to date.")}));
+        }
+        Ok(Err(e)) => {
+            let message = format!("{e:#}");
+            if message.contains("no Android") {
+                emit(
+                    cb,
+                    &json!({
+                        "event": "openUrl",
+                        "url": "https://github.com/whoamib2/pjdesk/releases/latest",
+                        "text": "Opening the latest release. No APK was attached.",
+                    }),
+                );
+            } else {
+                emit(cb, &json!({"event":"error","text": format!("Could not check for updates: {message}")}));
+            }
+        }
+        Err(_) => emit(cb, &json!({"event":"error","text": "Could not check for updates."})),
     }
 }
 
@@ -693,21 +754,16 @@ enum Approval {
     No(String),
 }
 
+enum TypedAuth {
+    Password(String),
+    AskPerson,
+    Cancel,
+}
+
+const ASK_SLOT: u8 = 255;
+
 async fn approve(state: &State, cb: &Arc<dyn Callbacks>, name: &str, ip: &str) -> Approval {
     let policy = state.policy.lock().unwrap().clone();
-    let permanent = state.permanent.lock().unwrap().is_some();
-    let unattended_mode = state.approval.lock().unwrap().as_str() == "unattended";
-    let prompt = !unattended_mode || policy.force_prompt;
-    let restricted = grant(perms::UNATTENDED_DEFAULT, policy.max_permissions, false);
-    let unattended_ok = permanent && policy.unattended_allowed && !policy.force_prompt;
-    if !prompt {
-        return if unattended_ok {
-            log_line(cb, "accepting with the permanent password, without asking");
-            Approval::Yes(restricted)
-        } else {
-            Approval::No("unattended access is not allowed".into())
-        };
-    }
     let (tx, rx) = oneshot::channel();
     *state.approval_tx.lock().unwrap() = Some(tx);
     log_line(cb, format!("waiting for approval from {name}"));
@@ -720,20 +776,13 @@ async fn approve(state: &State, cb: &Arc<dyn Callbacks>, name: &str, ip: &str) -
         }),
     );
     // Long enough to cover the Allow button and the Android screen-share consent.
-    let answer = tokio::time::timeout(Duration::from_secs(90), rx).await;
+    let answer = tokio::time::timeout(Duration::from_secs(45), rx).await;
     *state.approval_tx.lock().unwrap() = None;
     match answer {
         Ok(Ok(Ok(()))) => Approval::Yes(grant(perms::KEYBOARD | perms::MOUSE, policy.max_permissions, false)),
         Ok(Ok(Err(reason))) => Approval::No(reason),
         Ok(Err(_)) => Approval::No("the approval prompt closed".into()),
-        Err(_) => {
-            if unattended_ok {
-                log_line(cb, "approval timed out; accepting with the permanent password");
-                Approval::Yes(restricted)
-            } else {
-                Approval::No("nobody approved the connection in time".into())
-            }
-        }
+        Err(_) => Approval::No(format!("No one at {} answered the request", state.hostname)),
     }
 }
 
@@ -746,7 +795,8 @@ async fn host_session(
     session_id: u64,
     token: [u8; 16],
     server_udp: SocketAddr,
-    ceiling: u32,
+    controller_name: String,
+    controller_ip: String,
 ) -> Result<()> {
     let gen = state.gen.load(Ordering::SeqCst);
     let binding = p2p::bind_udp(server_udp, session_id, token, Role::Host).await?;
@@ -763,18 +813,63 @@ async fn host_session(
     let targets = p2p::candidates(peer_public, &peer_local);
     let punching = p2p::spawn_punching(binding.punch_socket, targets, session_id, Duration::from_secs(8));
     let passwords = auth_passwords(&state);
+    let permanent = state.permanent.lock().unwrap().clone();
     log_line(
         &cb,
         format!("checking the password ({} slot{})", passwords.len(), if passwords.len() == 1 { "" } else { "s" }),
     );
-    let accepted = accept_authenticated(&endpoint, &passwords, &state.hostname).await;
+    let accepted = accept_authenticated(&state, &cb, &endpoint, &passwords, &state.hostname, server_udp.ip(), peer_public, &controller_ip, &controller_name).await;
     punching.abort();
-    let (connection, auth) = match accepted {
+    let (connection, mut auth) = match accepted {
         Ok(done) => done,
         Err(e) if e.is::<WrongPassword>() => bail!("Wrong password"),
         Err(e) => return Err(e),
     };
-    log_line(&cb, format!("password accepted for {}", auth.peer_name));
+    let source = lockout::source_key(
+        connection.remote_address().ip(),
+        Some(server_udp.ip()),
+        Some(peer_public.ip()),
+        controller_ip.parse().ok(),
+        &controller_name,
+    );
+    let ceiling = if auth.password_slot == ASK_SLOT {
+        match approve(&state, &cb, &controller_name, &controller_ip).await {
+            Approval::Yes(bits) => {
+                grant_auth(&mut auth.send, &state.hostname).await?;
+                bits
+            }
+            Approval::No(reason) => {
+                let _ = refuse_auth(&mut auth.send, &reason).await;
+                bail!(reason);
+            }
+        }
+    } else {
+        state.lockout.lock().unwrap().succeed(&source);
+        let matched = admit::matched_permanent(&passwords, auth.password_slot, permanent.as_deref());
+        let permanent_set = permanent.as_deref().map(str::trim).is_some_and(|p| !p.is_empty());
+        let approval = state.approval.lock().unwrap().clone();
+        let policy = state.policy.lock().unwrap().clone();
+        match admit::after_password(&approval, matched, permanent_set, &policy, false) {
+            Admit::Open(bits) => {
+                log_line(&cb, "accepting with the permanent password, without asking");
+                grant_auth(&mut auth.send, &state.hostname).await?;
+                bits
+            }
+            Admit::Ask => match approve(&state, &cb, &controller_name, &controller_ip).await {
+                Approval::Yes(bits) => {
+                    grant_auth(&mut auth.send, &state.hostname).await?;
+                    bits
+                }
+                Approval::No(reason) => {
+                    let _ = refuse_auth(&mut auth.send, &reason).await;
+                    bail!(reason);
+                }
+            },
+        }
+    };
+    if auth.password_slot != ASK_SLOT {
+        log_line(&cb, format!("password accepted for {}", auth.peer_name));
+    }
     if state.gen.load(Ordering::SeqCst) != gen {
         connection.close(0u32.into(), b"stopped");
         bail!("stopped");
@@ -1013,9 +1108,15 @@ fn special_index(cmd: SpecialCommand) -> u8 {
 }
 
 async fn accept_authenticated(
+    state: &Arc<State>,
+    cb: &Arc<dyn Callbacks>,
     endpoint: &quinn::Endpoint,
     passwords: &[String],
     my_name: &str,
+    relay_ip: std::net::IpAddr,
+    peer_public: SocketAddr,
+    controller_ip: &str,
+    controller_name: &str,
 ) -> Result<(quinn::Connection, session::Authenticated)> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let attempt_used = Arc::new(AtomicBool::new(false));
@@ -1031,14 +1132,53 @@ async fn accept_authenticated(
                     continue;
                 }
                 let (passwords, my_name, attempt_used) = (passwords.to_vec(), my_name.to_owned(), attempt_used.clone());
+                let (state, cb, controller_ip, controller_name) =
+                    (state.clone(), cb.clone(), controller_ip.to_string(), controller_name.to_string());
                 pending.spawn(async move {
                     let connection = incoming.await?;
-                    let auth = session::host_auth(&connection, &passwords, &my_name, &attempt_used).await?;
-                    Ok((connection, auth))
+                    let source = lockout::source_key(
+                        connection.remote_address().ip(),
+                        Some(relay_ip),
+                        Some(peer_public.ip()),
+                        controller_ip.parse().ok(),
+                        &controller_name,
+                    );
+                    let locked = state.lockout.lock().unwrap().check(&source, std::time::Instant::now());
+                    if locked.locked {
+                        log_line(&cb, format!("locked out {source} for {} minutes", locked.minutes));
+                        refuse_before_password(&connection, &lockout::message(locked.minutes)).await?;
+                        return Err(LockedOut { minutes: locked.minutes }.into());
+                    }
+                    let fail_state = state.clone();
+                    let fail_cb = cb.clone();
+                    let fail_source = source.clone();
+                    let fail = move || {
+                        let status = fail_state.lockout.lock().unwrap().fail(&fail_source, std::time::Instant::now());
+                        if status.fresh {
+                            let who = if status.global { "all connections" } else { fail_source.as_str() };
+                            log_line(&fail_cb, format!("locked out {who} for {} minutes after repeated wrong passwords", status.minutes));
+                        }
+                        if status.locked { lockout::message(status.minutes) } else { "wrong password".into() }
+                    };
+                    match session::host_auth(&connection, &passwords, &my_name, &attempt_used, &fail).await {
+                        Ok(auth) => Ok((connection, auth)),
+                        Err(e) if e.is::<NeedsApproval>() => {
+                            let wait = e.downcast::<NeedsApproval>().unwrap();
+                            Ok((connection, session::Authenticated {
+                                send: wait.send,
+                                recv: wait.recv,
+                                peer_name: wait.peer_name,
+                                peer_proto: wait.peer_proto,
+                                password_slot: ASK_SLOT,
+                            }))
+                        }
+                        Err(e) => Err(e),
+                    }
                 });
             }
             Some(joined) = pending.join_next(), if !pending.is_empty() => match joined {
                 Ok(Ok(done)) => return Ok(done),
+                Ok(Err(e)) if e.is::<LockedOut>() => return Err(e),
                 Ok(Err(e)) if e.is::<WrongPassword>() => {
                     attempt_used.store(false, Ordering::SeqCst);
                 }
@@ -1050,11 +1190,11 @@ async fn accept_authenticated(
     }
 }
 
-async fn wait_typed_password(state: &State) -> Result<String> {
+async fn wait_typed_password(state: &State) -> Result<TypedAuth> {
     let (tx, rx) = oneshot::channel();
     *state.password_tx.lock().unwrap() = Some(tx);
     match tokio::time::timeout(Duration::from_secs(90), rx).await {
-        Ok(Ok(password)) => Ok(password),
+        Ok(Ok(reply)) => Ok(reply),
         _ => {
             *state.password_tx.lock().unwrap() = None;
             bail!("the password was not entered in time");
@@ -1124,16 +1264,26 @@ async fn controller_session(
     let endpoint = p2p::controller_endpoint(binding.socket, fingerprint)?;
     let candidates = p2p::candidates(peer_public, &peer_local);
     let mut password = password.to_string();
+    let mut from_store = !password.is_empty();
     let mut rejected = false;
+    let mut note = String::new();
+    let mut ask_person = false;
     let (connection, path, auth) = loop {
-        if password.is_empty() {
+        if password.is_empty() && !ask_person {
             emit(
                 &cb,
-                &json!({"event":"needPassword","id": target, "name": host_name, "rejected": rejected}),
+                &json!({"event":"needPassword","id": target, "name": host_name, "rejected": rejected, "message": note}),
             );
-            password = wait_typed_password(&state).await?;
-            if password.is_empty() {
-                bail!("cancelled");
+            match wait_typed_password(&state).await? {
+                TypedAuth::Password(typed) => {
+                    if typed.is_empty() {
+                        bail!("cancelled");
+                    }
+                    password = typed;
+                    from_store = false;
+                }
+                TypedAuth::AskPerson => ask_person = true,
+                TypedAuth::Cancel => bail!("cancelled"),
             }
         }
         let punching = binding.punch_socket.try_clone().ok().map(|sock| {
@@ -1144,12 +1294,29 @@ async fn controller_session(
             punching.abort();
         }
         let (connection, path) = connected?;
-        match session::controller_auth(&connection, &password, &state.hostname).await {
+        let authed = if ask_person {
+            session::controller_ask_person(&connection, &state.hostname).await
+        } else {
+            session::controller_auth(&connection, &password, &state.hostname).await
+        };
+        match authed {
             Ok(auth) => break (connection, path, auth),
+            Err(e) if e.is::<LockedOut>() => {
+                connection.close(1u32.into(), b"locked out");
+                bail!(e.to_string());
+            }
             Err(e) if e.is::<WrongPassword>() => {
                 connection.close(1u32.into(), b"authentication failed");
+                let mut text = format!("Incorrect password for {}", format_id(target));
+                if from_store {
+                    emit(&cb, &json!({"event":"clearSaved","id": target}));
+                    text.push_str(". The saved password on this computer was cleared.");
+                }
+                note = text;
                 password.clear();
+                from_store = false;
                 rejected = true;
+                ask_person = false;
             }
             Err(e) => {
                 connection.close(1u32.into(), b"authentication failed");
@@ -1376,6 +1543,7 @@ mod tests {
             gen: AtomicU64::new(1),
             approval_tx: Mutex::new(None),
             password_tx: Mutex::new(None),
+            lockout: Mutex::new(Lockout::default()),
             end_reason: Mutex::new(String::new()),
             control: Mutex::new(None),
             video: Mutex::new(None),

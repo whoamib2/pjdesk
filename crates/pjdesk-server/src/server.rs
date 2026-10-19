@@ -1004,11 +1004,21 @@ async fn fleet_sync(state: Shared) {
         let mut st = state.lock().unwrap();
         for req in &updates {
             if req == "*" {
-                for h in st.online.values() {
+                info!("Update all online computers: asking {} client(s) to install the latest release", st.online.len());
+                for (id, h) in &st.online {
+                    info!(
+                        "Asking {} \"{}\" (v{}) to update now",
+                        format_id(id),
+                        h.hostname,
+                        h.app_version
+                    );
                     let _ = h.tx.send(ServerMsg::UpdateNow);
                 }
             } else if let Some(h) = st.online.get(req) {
+                info!("Asking {} \"{}\" (v{}) to update now", format_id(req), h.hostname, h.app_version);
                 let _ = h.tx.send(ServerMsg::UpdateNow);
+            } else {
+                info!("Update request for {} was not sent; that computer is not online", format_id(req));
             }
         }
         for id in &forgets {

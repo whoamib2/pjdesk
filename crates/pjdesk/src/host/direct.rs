@@ -14,9 +14,11 @@ use pjdesk_proto::discover::{self, LanBeacon};
 use pjdesk_proto::{DIRECT_PORT, DISCOVERY_PORT, PROTOCOL_VERSION};
 use tracing::{info, warn};
 
-use super::{approve, ctrl, stream, HostState};
+use pjdesk_link::session::{LockedOut, NeedsApproval};
+
+use super::{ctrl, stream, HostState, ASK_SLOT};
 use crate::p2p;
-use crate::session::{self, WrongPassword};
+use crate::session::{self, Authenticated, WrongPassword};
 
 pub async fn serve(state: Arc<HostState>) -> Result<()> {
     let socket = std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], DIRECT_PORT)))?;
@@ -36,6 +38,8 @@ pub async fn serve(state: Arc<HostState>) -> Result<()> {
             if let Err(e) = one(state, incoming).await {
                 if e.is::<WrongPassword>() {
                     warn!("Direct connection used a wrong password");
+                } else if e.is::<LockedOut>() {
+                    warn!("Direct connection locked out: {e}");
                 } else {
                     warn!("Direct connection ended: {e:#}");
                 }
@@ -49,13 +53,38 @@ async fn one(state: Arc<HostState>, incoming: quinn::Incoming) -> Result<()> {
     let connection = incoming.await?;
     let attempt = Arc::new(AtomicBool::new(false));
     let passwords = state.auth_passwords();
-    let auth = session::host_auth(&connection, &passwords, &state.name, &attempt).await?;
-    state.reset_failures();
+    let permanent = state.permanent.lock().unwrap().clone();
     let ip = connection.remote_address().to_string();
-    let Some((mut ceiling, receive_dir)) = approve(&state, &auth.peer_name, &ip).await else {
-        connection.close(3u32.into(), b"declined");
-        return Ok(());
+    let source = pjdesk_link::lockout::source_key(connection.remote_address().ip(), None, None, None, &ip);
+    let locked = state.lockout.lock().unwrap().check(&source, std::time::Instant::now());
+    if locked.locked {
+        state.log_lock(&source, &locked);
+        session::refuse_before_password(&connection, &pjdesk_link::lockout::message(locked.minutes)).await?;
+        anyhow::bail!("{}", pjdesk_link::lockout::message(locked.minutes));
+    }
+    let fail_state = state.clone();
+    let fail_source = source.clone();
+    let fail = move || fail_state.note_wrong_password(&fail_source);
+    let mut auth = match session::host_auth(&connection, &passwords, &state.name, &attempt, &fail).await {
+        Ok(auth) => auth,
+        Err(e) if e.is::<NeedsApproval>() => {
+            let wait = e.downcast::<NeedsApproval>().unwrap();
+            Authenticated {
+                send: wait.send,
+                recv: wait.recv,
+                peer_name: wait.peer_name,
+                peer_proto: wait.peer_proto,
+                password_slot: ASK_SLOT,
+            }
+        }
+        Err(e) => return Err(e),
     };
+    if auth.password_slot != ASK_SLOT {
+        state.note_success(&source);
+    }
+    let peer_name = auth.peer_name.clone();
+    let (mut ceiling, receive_dir) =
+        super::open_session(&state, &mut auth, &passwords, permanent.as_deref(), &peer_name, &ip).await?;
     if state.streaming.swap(true, Ordering::SeqCst) {
         connection.close(2u32.into(), b"another controller is already connected");
         return Ok(());

@@ -10,6 +10,8 @@ use pjdesk_proto::auth;
 use pjdesk_proto::framing::{read_msg, write_msg, MAX_CONTROL_FRAME};
 use pjdesk_proto::peer::AuthMsg;
 use pjdesk_proto::{protocol_ok, version_rejected, PROTOCOL_VERSION};
+
+use crate::lockout;
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::time::timeout;
 
@@ -25,6 +27,39 @@ impl fmt::Display for WrongPassword {
 
 impl std::error::Error for WrongPassword {}
 
+/// The host is refusing passwords for a while. The display text is
+/// `locked out, try again in N minutes`.
+#[derive(Debug)]
+pub struct LockedOut {
+    pub minutes: u32,
+}
+
+impl fmt::Display for LockedOut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&lockout::message(self.minutes))
+    }
+}
+
+impl std::error::Error for LockedOut {}
+
+/// The controller asked the host to prompt the person at the computer
+/// instead of checking a password. The host has not sent a verdict yet.
+#[derive(Debug)]
+pub struct NeedsApproval {
+    pub send: SendStream,
+    pub recv: RecvStream,
+    pub peer_name: String,
+    pub peer_proto: u16,
+}
+
+impl fmt::Display for NeedsApproval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the controller asked the person at this computer")
+    }
+}
+
+impl std::error::Error for NeedsApproval {}
+
 /// The authenticated control stream plus the peer's display name.
 pub struct Authenticated {
     pub send: SendStream,
@@ -32,6 +67,8 @@ pub struct Authenticated {
     pub peer_name: String,
     /// Protocol version the peer offered. Version 2 is the 0.3.x session.
     pub peer_proto: u16,
+    /// Which host password matched. 0 is the one-time password; 1 is the permanent password.
+    pub password_slot: u8,
 }
 
 /// TLS keying material unique to this QUIC connection (channel binding).
@@ -47,6 +84,51 @@ fn channel_binding(connection: &Connection) -> Result<[u8; 32]> {
 /// permanent and one-time passwords. The controller uses its single typed
 /// password in every slot; the host tests one of its passwords per slot.
 const AUTH_SLOTS: usize = 2;
+/// Long enough for an Allow prompt. A password verdict still returns as soon
+/// as the host sends it.
+const VERDICT_WAIT: Duration = Duration::from_secs(90);
+
+fn auth_refusal(message: &str) -> anyhow::Error {
+    if let Some(minutes) = lockout::parse_minutes(message) {
+        return LockedOut { minutes }.into();
+    }
+    if message == "wrong password" || message.starts_with("wrong password") {
+        return WrongPassword.into();
+    }
+    anyhow!("{}", message)
+}
+
+async fn read_refusal(recv: &mut RecvStream) -> Option<String> {
+    match timeout(Duration::from_secs(2), read_msg::<_, AuthMsg>(recv, MAX_CONTROL_FRAME)).await {
+        Ok(Ok(AuthMsg::Result { ok: false, message, .. })) => Some(message),
+        _ => None,
+    }
+}
+
+/// Tells the controller the password was accepted and the session may start.
+pub async fn grant_auth(send: &mut SendStream, host_name: &str) -> Result<()> {
+    write_msg(send, &AuthMsg::Result { ok: true, message: String::new(), host_name: host_name.into() }).await?;
+    Ok(())
+}
+
+pub async fn refuse_auth(send: &mut SendStream, message: &str) -> Result<()> {
+    write_msg(send, &AuthMsg::Result { ok: false, message: message.to_string(), host_name: String::new() }).await?;
+    let _ = send.finish();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Ok(())
+}
+
+/// Answers a controller that has already opened the auth stream, without
+/// checking a password. Used while the source is locked out.
+pub async fn refuse_before_password(connection: &Connection, message: &str) -> Result<()> {
+    let (mut send, mut recv) = timeout(Duration::from_secs(10), connection.accept_bi())
+        .await
+        .context("the controller did not start authentication")??;
+    let _ = timeout(Duration::from_secs(10), read_msg::<_, AuthMsg>(&mut recv, MAX_CONTROL_FRAME))
+        .await
+        .context("the controller did not start authentication")??;
+    refuse_auth(&mut send, message).await
+}
 
 /// Controller side: prove we know one of the host's passwords.
 pub async fn controller_auth(connection: &Connection, password: &str, my_name: &str) -> Result<Authenticated> {
@@ -72,7 +154,7 @@ pub async fn controller_auth_version(
     }
     write_msg(&mut send, &AuthMsg::Start { proto, spakes, controller_name: my_name.into() }).await?;
 
-    let reply: AuthMsg = timeout(Duration::from_secs(15), read_msg(&mut recv, MAX_CONTROL_FRAME))
+    let reply: AuthMsg = timeout(VERDICT_WAIT, read_msg(&mut recv, MAX_CONTROL_FRAME))
         .await
         .context("the host did not answer")??;
     let (host_spakes, host_confirms) = match reply {
@@ -81,7 +163,7 @@ pub async fn controller_auth_version(
             if version_rejected(&message) {
                 bail!(message);
             }
-            bail!("the host refused the connection: {message}");
+            return Err(auth_refusal(&message));
         }
         other => bail!("unexpected message from the host: {other:?}"),
     };
@@ -103,22 +185,49 @@ pub async fn controller_auth_version(
     let (slot, key) = match matched {
         Some(m) => m,
         None => {
-            // Tell the host (so it counts the failed attempt), then give up.
+            // Tell the host (so it counts the failed attempt), then read its
+            // verdict. A lockout is not reported as a wrong password.
             let _ = write_msg(&mut send, &AuthMsg::Confirm { slot: 0xFF, confirm: [0; 32] }).await;
-            let _ = send.finish();
+            if let Some(message) = read_refusal(&mut recv).await {
+                return Err(auth_refusal(&message));
+            }
             return Err(WrongPassword.into());
         }
     };
     write_msg(&mut send, &AuthMsg::Confirm { slot: slot as u8, confirm: key.controller_confirm(&binding) }).await?;
 
-    let verdict: AuthMsg = timeout(Duration::from_secs(15), read_msg(&mut recv, MAX_CONTROL_FRAME))
+    let verdict: AuthMsg = timeout(VERDICT_WAIT, read_msg(&mut recv, MAX_CONTROL_FRAME))
         .await
         .context("the host did not answer")??;
     match verdict {
-        AuthMsg::Result { ok: true, host_name, .. } => {
-            Ok(Authenticated { send, recv, peer_name: host_name, peer_proto: proto })
-        }
-        AuthMsg::Result { ok: false, message, .. } => bail!("the host refused the connection: {message}"),
+        AuthMsg::Result { ok: true, host_name, .. } => Ok(Authenticated {
+            send,
+            recv,
+            peer_name: host_name,
+            peer_proto: proto,
+            password_slot: slot as u8,
+        }),
+        AuthMsg::Result { ok: false, message, .. } => Err(auth_refusal(&message)),
+        other => bail!("unexpected message from the host: {other:?}"),
+    }
+}
+
+/// Ask the person at the host instead of sending a password.
+pub async fn controller_ask_person(connection: &Connection, my_name: &str) -> Result<Authenticated> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_msg(&mut send, &AuthMsg::AskPerson { proto: PROTOCOL_VERSION, controller_name: my_name.into() }).await?;
+    let verdict: AuthMsg = timeout(VERDICT_WAIT, read_msg(&mut recv, MAX_CONTROL_FRAME))
+        .await
+        .context("the host did not answer")??;
+    match verdict {
+        AuthMsg::Result { ok: true, host_name, .. } => Ok(Authenticated {
+            send,
+            recv,
+            peer_name: host_name,
+            peer_proto: PROTOCOL_VERSION,
+            password_slot: 0,
+        }),
+        AuthMsg::Result { ok: false, message, .. } => Err(auth_refusal(&message)),
         other => bail!("unexpected message from the host: {other:?}"),
     }
 }
@@ -131,8 +240,9 @@ pub async fn controller_auth_version(
 pub async fn host_auth(
     connection: &Connection,
     passwords: &[String],
-    my_name: &str,
+    _my_name: &str,
     attempt_used: &AtomicBool,
+    failure_message: &(dyn Fn() -> String + Sync),
 ) -> Result<Authenticated> {
     let (mut send, mut recv) = timeout(Duration::from_secs(10), connection.accept_bi())
         .await
@@ -141,6 +251,17 @@ pub async fn host_auth(
         .await
         .context("the controller did not start authentication")??;
     let (proto, controller_spakes, controller_name) = match start {
+        AuthMsg::AskPerson { proto, controller_name } => {
+            if !protocol_ok(proto) {
+                let message = format!("version mismatch (host speaks protocol {PROTOCOL_VERSION}, controller {proto})");
+                let _ = refuse_auth(&mut send, &message).await;
+                bail!(message);
+            }
+            if attempt_used.swap(true, Ordering::SeqCst) {
+                bail!("only one password attempt is allowed per connection request");
+            }
+            return Err(NeedsApproval { send, recv, peer_name: controller_name, peer_proto: proto }.into());
+        }
         AuthMsg::Start { proto, spakes, controller_name } => (proto, spakes, controller_name),
         other => bail!("unexpected message from the controller: {other:?}"),
     };
@@ -184,16 +305,13 @@ pub async fn host_auth(
             _ => return Err(WrongPassword.into()),
         };
     if slot >= keys.len() || !keys[slot].verify_controller(&binding, &confirm) {
-        let _ = write_msg(
-            &mut send,
-            &AuthMsg::Result { ok: false, message: "wrong password".into(), host_name: String::new() },
-        )
-        .await;
-        let _ = send.finish();
-        // Give the message a moment to be delivered before the connection drops.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        return Err(WrongPassword.into());
+        let message = failure_message();
+        let _ = refuse_auth(&mut send, &message).await;
+        // A lockout is its own result. The password was not accepted, and the
+        // caller must not fall through to an Allow prompt.
+        return Err(auth_refusal(&message));
     }
-    write_msg(&mut send, &AuthMsg::Result { ok: true, message: String::new(), host_name: my_name.into() }).await?;
-    Ok(Authenticated { send, recv, peer_name: controller_name, peer_proto })
+    // The caller sends the success verdict after it decides whether to ask
+    // the person at this computer. A wrong password has already been answered.
+    Ok(Authenticated { send, recv, peer_name: controller_name, peer_proto, password_slot: slot as u8 })
 }
