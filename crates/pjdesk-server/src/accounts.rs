@@ -1,5 +1,7 @@
-//! Server accounts: usernames, Argon2 password hashes, login tokens and each
-//! account's address book.
+//! Older local accounts: usernames, Argon2 password hashes, login tokens and
+//! each account's address book. A new server does not need any of these. The
+//! server sign-in is the PJDesk account, and network access follows that
+//! account. Entries already in `accounts.json` still sign in.
 //!
 //! Everything lives under the server data folder (locked to SYSTEM and
 //! Administrators when installed as a service):

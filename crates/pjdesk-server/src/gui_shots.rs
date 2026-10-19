@@ -111,6 +111,35 @@ fn server_shots() {
         image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
         eprintln!("wrote {}", path.display());
     }
+    for (name, theme) in [("server-account-dark", egui::Theme::Dark), ("server-account-light", egui::Theme::Light)] {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(960.0, 320.0))
+            .with_pixels_per_point(1.0)
+            .with_theme(theme)
+            .wgpu()
+            .build_eframe(move |cc| {
+                let mut app = preview(cc, false, false);
+                app.preview_account = true;
+                let theme_name = match theme {
+                    egui::Theme::Light => "light",
+                    egui::Theme::Dark => "dark",
+                };
+                crate::ui_theme::apply(&cc.egui_ctx, theme_name);
+                if let Some(cloud) = app.cloud.as_mut() {
+                    cloud.account = "ben@spader.us".into();
+                    cloud.role = "active".into();
+                    cloud.active_name = "BENLENOVODESK".into();
+                    cloud.peer_name.clear();
+                    cloud.peer_role = "standby".into();
+                }
+                app
+            });
+        harness.step();
+        let image = harness.render().unwrap_or_else(|e| panic!("render {name}: {e}"));
+        let path = dir.join(format!("{name}.png"));
+        image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
+        eprintln!("wrote {}", path.display());
+    }
 }
 
 fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -> App {
@@ -131,7 +160,10 @@ fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -
         .unwrap();
         std::fs::write(
             dir.join("server-update-status.json"),
-            format!(r#"{{"last_check_at":{},"last_result":"Up to date","available":"","error":""}}"#, now.saturating_sub(120)),
+            format!(
+                r#"{{"last_check_at":{},"last_result":"Up to date","available":"","error":""}}"#,
+                now.saturating_sub(120)
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -171,7 +203,8 @@ fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -
             version: env!("CARGO_PKG_VERSION").into(),
             port: 21200,
             service_running: true,
-            fingerprint: "7f:3a:9c:11:b2:44:e0:8d:6c:15:aa:90:33:de:71:04:58:c6:2b:f9:17:ab:63:d0:4e:88:21:5c:b7:0a:66:d4".into(),
+            fingerprint:
+                "7f:3a:9c:11:b2:44:e0:8d:6c:15:aa:90:33:de:71:04:58:c6:2b:f9:17:ab:63:d0:4e:88:21:5c:b7:0a:66:d4".into(),
             fingerprint_known: true,
             update_auto: true,
             update_known: true,

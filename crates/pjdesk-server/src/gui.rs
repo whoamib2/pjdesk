@@ -1,10 +1,14 @@
 //! The PJDesk Server management window (what you get by double-clicking
-//! `pjdesk-server.exe`): service control, the server key fingerprint, user
-//! accounts and registered devices, and a tail of the log.
+//! `pjdesk-server.exe`): one PJDesk account sign-in, service control, the
+//! server key fingerprint, registered devices, and a tail of the log.
 //!
-//! Account and service changes need Administrator rights (the data folder is
-//! locked to SYSTEM and Administrators), so when the window can't write there
-//! it offers to relaunch elevated.
+//! That PJDesk account is Cloud Sync, the active or standby role, and My
+//! network. Older local accounts in `accounts.json` still work, and a new
+//! server does not need them. Install, stop, and uninstall need a Windows
+//! administrator. Saving settings needs that same write access to the data
+//! folder (SYSTEM and Administrators) and the signed-in PJDesk account. There
+//! is no separate PJDesk password. When the window can't write the folder it
+//! offers to relaunch elevated.
 
 // The window is the Windows entry point. Linux compiles it for headless shots.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -75,6 +79,8 @@ struct App {
     new_user: String,
     new_pass: String,
     new_admin: bool,
+    /// The optional form for an older local account. Hidden until opened.
+    legacy_add: bool,
     last_refresh: std::time::Instant,
     tray: Option<crate::tray::Tray>,
     really_quit: bool,
@@ -104,6 +110,8 @@ struct App {
     preview_network: bool,
     /// Headless shot of the network-key dialog.
     preview_netkey: bool,
+    /// Headless shot of the PJDesk account card.
+    preview_account: bool,
     nk_open: bool,
     nk_passphrase_mode: bool,
     nk_pass: String,
@@ -138,7 +146,12 @@ enum JobDone {
     /// Own bucket: it already holds a copy; ask before replacing it.
     BucketOccupied,
     /// PJDesk account: it holds another server's copy; ask which way to go.
-    Ask { cfg: crate::cloud::CloudConfig, from: String, written_at: u64, readable: bool },
+    Ask {
+        cfg: crate::cloud::CloudConfig,
+        from: String,
+        written_at: u64,
+        readable: bool,
+    },
 }
 
 type CloudJobResult = Result<JobDone, String>;
@@ -172,13 +185,17 @@ enum CloudAct {
     Choose(crate::cloud::Choice),
     CancelAsk,
     CreateAccount,
-    Setup { replace: bool },
+    Setup {
+        replace: bool,
+    },
     Join,
     SyncNow,
     Promote,
     Demote,
     CopyCode,
     Off,
+    /// Sign out, then offer the sign-in form for a different PJDesk account.
+    Switch,
     SignInAgain,
 }
 
@@ -202,6 +219,7 @@ impl App {
             new_user: String::new(),
             new_pass: String::new(),
             new_admin: false,
+            legacy_add: false,
             last_refresh: std::time::Instant::now(),
             tray: crate::tray::Tray::new(&cc.egui_ctx),
             really_quit: false,
@@ -222,6 +240,7 @@ impl App {
             preview_devices: false,
             preview_network: false,
             preview_netkey: false,
+            preview_account: false,
             nk_open: false,
             nk_passphrase_mode: true,
             nk_pass: String::new(),
@@ -262,7 +281,9 @@ impl App {
     }
 
     fn start_address_guess(&mut self) {
-        if self.pub_guess_rx.is_some() || crate::public_addr::load(&self.data_dir).is_some_and(|saved| !saved.address.trim().is_empty()) {
+        if self.pub_guess_rx.is_some()
+            || crate::public_addr::load(&self.data_dir).is_some_and(|saved| !saved.address.trim().is_empty())
+        {
             return;
         }
         let dir = self.data_dir.clone();
@@ -374,7 +395,11 @@ impl eframe::App for App {
             }
         }
         let ctx = ui.ctx().clone();
-        ctx.request_repaint_after(if self.waiting_for_service() { Duration::from_millis(50) } else { Duration::from_secs(1) });
+        ctx.request_repaint_after(if self.waiting_for_service() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(1)
+        });
         self.poll_cloud_job();
         self.poll_netkey();
         self.poll_release();
@@ -439,7 +464,14 @@ impl eframe::App for App {
             let (installed, running) = self.service_state();
             let (role, epoch, who, available, last_result, hosts) = if self.access != Access::Readable {
                 if let Some(s) = &self.live {
-                    (s.role.clone(), s.epoch, s.active_name.clone(), s.update_available.clone(), s.last_result.clone(), self.online.len())
+                    (
+                        s.role.clone(),
+                        s.epoch,
+                        s.active_name.clone(),
+                        s.update_available.clone(),
+                        s.last_result.clone(),
+                        self.online.len(),
+                    )
                 } else {
                     (String::new(), 0, String::new(), String::new(), String::new(), 0)
                 }
@@ -479,7 +511,7 @@ impl eframe::App for App {
                     card(ui, |ui| {
                         ui.horizontal(|ui| {
                             glyph(ui, Icon::Alert, p(ui).warn);
-                            ui.label("Running without Administrator rights. You can look, and changing accounts or the service needs an administrator.");
+                            ui.label("Running without Administrator rights. You can look. Install, stop, and uninstall need a Windows administrator. PJDesk settings use the signed-in account once this window can write the data folder. There is no separate PJDesk password.");
                         });
                         ui.add_space(8.0);
                         if ui_widgets::accent_button(ui, "Restart as administrator") && run_elevated(&[]) {
@@ -501,6 +533,11 @@ impl eframe::App for App {
                     self.network_card(ui);
                     return;
                 }
+                self.account_card(ui);
+                if self.preview_account {
+                    return;
+                }
+                ui.add_space(8.0);
                 self.service_card(ui);
                 ui.add_space(8.0);
                 self.network_card(ui);
@@ -548,10 +585,16 @@ impl App {
         use crate::self_update::{self, Settings};
         let mut settings = Settings::load(&self.data_dir);
         let reported = self_update::UpdateStatus::load(&self.data_dir);
+        let may_edit = self.may_edit_settings();
         card(ui, |ui| {
             heading(ui, "UPDATES");
             let mut auto = settings.auto;
-            if ui_widgets::checkbox(ui, &mut auto, "Install server updates automatically") {
+            let auto_changed = ui
+                .add_enabled_ui(may_edit, |ui| {
+                    ui_widgets::checkbox(ui, &mut auto, "Install server updates automatically")
+                })
+                .inner;
+            if auto_changed {
                 settings.auto = auto;
                 settings.save(&self.data_dir);
                 match self_update::set_task(&self.data_dir, auto) {
@@ -575,19 +618,37 @@ impl App {
                 .size(11.0),
             );
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Maintenance window");
-                ui.add(egui::TextEdit::singleline(&mut self.update_start).hint_text("any time").desired_width(70.0));
-                ui.label("to");
-                ui.add(egui::TextEdit::singleline(&mut self.update_end).hint_text("HH:MM").desired_width(70.0));
-                if ui.button("Save").clicked() {
-                    self.status = match self_update::set_window(&self.data_dir, &self.update_start, &self.update_end) {
-                        Ok(()) => "Saved the maintenance window. Leave both blank for any time.".into(),
-                        Err(e) => format!("{e}"),
-                    };
-                }
+            ui.add_enabled_ui(may_edit, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Maintenance window");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.update_start).hint_text("any time").desired_width(70.0),
+                    );
+                    ui.label("to");
+                    ui.add(egui::TextEdit::singleline(&mut self.update_end).hint_text("HH:MM").desired_width(70.0));
+                    if ui.button("Save").clicked() {
+                        self.status =
+                            match self_update::set_window(&self.data_dir, &self.update_start, &self.update_end) {
+                                Ok(()) => "Saved the maintenance window. Leave both blank for any time.".into(),
+                                Err(e) => format!("{e}"),
+                            };
+                    }
+                });
             });
-            ui.label(RichText::new("Local time. Leave both blank to install at any time.").color(p(ui).muted).size(11.0));
+            if !may_edit {
+                ui.label(
+                    RichText::new(if !self.can_write {
+                        "Restart as administrator to save this. Windows protects the data folder. There is no separate PJDesk password."
+                    } else {
+                        "Sign in with your PJDesk account above to change this. There is no separate server password."
+                    })
+                    .color(p(ui).muted)
+                    .size(12.0),
+                );
+            }
+            ui.label(
+                RichText::new("Local time. Leave both blank to install at any time.").color(p(ui).muted).size(11.0),
+            );
             ui.add_space(4.0);
             let checked = if reported.last_check_at == 0 {
                 "Last check: never".to_string()
@@ -614,7 +675,9 @@ impl App {
                         let _ = self_update::check_now(&dir);
                     });
                 }
-                if !reported.available.is_empty() && ui.add(egui::Button::new("Install this update").fill(p(ui).accent)).clicked() {
+                if !reported.available.is_empty()
+                    && ui.add(egui::Button::new("Install this update").fill(p(ui).accent)).clicked()
+                {
                     let dir = self.data_dir.clone();
                     self.status = "Installing the update…".into();
                     std::thread::spawn(move || {
@@ -641,7 +704,8 @@ impl App {
                 ui_widgets::dot(ui, c);
                 ui.label(t);
             });
-            let version = self.live.as_ref().map(|s| s.version.clone()).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+            let version =
+                self.live.as_ref().map(|s| s.version.clone()).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
             ui.label(RichText::new(format!("This server  v{version}")).strong().size(18.0).color(p(ui).text));
             if let Some(peer) = self.peer_version_line() {
                 ui.label(RichText::new(peer).color(p(ui).muted));
@@ -665,6 +729,11 @@ impl App {
                     }
                 }
             });
+            ui.label(
+                RichText::new("Install, stop, and uninstall need a Windows administrator.")
+                    .color(p(ui).muted)
+                    .size(11.0),
+            );
             ui.add_space(8.0);
             let mut tray_login = crate::tray::login_enabled();
             if ui_widgets::checkbox(ui, &mut tray_login, "Start tray at Windows sign-in") {
@@ -693,7 +762,11 @@ impl App {
                     }
                 }
             });
-            ui.label(RichText::new("Clients pin this on first connect; compare it when setting up a new computer.").color(p(ui).muted).size(11.0));
+            ui.label(
+                RichText::new("Clients pin this on first connect; compare it when setting up a new computer.")
+                    .color(p(ui).muted)
+                    .size(11.0),
+            );
         });
 
         if let Some(action) = action {
@@ -765,7 +838,11 @@ impl App {
             ui.add_enabled_ui(false, |ui| {
                 ui_widgets::checkbox(ui, &mut auto, "Install server updates automatically");
             });
-            ui.label(RichText::new("Shown from the running service. Restart as administrator to change it.").color(p(ui).muted).size(12.0));
+            ui.label(
+                RichText::new("Shown from the running service. Restart as administrator to change it.")
+                    .color(p(ui).muted)
+                    .size(12.0),
+            );
             if !snap.window_start.is_empty() || !snap.window_end.is_empty() {
                 ui.label(format!("Maintenance window {} to {}", snap.window_start, snap.window_end));
             }
@@ -803,25 +880,31 @@ impl App {
             }
             ui.horizontal(|ui| {
                 let (color, text) = if snap.role == "active" {
-                    let who = if snap.active_name.is_empty() { "this server".to_string() } else { snap.active_name.clone() };
+                    let who =
+                        if snap.active_name.is_empty() { "this server".to_string() } else { snap.active_name.clone() };
                     (p(ui).ok, format!("Primary: {who} uploads to the cloud (generation {}).", snap.epoch))
                 } else {
-                    let who = if snap.active_name.is_empty() { "the other server".to_string() } else { snap.active_name.clone() };
+                    let who = if snap.active_name.is_empty() {
+                        "the other server".to_string()
+                    } else {
+                        snap.active_name.clone()
+                    };
                     (p(ui).accent, format!("Standby. Primary: {who} (generation {}).", snap.epoch))
                 };
                 ui_widgets::dot(ui, color);
                 ui.label(text);
             });
-            if !snap.account.is_empty() {
-                ui.label(RichText::new(format!("Signed in as {}", snap.account)).color(p(ui).text).size(14.0));
-            }
             if !snap.notice.is_empty() {
                 ui.colored_label(p(ui).warn, &snap.notice);
             }
             if !snap.cloud_error.is_empty() {
                 ui.colored_label(p(ui).warn, &snap.cloud_error);
             }
-            ui.label(RichText::new("Shown from the running service. Restart as administrator to change cloud sync.").color(p(ui).muted).size(12.0));
+            ui.label(
+                RichText::new("Shown from the running service. Restart as administrator to change cloud sync.")
+                    .color(p(ui).muted)
+                    .size(12.0),
+            );
         });
     }
 
@@ -836,21 +919,279 @@ impl App {
         }
     }
 
+    /// Email of the PJDesk account this server is signed in as.
+    fn signed_in_email(&self) -> String {
+        if let Some(cloud) = &self.cloud {
+            if !cloud.account.is_empty() {
+                return cloud.account.clone();
+            }
+        }
+        if self.access == Access::Readable {
+            if let Some(cfg) = crate::cloud::CloudConfig::load(&self.data_dir) {
+                if cfg.is_account() && !cfg.email.is_empty() {
+                    return cfg.email;
+                }
+            }
+        }
+        self.live.as_ref().map(|s| s.account.clone()).filter(|s| !s.is_empty()).unwrap_or_default()
+    }
+
+    /// True when Cloud Sync is the advanced "your own bucket" path.
+    fn using_own_bucket(&self) -> bool {
+        self.access == Access::Readable
+            && self.cloud_on
+            && crate::cloud::CloudConfig::load(&self.data_dir).is_some_and(|cfg| !cfg.is_account())
+    }
+
+    /// PJDesk settings save when this window can write the data folder and a
+    /// PJDesk account (or an own-bucket sync) is signed in. No second password.
+    fn may_edit_settings(&self) -> bool {
+        self.can_write && (!self.signed_in_email().is_empty() || self.using_own_bucket())
+    }
+
+    fn account_role_line(&self) -> String {
+        let (role, active_name, peer_name) = if let Some(s) = &self.cloud {
+            if !s.role.is_empty() {
+                (s.role.clone(), s.active_name.clone(), s.peer_name.clone())
+            } else if let Some(live) = &self.live {
+                (live.role.clone(), live.active_name.clone(), live.peer_name.clone())
+            } else {
+                return String::new();
+            }
+        } else if let Some(live) = &self.live {
+            (live.role.clone(), live.active_name.clone(), live.peer_name.clone())
+        } else {
+            return String::new();
+        };
+        if role.is_empty() {
+            return String::new();
+        }
+        if role == "standby" {
+            let who = if active_name.is_empty() { "the other server".to_string() } else { active_name };
+            return format!("Standby of this account. Primary: {who}. Same account, no join code.");
+        }
+        let who = if active_name.is_empty() { "this server".to_string() } else { active_name };
+        if peer_name.is_empty() {
+            format!(
+                "Primary: {who}. A second server that signs in with this account becomes the standby. No join code."
+            )
+        } else {
+            format!("Primary: {who}. Standby: {peer_name}. Same account, no join code.")
+        }
+    }
+
+    fn account_card(&mut self, ui: &mut egui::Ui) {
+        let email = self.signed_in_email();
+        let own_bucket = self.using_own_bucket();
+        let role_line = self.account_role_line();
+        let mut act: Option<CloudAct> = None;
+        let busy = self.cloud_job.is_some();
+        let can_write = self.can_write;
+        let readable = self.access == Access::Readable;
+        let choosing_bucket = self.cloud_form.own_bucket;
+        card(ui, |ui| {
+            heading(ui, "PJDESK ACCOUNT");
+            if !readable {
+                if email.is_empty() {
+                    ui.label("Not signed in.");
+                } else {
+                    ui.label(RichText::new(format!("Signed in as {email}")).strong().size(18.0).color(p(ui).text));
+                    if !role_line.is_empty() {
+                        ui.label(&role_line);
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "You can look. Signing out, and saving PJDesk settings, needs this window to write the data folder. Restart as administrator for that. There is no separate PJDesk password.",
+                    )
+                    .color(p(ui).muted)
+                    .size(12.0),
+                );
+                return;
+            }
+            if own_bucket {
+                ui.label("This server uses your own bucket. A join code is only for that path.");
+                ui.label(
+                    RichText::new(
+                        "A PJDesk account is the sign-in for Cloud Sync, the active or standby role, and My network. The other server uses the same account and does not need a join code.",
+                    )
+                    .color(p(ui).muted)
+                    .size(12.0),
+                );
+                return;
+            }
+            if choosing_bucket {
+                ui.label("Join codes are only for your own bucket, under Cloud Sync below.");
+                ui.label(
+                    RichText::new("A PJDesk account does not need a join code. The other server signs in with the same account and becomes the standby.")
+                        .color(p(ui).muted)
+                        .size(12.0),
+                );
+                return;
+            }
+            if !email.is_empty() && self.cloud_on {
+                ui.label(RichText::new(format!("Signed in as {email}")).strong().size(20.0).color(p(ui).text));
+                if !role_line.is_empty() {
+                    ui.add_space(2.0);
+                    ui.label(&role_line);
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "This one login is Cloud Sync and backup, this server's active or standby role, and My network (the address, the key fingerprint, and the slot). Allowed accounts and Require signed-in accounts follow this account. There is no separate server password.",
+                    )
+                    .color(p(ui).muted)
+                    .size(12.0),
+                );
+                ui.add_space(8.0);
+                ui.add_enabled_ui(can_write && !busy, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Sign out")
+                            .on_hover_text("Sign this server out of PJDesk Cloud. The cloud copy is kept.")
+                            .clicked()
+                        {
+                            act = Some(CloudAct::Off);
+                        }
+                        if ui
+                            .button("Switch account")
+                            .on_hover_text("Sign out, then sign in with a different PJDesk account.")
+                            .clicked()
+                        {
+                            act = Some(CloudAct::Switch);
+                        }
+                    });
+                });
+                if !can_write {
+                    ui.label(
+                        RichText::new("Restart as administrator to sign out. Windows protects the saved sign-in.")
+                            .color(p(ui).muted)
+                            .size(12.0),
+                    );
+                }
+                return;
+            }
+            ui.label(
+                RichText::new(
+                    "Sign in once with your PJDesk account (the same login as pjdesk.com). That is Cloud Sync and backup, this server's role, and My network. A second server with the same account becomes the standby. No join code, and no separate server password.",
+                )
+                .color(p(ui).muted)
+                .size(12.0),
+            );
+            ui.add_space(6.0);
+            let online = self.online.len();
+            ui.add_enabled_ui(can_write && !busy, |ui| {
+                let f = &mut self.cloud_form;
+                if let Some((from, written_at, readable_copy)) = f.ask.clone() {
+                    if readable_copy {
+                        let when = format_local(written_at);
+                        ui.colored_label(
+                            p(ui).warn,
+                            format!("This account already holds {from}'s data (from {when}), and {online} computer(s) are connected to this server."),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(egui::Button::new("Use this server as the standby").fill(p(ui).accent))
+                                .on_hover_text(format!("This server takes {from}'s key, accounts and computer list, and stays on standby. No join code."))
+                                .clicked()
+                            {
+                                act = Some(CloudAct::Choose(crate::cloud::Choice::Join));
+                            }
+                            if ui.button("Use this server's data").on_hover_text("Replace the copy in the cloud with this server's data").clicked() {
+                                act = Some(CloudAct::Choose(crate::cloud::Choice::Replace));
+                            }
+                            if ui.button("Cancel").clicked() {
+                                act = Some(CloudAct::CancelAsk);
+                            }
+                        });
+                    } else {
+                        ui.colored_label(p(ui).warn, "This account's cloud copy was made with an older password, so it can't be opened.");
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new("Upload this server's data").fill(p(ui).accent)).clicked() {
+                                act = Some(CloudAct::Choose(crate::cloud::Choice::Replace));
+                            }
+                            if ui.button("Cancel").clicked() {
+                                act = Some(CloudAct::CancelAsk);
+                            }
+                        });
+                    }
+                } else {
+                    egui::Grid::new("cloudacct").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                        ui.label("Email");
+                        ui.add(egui::TextEdit::singleline(&mut f.acct_email).desired_width(300.0));
+                        ui.end_row();
+                        ui.label("Password");
+                        ui.horizontal(|ui| {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut f.acct_password).password(!f.show_acct_password).desired_width(270.0),
+                            );
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                act = Some(CloudAct::SignIn);
+                            }
+                            reveal_toggle(ui, &mut f.show_acct_password);
+                        });
+                        ui.end_row();
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("Sign in").fill(p(ui).accent)).clicked() {
+                            act = Some(CloudAct::SignIn);
+                        }
+                        ui.label(RichText::new("No account yet?").color(p(ui).muted).size(12.0));
+                        if ui.link("Create one at pjdesk.com").clicked() {
+                            act = Some(CloudAct::CreateAccount);
+                        }
+                    });
+                    if ui.link("Use your own bucket instead").clicked() {
+                        f.own_bucket = true;
+                    }
+                }
+            });
+            if !can_write {
+                ui.label(
+                    RichText::new("Restart as administrator to sign in. Windows protects the data folder. There is no separate PJDesk password.")
+                        .color(p(ui).muted)
+                        .size(12.0),
+                );
+            }
+            if busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Talking to the cloud…").color(p(ui).muted).size(12.0));
+                });
+            }
+        });
+        if let Some(act) = act {
+            self.run_cloud_action(act);
+        }
+    }
+
     fn accounts_card(&mut self, ui: &mut egui::Ui) {
         if self.access != Access::Readable {
             card(ui, |ui| {
-                heading(ui, "USER ACCOUNTS");
+                heading(ui, "OLDER LOCAL ACCOUNTS");
                 self.locked_line(ui);
             });
             return;
         }
+        let may_edit = self.may_edit_settings();
         card(ui, |ui| {
-            heading(ui, "USER ACCOUNTS");
-            ui.label(RichText::new("Accounts let people sign in to sync their address book and saved logins.").color(p(ui).muted).size(12.0));
+            heading(ui, "OLDER LOCAL ACCOUNTS");
+            ui.label(
+                RichText::new(
+                    "Kept so an older client can still sign in and sync its address book. A new server does not need these. Computers sign in with the PJDesk account, and network access follows that account.",
+                )
+                .color(p(ui).muted)
+                .size(12.0),
+            );
             ui.add_space(6.0);
 
-            if self.accounts.is_empty() {
-                ui.label(RichText::new("No accounts yet.").color(p(ui).muted));
+            if self.accounts.is_empty() && !self.legacy_add {
+                ui.label(
+                    RichText::new("None. A new server does not need these. Computers sign in with the PJDesk account.")
+                        .color(p(ui).muted),
+                );
             }
             let mut remove: Option<String> = None;
             let mut toggle_disabled: Option<(String, bool)> = None;
@@ -864,7 +1205,7 @@ impl App {
                         ui.label(RichText::new("disabled").color(p(ui).warn).size(11.0));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_enabled_ui(self.can_write, |ui| {
+                        ui.add_enabled_ui(may_edit, |ui| {
                             if ui.small_button("Remove").clicked() {
                                 remove = Some(a.username.clone());
                             }
@@ -876,57 +1217,77 @@ impl App {
                 });
             }
 
+            if !may_edit && (!self.accounts.is_empty() || self.legacy_add) {
+                let why = if !self.can_write {
+                    "Restart as administrator to change these. Windows protects the data folder. There is no separate PJDesk password."
+                } else {
+                    "Sign in with your PJDesk account above to change these. There is no separate server password."
+                };
+                ui.label(RichText::new(why).color(p(ui).muted).size(12.0));
+            }
+
             ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.label(RichText::new("Add an account").color(p(ui).muted).size(12.0));
-            ui.add_enabled_ui(self.can_write, |ui| {
-                egui::Grid::new("newacct").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("Username");
-                    ui.text_edit_singleline(&mut self.new_user);
-                    ui.end_row();
-                    ui.label("Password");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.new_pass).password(!self.show_new_pass));
-                        reveal_toggle(ui, &mut self.show_new_pass);
-                    });
-                    ui.end_row();
-                });
-                if !self.new_pass.is_empty() {
-                    let report = crate::password_policy::evaluate(&self.new_pass, &self.new_user);
-                    let word = match report.score {
-                        0 => "empty",
-                        1 => "too weak",
-                        2 => "acceptable",
-                        3 => "strong",
-                        _ => "very strong",
-                    };
-                    ui.label(RichText::new(format!("Strength: {word}")).color(if report.ok { p(ui).ok } else { p(ui).warn }).size(12.0));
-                    for check in &report.checks {
-                        let mark = if check.met { "Met" } else { "Need" };
-                        let color = if check.met { p(ui).ok } else { p(ui).muted };
-                        ui.label(RichText::new(format!("{mark} — {}", check.label)).color(color).size(11.0));
-                    }
+            if !self.legacy_add {
+                if ui.button("Add an older local account").clicked() {
+                    self.legacy_add = true;
                 }
-                ui.horizontal(|ui| {
-                    ui_widgets::checkbox(ui, &mut self.new_admin, "Administrator");
-                    if ui.add(egui::Button::new("Add").fill(p(ui).accent)).clicked() {
-                        let (u, p, admin) = (self.new_user.trim().to_string(), self.new_pass.clone(), self.new_admin);
-                        if let Some(mut accts) = self.accounts_mut() {
-                            match accts.create(&u, &p, admin, false) {
-                                Ok(()) => {
-                                    self.status = format!("Added account \"{}\"", accounts::normalize_username(&u));
-                                    self.new_user.clear();
-                                    self.new_pass.clear();
-                                    self.new_admin = false;
-                                    self.refresh();
-                                }
-                                Err(e) => self.status = format!("{e}"),
-                            }
+            } else {
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(RichText::new("Add an older local account").color(p(ui).muted).size(12.0));
+                ui.add_enabled_ui(may_edit, |ui| {
+                    egui::Grid::new("newacct").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                        ui.label("Username");
+                        ui.text_edit_singleline(&mut self.new_user);
+                        ui.end_row();
+                        ui.label("Password");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.new_pass).password(!self.show_new_pass));
+                            reveal_toggle(ui, &mut self.show_new_pass);
+                        });
+                        ui.end_row();
+                    });
+                    if !self.new_pass.is_empty() {
+                        let report = crate::password_policy::evaluate(&self.new_pass, &self.new_user);
+                        let word = match report.score {
+                            0 => "empty",
+                            1 => "too weak",
+                            2 => "acceptable",
+                            3 => "strong",
+                            _ => "very strong",
+                        };
+                        ui.label(
+                            RichText::new(format!("Strength: {word}"))
+                                .color(if report.ok { p(ui).ok } else { p(ui).warn })
+                                .size(12.0),
+                        );
+                        for check in &report.checks {
+                            let mark = if check.met { "Met" } else { "Need" };
+                            let color = if check.met { p(ui).ok } else { p(ui).muted };
+                            ui.label(RichText::new(format!("{mark} — {}", check.label)).color(color).size(11.0));
                         }
                     }
+                    ui.horizontal(|ui| {
+                        ui_widgets::checkbox(ui, &mut self.new_admin, "Administrator");
+                        if ui.add(egui::Button::new("Add").fill(p(ui).accent)).clicked() {
+                            let (u, p, admin) =
+                                (self.new_user.trim().to_string(), self.new_pass.clone(), self.new_admin);
+                            if let Some(mut accts) = self.accounts_mut() {
+                                match accts.create(&u, &p, admin, false) {
+                                    Ok(()) => {
+                                        self.status = format!("Added account \"{}\"", accounts::normalize_username(&u));
+                                        self.new_user.clear();
+                                        self.new_pass.clear();
+                                        self.new_admin = false;
+                                        self.refresh();
+                                    }
+                                    Err(e) => self.status = format!("{e}"),
+                                }
+                            }
+                        }
+                    });
                 });
-            });
+            }
 
             if let Some(u) = remove {
                 if let Some(mut accts) = self.accounts_mut() {
@@ -958,7 +1319,10 @@ impl App {
             if self.cloud_on {
                 let s = self.cloud.clone().unwrap_or_default();
                 let is_account = !s.account.is_empty();
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 let fresh = s.updated_at + 90 >= now;
                 ui.horizontal(|ui| {
                     if !fresh {
@@ -966,11 +1330,16 @@ impl App {
                         ui.label("Sync is on, but the server isn't running, so nothing is syncing.");
                     } else if s.role == "active" {
                         ui_widgets::dot(ui, p(ui).ok);
-                        let who = if s.active_name.is_empty() { "this server".to_string() } else { s.active_name.clone() };
+                        let who =
+                            if s.active_name.is_empty() { "this server".to_string() } else { s.active_name.clone() };
                         ui.label(format!("Primary: {who} uploads to the cloud (generation {}).", s.epoch));
                     } else {
                         ui_widgets::dot(ui, p(ui).accent);
-                        let who = if s.active_name.is_empty() { "the other server".to_string() } else { s.active_name.clone() };
+                        let who = if s.active_name.is_empty() {
+                            "the other server".to_string()
+                        } else {
+                            s.active_name.clone()
+                        };
                         ui.label(format!("Standby. Primary: {who} (generation {}).", s.epoch));
                     }
                 });
@@ -1018,17 +1387,17 @@ impl App {
                         if !is_account
                             && ui
                                 .button("Copy join code")
-                                .on_hover_text("Everything a backup server needs to join. Keep it like a password.")
+                                .on_hover_text("Only for your own bucket. A PJDesk account does not use a join code.")
                                 .clicked()
                         {
                             act = Some(CloudAct::CopyCode);
                         }
-                        let (label, tip) = if is_account {
-                            ("Sign out", "Sign this server out of PJDesk Cloud (the cloud copy is kept)")
-                        } else {
-                            ("Turn off", "Stop syncing on this server (the cloud copy is kept)")
-                        };
-                        if ui.button(label).on_hover_text(tip).clicked() {
+                        if !is_account
+                            && ui
+                                .button("Turn off")
+                                .on_hover_text("Stop syncing on this server (the cloud copy is kept)")
+                                .clicked()
+                        {
                             act = Some(CloudAct::Off);
                         }
                     });
@@ -1068,11 +1437,11 @@ impl App {
                 ui.add_space(4.0);
                 let how_to_add = if is_account {
                     format!(
-                        "Backup server: install PJDesk Server on another computer and sign in there with the same account ({}). It becomes the standby.",
+                        "The other server: install PJDesk Server and sign in with the same account ({}). It becomes the standby. No join code.",
                         s.account
                     )
                 } else {
-                    "Backup server: install PJDesk Server on another computer, choose Your own bucket, then This is a backup server, and paste the join code. It becomes the standby.".to_string()
+                    "The other server, for your own bucket: install PJDesk Server, choose Your own bucket, then This is a backup server, and paste the join code. It becomes the standby.".to_string()
                 };
                 ui.label(
                     RichText::new(format!(
@@ -1081,107 +1450,21 @@ impl App {
                     .color(p(ui).muted)
                     .size(11.0),
                 );
-            } else {
+            } else if self.cloud_form.own_bucket {
                 ui.label(
-                    RichText::new(format!(
-                        "Keep an encrypted copy of this server (its key, user accounts, address books and computer list) in the cloud. \
-                         Another PJDesk Server signed in with the same account becomes a standby. Make this the primary there when you want it to take over. \
-                         Computers still connect to whichever server {dns} points to."
-                    ))
+                    RichText::new(
+                        "Your own bucket is the advanced path. A join code pairs the standby. A PJDesk account, above, does not need one.",
+                    )
                     .color(p(ui).muted)
                     .size(12.0),
                 );
                 ui.add_space(6.0);
-                let f = &mut self.cloud_form;
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(!f.own_bucket, "PJDesk account").clicked() {
-                        f.own_bucket = false;
-                    }
-                    if ui.selectable_label(f.own_bucket, "Your own bucket (advanced)").clicked() {
-                        f.own_bucket = true;
-                    }
-                });
+                if ui.button("Use a PJDesk account instead").clicked() {
+                    self.cloud_form.own_bucket = false;
+                }
                 ui.add_space(4.0);
+                let f = &mut self.cloud_form;
                 ui.add_enabled_ui(can_write && !busy, |ui| {
-                    if !f.own_bucket {
-                        if let Some((from, written_at, readable)) = f.ask.clone() {
-                            if readable {
-                                ui.colored_label(
-                                    p(ui).warn,
-                                    format!(
-                                        "Your account already holds {from}'s data (from {}), and {online} computer(s) are connected to this server.",
-                                        format_local(written_at)
-                                    ),
-                                );
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .add(egui::Button::new("Make this server a backup").fill(p(ui).accent))
-                                        .on_hover_text(format!("Replace this server's key, accounts and computer list with {from}'s"))
-                                        .clicked()
-                                    {
-                                        act = Some(CloudAct::Choose(crate::cloud::Choice::Join));
-                                    }
-                                    if ui
-                                        .button("Use this server's data")
-                                        .on_hover_text("Replace the copy in the cloud with this server's data")
-                                        .clicked()
-                                    {
-                                        act = Some(CloudAct::Choose(crate::cloud::Choice::Replace));
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        act = Some(CloudAct::CancelAsk);
-                                    }
-                                });
-                            } else {
-                                ui.colored_label(p(ui).warn, "Your account's cloud copy was made with an older password, so it can't be opened.");
-                                ui.horizontal(|ui| {
-                                    if ui.add(egui::Button::new("Upload this server's data").fill(p(ui).accent)).clicked() {
-                                        act = Some(CloudAct::Choose(crate::cloud::Choice::Replace));
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        act = Some(CloudAct::CancelAsk);
-                                    }
-                                });
-                            }
-                        } else {
-                            egui::Grid::new("cloudacct").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                                ui.label("Email");
-                                ui.add(egui::TextEdit::singleline(&mut f.acct_email).desired_width(300.0));
-                                ui.end_row();
-                                ui.label("Password");
-                                ui.horizontal(|ui| {
-                                    let resp = ui.add(
-                                        egui::TextEdit::singleline(&mut f.acct_password)
-                                            .password(!f.show_acct_password)
-                                            .desired_width(270.0),
-                                    );
-                                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                        act = Some(CloudAct::SignIn);
-                                    }
-                                    reveal_toggle(ui, &mut f.show_acct_password);
-                                });
-                                ui.end_row();
-                            });
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                if ui.add(egui::Button::new("Sign in").fill(p(ui).accent)).clicked() {
-                                    act = Some(CloudAct::SignIn);
-                                }
-                                ui.label(RichText::new("No account yet?").color(p(ui).muted).size(12.0));
-                                if ui.link("Create one at pjdesk.com").clicked() {
-                                    act = Some(CloudAct::CreateAccount);
-                                }
-                            });
-                            ui.label(
-                                RichText::new(
-                                    "The first server you sign in is the main one; sign in on another PJDesk Server with the same account to make it the backup. \
-                                     Your password never leaves this computer, and the copy is encrypted so only your servers can read it.",
-                                )
-                                .color(p(ui).muted)
-                                .size(11.0),
-                            );
-                        }
-                    } else {
                         ui.horizontal(|ui| {
                             if ui.selectable_label(!f.joining, "This is the main server").clicked() {
                                 f.joining = false;
@@ -1262,8 +1545,15 @@ impl App {
                                 }
                             }
                         }
-                    }
                 });
+            } else {
+                ui.label(
+                    RichText::new(
+                        "Sign in with your PJDesk account at the top of this window. That one login turns on Cloud Sync, sets this server as active or standby, and registers it on My network.",
+                    )
+                    .color(p(ui).muted)
+                    .size(12.0),
+                );
             }
             if busy {
                 ui.horizontal(|ui| {
@@ -1307,6 +1597,10 @@ impl App {
             }
             CloudAct::CreateAccount => open_url(&format!("{}/account/#create", cloud::default_api())),
             CloudAct::SignInAgain => {
+                if !self.can_write {
+                    self.status = "Restart as administrator to sign in again. Windows protects the saved sign-in. There is no separate PJDesk password.".into();
+                    return;
+                }
                 if let Some(cfg) = CloudConfig::load(&dir) {
                     self.cloud_form.acct_email = cfg.email.clone();
                 }
@@ -1345,9 +1639,7 @@ impl App {
                 } else {
                     self.spawn_cloud_job(move || {
                         crate::cloud::demote(&dir)?;
-                        Ok(JobDone::Message(
-                            "This server stepped down to standby and will not upload.".into(),
-                        ))
+                        Ok(JobDone::Message("This server stepped down to standby and will not upload.".into()))
                     });
                 }
             }
@@ -1358,15 +1650,25 @@ impl App {
                 }
                 None => self.status = "Can't read the sync settings (restart as administrator).".into(),
             },
-            CloudAct::Off => {
-                let was_account = self.cloud.as_ref().is_some_and(|s| !s.account.is_empty());
+            CloudAct::Off | CloudAct::Switch => {
+                if !self.can_write {
+                    self.status = "Restart as administrator to sign out. Windows protects the saved sign-in. There is no separate PJDesk password.".into();
+                    return;
+                }
+                let switching = matches!(act, CloudAct::Switch);
+                let was_account =
+                    self.cloud.as_ref().is_some_and(|s| !s.account.is_empty()) || !self.signed_in_email().is_empty();
                 std::thread::spawn({
                     let dir = dir.clone();
                     move || cloud::sign_out(&dir)
                 });
                 // Remove the settings right away so the window updates.
                 cloud::turn_off(&dir);
-                self.status = if was_account {
+                self.cloud_form.own_bucket = false;
+                self.cloud_form.acct_password.clear();
+                self.status = if switching {
+                    "Signed out. Sign in with the PJDesk account this server should use.".into()
+                } else if was_account {
                     "Signed out of PJDesk Cloud; cloud sync is off on this server. The cloud copy is kept.".into()
                 } else {
                     "Cloud sync is off on this server. The copy in the bucket is kept.".into()
@@ -1488,6 +1790,12 @@ impl App {
         let dirty = self.pub_addr.trim() != saved_address.trim();
         let mut publish = false;
         let mut replace = false;
+        let may_edit = self.may_edit_settings();
+        let lock_reason = if !self.can_write {
+            "Restart as administrator to save this. Windows protects the data folder. There is no separate PJDesk password."
+        } else {
+            "Sign in with your PJDesk account above to change this. There is no separate server password."
+        };
         card(ui, |ui| {
             heading(ui, "PUBLIC ADDRESS");
             ui.label(RichText::new(
@@ -1501,37 +1809,49 @@ impl App {
                     .font(egui::TextStyle::Monospace),
             );
             if !self.pub_addr_note.is_empty() {
-                let color = if self.pub_addr_needs_confirm || crate::public_addr::is_private_address(self.pub_addr.trim()) && !self.pub_addr_confirmed {
+                let color = if self.pub_addr_needs_confirm
+                    || crate::public_addr::is_private_address(self.pub_addr.trim()) && !self.pub_addr_confirmed
+                {
                     p(ui).warn
                 } else {
                     p(ui).muted
                 };
                 ui.label(RichText::new(&self.pub_addr_note).color(color).size(12.0));
             }
-            if self.can_write && self.pub_addr_needs_confirm && ui.button("Replace the server on My network").clicked() {
+            if may_edit && self.pub_addr_needs_confirm && ui.button("Replace the server on My network").clicked() {
                 publish = true;
                 replace = true;
-            } else if self.can_write && !self.pub_addr_confirmed && !self.pub_addr.trim().is_empty() && ui.button("Confirm this address").clicked() {
+            } else if may_edit
+                && !self.pub_addr_confirmed
+                && !self.pub_addr.trim().is_empty()
+                && ui.button("Confirm this address").clicked()
+            {
                 publish = true;
-            } else if self.can_write && dirty && !self.pub_addr.trim().is_empty() && ui.button("Update My network").clicked() {
+            } else if may_edit && dirty && !self.pub_addr.trim().is_empty() && ui.button("Update My network").clicked()
+            {
                 publish = true;
+            }
+            if !may_edit {
+                ui.label(RichText::new(lock_reason).color(p(ui).muted).size(12.0));
             }
             ui.add_space(12.0);
             heading(ui, "SIGNED-IN ACCOUNTS");
             ui.label(RichText::new(
-                "Off by default, so an update does not take a computer offline. Turn this on only after every computer below has signed in.",
+                "Off by default, so an update does not take a computer offline. Turn this on only after every computer below has signed in. This follows the PJDesk account signed in above.",
             ).color(p(ui).muted));
             ui.add_space(6.0);
-            if ui.checkbox(&mut require, "Require signed-in accounts").changed() && self.can_write {
-                changed = true;
-            }
-            if !self.can_write {
-                ui.label(RichText::new("Restart as administrator to change this.").color(p(ui).muted).size(12.0));
-            }
+            ui.add_enabled_ui(may_edit, |ui| {
+                if ui.checkbox(&mut require, "Require signed-in accounts").changed() {
+                    changed = true;
+                }
+            });
             ui.add_space(8.0);
             ui.label(RichText::new("Not signed in yet").strong());
             if unsigned.is_empty() {
-                ui.label(RichText::new("Every registered computer has signed in, or none have registered.").color(p(ui).muted));
+                ui.label(
+                    RichText::new("Every registered computer has signed in, or none have registered.")
+                        .color(p(ui).muted),
+                );
             } else {
                 for (id, name) in &unsigned {
                     ui.horizontal(|ui| {
@@ -1550,20 +1870,27 @@ impl App {
                 }
             }
             if policy.public_key.is_empty() {
-                ui.label(RichText::new("The cloud signing key is saved here the next time this server checks in.").color(p(ui).muted).size(12.0));
+                ui.label(
+                    RichText::new("The cloud signing key is saved here the next time this server checks in.")
+                        .color(p(ui).muted)
+                        .size(12.0),
+                );
             } else {
                 ui.label(RichText::new("Cloud signing key is pinned.").color(p(ui).muted).size(12.0));
             }
             ui.add_space(10.0);
             ui.label(RichText::new("Network keys").strong());
-            ui.label(RichText::new("A copy-paste key joins this network. It is shown once and is not saved here.").color(p(ui).muted));
-            if self.can_write && ui.button("Create a network key").clicked() {
+            ui.label(
+                RichText::new("A copy-paste key joins this network. It is shown once and is not saved here.")
+                    .color(p(ui).muted),
+            );
+            if may_edit && ui.button("Create a network key").clicked() {
                 self.nk_open = true;
                 self.nk_blob.clear();
                 self.nk_pass.clear();
             }
-            if !self.can_write {
-                ui.label(RichText::new("Restart as administrator to create or revoke a network key.").color(p(ui).muted).size(12.0));
+            if !may_edit {
+                ui.label(RichText::new(lock_reason).color(p(ui).muted).size(12.0));
             }
             self.ensure_invites();
             if self.nk_invites.is_empty() {
@@ -1586,14 +1913,19 @@ impl App {
                     Some(t) => format!(" · expires {}", crate::registry::format_local(t)),
                     None => String::new(),
                 };
-                let bound = if inv.bound_email.is_empty() { String::new() } else { format!(" · only {}", inv.bound_email) };
+                let bound =
+                    if inv.bound_email.is_empty() { String::new() } else { format!(" · only {}", inv.bound_email) };
                 ui.label(format!("{state} · {limit}{exp}{bound}"));
                 for use_row in &inv.history {
                     let who = if use_row.device_name.is_empty() { "A device" } else { use_row.device_name.as_str() };
-                    let when = if use_row.used_at == 0 { String::new() } else { format!(" · {}", crate::registry::format_local(use_row.used_at)) };
+                    let when = if use_row.used_at == 0 {
+                        String::new()
+                    } else {
+                        format!(" · {}", crate::registry::format_local(use_row.used_at))
+                    };
                     ui.label(RichText::new(format!("  {who} · {}{when}", use_row.email)).color(p(ui).muted).size(12.0));
                 }
-                if inv.revoked_at.is_none() && self.can_write && ui.small_button("Revoke").clicked() {
+                if inv.revoked_at.is_none() && may_edit && ui.small_button("Revoke").clicked() {
                     revoke = Some(inv.id.clone());
                 }
             }
@@ -1634,11 +1966,12 @@ impl App {
         record.address = address;
         record.confirmed = true;
         record.needs_confirm = false;
-        let signed_in = crate::cloud::CloudConfig::load(&self.data_dir).is_some_and(|cfg| cfg.is_account() && !cfg.token.is_empty());
+        let signed_in = crate::cloud::CloudConfig::load(&self.data_dir)
+            .is_some_and(|cfg| cfg.is_account() && !cfg.token.is_empty());
         record.note = if signed_in {
             "Publishing this address…".into()
         } else {
-            "Sign in to PJDesk Cloud on this server to publish this address.".into()
+            "Sign in with your PJDesk account above to publish this address.".into()
         };
         crate::public_addr::save(&self.data_dir, &record);
         self.pub_addr_confirmed = true;
@@ -1653,7 +1986,12 @@ impl App {
     }
 
     fn ensure_invites(&mut self) {
-        if self.nk_loaded || self.nk_list_rx.is_some() || self.preview_network || self.preview_netkey || !self.can_write {
+        if self.nk_loaded
+            || self.nk_list_rx.is_some()
+            || self.preview_network
+            || self.preview_netkey
+            || !self.may_edit_settings()
+        {
             return;
         }
         self.nk_loaded = true;
@@ -1670,7 +2008,9 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.nk_busy = true;
         std::thread::spawn(move || {
-            let result = crate::cloud::revoke_network_key(&dir, &id).map(|()| crate::cloud::CreatedKey { blob: String::new(), embedded: false }).map_err(|e| e.to_string());
+            let result = crate::cloud::revoke_network_key(&dir, &id)
+                .map(|()| crate::cloud::CreatedKey { blob: String::new(), embedded: false })
+                .map_err(|e| e.to_string());
             let _ = tx.send(result);
         });
         self.nk_rx = Some(rx);
@@ -1777,12 +2117,17 @@ impl App {
                 ui.set_min_width(420.0);
                 if showing {
                     if self.nk_embedded {
-                        ui.colored_label(p(ui).warn, "Anyone who has this network key can join. Share it like a password.");
+                        ui.colored_label(
+                            p(ui).warn,
+                            "Anyone who has this network key can join. Share it like a password.",
+                        );
                     } else {
                         ui.label("The passphrase is not part of this key. Share it separately.");
                     }
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Copy this now. It is shown once and is not saved here.").color(p(ui).muted));
+                    ui.label(
+                        RichText::new("Copy this now. It is shown once and is not saved here.").color(p(ui).muted),
+                    );
                     ui.add(
                         egui::TextEdit::multiline(&mut self.nk_blob)
                             .desired_rows(5)
@@ -1823,15 +2168,30 @@ impl App {
                         });
                     } else {
                         ui.add_space(6.0);
-                        ui.colored_label(p(ui).warn, "Anyone who has this network key can join. Share it like a password.");
+                        ui.colored_label(
+                            p(ui).warn,
+                            "Anyone who has this network key can join. Share it like a password.",
+                        );
                     }
                     ui.add_space(6.0);
                     ui.label("Expires in days (optional)");
-                    ui.add(egui::TextEdit::singleline(&mut self.nk_days).hint_text("Leave empty for no expiry").desired_width(200.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.nk_days)
+                            .hint_text("Leave empty for no expiry")
+                            .desired_width(200.0),
+                    );
                     ui.label("Maximum uses (optional)");
-                    ui.add(egui::TextEdit::singleline(&mut self.nk_max).hint_text("Leave empty for no limit").desired_width(200.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.nk_max)
+                            .hint_text("Leave empty for no limit")
+                            .desired_width(200.0),
+                    );
                     ui.label("Limit to this account (optional)");
-                    ui.add(egui::TextEdit::singleline(&mut self.nk_bound).hint_text("ada@example.com").desired_width(280.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.nk_bound)
+                            .hint_text("ada@example.com")
+                            .desired_width(280.0),
+                    );
                     if !self.nk_error.is_empty() {
                         ui.colored_label(p(ui).warn, &self.nk_error);
                     }
@@ -1880,22 +2240,38 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !locked
                         && online > 0
-                        && ui.small_button("Update all online").on_hover_text("Tell every online computer to update now").clicked()
+                        && ui
+                            .small_button("Update all online")
+                            .on_hover_text("Tell every online computer to update now")
+                            .clicked()
                     {
                         update_all = true;
                     }
                 });
             });
             if locked {
-                ui.label(RichText::new("From the running service. Restart as administrator to change this list.").color(p(ui).muted).size(12.0));
+                ui.label(
+                    RichText::new("From the running service. Restart as administrator to change this list.")
+                        .color(p(ui).muted)
+                        .size(12.0),
+                );
             }
             if rows.is_empty() {
                 ui.label(RichText::new("No computers have registered yet.").color(p(ui).muted));
             }
             ui.horizontal(|ui| {
-                ui.add_sized([130.0, 16.0], egui::Label::new(RichText::new("ID").size(11.0).color(p(ui).muted).strong()));
-                ui.add_sized([140.0, 16.0], egui::Label::new(RichText::new("Name").size(11.0).color(p(ui).muted).strong()));
-                ui.add_sized([150.0, 16.0], egui::Label::new(RichText::new("Version").size(11.0).color(p(ui).muted).strong()));
+                ui.add_sized(
+                    [130.0, 16.0],
+                    egui::Label::new(RichText::new("ID").size(11.0).color(p(ui).muted).strong()),
+                );
+                ui.add_sized(
+                    [140.0, 16.0],
+                    egui::Label::new(RichText::new("Name").size(11.0).color(p(ui).muted).strong()),
+                );
+                ui.add_sized(
+                    [150.0, 16.0],
+                    egui::Label::new(RichText::new("Version").size(11.0).color(p(ui).muted).strong()),
+                );
                 ui.label(RichText::new("Status").size(11.0).color(p(ui).muted).strong());
             });
             egui::ScrollArea::vertical().max_height(220.0).id_salt("devices").show(ui, |ui| {
@@ -1975,7 +2351,7 @@ impl App {
                 .map(|s| {
                     s.devices
                         .iter()
-                        .map(|d|                         ShownDevice {
+                        .map(|d| ShownDevice {
                             id: d.id.clone(),
                             hostname: d.hostname.clone(),
                             version: d.version.clone(),
@@ -2093,7 +2469,11 @@ impl App {
         card(ui, |ui| {
             heading(ui, "LOG");
             if self.log_tail.is_empty() {
-                ui.label(RichText::new("No log yet (the server writes server.log in its data folder when it runs).").color(p(ui).muted).size(12.0));
+                ui.label(
+                    RichText::new("No log yet (the server writes server.log in its data folder when it runs).")
+                        .color(p(ui).muted)
+                        .size(12.0),
+                );
             } else {
                 egui::ScrollArea::vertical().max_height(160.0).id_salt("log").stick_to_bottom(true).show(ui, |ui| {
                     ui.label(RichText::new(&self.log_tail).monospace().size(11.0).color(p(ui).muted));
@@ -2117,7 +2497,7 @@ fn finish_account(
             crate::cloud::publish_network(dir, online, false);
             let _ = crate::requests::push(dir, crate::requests::SYNC_FILE, "now");
             JobDone::Message(format!(
-                "Signed in as {email}. This is the main server, and its data is backed up to PJDesk Cloud.                  To add a backup server, sign in on another PJDesk Server with the same account."
+                "Signed in as {email}. This is the main server, and its data is backed up to PJDesk Cloud. To add a standby, sign in on another PJDesk Server with the same account. No join code."
             ))
         }
         Connected::Resumed => {
@@ -2128,7 +2508,7 @@ fn finish_account(
             crate::cloud::publish_network(dir, online, false);
             let _ = crate::requests::push(dir, crate::requests::RELOAD_FILE, "now");
             JobDone::Message(format!(
-                "Signed in as {email}. This server now has {from}'s key, accounts and computer list, and stays on standby to take over."
+                "Signed in as {email}. This server now has {from}'s key, accounts and computer list, and stays on standby. No join code."
             ))
         }
         Connected::Replaced => {

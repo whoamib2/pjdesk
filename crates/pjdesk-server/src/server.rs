@@ -212,7 +212,11 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     info!("  Rendezvous/relay (UDP)   : {}:{}", opts.bind, opts.port);
     info!("  Data folder              : {}", data_dir.display());
     info!("  Registered devices       : {device_count}");
-    info!("  User accounts            : {account_count}");
+    if account_count == 0 {
+        info!("  Local accounts           : none (a PJDesk account is the server sign-in)");
+    } else {
+        info!("  Local accounts (legacy)  : {account_count}");
+    }
     info!("  Server key fingerprint   : {}", tls::format_fingerprint(&identity.fingerprint()));
     info!("Clients trust this key on first connect; compare it with what they print.");
 

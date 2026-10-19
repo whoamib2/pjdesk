@@ -116,8 +116,8 @@ pjdesk/
 │   ├── main.rs                        # CLI (run | service | account | update | fingerprint)
 │   ├── server.rs                      # run(): TCP signaling + UDP rendezvous/relay; load_identity / read_identity; calls repair_data_dir
 │   ├── service.rs                     # Windows service "PJDeskServer" + repair_data_dir (icacls /reset)
-│   ├── gui.rs                         # management window (eframe): service control, fingerprint (read-only), accounts, registered computers, log
-│   ├── accounts.rs                    # user accounts (sign-in for address book)
+│   ├── gui.rs                         # management window (eframe): PJDesk account sign-in, service, fingerprint, devices, log
+│   ├── accounts.rs                    # older local accounts (optional). The server sign-in is the PJDesk account
 │   └── registry.rs                    # devices.json; Registry::load self-heals (empty on unreadable/corrupt)
 │
 ├── crates/pjdesk/src/                 # the client (bin: pjdesk) — host + controller + GUI

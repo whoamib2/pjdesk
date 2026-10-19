@@ -3,7 +3,7 @@
 A self-hosted, open-source remote desktop in the spirit of RustDesk, written in Rust. Your computers connect only through a server you run — no cloud, no accounts with anyone but you. [pjdesk.com](https://pjdesk.com)
 
 * **`pjdesk.exe`** — the app. A window to share this computer (ID + password) and control others, with a settings window, a sign-in to your server, a synced address book, and an optional background service so you can connect at the sign-in screen and during UAC prompts.
-* **`pjdesk-server.exe`** — the hub. Signaling, NAT rendezvous and relay, with a management window for the service, user accounts and registered computers. Runs in a console or as a Windows service.
+* **`pjdesk-server.exe`** — the hub. Signaling, NAT rendezvous and relay, with a management window. Sign in once with the PJDesk account. Runs in a console or as a Windows service.
 
 Connections are **peer-to-peer** whenever UDP hole punching works, and are **relayed** through your server when it doesn't. Video is **end-to-end encrypted** either way (QUIC/TLS 1.3). Passwords are checked with **SPAKE2**, so they never travel over the network, not even to your own server.
 
@@ -17,7 +17,7 @@ Connections are **peer-to-peer** whenever UDP hole punching works, and are **rel
 2. **Install the app.** Run `PJDesk-Setup` on each computer. Open PJDesk, go to **Settings ▸ Network**, and enter your server's address.
 3. **Connect.** Your computer now shows a 9-digit **ID** and a password. Give those to someone, or type another computer's ID and password to control it.
 4. **(Optional) Always-on access.** In **Settings ▸ Security**, install the **background service** to reach this computer before anyone signs in and during UAC prompts. Set a permanent password there too.
-5. **(Optional) Sign in.** Create an account on the server (its window, or `pjdesk-server account add <name>`), then sign in from the app to sync an **address book** of saved computers across your machines.
+5. **Sign in.** Use the same PJDesk account (pjdesk.com) in the app and in the PJDesk Server window. That one login is Cloud Sync, the server's role, and My network. An older local account (`pjdesk-server account add`) still works for an address book. A new server does not need one.
 
 ---
 
@@ -254,14 +254,21 @@ S3-compatible bucket works). A second server signed in to the same copy stays
 in sync as a **standby**. You make it the **primary** when you want it to
 take over.
 
-**With a PJDesk account (easiest).** In the PJDesk Server window, open
-**Cloud Sync & Backup Server** → **PJDesk account** and sign in (create the
-account at pjdesk.com/account). The first server you sign in is the primary.
-Sign in on another PJDesk Server with the same account and it becomes the
-standby — nothing to copy between them. The password never leaves your servers:
+**With a PJDesk account (easiest).** In the PJDesk Server window, the
+**PJDesk account** card at the top is the one sign-in (create the account at
+pjdesk.com/account). The window shows **Signed in as** that email, with
+**Sign out** and **Switch account**. That login is Cloud Sync and backup, the
+active or standby role, and My network (address, fingerprint, and slot).
+Allowed accounts and Require signed-in accounts follow it. There is no
+separate server password. Install, stop, and uninstall still need a Windows
+administrator. The first server you sign in is the primary. Sign in on another
+PJDesk Server with the same account and it becomes the standby. No join code,
+and nothing to copy between them. The password never leaves your servers:
 they derive one key from it to sign in and another to encrypt the copy, so
 PJDesk Cloud can't read it. (`pjdesk-server cloud signin --email you@example.com`
 does the same from the command line.) See [cloud/README.md](cloud/README.md).
+Older local accounts in `accounts.json` keep working. A new server does not
+need them.
 
 **Your own bucket (advanced).** Prefer to keep the copy in your own Cloudflare
 R2 / S3 bucket? Choose **Your own bucket** instead:
