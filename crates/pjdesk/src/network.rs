@@ -89,6 +89,8 @@ pub struct Session {
     pub public_ip: String,
     pub computers: Vec<SavedComputer>,
     pub presence: Vec<HostPresence>,
+    /// PJDesk IDs deleted from the account. Empty when the service is older.
+    pub removed: Vec<String>,
 }
 
 /// A hostname is kept when a later update only has the raw IP it points at.
@@ -139,6 +141,8 @@ struct NetworkReply {
     computers: Vec<ComputerBody>,
     #[serde(default)]
     presence: Vec<PresenceBody>,
+    #[serde(default)]
+    removed: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -328,6 +332,7 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
                 online: c.online,
             })
             .collect(),
+        removed: reply.removed.into_iter().map(|id| pjdesk_proto::normalize_id(&id)).filter(|id| pjdesk_proto::is_valid_id(id)).collect(),
     })
 }
 
@@ -401,7 +406,24 @@ pub fn claim_current_server(login_token: &str, address: &str, fingerprint: &str,
 
 /// Exchanges a still-valid refresh token for a new access token.
 pub fn refresh(refresh_token: &str, device_id: &str, computers: Option<&serde_json::Value>) -> Result<Session> {
+    refresh_account(refresh_token, device_id, computers, "", false)
+}
+
+fn refresh_account(
+    refresh_token: &str,
+    device_id: &str,
+    computers: Option<&serde_json::Value>,
+    pjdesk_id: &str,
+    reinstate: bool,
+) -> Result<Session> {
     let mut body = serde_json::json!({ "refresh": refresh_token, "device_id": device_id });
+    let pjdesk_id = pjdesk_proto::normalize_id(pjdesk_id);
+    if pjdesk_proto::is_valid_id(&pjdesk_id) {
+        body["pjdesk_id"] = serde_json::Value::String(pjdesk_id);
+    }
+    if reinstate {
+        body["reinstate"] = serde_json::Value::Bool(true);
+    }
     if let Some(computers) = computers {
         if let Some(list) = computers.get("computers") {
             body["computers"] = list.clone();
@@ -420,6 +442,36 @@ pub fn refresh(refresh_token: &str, device_id: &str, computers: Option<&serde_js
     let reply: NetworkReply = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
     let email = String::new();
     session_from(&email, device_id, reply)
+}
+
+/// Downloads the account list, including computers deleted since the last sync.
+/// This computer's id is recorded so a later delete can sign it out. The local
+/// list is not uploaded.
+pub fn pull_list(refresh_token: &str, device_id: &str, pjdesk_id: &str) -> Result<Session> {
+    refresh_account(refresh_token, device_id, None, pjdesk_id, false)
+}
+
+/// Deletes one computer from the signed-in owner's account.
+pub fn delete_from_account(refresh_token: &str, device_id: &str, pjdesk_id: &str) -> Result<()> {
+    let id = pjdesk_proto::normalize_id(pjdesk_id);
+    if !pjdesk_proto::is_valid_id(&id) {
+        bail!("That is not a PJDesk ID.");
+    }
+    let body = serde_json::json!({ "refresh": refresh_token, "device_id": device_id, "id": id });
+    let text = match post_api(&format!("{}/api/network/computers/delete", api_base()), None, &body) {
+        Ok(text) => text,
+        Err(fail) => {
+            if fail.status == 404 || fail.status == 503 {
+                bail!("Could not delete that computer yet. On your PC, in cloud\\, run cloud\\deploy.cmd, then try again.");
+            }
+            bail!(fail.message);
+        }
+    };
+    let reply: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    if reply.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        bail!("Could not delete that computer.");
+    }
+    Ok(())
 }
 
 /// Opens a network key and enrolls this device. No PJDesk password is required
@@ -586,7 +638,7 @@ pub fn publish_this_computer(session: &Session, this: &ThisComputer, local: &[Sa
     }
     let list = enroll_this_computer(&list, this);
     let body = saved_value(&list);
-    let mut next = refresh(&session.refresh, &session.device_id, Some(&body))?;
+    let mut next = refresh_account(&session.refresh, &session.device_id, Some(&body), &this.id, true)?;
     if next.email.is_empty() {
         next.email = session.email.clone();
     }
@@ -621,6 +673,7 @@ pub fn enroll_known(
         public_ip: String::new(),
         computers: account.to_vec(),
         presence: Vec::new(),
+        removed: Vec::new(),
     };
     let _ = publish_this_computer(&session, this, local)?;
     Ok(())
@@ -681,12 +734,6 @@ pub fn computers_body(
     for id in notes.keys() {
         if pjdesk_proto::is_valid_id(id) && !hidden.iter().any(|h| h == id) {
             ids.insert(id.clone());
-        }
-    }
-    for id in hidden {
-        let id = pjdesk_proto::normalize_id(id);
-        if pjdesk_proto::is_valid_id(&id) {
-            ids.insert(id);
         }
     }
     let computers: Vec<serde_json::Value> = ids
@@ -764,7 +811,8 @@ fn refresh_config_inner(config: &mut Config, force: bool) {
         return;
     }
     let body = computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden);
-    match refresh(&refresh_token, &device, Some(&body)) {
+    let pjdesk_id = config.device_id.clone().unwrap_or_default();
+    match refresh_account(&refresh_token, &device, Some(&body), &pjdesk_id, false) {
         Ok(mut session) => {
             REFRESH_BACKOFF_SECS.store(15, std::sync::atomic::Ordering::Relaxed);
             NEXT_REFRESH_AT.store(0, std::sync::atomic::Ordering::Relaxed);

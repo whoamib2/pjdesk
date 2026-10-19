@@ -222,6 +222,9 @@ pub struct App {
     renaming: Option<String>,
     rename_text: String,
     confirm_remove: Option<String>,
+    confirm_delete: Option<String>,
+    delete_rx: Option<Receiver<Result<String, String>>>,
+    next_account_pull: u64,
     prompt_open: bool,
     prompt_id: String,
     prompt_password: String,
@@ -265,7 +268,7 @@ pub struct App {
     net_login: String,
     net_rx: Option<Receiver<Result<crate::network::SignIn, String>>>,
     /// Fills Saved computers from the account without opening a connection.
-    saved_rx: Option<Receiver<()>>,
+    saved_rx: Option<Receiver<Result<crate::network::Session, String>>>,
     /// Network key waiting in the import dialog. Not logged.
     import_blob: Option<String>,
     import_pass: String,
@@ -352,6 +355,9 @@ impl App {
             renaming: None,
             rename_text: String::new(),
             confirm_remove: None,
+            confirm_delete: None,
+            delete_rx: None,
+            next_account_pull: 0,
             prompt_open: false,
             prompt_id: String::new(),
             prompt_password: String::new(),
@@ -1423,27 +1429,95 @@ impl App {
     }
 
     fn request_saved_refresh(&mut self) {
-        if self.temp.is_some() || self.saved_rx.is_some() || self.cfg.network_refresh_token().is_empty() {
+        self.next_account_pull = 0;
+    }
+
+    fn maybe_pull_account(&mut self) {
+        if self.temp.is_some() || self.saved_rx.is_some() || self.delete_rx.is_some() {
             return;
         }
+        let refresh_token = self.cfg.network_refresh_token();
+        let device = self.cfg.network_device_id.clone().unwrap_or_default();
+        if refresh_token.is_empty() || device.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if now < self.next_account_pull {
+            return;
+        }
+        self.next_account_pull = now.saturating_add(20);
+        let pjdesk_id = self.cfg.device_id.clone().unwrap_or_default();
         let (tx, rx) = std::sync::mpsc::channel();
         self.saved_rx = Some(rx);
         std::thread::spawn(move || {
-            if let Ok(mut cfg) = crate::config::Config::load() {
-                crate::network::refresh_config_now(&mut cfg);
-            }
-            let _ = tx.send(());
+            let result = crate::network::pull_list(&refresh_token, &device, &pjdesk_id).map_err(|e| e.to_string());
+            let _ = tx.send(result);
         });
     }
 
     fn poll_saved_refresh(&mut self) {
         let Some(rx) = &self.saved_rx else { return };
         match rx.try_recv() {
-            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Ok(Ok(mut session)) => {
                 self.saved_rx = None;
-                if let Ok(disk) = crate::config::Config::load() {
-                    self.cfg.take_peer_reports_from(&disk);
+                if session.email.is_empty() {
+                    session.email = self.cfg.network_email.clone().unwrap_or_default();
                 }
+                let revoked = session.access.is_empty() && session.refresh.is_empty();
+                if revoked {
+                    self.cfg.leave_network_sign_in();
+                    let _ = self.cfg.save();
+                    return;
+                }
+                self.cfg.apply_network_session(&session);
+                let _ = self.cfg.save();
+            }
+            Ok(Err(message)) => {
+                self.saved_rx = None;
+                if message.contains("Sign in required") || message.to_ascii_lowercase().contains("revoked") {
+                    self.cfg.leave_network_sign_in();
+                    let _ = self.cfg.save();
+                    self.toast.show("Signed out");
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.saved_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn start_account_delete(&mut self, id: String) {
+        let refresh_token = self.cfg.network_refresh_token();
+        let device = self.cfg.network_device_id.clone().unwrap_or_default();
+        if refresh_token.is_empty() || device.is_empty() {
+            self.status = "Sign in to delete a computer from your account.".into();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.delete_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = crate::network::delete_from_account(&refresh_token, &device, &id).map_err(|e| e.to_string());
+            let _ = tx.send(result.map(|_| id));
+        });
+    }
+
+    fn poll_account_delete(&mut self) {
+        let Some(rx) = &self.delete_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(id)) => {
+                self.delete_rx = None;
+                self.cfg.forget_account_computer(&id);
+                let _ = self.cfg.save();
+                self.next_account_pull = 0;
+                self.toast.show("Deleted from your account");
+            }
+            Ok(Err(message)) => {
+                self.delete_rx = None;
+                self.status = message;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.delete_rx = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -1916,7 +1990,9 @@ impl eframe::App for App {
         self.poll_network();
         self.poll_temporary(&ctx);
         self.poll_self_enroll();
+        self.maybe_pull_account();
         self.poll_saved_refresh();
+        self.poll_account_delete();
         self.poll_password();
         self.poll_probe();
         self.poll_ask();
@@ -1970,6 +2046,7 @@ impl eframe::App for App {
             || self.change_rx.is_some()
             || self.net_rx.is_some()
             || self.saved_rx.is_some()
+            || self.delete_rx.is_some()
             || self.lan_rx.is_some()
             || !self.viewer_rx.is_empty()
             || !self.engine.ready;

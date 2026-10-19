@@ -108,8 +108,15 @@ pub fn restore_after_temporary(disk: &mut Config, snapshot: &Config, session_pas
             }
         }
     }
+    let learned = disk.account_removed.clone();
     disk.address_book = snapshot.address_book.clone();
     disk.saved_hidden = snapshot.saved_hidden.clone();
+    disk.account_removed = snapshot.account_removed.clone();
+    for id in learned {
+        if !disk.account_removed.iter().any(|h| h == &id) {
+            disk.account_removed.push(id);
+        }
+    }
     disk.network_email = snapshot.network_email.clone();
     disk.network_refresh = snapshot.network_refresh.clone();
     disk.network_access = snapshot.network_access.clone();
@@ -122,6 +129,12 @@ pub fn restore_after_temporary(disk: &mut Config, snapshot: &Config, session_pas
     disk.server = snapshot.server.clone();
     disk.server_fingerprint = snapshot.server_fingerprint.clone();
     disk.settings.peers = snapshot.settings.peers.clone();
+    let gone = disk.account_removed.clone();
+    disk.address_book.retain(|e| !gone.iter().any(|h| h == &e.id));
+    for id in &gone {
+        disk.settings.peers.remove(id);
+        disk.saved_passwords.remove(id);
+    }
 }
 
 /// A killed temporary sign-in left a marker. Drop the passwords and recents it

@@ -23,6 +23,9 @@
       { id: "123456789", name: "Front desk", hostname: "OFFICE-PC", os_family: "windows", os_version: "11" },
       { id: "555000111", name: "", hostname: "Pixel-8", os_family: "android", os_version: "15" },
     ],
+    presence: [
+      { id: "833201199", hostname: "DESKTOP-D7E4AOR", os_family: "", os_version: "", display_name: "" },
+    ],
     changes: [{ at: 1728200000, actor: "ben@spader.us", action: "register-active", detail: "office.example:21200" }],
     invites: [
       {
@@ -382,7 +385,7 @@
     root.append(form);
 
     if (readonly && member) {
-      computers(root, data.computers || []);
+      computers(root, data, true, preview);
       return;
     }
 
@@ -570,18 +573,74 @@
       keys.append(make);
     }
     root.append(keys);
-    computers(root, data.computers || []);
+    computers(root, data, readonly, preview);
   }
 
-  function computers(root, list) {
+  function formatId(id) {
+    const digits = String(id || "").replace(/\D/g, "");
+    return digits.replace(/(\d{3})(?=\d)/g, "$1 ").trim() || String(id || "");
+  }
+
+  function computerLabel(c) {
+    const host = c.hostname || c.display_name || "";
+    const nick = c.name && host && c.name.toLowerCase() !== host.toLowerCase() ? c.name : c.name || host || "Computer";
+    return nick;
+  }
+
+  function listedComputers(data) {
+    const byId = new Map();
+    for (const c of data.computers || []) {
+      if (c.hidden) continue;
+      if (c.id) byId.set(String(c.id).replace(/\D/g, ""), c);
+    }
+    for (const p of data.presence || []) {
+      const id = String(p.id || "").replace(/\D/g, "");
+      if (!/^\d{9}$/.test(id) || byId.has(id)) continue;
+      byId.set(id, {
+        id,
+        name: "",
+        hostname: p.hostname || "",
+        display_name: p.display_name || "",
+        os_family: p.os_family || "",
+        os_version: p.os_version || "",
+      });
+    }
+    return [...byId.values()];
+  }
+
+  function computers(root, data, readonly, preview) {
+    const list = listedComputers(data);
     const comps = el("div", null, "net-card");
-    comps.append(el("h2", "Saved computers"));
-    comps.append(el("p", "Names and IDs from this account. Passwords are not stored here.", "net-muted"));
-    if (!list.length) comps.append(el("p", "No saved computers yet.", "net-muted"));
+    comps.append(el("h2", "Computers"));
+    comps.append(el("p", "Saved computers and computers registered on your server. Passwords are not stored here. Delete removes one from your account.", "net-muted"));
+    if (!list.length) comps.append(el("p", "No computers yet.", "net-muted"));
     list.forEach((c) => {
-      const host = c.hostname || "";
-      const nick = c.name && host && c.name.toLowerCase() !== host.toLowerCase() ? `${c.name} · ${host}` : c.name || host || "Computer";
-      comps.append(el("div", `${nick} · ${c.id} · ${c.os_family || "unknown"} ${c.os_version || ""}`.trim()));
+      const row = el("div", null, "net-row");
+      const name = computerLabel(c);
+      const shown = formatId(c.id);
+      row.append(el("span", `${name} · ${shown} · ${c.os_family || "unknown"} ${c.os_version || ""}`.trim()));
+      if (!readonly) {
+        const btn = el("button", "Delete from my account", "btn btn-small btn-danger");
+        btn.type = "button";
+        btn.addEventListener("click", async () => {
+          const message = `Delete ${name} (${shown}) from your PJDesk account? It leaves Saved on every signed-in computer. If that computer is signed in, it is signed out. Signing in on it again adds it back.`;
+          if (!window.confirm(message)) return;
+          if (preview) {
+            row.remove();
+            return;
+          }
+          btn.disabled = true;
+          try {
+            await PJ.call("POST", "/api/network/computers/delete", { id: c.id });
+            refresh();
+          } catch (e) {
+            btn.disabled = false;
+            comps.append(el("p", e.message, "net-msg err"));
+          }
+        });
+        row.append(btn);
+      }
+      comps.append(row);
     });
     root.append(comps);
   }

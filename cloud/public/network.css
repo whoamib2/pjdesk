@@ -68,6 +68,8 @@
 }
 .net-card .btn-small,
 .net-dialog .btn-small { padding: 6px 10px; font-size: 0.85rem; }
+.net-card .btn-danger,
+.net-dialog .btn-danger { background: #c43b3b; border-color: #c43b3b; color: #fff; }
 .net-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
 .net-invite { margin-top: 14px; }
 .net-invite input { flex: 1; width: auto; min-width: 180px; }

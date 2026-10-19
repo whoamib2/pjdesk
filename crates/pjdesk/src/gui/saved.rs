@@ -211,6 +211,9 @@ impl App {
         if let Some(id) = self.confirm_remove.clone() {
             self.remove_dialog(ui, &id);
         }
+        if let Some(id) = self.confirm_delete.clone() {
+            self.delete_dialog(ui, &id);
+        }
     }
 
     fn saved_rows(&self) -> Vec<SavedRow> {
@@ -224,7 +227,8 @@ impl App {
         }
         let mut rows = Vec::new();
         for id in ids {
-            if !pjdesk_proto::is_valid_id(&id) || self.cfg.is_saved_hidden(&id) {
+            if !pjdesk_proto::is_valid_id(&id) || self.cfg.is_saved_hidden(&id) || self.cfg.account_removed.iter().any(|h| h == &id)
+            {
                 continue;
             }
             let entry = self.cfg.address_book.iter().find(|e| e.id == id);
@@ -399,8 +403,19 @@ impl App {
                     *action = Some(RowCmd::ForgetPassword(id.clone()));
                     ui.close();
                 }
-                if ui.button("Remove").clicked() {
+                if ui.button("Remove from Saved").clicked() {
                     *action = Some(RowCmd::Remove(id.clone()));
+                    ui.close();
+                }
+                if row.this_computer {
+                    ui.add_enabled(false, egui::Button::new("Delete from my account")).on_disabled_hover_text(
+                        "This computer stays on your account while PJDesk is signed in here.",
+                    );
+                } else if self.cfg.network_refresh_token().is_empty() {
+                    ui.add_enabled(false, egui::Button::new("Delete from my account"))
+                        .on_disabled_hover_text("Sign in to delete a computer from your account.");
+                } else if ui.button("Delete from my account").clicked() {
+                    *action = Some(RowCmd::DeleteAccount(id.clone()));
                     ui.close();
                 }
             });
@@ -422,6 +437,7 @@ impl App {
                 self.toast.show("Saved password forgotten");
             }
             RowCmd::Remove(id) => self.confirm_remove = Some(id),
+            RowCmd::DeleteAccount(id) => self.confirm_delete = Some(id),
             RowCmd::Move(id, up) => self.move_saved(&id, up),
             RowCmd::Rename(id) => {
                 let hostname = self.cfg.settings.peers.get(&id).map(|n| n.hostname.clone()).unwrap_or_default();
@@ -451,23 +467,43 @@ impl App {
         }
     }
 
+    fn computer_label(&self, id: &str) -> String {
+        let entry = self.cfg.address_book.iter().find(|e| e.id == id);
+        let note = self.cfg.settings.peers.get(id);
+        let hostname = note.map(|n| n.hostname.trim().to_string()).unwrap_or_default();
+        let alias = entry.map(|e| e.alias.clone()).unwrap_or_default();
+        let nickname = crate::config::nickname_text(&alias, id, &hostname);
+        if !nickname.is_empty() {
+            nickname
+        } else if !hostname.is_empty() {
+            hostname
+        } else {
+            format_id(id)
+        }
+    }
+
     fn remove_dialog(&mut self, ui: &mut egui::Ui, id: &str) {
         let shown = format_id(id);
+        let name = self.computer_label(id);
         let mut close = false;
         let mut remove = false;
-        egui::Window::new("Remove computer")
+        egui::Window::new("Remove from Saved")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ui.ctx(), |ui| {
-                ui.label(format!("Remove {shown} from saved computers?"));
-                ui.label(widgets::muted(ui, "This forgets the name, the saved password, and the last connection. It does not change the other computer."));
+                ui.set_max_width(440.0);
+                ui.label(format!("Remove {name} ({shown}) from Saved on this computer?"));
+                ui.label(widgets::muted(
+                    ui,
+                    "This only takes it off the Saved list here. It stays on your pjdesk.com account and on your other computers. The password saved on this computer is removed.",
+                ));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         close = true;
                     }
-                    if widgets::accent_button(ui, "Remove", Vec2::new(100.0, 32.0)) {
+                    if widgets::accent_button(ui, "Remove from Saved", Vec2::new(160.0, 32.0)) {
                         remove = true;
                     }
                 });
@@ -480,8 +516,44 @@ impl App {
             self.cfg.hide_saved(&id);
             self.confirm_remove = None;
             self.saved_sort = SavedSort::Order;
-            self.sync_address_book();
-            self.toast.show("Removed");
+            self.save_cfg();
+            self.toast.show("Removed from Saved");
+        }
+    }
+
+    fn delete_dialog(&mut self, ui: &mut egui::Ui, id: &str) {
+        let shown = format_id(id);
+        let name = self.computer_label(id);
+        let mut close = false;
+        let mut delete = false;
+        egui::Window::new("Delete from my account")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.set_max_width(440.0);
+                ui.label(format!("Delete {name} ({shown}) from your PJDesk account?"));
+                ui.label(widgets::muted(
+                    ui,
+                    "It leaves Saved on every computer signed in to this account. The password saved on this computer is removed. If that computer is signed in, it is signed out. Signing in on it again adds it back.",
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    if widgets::danger_button(ui, "Delete from my account", Vec2::new(210.0, 32.0)) {
+                        delete = true;
+                    }
+                });
+            });
+        if close {
+            self.confirm_delete = None;
+        }
+        if delete {
+            let id = id.to_string();
+            self.confirm_delete = None;
+            self.start_account_delete(id);
         }
     }
 
@@ -618,6 +690,7 @@ enum RowCmd {
     Favorite(String),
     ForgetPassword(String),
     Remove(String),
+    DeleteAccount(String),
     Rename(String),
     CommitRename(String),
     Move(String, bool),

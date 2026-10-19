@@ -109,6 +109,12 @@ pub fn accent_button(ui: &mut egui::Ui, label: &str, size: egui::Vec2) -> bool {
     ui.add_sized(size, egui::Button::new(RichText::new(label).strong().color(p.on_accent)).fill(p.accent)).clicked()
 }
 
+/// A destructive action. The label is the only signal, so it names what is deleted.
+pub fn danger_button(ui: &mut egui::Ui, label: &str, size: egui::Vec2) -> bool {
+    let fill = Color32::from_rgb(0xc4, 0x3b, 0x3b);
+    ui.add_sized(size, egui::Button::new(RichText::new(label).strong().color(Color32::WHITE)).fill(fill)).clicked()
+}
+
 /// Square icon button. The tooltip is required so the shape is never the only label.
 pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
     icon_button_active(ui, icon, tip, false)

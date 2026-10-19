@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.5
+
+Saved → Menu has two different actions. **Remove from Saved** takes a computer off the list on this computer only. **Delete from my account** removes it from the pjdesk.com account, so it leaves Saved on every signed-in computer. Desktop and server are 0.6.5. Android stays 0.6.7. Run `cloud\deploy.cmd` from your PC so migration `0012_removed_computers.sql` is applied and the worker is deployed. Do that before using Delete from my account. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. No tag, no release, and no GitHub Actions.
+
+* **Remove from Saved** is on the row Menu. It asks before it removes the computer from Saved on this computer, and it clears the password saved here. The computer stays on the account and on your other computers.
+* **Delete from my account** is on the same Menu. The confirm dialog names the computer and its ID. It is not offered for This computer. It deletes that computer's saved rows, its presence slot, and its sign-in from the account. Signed-in clients drop it on their next refresh (the open window checks about every 20 seconds). The password saved on the computer that clicked Delete is cleared. Signing in on that computer again adds it back.
+* pjdesk.com → Account → My network → Computers lists the same computers, with **Delete from my account**.
+
 ## 0.6.4
 
 A published 0.6.3 showed the Allow prompt before any password, so an unattended computer with a permanent password could not be reached. Desktop and server are 0.6.4. Android is 0.6.7. Install the server before the clients. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. On the server PC, in cloud\, run `cloud\deploy.cmd` so migrations 0008–0011 are applied before relying on installer display names. The PJDesk Server account sign-in stays persistent. No tag, no release, and no GitHub Actions.

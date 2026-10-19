@@ -377,6 +377,28 @@ export function savedShape(row) {
   return cleanComputer(row);
 }
 
+/** Nine digits, or "" when it is not a PJDesk ID. */
+export function pjdeskId(raw) {
+  const id = String(raw || "").replace(/\D/g, "");
+  return /^\d{9}$/.test(id) ? id : "";
+}
+
+/** Drops rows whose id was deleted from the account. */
+export function keepListed(rows, removed) {
+  const gone = new Set((removed || []).map((id) => pjdeskId(id)).filter(Boolean));
+  if (!gone.size) return rows || [];
+  return (rows || []).filter((row) => {
+    const id = pjdeskId(row?.id || row?.device_id || row?.pjdesk_id);
+    return !id || !gone.has(id);
+  });
+}
+
+export function ownerMayDelete(callerEmail, ownerEmail) {
+  const owner = String(ownerEmail || "").trim().toLowerCase();
+  const caller = String(callerEmail || "").trim().toLowerCase();
+  return !!owner && caller === owner;
+}
+
 function missingSavedColumn(err) {
   const message = columnMessage(err);
   return /no such column/i.test(message) && /starred|position|hidden/i.test(message);
@@ -409,6 +431,11 @@ function missingSavedDisplay(err) {
 }
 
 async function computersFor(env, networkId, accountId) {
+  const rows = await computersForStored(env, networkId, accountId);
+  return keepListed(rows, await removedFor(env, networkId));
+}
+
+async function computersForStored(env, networkId, accountId) {
   try {
     const { results } = await env.DB.prepare(
       `SELECT device_id, name, hostname, os_family, os_version, starred, position, hidden, display_name FROM network_computers
@@ -486,7 +513,8 @@ async function computersForLegacy(env, networkId, accountId, err) {
 }
 
 async function saveComputers(env, networkId, accountId, list) {
-  const rows = (Array.isArray(list) ? list : []).map(cleanComputer).filter(Boolean).slice(0, 500);
+  const removed = await removedFor(env, networkId);
+  const rows = keepListed((Array.isArray(list) ? list : []).map(cleanComputer).filter(Boolean), removed).slice(0, 500);
   const t = now();
   if (!rows.length) return;
   try {
@@ -638,6 +666,11 @@ function missingDisplay(err) {
 }
 
 async function presenceFor(env, networkId, role) {
+  const rows = await presenceForStored(env, networkId, role);
+  return keepListed(rows, await removedFor(env, networkId));
+}
+
+async function presenceForStored(env, networkId, role) {
   try {
     const cutoff = now() - 90 * 24 * 3600;
     const { results } = await env.DB.prepare(
@@ -701,6 +734,84 @@ async function accountRole(env, network, account) {
   return owner?.email === account.email ? "owner" : "member";
 }
 
+function missingRemoved(err) {
+  const message = columnMessage(err);
+  return /no such table/i.test(message) && /network_removed/i.test(message);
+}
+
+function missingPjdeskColumn(err) {
+  const message = columnMessage(err);
+  return /no such column/i.test(message) && /pjdesk_id/i.test(message);
+}
+
+async function removedFor(env, networkId) {
+  try {
+    const { results } = await env.DB.prepare("SELECT pjdesk_id FROM network_removed WHERE network_id = ?")
+      .bind(networkId)
+      .all();
+    return (results || []).map((row) => row.pjdesk_id).filter(Boolean);
+  } catch (err) {
+    if (missingRemoved(err)) return [];
+    throw err;
+  }
+}
+
+async function clearRemoved(env, networkId, id) {
+  try {
+    await env.DB.prepare("DELETE FROM network_removed WHERE network_id = ? AND pjdesk_id = ?").bind(networkId, id).run();
+  } catch (err) {
+    if (!missingRemoved(err)) throw err;
+  }
+}
+
+async function rememberPjdesk(env, networkId, deviceId, pjdesk) {
+  if (!pjdesk || !deviceId) return;
+  try {
+    await env.DB.prepare(
+      "UPDATE network_devices SET pjdesk_id = ? WHERE network_id = ? AND device_id = ? AND pjdesk_id != ?",
+    )
+      .bind(pjdesk, networkId, deviceId, pjdesk)
+      .run();
+  } catch (err) {
+    if (!missingPjdeskColumn(err)) throw err;
+  }
+}
+
+/** Deletes the saved rows, the presence slot, and a sign-in tied to this ID. */
+export async function forgetComputer(env, networkId, rawId) {
+  const id = pjdeskId(rawId);
+  if (!id) throw new HttpError(400, "That is not a PJDesk ID.");
+  try {
+    await env.DB.prepare(
+      `INSERT INTO network_removed (network_id, pjdesk_id, removed_at) VALUES (?, ?, ?)
+       ON CONFLICT(network_id, pjdesk_id) DO UPDATE SET removed_at = excluded.removed_at`,
+    )
+      .bind(networkId, id, now())
+      .run();
+  } catch (err) {
+    if (missingRemoved(err)) {
+      throw new HttpError(
+        503,
+        "Update the account service before deleting a computer. On your PC, in cloud\\, run cloud\\deploy.cmd.",
+      );
+    }
+    throw err;
+  }
+  await env.DB.prepare("DELETE FROM network_computers WHERE network_id = ? AND device_id = ?").bind(networkId, id).run();
+  try {
+    await env.DB.prepare("DELETE FROM network_presence WHERE network_id = ? AND pjdesk_id = ?").bind(networkId, id).run();
+  } catch (err) {
+    if (!missingPresence(err)) throw err;
+  }
+  await env.DB.prepare("DELETE FROM network_devices WHERE network_id = ? AND device_id = ?").bind(networkId, id).run();
+  try {
+    await env.DB.prepare("DELETE FROM network_devices WHERE network_id = ? AND pjdesk_id = ?").bind(networkId, id).run();
+  } catch (err) {
+    if (!missingPjdeskColumn(err)) throw err;
+  }
+  return id;
+}
+
 async function issue(env, account, network, deviceId, deviceName, computers) {
   if (!validDevice(deviceId)) throw new HttpError(400, "This device needs an id.");
   if (!network.active_address) throw new HttpError(400, NO_SERVER_MESSAGE);
@@ -728,6 +839,7 @@ async function issue(env, account, network, deviceId, deviceName, computers) {
     network: networkView(network),
     computers: saved,
     presence,
+    removed: await removedFor(env, network.id),
   };
 }
 
@@ -757,6 +869,7 @@ async function handle(request, env, url) {
   if (p === "/api/network/enroll" && m === "POST") return enroll(request, env);
   if (p === "/api/network/refresh" && m === "POST") return refresh(request, env);
   if (p === "/api/network/redeem" && m === "POST") return redeem(request, env);
+  if (p === "/api/network/computers/delete" && m === "POST") return deleteComputer(request, env);
 
   const account = await session(request, env);
 
@@ -797,6 +910,8 @@ async function getNetwork(env, account) {
     body.devices = devices.results || [];
     body.invites = await invitesFor(env, network.id);
     body.changes = await changesFor(env, network.id);
+    body.presence = await presenceFor(env, network.id, role);
+    body.removed = await removedFor(env, network.id);
     body.note = "Computers that have not signed in are listed in the PJDesk Server window until you turn on Require signed-in accounts.";
   }
   return json(body);
@@ -1048,6 +1163,9 @@ async function refresh(request, env) {
   if (owner?.email !== row.email && !member) throw new HttpError(401, "Sign in required.");
   const account = { accountId: row.account_id, email: row.email };
   if (requireAccountsOn(row.require_accounts) && !row.active_address) throw new HttpError(401, "Sign in required.");
+  const self = pjdeskId(body.pjdesk_id);
+  if (self) await rememberPjdesk(env, row.id, deviceId, self);
+  if (body.reinstate === true && self) await clearRemoved(env, row.id, self);
   const { access, exp } = await signToken(env, { email: account.email, network: row, deviceId });
   if (body.computers) await saveComputers(env, row.id, account.accountId, body.computers);
   const saved = await computersFor(env, row.id, account.accountId);
@@ -1061,6 +1179,7 @@ async function refresh(request, env) {
     network: networkView(row),
     computers: saved,
     presence,
+    removed: await removedFor(env, row.id),
   });
 }
 
@@ -1071,11 +1190,12 @@ async function postPresence(request, env, account) {
   }
   const body = await readJson(request);
   const devices = Array.isArray(body.devices) ? body.devices.slice(0, 500) : [];
+  const removed = new Set(await removedFor(env, found.network.id));
   const cutoff = now() - 90 * 24 * 3600;
   const stmts = [];
   for (const raw of devices) {
     const id = String(raw.id || "").replace(/\D/g, "");
-    if (!/^\d{9}$/.test(id)) continue;
+    if (!/^\d{9}$/.test(id) || removed.has(id)) continue;
     const last = Number(raw.last_seen) || now();
     if (last < cutoff) continue;
     const next = applyPresence({}, raw);
@@ -1120,8 +1240,56 @@ async function postPresence(request, env, account) {
 
 async function listComputers(env, account) {
   const found = await networkFor(env, account);
-  if (!found.network) return json({ computers: [] });
-  return json({ computers: await computersFor(env, found.network.id, account.accountId) });
+  if (!found.network) return json({ computers: [], removed: [] });
+  return json({
+    computers: await computersFor(env, found.network.id, account.accountId),
+    removed: await removedFor(env, found.network.id),
+  });
+}
+
+async function ownerByRefresh(env, body) {
+  const refreshToken = String(body.refresh || "");
+  const deviceId = String(body.device_id || "");
+  if (!validDevice(deviceId) || !/^[0-9a-f]{64}$/.test(refreshToken)) throw new HttpError(401, "Sign in required.");
+  const hash = await sha256Hex(refreshToken);
+  const row = await env.DB.prepare(
+    `SELECT d.account_id, d.email, d.revoked_at, n.id AS network_id, n.owner_id
+       FROM network_devices d JOIN networks n ON n.id = d.network_id
+      WHERE d.device_id = ? AND d.refresh_hash = ?`,
+  )
+    .bind(deviceId, hash)
+    .first();
+  if (!row || row.revoked_at) throw new HttpError(401, "Sign in required.");
+  const owner = await env.DB.prepare("SELECT email FROM accounts WHERE id = ?").bind(row.owner_id).first();
+  if (!ownerMayDelete(row.email, owner?.email)) {
+    throw new HttpError(403, "Only the network owner can delete a computer from the account.");
+  }
+  return { networkId: row.network_id, email: row.email };
+}
+
+async function deleteComputer(request, env) {
+  const body = await readJson(request);
+  const id = pjdeskId(body.id);
+  if (!id) throw new HttpError(400, "That is not a PJDesk ID.");
+  let networkId;
+  let actor;
+  const header = request.headers.get("authorization") || "";
+  if (/^Bearer\s+\S+/.test(header) && !body.refresh) {
+    const account = await session(request, env);
+    const found = await networkFor(env, account);
+    if (!found.network || found.role !== "owner") {
+      throw new HttpError(403, "Only the network owner can delete a computer from the account.");
+    }
+    networkId = found.network.id;
+    actor = account.email;
+  } else {
+    const opened = await ownerByRefresh(env, body);
+    networkId = opened.networkId;
+    actor = opened.email;
+  }
+  await forgetComputer(env, networkId, id);
+  await logChange(env, networkId, actor, "delete-computer", id);
+  return json({ ok: true, id, removed: await removedFor(env, networkId) });
 }
 
 async function putComputers(request, env, account) {
@@ -1129,7 +1297,10 @@ async function putComputers(request, env, account) {
   if (!found.network) throw new HttpError(403, "This account is not on a network.");
   const body = await readJson(request);
   await saveComputers(env, found.network.id, account.accountId, body.computers);
-  return json({ computers: await computersFor(env, found.network.id, account.accountId) });
+  return json({
+    computers: await computersFor(env, found.network.id, account.accountId),
+    removed: await removedFor(env, found.network.id),
+  });
 }
 
 async function enrollCode(env, account) {

@@ -76,10 +76,14 @@ pub struct Config {
     /// Sign-out clears it so the next sign-in merges again. The list itself stays.
     #[serde(default)]
     pub network_list_merged: bool,
-    /// Saved computers this person removed. They stay hidden, including ones the
-    /// server registry still reports. Synced with the account while signed in.
+    /// Saved computers this person removed on this computer only.
+    /// They stay off this list. The account still has them.
     #[serde(default)]
     pub saved_hidden: Vec<String>,
+    /// Computers deleted from the pjdesk.com account. They stay off every
+    /// signed-in client until that computer signs in again.
+    #[serde(default)]
+    pub account_removed: Vec<String>,
     /// A sign-in that must not be written. Saves keep the account, the saved
     /// list, and passwords already on disk, and write this process's device id.
     #[serde(skip)]
@@ -491,6 +495,19 @@ impl Config {
             writing.saved_hidden = disk.saved_hidden;
             writing.saved_passwords = disk.saved_passwords;
             writing.settings.peers = disk.settings.peers;
+            let mut removed = disk.account_removed;
+            for id in &self.account_removed {
+                if !removed.iter().any(|h| h == id) {
+                    removed.push(id.clone());
+                }
+            }
+            writing.account_removed = removed;
+            let gone = writing.account_removed.clone();
+            writing.address_book.retain(|e| !gone.iter().any(|h| h == &e.id));
+            for id in &gone {
+                writing.settings.peers.remove(id);
+                writing.saved_passwords.remove(id);
+            }
             if writing.device_id.is_none() {
                 writing.device_id = disk.device_id;
             }
@@ -508,6 +525,7 @@ impl Config {
             writing.network_list_merged = false;
             writing.address_book.clear();
             writing.saved_hidden.clear();
+            writing.account_removed.clear();
             writing.saved_passwords.clear();
             writing.settings.peers.clear();
             writing.server = None;
@@ -613,6 +631,16 @@ impl Config {
         if let Ok(fp) = parse_fingerprint(&session.standby_fingerprint) {
             self.network_standby_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         }
+        for id in &session.removed {
+            self.forget_account_computer(id);
+        }
+        for computer in &session.computers {
+            let id = pjdesk_proto::normalize_id(&computer.id);
+            let still = session.removed.iter().any(|r| pjdesk_proto::normalize_id(r) == id);
+            if !computer.hidden && !still {
+                self.account_removed.retain(|h| h != &id);
+            }
+        }
         let first = !self.network_list_merged;
         self.merge_computers(&session.computers, first);
         self.merge_presence(&session.presence);
@@ -651,13 +679,29 @@ impl Config {
         }
     }
 
+    /// Drops a computer the account deleted. The password on this computer goes
+    /// with it. A later sign-in on that computer puts the row back.
+    pub fn forget_account_computer(&mut self, id: &str) {
+        let id = pjdesk_proto::normalize_id(id);
+        if !pjdesk_proto::is_valid_id(&id) {
+            return;
+        }
+        self.address_book.retain(|e| e.id != id);
+        self.saved_passwords.remove(&id);
+        self.settings.peers.remove(&id);
+        self.saved_hidden.retain(|h| h != &id);
+        if !self.account_removed.iter().any(|h| h == &id) {
+            self.account_removed.push(id);
+        }
+    }
+
     /// Adds computers the account's server has seen, including ones saved
     /// earlier with no name. A nickname already typed here is left as it is.
     /// An empty hostname or user does not erase one already stored.
     pub fn merge_presence(&mut self, rows: &[crate::network::HostPresence]) {
         for row in rows {
             let id = pjdesk_proto::normalize_id(&row.id);
-            if !pjdesk_proto::is_valid_id(&id) {
+            if !pjdesk_proto::is_valid_id(&id) || self.account_removed.iter().any(|h| h == &id) {
                 continue;
             }
             let note = self.settings.peers.entry(id.clone()).or_default();
@@ -680,7 +724,7 @@ impl Config {
                 note.last_seen = row.last_seen;
             }
             note.reported_online = row.online;
-            if self.is_saved_hidden(&id) {
+            if self.is_saved_hidden(&id) || self.account_removed.iter().any(|h| h == &id) {
                 continue;
             }
             if !self.address_book.iter().any(|e| e.id == id) {
@@ -700,6 +744,9 @@ impl Config {
             if !pjdesk_proto::is_valid_id(&id) {
                 continue;
             }
+            if self.account_removed.iter().any(|h| h == &id) {
+                continue;
+            }
             if computer.hidden {
                 self.address_book.retain(|e| e.id != id);
                 if !self.saved_hidden.iter().any(|h| h == &id) {
@@ -707,7 +754,12 @@ impl Config {
                 }
                 continue;
             }
-            self.saved_hidden.retain(|h| h != &id);
+            if prefer_account {
+                self.saved_hidden.retain(|h| h != &id);
+            }
+            if self.is_saved_hidden(&id) {
+                continue;
+            }
             let note = self.settings.peers.entry(id.clone()).or_default();
             if note.hostname.trim().is_empty() && !computer.hostname.trim().is_empty() {
                 note.hostname = computer.hostname.trim().to_string();
@@ -1051,6 +1103,42 @@ mod tests {
         assert_eq!(c.address_book.len(), 3);
         assert_eq!(c.saved_password("111111111").as_deref(), Some("local-secret"));
         assert!(c.settings.peers.get("222222222").unwrap().favorite);
+    }
+
+    #[test]
+    fn a_local_remove_stays_and_an_account_delete_does_not_come_back() {
+        let mut c = Config::default();
+        c.address_book = vec![AddressEntry { id: "333333333".into(), alias: "Pixel".into(), ..Default::default() }];
+        c.remember_password("333333333", Some("phone-secret"));
+        c.remember_password("692996394", Some("desk-secret"));
+        c.settings.peers.insert("692996394".into(), PeerNote { hostname: "BENLENOVODESK".into(), ..Default::default() });
+        c.hide_saved("333333333");
+        c.merge_computers(
+            &[crate::network::SavedComputer {
+                id: "333333333".into(),
+                name: "Pixel".into(),
+                hostname: "Pixel 11".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        assert!(c.is_saved_hidden("333333333"));
+        assert!(c.address_book.iter().all(|e| e.id != "333333333"));
+        assert_eq!(c.saved_password("333333333"), None);
+        c.forget_account_computer("692996394");
+        c.merge_presence(&[crate::network::HostPresence {
+            id: "692996394".into(),
+            hostname: "BENLENOVODESK".into(),
+            os_family: "windows".into(),
+            os_version: "11".into(),
+            console_user: String::new(),
+            display_name: None,
+            last_seen: 50,
+            online: false,
+        }]);
+        assert!(c.address_book.iter().all(|e| e.id != "692996394"));
+        assert!(c.settings.peers.get("692996394").is_none());
+        assert_eq!(c.saved_password("692996394"), None);
     }
 
     #[test]
