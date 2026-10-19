@@ -368,6 +368,7 @@ function cleanComputer(row) {
     starred: row.starred === true || row.starred === 1,
     position: Number.isFinite(position) && position > 0 ? Math.min(position, 1_000_000) : 0,
     hidden,
+    display_name: String(row.display_name || "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 64),
   };
 }
 
@@ -402,8 +403,39 @@ function missingHostnameColumn(err) {
   return /no such column/i.test(message) && /hostname/i.test(message);
 }
 
+function missingSavedDisplay(err) {
+  const message = columnMessage(err);
+  return /no such column/i.test(message) && /display_name/i.test(message);
+}
+
 async function computersFor(env, networkId, accountId) {
   try {
+    const { results } = await env.DB.prepare(
+      `SELECT device_id, name, hostname, os_family, os_version, starred, position, hidden, display_name FROM network_computers
+        WHERE network_id = ? AND account_id = ? ORDER BY position, updated_at DESC LIMIT 500`,
+    )
+      .bind(networkId, accountId)
+      .all();
+    return (results || []).map((r) => ({
+      id: r.device_id,
+      name: r.hidden ? "" : r.name,
+      hostname: r.hostname || "",
+      os_family: r.os_family,
+      os_version: r.os_version,
+      starred: !!r.starred,
+      position: Number(r.position) || 0,
+      hidden: !!r.hidden,
+      display_name: r.display_name || "",
+    }));
+  } catch (err) {
+    if (missingSavedDisplay(err)) return computersForLegacy(env, networkId, accountId);
+    return computersForLegacy(env, networkId, accountId, err);
+  }
+}
+
+async function computersForLegacy(env, networkId, accountId, err) {
+  try {
+    if (err) throw err;
     const { results } = await env.DB.prepare(
       `SELECT device_id, name, hostname, os_family, os_version, starred, position, hidden FROM network_computers
         WHERE network_id = ? AND account_id = ? ORDER BY position, updated_at DESC LIMIT 500`,
@@ -456,6 +488,44 @@ async function computersFor(env, networkId, accountId) {
 async function saveComputers(env, networkId, accountId, list) {
   const rows = (Array.isArray(list) ? list : []).map(cleanComputer).filter(Boolean).slice(0, 500);
   const t = now();
+  if (!rows.length) return;
+  try {
+    await saveComputersDisplay(env, networkId, accountId, rows, t);
+  } catch (err) {
+    if (!missingSavedDisplay(err) && !missingSavedColumn(err) && !missingHostnameColumn(err)) throw err;
+    await saveComputersLegacy(env, networkId, accountId, rows, t);
+  }
+}
+
+async function saveComputersDisplay(env, networkId, accountId, rows, t) {
+  const writes = rows.map((c) =>
+    env.DB.prepare(
+      `INSERT INTO network_computers (network_id, account_id, device_id, name, hostname, os_family, os_version, updated_at, starred, position, hidden, display_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(network_id, account_id, device_id) DO UPDATE SET
+         name = excluded.name, hostname = excluded.hostname, os_family = excluded.os_family,
+         os_version = excluded.os_version, updated_at = excluded.updated_at,
+         starred = excluded.starred, position = excluded.position, hidden = excluded.hidden,
+         display_name = CASE WHEN excluded.display_name != '' THEN excluded.display_name ELSE network_computers.display_name END`,
+    ).bind(
+      networkId,
+      accountId,
+      c.id,
+      c.hidden ? "" : c.name,
+      c.hidden ? "" : c.hostname,
+      c.os_family,
+      c.os_version,
+      t,
+      c.starred ? 1 : 0,
+      c.position || 0,
+      c.hidden ? 1 : 0,
+      c.display_name || "",
+    ),
+  );
+  await env.DB.batch(writes);
+}
+
+async function saveComputersLegacy(env, networkId, accountId, rows, t) {
   const withHost = rows.map((c) =>
     env.DB.prepare(
       `INSERT INTO network_computers (network_id, account_id, device_id, name, hostname, os_family, os_version, updated_at, starred, position, hidden)

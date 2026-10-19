@@ -74,7 +74,7 @@ pub fn display_name_report() -> ClientMsg {
 }
 
 pub fn report() -> ClientMsg {
-    let (os_family, os_version) = os_facts();
+    let (os_family, os_version) = os_pair();
     ClientMsg::ReportHost {
         hostname: crate::hostname(),
         os_family,
@@ -90,6 +90,11 @@ fn console_user() -> String {
 
 fn sanitize(text: &str, max: usize) -> String {
     text.trim().chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
+/// Operating system family and version for this computer.
+pub fn os_pair() -> (String, String) {
+    os_facts()
 }
 
 #[cfg(windows)]

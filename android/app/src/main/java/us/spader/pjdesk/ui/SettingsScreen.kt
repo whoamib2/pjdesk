@@ -47,6 +47,8 @@ fun SettingsScreen(
     computerName: String = "",
     deviceLabel: String = "",
     onComputerName: (String) -> Unit = {},
+    tempIdleMinutes: Int = 30,
+    onTempIdleMinutes: (Int) -> Unit = {},
 ) {
     var server by rememberSaveable(state.server) { mutableStateOf(state.server) }
     var name by rememberSaveable(computerName) { mutableStateOf(computerName) }
@@ -131,8 +133,25 @@ fun SettingsScreen(
                 }
             }
         }
+        Section("Sign-in") {
+            Text("Temporary sign-in", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Minutes with no PJDesk activity before a temporary sign-in ends. The sign-in checkbox on the sign-in screen starts checked.",
+                color = pjMuted(),
+            )
+            var idle by rememberSaveable(tempIdleMinutes) { mutableStateOf(tempIdleMinutes.toString()) }
+            OutlinedTextField(
+                value = idle,
+                onValueChange = {
+                    idle = it.filter { ch -> ch.isDigit() }.take(4)
+                    idle.toIntOrNull()?.let { n -> onTempIdleMinutes(n.coerceIn(1, 24 * 60)) }
+                },
+                singleLine = true,
+                label = { Text("Idle minutes") },
+            )
+        }
         Section("About") {
-            Text("PJDesk 0.6.5", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.6", style = MaterialTheme.typography.titleMedium)
             Text(
                 "Android host and controller. Video is H.264 Annex-B from the hardware encoder, the same stream the Windows client decodes with OpenH264. The server comes from your PJDesk account after you sign in.",
                 color = pjMuted(),

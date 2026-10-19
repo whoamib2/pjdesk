@@ -147,10 +147,68 @@ object CloudAuth {
                     .put("name", c.nickname())
                     .put("hostname", c.hostname)
                     .put("os_family", c.osFamily)
-                    .put("os_version", c.osVersion),
+                    .put("os_version", c.osVersion)
+                    .put("display_name", c.displayName),
             )
         }
         return array
+    }
+
+    /**
+     * Adds this phone to the account list, keeping a nickname already stored.
+     * `uploadLocal` is false for a temporary sign-in, so a list already on this
+     * phone is not sent to the account.
+     */
+    fun prepareEnroll(
+        account: List<SavedComputer>,
+        local: List<SavedComputer>,
+        uploadLocal: Boolean,
+        id: String,
+        hostname: String,
+        displayName: String,
+        osVersion: String,
+    ): List<SavedComputer> {
+        val digits = id.filter { it.isDigit() }
+        val base = (if (uploadLocal) local else account).toMutableList()
+        if (uploadLocal && digits.length == 9) {
+            val accountName = account.find { it.id == digits }?.nickname().orEmpty()
+            val index = base.indexOfFirst { it.id == digits }
+            if (index >= 0 && accountName.isNotBlank() && base[index].nickname().isBlank()) {
+                base[index] = base[index].copy(name = accountName)
+            }
+        }
+        return enrollComputer(base, digits, hostname, displayName, osVersion)
+    }
+
+    fun enrollComputer(
+        computers: List<SavedComputer>,
+        id: String,
+        hostname: String,
+        displayName: String,
+        osVersion: String,
+    ): List<SavedComputer> {
+        if (id.length != 9) return computers
+        val host = hostname.trim()
+        val display = displayName.trim().let { if (it.equals(host, ignoreCase = true)) "" else it }
+        val index = computers.indexOfFirst { it.id == id }
+        if (index < 0) {
+            return computers + SavedComputer(
+                id = id,
+                hostname = host,
+                osFamily = "android",
+                osVersion = osVersion,
+                displayName = display,
+            )
+        }
+        val cur = computers[index]
+        return computers.toMutableList().also {
+            it[index] = cur.copy(
+                hostname = host.ifBlank { cur.hostname },
+                osFamily = "android",
+                osVersion = osVersion.ifBlank { cur.osVersion },
+                displayName = display.ifBlank { cur.displayName },
+            )
+        }
     }
 
     private fun session(email: String, deviceId: String, reply: JSONObject): Session {
@@ -169,6 +227,7 @@ object CloudAuth {
                         osFamily = o.optString("os_family"),
                         osVersion = o.optString("os_version"),
                         hostname = o.optString("hostname"),
+                        displayName = o.optString("display_name"),
                     ),
                 )
             }
@@ -221,6 +280,7 @@ object CloudAuth {
                 osFamily = incoming.osFamily.ifBlank { cur.osFamily },
                 osVersion = incoming.osVersion.ifBlank { cur.osVersion },
                 consoleUser = incoming.consoleUser.ifBlank { cur.consoleUser },
+                displayName = incoming.displayName.ifBlank { cur.displayName },
                 lastSeen = maxOf(cur.lastSeen, incoming.lastSeen),
                 online = incoming.online,
             )

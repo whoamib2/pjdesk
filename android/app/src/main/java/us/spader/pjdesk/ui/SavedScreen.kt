@@ -70,7 +70,8 @@ fun SavedScreen(
             items(shown, key = { it.id }) { computer ->
                 val nick = computer.nickname()
                 val host = computer.hostname.trim()
-                val title = nick.ifBlank { host.ifBlank { "No name yet" } }
+                val display = computer.displayName.trim().let { if (it.equals(host, ignoreCase = true)) "" else it }
+                val title = nick.ifBlank { display.ifBlank { host.ifBlank { "No name yet" } } }
                 val system = osLabel(computer.osFamily).ifBlank { "Unknown" }
                 val mine = selfId.isNotBlank() && computer.id == selfId.filter { it.isDigit() }
                 Card(Modifier.fillMaxWidth().clickable(enabled = !mine) { onOpen(computer) }) {
@@ -149,6 +150,7 @@ private fun matches(computer: SavedComputer, query: String): Boolean {
     val system = osLabel(computer.osFamily)
     return computer.nickname().lowercase().contains(q)
         || computer.hostname.lowercase().contains(q)
+        || computer.displayName.lowercase().contains(q)
         || (qid.isNotEmpty() && id.contains(qid))
         || computer.osFamily.lowercase().contains(q)
         || computer.consoleUser.lowercase().contains(q)

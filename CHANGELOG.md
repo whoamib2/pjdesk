@@ -2,14 +2,19 @@
 
 ## 0.6.3
 
-The PJDesk Server window stays usable after an update without Administrator rights. Desktop and server are 0.6.3. Android stays 0.6.5. No new database migration. No tag, no release, and no GitHub Actions.
+The PJDesk Server window stays usable after an update without Administrator rights. Signing in on a client adds that computer to the account, and the sign-in checkbox starts checked so the visit does not stay on someone else's computer. Desktop and server are 0.6.3. Android is 0.6.6. Run `cloud\deploy.cmd` from your PC so migration `0011_saved_display_name.sql` is applied and the worker is deployed. Do that before expecting the installer name to sync. No tag, no release, and no GitHub Actions.
+
+* Signing in on a client adds that computer (its ID, hostname, the name from the installer or Settings, and the operating system) to Saved computers on the account. If it is already there, the nickname stays and the other details refresh. It stays on the account after you sign out. Remove it from Saved → Menu → Remove, or on pjdesk.com. A computer that was hidden is shown again when you sign in on it.
+* The sign-in screen has **Sign me out when I'm done (use on someone else's computer)**, checked each time the form opens. Checked, the sign-in lasts until you close PJDesk, Windows locks or signs out or the PC shuts down, or PJDesk is idle (30 minutes, changeable in Settings, with a 60 second warning and **Stay signed in**). The refresh token stays in memory. Signing out removes the synced Saved list from that visit, passwords saved during the visit, Recent entries from the visit, and the account email. The computer stays in the account. Unchecked, sign-in still survives a restart and an update. The header says **Signed in until you close PJDesk** and shows **Sign out**.
+* **Just add this computer to my account**, under Sign in, signs in, adds this computer, and signs out immediately.
+* The PJDesk Server window's own account sign-in stays persistent. Android uses the same checkbox, checked by default, and signs out when the app is closed or after the same idle time. Android is 0.6.6.
 
 * Saving settings, signing in and out of the pjdesk.com account, the network address, the public-IP watch, Require signed-in accounts, promote, demote, sync, check for updates, install an update, and restarting the service go through the running PJDesk service. The window does not need to be elevated for those.
 * The service accepts a command when the caller is an administrator (including a normal Windows sign-in whose administrator rights are filtered by UAC) or the request carries a valid pjdesk.com access token for the same account the server is signed in to. Other local users are denied. Every command is written to the audit log. Passwords and tokens are not.
 * Install, uninstall, and stop still ask Windows to approve that one action. Restart as administrator stays as a link.
 * After an automatic update the window and tray open in the user session, as before. When the service answers, the window says **Managed through the PJDesk service.** instead of the administrator warning.
 * Sign-in stays across the update. The saved account is not removed.
-* A desktop 0.6.3 that already told the server its operating system is asked for the computer name. Android 0.6.3, and a 0.6.3 with no operating system stored, are not asked.
+* A desktop 0.6.3 that already told the server its operating system is asked for the computer name. Android 0.6.3, and a 0.6.3 with no operating system stored, are not asked. Android 0.6.6 is asked.
 
 ## 0.6.2
 

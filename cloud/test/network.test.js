@@ -245,9 +245,11 @@ test("a saved computer keeps the nickname, star, and order, and never a password
     starred: true,
     position: 20,
     password: "correct horse",
+    display_name: "Cabin desk",
   });
   assert.equal(row.id, "902488771");
   assert.equal(row.name, "Cabin");
+  assert.equal(row.display_name, "Cabin desk");
   assert.equal(row.starred, true);
   assert.equal(row.position, 20);
   assert.equal(row.hidden, false);

@@ -10,6 +10,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import us.spader.pjdesk.core.CloudAuth
 import us.spader.pjdesk.core.SavedComputer
+import us.spader.pjdesk.core.nickname
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -50,6 +51,29 @@ class CloudAuthTest {
         assertEquals("", hidden.getString("name"))
         assertEquals("BEN-PC", hidden.getString("hostname"))
         assertFalse(hidden.toString().contains("password"))
+    }
+
+    @Test
+    fun signingInAddsThisPhoneAndKeepsANickname() {
+        val account = listOf(SavedComputer("386626882", "Pixel", hostname = "old", displayName = ""))
+        val added = CloudAuth.prepareEnroll(
+            account,
+            listOf(SavedComputer("111111111", "Friend")),
+            uploadLocal = false,
+            id = "386 626 882",
+            hostname = "Pixel 8",
+            displayName = "Ben's phone",
+            osVersion = "15",
+        )
+        assertEquals(1, added.size)
+        assertEquals("Pixel", added[0].nickname())
+        assertEquals("Pixel 8", added[0].hostname)
+        assertEquals("Ben's phone", added[0].displayName)
+        assertFalse(added.any { it.id == "111111111" })
+        val fresh = CloudAuth.enrollComputer(emptyList(), "692996394", "BENLENOVODESK", "Office", "11")
+        assertEquals("692996394", fresh[0].id)
+        assertEquals("", fresh[0].nickname())
+        assertEquals(account, CloudAuth.enrollComputer(account, "nope", "x", "y", "1"))
     }
 
     @Test

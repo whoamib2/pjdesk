@@ -21,9 +21,12 @@ class Store(context: Context) {
     private val refreshBlob = KeystoreBlob(context.applicationContext, "pjdesk-network-refresh", "refresh")
     private val passwordBlob = KeystoreBlob(context.applicationContext, "pjdesk-computer-passwords", "passwords")
     private val savedFile = File(dir, "saved.json")
+    private val snapshotFile = File(dir, "saved-before-temp.json")
+    private val markerFile = File(dir, "temp-session.json")
 
     init {
         movePlainPermanentIntoKeystore()
+        if (markerFile.exists()) endTemporaryVisit()
     }
 
     var onboarded: Boolean
@@ -93,6 +96,7 @@ class Store(context: Context) {
                             consoleUser = o.optString("consoleUser"),
                             lastSeen = o.optLong("lastSeen"),
                             online = o.optBoolean("online"),
+                            displayName = o.optString("displayName"),
                         ),
                     )
                 }
@@ -129,6 +133,7 @@ class Store(context: Context) {
                 consoleUser = incoming.consoleUser.ifBlank { cur.consoleUser },
                 lastSeen = maxOf(cur.lastSeen, incoming.lastSeen),
                 online = if (incoming.lastSeen > 0 || incoming.online) incoming.online else cur.online,
+                displayName = incoming.displayName.ifBlank { cur.displayName },
             )
         }
         writeSaved(local)
@@ -171,7 +176,8 @@ class Store(context: Context) {
                     .put("osVersion", c.osVersion)
                     .put("consoleUser", c.consoleUser)
                     .put("lastSeen", c.lastSeen)
-                    .put("online", c.online),
+                    .put("online", c.online)
+                    .put("displayName", c.displayName),
             )
         }
         savedFile.writeText(array.toString())
@@ -189,6 +195,45 @@ class Store(context: Context) {
     var networkDeviceId: String
         get() = prefs.getString("networkDevice", "") ?: ""
         set(value) { prefs.edit().putString("networkDevice", value).apply() }
+
+    /** Minutes with no PJDesk activity before a temporary sign-in ends. */
+    var tempIdleMinutes: Int
+        get() = (prefs.getInt("tempIdleMinutes", 30)).coerceIn(1, 24 * 60)
+        set(value) { prefs.edit().putInt("tempIdleMinutes", value.coerceIn(1, 24 * 60)).apply() }
+
+    fun temporaryActive(): Boolean = markerFile.exists()
+
+    /** Remembers the saved list from before a temporary sign-in. */
+    fun beginTemporaryVisit() {
+        if (savedFile.exists()) savedFile.copyTo(snapshotFile, overwrite = true) else snapshotFile.writeText("[]")
+        markerFile.writeText("""{"passwords":[]}""")
+    }
+
+    fun noteTemporaryPassword(id: String) {
+        if (!markerFile.exists() || id.length != 9) return
+        val obj = runCatching { JSONObject(markerFile.readText()) }.getOrDefault(JSONObject())
+        val arr = obj.optJSONArray("passwords") ?: JSONArray()
+        for (i in 0 until arr.length()) if (arr.optString(i) == id) return
+        arr.put(id)
+        obj.put("passwords", arr)
+        markerFile.writeText(obj.toString())
+    }
+
+    /** Puts the saved list and passwords back, and clears the account email. */
+    fun endTemporaryVisit() {
+        if (!markerFile.exists() && !snapshotFile.exists()) return
+        val marker = runCatching { JSONObject(if (markerFile.exists()) markerFile.readText() else "{}") }.getOrNull()
+        if (snapshotFile.exists()) {
+            snapshotFile.copyTo(savedFile, overwrite = true)
+            snapshotFile.delete()
+        }
+        marker?.optJSONArray("passwords")?.let { arr ->
+            for (i in 0 until arr.length()) saveComputerPassword(arr.optString(i), "")
+        }
+        networkEmail = ""
+        saveNetworkRefresh("")
+        markerFile.delete()
+    }
 
     fun networkRefresh(): String = refreshBlob.read()
 

@@ -36,6 +36,8 @@ pub fn offer_current_server(role: &str, server: &str, fingerprint: &str) -> bool
 pub enum SignIn {
     Ready(Session),
     NoServer { role: String, login_token: String },
+    /// This computer was added to the account and the sign-in was dropped.
+    Added { email: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -47,6 +49,8 @@ pub struct SavedComputer {
     pub hostname: String,
     pub os_family: String,
     pub os_version: String,
+    /// Installer or Settings name. Empty when this computer uses its hostname.
+    pub display_name: String,
     /// Account star, when the account sent one. `None` leaves the local star.
     pub starred: Option<bool>,
     /// Account order, when the account sent one. `None` leaves the local order.
@@ -165,6 +169,8 @@ struct ComputerBody {
     os_family: String,
     #[serde(default)]
     os_version: String,
+    #[serde(default)]
+    display_name: String,
     #[serde(default)]
     starred: Option<bool>,
     #[serde(default)]
@@ -302,6 +308,7 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
                 hostname: c.hostname,
                 os_family: c.os_family,
                 os_version: c.os_version,
+                display_name: c.display_name,
                 starred: c.starred,
                 position: c.position,
                 hidden: c.hidden,
@@ -480,6 +487,183 @@ pub fn enroll(code: &str, device_id: &str, device_name: &str) -> Result<Session>
     session_from("", device_id, reply)
 }
 
+/// This computer, as it should appear in the account's Saved list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThisComputer {
+    pub id: String,
+    pub hostname: String,
+    pub display_name: String,
+    pub os_family: String,
+    pub os_version: String,
+}
+
+impl ThisComputer {
+    /// Facts from this install. An empty device id cannot be enrolled.
+    pub fn local(device_id: &str) -> Self {
+        let (os_family, os_version) = crate::hostfacts::os_pair();
+        let hostname = crate::hostname();
+        let display = crate::hostfacts::read_computer_name();
+        let display_name = if display.eq_ignore_ascii_case(hostname.trim()) { String::new() } else { display };
+        Self { id: device_id.to_string(), hostname, display_name, os_family, os_version }
+    }
+}
+
+/// Adds this computer, or refreshes its hostname, display name, and OS.
+/// A nickname already on the account is kept. Signing in on a computer that
+/// was removed puts it back, because this sign-in is that computer.
+pub fn enroll_this_computer(computers: &[SavedComputer], this: &ThisComputer) -> Vec<SavedComputer> {
+    let id = pjdesk_proto::normalize_id(&this.id);
+    if !pjdesk_proto::is_valid_id(&id) {
+        return computers.to_vec();
+    }
+    let mut out = computers.to_vec();
+    if let Some(row) = out.iter_mut().find(|c| pjdesk_proto::normalize_id(&c.id) == id) {
+        row.id = id;
+        row.hidden = false;
+        if !this.hostname.trim().is_empty() {
+            row.hostname = this.hostname.trim().to_string();
+        }
+        if !this.os_family.trim().is_empty() {
+            row.os_family = this.os_family.trim().to_string();
+        }
+        if !this.os_version.trim().is_empty() {
+            row.os_version = this.os_version.trim().to_string();
+        }
+        if !this.display_name.trim().is_empty() {
+            row.display_name = this.display_name.trim().to_string();
+        }
+    } else {
+        out.push(SavedComputer {
+            id,
+            name: String::new(),
+            hostname: this.hostname.trim().to_string(),
+            os_family: this.os_family.trim().to_string(),
+            os_version: this.os_version.trim().to_string(),
+            display_name: this.display_name.trim().to_string(),
+            ..SavedComputer::default()
+        });
+    }
+    out
+}
+
+fn saved_value(computers: &[SavedComputer]) -> serde_json::Value {
+    let list: Vec<serde_json::Value> = computers
+        .iter()
+        .filter(|c| pjdesk_proto::is_valid_id(&pjdesk_proto::normalize_id(&c.id)))
+        .map(|c| {
+            serde_json::json!({
+                "id": pjdesk_proto::normalize_id(&c.id),
+                "name": c.name,
+                "hostname": c.hostname,
+                "os_family": c.os_family,
+                "os_version": c.os_version,
+                "display_name": c.display_name,
+                "starred": c.starred.unwrap_or(false),
+                "position": c.position.unwrap_or(0),
+                "hidden": c.hidden,
+            })
+        })
+        .collect();
+    serde_json::json!({ "computers": list })
+}
+
+/// Uploads this computer onto the account, then returns the account's list.
+/// `local` is this computer's saved list when the sign-in should keep syncing it.
+/// An empty `local` uploads only the account's current rows plus this computer,
+/// so a friend's list is not added to the account.
+pub fn publish_this_computer(session: &Session, this: &ThisComputer, local: &[SavedComputer]) -> Result<Session> {
+    if session.refresh.is_empty() {
+        bail!("The account did not grant a sign-in for this computer.");
+    }
+    let mut list = if local.is_empty() { session.computers.clone() } else { local.to_vec() };
+    if let Some(account) = session.computers.iter().find(|c| pjdesk_proto::normalize_id(&c.id) == pjdesk_proto::normalize_id(&this.id))
+    {
+        if let Some(row) = list.iter_mut().find(|c| pjdesk_proto::normalize_id(&c.id) == pjdesk_proto::normalize_id(&this.id)) {
+            if row.name.trim().is_empty() {
+                row.name = account.name.clone();
+            }
+        }
+    }
+    let list = enroll_this_computer(&list, this);
+    let body = saved_value(&list);
+    let mut next = refresh(&session.refresh, &session.device_id, Some(&body))?;
+    if next.email.is_empty() {
+        next.email = session.email.clone();
+    }
+    if next.address.trim().is_empty() {
+        next.address = session.address.clone();
+        next.fingerprint = session.fingerprint.clone();
+    }
+    Ok(next)
+}
+
+/// Enrolls this computer on a sign-in that already has a refresh token.
+/// `local` is uploaded only for a sign-in that stays on this computer.
+/// An empty `local` sends the account's rows plus this computer.
+pub fn enroll_known(
+    refresh: &str,
+    network_device: &str,
+    account: &[SavedComputer],
+    local: &[SavedComputer],
+    this: &ThisComputer,
+) -> Result<()> {
+    let session = Session {
+        email: String::new(),
+        access: String::new(),
+        exp: 0,
+        refresh: refresh.to_string(),
+        device_id: network_device.to_string(),
+        address: String::new(),
+        fingerprint: String::new(),
+        standby_address: String::new(),
+        standby_fingerprint: String::new(),
+        lan: Vec::new(),
+        public_ip: String::new(),
+        computers: account.to_vec(),
+        presence: Vec::new(),
+    };
+    let _ = publish_this_computer(&session, this, local)?;
+    Ok(())
+}
+
+/// Enrolls this computer, then either keeps the session or drops it.
+pub fn finish_account_sign_in(session: Session, this: &ThisComputer, local: &[SavedComputer], enroll_only: bool) -> Result<SignIn> {
+    let email = session.email.clone();
+    let session = publish_this_computer(&session, this, local)?;
+    if enroll_only {
+        Ok(SignIn::Added { email: if session.email.is_empty() { email } else { session.email } })
+    } else {
+        Ok(SignIn::Ready(session))
+    }
+}
+
+/// The saved list this computer would upload, including nicknames and hide flags.
+pub fn saved_from_config(config: &Config) -> Vec<SavedComputer> {
+    let body = computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden);
+    let Some(list) = body.get("computers").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|row| {
+            let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if !pjdesk_proto::is_valid_id(id) {
+                return None;
+            }
+            Some(SavedComputer {
+                id: id.to_string(),
+                name: row.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                hostname: row.get("hostname").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                os_family: row.get("os_family").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                os_version: row.get("os_version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                display_name: row.get("display_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                starred: Some(row.get("starred").and_then(|v| v.as_bool()).unwrap_or(false)),
+                position: Some(row.get("position").and_then(|v| v.as_u64()).unwrap_or(0) as u32),
+                hidden: row.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
 /// Nickname, hostname, ID, and OS. A password is dropped. An alias that is
 /// only the ID, or only the hostname, is not uploaded as a nickname.
 pub fn computers_body(
@@ -520,6 +704,7 @@ pub fn computers_body(
                 "hostname": hostname,
                 "os_family": note.map(|n| n.os_family.as_str()).unwrap_or(""),
                 "os_version": note.map(|n| n.os_version.as_str()).unwrap_or(""),
+                "display_name": note.map(|n| n.display_name.as_str()).unwrap_or(""),
                 "starred": note.is_some_and(|n| n.favorite),
                 "position": note.map(|n| n.sort_order).unwrap_or(0),
                 "hidden": false,
@@ -728,6 +913,53 @@ mod tests {
             NO_SERVER,
             "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network."
         );
+    }
+
+    #[test]
+    fn signing_in_adds_this_computer_and_keeps_a_nickname() {
+        let existing = vec![SavedComputer {
+            id: "692996394".into(),
+            name: "Office".into(),
+            hostname: "OLD".into(),
+            os_family: "windows".into(),
+            os_version: "10".into(),
+            display_name: String::new(),
+            ..SavedComputer::default()
+        }];
+        let this = ThisComputer {
+            id: "692 996 394".into(),
+            hostname: "BENLENOVODESK".into(),
+            display_name: "Ben's desk".into(),
+            os_family: "windows".into(),
+            os_version: "11".into(),
+        };
+        let updated = enroll_this_computer(&existing, &this);
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].name, "Office");
+        assert_eq!(updated[0].hostname, "BENLENOVODESK");
+        assert_eq!(updated[0].display_name, "Ben's desk");
+        assert_eq!(updated[0].os_version, "11");
+        assert!(!updated[0].hidden);
+
+        let fresh = enroll_this_computer(&[], &this);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].id, "692996394");
+        assert_eq!(fresh[0].name, "");
+        assert_eq!(fresh[0].hostname, "BENLENOVODESK");
+
+        let removed = vec![SavedComputer {
+            id: "692996394".into(),
+            name: "Office".into(),
+            hidden: true,
+            ..SavedComputer::default()
+        }];
+        let back = enroll_this_computer(&removed, &this);
+        assert!(!back[0].hidden);
+        assert_eq!(back[0].name, "Office");
+
+        let skipped = enroll_this_computer(&existing, &ThisComputer { id: "nope".into(), ..this });
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].hostname, "OLD");
     }
 
     #[test]

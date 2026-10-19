@@ -136,7 +136,11 @@ async fn connect(
         crate::network::refresh_config(config);
     }
     let server = ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone());
-    let access = config.network_access_token();
+    let mut access = config.network_access_token();
+    if access.is_empty() {
+        // A temporary sign-in keeps the access token in this process only.
+        access = std::env::var("PJDESK_ACCESS").unwrap_or_default();
+    }
     let mut signal = SignalClient::connect(&server, config).await?;
     tracing::info!("Reached the server via {}", signal.via);
     println!("Server path: {}.", signal.via);

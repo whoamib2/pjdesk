@@ -20,7 +20,7 @@ mod shots;
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use eframe::egui;
@@ -49,6 +49,7 @@ enum DeskTab {
 
 /// Launches the app and blocks until the window is closed.
 pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result<()> {
+    crate::temp_sign::scrub_abandoned();
     let mut config = Config::load().unwrap_or_default();
     if let Some(flag) = &server_flag {
         if let Ok(addr) = ServerAddr::parse(flag) {
@@ -172,6 +173,13 @@ enum LoginMsg {
     Err(String),
 }
 
+/// In-memory sign-in. `snapshot` is this computer before the visit.
+struct TempHold {
+    snapshot: Config,
+    last_activity: Instant,
+    warning: bool,
+}
+
 pub struct App {
     cfg: Config,
     engine: Engine,
@@ -264,6 +272,21 @@ pub struct App {
     /// True when a paste offered the import. False when Import was already clicked
     /// and the dialog is only collecting a passphrase.
     import_confirm: bool,
+    /// Checked each time the sign-in form opens. Session-only when true.
+    net_temporary: bool,
+    net_enroll_only: bool,
+    pending_temporary: bool,
+    pending_enroll_only: bool,
+    /// Set while a temporary sign-in is in this process. The refresh token is not on disk.
+    temp: Option<TempHold>,
+    session_end: Option<Receiver<()>>,
+    temp_left: u64,
+    /// Nine-digit id already published for this sign-in. Empty until that succeeds.
+    enrolled_for: String,
+    enroll_after: Instant,
+    enroll_rx: Option<Receiver<bool>>,
+    /// Account rows from the last sign-in. A temporary visit uploads these, not the list that was already on this computer.
+    account_computers: Vec<crate::network::SavedComputer>,
     import_hint: String,
     /// Blob in flight for the current enroll, stored only after the server accepts it.
     pending_blob: Option<String>,
@@ -367,6 +390,17 @@ impl App {
             import_show: false,
             import_confirm: false,
             import_hint: String::new(),
+            net_temporary: true,
+            net_enroll_only: false,
+            pending_temporary: false,
+            pending_enroll_only: false,
+            temp: None,
+            session_end: if preview { None } else { Some(crate::temp_sign::watch_session_end()) },
+            temp_left: 0,
+            enrolled_for: String::new(),
+            enroll_after: Instant::now(),
+            enroll_rx: None,
+            account_computers: Vec::new(),
             pending_blob: None,
             net_importing: false,
             dismissed_paste: None,
@@ -565,10 +599,242 @@ impl App {
     }
 
     fn save_cfg(&mut self) {
+        if self.cfg.ephemeral_network {
+            if let Err(e) = self.cfg.save() {
+                self.status = format!("Could not save settings: {e}");
+            }
+            if let Ok(disk) = Config::load() {
+                if self.cfg.device_id.is_none() {
+                    self.cfg.device_id = disk.device_id;
+                }
+                if self.cfg.device_secret.is_none() {
+                    self.cfg.device_secret = disk.device_secret;
+                }
+            }
+            return;
+        }
         self.cfg.reload_identity_from_disk();
         if let Err(e) = self.cfg.save() {
             self.status = format!("Could not save settings: {e}");
         }
+    }
+
+    /// The 9-digit ID shown as Your ID, once the server has assigned it.
+    fn visible_id(&self) -> String {
+        if let Some(id) = &self.cfg.device_id {
+            let id = normalize_id(id);
+            if is_valid_id(&id) {
+                return id;
+            }
+        }
+        if self.engine.service_running {
+            if let Some(id) = &self.svc_status.id {
+                let id = normalize_id(id);
+                if is_valid_id(&id) {
+                    return id;
+                }
+            }
+        }
+        self.engine.shared.id().map(|id| normalize_id(&id)).filter(|id| is_valid_id(id)).unwrap_or_default()
+    }
+
+    fn note_enrolled(&mut self, computers: &[crate::network::SavedComputer]) {
+        self.account_computers = computers.to_vec();
+        let id = self.visible_id();
+        if is_valid_id(&id) && computers.iter().any(|c| normalize_id(&c.id) == id) {
+            self.enrolled_for = id;
+        } else {
+            self.enrolled_for.clear();
+        }
+    }
+
+    /// Keeps the refresh token in this process. Disk stays as it was before sign-in.
+    fn begin_temporary(&mut self, session: crate::network::Session) {
+        let snapshot = self.cfg.clone();
+        let had = !snapshot.network_refresh_token().is_empty();
+        crate::temp_sign::begin_marker(had);
+        self.note_enrolled(&session.computers);
+        // Show the account's computers for this visit. The list that was already
+        // on this computer stays in the snapshot and is not uploaded.
+        self.cfg.address_book.clear();
+        self.cfg.saved_hidden.clear();
+        self.cfg.settings.peers.clear();
+        self.cfg.ephemeral_network = true;
+        self.cfg.apply_network_session(&session);
+        self.net_email = self.cfg.network_email.clone().unwrap_or_default();
+        self.settings.set_server_text(&self.cfg.effective_server());
+        self.temp = Some(TempHold { snapshot, last_activity: Instant::now(), warning: false });
+        self.temp_left = 0;
+        self.engine.retarget(&self.cfg);
+        self.toast.show("Signed in until you close PJDesk");
+    }
+
+    /// Drops a temporary sign-in. This computer stays in the account.
+    fn end_temporary_sign_in(&mut self) {
+        let Some(temp) = self.temp.take() else { return };
+        self.cfg.ephemeral_network = false;
+        let (passwords, recents) = crate::temp_sign::marker_ids();
+        let mut disk = Config::load().unwrap_or_else(|_| temp.snapshot.clone());
+        crate::temp_sign::restore_after_temporary(&mut disk, &temp.snapshot, &passwords, &recents);
+        if disk.device_id.is_none() {
+            disk.device_id = self.cfg.device_id.clone();
+        }
+        if disk.device_secret.is_none() {
+            disk.device_secret = self.cfg.device_secret.clone();
+        }
+        disk.ephemeral_network = false;
+        if let Err(e) = disk.save() {
+            self.status = format!("Could not save settings: {e}");
+        }
+        self.cfg = disk;
+        self.net_email = self.cfg.network_email.clone().unwrap_or_default();
+        self.show_net_sign_in = false;
+        self.enrolled_for.clear();
+        self.account_computers.clear();
+        self.temp_left = 0;
+        crate::temp_sign::clear_marker();
+        self.engine.retarget(&self.cfg);
+        self.settings.set_server_text(&self.cfg.effective_server());
+        self.toast.show("Signed out");
+    }
+
+    /// True when Windows locked, signed out, or is shutting down since the last check.
+    fn session_ended(&mut self) -> bool {
+        let Some(rx) = &self.session_end else { return false };
+        let mut ended = false;
+        loop {
+            match rx.try_recv() {
+                Ok(()) => ended = true,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return ended,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.session_end = None;
+                    return ended;
+                }
+            }
+        }
+    }
+
+    fn poll_temporary(&mut self, ctx: &egui::Context) {
+        if self.temp.is_none() {
+            let _ = self.session_ended();
+            return;
+        }
+        if self.session_ended() {
+            self.end_temporary_sign_in();
+            return;
+        }
+        let busy = !self.viewer_rx.is_empty() || self.ask_alive;
+        let input = ctx.input(|i| {
+            i.pointer.any_pressed()
+                || i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { pressed: true, .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::MouseWheel { .. }
+                            | egui::Event::Touch { .. }
+                            | egui::Event::Paste(_)
+                    )
+                })
+        });
+        if busy || input {
+            if let Some(temp) = &mut self.temp {
+                temp.last_activity = Instant::now();
+                temp.warning = false;
+            }
+            self.temp_left = 0;
+        }
+        let minutes = self.cfg.settings.temp_idle_minutes;
+        let last = self.temp.as_ref().map(|t| t.last_activity).unwrap_or_else(Instant::now);
+        match crate::temp_sign::idle_remaining(last, minutes, Instant::now()) {
+            Some(0) => self.end_temporary_sign_in(),
+            Some(left) => {
+                self.temp_left = left;
+                if let Some(temp) = &mut self.temp {
+                    temp.warning = true;
+                }
+            }
+            None => {
+                self.temp_left = 0;
+                if let Some(temp) = &mut self.temp {
+                    temp.warning = false;
+                }
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
+    fn temporary_warning(&mut self, ctx: &egui::Context) {
+        let show = self.temp.as_ref().is_some_and(|t| t.warning) && self.temp_left > 0;
+        if !show {
+            return;
+        }
+        let left = self.temp_left;
+        let mut stay = false;
+        egui::Window::new("Still there?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(format!("Signing out in {left} seconds because PJDesk is idle."));
+                ui.add_space(8.0);
+                if ui.button("Stay signed in").clicked() {
+                    stay = true;
+                }
+            });
+        if stay {
+            if let Some(temp) = &mut self.temp {
+                temp.last_activity = Instant::now();
+                temp.warning = false;
+            }
+            self.temp_left = 0;
+        }
+    }
+
+    /// Publishes this computer once its 9-digit ID exists. A temporary visit
+    /// does not upload the saved list that was already on this computer.
+    fn poll_self_enroll(&mut self) {
+        if let Some(rx) = &self.enroll_rx {
+            match rx.try_recv() {
+                Ok(true) => self.enroll_rx = None,
+                Ok(false) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.enroll_rx = None;
+                    self.enrolled_for.clear();
+                    self.enroll_after = Instant::now() + Duration::from_secs(30);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            }
+        }
+        if Instant::now() < self.enroll_after || self.enroll_rx.is_some() {
+            return;
+        }
+        let signed_in = self.temp.is_some() || !self.cfg.network_refresh_token().is_empty();
+        if !signed_in {
+            return;
+        }
+        let id = self.visible_id();
+        if !is_valid_id(&id) || self.enrolled_for == id {
+            return;
+        }
+        let refresh = self.cfg.network_refresh_token();
+        let device = self.cfg.network_device_id.clone().unwrap_or_default();
+        if refresh.is_empty() || device.is_empty() {
+            return;
+        }
+        self.enrolled_for = id.clone();
+        let account = self.account_computers.clone();
+        let local = if self.temp.is_some() { Vec::new() } else { crate::network::saved_from_config(&self.cfg) };
+        let this = crate::network::ThisComputer::local(&id);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.enroll_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("enroll-self".into())
+            .spawn(move || {
+                let ok = crate::network::enroll_known(&refresh, &device, &account, &local, &this).is_ok();
+                let _ = tx.send(ok);
+            })
+            .ok();
     }
 
     /// Re-reads hostname and OS the viewer stored, so the list matches the last connect.
@@ -670,6 +936,9 @@ impl App {
     fn mark_recent(&mut self, id: &str) {
         let note = self.cfg.settings.peers.entry(id.to_string()).or_default();
         note.last_connected = unix_now();
+        if self.temp.is_some() {
+            crate::temp_sign::note_recent(id);
+        }
         self.save_cfg();
     }
 
@@ -779,6 +1048,25 @@ impl App {
                 self.net_offer = crate::network::offer_current_server(&role, &server, &fingerprint);
                 self.net_login = if self.net_offer { login_token } else { String::new() };
             }
+            Ok(Ok(crate::network::SignIn::Added { email })) => {
+                self.net_busy = false;
+                self.net_rx = None;
+                self.net_offer = false;
+                self.net_login.clear();
+                self.pending_blob = None;
+                self.net_importing = false;
+                self.net_pass.clear();
+                self.net_code.clear();
+                self.net_blob.clear();
+                self.net_key_pass.clear();
+                self.import_pass.clear();
+                self.net_error.clear();
+                self.show_net_sign_in = false;
+                self.pending_temporary = false;
+                self.pending_enroll_only = false;
+                let who = if email.is_empty() { self.net_email.trim().to_string() } else { email };
+                self.toast.show(format!("Added this computer to {who}. Nothing from that sign-in was kept on this computer."));
+            }
             Ok(Ok(crate::network::SignIn::Ready(session))) => {
                 self.net_busy = false;
                 self.net_rx = None;
@@ -787,8 +1075,10 @@ impl App {
                 if let Some(blob) =
                     self.pending_blob.take().or_else(|| pjdesk_proto::netkey::blob_from_text(&self.net_blob))
                 {
-                    self.cfg.network_key = Some(blob);
-                    crate::network::clear_installer_network_key();
+                    if !self.pending_temporary {
+                        self.cfg.network_key = Some(blob);
+                        crate::network::clear_installer_network_key();
+                    }
                 }
                 let imported = self.net_importing;
                 self.net_importing = false;
@@ -808,16 +1098,24 @@ impl App {
                 if session.email.is_empty() {
                     session.email = self.net_email.trim().to_lowercase();
                 }
-                self.cfg.apply_network_session(&session);
-                self.net_email = self.cfg.network_email.clone().unwrap_or_default();
-                self.settings.set_server_text(&self.cfg.effective_server());
-                self.save_cfg();
-                crate::network::copy_to_service(&self.cfg);
-                self.engine.retarget(&self.cfg);
-                if imported {
-                    self.toast.show("Import server configuration successfully");
+                let temporary = self.pending_temporary;
+                self.pending_temporary = false;
+                self.pending_enroll_only = false;
+                if temporary {
+                    self.begin_temporary(session);
                 } else {
-                    self.toast.show(format!("Signed in as {}", self.net_email));
+                    self.note_enrolled(&session.computers);
+                    self.cfg.apply_network_session(&session);
+                    self.net_email = self.cfg.network_email.clone().unwrap_or_default();
+                    self.settings.set_server_text(&self.cfg.effective_server());
+                    self.save_cfg();
+                    crate::network::copy_to_service(&self.cfg);
+                    self.engine.retarget(&self.cfg);
+                    if imported {
+                        self.toast.show("Import server configuration successfully");
+                    } else {
+                        self.toast.show(format!("Signed in as {}", self.net_email));
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -846,6 +1144,21 @@ impl App {
         if self.net_busy {
             return;
         }
+        let enroll_only = self.net_enroll_only;
+        self.net_enroll_only = false;
+        let pjdesk_id = self.visible_id();
+        if enroll_only && !pjdesk_proto::is_valid_id(&pjdesk_id) {
+            self.net_error = "This computer does not have an ID yet. Wait until Your ID appears, then try again.".into();
+            return;
+        }
+        self.pending_temporary = self.net_temporary && !enroll_only;
+        self.pending_enroll_only = enroll_only;
+        let this = crate::network::ThisComputer::local(&pjdesk_id);
+        let local = if self.pending_temporary || enroll_only {
+            Vec::new()
+        } else {
+            crate::network::saved_from_config(&self.cfg)
+        };
         let device = self.cfg.network_device();
         let name = crate::hostname();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -859,9 +1172,11 @@ impl App {
             std::thread::Builder::new()
                 .name("network-sign-in".into())
                 .spawn(move || {
-                    let result = crate::network::enroll(&code, &device, &name)
-                        .map(crate::network::SignIn::Ready)
-                        .map_err(|e| e.to_string());
+                    let result = match crate::network::enroll(&code, &device, &name) {
+                        Ok(session) => crate::network::finish_account_sign_in(session, &this, &local, enroll_only)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
                     let _ = tx.send(result);
                 })
                 .ok();
@@ -878,9 +1193,11 @@ impl App {
                 .name("network-sign-in".into())
                 .spawn(move || {
                     let creds = if account { Some((email.as_str(), password.as_str())) } else { None };
-                    let result = crate::network::redeem(&blob, &passphrase, &device, &name, creds)
-                        .map(crate::network::SignIn::Ready)
-                        .map_err(|e| e.to_string());
+                    let result = match crate::network::redeem(&blob, &passphrase, &device, &name, creds) {
+                        Ok(session) => crate::network::finish_account_sign_in(session, &this, &local, enroll_only)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
                     let _ = tx.send(result);
                 })
                 .ok();
@@ -890,7 +1207,13 @@ impl App {
             std::thread::Builder::new()
                 .name("network-sign-in".into())
                 .spawn(move || {
-                    let result = crate::network::sign_in(&email, &password, &device, &name).map_err(|e| e.to_string());
+                    let result = match crate::network::sign_in(&email, &password, &device, &name) {
+                        Ok(crate::network::SignIn::Ready(session)) => {
+                            crate::network::finish_account_sign_in(session, &this, &local, enroll_only).map_err(|e| e.to_string())
+                        }
+                        Ok(other) => Ok(other),
+                        Err(e) => Err(e.to_string()),
+                    };
                     let _ = tx.send(result);
                 })
                 .ok();
@@ -906,6 +1229,13 @@ impl App {
         let fingerprint = self.cfg.server_fingerprint.clone().unwrap_or_default();
         let device = self.cfg.network_device();
         let name = crate::hostname();
+        let enroll_only = self.pending_enroll_only;
+        let this = crate::network::ThisComputer::local(&self.visible_id());
+        let local = if self.pending_temporary || enroll_only {
+            Vec::new()
+        } else {
+            crate::network::saved_from_config(&self.cfg)
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         self.net_rx = Some(rx);
         self.net_busy = true;
@@ -913,9 +1243,12 @@ impl App {
         std::thread::Builder::new()
             .name("network-claim".into())
             .spawn(move || {
-                let result = crate::network::claim_current_server(&token, &address, &fingerprint, &device, &name)
-                    .map(crate::network::SignIn::Ready)
-                    .map_err(|e| e.to_string());
+                let result = match crate::network::claim_current_server(&token, &address, &fingerprint, &device, &name) {
+                    Ok(session) => {
+                        crate::network::finish_account_sign_in(session, &this, &local, enroll_only).map_err(|e| e.to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
                 let _ = tx.send(result);
             })
             .ok();
@@ -1072,7 +1405,12 @@ impl App {
 
     /// Leaves the PJDesk account. The server address, saved computers, and
     /// per-computer passwords stay on this computer.
+    /// A temporary sign-in instead restores this computer to how it was.
     fn sign_out_network(&mut self) {
+        if self.temp.is_some() {
+            self.end_temporary_sign_in();
+            return;
+        }
         self.cfg.reload_identity_from_disk();
         self.cfg.leave_network_sign_in();
         self.show_net_sign_in = false;
@@ -1083,7 +1421,7 @@ impl App {
     }
 
     fn request_saved_refresh(&mut self) {
-        if self.saved_rx.is_some() || self.cfg.network_refresh_token().is_empty() {
+        if self.temp.is_some() || self.saved_rx.is_some() || self.cfg.network_refresh_token().is_empty() {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1198,6 +1536,15 @@ impl App {
         }
         if remember {
             cmd.env("PJDESK_REMEMBER", "1");
+            if self.temp.is_some() {
+                crate::temp_sign::note_password(id);
+            }
+        }
+        if self.temp.is_some() {
+            let token = self.cfg.network_access_token();
+            if !token.is_empty() {
+                cmd.env("PJDESK_ACCESS", token);
+            }
         }
         if let Some(note) = self.cfg.settings.peers.get(id) {
             cmd.env("PJDESK_VIEW", note.view_mode.to_string());
@@ -1469,11 +1816,17 @@ fn last_session_reason() -> Option<String> {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&glow::Context>) {
+        self.end_temporary_sign_in();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.ctx = ui.ctx().clone();
         let ctx = self.ctx.clone();
         self.poll_login();
         self.poll_network();
+        self.poll_temporary(&ctx);
+        self.poll_self_enroll();
         self.poll_saved_refresh();
         self.poll_password();
         self.poll_probe();
@@ -1502,7 +1855,11 @@ impl eframe::App for App {
                 }
             }
         }
-        if has_tray && !self.really_quit && ctx.input(|i| i.viewport().close_requested()) {
+        let closing = ctx.input(|i| i.viewport().close_requested());
+        if closing && (self.really_quit || !has_tray) && self.temp.is_some() {
+            self.end_temporary_sign_in();
+        }
+        if has_tray && !self.really_quit && closing {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             if !self.told_tray {
@@ -1534,6 +1891,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.body(ui));
 
         self.settings_window(&ctx);
+        self.temporary_warning(&ctx);
         self.import_prompt(&ctx);
         self.password_prompt(&ctx);
         self.login_window(&ctx);

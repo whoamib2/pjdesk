@@ -2,9 +2,11 @@ package us.spader.pjdesk.ui
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Checkbox
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -51,6 +53,9 @@ fun SignInScreen(
     onDismissImport: () -> Unit = {},
     offerCurrent: Boolean = false,
     onUseCurrent: () -> Unit = {},
+    temporary: Boolean = true,
+    onTemporary: (Boolean) -> Unit = {},
+    onEnrollOnly: () -> Unit = {},
 ) {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -120,6 +125,14 @@ fun SignInScreen(
                     )
                     Text("From pjdesk.com → Account → My network. One device, one hour.", color = pjMuted())
                 }
+                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    Checkbox(checked = temporary, onCheckedChange = onTemporary, enabled = !busy)
+                    Text("Sign me out when I'm done (use on someone else's computer)")
+                }
+                Text(
+                    "This computer is added to your account either way. When this is checked, the sign-in ends when you close PJDesk and is not kept on this phone.",
+                    color = pjMuted(),
+                )
                 if (error.isNotEmpty()) Text(error, color = MaterialTheme.colorScheme.error)
                 if (offerCurrent) {
                     Button(onClick = onUseCurrent, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
@@ -128,6 +141,11 @@ fun SignInScreen(
                 }
                 Button(onClick = onSubmit, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
                     Text(if (busy) "Signing in…" else if (useKey) "Use network key" else "Sign in")
+                }
+                if (!useCode && !useKey) {
+                    TextButton(onClick = onEnrollOnly, enabled = !busy) {
+                        Text("Just add this computer to my account")
+                    }
                 }
                 if (useKey || useCode) {
                     TextButton(onClick = { onUseKey(false); onUseCode(false) }, enabled = !busy) {

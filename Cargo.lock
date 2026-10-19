@@ -3650,6 +3650,7 @@ dependencies = [
  "eframe",
  "egui_kittest",
  "epaint_default_fonts",
+ "glow",
  "hex",
  "openh264",
  "pjdesk-link",

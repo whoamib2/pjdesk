@@ -57,6 +57,8 @@ data class SavedComputer(
     val consoleUser: String = "",
     val lastSeen: Long = 0,
     val online: Boolean = false,
+    /** Name chosen on that computer. Empty means show the hostname. */
+    val displayName: String = "",
 )
 
 fun compactId(text: String): String = text.filter { !it.isWhitespace() }

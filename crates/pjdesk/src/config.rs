@@ -43,7 +43,7 @@ pub struct Config {
     /// The account address book is the synced store; this is the local one.
     /// Passwords stay on this computer. They are not uploaded.
     #[serde(default)]
-    saved_passwords: BTreeMap<String, String>,
+    pub(crate) saved_passwords: BTreeMap<String, String>,
     /// PJDesk account that owns the private server this client uses.
     #[serde(default)]
     pub network_email: Option<String>,
@@ -80,6 +80,10 @@ pub struct Config {
     /// server registry still reports. Synced with the account while signed in.
     #[serde(default)]
     pub saved_hidden: Vec<String>,
+    /// A sign-in that must not be written. Saves keep the account, the saved
+    /// list, and passwords already on disk, and write this process's device id.
+    #[serde(skip)]
+    pub ephemeral_network: bool,
 }
 
 /// Quality, behaviour and startup preferences.
@@ -110,6 +114,9 @@ pub struct Settings {
     /// The first-login "Remember password" box starts checked.
     #[serde(default)]
     pub remember_passwords: bool,
+    /// Minutes with no PJDesk activity before a temporary sign-in ends.
+    #[serde(default = "default_temp_idle")]
+    pub temp_idle_minutes: u32,
     /// "system" follows Windows, or "dark" / "light".
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -230,6 +237,9 @@ fn default_bitrate() -> u32 {
 fn default_max_width() -> u32 {
     2560
 }
+fn default_temp_idle() -> u32 {
+    30
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -242,6 +252,7 @@ impl Default for Settings {
             permanent_password: None,
             start_with_windows: false,
             remember_passwords: false,
+            temp_idle_minutes: default_temp_idle(),
             theme: default_theme(),
             approval: default_approval(),
             receive_dir: String::new(),
@@ -445,13 +456,65 @@ impl Config {
 
     /// Writes this config to a specific file (atomically).
     pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        let writing = self.for_disk(path);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&writing)?)?;
         std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
+    }
+
+    /// A temporary sign-in keeps the account fields already on disk.
+    fn for_disk(&self, path: &std::path::Path) -> Self {
+        if !self.ephemeral_network {
+            return self.clone();
+        }
+        let mut writing = self.clone();
+        writing.ephemeral_network = false;
+        let disk = Self::load_from(path).ok();
+        if let Some(disk) = disk {
+            writing.network_email = disk.network_email;
+            writing.network_refresh = disk.network_refresh;
+            writing.network_access = disk.network_access;
+            writing.network_access_exp = disk.network_access_exp;
+            writing.network_list_merged = disk.network_list_merged;
+            writing.network_standby = disk.network_standby;
+            writing.network_standby_fingerprint = disk.network_standby_fingerprint;
+            writing.network_lan = disk.network_lan;
+            writing.network_public_ip = disk.network_public_ip;
+            writing.network_key = disk.network_key;
+            writing.server = disk.server;
+            writing.server_fingerprint = disk.server_fingerprint;
+            writing.address_book = disk.address_book;
+            writing.saved_hidden = disk.saved_hidden;
+            writing.saved_passwords = disk.saved_passwords;
+            writing.settings.peers = disk.settings.peers;
+            if writing.device_id.is_none() {
+                writing.device_id = disk.device_id;
+            }
+            if writing.device_secret.is_none() {
+                writing.device_secret = disk.device_secret;
+            }
+            if writing.network_device_id.is_none() {
+                writing.network_device_id = disk.network_device_id;
+            }
+        } else {
+            writing.network_email = None;
+            writing.network_refresh = None;
+            writing.network_access = None;
+            writing.network_access_exp = 0;
+            writing.network_list_merged = false;
+            writing.address_book.clear();
+            writing.saved_hidden.clear();
+            writing.saved_passwords.clear();
+            writing.settings.peers.clear();
+            writing.server = None;
+            writing.server_fingerprint = None;
+            writing.network_key = None;
+        }
+        writing
     }
 
     /// The device secret, created (and saved) on first use.
@@ -654,6 +717,9 @@ impl Config {
             }
             if note.os_version.is_empty() {
                 note.os_version = computer.os_version.clone();
+            }
+            if !computer.display_name.trim().is_empty() {
+                note.display_name = computer.display_name.trim().to_string();
             }
             if let Some(starred) = computer.starred {
                 note.favorite = starred;
@@ -932,6 +998,7 @@ mod tests {
                     hostname: "CABINDESK".into(),
                     os_family: "windows".into(),
                     os_version: "11".into(),
+                    display_name: String::new(),
                     starred: Some(true),
                     position: Some(5),
                     hidden: false,
@@ -1027,6 +1094,42 @@ mod tests {
         assert_eq!(desk.hostname, "BENLENOVODESK");
         assert_eq!(desk.console_user, "SPADER\\Ben");
         assert!(c.address_book.iter().any(|e| e.id == "692996394" && e.alias.is_empty()));
+    }
+
+    #[test]
+    fn a_temporary_sign_in_does_not_write_the_account() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-temp-sign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client.json");
+        let mut before = Config::default();
+        before.address_book =
+            vec![AddressEntry { id: "111111111".into(), alias: "Friend".into(), ..Default::default() }];
+        before.server = Some("friend.example:21200".into());
+        before.save_to(&path).unwrap();
+
+        let mut live = before.clone();
+        live.ephemeral_network = true;
+        live.network_email = Some("ben@spader.us".into());
+        live.network_refresh = Some("plain:session-token".into());
+        live.network_access = Some("plain:access-token".into());
+        live.address_book.push(AddressEntry { id: "692996394".into(), alias: "Office".into(), ..Default::default() });
+        live.server = Some("pjdesk.spader.us:21200".into());
+        live.device_id = Some("386626882".into());
+        live.save_to(&path).unwrap();
+
+        let disk = Config::load_from(&path).unwrap();
+        assert!(disk.network_email.is_none());
+        assert!(disk.network_refresh.is_none());
+        assert!(disk.network_access.is_none());
+        assert_eq!(disk.address_book.len(), 1);
+        assert_eq!(disk.address_book[0].alias, "Friend");
+        assert_eq!(disk.server.as_deref(), Some("friend.example:21200"));
+        assert_eq!(disk.device_id.as_deref(), Some("386626882"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("session-token"));
+        assert!(!text.contains("ben@spader.us"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

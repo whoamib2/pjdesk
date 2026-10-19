@@ -45,6 +45,7 @@ fun HomeScreen(
     onSignIn: (() -> Unit)? = null,
     accountEmail: String = "",
     onSignOut: (() -> Unit)? = null,
+    temporary: Boolean = false,
 ) {
     Column(
         modifier = Modifier
@@ -56,9 +57,13 @@ fun HomeScreen(
         if (accountEmail.isNotBlank()) {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Signed in as $accountEmail")
+                    if (temporary) {
+                        Text("Signed in until you close PJDesk")
+                    } else {
+                        Text("Signed in as $accountEmail")
+                    }
                     if (onSignOut != null) {
-                        TextButton(onClick = onSignOut) { Text("Sign out") }
+                        Button(onClick = onSignOut, modifier = Modifier.fillMaxWidth()) { Text("Sign out") }
                     }
                 }
             }

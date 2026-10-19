@@ -33,6 +33,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -111,9 +112,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private val app get() = application as PjApp
+    private val tempFlag = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val interaction = mutableIntStateOf(0)
+
+    override fun onUserInteraction() {
+        super.onUserInteraction()
+        interaction.intValue++
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (app.store.temporaryActive() && !tempFlag.get()) app.store.endTemporaryVisit()
         enableEdgeToEdge()
         HostService.arm(this)
         captureReady.value = HostService.capturing || app.store.captureTried
@@ -147,8 +156,131 @@ class MainActivity : ComponentActivity() {
             var importPass by remember { mutableStateOf("") }
             var importFromPaste by remember { mutableStateOf(true) }
             var savePassword by remember { mutableStateOf(false) }
-            var askedPassword by remember { mutableStateOf("") }
+            var signOutWhenDone by remember { mutableStateOf(true) }
+            var temporarySession by remember { mutableStateOf(false) }
+            var memoryRefresh by remember { mutableStateOf("") }
+            var enrolledFor by remember { mutableStateOf("") }
+            var accountComputers by remember { mutableStateOf(emptyList<us.spader.pjdesk.core.SavedComputer>()) }
+            var tempWarn by remember { mutableStateOf(false) }
+            var tempLeft by remember { mutableIntStateOf(0) }
+            var lastActivity by remember { mutableLongStateOf(android.os.SystemClock.elapsedRealtime()) }
+            val bumps = interaction.intValue
+            fun signOutTemporary() {
+                tempFlag.set(false)
+                temporarySession = false
+                memoryRefresh = ""
+                app.store.endTemporaryVisit()
+                engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", "").toString())
+                account = ""
+                saved = app.store.saved()
+                tempWarn = false
+                enrolledFor = ""
+                accountComputers = emptyList()
+            }
             val scope = rememberCoroutineScope()
+            fun applySignedIn(
+                session: us.spader.pjdesk.core.Session,
+                emailHint: String,
+                keyBlob: String?,
+                temporaryNow: Boolean,
+                enrollOnlyNow: Boolean,
+                notice: String? = null,
+            ) {
+                val pjdeskId = state.id.filter { it.isDigit() }
+                if (enrollOnlyNow && pjdeskId.length != 9) {
+                    netBusy = false
+                    netError = "This computer does not have an ID yet. Wait until Your ID appears, then try again."
+                    return
+                }
+                val uploadLocal = !temporaryNow && !enrollOnlyNow
+                val hostname = engine.deviceLabel()
+                val display = app.store.computerName
+                val osVersion = Build.VERSION.RELEASE ?: ""
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching {
+                            val list = us.spader.pjdesk.core.CloudAuth.prepareEnroll(
+                                session.computers,
+                                if (uploadLocal) app.store.saved() else emptyList(),
+                                uploadLocal,
+                                pjdeskId,
+                                hostname,
+                                display,
+                                osVersion,
+                            )
+                            val next = if (session.refresh.isBlank()) {
+                                session
+                            } else {
+                                us.spader.pjdesk.core.CloudAuth.refresh(
+                                    session.refresh,
+                                    session.deviceId,
+                                    us.spader.pjdesk.core.CloudAuth.computersJson(list),
+                                )
+                            }
+                            next.copy(email = next.email.ifBlank { session.email.ifBlank { emailHint.trim() } })
+                        }
+                    }
+                    netBusy = false
+                    result.onSuccess { enrolled ->
+                        val who = enrolled.email.ifBlank { emailHint.trim() }
+                        netPass = ""
+                        netKeyPass = ""
+                        netCode = ""
+                        netBlob = ""
+                        importPass = ""
+                        netError = ""
+                        netOffer = false
+                        netLogin = ""
+                        importOffer = null
+                        if (enrollOnlyNow) {
+                            signingIn = false
+                            scope.launch {
+                                snackbar.showSnackbar("Added this computer to $who. Nothing from that sign-in was kept on this computer.")
+                            }
+                            return@onSuccess
+                        }
+                        app.store.networkDeviceId = enrolled.deviceId
+                        if (temporaryNow) {
+                            app.store.beginTemporaryVisit()
+                            tempFlag.set(true)
+                            temporarySession = true
+                            memoryRefresh = enrolled.refresh
+                            lastActivity = android.os.SystemClock.elapsedRealtime()
+                            app.store.mergeCloud(enrolled.computers)
+                        } else {
+                            val first = app.store.networkEmail.isBlank()
+                            app.store.mergeCloud(enrolled.computers, preferAccount = first)
+                            app.store.networkEmail = who
+                            app.store.saveNetworkRefresh(enrolled.refresh)
+                            if (!keyBlob.isNullOrBlank()) {
+                                us.spader.pjdesk.core.NetKey.blobIn(keyBlob)?.let { app.store.networkKey = it }
+                            }
+                        }
+                        accountComputers = enrolled.computers
+                        enrolledFor = if (pjdeskId.length == 9) pjdeskId else ""
+                        engine.command(org.json.JSONObject().put("cmd", "server").put("address", enrolled.address).toString())
+                        engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", enrolled.access).toString())
+                        account = who
+                        signingIn = false
+                        saved = app.store.saved()
+                        if (temporaryNow) {
+                            scope.launch { snackbar.showSnackbar("Signed in until you close PJDesk") }
+                        } else if (!notice.isNullOrBlank()) {
+                            scope.launch { snackbar.showSnackbar(notice) }
+                        }
+                    }.onFailure { err ->
+                        val cloud = err as? us.spader.pjdesk.core.CloudAuthException
+                        netOffer = cloud != null && cloud.code == "no_server" && us.spader.pjdesk.core.CloudAuth.offerCurrentServer(
+                            if (cloud.role.isBlank()) "owner" else cloud.role,
+                            state.server,
+                            state.fingerprint,
+                        )
+                        netLogin = if (netOffer) cloud?.loginToken.orEmpty() else ""
+                        netError = err.message ?: "Could not sign in."
+                    }
+                }
+            }
+            var askedPassword by remember { mutableStateOf("") }
             val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
                 if (granted) netScan = true else netError = "Camera permission is needed to scan a network key."
             }
@@ -185,25 +317,10 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                     }
-                    netBusy = false
                     result.onSuccess { session ->
-                        val who = session.email.ifBlank { email.trim() }
-                        app.store.networkEmail = who
-                        app.store.networkDeviceId = session.deviceId
-                        app.store.networkKey = blob
-                        app.store.saveNetworkRefresh(session.refresh)
-                        engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
-                        engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
-                        app.store.mergeCloud(session.computers)
-                        netPass = ""
-                        netKeyPass = ""
-                        importPass = ""
-                        netBlob = ""
-                        importOffer = null
-                        account = who
-                        saved = app.store.saved()
-                        snackbar.showSnackbar("Import server configuration successfully")
+                        applySignedIn(session, email, blob, signOutWhenDone, false, "Import server configuration successfully")
                     }.onFailure {
+                        netBusy = false
                         val message = it.message ?: "Could not sign in."
                         netError = message
                         if (message.contains("specific account")) {
@@ -216,21 +333,64 @@ class MainActivity : ComponentActivity() {
             }
             var showPermanent by remember { mutableStateOf(false) }
             val capture by captureReady.collectAsState()
-            LaunchedEffect(account) {
-                val refresh = app.store.networkRefresh()
+            LaunchedEffect(account, memoryRefresh, temporarySession) {
+                val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                 val device = app.store.networkDeviceId
                 if (account.isBlank() || refresh.isBlank() || device.isBlank()) return@LaunchedEffect
+                val computers = if (temporarySession) null else CloudAuth.computersJson(app.store.saved())
                 val session = withContext(Dispatchers.IO) {
-                    runCatching {
-                        CloudAuth.refresh(refresh, device, CloudAuth.computersJson(app.store.saved()))
-                    }.getOrNull()
+                    runCatching { CloudAuth.refresh(refresh, device, computers) }.getOrNull()
                 } ?: return@LaunchedEffect
                 engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
-                if (session.address.isNotBlank()) {
+                if (session.address.isNotBlank() && !temporarySession) {
                     engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
                 }
-                app.store.mergeCloud(session.computers)
-                saved = app.store.saved()
+                if (!temporarySession) {
+                    app.store.mergeCloud(session.computers)
+                    saved = app.store.saved()
+                }
+            }
+            LaunchedEffect(bumps, state.session?.id) {
+                if (temporarySession) lastActivity = android.os.SystemClock.elapsedRealtime()
+            }
+            LaunchedEffect(temporarySession) {
+                if (!temporarySession) {
+                    tempWarn = false
+                    return@LaunchedEffect
+                }
+                while (temporarySession && tempFlag.get()) {
+                    if (state.session != null) lastActivity = android.os.SystemClock.elapsedRealtime()
+                    val limit = app.store.tempIdleMinutes.coerceIn(1, 24 * 60) * 60_000L
+                    val leftMs = limit - (android.os.SystemClock.elapsedRealtime() - lastActivity)
+                    if (leftMs <= 0L) {
+                        signOutTemporary()
+                        snackbar.showSnackbar("Signed out")
+                        break
+                    }
+                    tempWarn = leftMs <= 60_000L
+                    tempLeft = ((leftMs + 999) / 1000L).toInt()
+                    kotlinx.coroutines.delay(if (tempWarn) 250 else 1000)
+                }
+            }
+            LaunchedEffect(state.id, account, temporarySession) {
+                val id = state.id.filter { it.isDigit() }
+                if (account.isBlank() || id.length != 9 || enrolledFor == id) return@LaunchedEffect
+                val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                val device = app.store.networkDeviceId
+                if (refresh.isBlank() || device.isBlank()) return@LaunchedEffect
+                val uploadLocal = !temporarySession
+                val local = if (uploadLocal) app.store.saved() else emptyList()
+                val known = accountComputers
+                val hostname = engine.deviceLabel()
+                val display = app.store.computerName
+                val osVersion = Build.VERSION.RELEASE ?: ""
+                val ok = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val list = CloudAuth.prepareEnroll(known, local, uploadLocal, id, hostname, display, osVersion)
+                        CloudAuth.refresh(refresh, device, CloudAuth.computersJson(list))
+                    }.isSuccess
+                }
+                if (ok) enrolledFor = id
             }
             LaunchedEffect(state.error) {
                 val text = state.error ?: return@LaunchedEffect
@@ -250,9 +410,9 @@ class MainActivity : ComponentActivity() {
                 if (session.id.isBlank()) return@LaunchedEffect
                 app.store.noteRemote(session.id, session.peer, session.platform, session.version)
                 saved = app.store.saved()
-                val refresh = app.store.networkRefresh()
+                val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                 val device = app.store.networkDeviceId
-                if (refresh.isNotBlank() && device.isNotBlank()) {
+                if (!temporarySession && refresh.isNotBlank() && device.isNotBlank()) {
                     withContext(Dispatchers.IO) {
                         runCatching { CloudAuth.refresh(refresh, device, CloudAuth.computersJson(app.store.saved())) }
                     }
@@ -328,6 +488,28 @@ class MainActivity : ComponentActivity() {
                             applyImported(blob, importPass, bound)
                         },
                         onDismissImport = { importOffer = null; importPass = "" },
+                        temporary = signOutWhenDone,
+                        onTemporary = { signOutWhenDone = it },
+                        onEnrollOnly = {
+                            val device = app.store.networkDeviceId.ifBlank {
+                                UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
+                            }
+                            netBusy = true
+                            netError = ""
+                            val email = netEmail
+                            val pass = netPass
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) {
+                                    runCatching { CloudAuth.signIn(email, pass, device, "Android") }
+                                }
+                                result.onSuccess { session ->
+                                    applySignedIn(session, email, null, false, true)
+                                }.onFailure { err ->
+                                    netBusy = false
+                                    netError = err.message ?: "Could not sign in."
+                                }
+                            }
+                        },
                         offerCurrent = netOffer,
                         onUseCurrent = {
                             val token = netLogin
@@ -343,22 +525,12 @@ class MainActivity : ComponentActivity() {
                                 val result = withContext(Dispatchers.IO) {
                                     runCatching { CloudAuth.claimCurrentServer(token, address, fingerprint, device, "Android") }
                                 }
-                                netBusy = false
                                 result.onSuccess { session ->
-                                    val email = session.email.ifBlank { netEmail.trim() }
-                                    app.store.networkEmail = email
-                                    app.store.networkDeviceId = session.deviceId
-                                    app.store.saveNetworkRefresh(session.refresh)
-                                    engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
-                                    engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
-                                    app.store.mergeCloud(session.computers)
-                                    netPass = ""
-                                    netLogin = ""
-                                    netOffer = false
-                                    account = email
-                                    signingIn = false
-                                    saved = app.store.saved()
-                                }.onFailure { netError = it.message ?: "Could not sign in." }
+                                    applySignedIn(session, netEmail, null, signOutWhenDone, false)
+                                }.onFailure {
+                                    netBusy = false
+                                    netError = it.message ?: "Could not sign in."
+                                }
                             }
                         },
                         onSubmit = {
@@ -392,26 +564,10 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
                                 }
-                                netBusy = false
                                 result.onSuccess { session ->
-                                    val email = session.email.ifBlank { netEmail.trim() }
-                                    val first = app.store.networkEmail.isBlank()
-                                    app.store.mergeCloud(session.computers, preferAccount = first)
-                                    app.store.networkEmail = email
-                                    app.store.networkDeviceId = session.deviceId
-                                    if (useKey) NetKey.blobIn(blob)?.let { app.store.networkKey = it }
-                                    app.store.saveNetworkRefresh(session.refresh)
-                                    engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
-                                    engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
-                                    netPass = ""
-                                    netKeyPass = ""
-                                    netBlob = ""
-                                    account = email
-                                    signingIn = false
-                                    netOffer = false
-                                    netLogin = ""
-                                    saved = app.store.saved()
+                                    applySignedIn(session, email, if (useKey) blob else null, signOutWhenDone, false)
                                 }.onFailure { err ->
+                                    netBusy = false
                                     val cloud = err as? CloudAuthException
                                     netOffer = cloud != null && cloud.code == "no_server" && CloudAuth.offerCurrentServer(
                                         if (cloud.role.isBlank()) "owner" else cloud.role,
@@ -484,16 +640,25 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
                                     onSignIn = if (account.isEmpty() && state.server.isNotEmpty()) {
-                                        { signingIn = true }
+                                        {
+                                            signOutWhenDone = true
+                                            signingIn = true
+                                        }
                                     } else {
                                         null
                                     },
                                     accountEmail = account,
+                                    temporary = temporarySession,
                                     onSignOut = {
-                                        app.store.networkEmail = ""
-                                        app.store.saveNetworkRefresh("")
-                                        engine.command(JSONObject().put("cmd", "accessToken").put("token", "").toString())
-                                        account = ""
+                                        if (temporarySession) {
+                                            signOutTemporary()
+                                            scope.launch { snackbar.showSnackbar("Signed out") }
+                                        } else {
+                                            app.store.networkEmail = ""
+                                            app.store.saveNetworkRefresh("")
+                                            engine.command(JSONObject().put("cmd", "accessToken").put("token", "").toString())
+                                            account = ""
+                                        }
                                     },
                                 )
                                 1 -> SavedScreen(
@@ -535,6 +700,8 @@ class MainActivity : ComponentActivity() {
                                     computerName = app.store.computerName,
                                     deviceLabel = engine.deviceLabel(),
                                     onComputerName = { engine.setDisplayName(it) },
+                                    tempIdleMinutes = app.store.tempIdleMinutes,
+                                    onTempIdleMinutes = { app.store.tempIdleMinutes = it },
                                     theme = theme.value,
                                     onTheme = {
                                         theme.value = it
@@ -595,6 +762,25 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+                if (tempWarn && temporarySession) {
+                    AlertDialog(
+                        onDismissRequest = {},
+                        title = { Text("Still there?") },
+                        text = { Text("Signing out in $tempLeft seconds because PJDesk is idle.") },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                lastActivity = android.os.SystemClock.elapsedRealtime()
+                                tempWarn = false
+                            }) { Text("Stay signed in") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = {
+                                signOutTemporary()
+                                scope.launch { snackbar.showSnackbar("Signed out") }
+                            }) { Text("Sign out") }
+                        },
+                    )
+                }
                 if (state.askPassword) {
                     AlertDialog(
                         onDismissRequest = { engine.cancelPassword() },
@@ -622,6 +808,7 @@ class MainActivity : ComponentActivity() {
                                 val id = connectId.filter { it.isDigit() }
                                 if (savePassword && askedPassword.isNotBlank()) {
                                     app.store.saveComputerPassword(id, askedPassword)
+                                    if (temporarySession) app.store.noteTemporaryPassword(id)
                                 }
                                 engine.submitPassword(askedPassword)
                                 askedPassword = ""
@@ -658,7 +845,13 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        if (isFinishing) decoder?.stop()
+        if (isFinishing) {
+            decoder?.stop()
+            if (tempFlag.get()) {
+                tempFlag.set(false)
+                app.store.endTemporaryVisit()
+            }
+        }
         super.onDestroy()
     }
 

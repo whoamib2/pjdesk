@@ -25,6 +25,7 @@ pub struct SettingsDraft {
     server: String,
     start_with_windows: bool,
     remember_passwords: bool,
+    temp_idle_minutes: u32,
     view_only: bool,
     use_permanent: bool,
     permanent_password: String,
@@ -59,6 +60,7 @@ impl SettingsDraft {
             server: cfg.server.clone().unwrap_or_default(),
             start_with_windows: s.start_with_windows,
             remember_passwords: s.remember_passwords,
+            temp_idle_minutes: s.temp_idle_minutes.clamp(1, 24 * 60),
             view_only: s.view_only,
             use_permanent: s.permanent_password.is_some(),
             permanent_password: s.permanent_password().unwrap_or_default(),
@@ -287,6 +289,7 @@ impl App {
         let s = &mut self.cfg.settings;
         s.start_with_windows = d.start_with_windows;
         s.remember_passwords = d.remember_passwords;
+        s.temp_idle_minutes = d.temp_idle_minutes.clamp(1, 24 * 60);
         s.view_only = d.view_only;
         s.fps = d.fps.clamp(1, 120);
         s.bitrate_kbps = d.bitrate_kbps.clamp(200, 50_000);
@@ -442,6 +445,9 @@ fn general_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
         ui,
         "When this is on, the password prompt starts with Remember password checked. The password is saved only after the other computer accepts it.",
     ));
+    ui.add_space(8.0);
+    ui.label("Sign out a temporary sign-in after this many minutes with no PJDesk activity");
+    ui.add(egui::DragValue::new(&mut d.temp_idle_minutes).range(1..=24 * 60).suffix(" min"));
     ui.label(widgets::muted(
         ui,
         "For always-on access (even at the login screen), install the background service on the Security page.",

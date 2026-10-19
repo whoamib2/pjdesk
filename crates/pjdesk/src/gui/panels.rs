@@ -26,7 +26,12 @@ impl App {
                 }
                 ui.separator();
                 let email = self.cfg.network_email.clone().unwrap_or_default();
-                if !email.trim().is_empty() {
+                if self.temp.is_some() {
+                    ui.label(RichText::new("Signed in until you close PJDesk").color(p.warn).size(13.0));
+                    if ui.button("Sign out").clicked() {
+                        self.end_temporary_sign_in();
+                    }
+                } else if !email.trim().is_empty() {
                     ui.menu_button(RichText::new(email.trim()).color(p.ok), |ui| {
                         if ui.button("Manage account").clicked() {
                             ui.ctx().open_url(egui::OpenUrl::new_tab("https://pjdesk.com/account"));
@@ -45,6 +50,8 @@ impl App {
                         .clicked()
                     {
                         self.show_net_sign_in = true;
+                        self.net_temporary = true;
+                        self.net_enroll_only = false;
                         self.status.clear();
                     }
                     theme::icon_in(ui, Icon::User, 16.0, p.muted);
@@ -160,6 +167,7 @@ impl App {
     fn sign_in_panel(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
         let mut go = false;
+        let mut enroll_only = false;
         let mut cancel = false;
         ui.vertical_centered(|ui| {
             ui.set_max_width(440.0);
@@ -167,6 +175,9 @@ impl App {
             ui.label(RichText::new("Sign in to your network").size(26.0).strong().color(p.text));
             ui.add_space(4.0);
             let intro = match self.net_mode {
+                2 if self.net_temporary => {
+                    "Paste a network key. This computer is added to your account. This sign-in ends when you close PJDesk."
+                }
                 2 => "Paste a network key from My network or the PJDesk Server window. This computer enrolls and stays signed in after a restart.",
                 1 => "An enrollment code is for one device and expires in an hour.",
                 _ => "Your PJDesk account sets the servers for this network. It does not connect you to a computer, and it is not that computer's password.",
@@ -221,6 +232,16 @@ impl App {
                     ui.label(widgets::muted(ui, "From pjdesk.com → Account → My network. One device, one hour."));
                 }
                 ui.add_space(8.0);
+                widgets::checkbox(
+                    ui,
+                    &mut self.net_temporary,
+                    "Sign me out when I'm done (use on someone else's computer)",
+                );
+                ui.label(widgets::muted(
+                    ui,
+                    "This computer is added to your account either way. When this is checked, the sign-in ends when you close PJDesk and is not kept on this computer.",
+                ));
+                ui.add_space(8.0);
                 if !self.net_error.is_empty() {
                     ui.colored_label(p.warn, &self.net_error);
                     ui.add_space(6.0);
@@ -240,6 +261,18 @@ impl App {
                 };
                 if widgets::accent_button(ui, label, egui::vec2(ui.available_width(), 40.0)) && !self.net_busy {
                     go = true;
+                }
+                if self.net_mode == 0 && !self.net_busy {
+                    ui.add_space(4.0);
+                    let link = ui.add(
+                        egui::Button::new(
+                            RichText::new("Just add this computer to my account").underline().color(p.accent),
+                        )
+                        .frame(false),
+                    );
+                    if link.clicked() {
+                        enroll_only = true;
+                    }
                 }
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
@@ -271,7 +304,11 @@ impl App {
         if cancel {
             self.show_net_sign_in = false;
         }
-        if go {
+        if enroll_only {
+            self.net_enroll_only = true;
+            self.start_network_sign_in();
+        } else if go {
+            self.net_enroll_only = false;
             self.start_network_sign_in();
         }
     }
