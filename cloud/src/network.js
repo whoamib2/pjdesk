@@ -180,41 +180,91 @@ async function networkFor(env, account) {
 function cleanComputer(row) {
   const id = String(row.id || row.device_id || "").replace(/\D/g, "");
   if (id.length !== 9) return null;
+  const hostname = String(row.hostname || "").slice(0, 80);
+  let name = String(row.name || "").slice(0, 80);
+  const compact = name.replace(/\s/g, "");
+  if (compact === id) name = "";
+  if (hostname && name.toLowerCase() === hostname.toLowerCase()) name = "";
   return {
     id,
-    name: String(row.name || "").slice(0, 80),
+    name,
+    hostname,
     os_family: String(row.os_family || row.osFamily || "").slice(0, 32),
     os_version: String(row.os_version || row.osVersion || "").slice(0, 40),
   };
 }
 
+function missingHostnameColumn(err) {
+  const parts = [];
+  let cur = err;
+  for (let i = 0; i < 4 && cur; i += 1) {
+    parts.push(typeof cur === "string" ? cur : cur.message || "");
+    cur = cur.cause;
+  }
+  const message = parts.join(" ");
+  return /no such column/i.test(message) && /hostname/i.test(message);
+}
+
 async function computersFor(env, networkId, accountId) {
-  const { results } = await env.DB.prepare(
-    `SELECT device_id, name, os_family, os_version FROM network_computers
-      WHERE network_id = ? AND account_id = ? ORDER BY updated_at DESC LIMIT 500`,
-  )
-    .bind(networkId, accountId)
-    .all();
-  return (results || []).map((r) => ({
-    id: r.device_id,
-    name: r.name,
-    os_family: r.os_family,
-    os_version: r.os_version,
-  }));
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT device_id, name, hostname, os_family, os_version FROM network_computers
+        WHERE network_id = ? AND account_id = ? ORDER BY updated_at DESC LIMIT 500`,
+    )
+      .bind(networkId, accountId)
+      .all();
+    return (results || []).map((r) => ({
+      id: r.device_id,
+      name: r.name,
+      hostname: r.hostname || "",
+      os_family: r.os_family,
+      os_version: r.os_version,
+    }));
+  } catch (err) {
+    if (!missingHostnameColumn(err)) throw err;
+    const { results } = await env.DB.prepare(
+      `SELECT device_id, name, os_family, os_version FROM network_computers
+        WHERE network_id = ? AND account_id = ? ORDER BY updated_at DESC LIMIT 500`,
+    )
+      .bind(networkId, accountId)
+      .all();
+    return (results || []).map((r) => ({
+      id: r.device_id,
+      name: r.name,
+      hostname: "",
+      os_family: r.os_family,
+      os_version: r.os_version,
+    }));
+  }
 }
 
 async function saveComputers(env, networkId, accountId, list) {
   const rows = (Array.isArray(list) ? list : []).map(cleanComputer).filter(Boolean).slice(0, 500);
   const t = now();
-  const stmts = rows.map((c) =>
+  const withHost = rows.map((c) =>
     env.DB.prepare(
-      `INSERT INTO network_computers (network_id, account_id, device_id, name, os_family, os_version, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO network_computers (network_id, account_id, device_id, name, hostname, os_family, os_version, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(network_id, account_id, device_id) DO UPDATE SET
-         name = excluded.name, os_family = excluded.os_family, os_version = excluded.os_version, updated_at = excluded.updated_at`,
-    ).bind(networkId, accountId, c.id, c.name, c.os_family, c.os_version, t),
+         name = excluded.name, hostname = excluded.hostname, os_family = excluded.os_family,
+         os_version = excluded.os_version, updated_at = excluded.updated_at`,
+    ).bind(networkId, accountId, c.id, c.name, c.hostname, c.os_family, c.os_version, t),
   );
-  if (stmts.length) await env.DB.batch(stmts);
+  if (!withHost.length) return;
+  try {
+    await env.DB.batch(withHost);
+  } catch (err) {
+    if (!missingHostnameColumn(err)) throw err;
+    const legacy = rows.map((c) =>
+      env.DB.prepare(
+        `INSERT INTO network_computers (network_id, account_id, device_id, name, os_family, os_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(network_id, account_id, device_id) DO UPDATE SET
+           name = excluded.name, os_family = excluded.os_family, os_version = excluded.os_version, updated_at = excluded.updated_at`,
+      ).bind(networkId, accountId, c.id, c.name, c.os_family, c.os_version, t),
+    );
+    await env.DB.batch(legacy);
+  }
 }
 
 function validDevice(id) {

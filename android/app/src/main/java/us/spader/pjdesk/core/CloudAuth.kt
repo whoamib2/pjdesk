@@ -58,12 +58,10 @@ object CloudAuth {
         return session(email.trim().lowercase(), deviceId, reply)
     }
 
-    fun refresh(refresh: String, deviceId: String): Session {
-        val reply = post(
-            "$API/api/network/refresh",
-            null,
-            JSONObject().put("refresh", refresh).put("device_id", deviceId),
-        )
+    fun refresh(refresh: String, deviceId: String, computers: JSONArray? = null): Session {
+        val body = JSONObject().put("refresh", refresh).put("device_id", deviceId)
+        if (computers != null) body.put("computers", computers)
+        val reply = post("$API/api/network/refresh", null, body)
         return session("", deviceId, reply)
     }
 
@@ -111,7 +109,8 @@ object CloudAuth {
             array.put(
                 JSONObject()
                     .put("id", c.id)
-                    .put("name", c.name)
+                    .put("name", c.nickname())
+                    .put("hostname", c.hostname)
                     .put("os_family", c.osFamily)
                     .put("os_version", c.osVersion),
             )
@@ -134,6 +133,7 @@ object CloudAuth {
                         name = o.optString("name"),
                         osFamily = o.optString("os_family"),
                         osVersion = o.optString("os_version"),
+                        hostname = o.optString("hostname"),
                     ),
                 )
             }

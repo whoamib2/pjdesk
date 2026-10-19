@@ -43,11 +43,30 @@ data class DeskState(
 
 data class SavedComputer(
     val id: String,
-    val name: String,
+    /** Optional nickname. Empty when the user has not named this computer. */
+    val name: String = "",
     val osFamily: String = "",
     val osVersion: String = "",
     val passwordSaved: Boolean = false,
+    /** Hostname the remote computer reported. Empty before the first time it was seen. */
+    val hostname: String = "",
 )
+
+fun compactId(text: String): String = text.filter { !it.isWhitespace() }
+
+/** True when `text` is the same 9-digit ID, ignoring spaces. */
+fun isIdLabel(text: String, id: String): Boolean {
+    val a = compactId(text)
+    return a.isNotEmpty() && a.equals(compactId(id), ignoreCase = true)
+}
+
+/** A name the user typed. The ID and the computer's own hostname are not nicknames. */
+fun SavedComputer.nickname(): String {
+    val alias = name.trim()
+    if (alias.isEmpty() || isIdLabel(alias, id)) return ""
+    if (hostname.isNotBlank() && alias.equals(hostname.trim(), ignoreCase = true)) return ""
+    return alias
+}
 
 fun permanentOk(password: String): Boolean =
     password.trim().codePointCount(0, password.trim().length) >= 8

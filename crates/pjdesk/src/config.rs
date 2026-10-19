@@ -130,6 +130,25 @@ fn default_approval() -> String {
     "prompt".into()
 }
 
+/// True when `text` is the same 9-digit ID, ignoring spaces.
+pub fn same_id(text: &str, id: &str) -> bool {
+    let a: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let b: String = id.chars().filter(|c| !c.is_whitespace()).collect();
+    !a.is_empty() && a.eq_ignore_ascii_case(&b)
+}
+
+/// A name the user typed. The ID and the computer's own hostname are not nicknames.
+pub fn nickname_text(alias: &str, id: &str, hostname: &str) -> String {
+    let alias = alias.trim();
+    if alias.is_empty() || same_id(alias, id) {
+        return String::new();
+    }
+    if !hostname.trim().is_empty() && alias.eq_ignore_ascii_case(hostname.trim()) {
+        return String::new();
+    }
+    alias.to_string()
+}
+
 /// Remembered locally, not part of the synced address book.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerNote {
@@ -137,6 +156,9 @@ pub struct PeerNote {
     pub favorite: bool,
     #[serde(default)]
     pub last_connected: u64,
+    /// Hostname the host reported. Empty until a connection, LAN presence, or the account list supplies one.
+    #[serde(default)]
+    pub hostname: String,
     /// "windows", "macos", "linux", "android", or empty when the host did not say.
     #[serde(default)]
     pub os_family: String,
@@ -290,6 +312,75 @@ impl Config {
         let _ = cfg.save_to(&path);
     }
 
+    /// Caches the hostname a host reported, reloading first so a save from the
+    /// window does not drop it. Refreshed on each connect. An ID is not a hostname.
+    pub fn remember_hostname(id: &str, hostname: &str) {
+        let hostname = hostname.trim();
+        if hostname.is_empty() || !pjdesk_proto::is_valid_id(id) || same_id(hostname, id) {
+            return;
+        }
+        let path = Self::path();
+        let mut cfg = Self::load_from(&path).unwrap_or_default();
+        let note = cfg.settings.peers.entry(id.to_string()).or_default();
+        if note.hostname == hostname {
+            return;
+        }
+        note.hostname = hostname.to_string();
+        let _ = cfg.save_to(&path);
+        std::thread::spawn(|| {
+            let _ = crate::network::push_saved_computers_from_disk();
+        });
+    }
+
+    /// Fills hostname and OS this copy does not have yet. A value already in
+    /// memory is kept. Used before a save so the window does not wipe what the
+    /// viewer just wrote.
+    pub fn fill_peer_facts_from(&mut self, disk: &Config) {
+        for (id, src) in &disk.settings.peers {
+            let note = self.settings.peers.entry(id.clone()).or_default();
+            if note.hostname.trim().is_empty() && !src.hostname.trim().is_empty() {
+                note.hostname = src.hostname.clone();
+            }
+            if note.os_family.trim().is_empty() && !src.os_family.trim().is_empty() {
+                note.os_family = src.os_family.clone();
+                note.os_version = src.os_version.clone();
+            } else if note.os_version.is_empty() && note.os_family == src.os_family && !src.os_version.is_empty() {
+                note.os_version = src.os_version.clone();
+            }
+            if src.last_connected > note.last_connected {
+                note.last_connected = src.last_connected;
+            }
+            if note.windows.is_empty() && !src.windows.is_empty() {
+                note.windows = src.windows.clone();
+            }
+            if note.view_mode == 0 && note.last_display == 0 && (src.view_mode != 0 || src.last_display != 0) {
+                note.view_mode = src.view_mode;
+                note.last_display = src.last_display;
+            }
+        }
+    }
+
+    /// Copies host-reported hostname and OS from `disk` when that file has them.
+    /// The viewer writes those after a connect; the window re-reads them when
+    /// Saved computers opens and when the viewer exits.
+    pub fn take_peer_reports_from(&mut self, disk: &Config) {
+        for (id, src) in &disk.settings.peers {
+            let note = self.settings.peers.entry(id.clone()).or_default();
+            if !src.hostname.trim().is_empty() {
+                note.hostname = src.hostname.clone();
+            }
+            if !src.os_family.trim().is_empty() {
+                note.os_family = src.os_family.clone();
+                if !src.os_version.is_empty() {
+                    note.os_version = src.os_version.clone();
+                }
+            }
+            if src.last_connected > note.last_connected {
+                note.last_connected = src.last_connected;
+            }
+        }
+    }
+
     pub fn save(&self) -> Result<()> {
         self.save_to(&Self::path())
     }
@@ -406,25 +497,34 @@ impl Config {
             if !pjdesk_proto::is_valid_id(&id) {
                 continue;
             }
-            if let Some(entry) = self.address_book.iter_mut().find(|e| e.id == id) {
-                if entry.alias.trim().is_empty() && !computer.name.trim().is_empty() {
-                    entry.alias = computer.name.trim().to_string();
-                }
-                entry.password = None;
-            } else {
-                self.address_book.push(AddressEntry {
-                    id: id.clone(),
-                    alias: computer.name.trim().to_string(),
-                    password: None,
-                    ..Default::default()
-                });
+            let note = self.settings.peers.entry(id.clone()).or_default();
+            if note.hostname.trim().is_empty() && !computer.hostname.trim().is_empty() {
+                note.hostname = computer.hostname.trim().to_string();
             }
-            let note = self.settings.peers.entry(id).or_default();
             if note.os_family.is_empty() {
                 note.os_family = computer.os_family.clone();
             }
             if note.os_version.is_empty() {
                 note.os_version = computer.os_version.clone();
+            }
+            let known_host = note.hostname.clone();
+            let incoming = nickname_text(&computer.name, &id, &known_host);
+            if let Some(entry) = self.address_book.iter_mut().find(|e| e.id == id) {
+                entry.password = None;
+                if nickname_text(&entry.alias, &id, &known_host).is_empty() {
+                    if !incoming.is_empty() {
+                        entry.alias = incoming;
+                    } else if same_id(&entry.alias, &id) {
+                        entry.alias.clear();
+                    }
+                }
+            } else if !incoming.is_empty() || !known_host.is_empty() || !computer.os_family.is_empty() {
+                self.address_book.push(AddressEntry {
+                    id: id.clone(),
+                    alias: incoming,
+                    password: None,
+                    ..Default::default()
+                });
             }
         }
     }
@@ -434,6 +534,7 @@ impl Config {
     /// the GUI from clobbering them when it writes settings.
     pub fn reload_identity_from_disk(&mut self) {
         if let Ok(disk) = Self::load() {
+            self.fill_peer_facts_from(&disk);
             if disk.device_id.is_some() {
                 self.device_id = disk.device_id;
             }
@@ -539,7 +640,82 @@ mod tests {
         let old: PeerNote = serde_json::from_str(r#"{"favorite":true,"last_connected":3}"#).unwrap();
         assert!(old.favorite);
         assert!(old.os_family.is_empty());
+        assert!(old.hostname.is_empty());
         assert_eq!(old.view_mode, 0);
+    }
+
+    #[test]
+    fn a_nickname_is_not_the_id_or_the_hostname() {
+        assert_eq!(nickname_text("386 626 882", "386626882", "BEN-PC"), "");
+        assert_eq!(nickname_text("BEN-PC", "386626882", "ben-pc"), "");
+        assert_eq!(nickname_text("Front desk", "386626882", "BEN-PC"), "Front desk");
+        assert_eq!(nickname_text("  ", "386626882", "BEN-PC"), "");
+    }
+
+    #[test]
+    fn a_save_keeps_the_hostname_and_os_the_viewer_wrote() {
+        let mut memory = Config::default();
+        memory.settings.peers.insert(
+            "123456789".into(),
+            PeerNote { last_connected: 50, ..Default::default() },
+        );
+        let mut disk = Config::default();
+        disk.settings.peers.insert(
+            "123456789".into(),
+            PeerNote {
+                hostname: "BEN-PC".into(),
+                os_family: "windows".into(),
+                os_version: "11".into(),
+                last_connected: 10,
+                ..Default::default()
+            },
+        );
+        memory.fill_peer_facts_from(&disk);
+        let note = memory.settings.peers.get("123456789").unwrap();
+        assert_eq!(note.hostname, "BEN-PC");
+        assert_eq!(note.os_family, "windows");
+        assert_eq!(note.os_version, "11");
+        assert_eq!(note.last_connected, 50);
+
+        let mut typed = Config::default();
+        typed.settings.peers.insert(
+            "123456789".into(),
+            PeerNote { hostname: "OFFICE-PC".into(), os_family: "windows".into(), ..Default::default() },
+        );
+        let empty = Config::default();
+        typed.fill_peer_facts_from(&empty);
+        assert_eq!(typed.settings.peers.get("123456789").unwrap().hostname, "OFFICE-PC");
+
+        typed.take_peer_reports_from(&disk);
+        let note = typed.settings.peers.get("123456789").unwrap();
+        assert_eq!(note.hostname, "BEN-PC");
+        assert_eq!(note.os_version, "11");
+    }
+
+    #[test]
+    fn merge_keeps_a_nickname_and_fills_an_empty_hostname() {
+        let mut c = Config::default();
+        c.address_book = vec![AddressEntry { id: "123456789".into(), alias: "Front desk".into(), ..Default::default() }];
+        c.merge_computers(&[crate::network::SavedComputer {
+            id: "123456789".into(),
+            name: "Other name".into(),
+            hostname: "OFFICE-PC".into(),
+            os_family: "windows".into(),
+            os_version: "11".into(),
+        }]);
+        assert_eq!(c.address_book[0].alias, "Front desk");
+        assert_eq!(c.settings.peers.get("123456789").unwrap().hostname, "OFFICE-PC");
+
+        let mut fresh = Config::default();
+        fresh.merge_computers(&[crate::network::SavedComputer {
+            id: "386626882".into(),
+            name: "386 626 882".into(),
+            hostname: "BEN-PC".into(),
+            os_family: String::new(),
+            os_version: String::new(),
+        }]);
+        assert!(fresh.address_book.iter().all(|e| e.alias.is_empty()));
+        assert_eq!(fresh.settings.peers.get("386626882").unwrap().hostname, "BEN-PC");
     }
 
     #[test]
@@ -563,6 +739,7 @@ mod tests {
         c.merge_computers(&[crate::network::SavedComputer {
             id: "123456789".into(),
             name: "Office".into(),
+            hostname: String::new(),
             os_family: "windows".into(),
             os_version: "11".into(),
         }]);

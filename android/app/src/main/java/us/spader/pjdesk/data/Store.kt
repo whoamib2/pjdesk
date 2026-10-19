@@ -4,6 +4,8 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import us.spader.pjdesk.core.SavedComputer
+import us.spader.pjdesk.core.isIdLabel
+import us.spader.pjdesk.core.nickname
 import java.io.File
 
 /**
@@ -58,13 +60,25 @@ class Store(context: Context) {
             buildList {
                 for (i in 0 until array.length()) {
                     val o = array.getJSONObject(i)
+                    val id = o.optString("id")
+                    val rawName = o.optString("name")
+                    val hasHostname = o.has("hostname")
+                    val hostname = if (hasHostname) {
+                        o.optString("hostname")
+                    } else if (isIdLabel(rawName, id)) {
+                        ""
+                    } else {
+                        rawName
+                    }
+                    val name = if (hasHostname) rawName else ""
                     add(
                         SavedComputer(
-                            id = o.optString("id"),
-                            name = o.optString("name"),
+                            id = id,
+                            name = name,
                             osFamily = o.optString("osFamily"),
                             osVersion = o.optString("osVersion"),
-                            passwordSaved = computerPassword(o.optString("id")).isNotEmpty(),
+                            passwordSaved = computerPassword(id).isNotEmpty(),
+                            hostname = hostname,
                         ),
                     )
                 }
@@ -73,14 +87,63 @@ class Store(context: Context) {
     }
 
     fun remember(computer: SavedComputer) {
-        val next = saved().filterNot { it.id == computer.id }.toMutableList()
-        next.add(0, computer)
+        mergeCloud(listOf(computer))
+    }
+
+    /** Fills an empty nickname, hostname, or OS from the account. A value already stored here stays. */
+    fun mergeCloud(remote: List<SavedComputer>) {
+        val local = saved().toMutableList()
+        for (incoming in remote) {
+            if (incoming.id.length != 9) continue
+            val index = local.indexOfFirst { it.id == incoming.id }
+            if (index < 0) {
+                local.add(0, incoming.copy(name = incoming.nickname(), passwordSaved = false))
+                continue
+            }
+            val cur = local[index]
+            local[index] = cur.copy(
+                name = cur.nickname().ifBlank { incoming.nickname() },
+                hostname = cur.hostname.ifBlank { incoming.hostname },
+                osFamily = cur.osFamily.ifBlank { incoming.osFamily },
+                osVersion = cur.osVersion.ifBlank { incoming.osVersion },
+            )
+        }
+        writeSaved(local)
+    }
+
+    /** Hostname and OS from a session. A nickname already set on this phone is left as it is. */
+    fun noteRemote(id: String, hostname: String, osFamily: String, osVersion: String) {
+        if (id.length != 9) return
+        val host = hostname.trim().let { if (isIdLabel(it, id)) "" else it }
+        val current = saved()
+        val prev = current.find { it.id == id }
+        val next = if (prev == null) {
+            SavedComputer(id = id, hostname = host, osFamily = osFamily, osVersion = osVersion)
+        } else {
+            prev.copy(
+                hostname = host.ifBlank { prev.hostname },
+                osFamily = osFamily.ifBlank { prev.osFamily },
+                osVersion = osVersion.ifBlank { prev.osVersion },
+            )
+        }
+        writeSaved(listOf(next) + current.filterNot { it.id == id })
+    }
+
+    fun rename(id: String, nickname: String) {
+        val current = saved()
+        val prev = current.find { it.id == id } ?: SavedComputer(id = id)
+        val next = prev.copy(name = nickname.trim())
+        writeSaved(listOf(next) + current.filterNot { it.id == id })
+    }
+
+    private fun writeSaved(list: List<SavedComputer>) {
         val array = JSONArray()
-        next.take(200).forEach { c ->
+        list.take(200).forEach { c ->
             array.put(
                 JSONObject()
                     .put("id", c.id)
-                    .put("name", c.name)
+                    .put("name", c.nickname())
+                    .put("hostname", c.hostname)
                     .put("osFamily", c.osFamily)
                     .put("osVersion", c.osVersion),
             )
@@ -120,18 +183,7 @@ class Store(context: Context) {
 
     fun forget(id: String) {
         saveComputerPassword(id, "")
-        val next = saved().filterNot { it.id == id }
-        val array = JSONArray()
-        next.forEach { c ->
-            array.put(
-                JSONObject()
-                    .put("id", c.id)
-                    .put("name", c.name)
-                    .put("osFamily", c.osFamily)
-                    .put("osVersion", c.osVersion),
-            )
-        }
-        savedFile.writeText(array.toString())
+        writeSaved(saved().filterNot { it.id == id })
     }
 
     /** Older builds kept this secret in the plain preference file. Move it once, then delete the plain copy. */

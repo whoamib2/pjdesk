@@ -714,7 +714,9 @@
     const list = data.computers || [];
     if (!list.length) comps.append(el("p", "No saved computers yet.", "muted"));
     list.forEach((c) => {
-      comps.append(el("div", `${c.name || "Computer"} · ${c.id} · ${c.os_family || "unknown"} ${c.os_version || ""}`.trim()));
+      const host = c.hostname || "";
+      const nick = c.name && host && c.name.toLowerCase() !== host.toLowerCase() ? `${c.name} · ${host}` : c.name || host || "Computer";
+      comps.append(el("div", `${nick} · ${c.id} · ${c.os_family || "unknown"} ${c.os_version || ""}`.trim()));
     });
     root.append(comps);
     if (preview && params.get("invite") === "1" && window.PJNetKey) {

@@ -16,7 +16,10 @@ pub enum SavedSort {
 
 pub struct SavedRow {
     pub id: String,
-    pub name: String,
+    /// User-typed name. Empty when they have not set one.
+    pub nickname: String,
+    /// Hostname the host reported. Empty before the first time it was seen.
+    pub hostname: String,
     pub os_family: String,
     pub os_version: String,
     pub last_connected: u64,
@@ -45,25 +48,34 @@ pub fn os_label(family: &str) -> &'static str {
     }
 }
 
-/// True when `query` matches the name, the ID (spaces ignored), or the OS.
-pub fn query_matches(query: &str, name: &str, id: &str, os_family: &str) -> bool {
+/// True when `query` matches the nickname, the hostname, the ID (spaces ignored), or the OS.
+pub fn query_matches(query: &str, nickname: &str, hostname: &str, id: &str, os_family: &str) -> bool {
     let q = query.trim().to_ascii_lowercase();
     if q.is_empty() {
         return true;
     }
     let q_id: String = q.chars().filter(|c| !c.is_whitespace()).collect();
     let id_compact: String = id.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
-    name.to_ascii_lowercase().contains(&q)
+    nickname.to_ascii_lowercase().contains(&q)
+        || hostname.to_ascii_lowercase().contains(&q)
         || (!q_id.is_empty() && id_compact.contains(&q_id))
         || os_label(os_family).to_ascii_lowercase().contains(&q)
         || os_family.to_ascii_lowercase().contains(&q)
 }
 
+fn sort_label(row: &SavedRow) -> String {
+    if !row.nickname.is_empty() {
+        row.nickname.to_ascii_lowercase()
+    } else {
+        row.hostname.to_ascii_lowercase()
+    }
+}
+
 pub fn sort_rows(rows: &mut [SavedRow], sort: SavedSort) {
     match sort {
-        SavedSort::Name => rows.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()).then(a.id.cmp(&b.id))),
-        SavedSort::Recent => rows.sort_by(|a, b| b.last_connected.cmp(&a.last_connected).then(a.name.cmp(&b.name))),
-        SavedSort::Os => rows.sort_by(|a, b| os_label(&a.os_family).cmp(os_label(&b.os_family)).then(a.name.cmp(&b.name))),
+        SavedSort::Name => rows.sort_by(|a, b| sort_label(a).cmp(&sort_label(b)).then(a.id.cmp(&b.id))),
+        SavedSort::Recent => rows.sort_by(|a, b| b.last_connected.cmp(&a.last_connected).then(sort_label(a).cmp(&sort_label(b)))),
+        SavedSort::Os => rows.sort_by(|a, b| os_label(&a.os_family).cmp(os_label(&b.os_family)).then(sort_label(a).cmp(&sort_label(b)))),
     }
 }
 
@@ -79,9 +91,12 @@ impl App {
                     &format!("Signed in as {email}. This list is your account's computers. Passwords stay on this computer."),
                 ));
             }
-            ui.label(widgets::muted(ui, "Search by name, ID, or operating system. Enter connects to the first match."));
+            ui.label(widgets::muted(
+                ui,
+                "Search by nickname, computer name, ID, or operating system. Enter connects to the first match.",
+            ));
             ui.add_space(8.0);
-            let search = widgets::text_field(ui, &mut self.saved_query, "Search name, ID, or OS", false);
+            let search = widgets::text_field(ui, &mut self.saved_query, "Search nickname, name, ID, or OS", false);
             submitted = search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -107,7 +122,7 @@ impl App {
             rows.retain(|r| r.favorite);
         }
         let query = self.saved_query.clone();
-        rows.retain(|r| query_matches(&query, &r.name, &r.id, &r.os_family));
+        rows.retain(|r| query_matches(&query, &r.nickname, &r.hostname, &r.id, &r.os_family));
         sort_rows(&mut rows, self.saved_sort);
         if submitted {
             if let Some(first) = rows.first() {
@@ -121,15 +136,20 @@ impl App {
                 ui.label(widgets::muted(ui, "No saved computers match."));
                 return;
             }
-            header(ui);
-            ui.separator();
             egui::ScrollArea::vertical().id_salt("saved-rows").auto_shrink([false, false]).show(ui, |ui| {
                 let mut action: Option<RowCmd> = None;
-                for row in &rows {
-                    if self.row_line(ui, row, &mut action) {
-                        ui.separator();
-                    }
-                }
+                egui::Grid::new("saved-table")
+                    .num_columns(10)
+                    .spacing(egui::vec2(6.0, 4.0))
+                    .min_col_width(0.0)
+                    .show(ui, |ui| {
+                        header(ui);
+                        ui.end_row();
+                        for row in &rows {
+                            self.row_line(ui, row, &mut action);
+                            ui.end_row();
+                        }
+                    });
                 if let Some(cmd) = action {
                     self.apply_saved(cmd);
                 }
@@ -157,15 +177,14 @@ impl App {
             }
             let entry = self.cfg.address_book.iter().find(|e| e.id == id);
             let note = self.cfg.settings.peers.get(&id);
-            let alias = entry.and_then(|e| {
-                let a = e.alias.trim();
-                if a.is_empty() { None } else { Some(a.to_string()) }
-            });
-            let name = alias.unwrap_or_else(|| format_id(&id));
+            let hostname = note.map(|n| n.hostname.trim().to_string()).unwrap_or_default();
+            let alias = entry.map(|e| e.alias.clone()).unwrap_or_default();
+            let nickname = crate::config::nickname_text(&alias, &id, &hostname);
             let online = self.lan.iter().any(|(_, lan_id, _)| normalize_id(lan_id) == id);
             rows.push(SavedRow {
                 id: id.clone(),
-                name,
+                nickname,
+                hostname,
                 os_family: note.map(|n| n.os_family.clone()).unwrap_or_default(),
                 os_version: note.map(|n| n.os_version.clone()).unwrap_or_default(),
                 last_connected: note.map(|n| n.last_connected).unwrap_or(0),
@@ -177,48 +196,51 @@ impl App {
         rows
     }
 
-    fn row_line(&mut self, ui: &mut egui::Ui, row: &SavedRow, action: &mut Option<RowCmd>) -> bool {
+    fn row_line(&mut self, ui: &mut egui::Ui, row: &SavedRow, action: &mut Option<RowCmd>) {
         let p = theme::paint(ui);
         let id = row.id.clone();
-        ui.horizontal(|ui| {
-            ui.set_min_height(40.0);
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::hover());
-            super::icons::paint(ui.painter(), rect, os_icon(&row.os_family), p.text);
-            ui.add_space(8.0);
-            if self.renaming.as_deref() == Some(id.as_str()) {
-                let edit = ui.add(egui::TextEdit::singleline(&mut self.rename_text).desired_width(COL_NAME));
-                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    *action = Some(RowCmd::CommitRename(id.clone()));
-                }
-            } else {
-                left_cell(ui, COL_NAME, RichText::new(&row.name).color(p.text));
+        icon_cell(ui, os_icon(&row.os_family), p.text);
+        if self.renaming.as_deref() == Some(id.as_str()) {
+            let commit = name_editor(ui, &mut self.rename_text);
+            if commit {
+                *action = Some(RowCmd::CommitRename(id.clone()));
             }
-            left_cell(ui, COL_ID, RichText::new(format_id(&id)).monospace().color(p.muted));
+        } else {
+            name_cell(ui, &row.nickname, &row.hostname, p.text, p.muted);
+        }
+        fixed(ui, W_ID, |ui| {
+            ui.add(egui::Label::new(RichText::new(format_id(&id)).monospace().color(p.muted)).truncate());
+        });
+        fixed(ui, W_COPY, |ui| {
             if widgets::icon_button(ui, Icon::Copy, "Copy ID").clicked() {
                 ui.ctx().copy_text(format_id(&id));
                 self.toast.show("Copied");
             }
-            let when = if row.last_connected == 0 { "Never".to_string() } else { ago(row.last_connected) };
-            ui.add_sized([110.0, 20.0], egui::Label::new(RichText::new(when).color(p.muted).size(12.0)));
-            let os = if row.os_version.is_empty() {
-                os_label(&row.os_family).to_string()
-            } else {
-                format!("{} {}", os_label(&row.os_family), row.os_version)
-            };
-            ui.add_sized([140.0, 20.0], egui::Label::new(RichText::new(os).color(p.muted).size(12.0)));
+        });
+        let when = if row.last_connected == 0 { "Never".to_string() } else { ago(row.last_connected) };
+        fixed(ui, W_LAST, |ui| {
+            ui.add(egui::Label::new(RichText::new(when).color(p.muted).size(12.0)).truncate());
+        });
+        let os = system_label(&row.os_family, &row.os_version);
+        fixed(ui, W_SYS, |ui| {
+            ui.add(egui::Label::new(RichText::new(os).color(p.muted).size(12.0)).truncate());
+        });
+        fixed(ui, W_LOCK, |ui| {
             if row.has_password {
                 theme::icon_in(ui, Icon::Lock, 14.0, p.muted);
-            } else {
-                ui.add_space(18.0);
             }
+        });
+        fixed(ui, W_STATUS, |ui| {
             if row.online {
                 widgets::status_dot(ui, p.ok, "On this network");
-            } else {
-                ui.add_space(14.0);
             }
+        });
+        fixed(ui, W_CONNECT, |ui| {
             if ui.button("Connect").clicked() {
                 *action = Some(RowCmd::Connect(id.clone()));
             }
+        });
+        fixed(ui, W_MENU, |ui| {
             ui.menu_button("Menu", |ui| {
                 if ui.button("Rename").clicked() {
                     *action = Some(RowCmd::Rename(id.clone()));
@@ -243,7 +265,6 @@ impl App {
                 }
             });
         });
-        true
     }
 
     fn apply_saved(&mut self, cmd: RowCmd) {
@@ -261,11 +282,16 @@ impl App {
             }
             RowCmd::Remove(id) => self.confirm_remove = Some(id),
             RowCmd::Rename(id) => {
-                self.rename_text = self.row_title(&id);
+                let hostname = self.cfg.settings.peers.get(&id).map(|n| n.hostname.clone()).unwrap_or_default();
+                let alias = self.cfg.address_book.iter().find(|e| e.id == id).map(|e| e.alias.clone()).unwrap_or_default();
+                self.rename_text = crate::config::nickname_text(&alias, &id, &hostname);
                 self.renaming = Some(id);
             }
             RowCmd::CommitRename(id) => {
-                let alias = self.rename_text.trim().to_string();
+                let mut alias = self.rename_text.trim().to_string();
+                if crate::config::same_id(&alias, &id) {
+                    alias.clear();
+                }
                 if let Some(entry) = self.cfg.address_book.iter_mut().find(|e| e.id == id) {
                     entry.alias = alias;
                 } else if !alias.is_empty() {
@@ -277,7 +303,7 @@ impl App {
                 }
                 self.renaming = None;
                 self.sync_address_book();
-                self.toast.show("Name saved");
+                self.toast.show("Nickname saved");
             }
         }
     }
@@ -401,25 +427,104 @@ fn ago(unix: u64) -> String {
     }
 }
 
-const COL_NAME: f32 = 210.0;
-const COL_ID: f32 = 156.0;
+const ROW_H: f32 = 46.0;
+const W_ICON: f32 = 28.0;
+const W_NAME: f32 = 200.0;
+const W_ID: f32 = 118.0;
+const W_COPY: f32 = 32.0;
+const W_LAST: f32 = 112.0;
+const W_SYS: f32 = 140.0;
+const W_LOCK: f32 = 18.0;
+const W_STATUS: f32 = 156.0;
+const W_CONNECT: f32 = 88.0;
+const W_MENU: f32 = 76.0;
 
-fn left_cell(ui: &mut egui::Ui, width: f32, text: RichText) {
-    ui.allocate_ui_with_layout(Vec2::new(width, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        ui.add(egui::Label::new(text).truncate());
+fn system_label(family: &str, version: &str) -> String {
+    if family.is_empty() {
+        return "Unknown".into();
+    }
+    if version.is_empty() {
+        os_label(family).to_string()
+    } else {
+        format!("{} {version}", os_label(family))
+    }
+}
+
+/// One grid cell. The width is fixed so a badge on one row cannot move the buttons on the others.
+fn fixed(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(Vec2::new(width, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_width(width);
+        ui.set_max_width(width);
+        add(ui);
+    });
+}
+
+fn icon_cell(ui: &mut egui::Ui, icon: Icon, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(W_ICON, ROW_H), egui::Sense::hover());
+    let icon_rect = egui::Rect::from_center_size(rect.center(), Vec2::splat(22.0));
+    super::icons::paint(ui.painter(), icon_rect, icon, color);
+}
+
+fn name_cell(ui: &mut egui::Ui, nickname: &str, hostname: &str, text: egui::Color32, muted: egui::Color32) {
+    let (primary, secondary, placeholder) = if !nickname.is_empty() {
+        (nickname.to_string(), hostname.to_string(), false)
+    } else if !hostname.is_empty() {
+        (hostname.to_string(), String::new(), false)
+    } else {
+        ("No name yet".into(), String::new(), true)
+    };
+    let layout = if secondary.is_empty() {
+        egui::Layout::left_to_right(egui::Align::Center)
+    } else {
+        egui::Layout::top_down(egui::Align::Min)
+    };
+    ui.allocate_ui_with_layout(Vec2::new(W_NAME, ROW_H), layout, |ui| {
+        ui.set_min_width(W_NAME);
+        ui.set_max_width(W_NAME);
+        let color = if placeholder { muted } else { text };
+        ui.add(egui::Label::new(RichText::new(primary).color(color)).truncate());
+        if !secondary.is_empty() {
+            ui.add(egui::Label::new(RichText::new(secondary).color(muted).size(11.0)).truncate());
+        }
+    });
+}
+
+fn name_editor(ui: &mut egui::Ui, text: &mut String) -> bool {
+    let mut commit = false;
+    ui.allocate_ui_with_layout(Vec2::new(W_NAME, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_width(W_NAME);
+        ui.set_max_width(W_NAME);
+        let edit = ui.add(egui::TextEdit::singleline(text).desired_width(W_NAME - 4.0).hint_text("Nickname"));
+        if !edit.has_focus() {
+            edit.request_focus();
+        }
+        if edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            commit = true;
+        }
+    });
+    commit
+}
+
+fn header_label(ui: &mut egui::Ui, width: f32, text: &str) {
+    let p = theme::paint(ui);
+    fixed(ui, width, |ui| {
+        if !text.is_empty() {
+            ui.add(egui::Label::new(RichText::new(text).size(12.0).color(p.muted).strong()).truncate());
+        }
     });
 }
 
 fn header(ui: &mut egui::Ui) {
-    let p = theme::paint(ui);
-    ui.horizontal(|ui| {
-        ui.add_space(32.0);
-        left_cell(ui, COL_NAME, RichText::new("Name").size(12.0).color(p.muted).strong());
-        left_cell(ui, COL_ID, RichText::new("ID").size(12.0).color(p.muted).strong());
-        ui.add_space(28.0);
-        left_cell(ui, 110.0, RichText::new("Last connected").size(12.0).color(p.muted).strong());
-        left_cell(ui, 140.0, RichText::new("System").size(12.0).color(p.muted).strong());
-    });
+    let _ = ui.allocate_exact_size(Vec2::new(W_ICON, 16.0), egui::Sense::hover());
+    header_label(ui, W_NAME, "Name");
+    header_label(ui, W_ID, "ID");
+    header_label(ui, W_COPY, "");
+    header_label(ui, W_LAST, "Last connected");
+    header_label(ui, W_SYS, "System");
+    header_label(ui, W_LOCK, "");
+    header_label(ui, W_STATUS, "");
+    header_label(ui, W_CONNECT, "");
+    header_label(ui, W_MENU, "");
 }
 
 #[cfg(test)]
@@ -428,12 +533,15 @@ mod tests {
 
     #[test]
     fn search_matches_name_id_with_spaces_and_os() {
-        assert!(query_matches("office", "Office PC", "123456789", "windows"));
-        assert!(query_matches("123 456", "Office PC", "123456789", "windows"));
-        assert!(query_matches("linux", "Lab", "555666777", "linux"));
-        assert!(query_matches("mac", "Studio", "555666777", "macos"));
-        assert!(!query_matches("android", "Office PC", "123456789", "windows"));
-        assert!(query_matches("   ", "Office PC", "123456789", ""));
+        assert!(query_matches("front", "Front desk", "OFFICE-PC", "123456789", "windows"));
+        assert!(query_matches("office-pc", "Front desk", "OFFICE-PC", "123456789", "windows"));
+        assert!(query_matches("123 456", "Front desk", "OFFICE-PC", "123456789", "windows"));
+        assert!(query_matches("linux", "", "BEN-LAPTOP", "555666777", "linux"));
+        assert!(query_matches("mac", "Studio", "mac-studio", "555666777", "macos"));
+        assert!(!query_matches("android", "Front desk", "OFFICE-PC", "123456789", "windows"));
+        assert!(query_matches("   ", "Front desk", "OFFICE-PC", "123456789", ""));
+        assert_eq!(system_label("", ""), "Unknown");
+        assert_eq!(system_label("windows", "11"), "Windows 11");
     }
 
     #[test]
@@ -441,7 +549,8 @@ mod tests {
         let mut rows = vec![
             SavedRow {
                 id: "222222222".into(),
-                name: "Zed".into(),
+                nickname: String::new(),
+                hostname: "Zed".into(),
                 os_family: "linux".into(),
                 os_version: String::new(),
                 last_connected: 10,
@@ -451,7 +560,8 @@ mod tests {
             },
             SavedRow {
                 id: "111111111".into(),
-                name: "Alpha".into(),
+                nickname: "Alpha".into(),
+                hostname: "OFFICE-PC".into(),
                 os_family: "windows".into(),
                 os_version: String::new(),
                 last_connected: 50,
@@ -461,7 +571,7 @@ mod tests {
             },
         ];
         sort_rows(&mut rows, SavedSort::Name);
-        assert_eq!(rows[0].name, "Alpha");
+        assert_eq!(rows[0].nickname, "Alpha");
         sort_rows(&mut rows, SavedSort::Recent);
         assert_eq!(rows[0].id, "111111111");
         sort_rows(&mut rows, SavedSort::Os);

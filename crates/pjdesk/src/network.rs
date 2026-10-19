@@ -4,7 +4,7 @@
 //! functions from a background thread, never from the UI thread.
 //!
 //! Saved-computer passwords are not part of this. The list uploaded here is
-//! name, ID, and operating system only.
+//! the nickname, the hostname, the ID, and the operating system.
 
 use std::time::Duration;
 
@@ -19,7 +19,10 @@ const DEFAULT_API: &str = "https://pjdesk.com";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedComputer {
     pub id: String,
+    /// Optional nickname. Empty when the user has not named it.
     pub name: String,
+    /// Hostname the host reported. Empty until a computer has been seen.
+    pub hostname: String,
     pub os_family: String,
     pub os_version: String,
 }
@@ -77,6 +80,8 @@ struct ComputerBody {
     id: String,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    hostname: String,
     #[serde(default)]
     os_family: String,
     #[serde(default)]
@@ -147,7 +152,13 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
         computers: reply
             .computers
             .into_iter()
-            .map(|c| SavedComputer { id: c.id, name: c.name, os_family: c.os_family, os_version: c.os_version })
+            .map(|c| SavedComputer {
+                id: c.id,
+                name: c.name,
+                hostname: c.hostname,
+                os_family: c.os_family,
+                os_version: c.os_version,
+            })
             .collect(),
     })
 }
@@ -257,22 +268,61 @@ pub fn enroll(code: &str, device_id: &str, device_name: &str) -> Result<Session>
     session_from("", device_id, reply)
 }
 
-/// Name, ID, and OS only. A password on an address-book entry is dropped.
+/// Nickname, hostname, ID, and OS. A password is dropped. An alias that is
+/// only the ID, or only the hostname, is not uploaded as a nickname.
 pub fn computers_body(entries: &[AddressEntry], notes: &std::collections::BTreeMap<String, PeerNote>) -> serde_json::Value {
-    let computers: Vec<serde_json::Value> = entries
-        .iter()
-        .filter(|e| pjdesk_proto::is_valid_id(&e.id))
-        .map(|e| {
-            let note = notes.get(&e.id);
+    use std::collections::BTreeSet;
+    let mut ids = BTreeSet::new();
+    for entry in entries {
+        if pjdesk_proto::is_valid_id(&entry.id) {
+            ids.insert(entry.id.clone());
+        }
+    }
+    for id in notes.keys() {
+        if pjdesk_proto::is_valid_id(id) {
+            ids.insert(id.clone());
+        }
+    }
+    let computers: Vec<serde_json::Value> = ids
+        .into_iter()
+        .map(|id| {
+            let alias = entries.iter().find(|e| e.id == id).map(|e| e.alias.as_str()).unwrap_or("");
+            let note = notes.get(&id);
+            let hostname = note.map(|n| n.hostname.as_str()).unwrap_or("");
             serde_json::json!({
-                "id": e.id,
-                "name": e.alias,
+                "id": id,
+                "name": crate::config::nickname_text(alias, &id, hostname),
+                "hostname": hostname,
                 "os_family": note.map(|n| n.os_family.as_str()).unwrap_or(""),
                 "os_version": note.map(|n| n.os_version.as_str()).unwrap_or(""),
             })
         })
         .collect();
     serde_json::json!({ "computers": computers })
+}
+
+/// Uploads the saved list on this computer's refresh token. A failure leaves
+/// the local list as it is. The passphrase and computer passwords are not sent.
+pub fn push_saved_computers_from_disk() -> Result<()> {
+    let mut config = Config::load().unwrap_or_default();
+    let refresh_token = config.network_refresh_token();
+    let device = config.network_device_id.clone().unwrap_or_default();
+    if refresh_token.is_empty() || device.is_empty() {
+        return Ok(());
+    }
+    let body = computers_body(&config.address_book, &config.settings.peers);
+    let mut session = refresh(&refresh_token, &device, Some(&body))?;
+    if let Ok(disk) = Config::load() {
+        config.fill_peer_facts_from(&disk);
+        if session.email.is_empty() {
+            session.email = disk.network_email.clone().unwrap_or_default();
+        }
+    }
+    config.apply_network_session(&session);
+    if let Ok(disk) = Config::load() {
+        config.fill_peer_facts_from(&disk);
+    }
+    config.save()
 }
 
 /// Refreshes the access token when it is close to expiring. Safe to call from
@@ -356,13 +406,33 @@ mod tests {
         let mut notes = std::collections::BTreeMap::new();
         notes.insert(
             "123456789".into(),
-            PeerNote { os_family: "windows".into(), os_version: "11".into(), ..Default::default() },
+            PeerNote {
+                hostname: "OFFICE-PC".into(),
+                os_family: "windows".into(),
+                os_version: "11".into(),
+                ..Default::default()
+            },
         );
         let body = computers_body(&entries, &notes);
         let text = body.to_string();
         assert!(!text.contains("correct horse"));
         assert!(!text.contains("password"));
         assert!(text.contains("Office"));
+        assert!(text.contains("OFFICE-PC"));
         assert!(text.contains("windows"));
+
+        let id_only = vec![AddressEntry {
+            id: "386626882".into(),
+            alias: "386 626 882".into(),
+            password: Some("secret".into()),
+            ..Default::default()
+        }];
+        let mut seen = std::collections::BTreeMap::new();
+        seen.insert("386626882".into(), PeerNote { hostname: "BEN-PC".into(), ..Default::default() });
+        let uploaded = computers_body(&id_only, &seen);
+        let name = uploaded["computers"][0]["name"].as_str().unwrap();
+        assert_eq!(name, "");
+        assert_eq!(uploaded["computers"][0]["hostname"].as_str().unwrap(), "BEN-PC");
+        assert!(!uploaded.to_string().contains("secret"));
     }
 }

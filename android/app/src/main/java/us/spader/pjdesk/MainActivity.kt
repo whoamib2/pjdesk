@@ -46,7 +46,6 @@ import us.spader.pjdesk.ui.SignInScreen
 import java.util.UUID
 import us.spader.pjdesk.a11y.PjAccessibilityService
 import us.spader.pjdesk.core.permanentIssue
-import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.media.ScreenDecoder
 import us.spader.pjdesk.service.HostService
 import us.spader.pjdesk.ui.HomeScreen
@@ -183,7 +182,7 @@ class MainActivity : ComponentActivity() {
                         app.store.saveNetworkRefresh(session.refresh)
                         engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
                         engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
-                        session.computers.filter { it.id.length == 9 }.forEach { app.store.remember(it) }
+                        app.store.mergeCloud(session.computers)
                         netPass = ""
                         netKeyPass = ""
                         importPass = ""
@@ -210,12 +209,16 @@ class MainActivity : ComponentActivity() {
                 val device = app.store.networkDeviceId
                 if (account.isBlank() || refresh.isBlank() || device.isBlank()) return@LaunchedEffect
                 val session = withContext(Dispatchers.IO) {
-                    runCatching { CloudAuth.refresh(refresh, device) }.getOrNull()
+                    runCatching {
+                        CloudAuth.refresh(refresh, device, CloudAuth.computersJson(app.store.saved()))
+                    }.getOrNull()
                 } ?: return@LaunchedEffect
                 engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
                 if (session.address.isNotBlank()) {
                     engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
                 }
+                app.store.mergeCloud(session.computers)
+                saved = app.store.saved()
             }
             LaunchedEffect(state.error) {
                 val text = state.error ?: return@LaunchedEffect
@@ -230,18 +233,18 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(state.hosting) {
                 HostService.controlled(this@MainActivity, state.hosting)
             }
-            LaunchedEffect(state.session?.id, state.session?.platform, state.session?.version) {
+            LaunchedEffect(state.session?.id, state.session?.peer, state.session?.platform, state.session?.version) {
                 val session = state.session ?: return@LaunchedEffect
                 if (session.id.isBlank()) return@LaunchedEffect
-                app.store.remember(
-                    SavedComputer(
-                        id = session.id,
-                        name = session.peer.ifBlank { session.id },
-                        osFamily = session.platform,
-                        osVersion = session.version,
-                    ),
-                )
+                app.store.noteRemote(session.id, session.peer, session.platform, session.version)
                 saved = app.store.saved()
+                val refresh = app.store.networkRefresh()
+                val device = app.store.networkDeviceId
+                if (refresh.isNotBlank() && device.isNotBlank()) {
+                    withContext(Dispatchers.IO) {
+                        runCatching { CloudAuth.refresh(refresh, device, CloudAuth.computersJson(app.store.saved())) }
+                    }
+                }
             }
             PjTheme(theme.value) {
                 val session = state.session
@@ -353,11 +356,12 @@ class MainActivity : ComponentActivity() {
                                     app.store.saveNetworkRefresh(session.refresh)
                                     engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
                                     engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
-                                    session.computers.filter { it.id.length == 9 }.forEach { app.store.remember(it) }
+                                    app.store.mergeCloud(session.computers)
                                     netPass = ""
                                     netKeyPass = ""
                                     netBlob = ""
                                     account = email
+                                    saved = app.store.saved()
                                 }.onFailure { netError = it.message ?: "Could not sign in." }
                             }
                         },
@@ -440,6 +444,21 @@ class MainActivity : ComponentActivity() {
                                     onRemovePassword = {
                                         app.store.saveComputerPassword(it.id, "")
                                         saved = app.store.saved()
+                                    },
+                                    onRename = { computer, nickname ->
+                                        app.store.rename(computer.id, nickname)
+                                        saved = app.store.saved()
+                                        val refresh = app.store.networkRefresh()
+                                        val device = app.store.networkDeviceId
+                                        if (refresh.isNotBlank() && device.isNotBlank()) {
+                                            scope.launch {
+                                                withContext(Dispatchers.IO) {
+                                                    runCatching {
+                                                        CloudAuth.refresh(refresh, device, CloudAuth.computersJson(app.store.saved()))
+                                                    }
+                                                }
+                                            }
+                                        }
                                     },
                                 )
                                 else -> SettingsScreen(

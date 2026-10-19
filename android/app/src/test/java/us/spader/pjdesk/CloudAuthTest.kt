@@ -27,10 +27,19 @@ class CloudAuthTest {
 
     @Test
     fun savedComputersCarryNoPassword() {
-        val array = CloudAuth.computersJson(listOf(SavedComputer("123456789", "Office", "windows", "11", true)))
+        val array = CloudAuth.computersJson(
+            listOf(SavedComputer("123456789", "Office", "windows", "11", true, "OFFICE-PC")),
+        )
         val text = array.toString()
         assertFalse(text.contains("password"))
-        assertEquals("Office", JSONObject(text.removePrefix("[").removeSuffix("]")).getString("name"))
+        val row = JSONObject(text.removePrefix("[").removeSuffix("]"))
+        assertEquals("Office", row.getString("name"))
+        assertEquals("OFFICE-PC", row.getString("hostname"))
+        val idOnly = CloudAuth.computersJson(listOf(SavedComputer("386626882", "386 626 882", hostname = "BEN-PC")))
+        val hidden = idOnly.getJSONObject(0)
+        assertEquals("", hidden.getString("name"))
+        assertEquals("BEN-PC", hidden.getString("hostname"))
+        assertFalse(hidden.toString().contains("password"))
     }
 
     @Test

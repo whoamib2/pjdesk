@@ -61,12 +61,19 @@ class ScreenshotTest {
     }
 
     @Test
-    fun saved() = shot("saved") {
+    fun saved() = shot("saved") { savedList() }
+
+    @Test
+    fun savedLight() = shot("saved-light", "light") { savedList() }
+
+    @Composable
+    private fun savedList() {
         SavedScreen(
             computers = listOf(
-                SavedComputer("123456789", "Office", "windows", "11"),
-                SavedComputer("555000111", "Pixel", "android", "15"),
-                SavedComputer("424242424", "Studio", "macos", "15"),
+                SavedComputer("123456789", "Front desk", "windows", "11", hostname = "OFFICE-PC"),
+                SavedComputer("555000111", "", "android", "15", hostname = "Pixel-8"),
+                SavedComputer("424242424", "Studio", "macos", "15", hostname = "mac-studio"),
+                SavedComputer("386626882", "386 626 882", "", ""),
             ),
             query = "",
             onQuery = {},

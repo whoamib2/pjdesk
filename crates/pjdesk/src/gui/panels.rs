@@ -37,6 +37,7 @@ impl App {
             }
             if ui.selectable_label(saved_on, "Saved computers").clicked() {
                 self.page = super::MainPage::Saved;
+                self.reload_peer_reports();
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -720,7 +721,11 @@ impl App {
 
     fn desk_row(&self, id: &str, online: bool) -> DeskRow {
         let title = self.row_title(id);
+        let hostname = self.cfg.settings.peers.get(id).map(|n| n.hostname.trim().to_string()).unwrap_or_default();
         let mut bits = Vec::new();
+        if !hostname.is_empty() && hostname != title {
+            bits.push(hostname);
+        }
         if title != format_id(id) {
             bits.push(format_id(id));
         }
@@ -751,13 +756,16 @@ impl App {
     }
 
     pub(super) fn row_title(&self, id: &str) -> String {
-        self.cfg
-            .address_book
-            .iter()
-            .find(|e| e.id == id)
-            .map(|e| e.alias.clone())
-            .filter(|a| !a.is_empty())
-            .unwrap_or_else(|| format_id(id))
+        let hostname = self.cfg.settings.peers.get(id).map(|n| n.hostname.trim().to_string()).unwrap_or_default();
+        let alias = self.cfg.address_book.iter().find(|e| e.id == id).map(|e| e.alias.clone()).unwrap_or_default();
+        let nick = crate::config::nickname_text(&alias, id, &hostname);
+        if !nick.is_empty() {
+            return nick;
+        }
+        if !hostname.is_empty() {
+            return hostname;
+        }
+        format_id(id)
     }
 
     fn empty_hint(&self) -> &'static str {

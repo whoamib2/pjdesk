@@ -144,6 +144,7 @@ async fn connect(
             }
             Ok(Some(ServerMsg::SessionReady { session_id, token, udp_port, host_name })) => {
                 tracing::info!("Host accepted session {session_id:x}");
+                cache_host_name(target, &host_name);
                 break (session_id, token, udp_port, host_name);
             }
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
@@ -196,16 +197,24 @@ async fn connect(
         }
     };
     tracing::info!("Password accepted by {}", auth.peer_name);
+    let reported = if auth.peer_name.is_empty() { host_name } else { auth.peer_name };
+    cache_host_name(target, &reported);
     Ok(Link {
         connection,
         endpoint,
         control_send: auth.send,
         control_recv: auth.recv,
-        host_name: if auth.peer_name.is_empty() { host_name } else { auth.peer_name },
+        host_name: reported,
         host_id: target.to_string(),
         path,
         peer_proto: auth.peer_proto,
     })
+}
+
+/// Writes the host's name onto the saved computer. SessionReady supplies it
+/// before the password, and the handshake refreshes it after the password is accepted.
+fn cache_host_name(id: &str, name: &str) {
+    crate::config::Config::remember_hostname(id, name);
 }
 
 /// Direct IP: QUIC to `host:port` with the saved certificate pin (or first use).

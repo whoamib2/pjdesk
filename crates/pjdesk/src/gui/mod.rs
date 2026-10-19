@@ -403,8 +403,9 @@ impl App {
             crate::config::PeerNote {
                 favorite: true,
                 last_connected: now.saturating_sub(3600),
+                hostname: "OFFICE-PC".into(),
                 os_family: "windows".into(),
-                os_version: "10.0.26100".into(),
+                os_version: "11".into(),
                 ..Default::default()
             },
         );
@@ -413,6 +414,7 @@ impl App {
             crate::config::PeerNote {
                 favorite: false,
                 last_connected: now.saturating_sub(86_400),
+                hostname: "BEN-LAPTOP".into(),
                 os_family: "linux".into(),
                 os_version: "24.04".into(),
                 ..Default::default()
@@ -429,6 +431,12 @@ impl App {
     #[cfg(feature = "ui-shots")]
     fn load_saved_preview(&mut self) {
         self.load_preview(false);
+        if let Some(entry) = self.cfg.address_book.iter_mut().find(|e| e.id == "123456789") {
+            entry.alias = "Front desk".into();
+        }
+        if let Some(entry) = self.cfg.address_book.iter_mut().find(|e| e.id == "555666777") {
+            entry.alias.clear();
+        }
         self.cfg.address_book.push(pjdesk_proto::signal::AddressEntry {
             id: "444555666".into(),
             alias: "Studio".into(),
@@ -436,7 +444,12 @@ impl App {
         });
         self.cfg.address_book.push(pjdesk_proto::signal::AddressEntry {
             id: "777888999".into(),
-            alias: "Phone".into(),
+            alias: String::new(),
+            ..Default::default()
+        });
+        self.cfg.address_book.push(pjdesk_proto::signal::AddressEntry {
+            id: "386626882".into(),
+            alias: "386 626 882".into(),
             ..Default::default()
         });
         self.cfg.settings.peers.insert(
@@ -444,14 +457,16 @@ impl App {
             crate::config::PeerNote {
                 favorite: true,
                 last_connected: unix_now().saturating_sub(7200),
+                hostname: "mac-studio".into(),
                 os_family: "macos".into(),
-                os_version: "15.1".into(),
+                os_version: "15".into(),
                 ..Default::default()
             },
         );
         self.cfg.settings.peers.insert(
             "777888999".into(),
             crate::config::PeerNote {
+                hostname: "Pixel-8".into(),
                 os_family: "android".into(),
                 os_version: "14".into(),
                 last_connected: unix_now().saturating_sub(400_000),
@@ -459,7 +474,7 @@ impl App {
             },
         );
         self.cfg.remember_password("123456789", Some("saved-secret"));
-        self.lan = vec![("Office PC".into(), "123456789".into(), "192.168.1.20:21201".into())];
+        self.lan = vec![("OFFICE-PC".into(), "123456789".into(), "192.168.1.20:21201".into())];
         self.page = MainPage::Saved;
         self.saved_query.clear();
     }
@@ -523,6 +538,13 @@ impl App {
         self.cfg.reload_identity_from_disk();
         if let Err(e) = self.cfg.save() {
             self.status = format!("Could not save settings: {e}");
+        }
+    }
+
+    /// Re-reads hostname and OS the viewer stored, so the list matches the last connect.
+    fn reload_peer_reports(&mut self) {
+        if let Ok(disk) = crate::config::Config::load() {
+            self.cfg.take_peer_reports_from(&disk);
         }
     }
 
@@ -989,6 +1011,9 @@ impl App {
 
     fn sync_address_book(&mut self) {
         self.save_cfg();
+        std::thread::spawn(|| {
+            let _ = crate::network::push_saved_computers_from_disk();
+        });
         if self.cfg.account.is_none() {
             return;
         }
@@ -1086,6 +1111,7 @@ impl App {
         for rx in pending {
             match rx.try_recv() {
                 Ok((id, code, files)) => {
+                    self.reload_peer_reports();
                     if code != 0 {
                         let reason = last_session_reason().unwrap_or_else(|| {
                             if code == 3 {
@@ -1171,9 +1197,35 @@ impl App {
                 format!("Found {} computer(s) on this network.", rows.len())
             };
             self.lan = rows;
+            self.note_lan_names();
             if !self.lan.is_empty() {
                 self.desk_tab = DeskTab::Lan;
             }
+        }
+    }
+
+    /// A computer already saved learns its name from a LAN announcement when it has none yet.
+    fn note_lan_names(&mut self) {
+        let mut changed = false;
+        let found = self.lan.clone();
+        for (name, id, _) in found {
+            let id = normalize_id(&id);
+            let name = name.trim();
+            if name.is_empty() || name == "Computer" || !is_valid_id(&id) {
+                continue;
+            }
+            let known = self.cfg.address_book.iter().any(|e| e.id == id) || self.cfg.settings.peers.contains_key(&id);
+            if !known {
+                continue;
+            }
+            let note = self.cfg.settings.peers.entry(id).or_default();
+            if note.hostname.is_empty() {
+                note.hostname = name.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_cfg();
         }
     }
 }
