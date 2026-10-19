@@ -26,6 +26,18 @@ InstallDirRegKey HKLM "Software\${APPNAME}" "InstallDir"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 
+!ifndef VERQUAD
+  !define VERQUAD "${VERSION}.0"
+!endif
+VIProductVersion "${VERQUAD}"
+VIAddVersionKey "ProductName" "PJDesk"
+VIAddVersionKey "CompanyName" "PJDesk"
+VIAddVersionKey "FileDescription" "PJDesk remote desktop installer"
+VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "ProductVersion" "${VERSION}"
+VIAddVersionKey "LegalCopyright" "PJDesk"
+VIAddVersionKey "OriginalFilename" "PJDesk-Client-Setup-${VERSION}.exe"
+
 !include "MUI2.nsh"
 !include "nsDialogs.nsh"
 !include "LogicLib.nsh"
@@ -137,9 +149,15 @@ Section "PJDesk (required)" SecCore
   WriteRegStr HKLM "Software\${APPNAME}" "InstallDir" "$INSTDIR"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  ; Auto-update check every 30 minutes, as SYSTEM (short path avoids quoting the spaces).
-  GetFullPathName /SHORT $0 "$INSTDIR\${EXE}"
-  nsExec::Exec 'schtasks /Create /TN "PJDesk Update" /TR "$0 update" /SC MINUTE /MO 30 /RU SYSTEM /RL HIGHEST /F'
+  ; No scheduled task. The service installs updates itself. A task that
+  ; Task Scheduler (svchost) launched was being flagged by Defender.
+  nsExec::Exec 'schtasks /Delete /TN "PJDesk Update" /F'
+  ; UDP 21201 is the direct LAN port. A program rule whose path contains
+  ; spaces often does not apply, so the port rule is explicit.
+  nsExec::Exec 'netsh advfirewall firewall delete rule name="PJDesk LAN"'
+  nsExec::Exec 'netsh advfirewall firewall add rule name="PJDesk LAN" dir=in action=allow protocol=UDP localport=21201 profile=any'
+  nsExec::Exec 'netsh advfirewall firewall delete rule name="PJDesk"'
+  nsExec::Exec 'netsh advfirewall firewall add rule name="PJDesk" dir=in action=allow program="$INSTDIR\${EXE}" enable=yes profile=any'
   ; The new exe restarts the service (several tries) and opens PJDesk in the
   ; signed-in user's session. net start is the fallback if that command is absent.
   nsExec::ExecToLog '"$INSTDIR\${EXE}" update-handoff'

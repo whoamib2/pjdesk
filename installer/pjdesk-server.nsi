@@ -26,6 +26,18 @@ InstallDirRegKey HKLM "Software\PJDeskServer" "InstallDir"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 
+!ifndef VERQUAD
+  !define VERQUAD "${VERSION}.0"
+!endif
+VIProductVersion "${VERQUAD}"
+VIAddVersionKey "ProductName" "PJDesk Server"
+VIAddVersionKey "CompanyName" "PJDesk"
+VIAddVersionKey "FileDescription" "PJDesk remote desktop server installer"
+VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "ProductVersion" "${VERSION}"
+VIAddVersionKey "LegalCopyright" "PJDesk"
+VIAddVersionKey "OriginalFilename" "PJDesk-Server-Setup-${VERSION}.exe"
+
 !include "MUI2.nsh"
 
 !define MUI_ICON "pjdesk-server.ico"
@@ -84,6 +96,10 @@ Section "PJDesk Server (required)" SecCore
   ; every newer release on its own. The data folder under ProgramData is not
   ; touched: the key, accounts, cloud settings and the update preference stay.
   nsExec::Exec 'schtasks /Delete /TN "PJDesk Server Update" /F'
+  nsExec::Exec 'netsh advfirewall firewall delete rule name="PJDesk Server TCP"'
+  nsExec::Exec 'netsh advfirewall firewall add rule name="PJDesk Server TCP" dir=in action=allow protocol=TCP localport=21200 profile=any'
+  nsExec::Exec 'netsh advfirewall firewall delete rule name="PJDesk Server UDP"'
+  nsExec::Exec 'netsh advfirewall firewall add rule name="PJDesk Server UDP" dir=in action=allow protocol=UDP localport=21200 profile=any'
   ; Tray icon for the user who installed, started at every sign-in.
   ; The service itself cannot show a tray (it runs in session 0).
   WriteRegDWORD HKCU "Software\PJDeskServer" "TrayAtLogin" 1

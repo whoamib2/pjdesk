@@ -281,10 +281,16 @@ fn update_dir() -> PathBuf {
     base.join("PJDesk").join("updates")
 }
 
-/// Creates the update directory and keeps other users out of it. A symlink or
-/// junction already sitting there is removed first so a local user cannot
-/// redirect the write.
-fn harden_update_dir(path: &std::path::Path) -> Result<()> {
+/// Creates the update directory. A symlink or junction already sitting there is
+/// removed first so a local user cannot redirect the write. Files already in
+/// the folder (including ones Microsoft Defender quarantined) are left in place;
+/// the installer is a new random name.
+///
+/// `lock_acl` is only for an elevated process (the service, or `pjdesk update`
+/// after the administrator prompt). The unelevated window must not call this
+/// with `lock_acl` set: changing the ACL is what failed on a normal desktop.
+/// A failed lockdown does not stop the update when the folder is still writable.
+fn harden_update_dir(path: &std::path::Path, lock_acl: bool) -> Result<()> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
             let _ = std::fs::remove_dir(path);
@@ -295,27 +301,34 @@ fn harden_update_dir(path: &std::path::Path) -> Result<()> {
     if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
         bail!("refusing to download an update through a link at {}", path.display());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // Grant on the directory only. Inheritance flags are invalid on files,
-        // so this must not be applied with /T (see the server's data-folder notes).
-        let status = std::process::Command::new("icacls")
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/Q"])
-            .creation_flags(0x0800_0000)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if !matches!(status, Ok(s) if s.success()) {
-            bail!("could not lock down the update directory {}", path.display());
+    if lock_acl {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // Directory only. (OI)(CI) on a file is an invalid ACE, and /T would
+            // try to rewrite quarantined leftovers and fail the whole update.
+            let _ = std::process::Command::new("icacls")
+                .arg(path)
+                .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/Q"])
+                .creation_flags(0x0800_0000)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
         }
     }
+    let probe = path.join(format!(".write-{}", std::process::id()));
+    std::fs::write(&probe, b"ok").with_context(|| {
+        format!(
+            "could not save an update in {}. Files already there were left in place. If Microsoft Defender quarantined an older installer, restore or remove that item and try again.",
+            path.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe);
     Ok(())
 }
 
@@ -333,10 +346,10 @@ fn safe_version(version: &str) -> String {
 /// refused: HTTPS to GitHub is necessary, and the checksum catches a truncated
 /// or swapped download before anything is executed.
 pub fn download_verified(update: &Available) -> Result<PathBuf> {
-    download_verified_progress(update, &|_| {})
+    download_verified_progress(update, &|_| {}, true)
 }
 
-fn download_verified_progress(update: &Available, progress: &dyn Fn(&str)) -> Result<PathBuf> {
+fn download_verified_progress(update: &Available, progress: &dyn Fn(&str), lock_acl: bool) -> Result<PathBuf> {
     let sums_url = update.sums_url.as_deref().context(
         "this release has no SHA256SUMS file, so it was not installed. Publish SHA256SUMS next to the installer.",
     )?;
@@ -369,7 +382,7 @@ fn download_verified_progress(update: &Available, progress: &dyn Fn(&str)) -> Re
     }
 
     let dir = update_dir();
-    harden_update_dir(&dir)?;
+    harden_update_dir(&dir, lock_acl)?;
     let path = dir.join(format!("{}-{}.exe", hex::encode(crate::random_bytes::<8>()), safe_version(&update.version)));
     {
         let mut file = std::fs::OpenOptions::new()
@@ -492,7 +505,19 @@ pub fn install_available(update: &Available) -> Result<()> {
 /// `progress` is a short line for the window: checking, a download percent,
 /// verifying, then the install. The installer closes PJDesk and `update-handoff`
 /// opens it again, so the last line is shown before the installer starts.
+/// Same as [`install_client_as_service`], but does not change folder permissions.
+/// The unelevated window does not use this; it asks the service.
 pub fn install_client_reporting(current: &str, progress: &dyn Fn(&str)) -> Result<Outcome> {
+    install_client_reporting_lock(current, progress, false)
+}
+
+/// Check, download, verify, and install from an elevated process (the service
+/// or `pjdesk update` after the administrator prompt).
+pub fn install_client_as_service(current: &str, progress: &dyn Fn(&str)) -> Result<Outcome> {
+    install_client_reporting_lock(current, progress, true)
+}
+
+fn install_client_reporting_lock(current: &str, progress: &dyn Fn(&str), lock_acl: bool) -> Result<Outcome> {
     progress("Checking for updates…");
     match check_client(crate::UPDATE_REPO, current)? {
         None => {
@@ -501,7 +526,7 @@ pub fn install_client_reporting(current: &str, progress: &dyn Fn(&str)) -> Resul
             Ok(Outcome::UpToDate(current.to_string()))
         }
         Some(update) => {
-            let path = download_verified_progress(&update, progress)?;
+            let path = download_verified_progress(&update, progress, lock_acl)?;
             let line = format!("Installing PJDesk {}. PJDesk will close and open again.", update.version);
             progress(&line);
             // One beat so the window can paint that line before the installer
@@ -615,6 +640,33 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa *PJDesk-Server-
             Asset { name: "PJDesk-Android-0.6.7.apk".into(), browser_download_url: "apk".into() },
         ];
         assert_eq!(pick_android_asset(&assets).map(|a| a.browser_download_url.as_str()), Some("apk"));
+    }
+
+    #[test]
+    fn a_leftover_file_does_not_block_the_update_directory() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-upd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old-0.6.4.exe"), b"quarantined leftover").unwrap();
+        let link = dir.join("linked");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("real"), &link).unwrap();
+        harden_update_dir(&dir, false).unwrap();
+        let dest = dir.join("new-installer.exe");
+        std::fs::write(&dest, b"installer").unwrap();
+        assert!(dest.is_file());
+        assert_eq!(std::fs::read(dir.join("old-0.6.4.exe")).unwrap(), b"quarantined leftover");
+        #[cfg(unix)]
+        {
+            // A link is removed and replaced with a real directory. The folder
+            // it pointed at does not receive the probe file.
+            harden_update_dir(&link, false).unwrap();
+            assert!(link.is_dir());
+            assert!(!link.symlink_metadata().unwrap().file_type().is_symlink());
+            assert!(dir.join("real").read_dir().unwrap().next().is_none());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

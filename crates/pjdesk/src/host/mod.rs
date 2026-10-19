@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use pjdesk_proto::auth::generate_password;
+use pjdesk_proto::framing::write_msg;
+use pjdesk_proto::peer::HostMsg;
 use pjdesk_proto::signal::{ClientMsg, ErrorCode, Policy, ServerMsg, SessionId};
 use pjdesk_proto::tls::TlsIdentity;
 use pjdesk_proto::udp::Role;
@@ -352,7 +354,7 @@ pub fn run(server: ServerAddr, config: Config, args: HostArgs) -> Result<()> {
 /// Like [`run`], but reports status to (and takes password changes from) a GUI.
 pub fn run_with(server: ServerAddr, config: Config, args: HostArgs, shared: Option<Arc<HostShared>>) -> Result<()> {
     platform_init();
-    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     runtime.block_on(host_main(server, config, args, shared))
 }
 
@@ -732,9 +734,12 @@ async fn session_inner(
     state.pending.fetch_sub(1, Ordering::SeqCst);
     *still_pending = false;
     if state.streaming.swap(true, Ordering::SeqCst) {
-        connection.close(2u32.into(), b"another controller is already connected");
+        let message = "another controller is already connected";
+        warn!("Password was accepted, then the session stopped: {message}");
+        let _ = write_msg(&mut auth.send, &HostMsg::Notice(message.into())).await;
+        connection.close(2u32.into(), message.as_bytes());
         let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
-        bail!("another controller connected first");
+        bail!(message);
     }
 
     let remote = connection.remote_address();
@@ -745,7 +750,12 @@ async fn session_inner(
     } else {
         "Internet"
     };
-    info!("\"{}\" connected ({path}, {})", auth.peer_name, remote);
+    info!("Password accepted for \"{}\". Starting the picture ({path}, {})", auth.peer_name, remote);
+    if state.args.service_host {
+        info!("Host log: C:\\ProgramData\\PJDesk\\service\\service.log");
+    } else {
+        info!("Host log: %APPDATA%\\PJDesk\\pjdesk.log");
+    }
     if let Some(shared) = &state.shared {
         *shared.connected.lock().unwrap() = Some(auth.peer_name.clone());
     }

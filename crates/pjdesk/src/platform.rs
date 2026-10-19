@@ -32,6 +32,24 @@ pub fn input_desktop_name() -> Option<String> {
     }
 }
 
+/// Windows session this process is running in. Session 0 is the service
+/// session and has no interactive desktop, so capture there stays black.
+#[cfg(windows)]
+pub fn session_id() -> Option<u32> {
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    unsafe {
+        let mut id = 0u32;
+        ProcessIdToSessionId(GetCurrentProcessId(), &mut id).ok()?;
+        Some(id)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn session_id() -> Option<u32> {
+    None
+}
+
 /// Attaches the current thread to the input desktop, so GDI/DXGI capture and
 /// `SendInput` act on whatever is on screen now (including the secure desktop).
 /// Returns true on success.

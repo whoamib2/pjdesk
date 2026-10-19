@@ -86,7 +86,10 @@ async fn one(state: Arc<HostState>, incoming: quinn::Incoming) -> Result<()> {
     let (mut ceiling, receive_dir) =
         super::open_session(&state, &mut auth, &passwords, permanent.as_deref(), &peer_name, &ip).await?;
     if state.streaming.swap(true, Ordering::SeqCst) {
-        connection.close(2u32.into(), b"another controller is already connected");
+        let message = "another controller is already connected";
+        warn!("Password was accepted, then the direct session stopped: {message}");
+        let _ = pjdesk_proto::framing::write_msg(&mut auth.send, &pjdesk_proto::peer::HostMsg::Notice(message.into())).await;
+        connection.close(2u32.into(), message.as_bytes());
         return Ok(());
     }
     if let Some(shared) = &state.shared {
@@ -109,6 +112,12 @@ async fn one(state: Arc<HostState>, incoming: quinn::Incoming) -> Result<()> {
         tunnel_ports: ports,
         receive_dir,
     };
+    info!("Password accepted for \"{}\" on UDP {}. Starting the picture.", grant.peer_name, pjdesk_proto::DIRECT_PORT);
+    if state.args.service_host {
+        info!("Host log: C:\\ProgramData\\PJDesk\\service\\service.log");
+    } else {
+        info!("Host log: %APPDATA%\\PJDesk\\pjdesk.log");
+    }
     let result = stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
     state.streaming.store(false, Ordering::SeqCst);
     if let Some(shared) = &state.shared {

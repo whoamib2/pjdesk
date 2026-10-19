@@ -462,7 +462,7 @@ fn general_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
     ui.horizontal(|ui| {
         if !d.auto_update_known && !d.auto_update_touched {
             widgets::spinner(ui, theme::paint(ui).muted);
-            ui.label(widgets::muted(ui, "Checking the update schedule…"));
+            ui.label(widgets::muted(ui, "Checking automatic updates…"));
         }
     });
     if widgets::checkbox(ui, &mut d.auto_update, "Install updates automatically (checks every 30 minutes)") {
@@ -471,7 +471,7 @@ fn general_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
     }
     ui.label(widgets::muted(
         ui,
-        "Downloads new versions from the project's GitHub releases, verifies them, and installs silently. Changing this asks for Administrator rights.",
+        "The background service checks every 30 minutes and installs the update itself. PJDesk does not register a scheduled task. Changing this asks for Administrator rights.",
     ));
     ui.add_space(8.0);
     update_now_button(ui);

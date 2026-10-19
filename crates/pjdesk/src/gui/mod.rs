@@ -1633,10 +1633,12 @@ impl App {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
+            allow_viewer_foreground();
             cmd.creation_flags(0x0800_0000);
         }
         match cmd.spawn() {
             Ok(mut child) => {
+                clear_session_status();
                 self.mark_recent(id);
                 let what = if files { "Opening file transfer for" } else { "Opening" };
                 self.toast.show(format!("{what} {}", format_id(id)));
@@ -1658,6 +1660,16 @@ impl App {
             return;
         }
         self.status = note;
+    }
+
+    fn poll_session_status(&mut self) {
+        if self.viewer_rx.is_empty() && !self.ask_alive {
+            return;
+        }
+        let Some(text) = read_session_status() else { return };
+        if text != self.status {
+            self.status = text;
+        }
     }
 
     fn poll_viewers(&mut self) {
@@ -1789,6 +1801,7 @@ impl App {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
+            allow_viewer_foreground();
             cmd.creation_flags(0x0800_0000);
         }
         match cmd.spawn() {
@@ -1822,6 +1835,7 @@ impl App {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
+            allow_viewer_foreground();
             cmd.creation_flags(0x0800_0000);
         }
         match cmd.spawn() {
@@ -1971,6 +1985,29 @@ fn write_service_consent(accept: bool) {
     let _ = std::fs::write(path, body.to_string());
 }
 
+/// Lets the viewer process bring its window in front of this one.
+#[cfg(windows)]
+fn allow_viewer_foreground() {
+    use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+    unsafe {
+        let _ = AllowSetForegroundWindow(0xFFFF_FFFF);
+    }
+}
+
+fn clear_session_status() {
+    let path = crate::config::Config::path();
+    let Some(dir) = path.parent() else { return };
+    let _ = std::fs::remove_file(dir.join("session-status.txt"));
+    let _ = std::fs::remove_file(dir.join("last-session.txt"));
+}
+
+fn read_session_status() -> Option<String> {
+    let path = crate::config::Config::path().parent()?.join("session-status.txt");
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 fn last_session_reason() -> Option<String> {
     let path = crate::config::Config::path().parent()?.join("last-session.txt");
     let text = std::fs::read_to_string(path).ok()?;
@@ -1996,6 +2033,7 @@ impl eframe::App for App {
         self.poll_password();
         self.poll_probe();
         self.poll_ask();
+        self.poll_session_status();
         self.poll_viewers();
         self.poll_client_update();
         self.notice_sign_in_paste(&ctx);

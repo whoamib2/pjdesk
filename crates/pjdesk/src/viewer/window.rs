@@ -11,11 +11,11 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use pjdesk_proto::format_id;
 use pjdesk_proto::peer::{ControlMsg, InputEvent, MouseButton, VideoHeader, KEY_NUMPAD_DIGIT};
 use quinn::{Connection, SendStream};
@@ -27,7 +27,7 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
+use winit::window::{CustomCursor, Fullscreen, UserAttentionType, Window, WindowId};
 
 use super::decoder::VideoDecoder;
 use super::render::{self, Layout, RgbFrame};
@@ -62,7 +62,14 @@ struct Stats {
 }
 
 pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    if let Some(reason) = link.connection.close_reason() {
+        let text = format!("The host closed the session before the window opened: {reason}");
+        crate::note_failure(&text);
+        anyhow::bail!(text);
+    }
+    crate::note_status("Opening the viewer window");
+    info!("Opening the viewer window");
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().context("could not create the viewer window")?;
     let proxy = event_loop.create_proxy();
     let slot = Arc::new(FrameSlot::default());
     let stats = Arc::new(Stats::default());
@@ -103,6 +110,7 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
     }
     let places =
         loaded.as_ref().and_then(|c| c.settings.peers.get(&host_id).map(|n| n.windows.clone())).unwrap_or_default();
+    let live_watch = live.clone();
     let mut app = App {
         title,
         window: None,
@@ -139,12 +147,50 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         remote_size: None,
         android_stroke: pjdesk_proto::gesture::StrokeTracker::default(),
         pointer_down: false,
+        saw_picture: Arc::new(AtomicBool::new(false)),
+        failed_open: None,
+        window_shown: Arc::new(AtomicBool::new(false)),
     };
+    let saw_watch = app.saw_picture.clone();
+    let host_for_watch = app.host_name.clone();
+    let proxy_watch = proxy.clone();
+    runtime.spawn(async move {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        if saw_watch.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut guard = live_watch.lock().unwrap();
+        if guard.closed.is_some() || guard.restart {
+            return;
+        }
+        let text = format!(
+            "No picture arrived from {host_for_watch}. The password was accepted, but that computer did not start sending its screen. {}",
+            crate::host_log_hint()
+        );
+        crate::note_failure(&text);
+        guard.closed = Some(text.clone());
+        drop(guard);
+        let _ = proxy_watch.send_event(UserEvent::Closed(text));
+    });
     if std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files") {
         app.panel.open = true;
         app.panel.tab = 0;
     }
+    let shown = app.window_shown.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(8));
+        if !shown.load(Ordering::SeqCst) {
+            crate::note_failure(&format!(
+                "The viewer window did not open after the password was accepted. {}",
+                crate::host_log_hint()
+            ));
+            std::process::exit(1);
+        }
+    });
     event_loop.run_app(&mut app)?;
+    if let Some(text) = app.failed_open.clone() {
+        anyhow::bail!(text);
+    }
 
     let restarting = app.restarting;
     if !restarting {
@@ -312,6 +358,9 @@ struct App {
     /// Press on an Android picture, turned into a tap or a swipe on release.
     android_stroke: pjdesk_proto::gesture::StrokeTracker,
     pointer_down: bool,
+    saw_picture: Arc<AtomicBool>,
+    failed_open: Option<String>,
+    window_shown: Arc<AtomicBool>,
 }
 
 struct ExtraPane {
@@ -459,6 +508,13 @@ impl App {
                 "Waiting for this screen",
                 0xFF_9a_a3_b5,
             );
+        } else if self.current.is_none() {
+            let waiting = if let Some(reason) = &snap.closed {
+                reason.clone()
+            } else {
+                format!("Waiting for the picture from {}", self.host_name)
+            };
+            toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, origin as f32 + 48.0, &waiting, 0xFF_e7_ec_f5);
         }
         Self::paint_overlay(&self.toolbar, &self.toast, &mut buffer, win_w, win_h, display, separate, true);
         self.panel.draw(&mut buffer, win_w, win_h, &snap);
@@ -1058,6 +1114,7 @@ fn dot_cursor() -> Vec<u8> {
 impl App {
     fn pump_frame(&mut self) {
         if let Some(frame) = self.slot.latest.lock().unwrap().take() {
+            self.saw_picture.store(true, Ordering::Relaxed);
             if let Some(old) = self.current.replace(frame) {
                 self.slot.spare.lock().unwrap().push(old.pixels);
             }
@@ -1526,15 +1583,25 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let attributes = Window::default_attributes()
             .with_title(self.title.clone())
-            .with_inner_size(PhysicalSize::new(1280u32, 720u32));
+            .with_inner_size(PhysicalSize::new(1280u32, 720u32))
+            .with_visible(true)
+            .with_active(true);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Rc::new(window),
             Err(e) => {
-                eprintln!("Cannot open a window: {e}");
+                let text = format!("Could not open the viewer window: {e}");
+                crate::note_failure(&text);
+                info!("{text}");
+                self.failed_open = Some(text);
                 event_loop.exit();
                 return;
             }
         };
+        info!("Viewer window is open");
+        crate::note_status("Viewer window is open. Waiting for the picture.");
+        self.window_shown.store(true, Ordering::SeqCst);
+        window.focus_window();
+        window.request_user_attention(Some(UserAttentionType::Critical));
         if let Ok(source) = CustomCursor::from_rgba(dot_cursor(), 5, 5, 2, 2) {
             window.set_cursor(event_loop.create_custom_cursor(source));
         }
@@ -1543,7 +1610,10 @@ impl ApplicationHandler<UserEvent> for App {
         match surface {
             Ok(surface) => self.surface = Some(surface),
             Err(e) => {
-                eprintln!("Cannot draw into the window: {e}");
+                let text = format!("Could not draw the viewer window: {e}");
+                crate::note_failure(&text);
+                info!("{text}");
+                self.failed_open = Some(text);
                 event_loop.exit();
                 return;
             }
@@ -1586,7 +1656,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Closed(reason) => {
                 self.closed = true;
                 info!("Disconnected: {reason}");
-                window.set_title(&format!("{} — DISCONNECTED: {reason}", self.title));
+                crate::note_status(&format!("Session stopped: {reason}"));
+                window.set_title(&format!("{} — {reason}", self.title));
+                window.request_redraw();
             }
         }
     }

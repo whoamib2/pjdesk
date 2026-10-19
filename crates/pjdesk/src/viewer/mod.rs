@@ -61,7 +61,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         }
     };
 
-    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let mut waiting = false;
     let mut tries = 0u32;
     loop {
@@ -104,7 +104,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
             }
             let _ = config.save();
         }
-        println!("Connected to \"{}\" ({}, {})", link.host_name, format_id(&link.host_id), link.path);
+        tracing::info!("Connected to \"{}\" ({}, {})", link.host_name, format_id(&link.host_id), link.path);
         if args.headless {
             return runtime.block_on(headless(link, args.frames));
         }
@@ -112,7 +112,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
             break;
         }
         waiting = true;
-        println!("Waiting for the computer to come back…");
+        tracing::info!("Waiting for the computer to come back");
         std::thread::sleep(Duration::from_secs(5));
     }
     Ok(())
@@ -129,7 +129,6 @@ async fn connect(
     waiting_retry: bool,
 ) -> Result<Link> {
     tracing::info!("Connecting to {} through {server}", format_id(target));
-    println!("Connecting to {} through {server}...", format_id(target));
     if waiting_retry {
         crate::network::refresh_config_now(config);
     } else {
@@ -143,7 +142,6 @@ async fn connect(
     }
     let mut signal = SignalClient::connect(&server, config).await?;
     tracing::info!("Reached the server via {}", signal.via);
-    println!("Server path: {}.", signal.via);
     if !access.is_empty() {
         let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
     }
@@ -191,6 +189,14 @@ async fn connect(
     let (peer_public, peer_local, fingerprint) = loop {
         match timeout(Duration::from_secs(20), signal.recv()).await {
             Ok(Some(ServerMsg::PeerInfo { public_addr, local_addrs, cert_fingerprint, .. })) => {
+                tracing::info!(
+                    "Host addresses: public {public_addr}, on this network {}",
+                    if local_addrs.is_empty() {
+                        "none reported".to_string()
+                    } else {
+                        local_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                    }
+                );
                 break (public_addr, local_addrs, cert_fingerprint.context("the server didn't send the host's key")?)
             }
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
@@ -278,7 +284,21 @@ async fn connect(
             }
         }
     };
-    tracing::info!("Password accepted by {}", auth.peer_name);
+    tracing::info!("Password accepted by {} ({path}). Starting the picture.", auth.peer_name);
+    tracing::info!("{}", crate::host_log_hint());
+    crate::note_status(&format!(
+        "Password accepted by {}. Starting the picture ({path}).",
+        auth.peer_name
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    if let Some(reason) = connection.close_reason() {
+        let text = format!(
+            "Password accepted by {}, then the host closed the session: {reason}",
+            auth.peer_name
+        );
+        crate::note_failure(&text);
+        bail!(text);
+    }
     let reported = if auth.peer_name.is_empty() { host_name } else { auth.peer_name };
     cache_host_name(target, &reported);
     Ok(Link {

@@ -14,6 +14,7 @@
 mod account;
 mod audio;
 mod client_update;
+mod update_pipe;
 mod clip;
 mod color;
 mod config;
@@ -78,13 +79,13 @@ enum Cmd {
     /// After a silent install: restart the service and the signed-in user's window.
     #[command(name = "update-handoff", hide = true)]
     UpdateHandoff,
-    /// Check for a newer PJDesk and install it (the daily task runs this).
+    /// Check for a newer PJDesk and install it. The service does this; there is no scheduled task.
     Update {
         /// Only report whether an update is available; don't install.
         #[arg(long)]
         check: bool,
     },
-    /// Internal: turn the daily auto-update task on or off.
+    /// Internal: turn automatic updates on or off. The service does the check.
     #[command(name = "update-task", hide = true)]
     UpdateTask {
         #[arg(long)]
@@ -314,6 +315,13 @@ fn main() {
     // The service and its helper run with no console and set up their own
     // (file) logging, so route them before touching the console.
     let raw: Vec<String> = std::env::args().collect();
+    let is_connect = raw.iter().any(|a| a == "connect");
+    if is_connect {
+        // The viewer window needs the main thread in the STA apartment before
+        // DPAPI or QUIC touch COM. Doing that later made create_window fail
+        // with no log line and no window after the password was accepted.
+        init_viewer_com();
+    }
     let is_background = raw.iter().any(|a| a == "__session-host" || a == "update-handoff")
         || (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"));
 
@@ -350,6 +358,9 @@ fn main() {
         }
         Some(_) => {
             init_logging();
+            if is_connect {
+                install_session_panic_hook();
+            }
             if let Err(e) = run(cli) {
                 let text = format!("{e:#}");
                 note_failure(&text);
@@ -481,7 +492,27 @@ fn login_command(config: &mut Config, args: LoginArgs, server_flag: Option<Strin
 
 fn update_command(check: bool) -> Result<()> {
     use pjdesk_proto::update::Outcome;
-    match pjdesk_proto::update::perform_client(pjdesk_proto::UPDATE_REPO, env!("CARGO_PKG_VERSION"), check)? {
+    if !check {
+        // This process is the administrator prompt (or an elevated console).
+        // It may lock down the update folder. The normal window does not.
+        return match pjdesk_proto::update::install_client_as_service(env!("CARGO_PKG_VERSION"), &|line| {
+            println!("{line}");
+        })? {
+            Outcome::UpToDate(v) => {
+                println!("PJDesk {v} is up to date.");
+                Ok(())
+            }
+            Outcome::Found(v) => {
+                println!("PJDesk {v} is available.");
+                Ok(())
+            }
+            Outcome::Installing(v) => {
+                println!("Installing PJDesk {v}...");
+                Ok(())
+            }
+        };
+    }
+    match pjdesk_proto::update::perform_client(pjdesk_proto::UPDATE_REPO, env!("CARGO_PKG_VERSION"), true)? {
         Outcome::UpToDate(v) => println!("PJDesk {v} is up to date."),
         Outcome::Found(v) => println!("PJDesk {v} is available (run `pjdesk update` to install it)."),
         Outcome::Installing(v) => println!("Installing PJDesk {v}..."),
@@ -652,12 +683,53 @@ fn init_log_file(default_filter: &str) {
     let _ = builder.with_writer(std::io::stderr).try_init();
 }
 
+/// Where to look on the computer that is sharing its screen.
+pub fn host_log_hint() -> &'static str {
+    "On that computer, check %APPDATA%\\PJDesk\\pjdesk.log. If the PJDesk service is hosting, also check C:\\ProgramData\\PJDesk\\service\\service.log."
+}
+
+/// The viewer thread has to be STA before anything else initializes COM.
+#[cfg(windows)]
+fn init_viewer_com() {
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+}
+
+#[cfg(not(windows))]
+fn init_viewer_com() {}
+
+fn install_session_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        note_failure(&format!("The viewer stopped unexpectedly: {info}"));
+        default(info);
+    }));
+}
+
 /// Writes the reason a viewer or connect command stopped, next to pjdesk.log.
+/// The main window reads this when the viewer process exits.
 fn note_failure(text: &str) {
-    tracing::error!("session failed: {text}");
+    let connect = std::env::args().any(|a| a == "connect");
+    if connect {
+        tracing::error!("session failed: {text}");
+    } else {
+        tracing::error!("{text}");
+    }
     if let Some(dir) = Config::path().parent() {
         let _ = std::fs::create_dir_all(dir);
         let _ = std::fs::write(dir.join("last-session.txt"), text);
+        let _ = std::fs::write(dir.join("session-status.txt"), text);
+    }
+}
+
+/// A step the main window can show while the viewer is still running.
+pub fn note_status(text: &str) {
+    tracing::info!("{text}");
+    if let Some(dir) = Config::path().parent() {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(dir.join("session-status.txt"), text);
     }
 }
 

@@ -736,6 +736,13 @@ impl Session {
         }
     }
 
+    /// Tells the controller what this computer is doing. Shown in the viewer
+    /// and written to the client log.
+    pub fn notify(&self, text: &str) {
+        info!("{text}");
+        let _ = self.host_tx.send(HostMsg::Notice(text.to_string()));
+    }
+
     pub fn spawn_side_loops(self: &Arc<Self>) {
         let session = self.clone();
         let conn = self.conn.clone();

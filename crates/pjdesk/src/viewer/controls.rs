@@ -240,10 +240,13 @@ async fn run_loop(
             msg = read_msg::<_, HostMsg>(&mut control_recv, MAX_CONTROL_FRAME) => {
                 match msg {
                     Ok(msg) => on_host(msg, &connection, &control, &live, &tunnels, &wake, &host_id),
-                    Err(_) => {
+                    Err(e) => {
                         let mut g = live.lock().unwrap();
                         if g.closed.is_none() && !g.restart {
-                            g.closed = Some("the host closed the session".into());
+                            let text = format!("The host closed the session: {e:#}");
+                            tracing::error!("{text}");
+                            crate::note_failure(&text);
+                            g.closed = Some(text);
                         }
                         wake();
                         break;
@@ -257,7 +260,14 @@ async fn run_loop(
             _ = connection.closed() => {
                 let mut g = live.lock().unwrap();
                 if g.closed.is_none() && !g.restart {
-                    g.closed = Some("the connection ended".into());
+                    let why = connection
+                        .close_reason()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "the connection ended".into());
+                    let text = format!("Session stopped: {why}");
+                    tracing::error!("{text}");
+                    crate::note_failure(&text);
+                    g.closed = Some(text);
                 }
                 wake();
                 break;
@@ -278,6 +288,7 @@ fn on_host(
     let mut g = live.lock().unwrap();
     match msg {
         HostMsg::Welcome { permissions, monitors, .. } => {
+            tracing::info!("Host granted {}", perms::describe(permissions));
             g.perms = permissions;
             g.monitors = monitors;
             g.note(format!("This session can {}", perms::describe(permissions)));
@@ -319,7 +330,11 @@ fn on_host(
             g.platform_version = version.clone();
             remember_platform(host_id, &family, &version);
         }
-        HostMsg::Notice(text) => g.note(text),
+        HostMsg::Notice(text) => {
+            tracing::info!("Host says: {text}");
+            crate::note_status(&format!("Host: {text}"));
+            g.note(text);
+        }
         HostMsg::Denied { what, reason } => g.note(format!("{what}: {reason}")),
         HostMsg::Chat { text } => g.chat.push((false, text)),
         HostMsg::Privacy { enabled } => g.privacy = enabled,
@@ -679,8 +694,26 @@ async fn dispatch_uni(
 ) {
     let video = match tokio::time::timeout(Duration::from_secs(20), connection.accept_uni()).await {
         Ok(Ok(s)) => s,
-        _ => return,
+        Ok(Err(e)) => {
+            let text = format!("The host did not open the video stream: {e}");
+            tracing::error!("{text}");
+            crate::note_failure(&text);
+            live.lock().unwrap().closed = Some(text);
+            return;
+        }
+        Err(_) => {
+            let why = connection
+                .close_reason()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "the host never opened the video stream".into());
+            let text = format!("No picture from the host: {why}");
+            tracing::error!("{text}");
+            crate::note_failure(&text);
+            live.lock().unwrap().closed = Some(text);
+            return;
+        }
     };
+    tracing::info!("Video stream received from the host");
     tokio::spawn(async move {
         let mut video = video;
         loop {

@@ -124,7 +124,7 @@ pjdesk/
 │   ├── main.rs                        # CLI (default=GUI; host|connect|config|login|service|__session-host); ensure_console()
 │   ├── config.rs                      # client.json: server, server_fingerprint, device_id/secret, Settings, Account, saved passwords
 │   ├── secure.rs                      # DPAPI encrypt/decrypt (user-scoped) for secrets
-│   ├── service.rs                     # Windows service "PJDesk"; session-host via WTSQueryUserToken; UPDATE_TASK "PJDesk Update" (schtasks)
+│   ├── service.rs                     # Windows service "PJDesk"; session-host via WTSQueryUserToken; updates from the service (no schtasks)
 │   ├── platform.rs  syspaths.rs       # elevation (run_elevated), paths, service status file
 │   ├── p2p.rs  signaling.rs  session.rs  account.rs   # connection setup, signaling client, session auth, account login
 │   ├── gui/
@@ -154,8 +154,8 @@ pjdesk/
 | Data dir | `C:\ProgramData\PJDesk\service` (service `client.json`) | `C:\ProgramData\PJDesk\server` |
 | GUI config | `%APPDATA%\PJDesk\client.json` | — |
 | Data files | `client.json` | `server-cert.pem`, `server-key.pem`, `devices.json`, `accounts.json`, `server.log` |
-| Firewall rule | `PJDesk` | `PJDesk Server` (TCP+UDP 21200) |
-| Update task | schtasks `PJDesk Update` (SYSTEM) | via installer / `pjdesk-server update` |
+| Firewall rule | `PJDesk`, plus `PJDesk LAN` (UDP 21201) | `PJDesk Server` (TCP+UDP 21200) |
+| Updates | PJDesk service, every 30 minutes. No scheduled task. | PJDesk Server service. No scheduled task. |
 
 ---
 
@@ -245,10 +245,9 @@ force‑update + per‑client version display.
 4. **Publish the release (production push — test on ONE client first):**
    `gh release create v0.3.0 installer/PJDesk-Setup-0.3.0.exe installer/PJDesk-Server-Setup-0.3.0.exe installer/SHA256SUMS -t "PJDesk 0.3.0" -n "<notes>"`,
    then update the `pjdesk.com` (`gh-pages`) download page to 0.3.0.
-5. **Switch auto‑update to every 30 min:** in `crates/pjdesk/src/service.rs`
-   `set_update_task`, change the schtasks schedule from `/SC DAILY /ST 03:00` to
-   `/SC MINUTE /MO 30`; mirror for the server and in the `.nsi` installers. Confirm
-   a client actually pulls 0.3.0 from the release.
+5. **Automatic updates** are the PJDesk service, about every 30 minutes. There is
+   no scheduled task. Confirm a client pulls the release when **Check for updates now**
+   is used, or when the service's own check runs.
 
 *(After the pipeline: server‑side **force‑update** + **per‑client version** display
 in the server window; then Build 2 = clipboard sync + multi‑monitor tabs; then UI

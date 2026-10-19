@@ -334,7 +334,9 @@ folder, readable by SYSTEM and Administrators only.
 ## Troubleshooting
 
 * **"no UDP reply from the server"**: UDP 21200 is blocked. Allow it in the server's firewall and forward it on the router.
-* **Always "relayed"**: P2P is not possible between those networks (for example symmetric NAT or carrier-grade NAT). The relay still works, at the cost of server bandwidth.
+* **Always "relayed" on the same LAN**: the direct path is UDP 21201. Allow inbound UDP 21201 (the installer adds a rule named PJDesk LAN). The log line "Connected via LAN" is only the path to the server, not the path to the other computer. A relay across different networks is normal when NAT blocks a direct route.
+* **Microsoft Defender quarantines PJDesk** (Trojan:Script/Wacatac.H!ml): 0.6.6 no longer registers a scheduled task for updates. Submit the file as a false positive at https://www.microsoft.com/en-us/wdsi/filesubmission. Sign in with a Microsoft account, choose Software developer, and mark it a false positive. Upload `C:\Program Files\PJDesk\pjdesk.exe`, the installer, and any quarantined update from `C:\ProgramData\PJDesk\updates`. The detection name is Trojan:Script/Wacatac.H!ml. Company and product are PJDesk, a remote desktop. After Microsoft clears it, restore the quarantined files or install 0.6.6 again.
+* **Session stays on "Opening" after the password**: the status line under the main window names the step that stopped. On the other computer, check `%APPDATA%\PJDesk\pjdesk.log`. If the PJDesk service is hosting, also check `C:\ProgramData\PJDesk\service\service.log`.
 * **"SERVER KEY MISMATCH"**: the server was reinstalled (new key), or something is intercepting. Compare with `pjdesk-server fingerprint`, then `pjdesk config --reset-fingerprint`.
 * **Can't control admin windows or UAC prompts**: Windows blocks input from normal apps into elevated apps. Run `pjdesk.exe` as administrator on the host. UAC's secure desktop and Ctrl+Alt+Del need a SYSTEM service (roadmap).
 * **Slow encoding at 4K**: use `--max-width 1920`, and build with NASM installed.

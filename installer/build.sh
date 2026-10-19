@@ -6,6 +6,11 @@
 # and `makensis` is on PATH (Linux: apt install nsis; Windows: NSIS).
 #
 # Usage: installer/build.sh [version]
+#
+# Executables are not packed (no UPX). Packing is a common false-positive trigger.
+# Optional Authenticode signing: set PJDESK_SIGN_PFX to a PKCS#12 file and
+# PJDESK_SIGN_PASSWORD to its password. Signing is skipped when PJDESK_SIGN_PFX
+# is unset. osslsigncode or signtool must be on PATH when a certificate is set.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -61,11 +66,51 @@ EOF
 # CRLF line endings for Notepad.
 sed -i 's/$/\r/' "$WORK/QUICKSTART.txt"
 
+# 0.6.6 -> 0.6.6.0. NSIS VIProductVersion needs four numeric parts.
+VERQUAD="$VERSION"
+case "$VERQUAD" in
+  *.*.*.*) ;;
+  *.*.*) VERQUAD="${VERQUAD}.0" ;;
+  *.*) VERQUAD="${VERQUAD}.0.0" ;;
+  *) VERQUAD="${VERQUAD}.0.0.0" ;;
+esac
+
+sign_file() {
+  local file="$1"
+  if [ -z "${PJDESK_SIGN_PFX:-}" ]; then
+    return 0
+  fi
+  if command -v osslsigncode >/dev/null 2>&1; then
+    osslsigncode sign -pkcs12 "$PJDESK_SIGN_PFX" -pass "${PJDESK_SIGN_PASSWORD:-}" \
+      -n "PJDesk" -i "https://pjdesk.com" \
+      -t "http://timestamp.digicert.com" \
+      -in "$file" -out "$file.signed"
+    mv -f "$file.signed" "$file"
+  elif command -v signtool >/dev/null 2>&1; then
+    signtool sign /f "$PJDESK_SIGN_PFX" /p "${PJDESK_SIGN_PASSWORD:-}" /fd SHA256 \
+      /tr "http://timestamp.digicert.com" /td SHA256 /d "PJDesk" "$file"
+  else
+    echo "PJDESK_SIGN_PFX is set but neither osslsigncode nor signtool is on PATH." >&2
+    exit 1
+  fi
+}
+
+if [ -z "${PJDESK_SIGN_PFX:-}" ]; then
+  echo "Authenticode signing skipped (set PJDESK_SIGN_PFX to sign)."
+else
+  sign_file "$WORK/pjdesk.exe"
+  sign_file "$WORK/pjdesk-server.exe"
+fi
+
 cd "$WORK"
-makensis -DVERSION="$VERSION" pjdesk-client.nsi
-makensis -DVERSION="$VERSION" pjdesk-server.nsi
+makensis -DVERSION="$VERSION" -DVERQUAD="$VERQUAD" pjdesk-client.nsi
+makensis -DVERSION="$VERSION" -DVERQUAD="$VERQUAD" pjdesk-server.nsi
 
 mv -f "PJDesk-Client-Setup-$VERSION.exe" "PJDesk-Server-Setup-$VERSION.exe" "$HERE/"
+if [ -n "${PJDESK_SIGN_PFX:-}" ]; then
+  sign_file "$HERE/PJDesk-Client-Setup-$VERSION.exe"
+  sign_file "$HERE/PJDesk-Server-Setup-$VERSION.exe"
+fi
 # Installed 0.5.x and 0.6.x clients look up PJDesk-Setup-<ver>.exe on GitHub.
 # The copy is byte-identical. SHA256SUMS lists both names with the same hash.
 cp -f "$HERE/PJDesk-Client-Setup-$VERSION.exe" "$HERE/PJDesk-Setup-$VERSION.exe"

@@ -81,6 +81,21 @@ pub trait Capturer {
     }
 }
 
+/// GDI grab used when DXGI has not produced a first frame. The first
+/// `AcquireNextFrame` often times out on an idle desktop, which used to leave
+/// the controller with a password acceptance and no picture.
+pub fn open_gdi_fallback(display: usize) -> Result<Box<dyn Capturer>> {
+    #[cfg(windows)]
+    {
+        Ok(Box::new(gdi::GdiCapturer::new(display, true)?))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = display;
+        Err(anyhow::anyhow!("GDI capture is only available on Windows"))
+    }
+}
+
 /// Opens the best available capturer for the host options.
 pub fn open(args: &HostArgs) -> Result<Box<dyn Capturer>> {
     if args.test_pattern {

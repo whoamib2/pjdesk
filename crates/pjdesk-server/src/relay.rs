@@ -46,6 +46,7 @@ pub async fn run(socket: Arc<UdpSocket>, state: Shared) -> Result<()> {
     let mut routes: HashMap<SocketAddr, Route> = HashMap::new();
     let mut binds: HashMap<IpAddr, (Instant, u32)> = HashMap::new();
     let mut last_sweep = Instant::now();
+    let mut last_forward_error = Instant::now() - Duration::from_secs(30);
 
     loop {
         let (len, src) = match socket.recv_from(&mut buf).await {
@@ -70,11 +71,18 @@ pub async fn run(socket: Arc<UdpSocket>, state: Shared) -> Result<()> {
         } else if routes.get(&src).is_some_and(|route| route.bytes.saturating_add(len as u64) > ROUTE_MAX_BYTES) {
             info!("relay route from {src} hit the {} MiB cap; closing it", ROUTE_MAX_BYTES / (1024 * 1024));
             routes.remove(&src);
-        } else if let Some(route) = routes.get_mut(&src) {
+        } else if let Some(to) = routes.get_mut(&src).map(|route| {
             route.last_seen = Instant::now();
             route.bytes += len as u64;
-            let to = route.to;
-            let _ = socket.send_to(packet, to).await;
+            route.to
+        }) {
+            // `routes` is not borrowed across this await.
+            if let Err(e) = socket.send_to(packet, to).await {
+                if last_forward_error.elapsed() > Duration::from_secs(10) {
+                    last_forward_error = Instant::now();
+                    tracing::warn!("Relay could not forward a packet to {to}: {e}");
+                }
+            }
         }
 
         if last_sweep.elapsed() > Duration::from_secs(10) {
