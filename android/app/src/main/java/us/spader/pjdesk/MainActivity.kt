@@ -46,6 +46,8 @@ import us.spader.pjdesk.core.NetKey
 import us.spader.pjdesk.ui.SignInScreen
 import java.util.UUID
 import us.spader.pjdesk.a11y.PjAccessibilityService
+import us.spader.pjdesk.core.SavedComputer
+import us.spader.pjdesk.core.nickname
 import us.spader.pjdesk.core.permanentIssue
 import us.spader.pjdesk.media.ScreenDecoder
 import us.spader.pjdesk.service.HostService
@@ -441,6 +443,7 @@ class MainActivity : ComponentActivity() {
                                     state = state,
                                     connectId = connectId,
                                     connectPassword = connectPassword,
+                                    connectName = connectComputerName(saved, connectId),
                                     onConnectId = { connectId = it },
                                     onConnectPassword = { connectPassword = it },
                                     savePassword = savePassword,
@@ -625,5 +628,18 @@ class MainActivity : ComponentActivity() {
     private fun copy(text: String) {
         val clipboard = getSystemService(ClipboardManager::class.java)
         clipboard.setPrimaryClip(ClipData.newPlainText("pjdesk", text))
+    }
+}
+
+/** The computer's nickname or hostname, for the connect password label. */
+internal fun connectComputerName(saved: List<SavedComputer>, connectId: String): String {
+    val id = connectId.filter { it.isDigit() }
+    if (id.isEmpty()) return ""
+    val computer = saved.firstOrNull { it.id == id } ?: return ""
+    val nick = computer.nickname()
+    return when {
+        nick.isNotEmpty() -> nick
+        computer.hostname.isNotBlank() -> computer.hostname
+        else -> ""
     }
 }

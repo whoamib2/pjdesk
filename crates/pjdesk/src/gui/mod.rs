@@ -539,9 +539,10 @@ impl App {
     #[cfg(feature = "ui-shots")]
     fn load_password_preview(&mut self) {
         self.load_preview(false);
+        self.net_pass = "account-secret-not-for-connect".into();
         self.prompt_open = true;
-        self.prompt_id = "555666777".into();
-        self.prompt_password = "correct horse".into();
+        self.prompt_id = "123456789".into();
+        self.prompt_password.clear();
         self.prompt_show = false;
         self.prompt_remember = true;
         self.prompt_rejected = false;
@@ -774,7 +775,9 @@ impl App {
                 self.net_rx = None;
                 self.net_offer = false;
                 self.net_login.clear();
-                if let Some(blob) = self.pending_blob.take().or_else(|| pjdesk_proto::netkey::blob_from_text(&self.net_blob)) {
+                if let Some(blob) =
+                    self.pending_blob.take().or_else(|| pjdesk_proto::netkey::blob_from_text(&self.net_blob))
+                {
                     self.cfg.network_key = Some(blob);
                     crate::network::clear_installer_network_key();
                 }
@@ -847,7 +850,9 @@ impl App {
             std::thread::Builder::new()
                 .name("network-sign-in".into())
                 .spawn(move || {
-                    let result = crate::network::enroll(&code, &device, &name).map(crate::network::SignIn::Ready).map_err(|e| e.to_string());
+                    let result = crate::network::enroll(&code, &device, &name)
+                        .map(crate::network::SignIn::Ready)
+                        .map_err(|e| e.to_string());
                     let _ = tx.send(result);
                 })
                 .ok();
@@ -864,7 +869,9 @@ impl App {
                 .name("network-sign-in".into())
                 .spawn(move || {
                     let creds = if account { Some((email.as_str(), password.as_str())) } else { None };
-                    let result = crate::network::redeem(&blob, &passphrase, &device, &name, creds).map(crate::network::SignIn::Ready).map_err(|e| e.to_string());
+                    let result = crate::network::redeem(&blob, &passphrase, &device, &name, creds)
+                        .map(crate::network::SignIn::Ready)
+                        .map_err(|e| e.to_string());
                     let _ = tx.send(result);
                 })
                 .ok();
@@ -923,7 +930,8 @@ impl App {
             self.import_pass.clear();
             self.import_show = false;
             self.import_confirm = false;
-            self.import_hint = "This copy of PJDesk includes a network key. Enter the passphrase that was shared separately.".into();
+            self.import_hint =
+                "This copy of PJDesk includes a network key. Enter the passphrase that was shared separately.".into();
         }
     }
 
@@ -952,7 +960,8 @@ impl App {
     }
 
     fn export_server_config(&mut self) {
-        let Some(blob) = self.cfg.network_key.clone().filter(|s| pjdesk_proto::netkey::blob_from_text(s).is_some()) else {
+        let Some(blob) = self.cfg.network_key.clone().filter(|s| pjdesk_proto::netkey::blob_from_text(s).is_some())
+        else {
             self.toast.show("There is no server config to export.");
             return;
         };
@@ -989,7 +998,8 @@ impl App {
             self.import_pass.clear();
             self.import_show = false;
             self.import_confirm = true;
-            self.import_hint = "A network key was pasted. Importing it sets this computer's server and enrolls it.".into();
+            self.import_hint =
+                "A network key was pasted. Importing it sets this computer's server and enrolls it.".into();
         }
     }
 
@@ -1101,6 +1111,7 @@ impl App {
     fn open_prompt(&mut self, id: &str, files: bool, rejected: bool) {
         self.prompt_open = true;
         self.prompt_id = id.to_string();
+        // The PJDesk account password is a different field and is never copied here.
         self.prompt_password.clear();
         self.prompt_show = false;
         self.prompt_remember = self.cfg.settings.remember_passwords;

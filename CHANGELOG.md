@@ -2,6 +2,7 @@
 
 ## 0.6.0
 
+* Connecting to a computer still asks for that computer's own permanent or one-time password. Signing in with the PJDesk account does not fill that in and does not skip it. The connect dialog says **Password for** the computer's name, with **Save password for this computer**. That saved password stays on the computer (Windows DPAPI, or the Android Keystore) and is not uploaded. The account sign-in is labeled for the network and its servers.
 * One PJDesk account signs in the server. In the PJDesk Server window, **PJDesk account** is that login (for example ben@spader.us), with **Sign out** and **Switch account**. It is Cloud Sync and backup, the active or standby role, pairing with the other server, and registration on My network (address, fingerprint, and slot). Allowed accounts and **Require signed-in accounts** follow that account. A second server that signs in with the same account becomes the standby. No join code. There is no separate server password. Install, stop, and uninstall still need a Windows administrator, because that is an operating-system rule. Older local accounts in `accounts.json` keep working for an older client. A new server does not need any. The log used to say "User accounts"; it now says there are no local accounts, or lists the older ones as legacy.
 
 ### Servers already signed in

@@ -59,7 +59,11 @@ impl App {
                         ui.label(RichText::new(who).color(p.ok));
                     }
                     None => {
-                        if ui.button("Sign in").on_hover_text("Sign in to your PJDesk server").clicked() {
+                        if ui
+                            .button("Sign in")
+                            .on_hover_text("Older local account on this server. Not the password for a computer.")
+                            .clicked()
+                        {
                             self.show_login = true;
                             self.status.clear();
                         }
@@ -78,7 +82,7 @@ impl App {
         if self.cfg.network_email.as_deref().map(str::trim).unwrap_or("").is_empty() {
             let mut open = false;
             theme::card(ui, |ui| {
-                ui.label("Sign in to your PJDesk account so this computer keeps working after signed-in accounts are required.");
+                ui.label("Sign in with your PJDesk account for this network and its servers. That sign-in is not the password for a computer.");
                 if ui.button("Sign in").clicked() {
                     open = true;
                 }
@@ -193,12 +197,12 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.set_max_width(440.0);
             ui.add_space(24.0);
-            ui.label(RichText::new("Sign in").size(26.0).strong().color(p.text));
+            ui.label(RichText::new("Sign in to your network").size(26.0).strong().color(p.text));
             ui.add_space(4.0);
             let intro = match self.net_mode {
                 2 => "Paste a network key from My network or the PJDesk Server window. This computer enrolls and stays signed in after a restart.",
                 1 => "An enrollment code is for one device and expires in an hour.",
-                _ => "Use your PJDesk account. The client gets your private server from the account. Nothing is typed by hand.",
+                _ => "Your PJDesk account sets the servers for this network. It does not connect you to a computer, and it is not that computer's password.",
             };
             ui.label(widgets::muted(ui, intro));
             ui.add_space(16.0);
@@ -220,7 +224,10 @@ impl App {
                         ui.add_space(8.0);
                         widgets::field_label(ui, "Passphrase");
                         widgets::password_field(ui, &mut self.net_key_pass, "Passphrase", &mut self.net_key_show);
-                        ui.label(widgets::muted(ui, "Only if the key was created with a passphrase. Leave this empty for a self-contained key."));
+                        ui.label(widgets::muted(
+                            ui,
+                            "Only if the key was created with a passphrase. Leave this empty for a self-contained key.",
+                        ));
                     }
                     if embedded {
                         ui.add_space(6.0);
@@ -239,8 +246,8 @@ impl App {
                     widgets::field_label(ui, "Email");
                     widgets::text_field(ui, &mut self.net_email, "you@example.com", false);
                     ui.add_space(8.0);
-                    widgets::field_label(ui, "Password");
-                    widgets::password_field(ui, &mut self.net_pass, "Password", &mut self.net_show);
+                    widgets::field_label(ui, "PJDesk account password");
+                    widgets::password_field(ui, &mut self.net_pass, "Account password", &mut self.net_show);
                 } else {
                     widgets::field_label(ui, "Enrollment code");
                     widgets::text_field(ui, &mut self.net_code, "ABCD-EFGH", true);
@@ -251,7 +258,10 @@ impl App {
                     ui.colored_label(p.warn, &self.net_error);
                     ui.add_space(6.0);
                 }
-                if self.net_offer && !self.net_busy && ui.button("Use this computer's current server for my network").clicked() {
+                if self.net_offer
+                    && !self.net_busy
+                    && ui.button("Use this computer's current server for my network").clicked()
+                {
                     self.claim_current_server();
                 }
                 let label = if self.net_busy {
@@ -284,7 +294,8 @@ impl App {
                         self.net_offer = false;
                         self.net_login.clear();
                     }
-                    if self.show_net_sign_in && !self.cfg.effective_server().is_empty() && ui.button("Cancel").clicked() {
+                    if self.show_net_sign_in && !self.cfg.effective_server().is_empty() && ui.button("Cancel").clicked()
+                    {
                         cancel = true;
                     }
                 });
@@ -515,11 +526,20 @@ impl App {
             }
 
             ui.add_space(8.0);
-            widgets::field_label(ui, "Password (optional if saved)");
-            let pw_resp =
-                widgets::password_field(ui, &mut self.connect_password, "Password", &mut self.show_connect_password);
+            let pw_label = self.computer_password_label(&self.connect_id);
+            widgets::field_label(ui, &pw_label);
+            let pw_resp = widgets::password_field(
+                ui,
+                &mut self.connect_password,
+                "Computer password",
+                &mut self.show_connect_password,
+            );
             ui.add_space(4.0);
-            widgets::checkbox(ui, &mut self.remember, "Remember this computer's password");
+            widgets::checkbox(ui, &mut self.remember, "Save password for this computer");
+            ui.label(widgets::muted(
+                ui,
+                "The password on that computer. Your PJDesk account password is not filled in here. A saved password stays on this computer and is not uploaded.",
+            ));
 
             ui.add_space(8.0);
             let enter = (id_resp.lost_focus() || pw_resp.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -764,6 +784,15 @@ impl App {
         }
     }
 
+    /// The connect field. Never the PJDesk account password.
+    pub(super) fn computer_password_label(&self, id: &str) -> String {
+        let id = normalize_id(id);
+        if id.is_empty() {
+            return "Password for this computer".into();
+        }
+        format!("Password for {}", self.row_title(&id))
+    }
+
     pub(super) fn row_title(&self, id: &str) -> String {
         let hostname = self.cfg.settings.peers.get(id).map(|n| n.hostname.trim().to_string()).unwrap_or_default();
         let alias = self.cfg.address_book.iter().find(|e| e.id == id).map(|e| e.alias.clone()).unwrap_or_default();
@@ -847,7 +876,7 @@ impl App {
         let mut open = true;
         let mut submit = false;
         let p = theme::paint_ctx(ctx);
-        egui::Window::new("Sign in to your server")
+        egui::Window::new("Older local account")
             .collapsible(false)
             .resizable(false)
             .default_width(420.0)
@@ -856,14 +885,19 @@ impl App {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_min_width(360.0);
+                ui.label(widgets::muted(
+                    ui,
+                    "An older account stored on the server. It is not your PJDesk account, and it is not the password for a computer.",
+                ));
+                ui.add_space(8.0);
                 if self.cfg.server.is_none() {
                     ui.colored_label(p.warn, "Set your server in Settings first.");
                 }
                 ui.label("Username");
                 ui.text_edit_singleline(&mut self.login_user);
                 ui.add_space(8.0);
-                ui.label("Password");
-                let pw = widgets::password_field(ui, &mut self.login_pass, "Password", &mut self.show_login_pass);
+                ui.label("Local account password");
+                let pw = widgets::password_field(ui, &mut self.login_pass, "Local account password", &mut self.show_login_pass);
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if self.login_busy {

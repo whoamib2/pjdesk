@@ -236,7 +236,7 @@ impl App {
                 });
             }
             None => {
-                ui.label("Sign in to sync your address book with the server you run.");
+                ui.label("An older local account syncs an address book with the server you run. It is not the password for a computer.");
                 ui.add_space(8.0);
                 if ui.button("Sign in").clicked() {
                     self.show_login = true;
@@ -407,16 +407,10 @@ fn nav(ui: &mut egui::Ui, tab: &mut Tab) {
     ] {
         let selected = *tab == which;
         let p = theme::paint(ui);
-        let text = if selected {
-            RichText::new(label).strong().color(p.text)
-        } else {
-            RichText::new(label).color(p.muted)
-        };
+        let text =
+            if selected { RichText::new(label).strong().color(p.text) } else { RichText::new(label).color(p.muted) };
         let fill = if selected { p.accent.linear_multiply(0.18) } else { Color32::TRANSPARENT };
-        if ui
-            .add_sized([ui.available_width(), 36.0], egui::Button::new(text).fill(fill).frame(selected))
-            .clicked()
-        {
+        if ui.add_sized([ui.available_width(), 36.0], egui::Button::new(text).fill(fill).frame(selected)).clicked() {
             *tab = which;
         }
     }
@@ -497,7 +491,11 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
             ui.label(widgets::muted(ui, "Checking the background service…"));
         });
     } else if installed {
-        widgets::status_dot(ui, if running { p.ok } else { p.warn }, if running { "Installed and running" } else { "Installed, not running" });
+        widgets::status_dot(
+            ui,
+            if running { p.ok } else { p.warn },
+            if running { "Installed and running" } else { "Installed, not running" },
+        );
     } else {
         widgets::status_dot(ui, p.muted, "Not installed");
     }
@@ -564,7 +562,11 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("ID/RELAY SERVER").color(theme::paint(ui).muted).size(11.5).strong());
             ui.add_space(8.0);
-            if ui.button("Import server config").on_hover_text("Read a network key from the clipboard and apply it").clicked() {
+            if ui
+                .button("Import server config")
+                .on_hover_text("Read a network key from the clipboard and apply it")
+                .clicked()
+            {
                 do_import = true;
             }
             if ui.button("Export server config").on_hover_text("Copy this computer's network key").clicked() {

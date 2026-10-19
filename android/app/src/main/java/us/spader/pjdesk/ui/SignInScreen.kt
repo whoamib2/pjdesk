@@ -66,10 +66,10 @@ fun SignInScreen(
                 fromPaste = true,
             )
         }
-        Text("Sign in", style = MaterialTheme.typography.headlineMedium)
+        Text("Sign in to your network", style = MaterialTheme.typography.headlineMedium)
         Text(
             if (useKey) "Paste a network key, or scan its QR code. This phone enrolls and stays signed in after a restart."
-            else "Use your PJDesk account. This phone gets your private server from the account.",
+            else "Your PJDesk account sets the servers for this network. It does not connect you to a computer, and it is not that computer's password.",
             color = pjMuted(),
         )
         Card(Modifier.fillMaxWidth()) {
@@ -109,7 +109,7 @@ fun SignInScreen(
                         singleLine = true,
                         label = { Text("Email") },
                     )
-                    SecretField(value = password, onValueChange = onPassword, label = "Password")
+                    SecretField(value = password, onValueChange = onPassword, label = "PJDesk account password")
                 } else {
                     OutlinedTextField(
                         value = code,

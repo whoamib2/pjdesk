@@ -27,6 +27,7 @@ fun HomeScreen(
     state: DeskState,
     connectId: String,
     connectPassword: String,
+    connectName: String = "",
     onConnectId: (String) -> Unit,
     onConnectPassword: (String) -> Unit,
     onConnect: () -> Unit,
@@ -53,7 +54,7 @@ fun HomeScreen(
         if (onSignIn != null) {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Sign in to your PJDesk account so this phone keeps working after signed-in accounts are required.")
+                    Text("Sign in with your PJDesk account for this network and its servers. That sign-in is not the password for a computer.")
                     Button(onClick = onSignIn) { Text("Sign in") }
                 }
             }
@@ -126,7 +127,12 @@ fun HomeScreen(
                 SecretField(
                     value = connectPassword,
                     onValueChange = onConnectPassword,
-                    label = "Password",
+                    label = if (connectName.isBlank()) "Password for this computer" else "Password for $connectName",
+                )
+                Text(
+                    "The password on that computer. Your PJDesk account password is not filled in here.",
+                    color = pjMuted(),
+                    style = MaterialTheme.typography.labelMedium,
                 )
                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                     Checkbox(checked = savePassword, onCheckedChange = onSavePassword)

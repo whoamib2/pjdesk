@@ -74,8 +74,11 @@ fn sort_label(row: &SavedRow) -> String {
 pub fn sort_rows(rows: &mut [SavedRow], sort: SavedSort) {
     match sort {
         SavedSort::Name => rows.sort_by(|a, b| sort_label(a).cmp(&sort_label(b)).then(a.id.cmp(&b.id))),
-        SavedSort::Recent => rows.sort_by(|a, b| b.last_connected.cmp(&a.last_connected).then(sort_label(a).cmp(&sort_label(b)))),
-        SavedSort::Os => rows.sort_by(|a, b| os_label(&a.os_family).cmp(os_label(&b.os_family)).then(sort_label(a).cmp(&sort_label(b)))),
+        SavedSort::Recent => {
+            rows.sort_by(|a, b| b.last_connected.cmp(&a.last_connected).then(sort_label(a).cmp(&sort_label(b))))
+        }
+        SavedSort::Os => rows
+            .sort_by(|a, b| os_label(&a.os_family).cmp(os_label(&b.os_family)).then(sort_label(a).cmp(&sort_label(b)))),
     }
 }
 
@@ -88,7 +91,9 @@ impl App {
             if let Some(email) = self.cfg.network_email.as_deref().filter(|s| !s.is_empty()) {
                 ui.label(widgets::muted(
                     ui,
-                    &format!("Signed in as {email}. This list is your account's computers. Passwords stay on this computer."),
+                    &format!(
+                        "Signed in as {email}. This list is your account's computers. Passwords stay on this computer."
+                    ),
                 ));
             }
             ui.label(widgets::muted(
@@ -138,18 +143,17 @@ impl App {
             }
             egui::ScrollArea::vertical().id_salt("saved-rows").auto_shrink([false, false]).show(ui, |ui| {
                 let mut action: Option<RowCmd> = None;
-                egui::Grid::new("saved-table")
-                    .num_columns(10)
-                    .spacing(egui::vec2(6.0, 4.0))
-                    .min_col_width(0.0)
-                    .show(ui, |ui| {
+                egui::Grid::new("saved-table").num_columns(10).spacing(egui::vec2(6.0, 4.0)).min_col_width(0.0).show(
+                    ui,
+                    |ui| {
                         header(ui);
                         ui.end_row();
                         for row in &rows {
                             self.row_line(ui, row, &mut action);
                             ui.end_row();
                         }
-                    });
+                    },
+                );
                 if let Some(cmd) = action {
                     self.apply_saved(cmd);
                 }
@@ -283,7 +287,8 @@ impl App {
             RowCmd::Remove(id) => self.confirm_remove = Some(id),
             RowCmd::Rename(id) => {
                 let hostname = self.cfg.settings.peers.get(&id).map(|n| n.hostname.clone()).unwrap_or_default();
-                let alias = self.cfg.address_book.iter().find(|e| e.id == id).map(|e| e.alias.clone()).unwrap_or_default();
+                let alias =
+                    self.cfg.address_book.iter().find(|e| e.id == id).map(|e| e.alias.clone()).unwrap_or_default();
                 self.rename_text = crate::config::nickname_text(&alias, &id, &hostname);
                 self.renaming = Some(id);
             }
@@ -349,27 +354,27 @@ impl App {
         }
         let mut close = false;
         let mut go = false;
-        let title = if self.prompt_rejected { "Password was not accepted" } else { "Password" };
+        let name = self.row_title(&self.prompt_id);
+        let title = format!("Password for {name}");
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                let name = self.row_title(&self.prompt_id.clone());
-                ui.label(RichText::new(name).strong());
                 ui.label(RichText::new(format_id(&self.prompt_id)).monospace().color(theme::paint(ui).muted));
                 if self.prompt_rejected {
                     ui.add_space(4.0);
-                    ui.label("That saved password was rejected. Enter the current one to update it.");
+                    ui.label("That saved password was rejected. Enter the current one for this computer.");
                 }
                 ui.add_space(8.0);
-                widgets::field_label(ui, "Password");
-                let resp = widgets::password_field(ui, &mut self.prompt_password, "Password", &mut self.prompt_show);
+                let label = format!("Password for {name}");
+                widgets::field_label(ui, &label);
+                let resp = widgets::password_field(ui, &mut self.prompt_password, "Computer password", &mut self.prompt_show);
                 ui.add_space(4.0);
                 widgets::checkbox(ui, &mut self.prompt_remember, "Save password for this computer");
                 ui.label(widgets::muted(
                     ui,
-                    "Stored on this computer only, with Windows encryption. It is not uploaded.",
+                    "The password on this computer, not your PJDesk account. Saved on this computer only, and not uploaded.",
                 ));
                 ui.add_space(8.0);
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -386,12 +391,8 @@ impl App {
             self.prompt_open = false;
         }
         if go {
-            let (id, pw, files, remember) = (
-                self.prompt_id.clone(),
-                self.prompt_password.clone(),
-                self.prompt_files,
-                self.prompt_remember,
-            );
+            let (id, pw, files, remember) =
+                (self.prompt_id.clone(), self.prompt_password.clone(), self.prompt_files, self.prompt_remember);
             if pw.trim().is_empty() {
                 self.status = "Enter the password.".into();
             } else {
