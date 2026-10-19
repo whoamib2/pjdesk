@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyPresence, canonical, decide, inviteError, isPrivateAddress, normalizeFingerprint, planRegistration, presenceView, requireAccountsOn } from "../src/network.js";
+import { applyPresence, canonical, decide, inviteError, isPrivateAddress, normalizeFingerprint, planRegistration, presenceView, requireAccountsOn, savedShape } from "../src/network.js";
 
 test("canonical matches the shared fixture", () => {
   const text = canonical({
@@ -233,6 +233,29 @@ test("an empty host report does not erase the name or the user", () => {
   assert.equal(newer.online, 1);
   assert.equal(presenceView(newer, "owner").console_user, "Ben");
   assert.equal(presenceView(newer, "member").console_user, "");
+});
+
+test("a saved computer keeps the nickname, star, and order, and never a password", () => {
+  const row = savedShape({
+    id: "902 488 771",
+    name: "Cabin",
+    hostname: "CABINDESK",
+    os_family: "windows",
+    os_version: "11",
+    starred: true,
+    position: 20,
+    password: "correct horse",
+  });
+  assert.equal(row.id, "902488771");
+  assert.equal(row.name, "Cabin");
+  assert.equal(row.starred, true);
+  assert.equal(row.position, 20);
+  assert.equal(row.hidden, false);
+  assert.equal(JSON.stringify(row).includes("password"), false);
+  assert.equal(JSON.stringify(row).includes("correct horse"), false);
+  const hidden = savedShape({ id: "111111111", name: "Gone", hidden: true });
+  assert.equal(hidden.hidden, true);
+  assert.equal(hidden.name, "");
 });
 
 test("a saved computer has no password field in the canonical record", () => {

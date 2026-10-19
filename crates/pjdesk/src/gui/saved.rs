@@ -12,6 +12,7 @@ pub enum SavedSort {
     Name,
     Recent,
     Os,
+    Order,
 }
 
 pub struct SavedRow {
@@ -32,6 +33,7 @@ pub struct SavedRow {
     pub last_seen: u64,
     /// This row is the computer the window is running on.
     pub this_computer: bool,
+    pub sort_order: u32,
 }
 
 pub fn os_icon(family: &str) -> Icon {
@@ -86,6 +88,11 @@ pub fn sort_rows(rows: &mut [SavedRow], sort: SavedSort) {
         }
         SavedSort::Os => rows
             .sort_by(|a, b| os_label(&a.os_family).cmp(os_label(&b.os_family)).then(sort_label(a).cmp(&sort_label(b)))),
+        SavedSort::Order => rows.sort_by(|a, b| {
+            let ao = if a.sort_order == 0 { u32::MAX } else { a.sort_order };
+            let bo = if b.sort_order == 0 { u32::MAX } else { b.sort_order };
+            ao.cmp(&bo).then(sort_label(a).cmp(&sort_label(b))).then(a.id.cmp(&b.id))
+        }),
     }
 }
 
@@ -99,9 +106,11 @@ impl App {
                 ui.label(widgets::muted(
                     ui,
                     &format!(
-                        "Signed in as {email}. This list is your account's computers. Passwords stay on this computer."
+                        "Signed in as {email}. This list syncs with your account. Passwords stay on this computer."
                     ),
                 ));
+            } else {
+                ui.label(widgets::muted(ui, "Sign in at pjdesk.com to sync across your computers."));
             }
             ui.label(widgets::muted(
                 ui,
@@ -118,11 +127,13 @@ impl App {
                         SavedSort::Name => "Name",
                         SavedSort::Recent => "Last connected",
                         SavedSort::Os => "Operating system",
+                        SavedSort::Order => "Saved order",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.saved_sort, SavedSort::Name, "Name");
                         ui.selectable_value(&mut self.saved_sort, SavedSort::Recent, "Last connected");
                         ui.selectable_value(&mut self.saved_sort, SavedSort::Os, "Operating system");
+                        ui.selectable_value(&mut self.saved_sort, SavedSort::Order, "Saved order");
                     });
                 widgets::checkbox(ui, &mut self.saved_favorites, "Favorites");
             });
@@ -183,7 +194,7 @@ impl App {
         }
         let mut rows = Vec::new();
         for id in ids {
-            if !pjdesk_proto::is_valid_id(&id) {
+            if !pjdesk_proto::is_valid_id(&id) || self.cfg.is_saved_hidden(&id) {
                 continue;
             }
             let entry = self.cfg.address_book.iter().find(|e| e.id == id);
@@ -206,6 +217,7 @@ impl App {
                 console_user: note.map(|n| n.console_user.clone()).unwrap_or_default(),
                 last_seen: note.map(|n| n.last_seen).unwrap_or(0),
                 this_computer: self.is_this_computer(&id),
+                sort_order: note.map(|n| n.sort_order).unwrap_or(0),
             });
         }
         rows
@@ -292,6 +304,14 @@ impl App {
                     *action = Some(RowCmd::Favorite(id.clone()));
                     ui.close();
                 }
+                if ui.button("Move up").clicked() {
+                    *action = Some(RowCmd::Move(id.clone(), true));
+                    ui.close();
+                }
+                if ui.button("Move down").clicked() {
+                    *action = Some(RowCmd::Move(id.clone(), false));
+                    ui.close();
+                }
                 if row.has_password && ui.button("Remove saved password").clicked() {
                     *action = Some(RowCmd::ForgetPassword(id.clone()));
                     ui.close();
@@ -318,6 +338,7 @@ impl App {
                 self.toast.show("Saved password forgotten");
             }
             RowCmd::Remove(id) => self.confirm_remove = Some(id),
+            RowCmd::Move(id, up) => self.move_saved(&id, up),
             RowCmd::Rename(id) => {
                 let hostname = self.cfg.settings.peers.get(&id).map(|n| n.hostname.clone()).unwrap_or_default();
                 let alias =
@@ -372,13 +393,29 @@ impl App {
         }
         if remove {
             let id = id.to_string();
-            self.cfg.address_book.retain(|e| e.id != id);
-            self.cfg.remember_password(&id, None);
-            self.cfg.settings.peers.remove(&id);
+            self.cfg.hide_saved(&id);
             self.confirm_remove = None;
+            self.saved_sort = SavedSort::Order;
             self.sync_address_book();
             self.toast.show("Removed");
         }
+    }
+
+    /// Rewrites Saved order so `id` swaps with its neighbor. The new order syncs
+    /// only while this computer is signed in to pjdesk.com.
+    fn move_saved(&mut self, id: &str, up: bool) {
+        let mut rows = self.saved_rows();
+        sort_rows(&mut rows, SavedSort::Order);
+        let Some(index) = rows.iter().position(|r| r.id == id) else { return };
+        let other = if up { index.checked_sub(1) } else { (index + 1 < rows.len()).then_some(index + 1) };
+        let Some(other) = other else { return };
+        rows.swap(index, other);
+        for (place, row) in rows.iter().enumerate() {
+            self.cfg.settings.peers.entry(row.id.clone()).or_default().sort_order = ((place as u32) + 1) * 10;
+        }
+        self.saved_sort = SavedSort::Order;
+        self.sync_address_book();
+        self.toast.show("Order saved");
     }
 
     pub(super) fn password_prompt(&mut self, ctx: &egui::Context) {
@@ -445,6 +482,7 @@ enum RowCmd {
     Remove(String),
     Rename(String),
     CommitRename(String),
+    Move(String, bool),
 }
 
 fn ago(unix: u64) -> String {
@@ -608,6 +646,7 @@ mod tests {
                 console_user: String::new(),
                 last_seen: 0,
                 this_computer: false,
+                sort_order: 0,
             },
             SavedRow {
                 id: "111111111".into(),
@@ -622,6 +661,7 @@ mod tests {
                 console_user: "Ben".into(),
                 last_seen: 40,
                 this_computer: false,
+                sort_order: 0,
             },
         ];
         sort_rows(&mut rows, SavedSort::Name);

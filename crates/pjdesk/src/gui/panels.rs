@@ -75,7 +75,7 @@ impl App {
             self.sign_in_panel(ui);
             return;
         }
-        if self.cfg.network_email.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        if self.page != super::MainPage::Saved && self.cfg.network_email.as_deref().map(str::trim).unwrap_or("").is_empty() {
             let mut open = false;
             theme::card(ui, |ui| {
                 ui.label("Sign in with your PJDesk account for this network and its servers. That sign-in is not the password for a computer.");

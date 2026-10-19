@@ -669,11 +669,8 @@ impl App {
         let note = self.cfg.settings.peers.entry(id.to_string()).or_default();
         note.favorite = !note.favorite;
         let on = note.favorite;
-        if !on && note.last_connected == 0 {
-            self.cfg.settings.peers.remove(id);
-        }
-        self.save_cfg();
-        self.toast.show(if on { "Added to favorites" } else { "Removed from favorites" });
+        self.sync_address_book();
+        self.toast.show(if on { "Starred" } else { "Star removed" });
     }
 
     fn start_token_refresh(&mut self) {
@@ -1069,10 +1066,7 @@ impl App {
     /// per-computer passwords stay on this computer.
     fn sign_out_network(&mut self) {
         self.cfg.reload_identity_from_disk();
-        self.cfg.network_email = None;
-        self.cfg.network_refresh = None;
-        self.cfg.network_access = None;
-        self.cfg.network_access_exp = 0;
+        self.cfg.leave_network_sign_in();
         self.show_net_sign_in = false;
         if let Err(e) = self.cfg.save() {
             self.status = format!("Could not save settings: {e}");

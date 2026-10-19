@@ -72,6 +72,14 @@ pub struct Config {
     /// is not stored. Export copies this string; nothing logs it.
     #[serde(default)]
     pub network_key: Option<String>,
+    /// True after this computer has merged its local Saved list into the account once.
+    /// Sign-out clears it so the next sign-in merges again. The list itself stays.
+    #[serde(default)]
+    pub network_list_merged: bool,
+    /// Saved computers this person removed. They stay hidden, including ones the
+    /// server registry still reports. Synced with the account while signed in.
+    #[serde(default)]
+    pub saved_hidden: Vec<String>,
 }
 
 /// Quality, behaviour and startup preferences.
@@ -173,6 +181,9 @@ pub struct PeerNote {
     /// Last interactive user reported by that computer. Empty until one is known.
     #[serde(default)]
     pub console_user: String,
+    /// User order in Saved. 0 means unordered. Not a password and not uploaded by itself.
+    #[serde(default)]
+    pub sort_order: u32,
     /// When the account's server last saw this computer. 0 until then.
     #[serde(default)]
     pub last_seen: u64,
@@ -536,8 +547,42 @@ impl Config {
         if let Ok(fp) = parse_fingerprint(&session.standby_fingerprint) {
             self.network_standby_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         }
-        self.merge_computers(&session.computers);
+        let first = !self.network_list_merged;
+        self.merge_computers(&session.computers, first);
         self.merge_presence(&session.presence);
+        if !session.email.trim().is_empty() || !session.refresh.is_empty() {
+            self.network_list_merged = true;
+        }
+    }
+
+    /// Drops the pjdesk.com sign-in. The saved list, nicknames, stars, order,
+    /// and per-computer passwords stay on this computer. Syncing stops.
+    pub fn leave_network_sign_in(&mut self) {
+        self.network_email = None;
+        self.network_refresh = None;
+        self.network_access = None;
+        self.network_access_exp = 0;
+        self.network_list_merged = false;
+    }
+
+    pub fn is_saved_hidden(&self, id: &str) -> bool {
+        let id = pjdesk_proto::normalize_id(id);
+        self.saved_hidden.iter().any(|h| h == &id)
+    }
+
+    /// Removes a computer from the local Saved list and remembers the hide.
+    /// The password on this computer is dropped with it. Nothing here is uploaded
+    /// until the caller syncs.
+    pub fn hide_saved(&mut self, id: &str) {
+        let id = pjdesk_proto::normalize_id(id);
+        if !pjdesk_proto::is_valid_id(&id) {
+            return;
+        }
+        self.address_book.retain(|e| e.id != id);
+        self.saved_passwords.remove(&id);
+        if !self.saved_hidden.iter().any(|h| h == &id) {
+            self.saved_hidden.push(id);
+        }
     }
 
     /// Adds computers the account's server has seen, including ones saved
@@ -566,6 +611,9 @@ impl Config {
                 note.last_seen = row.last_seen;
             }
             note.reported_online = row.online;
+            if self.is_saved_hidden(&id) {
+                continue;
+            }
             if !self.address_book.iter().any(|e| e.id == id) {
                 self.address_book.push(AddressEntry { id, alias: String::new(), ..Default::default() });
             }
@@ -573,12 +621,24 @@ impl Config {
     }
 
     /// Adds the account's saved computers. Local passwords are left as they are.
-    pub fn merge_computers(&mut self, computers: &[crate::network::SavedComputer]) {
+    ///
+    /// `prefer_account` is the first sign-in merge: the same computer keeps one
+    /// row, and the account's nickname wins when both sides have one. Later
+    /// refreshes leave a nickname typed on this computer alone.
+    pub fn merge_computers(&mut self, computers: &[crate::network::SavedComputer], prefer_account: bool) {
         for computer in computers {
             let id = pjdesk_proto::normalize_id(&computer.id);
             if !pjdesk_proto::is_valid_id(&id) {
                 continue;
             }
+            if computer.hidden {
+                self.address_book.retain(|e| e.id != id);
+                if !self.saved_hidden.iter().any(|h| h == &id) {
+                    self.saved_hidden.push(id);
+                }
+                continue;
+            }
+            self.saved_hidden.retain(|h| h != &id);
             let note = self.settings.peers.entry(id.clone()).or_default();
             if note.hostname.trim().is_empty() && !computer.hostname.trim().is_empty() {
                 note.hostname = computer.hostname.trim().to_string();
@@ -589,18 +649,28 @@ impl Config {
             if note.os_version.is_empty() {
                 note.os_version = computer.os_version.clone();
             }
+            if let Some(starred) = computer.starred {
+                note.favorite = starred;
+            }
+            if let Some(position) = computer.position {
+                note.sort_order = position;
+            }
             let known_host = note.hostname.clone();
             let incoming = nickname_text(&computer.name, &id, &known_host);
             if let Some(entry) = self.address_book.iter_mut().find(|e| e.id == id) {
                 entry.password = None;
-                if nickname_text(&entry.alias, &id, &known_host).is_empty() {
+                let local = nickname_text(&entry.alias, &id, &known_host);
+                if prefer_account && !incoming.is_empty() {
+                    entry.alias = incoming;
+                } else if local.is_empty() {
                     if !incoming.is_empty() {
                         entry.alias = incoming;
                     } else if same_id(&entry.alias, &id) {
                         entry.alias.clear();
                     }
                 }
-            } else if !incoming.is_empty() || !known_host.is_empty() || !computer.os_family.is_empty() {
+            } else if !incoming.is_empty() || !known_host.is_empty() || !computer.os_family.is_empty() || computer.starred.is_some()
+            {
                 self.address_book.push(AddressEntry {
                     id: id.clone(),
                     alias: incoming,
@@ -778,24 +848,30 @@ mod tests {
     fn merge_keeps_a_nickname_and_fills_an_empty_hostname() {
         let mut c = Config::default();
         c.address_book = vec![AddressEntry { id: "123456789".into(), alias: "Front desk".into(), ..Default::default() }];
-        c.merge_computers(&[crate::network::SavedComputer {
-            id: "123456789".into(),
-            name: "Other name".into(),
-            hostname: "OFFICE-PC".into(),
-            os_family: "windows".into(),
-            os_version: "11".into(),
-        }]);
+        c.merge_computers(
+            &[crate::network::SavedComputer {
+                id: "123456789".into(),
+                name: "Other name".into(),
+                hostname: "OFFICE-PC".into(),
+                os_family: "windows".into(),
+                os_version: "11".into(),
+                ..Default::default()
+            }],
+            false,
+        );
         assert_eq!(c.address_book[0].alias, "Front desk");
         assert_eq!(c.settings.peers.get("123456789").unwrap().hostname, "OFFICE-PC");
 
         let mut fresh = Config::default();
-        fresh.merge_computers(&[crate::network::SavedComputer {
-            id: "386626882".into(),
-            name: "386 626 882".into(),
-            hostname: "BEN-PC".into(),
-            os_family: String::new(),
-            os_version: String::new(),
-        }]);
+        fresh.merge_computers(
+            &[crate::network::SavedComputer {
+                id: "386626882".into(),
+                name: "386 626 882".into(),
+                hostname: "BEN-PC".into(),
+                ..Default::default()
+            }],
+            false,
+        );
         assert!(fresh.address_book.iter().all(|e| e.alias.is_empty()));
         assert_eq!(fresh.settings.peers.get("386626882").unwrap().hostname, "BEN-PC");
     }
@@ -818,15 +894,90 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         assert!(!json.contains("correct horse"));
         assert!(json.contains("dpapi:") || json.contains("plain:"));
-        c.merge_computers(&[crate::network::SavedComputer {
-            id: "123456789".into(),
-            name: "Office".into(),
-            hostname: String::new(),
-            os_family: "windows".into(),
-            os_version: "11".into(),
-        }]);
+        c.merge_computers(
+            &[crate::network::SavedComputer {
+                id: "123456789".into(),
+                name: "Office".into(),
+                hostname: String::new(),
+                os_family: "windows".into(),
+                os_version: "11".into(),
+                ..Default::default()
+            }],
+            false,
+        );
         assert_eq!(c.saved_password("123456789").as_deref(), Some("correct horse"));
         assert!(c.address_book.iter().all(|e| e.password.is_none()));
+    }
+
+    #[test]
+    fn first_sign_in_merges_local_computers_and_prefers_the_account_nickname() {
+        let mut c = Config::default();
+        c.remember_password("111111111", Some("local-secret"));
+        c.address_book = vec![
+            AddressEntry { id: "111111111".into(), alias: "Local name".into(), ..Default::default() },
+            AddressEntry { id: "222222222".into(), alias: "Only here".into(), ..Default::default() },
+        ];
+        c.settings.peers.insert("222222222".into(), PeerNote { favorite: true, sort_order: 20, ..Default::default() });
+        c.merge_computers(
+            &[
+                crate::network::SavedComputer {
+                    id: "111111111".into(),
+                    name: "Account name".into(),
+                    hostname: "CABINDESK".into(),
+                    os_family: "windows".into(),
+                    os_version: "11".into(),
+                    starred: Some(true),
+                    position: Some(5),
+                    hidden: false,
+                },
+                crate::network::SavedComputer {
+                    id: "333333333".into(),
+                    name: "Pixel".into(),
+                    hostname: "Pixel 11".into(),
+                    os_family: "android".into(),
+                    os_version: "16".into(),
+                    ..Default::default()
+                },
+                crate::network::SavedComputer {
+                    id: "444444444".into(),
+                    name: "Old".into(),
+                    hidden: true,
+                    ..Default::default()
+                },
+            ],
+            true,
+        );
+        assert_eq!(c.address_book.iter().find(|e| e.id == "111111111").unwrap().alias, "Account name");
+        assert_eq!(c.address_book.iter().find(|e| e.id == "222222222").unwrap().alias, "Only here");
+        assert_eq!(c.address_book.iter().find(|e| e.id == "333333333").unwrap().alias, "Pixel");
+        assert!(c.address_book.iter().all(|e| e.id != "444444444"));
+        assert!(c.is_saved_hidden("444444444"));
+        assert_eq!(c.settings.peers.get("111111111").unwrap().favorite, true);
+        assert_eq!(c.settings.peers.get("111111111").unwrap().sort_order, 5);
+        assert_eq!(c.settings.peers.get("222222222").unwrap().sort_order, 20);
+        assert_eq!(c.saved_password("111111111").as_deref(), Some("local-secret"));
+        assert!(c.address_book.iter().all(|e| e.password.is_none()));
+
+        let mut later = c.clone();
+        later.address_book.iter_mut().find(|e| e.id == "111111111").unwrap().alias = "Typed here".into();
+        later.merge_computers(
+            &[crate::network::SavedComputer {
+                id: "111111111".into(),
+                name: "Account name".into(),
+                hostname: "CABINDESK".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        assert_eq!(later.address_book.iter().find(|e| e.id == "111111111").unwrap().alias, "Typed here");
+
+        c.leave_network_sign_in();
+        assert!(c.network_email.is_none());
+        assert!(c.network_refresh.is_none());
+        assert!(!c.network_list_merged);
+        assert_eq!(c.address_book.len(), 3);
+        assert_eq!(c.saved_password("111111111").as_deref(), Some("local-secret"));
+        assert!(c.settings.peers.get("222222222").unwrap().favorite);
     }
 
     #[test]

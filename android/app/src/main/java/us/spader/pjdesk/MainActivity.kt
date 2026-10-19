@@ -389,13 +389,14 @@ class MainActivity : ComponentActivity() {
                                 netBusy = false
                                 result.onSuccess { session ->
                                     val email = session.email.ifBlank { netEmail.trim() }
+                                    val first = app.store.networkEmail.isBlank()
+                                    app.store.mergeCloud(session.computers, preferAccount = first)
                                     app.store.networkEmail = email
                                     app.store.networkDeviceId = session.deviceId
                                     if (useKey) NetKey.blobIn(blob)?.let { app.store.networkKey = it }
                                     app.store.saveNetworkRefresh(session.refresh)
                                     engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
                                     engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
-                                    app.store.mergeCloud(session.computers)
                                     netPass = ""
                                     netKeyPass = ""
                                     netBlob = ""
@@ -494,6 +495,7 @@ class MainActivity : ComponentActivity() {
                                     },
                                 )
                                 1 -> SavedScreen(
+                                    signedIn = account.isNotEmpty(),
                                     computers = saved,
                                     query = query,
                                     onQuery = { query = it },

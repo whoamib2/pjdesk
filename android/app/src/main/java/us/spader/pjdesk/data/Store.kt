@@ -93,8 +93,12 @@ class Store(context: Context) {
         mergeCloud(listOf(computer))
     }
 
-    /** Fills an empty nickname, hostname, or OS from the account. A value already stored here stays. */
-    fun mergeCloud(remote: List<SavedComputer>) {
+    /**
+     * Fills the local Saved list from the account.
+     * On first sign-in (`preferAccount`) the account nickname wins a conflict.
+     * A later refresh leaves a nickname typed on this phone. Passwords stay here.
+     */
+    fun mergeCloud(remote: List<SavedComputer>, preferAccount: Boolean = false) {
         val local = saved().toMutableList()
         for (incoming in remote) {
             if (incoming.id.length != 9) continue
@@ -104,8 +108,10 @@ class Store(context: Context) {
                 continue
             }
             val cur = local[index]
+            val accountName = incoming.nickname()
+            val name = if (preferAccount && accountName.isNotBlank()) accountName else cur.nickname().ifBlank { accountName }
             local[index] = cur.copy(
-                name = cur.nickname().ifBlank { incoming.nickname() },
+                name = name,
                 hostname = incoming.hostname.ifBlank { cur.hostname },
                 osFamily = incoming.osFamily.ifBlank { cur.osFamily },
                 osVersion = incoming.osVersion.ifBlank { cur.osVersion },

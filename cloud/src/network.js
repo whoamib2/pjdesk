@@ -357,13 +357,38 @@ function cleanComputer(row) {
   const compact = name.replace(/\s/g, "");
   if (compact === id) name = "";
   if (hostname && name.toLowerCase() === hostname.toLowerCase()) name = "";
+  const position = Number(row.position);
+  const hidden = row.hidden === true || row.hidden === 1;
   return {
     id,
-    name,
+    name: hidden ? "" : name,
     hostname,
     os_family: String(row.os_family || row.osFamily || "").slice(0, 32),
     os_version: String(row.os_version || row.osVersion || "").slice(0, 40),
+    starred: row.starred === true || row.starred === 1,
+    position: Number.isFinite(position) && position > 0 ? Math.min(position, 1_000_000) : 0,
+    hidden,
   };
+}
+
+/** Fields the account stores for one saved computer. Passwords are not among them. */
+export function savedShape(row) {
+  return cleanComputer(row);
+}
+
+function missingSavedColumn(err) {
+  const message = columnMessage(err);
+  return /no such column/i.test(message) && /starred|position|hidden/i.test(message);
+}
+
+function columnMessage(err) {
+  const parts = [];
+  let cur = err;
+  for (let i = 0; i < 4 && cur; i += 1) {
+    parts.push(typeof cur === "string" ? cur : cur.message || "");
+    cur = cur.cause;
+  }
+  return parts.join(" ");
 }
 
 function missingHostnameColumn(err) {
@@ -380,20 +405,38 @@ function missingHostnameColumn(err) {
 async function computersFor(env, networkId, accountId) {
   try {
     const { results } = await env.DB.prepare(
-      `SELECT device_id, name, hostname, os_family, os_version FROM network_computers
-        WHERE network_id = ? AND account_id = ? ORDER BY updated_at DESC LIMIT 500`,
+      `SELECT device_id, name, hostname, os_family, os_version, starred, position, hidden FROM network_computers
+        WHERE network_id = ? AND account_id = ? ORDER BY position, updated_at DESC LIMIT 500`,
     )
       .bind(networkId, accountId)
       .all();
     return (results || []).map((r) => ({
       id: r.device_id,
-      name: r.name,
+      name: r.hidden ? "" : r.name,
       hostname: r.hostname || "",
       os_family: r.os_family,
       os_version: r.os_version,
+      starred: !!r.starred,
+      position: Number(r.position) || 0,
+      hidden: !!r.hidden,
     }));
   } catch (err) {
-    if (!missingHostnameColumn(err)) throw err;
+    if (!missingSavedColumn(err) && !missingHostnameColumn(err)) throw err;
+    if (missingSavedColumn(err)) {
+      const { results } = await env.DB.prepare(
+        `SELECT device_id, name, hostname, os_family, os_version FROM network_computers
+          WHERE network_id = ? AND account_id = ? ORDER BY updated_at DESC LIMIT 500`,
+      )
+        .bind(networkId, accountId)
+        .all();
+      return (results || []).map((r) => ({
+        id: r.device_id,
+        name: r.name,
+        hostname: r.hostname || "",
+        os_family: r.os_family,
+        os_version: r.os_version,
+      }));
+    }
     const { results } = await env.DB.prepare(
       `SELECT device_id, name, os_family, os_version FROM network_computers
         WHERE network_id = ? AND account_id = ? ORDER BY updated_at DESC LIMIT 500`,
@@ -415,17 +458,45 @@ async function saveComputers(env, networkId, accountId, list) {
   const t = now();
   const withHost = rows.map((c) =>
     env.DB.prepare(
-      `INSERT INTO network_computers (network_id, account_id, device_id, name, hostname, os_family, os_version, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO network_computers (network_id, account_id, device_id, name, hostname, os_family, os_version, updated_at, starred, position, hidden)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(network_id, account_id, device_id) DO UPDATE SET
          name = excluded.name, hostname = excluded.hostname, os_family = excluded.os_family,
-         os_version = excluded.os_version, updated_at = excluded.updated_at`,
-    ).bind(networkId, accountId, c.id, c.name, c.hostname, c.os_family, c.os_version, t),
+         os_version = excluded.os_version, updated_at = excluded.updated_at,
+         starred = excluded.starred, position = excluded.position, hidden = excluded.hidden`,
+    ).bind(
+      networkId,
+      accountId,
+      c.id,
+      c.hidden ? "" : c.name,
+      c.hidden ? "" : c.hostname,
+      c.os_family,
+      c.os_version,
+      t,
+      c.starred ? 1 : 0,
+      c.position || 0,
+      c.hidden ? 1 : 0,
+    ),
   );
   if (!withHost.length) return;
   try {
     await env.DB.batch(withHost);
   } catch (err) {
+    if (missingSavedColumn(err)) {
+      const mid = rows
+        .filter((c) => !c.hidden)
+        .map((c) =>
+          env.DB.prepare(
+            `INSERT INTO network_computers (network_id, account_id, device_id, name, hostname, os_family, os_version, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(network_id, account_id, device_id) DO UPDATE SET
+               name = excluded.name, hostname = excluded.hostname, os_family = excluded.os_family,
+               os_version = excluded.os_version, updated_at = excluded.updated_at`,
+          ).bind(networkId, accountId, c.id, c.name, c.hostname, c.os_family, c.os_version, t),
+        );
+      if (mid.length) await env.DB.batch(mid);
+      return;
+    }
     if (!missingHostnameColumn(err)) throw err;
     const legacy = rows.map((c) =>
       env.DB.prepare(

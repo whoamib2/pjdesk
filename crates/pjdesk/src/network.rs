@@ -38,7 +38,7 @@ pub enum SignIn {
     NoServer { role: String, login_token: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SavedComputer {
     pub id: String,
     /// Optional nickname. Empty when the user has not named it.
@@ -47,6 +47,12 @@ pub struct SavedComputer {
     pub hostname: String,
     pub os_family: String,
     pub os_version: String,
+    /// Account star, when the account sent one. `None` leaves the local star.
+    pub starred: Option<bool>,
+    /// Account order, when the account sent one. `None` leaves the local order.
+    pub position: Option<u32>,
+    /// The account says this computer was removed from Saved.
+    pub hidden: bool,
 }
 
 /// A computer registered on the account's server. The user name is present only
@@ -157,6 +163,12 @@ struct ComputerBody {
     os_family: String,
     #[serde(default)]
     os_version: String,
+    #[serde(default)]
+    starred: Option<bool>,
+    #[serde(default)]
+    position: Option<u32>,
+    #[serde(default)]
+    hidden: bool,
 }
 
 #[derive(Deserialize)]
@@ -262,6 +274,9 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
                 hostname: c.hostname,
                 os_family: c.os_family,
                 os_version: c.os_version,
+                starred: c.starred,
+                position: c.position,
+                hidden: c.hidden,
             })
             .collect(),
         presence: reply
@@ -429,7 +444,11 @@ pub fn enroll(code: &str, device_id: &str, device_name: &str) -> Result<Session>
 
 /// Nickname, hostname, ID, and OS. A password is dropped. An alias that is
 /// only the ID, or only the hostname, is not uploaded as a nickname.
-pub fn computers_body(entries: &[AddressEntry], notes: &std::collections::BTreeMap<String, PeerNote>) -> serde_json::Value {
+pub fn computers_body(
+    entries: &[AddressEntry],
+    notes: &std::collections::BTreeMap<String, PeerNote>,
+    hidden: &[String],
+) -> serde_json::Value {
     use std::collections::BTreeSet;
     let mut ids = BTreeSet::new();
     for entry in entries {
@@ -438,13 +457,22 @@ pub fn computers_body(entries: &[AddressEntry], notes: &std::collections::BTreeM
         }
     }
     for id in notes.keys() {
-        if pjdesk_proto::is_valid_id(id) {
+        if pjdesk_proto::is_valid_id(id) && !hidden.iter().any(|h| h == id) {
             ids.insert(id.clone());
+        }
+    }
+    for id in hidden {
+        let id = pjdesk_proto::normalize_id(id);
+        if pjdesk_proto::is_valid_id(&id) {
+            ids.insert(id);
         }
     }
     let computers: Vec<serde_json::Value> = ids
         .into_iter()
         .map(|id| {
+            if hidden.iter().any(|h| h == &id) {
+                return serde_json::json!({ "id": id, "name": "", "hostname": "", "os_family": "", "os_version": "", "hidden": true });
+            }
             let alias = entries.iter().find(|e| e.id == id).map(|e| e.alias.as_str()).unwrap_or("");
             let note = notes.get(&id);
             let hostname = note.map(|n| n.hostname.as_str()).unwrap_or("");
@@ -454,6 +482,9 @@ pub fn computers_body(entries: &[AddressEntry], notes: &std::collections::BTreeM
                 "hostname": hostname,
                 "os_family": note.map(|n| n.os_family.as_str()).unwrap_or(""),
                 "os_version": note.map(|n| n.os_version.as_str()).unwrap_or(""),
+                "starred": note.is_some_and(|n| n.favorite),
+                "position": note.map(|n| n.sort_order).unwrap_or(0),
+                "hidden": false,
             })
         })
         .collect();
@@ -469,7 +500,7 @@ pub fn push_saved_computers_from_disk() -> Result<()> {
     if refresh_token.is_empty() || device.is_empty() {
         return Ok(());
     }
-    let body = computers_body(&config.address_book, &config.settings.peers);
+    let body = computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden);
     let mut session = refresh(&refresh_token, &device, Some(&body))?;
     if let Ok(disk) = Config::load() {
         config.fill_peer_facts_from(&disk);
@@ -506,7 +537,7 @@ fn refresh_config_inner(config: &mut Config, force: bool) {
     if !force && config.network_access_exp > now + 120 && !config.network_access_token().is_empty() {
         return;
     }
-    let body = computers_body(&config.address_book, &config.settings.peers);
+    let body = computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden);
     if let Ok(mut session) = refresh(&refresh_token, &device, Some(&body)) {
         if session.email.is_empty() {
             session.email = config.network_email.clone().unwrap_or_default();
@@ -584,7 +615,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let body = computers_body(&entries, &notes);
+        let body = computers_body(&entries, &notes, &[]);
         let text = body.to_string();
         assert!(!text.contains("correct horse"));
         assert!(!text.contains("password"));
@@ -600,7 +631,7 @@ mod tests {
         }];
         let mut seen = std::collections::BTreeMap::new();
         seen.insert("386626882".into(), PeerNote { hostname: "BEN-PC".into(), ..Default::default() });
-        let uploaded = computers_body(&id_only, &seen);
+        let uploaded = computers_body(&id_only, &seen, &[]);
         let name = uploaded["computers"][0]["name"].as_str().unwrap();
         assert_eq!(name, "");
         assert_eq!(uploaded["computers"][0]["hostname"].as_str().unwrap(), "BEN-PC");

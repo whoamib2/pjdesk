@@ -36,6 +36,7 @@ fun SavedScreen(
     onRemovePassword: (SavedComputer) -> Unit = {},
     onRename: (SavedComputer, String) -> Unit = { _, _ -> },
     selfId: String = "",
+    signedIn: Boolean = false,
 ) {
     val q = query.trim()
     val shown = computers.filter { matches(it, q) }
@@ -43,6 +44,15 @@ fun SavedScreen(
     var draft by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Saved computers", style = MaterialTheme.typography.titleLarge)
+        Text(
+            if (signedIn) {
+                "This list syncs with your account. Passwords stay on this phone."
+            } else {
+                "Sign in at pjdesk.com to sync across your computers."
+            },
+            color = pjMuted(),
+            style = MaterialTheme.typography.bodySmall,
+        )
         OutlinedTextField(
             value = query,
             onValueChange = onQuery,
