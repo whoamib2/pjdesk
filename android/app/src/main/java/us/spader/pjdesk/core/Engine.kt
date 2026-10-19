@@ -38,10 +38,10 @@ class Engine(context: Context) : EngineListener {
             update { it.copy(status = "The PJDesk engine did not start.", error = "nativeCreate returned 0") }
             return
         }
-        command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
         if (store.permanent.isNotEmpty()) {
             command(JSONObject().put("cmd", "setPermanent").put("password", store.permanent).toString())
         }
+        command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
     }
 
     fun command(json: String) {
@@ -71,6 +71,11 @@ class Engine(context: Context) : EngineListener {
     fun stop(reason: String = "stopped") {
         AppLog.i("stopping the session: $reason")
         command(JSONObject().put("cmd", "stop").put("reason", reason).toString())
+    }
+
+    fun showStatus(text: String) {
+        AppLog.i(text)
+        update { it.copy(status = text) }
     }
 
     fun showError(text: String) {
@@ -150,10 +155,15 @@ class Engine(context: Context) : EngineListener {
 
     private fun apply(event: JSONObject) {
         val kind = event.optString("event")
-        if (kind != "log") AppLog.i("event $kind ${event.optString("text")} ${event.optString("reason")}")
+        if (kind == "registered") {
+            AppLog.i("event registered id=${event.optString("idFormatted")}")
+        } else if (kind != "log") {
+            AppLog.i("event $kind ${event.optString("text")} ${event.optString("reason")}")
+        }
         when (kind) {
             "log" -> AppLog.i(event.optString("text"))
             "registered" -> update {
+                val ready = it.status == "Connecting…" || it.status == "Online" || it.status.isBlank()
                 it.copy(
                     id = event.optString("id"),
                     idFormatted = event.optString("idFormatted"),
@@ -162,13 +172,20 @@ class Engine(context: Context) : EngineListener {
                     fingerprint = event.optString("fingerprint"),
                     server = event.optString("server", it.server),
                     approval = event.optString("approval", it.approval),
-                    status = if (it.status == "Connecting…") "Online" else it.status,
+                    status = if (ready) "Ready" else it.status,
                 )
             }
-            "status" -> update { it.copy(status = event.optString("text")) }
+            "status" -> update {
+                val text = event.optString("text")
+                if (text == "Ready" && (it.hosting || it.incoming != null || it.session != null)) it
+                else it.copy(status = text)
+            }
             "error" -> update { it.copy(error = event.optString("text")) }
             "incoming" -> update {
-                it.copy(incoming = IncomingCall(event.optString("name"), event.optString("ip")))
+                it.copy(
+                    incoming = IncomingCall(event.optString("name"), event.optString("ip")),
+                    status = "Waiting for approval",
+                )
             }
             "hosting" -> update { it.copy(hosting = true, incoming = null, status = "Being controlled by ${event.optString("peer")}") }
             "controlling" -> update {
@@ -211,12 +228,13 @@ class Engine(context: Context) : EngineListener {
             "input" -> RemoteControl.handle(event)
             "disconnected" -> {
                 val role = event.optString("role")
+                val reason = event.optString("reason").ifBlank { "the session ended" }
                 update {
                     it.copy(
                         hosting = if (role == "host" || role == "session") false else it.hosting,
                         session = if (role == "controller" || role == "session") null else it.session,
                         incoming = null,
-                        status = event.optString("reason").ifBlank { "Disconnected" },
+                        status = "Ended: $reason",
                     )
                 }
             }

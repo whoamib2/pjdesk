@@ -33,7 +33,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.1";
+pub const APP_VERSION: &str = "0.6.2";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -261,6 +261,7 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             let pw = cmd.get("password").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
             if pw.is_empty() {
                 *state.permanent.lock().unwrap() = None;
+                *state.approval.lock().unwrap() = "prompt".into();
                 publish(state, cb);
             } else if permanent_ok(&pw) {
                 *state.permanent.lock().unwrap() = Some(pw);
@@ -271,8 +272,16 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         }
         "setApproval" => {
             let mode = cmd.get("mode").and_then(|v| v.as_str()).unwrap_or("prompt");
-            *state.approval.lock().unwrap() = if mode == "unattended" { "unattended".into() } else { "prompt".into() };
-            publish(state, cb);
+            let want = mode == "unattended";
+            let allowed = want && state.permanent.lock().unwrap().is_some();
+            if want && !allowed {
+                *state.approval.lock().unwrap() = "prompt".into();
+                publish(state, cb);
+                emit(cb, &json!({"event":"error","text":"Save a permanent password first."}));
+            } else {
+                *state.approval.lock().unwrap() = if allowed { "unattended".into() } else { "prompt".into() };
+                publish(state, cb);
+            }
         }
         "regenerate" => {
             *state.otp.lock().unwrap() = generate_password();
@@ -501,7 +510,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
                         persist(&state);
                         publish(&state, &cb);
                         log_line(&cb, format!("registered as {}", format_id(&device_id)));
-                        emit(&cb, &json!({"event":"status","text":"Online"}));
+                        emit(&cb, &json!({"event":"status","text":"Ready"}));
                     }
                     ServerMsg::Policy(policy) => {
                         *state.policy.lock().unwrap() = policy;
@@ -531,7 +540,11 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
                             let reason = match &ended {
                                 Ok(()) => {
                                     let saved = state.end_reason.lock().unwrap().clone();
-                                    if saved.is_empty() { "session ended".to_string() } else { saved }
+                                    if saved.is_empty() {
+                                        "the other computer closed the session".to_string()
+                                    } else {
+                                        saved
+                                    }
                                 }
                                 Err(e) => format!("{e:#}"),
                             };
@@ -618,7 +631,6 @@ async fn host_session(
     ceiling: u32,
 ) -> Result<()> {
     let gen = state.gen.load(Ordering::SeqCst);
-    *state.end_reason.lock().unwrap() = String::new();
     let binding = p2p::bind_udp(server_udp, session_id, token, Role::Host).await?;
     let endpoint = p2p::host_endpoint(binding.socket, &state.identity)?;
     signal.send(ClientMsg::UdpReady {
@@ -698,7 +710,9 @@ async fn host_session(
     }
     let result = loop {
         if state.gen.load(Ordering::SeqCst) != gen || state.app_stop.load(Ordering::SeqCst) {
-            break Ok(());
+            let saved = state.end_reason.lock().unwrap().clone();
+            let saved = if saved.is_empty() { "stopped".to_string() } else { saved };
+            break Err(anyhow!("{saved}"));
         }
         let msg = tokio::time::timeout(
             Duration::from_secs(20),
@@ -713,13 +727,13 @@ async fn host_session(
                 } else {
                     format!("the control stream closed: {e:#}")
                 };
-                break Err(anyhow!(reason));
+                break Err(anyhow!("{reason}"));
             }
             Err(_) => {
                 // Idle phones still send frames. A quiet control stream is fine
                 // as long as the QUIC connection is up.
                 if connection.close_reason().is_some() {
-                    break Ok(());
+                    break Err(anyhow!("the other computer closed the session"));
                 }
                 continue;
             }

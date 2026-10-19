@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Do not add flagRequestAccessibilityButton. That flag is what puts PJDesk in
+  accessibility_button_targets and draws the floating shortcut on the screen edge.
+-->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeViewFocused|typeWindowStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"

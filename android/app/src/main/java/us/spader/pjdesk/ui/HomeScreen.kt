@@ -35,7 +35,7 @@ fun HomeScreen(
     onStop: () -> Unit,
     showPermanent: Boolean = false,
     onShowPermanent: (Boolean) -> Unit = {},
-    onSavePermanent: (String, String, Boolean) -> Unit = { _, _, _ -> },
+    onSavePermanent: (String, String) -> Unit = { _, _ -> },
     onClearPermanent: () -> Unit = {},
     onUnattended: (Boolean) -> Unit = {},
 ) {
@@ -81,18 +81,24 @@ fun HomeScreen(
                 if (state.hasPermanent) {
                     Text("A permanent password is set.", color = pjMuted(), style = MaterialTheme.typography.bodyMedium)
                 }
-                TextButton(onClick = { onShowPermanent(!showPermanent) }) {
+                OutlinedButton(
+                    onClick = { onShowPermanent(!showPermanent) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
                     Text(if (showPermanent) "Hide permanent password" else "Set permanent password")
                 }
                 if (showPermanent) {
                     PermanentPasswordForm(
                         hasPermanent = state.hasPermanent,
-                        unattended = state.approval == "unattended",
                         onSave = onSavePermanent,
                         onClear = onClearPermanent,
-                        onUnattended = onUnattended,
                     )
                 }
+                WhenSomeoneConnects(
+                    hasPermanent = state.hasPermanent,
+                    unattended = state.approval == "unattended",
+                    onUnattended = onUnattended,
+                )
             }
         }
         Card(modifier = Modifier.fillMaxWidth()) {

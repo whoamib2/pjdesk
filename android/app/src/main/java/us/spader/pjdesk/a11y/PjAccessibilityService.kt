@@ -1,12 +1,14 @@
 package us.spader.pjdesk.a11y
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.ComponentName
 import android.content.Context
 import android.media.AudioManager
 import android.provider.Settings
 import android.view.accessibility.AccessibilityEvent
 import org.json.JSONObject
+import us.spader.pjdesk.AppLog
 import us.spader.pjdesk.service.RemoteControl
 import us.spader.pjdesk.service.gestureDescription
 import us.spader.pjdesk.service.screenSize
@@ -19,6 +21,7 @@ import us.spader.pjdesk.service.setFocusedText
 class PjAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         RemoteControl.service = this
+        dropAccessibilityButton()
     }
 
     override fun onDestroy() {
@@ -51,6 +54,33 @@ class PjAccessibilityService : AccessibilityService() {
                 performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
             } else {
                 performGlobalAction(GLOBAL_ACTION_POWER_DIALOG)
+            }
+        }
+    }
+
+    /**
+     * The floating blue button is the system accessibility shortcut. PJDesk does
+     * not request it. Clear the flag if a previous build or the system set it,
+     * and drop this service from the shortcut target list when the platform allows.
+     */
+    private fun dropAccessibilityButton() {
+        val info = serviceInfo ?: return
+        val without = info.flags and AccessibilityServiceInfo.FLAG_REQUEST_ACCESSIBILITY_BUTTON.inv()
+        if (without != info.flags) {
+            info.flags = without
+            serviceInfo = info
+            AppLog.i("cleared the accessibility button flag")
+        }
+        val resolver = contentResolver
+        for (key in listOf("accessibility_button_targets", "accessibility_shortcut_target_service")) {
+            val current = Settings.Secure.getString(resolver, key) ?: continue
+            if (!current.contains(packageName)) continue
+            val next = current.split(':').filter { it.isNotBlank() && !it.contains(packageName) }.joinToString(":")
+            try {
+                val wrote = Settings.Secure.putString(resolver, key, next)
+                AppLog.i(if (wrote) "removed this service from $key" else "could not change $key")
+            } catch (e: SecurityException) {
+                AppLog.i("this service is still listed in $key")
             }
         }
     }

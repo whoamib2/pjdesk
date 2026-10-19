@@ -136,6 +136,7 @@ class HostService : Service() {
         engine.onKeyframe = { next.requestKeyframe() }
         encoder = next
         next.start(
+            onBeforeDisplay = { promoteToProjection() },
             onReady = {
                 main.post {
                     if (generation != mine) return@post

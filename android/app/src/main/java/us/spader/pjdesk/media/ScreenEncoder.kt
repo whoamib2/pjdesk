@@ -9,6 +9,7 @@ import android.media.projection.MediaProjection
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
@@ -30,6 +31,7 @@ class ScreenEncoder(
 ) {
     private val thread = HandlerThread("pjdesk-encode").also { it.start() }
     private val handler = Handler(thread.looper)
+    private val main = Handler(Looper.getMainLooper())
     private var codec: MediaCodec? = null
     private var display: VirtualDisplay? = null
     private var surface: Surface? = null
@@ -38,7 +40,13 @@ class ScreenEncoder(
     private var bitrate = 6_000_000
     @Volatile private var running = true
 
-    fun start(onReady: () -> Unit, onFailed: (String) -> Unit) {
+    /**
+     * The codec starts on the encoder thread. The virtual display is created
+     * back on the main thread, which is where the projection callback is
+     * registered. Creating it on the encoder thread makes Android 14+ stop
+     * the projection immediately.
+     */
+    fun start(onBeforeDisplay: () -> Boolean, onReady: () -> Unit, onFailed: (String) -> Unit) {
         handler.post {
             try {
                 val encoder = openEncoder()
@@ -46,26 +54,37 @@ class ScreenEncoder(
                 val input = encoder.createInputSurface()
                 surface = input
                 encoder.start()
-                display = projection.createVirtualDisplay(
-                    "pjdesk",
-                    width,
-                    height,
-                    dpi.coerceAtLeast(1),
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                    input,
-                    null,
-                    handler,
-                )
-                if (display == null) {
-                    onFailed("Screen capture did not start")
-                    return@post
+                main.post {
+                    try {
+                        if (!onBeforeDisplay()) {
+                            onFailed("Could not start the screen-capture service")
+                            return@post
+                        }
+                        display = projection.createVirtualDisplay(
+                            "pjdesk",
+                            width,
+                            height,
+                            dpi.coerceAtLeast(1),
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                            input,
+                            null,
+                            main,
+                        )
+                        if (display == null) {
+                            onFailed("Screen capture did not start")
+                            return@post
+                        }
+                        Log.i(TAG, "encoder started ${width}x$height")
+                        onReady()
+                        handler.post { drain() }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "virtual display failed", e)
+                        onFailed(e.message ?: "Screen capture failed")
+                    }
                 }
-                Log.i(TAG, "encoder started ${width}x$height")
-                onReady()
-                drain()
             } catch (e: Exception) {
                 Log.e(TAG, "encoder failed", e)
-                onFailed(e.message ?: "Screen capture failed")
+                main.post { onFailed(e.message ?: "Screen capture failed") }
             }
         }
     }

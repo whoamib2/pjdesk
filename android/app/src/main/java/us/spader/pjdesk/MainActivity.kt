@@ -198,13 +198,12 @@ class MainActivity : ComponentActivity() {
                                     onStop = { HostService.stop(this@MainActivity) },
                                     showPermanent = showPermanent,
                                     onShowPermanent = { showPermanent = it },
-                                    onSavePermanent = { password, confirm, unattended ->
+                                    onSavePermanent = { password, confirm ->
                                         val issue = permanentIssue(password, confirm)
                                         if (issue != null) {
                                             engine.showError(issue)
                                         } else {
                                             engine.setPermanent(password.trim())
-                                            engine.setApproval(if (unattended) "unattended" else "prompt")
                                             showPermanent = false
                                         }
                                     },
@@ -236,13 +235,12 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onServer = engine::setServer,
                                     onResetFingerprint = engine::resetFingerprint,
-                                    onSavePermanent = { password, confirm, unattended ->
+                                    onSavePermanent = { password, confirm ->
                                         val issue = permanentIssue(password, confirm)
                                         if (issue != null) {
                                             engine.showError(issue)
                                         } else {
                                             engine.setPermanent(password.trim())
-                                            engine.setApproval(if (unattended) "unattended" else "prompt")
                                         }
                                     },
                                     onClearPermanent = {
@@ -299,6 +297,7 @@ class MainActivity : ComponentActivity() {
         // Android 14 and later consume each consent on one virtual display.
         // Always ask again for a real session, including when setup already did.
         pendingAccept = acceptAfter
+        if (acceptAfter) app.engine.showStatus("Waiting for screen sharing")
         AppLog.i(if (acceptAfter) "asking to share the screen for an incoming connection" else "asking to share the screen during setup")
         val manager = getSystemService(MediaProjectionManager::class.java)
         projection.launch(manager.createScreenCaptureIntent())
