@@ -68,7 +68,6 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         anyhow::bail!(text);
     }
     crate::note_status("Opening the viewer window");
-    info!("Opening the viewer window");
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().context("could not create the viewer window")?;
     let proxy = event_loop.create_proxy();
     let slot = Arc::new(FrameSlot::default());
@@ -82,6 +81,7 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
     runtime.spawn(send_control(control_send, control_rx));
     let wake_proxy = proxy.clone();
     let (live, cmds, recorder) = super::controls::start(
+        runtime.handle().clone(),
         connection.clone(),
         control_recv,
         control_tx.clone(),

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.7
+
+The 0.6.6 viewer panicked on every session as soon as the window opened: `there is no reactor running`. The window thread is not inside the Tokio runtime, and the session tasks used `tokio::spawn` from that thread. They now use the runtime handle captured when the session starts. "Opening the viewer window" is logged once. Desktop and server are 0.6.7. Android stays 0.6.7. No new migration, no tag, no release, and no GitHub Actions.
+
 ## 0.6.6
 
 A password that CABINDESK accepted still did not open a session, and two computers on the same LAN never tried UDP 21201. Microsoft Defender was quarantining PJDesk as Trojan:Script/Wacatac.H!ml because Task Scheduler launched the updater. Desktop and server are 0.6.6. Android stays 0.6.7. There is no new cloud migration. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Install the server before the clients. No tag, no release, and no GitHub Actions.

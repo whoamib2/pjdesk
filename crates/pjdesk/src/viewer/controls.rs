@@ -20,8 +20,28 @@ use pjdesk_proto::peer::{
 use pjdesk_proto::perms::{self, has};
 use pjdesk_proto::quality;
 use quinn::Connection;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
+
+/// The viewer window runs on the winit thread, which is not inside the Tokio
+/// runtime. `tokio::spawn` from that thread panics ("there is no reactor
+/// running"). Tasks go through the handle captured when the session starts.
+static VIEWER_RT: std::sync::OnceLock<Handle> = std::sync::OnceLock::new();
+
+fn spawn_viewer<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = Handle::try_current() {
+        handle.spawn(fut);
+        return;
+    }
+    VIEWER_RT
+        .get()
+        .expect("viewer task started before the session runtime was set")
+        .spawn(fut);
+}
 
 use crate::audio::Player;
 use crate::clip;
@@ -163,6 +183,7 @@ struct PendingTunnel {
 
 /// Starts the host-message loop and the side-stream reader.
 pub fn start(
+    rt: Handle,
     connection: Connection,
     control_recv: quinn::RecvStream,
     control: mpsc::UnboundedSender<ControlMsg>,
@@ -171,6 +192,7 @@ pub fn start(
     host_id: String,
     wake: impl Fn() + Send + Sync + 'static,
 ) -> (Arc<Mutex<Live>>, mpsc::UnboundedSender<Cmd>, Arc<Mutex<RecorderSlot>>) {
+    let _ = VIEWER_RT.set(rt);
     let live = Arc::new(Mutex::new(Live::new(peer_proto >= 3)));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let recorder = Arc::new(Mutex::new(RecorderSlot::new()));
@@ -190,7 +212,7 @@ pub fn start(
     let conn = connection.clone();
     let live_uni = live.clone();
     let player_uni = player.clone();
-    tokio::spawn(async move {
+    spawn_viewer(async move {
         dispatch_uni(conn, frames, live_uni, player_uni).await;
     });
 
@@ -199,7 +221,7 @@ pub fn start(
     let conn_loop = connection.clone();
     let wake_loop = wake.clone();
     let recorder_loop = recorder.clone();
-        tokio::spawn(async move {
+    spawn_viewer(async move {
             run_loop(
                 conn_loop,
                 control_recv,
@@ -217,7 +239,7 @@ pub fn start(
     let live_clip = live.clone();
     let control_clip = control;
     let wake_clip = wake;
-    tokio::spawn(async move {
+    spawn_viewer(async move {
         clip_watch(live_clip, control_clip, wake_clip).await;
     });
 
@@ -364,7 +386,7 @@ fn on_host(
                 let live = std::sync::Arc::clone(live);
                 let wake = std::sync::Arc::clone(wake);
                 let control = control.clone();
-                tokio::spawn(async move {
+                spawn_viewer(async move {
                     if let Err(e) = send_bytes(conn, id, &path, resume, &live).await {
                         if let Some(t) = live.lock().unwrap().transfer_mut(id) {
                             t.state = format!("{e:#}");
@@ -562,7 +584,7 @@ async fn on_cmd(
                 let tunnels = tunnels.clone();
                 let live = live.clone();
                 let wake = wake.clone();
-                tokio::spawn(async move {
+                spawn_viewer(async move {
                     if let Err(e) = listen_tunnel(conn, control, tunnels, local, host, port).await {
                         live.lock().unwrap().note(format!("Port forward: {e:#}"));
                         wake();
@@ -714,7 +736,7 @@ async fn dispatch_uni(
         }
     };
     tracing::info!("Video stream received from the host");
-    tokio::spawn(async move {
+    spawn_viewer(async move {
         let mut video = video;
         loop {
             let mut data = Vec::new();
@@ -731,7 +753,7 @@ async fn dispatch_uni(
     while let Ok(mut stream) = connection.accept_uni().await {
         let live = live.clone();
         let player = player.clone();
-        tokio::spawn(async move {
+        spawn_viewer(async move {
             let _ = read_side(&mut stream, &live, &player).await;
         });
     }
@@ -816,7 +838,7 @@ async fn listen_tunnel(
         let _ = control.send(ControlMsg::Tunnel(TunnelMsg::Open { id, remote_host: host.clone(), remote_port: port }));
         let connection = connection.clone();
         let pending = tunnels.clone();
-        tokio::spawn(async move {
+        spawn_viewer(async move {
             let ready = matches!(tokio::time::timeout(Duration::from_secs(8), rx).await, Ok(Ok(Ok(()))));
             if !ready {
                 pending.lock().unwrap().waiters.remove(&id);
@@ -881,7 +903,7 @@ pub fn send_clipboard_image(control: &mpsc::UnboundedSender<ControlMsg>, connect
         }));
     } else {
         let conn = connection.clone();
-        tokio::spawn(async move {
+        spawn_viewer(async move {
             if let Ok(mut uni) = conn.open_uni().await {
                 let _ = write_side_header(&mut uni, CLIP_MAGIC, &SideHeader { id: 0, offset: 0, a: w as u32, b: h as u32 }).await;
                 let _ = write_side_chunk(&mut uni, &png).await;
@@ -889,5 +911,48 @@ pub fn send_clipboard_image(control: &mpsc::UnboundedSender<ControlMsg>, connect
                 let _ = uni.finish();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    /// The window thread calls `start` after `block_on` has returned, so there
+    /// is no current reactor. 0.6.6 panicked here.
+    #[test]
+    fn start_outside_the_runtime_does_not_panic() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (connection, recv) = rt.block_on(session_pair());
+        assert!(Handle::try_current().is_err(), "this thread must be outside the Tokio runtime");
+        let (control, _rx) = mpsc::unbounded_channel();
+        let (frames, _frames_rx) = std::sync::mpsc::channel();
+        let _ = start(rt.handle().clone(), connection.clone(), recv, control, frames, 3, "100000001".into(), || {});
+        connection.close(0u32.into(), b"test");
+        rt.shutdown_timeout(Duration::from_secs(3));
+    }
+
+    async fn session_pair() -> (Connection, quinn::RecvStream) {
+        let identity = pjdesk_proto::tls::TlsIdentity::generate("pjdesk-host").unwrap();
+        let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        host_sock.set_nonblocking(true).unwrap();
+        let addr = host_sock.local_addr().unwrap();
+        let host = crate::p2p::host_endpoint(host_sock, &identity).unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_sock.set_nonblocking(true).unwrap();
+        let client = crate::p2p::controller_endpoint(client_sock, identity.fingerprint()).unwrap();
+        let connecting = client.connect(addr, pjdesk_proto::PEER_SERVER_NAME).unwrap();
+        let incoming = host.accept().await.expect("host accept").await.expect("host handshake");
+        let connection = connecting.await.expect("client handshake");
+        let mut send = incoming.open_uni().await.expect("open uni");
+        send.write_all(&[0]).await.unwrap();
+        let recv = connection.accept_uni().await.expect("accept uni");
+        // The QUIC driver lives in the endpoints. Keep them for the rest of the test.
+        std::mem::forget(host);
+        std::mem::forget(client);
+        std::mem::forget(send);
+        (connection, recv)
     }
 }
