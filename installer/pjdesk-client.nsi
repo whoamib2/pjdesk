@@ -27,8 +27,8 @@ RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 
 !include "MUI2.nsh"
-!include "WordFunc.nsh"
-!insertmacro StrStr
+!include "StrFunc.nsh"
+${Using:StrFunc} StrStr
 
 !define MUI_ICON "pjdesk.ico"
 !define MUI_UNICON "pjdesk.ico"

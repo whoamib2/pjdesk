@@ -587,6 +587,15 @@ mod tests {
         let mut s = base();
         s.available = Some("0.3.9".into());
         assert_eq!(decide(&s), Plan::Skip { reason: "not newer" });
+        // The public feed still names 0.5.2. Neither an automatic nor a manual
+        // check on 0.6.0 may install it.
+        s.current = "0.6.0".into();
+        s.available = Some("0.5.2".into());
+        s.manual = true;
+        assert_eq!(decide(&s), Plan::Skip { reason: "not newer" });
+        s.manual = false;
+        assert_eq!(decide(&s), Plan::Skip { reason: "not newer" });
+        s.current = "0.4.0".into();
         s.available = Some("0.9.0-rc1".into());
         assert_eq!(decide(&s), Plan::Skip { reason: "pre-release" });
         s.available = Some("0.5.0".into());

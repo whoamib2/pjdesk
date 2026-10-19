@@ -424,6 +424,10 @@ mod tests {
         assert!(!is_newer("0.4.0", "0.4.0-rc1"));
         assert!(is_newer("0.4.0-rc1", "0.4.0"));
         assert!(!is_newer("0.4.1", "0.4.0"));
+        // pjdesk.com/api/release still serves 0.5.2. A 0.6.0 install must not take it.
+        assert!(!is_newer("0.6.0", "0.5.2"));
+        assert!(!is_newer("0.6.0", "v0.5.2"));
+        assert!(is_newer("0.5.2", "0.6.0"));
         assert!(version_at_least("0.4.1", "0.4.0"));
         assert!(version_at_least("0.4.0", "0.4.0"));
         assert!(!version_at_least("0.4.0-rc1", "0.4.0"));
