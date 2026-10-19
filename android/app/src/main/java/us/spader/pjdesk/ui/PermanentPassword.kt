@@ -32,7 +32,7 @@ import us.spader.pjdesk.core.permanentIssue
 @Composable
 fun PermanentPasswordForm(
     hasPermanent: Boolean,
-    onSave: (password: String, confirm: String) -> Unit,
+    onSave: (password: String, confirm: String) -> Boolean,
     onClear: () -> Unit,
 ) {
     var password by rememberSaveable { mutableStateOf("") }
@@ -51,9 +51,10 @@ fun PermanentPasswordForm(
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = {
-                    onSave(password, confirm)
-                    password = ""
-                    confirm = ""
+                    if (onSave(password, confirm)) {
+                        password = ""
+                        confirm = ""
+                    }
                 },
                 enabled = issue == null && password.isNotEmpty(),
             ) { Text("Save") }

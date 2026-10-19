@@ -38,6 +38,7 @@ data class DeskState(
     val hosting: Boolean = false,
     val session: SessionInfo? = null,
     val error: String? = null,
+    val notice: String? = null,
 )
 
 data class SavedComputer(

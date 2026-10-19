@@ -118,6 +118,11 @@ class MainActivity : ComponentActivity() {
                 snackbar.showSnackbar(text)
                 engine.dismissError()
             }
+            LaunchedEffect(state.notice) {
+                val text = state.notice ?: return@LaunchedEffect
+                snackbar.showSnackbar(text)
+                engine.dismissNotice()
+            }
             LaunchedEffect(state.hosting) {
                 HostService.controlled(this@MainActivity, state.hosting)
             }
@@ -202,9 +207,9 @@ class MainActivity : ComponentActivity() {
                                         val issue = permanentIssue(password, confirm)
                                         if (issue != null) {
                                             engine.showError(issue)
+                                            false
                                         } else {
                                             engine.setPermanent(password.trim())
-                                            showPermanent = false
                                         }
                                     },
                                     onClearPermanent = {
@@ -239,6 +244,7 @@ class MainActivity : ComponentActivity() {
                                         val issue = permanentIssue(password, confirm)
                                         if (issue != null) {
                                             engine.showError(issue)
+                                            false
                                         } else {
                                             engine.setPermanent(password.trim())
                                         }

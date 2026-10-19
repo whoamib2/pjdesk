@@ -20,8 +20,15 @@ class Engine(context: Context) : EngineListener {
     private val store = Store(app)
     private val main = Handler(Looper.getMainLooper())
     private val handle = AtomicLong(0)
+    /** One retry when a registration event disagrees with the Keystore, so a stale event cannot loop. */
+    private var permanentRepush = false
 
-    private val _state = MutableStateFlow(DeskState(approval = store.approval))
+    private val _state = MutableStateFlow(
+        DeskState(
+            approval = store.approval,
+            hasPermanent = store.permanent.isNotEmpty(),
+        ),
+    )
     val state: StateFlow<DeskState> = _state.asStateFlow()
 
     var onVideo: ((ByteArray, Int, Int, Boolean) -> Unit)? = null
@@ -38,9 +45,7 @@ class Engine(context: Context) : EngineListener {
             update { it.copy(status = "The PJDesk engine did not start.", error = "nativeCreate returned 0") }
             return
         }
-        if (store.permanent.isNotEmpty()) {
-            command(JSONObject().put("cmd", "setPermanent").put("password", store.permanent).toString())
-        }
+        pushPermanent()
         command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
     }
 
@@ -113,14 +118,54 @@ class Engine(context: Context) : EngineListener {
 
     fun keyframe() = command("""{"cmd":"keyframe"}""")
 
-    fun setPermanent(password: String) {
-        store.permanent = password
-        command(JSONObject().put("cmd", "setPermanent").put("password", password).toString())
+    /**
+     * Saves [password] in the Keystore and gives it to the running host.
+     * An empty password removes it. Returns false when it could not be stored.
+     * The password itself is never written to the log.
+     */
+    fun setPermanent(password: String): Boolean {
+        val trimmed = password.trim()
+        if (trimmed.isNotEmpty() && !permanentOk(trimmed)) {
+            update { it.copy(error = "Use at least 8 characters.") }
+            return false
+        }
+        if (!store.savePermanent(trimmed)) {
+            update { it.copy(error = "Couldn't save the permanent password on this phone.") }
+            return false
+        }
+        if (trimmed.isEmpty()) store.approval = "prompt"
+        update {
+            it.copy(
+                hasPermanent = trimmed.isNotEmpty(),
+                approval = store.approval,
+                notice = if (trimmed.isEmpty()) "Permanent password removed." else "Permanent password saved.",
+            )
+        }
+        pushPermanent()
+        if (trimmed.isEmpty()) command("""{"cmd":"setApproval","mode":"prompt"}""")
+        return true
     }
 
     fun setApproval(mode: String) {
-        store.approval = mode
-        command(JSONObject().put("cmd", "setApproval").put("mode", mode).toString())
+        val unattended = mode == "unattended"
+        if (unattended && store.permanent.isEmpty()) {
+            store.approval = "prompt"
+            update { it.copy(approval = "prompt", error = "Save a permanent password first.") }
+            command("""{"cmd":"setApproval","mode":"prompt"}""")
+            return
+        }
+        val stored = if (unattended) "unattended" else "prompt"
+        store.approval = stored
+        update { it.copy(approval = stored) }
+        command("""{"cmd":"setApproval","mode":"$stored"}""")
+    }
+
+    /** The permanent password the host is given. Empty when none is saved. */
+    internal fun permanentForHost(): String = store.permanent
+
+    private fun pushPermanent() {
+        // The command carries the secret to the host. Do not log this JSON.
+        command(JSONObject().put("cmd", "setPermanent").put("password", store.permanent).toString())
     }
 
     fun regenerate() = command("""{"cmd":"regenerate"}""")
@@ -130,6 +175,8 @@ class Engine(context: Context) : EngineListener {
         command(JSONObject().put("cmd", "capture").put("width", width).put("height", height).toString())
 
     fun dismissError() = update { it.copy(error = null) }
+
+    fun dismissNotice() = update { it.copy(notice = null) }
 
     fun shutdown() {
         val h = handle.getAndSet(0L)
@@ -162,18 +209,30 @@ class Engine(context: Context) : EngineListener {
         }
         when (kind) {
             "log" -> AppLog.i(event.optString("text"))
-            "registered" -> update {
-                val ready = it.status == "Connecting…" || it.status == "Online" || it.status.isBlank()
-                it.copy(
-                    id = event.optString("id"),
-                    idFormatted = event.optString("idFormatted"),
-                    password = event.optString("password"),
-                    hasPermanent = event.optBoolean("permanent"),
-                    fingerprint = event.optString("fingerprint"),
-                    server = event.optString("server", it.server),
-                    approval = event.optString("approval", it.approval),
-                    status = if (ready) "Ready" else it.status,
-                )
+            "registered" -> {
+                // The Keystore is the source of truth. A registration that
+                // races ahead of setPermanent must not clear a password that
+                // was just saved. If the host is behind, tell it once.
+                val saved = store.permanent.isNotEmpty()
+                if (event.optBoolean("permanent") == saved) {
+                    permanentRepush = false
+                } else if (!permanentRepush) {
+                    permanentRepush = true
+                    pushPermanent()
+                }
+                update {
+                    val ready = it.status == "Connecting…" || it.status == "Online" || it.status.isBlank()
+                    it.copy(
+                        id = event.optString("id"),
+                        idFormatted = event.optString("idFormatted"),
+                        password = event.optString("password"),
+                        hasPermanent = store.permanent.isNotEmpty(),
+                        fingerprint = event.optString("fingerprint"),
+                        server = event.optString("server", it.server),
+                        approval = store.approval,
+                        status = if (ready) "Ready" else it.status,
+                    )
+                }
             }
             "status" -> update {
                 val text = event.optString("text")

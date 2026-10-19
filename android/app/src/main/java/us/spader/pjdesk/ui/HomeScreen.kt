@@ -35,7 +35,7 @@ fun HomeScreen(
     onStop: () -> Unit,
     showPermanent: Boolean = false,
     onShowPermanent: (Boolean) -> Unit = {},
-    onSavePermanent: (String, String) -> Unit = { _, _ -> },
+    onSavePermanent: (String, String) -> Boolean = { _, _ -> false },
     onClearPermanent: () -> Unit = {},
     onUnattended: (Boolean) -> Unit = {},
 ) {

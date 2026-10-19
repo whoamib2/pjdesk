@@ -33,7 +33,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.2";
+pub const APP_VERSION: &str = "0.6.3";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -1150,11 +1150,111 @@ mod tests {
         assert!(matches!(special_from(4), Some(SpecialCommand::Home)));
     }
 
+    /// Save, drop the in-memory host (a process restart), hand the stored secret
+    /// back the way the Android Keystore does on the next launch, and check that
+    /// SPAKE2 accepts that password and rejects a different one.
+    #[test]
+    fn permanent_password_survives_restart_and_authenticates() {
+        let saved = "correct horse";
+        let dir = std::env::temp_dir().join(format!("pjdesk-permanent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let cb: Arc<dyn Callbacks> = Arc::new(Silent);
+            let state = test_state(&dir);
+            let otp = state.otp.lock().unwrap().clone();
+            apply(&state, &cb, json!({"cmd":"setPermanent","password": saved})).await;
+            assert_eq!(auth_passwords(&state)[1], saved);
+            assert!(host_accepts_typed(&auth_passwords(&state), saved));
+            assert!(host_accepts_typed(&auth_passwords(&state), &otp));
+            persist(&state);
+            let on_disk = std::fs::read_to_string(dir.join("pjdesk.json")).unwrap_or_default();
+            assert!(!on_disk.contains(saved), "permanent password was written to disk");
+            drop(state);
+
+            let restarted = test_state(&dir);
+            assert!(restarted.permanent.lock().unwrap().is_none());
+            apply(&restarted, &cb, json!({"cmd":"setPermanent","password": saved})).await;
+            let passwords = auth_passwords(&restarted);
+            assert_eq!(passwords.len(), 2);
+            assert_eq!(passwords[1], saved);
+            assert!(host_accepts_typed(&passwords, saved));
+            assert!(host_accepts_typed(&passwords, &passwords[0]));
+            assert!(!host_accepts_typed(&passwords, "wrong horse battery"));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn disk_round_trip_ignores_unknown_future_fields() {
         let raw = r#"{"server":"pjdesk.spader.us:21200","fingerprint":"abcd","device_id":"123456789","extra":1}"#;
         let disk: Disk = serde_json::from_str(raw).unwrap();
         assert_eq!(disk.device_id, "123456789");
         assert!(disk.secret_hex.is_empty());
+    }
+
+    struct Silent;
+    impl Callbacks for Silent {
+        fn on_event(&self, _json: &str) {}
+        fn on_video(&self, _data: &[u8], _width: u32, _height: u32, _keyframe: bool) {}
+    }
+
+    fn test_state(dir: &std::path::Path) -> Arc<State> {
+        let identity = TlsIdentity::load_or_create(&dir.join("host.crt"), &dir.join("host.key"), "pjdesk-host").unwrap();
+        Arc::new(State {
+            dir: dir.to_path_buf(),
+            hostname: "Pixel".into(),
+            secret: [7u8; 32],
+            identity,
+            device_id: Mutex::new(None),
+            server: Mutex::new(DEFAULT_SERVER.into()),
+            fingerprint: Mutex::new(None),
+            otp: Mutex::new(generate_password()),
+            permanent: Mutex::new(None),
+            approval: Mutex::new("prompt".into()),
+            policy: Mutex::new(pjdesk_proto::signal::Policy::default()),
+            capture: Mutex::new((1080, 2400)),
+            gen: AtomicU64::new(1),
+            approval_tx: Mutex::new(None),
+            end_reason: Mutex::new(String::new()),
+            control: Mutex::new(None),
+            video: Mutex::new(None),
+            app_stop: AtomicBool::new(false),
+        })
+    }
+
+    /// The host's SPAKE2 check: the typed password has to match one slot.
+    fn host_accepts_typed(host_passwords: &[String], typed: &str) -> bool {
+        use pjdesk_proto::auth::{controller_start, host_start};
+        let binding = b"restart-channel";
+        const SLOTS: usize = 2;
+        let (mut ctrl_ex, mut ctrl_msgs) = (Vec::new(), Vec::new());
+        for _ in 0..SLOTS {
+            let (ex, msg) = controller_start(typed);
+            ctrl_ex.push(ex);
+            ctrl_msgs.push(msg);
+        }
+        let n = host_passwords.len().min(ctrl_msgs.len());
+        let (mut host_keys, mut host_msgs, mut host_confirms) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            let (ex, msg) = host_start(&host_passwords[i]);
+            let key = ex.finish(&ctrl_msgs[i]).expect("host spake");
+            host_confirms.push(key.host_confirm(binding));
+            host_msgs.push(msg);
+            host_keys.push(key);
+        }
+        for (i, ex) in ctrl_ex.into_iter().enumerate() {
+            if i >= host_msgs.len() {
+                break;
+            }
+            if let Ok(key) = ex.finish(&host_msgs[i]) {
+                if key.verify_host(binding, &host_confirms[i]) {
+                    let confirm = key.controller_confirm(binding);
+                    return host_keys[i].verify_controller(binding, &confirm);
+                }
+            }
+        }
+        false
     }
 }

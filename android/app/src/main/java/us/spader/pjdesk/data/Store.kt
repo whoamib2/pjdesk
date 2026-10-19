@@ -7,13 +7,20 @@ import us.spader.pjdesk.core.SavedComputer
 import java.io.File
 
 /**
- * App-private preferences. Passwords stay in this directory, which is not
- * backed up (`allowBackup` is false) and is not a world-readable store.
+ * App-private preferences. The permanent password is encrypted with an
+ * Android Keystore key. SPAKE2 needs that secret on the host to finish the
+ * handshake, so a one-way verifier cannot replace it. The ciphertext is not
+ * backed up (`allowBackup` is false).
  */
 class Store(context: Context) {
     private val dir = context.filesDir
     private val prefs = context.getSharedPreferences("pjdesk", Context.MODE_PRIVATE)
+    private val secret = PermanentSecret(context.applicationContext)
     private val savedFile = File(dir, "saved.json")
+
+    init {
+        movePlainPermanentIntoKeystore()
+    }
 
     var onboarded: Boolean
         get() = prefs.getBoolean("onboarded", false)
@@ -28,13 +35,19 @@ class Store(context: Context) {
         get() = prefs.getString("theme", "system") ?: "system"
         set(value) { prefs.edit().putString("theme", value).apply() }
 
-    var permanent: String
-        get() = prefs.getString("permanent", "") ?: ""
-        set(value) { prefs.edit().putString("permanent", value).apply() }
+    /** Decrypted permanent password, or empty when none is saved. */
+    val permanent: String
+        get() = secret.read()
+
+    /**
+     * Writes the permanent password and waits until the ciphertext is on disk.
+     * An empty value removes it. Returns false when it could not be stored.
+     */
+    fun savePermanent(password: String): Boolean = secret.write(password)
 
     var approval: String
         get() = prefs.getString("approval", "prompt") ?: "prompt"
-        set(value) { prefs.edit().putString("approval", value).apply() }
+        set(value) { prefs.edit().putString("approval", value).commit() }
 
     fun saved(): List<SavedComputer> {
         if (!savedFile.exists()) return emptyList()
@@ -85,5 +98,17 @@ class Store(context: Context) {
             )
         }
         savedFile.writeText(array.toString())
+    }
+
+    /** Older builds kept this secret in the plain preference file. Move it once, then delete the plain copy. */
+    private fun movePlainPermanentIntoKeystore() {
+        if (!prefs.contains(PLAIN_PERMANENT)) return
+        val old = prefs.getString(PLAIN_PERMANENT, "").orEmpty()
+        val moved = old.isEmpty() || permanent.isNotEmpty() || savePermanent(old)
+        if (moved) prefs.edit().remove(PLAIN_PERMANENT).commit()
+    }
+
+    private companion object {
+        const val PLAIN_PERMANENT = "permanent"
     }
 }

@@ -32,7 +32,7 @@ fun SettingsScreen(
     onTheme: (String) -> Unit,
     onServer: (String) -> Unit,
     onResetFingerprint: () -> Unit,
-    onSavePermanent: (String, String) -> Unit = { _, _ -> },
+    onSavePermanent: (String, String) -> Boolean = { _, _ -> false },
     onClearPermanent: () -> Unit = {},
     onUnattended: (Boolean) -> Unit = {},
     onShareLogs: () -> Unit = {},
@@ -86,7 +86,7 @@ fun SettingsScreen(
             }
         }
         Section("About") {
-            Text("PJDesk 0.6.2", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.3", style = MaterialTheme.typography.titleMedium)
             Text(
                 "Android host and controller. Video is H.264 Annex-B from the hardware encoder, the same stream the Windows client decodes with OpenH264. The server default is pjdesk.spader.us:21200.",
                 color = pjMuted(),
