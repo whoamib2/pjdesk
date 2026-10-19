@@ -92,6 +92,36 @@ class ScreenshotTest {
     }
 
     @Test
+    fun networkKeyDark() = shot("netkey-dark", "dark") { networkKey() }
+
+    @Test
+    fun networkKeyLight() = shot("netkey-light", "light") { networkKey() }
+
+    @Composable
+    private fun networkKey() {
+        SignInScreen(
+            email = "",
+            password = "",
+            code = "",
+            useCode = false,
+            useKey = true,
+            blob = "pjdesk-net1:paste-the-key-here",
+            keyPass = "",
+            busy = false,
+            error = "",
+            onEmail = {},
+            onPassword = {},
+            onCode = {},
+            onBlob = {},
+            onKeyPass = {},
+            onUseCode = {},
+            onUseKey = {},
+            onScan = {},
+            onSubmit = {},
+        )
+    }
+
+    @Test
     fun signInDark() = shot("signin-dark", "dark") { signIn() }
 
     @Test

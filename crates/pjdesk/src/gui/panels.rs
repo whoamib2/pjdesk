@@ -194,16 +194,47 @@ impl App {
             ui.add_space(24.0);
             ui.label(RichText::new("Sign in").size(26.0).strong().color(p.text));
             ui.add_space(4.0);
-            ui.label(widgets::muted(
-                ui,
-                "Use your PJDesk account. The client gets your private server from the account. Nothing is typed by hand.",
-            ));
+            let intro = match self.net_mode {
+                2 => "Paste a network key from My network or the PJDesk Server window. This computer enrolls and stays signed in after a restart.",
+                1 => "An enrollment code is for one device and expires in an hour.",
+                _ => "Use your PJDesk account. The client gets your private server from the account. Nothing is typed by hand.",
+            };
+            ui.label(widgets::muted(ui, intro));
             ui.add_space(16.0);
         });
         ui.vertical_centered(|ui| {
             ui.set_max_width(440.0);
             theme::card(ui, |ui| {
-                if !self.net_use_code {
+                if self.net_mode == 2 {
+                    widgets::field_label(ui, "Network key");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.net_blob)
+                            .hint_text("pjdesk-net1:…")
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    let embedded = pjdesk_proto::netkey::is_embedded(&self.net_blob);
+                    if !embedded {
+                        ui.add_space(8.0);
+                        widgets::field_label(ui, "Passphrase");
+                        widgets::password_field(ui, &mut self.net_key_pass, "Passphrase", &mut self.net_key_show);
+                        ui.label(widgets::muted(ui, "Only if the key was created with a passphrase. Leave this empty for a self-contained key."));
+                    }
+                    if embedded {
+                        ui.add_space(6.0);
+                        ui.colored_label(p.warn, "Anyone who has this network key can join.");
+                    }
+                    if self.net_key_account || self.net_error.contains("specific account") {
+                        self.net_key_account = true;
+                        ui.add_space(8.0);
+                        widgets::field_label(ui, "Account email");
+                        widgets::text_field(ui, &mut self.net_email, "you@example.com", false);
+                        ui.add_space(8.0);
+                        widgets::field_label(ui, "Account password");
+                        widgets::password_field(ui, &mut self.net_pass, "Password", &mut self.net_show);
+                    }
+                } else if self.net_mode == 0 {
                     widgets::field_label(ui, "Email");
                     widgets::text_field(ui, &mut self.net_email, "you@example.com", false);
                     ui.add_space(8.0);
@@ -219,15 +250,28 @@ impl App {
                     ui.colored_label(p.warn, &self.net_error);
                     ui.add_space(6.0);
                 }
-                let label = if self.net_busy { "Signing in…" } else { "Sign in" };
+                let label = if self.net_busy {
+                    "Signing in…"
+                } else if self.net_mode == 2 {
+                    "Use network key"
+                } else {
+                    "Sign in"
+                };
                 if widgets::accent_button(ui, label, egui::vec2(ui.available_width(), 40.0)) && !self.net_busy {
                     go = true;
                 }
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let toggle = if self.net_use_code { "Use email and password" } else { "I have an enrollment code" };
-                    if ui.button(toggle).clicked() && !self.net_busy {
-                        self.net_use_code = !self.net_use_code;
+                ui.horizontal_wrapped(|ui| {
+                    if self.net_mode != 0 && ui.button("Use email and password").clicked() && !self.net_busy {
+                        self.net_mode = 0;
+                        self.net_error.clear();
+                    }
+                    if self.net_mode != 1 && ui.button("I have an enrollment code").clicked() && !self.net_busy {
+                        self.net_mode = 1;
+                        self.net_error.clear();
+                    }
+                    if self.net_mode != 2 && ui.button("Use a network key").clicked() && !self.net_busy {
+                        self.net_mode = 2;
                         self.net_error.clear();
                     }
                     if self.show_net_sign_in && !self.cfg.effective_server().is_empty() && ui.button("Cancel").clicked() {

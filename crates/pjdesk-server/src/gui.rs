@@ -102,6 +102,23 @@ struct App {
     preview_devices: bool,
     /// Headless shot of the signed-in-accounts card.
     preview_network: bool,
+    /// Headless shot of the network-key dialog.
+    preview_netkey: bool,
+    nk_open: bool,
+    nk_passphrase_mode: bool,
+    nk_pass: String,
+    nk_show: bool,
+    nk_days: String,
+    nk_max: String,
+    nk_bound: String,
+    nk_blob: String,
+    nk_embedded: bool,
+    nk_error: String,
+    nk_busy: bool,
+    nk_rx: Option<std::sync::mpsc::Receiver<Result<crate::cloud::CreatedKey, String>>>,
+    nk_invites: Vec<crate::cloud::NetworkInvite>,
+    nk_loaded: bool,
+    nk_list_rx: Option<std::sync::mpsc::Receiver<Result<Vec<crate::cloud::NetworkInvite>, String>>>,
     /// Latest client release from pjdesk.com, fetched off this thread.
     latest_release: Option<String>,
     release_at: Option<Instant>,
@@ -198,6 +215,22 @@ impl App {
             preview_locked: false,
             preview_devices: false,
             preview_network: false,
+            preview_netkey: false,
+            nk_open: false,
+            nk_passphrase_mode: true,
+            nk_pass: String::new(),
+            nk_show: false,
+            nk_days: String::new(),
+            nk_max: String::new(),
+            nk_bound: String::new(),
+            nk_blob: String::new(),
+            nk_embedded: false,
+            nk_error: String::new(),
+            nk_busy: false,
+            nk_rx: None,
+            nk_invites: Vec::new(),
+            nk_loaded: false,
+            nk_list_rx: None,
             latest_release: None,
             release_at: None,
             release_rx: None,
@@ -287,6 +320,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(if self.waiting_for_service() { Duration::from_millis(50) } else { Duration::from_secs(1) });
         self.poll_cloud_job();
+        self.poll_netkey();
         self.poll_release();
 
         // System tray: Show/Quit, and hide-to-tray when the window is closed.
@@ -405,7 +439,7 @@ impl eframe::App for App {
                     self.devices_card(ui);
                     return;
                 }
-                if self.preview_network {
+                if self.preview_network || self.preview_netkey {
                     ui.label(RichText::new(format!("This server  v{}", env!("CARGO_PKG_VERSION"))).strong().size(18.0));
                     ui.add_space(8.0);
                     self.network_card(ui);
@@ -437,6 +471,7 @@ impl eframe::App for App {
                 }
             });
         });
+        self.netkey_dialog(ui);
     }
 }
 
@@ -1430,6 +1465,52 @@ impl App {
             } else {
                 ui.label(RichText::new("Cloud signing key is pinned.").color(p(ui).muted).size(12.0));
             }
+            ui.add_space(10.0);
+            ui.label(RichText::new("Network keys").strong());
+            ui.label(RichText::new("A copy-paste key joins this network. It is shown once and is not saved here.").color(p(ui).muted));
+            if self.can_write && ui.button("Create a network key").clicked() {
+                self.nk_open = true;
+                self.nk_blob.clear();
+                self.nk_pass.clear();
+            }
+            if !self.can_write {
+                ui.label(RichText::new("Restart as administrator to create or revoke a network key.").color(p(ui).muted).size(12.0));
+            }
+            self.ensure_invites();
+            if self.nk_invites.is_empty() {
+                ui.label(RichText::new("No network keys yet.").color(p(ui).muted));
+            }
+            let mut revoke: Option<String> = None;
+            for inv in &self.nk_invites {
+                let state = if inv.revoked_at.is_some() {
+                    "revoked"
+                } else if inv.mode == "embedded" {
+                    "self-contained"
+                } else {
+                    "passphrase"
+                };
+                let limit = match inv.max_uses {
+                    Some(max) => format!("{} of {max} uses", inv.uses),
+                    None => "no use limit".into(),
+                };
+                let exp = match inv.expires_at {
+                    Some(t) => format!(" · expires {}", crate::registry::format_local(t)),
+                    None => String::new(),
+                };
+                let bound = if inv.bound_email.is_empty() { String::new() } else { format!(" · only {}", inv.bound_email) };
+                ui.label(format!("{state} · {limit}{exp}{bound}"));
+                for use_row in &inv.history {
+                    let who = if use_row.device_name.is_empty() { "A device" } else { use_row.device_name.as_str() };
+                    let when = if use_row.used_at == 0 { String::new() } else { format!(" · {}", crate::registry::format_local(use_row.used_at)) };
+                    ui.label(RichText::new(format!("  {who} · {}{when}", use_row.email)).color(p(ui).muted).size(12.0));
+                }
+                if inv.revoked_at.is_none() && self.can_write && ui.small_button("Revoke").clicked() {
+                    revoke = Some(inv.id.clone());
+                }
+            }
+            if let Some(id) = revoke {
+                self.spawn_revoke_key(id);
+            }
         });
         if changed {
             policy.require_accounts = require;
@@ -1439,6 +1520,214 @@ impl App {
                 let dir = self.data_dir.clone();
                 std::thread::spawn(move || crate::cloud::push_require_accounts(&dir, require));
             }
+        }
+    }
+
+    fn ensure_invites(&mut self) {
+        if self.nk_loaded || self.nk_list_rx.is_some() || self.preview_network || self.preview_netkey || !self.can_write {
+            return;
+        }
+        self.nk_loaded = true;
+        let dir = self.data_dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::cloud::list_network_keys(&dir).map_err(|e| e.to_string()));
+        });
+        self.nk_list_rx = Some(rx);
+    }
+
+    fn spawn_revoke_key(&mut self, id: String) {
+        let dir = self.data_dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.nk_busy = true;
+        std::thread::spawn(move || {
+            let result = crate::cloud::revoke_network_key(&dir, &id).map(|()| crate::cloud::CreatedKey { blob: String::new(), embedded: false }).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.nk_rx = Some(rx);
+        self.nk_loaded = false;
+    }
+
+    fn spawn_create_key(&mut self) {
+        if self.nk_busy {
+            return;
+        }
+        let passphrase_mode = self.nk_passphrase_mode;
+        let pass = std::mem::take(&mut self.nk_pass);
+        if passphrase_mode && pass.chars().count() < 8 {
+            self.nk_pass = pass;
+            self.nk_error = "Use a passphrase of at least 8 characters.".into();
+            return;
+        }
+        let days = match self.nk_days.trim() {
+            "" => None,
+            text => match text.parse::<u64>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => {
+                    self.nk_pass = pass;
+                    self.nk_error = "Expiry has to be a number of days, or empty.".into();
+                    return;
+                }
+            },
+        };
+        let max_uses = match self.nk_max.trim() {
+            "" => None,
+            text => match text.parse::<u32>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => {
+                    self.nk_pass = pass;
+                    self.nk_error = "Maximum uses has to be at least 1, or leave it empty.".into();
+                    return;
+                }
+            },
+        };
+        let bound = self.nk_bound.clone();
+        let dir = self.data_dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.nk_busy = true;
+        self.nk_error.clear();
+        std::thread::spawn(move || {
+            let pass = pass;
+            let result = crate::cloud::create_network_key(
+                &dir,
+                if passphrase_mode { Some(pass.as_str()) } else { None },
+                days,
+                max_uses,
+                &bound,
+            )
+            .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.nk_rx = Some(rx);
+    }
+
+    fn poll_netkey(&mut self) {
+        if let Some(rx) = &self.nk_list_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.nk_list_rx = None;
+                match result {
+                    Ok(list) => self.nk_invites = list,
+                    Err(e) => self.nk_error = e,
+                }
+            }
+        }
+        let Some(rx) = &self.nk_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.nk_rx = None;
+        self.nk_busy = false;
+        match result {
+            Ok(created) if created.blob.is_empty() => {
+                self.nk_loaded = false;
+                self.nk_invites.clear();
+            }
+            Ok(created) => {
+                self.nk_embedded = created.embedded;
+                self.nk_blob = created.blob;
+                self.nk_open = true;
+                self.nk_loaded = false;
+                self.nk_invites.clear();
+            }
+            Err(e) => self.nk_error = e,
+        }
+    }
+
+    fn netkey_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.nk_open {
+            return;
+        }
+        let mut open = self.nk_open;
+        let mut create = false;
+        let mut close = false;
+        let showing = !self.nk_blob.is_empty();
+        egui::Window::new("Network key")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(420.0);
+                if showing {
+                    if self.nk_embedded {
+                        ui.colored_label(p(ui).warn, "Anyone who has this network key can join. Share it like a password.");
+                    } else {
+                        ui.label("The passphrase is not part of this key. Share it separately.");
+                    }
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Copy this now. It is shown once and is not saved here.").color(p(ui).muted));
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.nk_blob)
+                            .desired_rows(5)
+                            .desired_width(400.0)
+                            .font(egui::TextStyle::Monospace)
+                            .interactive(false),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy").clicked() {
+                            copy(&self.nk_blob);
+                        }
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                } else {
+                    ui.label("This key contains the server address and a way to enroll. It is encrypted.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.nk_passphrase_mode, true, "Passphrase");
+                        ui.selectable_value(&mut self.nk_passphrase_mode, false, "Self-contained");
+                    });
+                    if self.nk_passphrase_mode {
+                        ui.add_space(6.0);
+                        ui.label("Passphrase");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.nk_pass)
+                                    .password(!self.nk_show)
+                                    .hint_text("At least 8 characters")
+                                    .desired_width(280.0),
+                            );
+                            let label = if self.nk_show { "Hide" } else { "Show" };
+                            if ui.button(label).clicked() {
+                                self.nk_show = !self.nk_show;
+                            }
+                        });
+                    } else {
+                        ui.add_space(6.0);
+                        ui.colored_label(p(ui).warn, "Anyone who has this network key can join. Share it like a password.");
+                    }
+                    ui.add_space(6.0);
+                    ui.label("Expires in days (optional)");
+                    ui.add(egui::TextEdit::singleline(&mut self.nk_days).hint_text("Leave empty for no expiry").desired_width(200.0));
+                    ui.label("Maximum uses (optional)");
+                    ui.add(egui::TextEdit::singleline(&mut self.nk_max).hint_text("Leave empty for no limit").desired_width(200.0));
+                    ui.label("Limit to this account (optional)");
+                    ui.add(egui::TextEdit::singleline(&mut self.nk_bound).hint_text("ada@example.com").desired_width(280.0));
+                    if !self.nk_error.is_empty() {
+                        ui.colored_label(p(ui).warn, &self.nk_error);
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                        let label = if self.nk_busy { "Creating…" } else { "Create network key" };
+                        if ui.add_enabled(!self.nk_busy, egui::Button::new(label)).clicked() {
+                            create = true;
+                        }
+                    });
+                }
+            });
+        if create {
+            self.spawn_create_key();
+        }
+        if !open || close {
+            self.nk_open = false;
+            self.nk_blob.clear();
+            self.nk_pass.clear();
+            self.nk_error.clear();
+        } else {
+            self.nk_open = open;
         }
     }
 

@@ -143,6 +143,18 @@ th { color: var(--muted); font-size: 12px; font-weight: 600; }
   justify-content: center;
   padding: 24px;
 }
+.dialog.wide { width: min(520px, 100%); }
+.dialog textarea, #invite-pass {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: ui-monospace, "Cascadia Mono", monospace;
+  font-size: 12px;
+}
+#invite-qr { background: white; border-radius: 8px; padding: 8px; align-self: flex-start; }
+.key-row { display: flex; flex-direction: column; gap: 4px; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .dialog {
   width: min(440px, 100%);
   background: var(--panel);

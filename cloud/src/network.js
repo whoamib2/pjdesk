@@ -62,6 +62,21 @@ export function canonical({ email, networkId, fingerprints, deviceId, exp }) {
 }
 
 /** Mirrors the server's admit() for the pure cases the Worker can see. */
+/** Why a network key cannot be redeemed. Null means it can. Matches pjdesk-proto. */
+export function inviteError({ revoked, expiresAt, uses, maxUses, now, boundEmail, callerEmail }) {
+  if (revoked) return "This network key was revoked.";
+  if (expiresAt != null && now >= expiresAt) return "This network key has expired.";
+  if (maxUses != null && uses >= maxUses) {
+    return "This network key has already been used the maximum number of times.";
+  }
+  const bound = String(boundEmail || "").trim().toLowerCase();
+  if (bound) {
+    const caller = String(callerEmail || "").trim().toLowerCase();
+    if (!caller || caller !== bound) return "This network key is for a specific account. Sign in as that account.";
+  }
+  return null;
+}
+
 export function decide({ requireAccounts, verified, expired, wrongServer, revoked, allowed, email }) {
   if (!verified || expired || wrongServer) {
     return requireAccounts ? "deny" : "open";
@@ -253,6 +268,7 @@ async function handle(request, env, url) {
 
   if (p === "/api/network/enroll" && m === "POST") return enroll(request, env);
   if (p === "/api/network/refresh" && m === "POST") return refresh(request, env);
+  if (p === "/api/network/redeem" && m === "POST") return redeem(request, env);
 
   const account = await session(request, env);
 
@@ -265,6 +281,8 @@ async function handle(request, env, url) {
   if (p === "/api/network/computers" && m === "GET") return listComputers(env, account);
   if (p === "/api/network/computers" && m === "PUT") return putComputers(request, env, account);
   if (p === "/api/network/enroll-code" && m === "POST") return enrollCode(env, account);
+  if (p === "/api/network/invites" && m === "POST") return createInvite(request, env, account);
+  if (p === "/api/network/invites/revoke" && m === "POST") return revokeInvite(request, env, account);
   if (p === "/api/network/policy" && m === "GET") return policy(env, account);
   return null;
 }
@@ -287,6 +305,7 @@ async function getNetwork(env, account) {
       .all();
     body.members = members.results || [];
     body.devices = devices.results || [];
+    body.invites = await invitesFor(env, network.id);
     body.note = "Computers that have not signed in are listed in the PJDesk Server window until you turn on Require signed-in accounts.";
   }
   return json(body);
@@ -389,7 +408,17 @@ async function refresh(request, env) {
   )
     .bind(deviceId, hash)
     .first();
-  if (!row || row.revoked_at) throw new HttpError(401, "Sign in required.");
+  if (!row) throw new HttpError(401, "Sign in required.");
+  if (row.revoked_at) {
+    const viaKey = await env.DB.prepare(
+      `SELECT 1 AS hit FROM network_invite_uses u
+         JOIN network_invites i ON i.id = u.invite_id
+        WHERE u.device_id = ? AND i.network_id = ? AND i.revoked_at IS NOT NULL LIMIT 1`,
+    )
+      .bind(deviceId, row.network_id)
+      .first();
+    throw new HttpError(401, viaKey ? "This network key was revoked." : "Sign in required.");
+  }
   if (now() - row.enrolled_at > REFRESH_TTL) throw new HttpError(401, "Sign in required.");
   const member = await env.DB.prepare(
     "SELECT revoked_at FROM network_members WHERE network_id = ? AND email = ?",
@@ -486,4 +515,172 @@ async function policy(env, account) {
     revoked_devices: (revoked.results || []).map((r) => r.device_id),
     fingerprints: fingerprintsOf(network),
   });
+}
+
+async function invitesFor(env, networkId) {
+  const { results } = await env.DB.prepare(
+    `SELECT id, mode, bound_email, max_uses, uses, expires_at, created_at, revoked_at
+       FROM network_invites WHERE network_id = ? ORDER BY created_at DESC`,
+  )
+    .bind(networkId)
+    .all();
+  const uses = await env.DB.prepare(
+    `SELECT u.invite_id, u.device_id, u.device_name, u.email, u.used_at
+       FROM network_invite_uses u JOIN network_invites i ON i.id = u.invite_id
+      WHERE i.network_id = ? ORDER BY u.used_at DESC`,
+  )
+    .bind(networkId)
+    .all();
+  const by = {};
+  for (const row of uses.results || []) {
+    (by[row.invite_id] ||= []).push({
+      device_id: row.device_id,
+      device_name: row.device_name,
+      email: row.email,
+      used_at: row.used_at,
+    });
+  }
+  return (results || []).map((row) => ({
+    id: row.id,
+    mode: row.mode,
+    bound_email: row.bound_email || "",
+    max_uses: row.max_uses,
+    uses: row.uses || 0,
+    expires_at: row.expires_at,
+    created_at: row.created_at,
+    revoked_at: row.revoked_at,
+    history: by[row.id] || [],
+  }));
+}
+
+async function createInvite(request, env, account) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "Set your network before creating a network key.");
+  if (!row.active_address) throw new HttpError(400, "Set the server address in My network first.");
+  const body = await readJson(request);
+  const secretHash = String(body.secret_hash || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(secretHash)) throw new HttpError(400, "This network key is not valid.");
+  const mode = body.mode === "embedded" ? "embedded" : body.mode === "passphrase" ? "passphrase" : "";
+  if (!mode) throw new HttpError(400, "Choose how this network key is protected.");
+  const bound = normEmail(body.bound_email || "");
+  if (bound && !validEmail(bound)) throw new HttpError(400, "Enter a valid email address.");
+  if (bound && bound !== account.email) {
+    const member = await env.DB.prepare(
+      "SELECT revoked_at FROM network_members WHERE network_id = ? AND email = ?",
+    )
+      .bind(row.id, bound)
+      .first();
+    if (!member || member.revoked_at) throw new HttpError(400, "That account is not allowed on this network.");
+  }
+  let maxUses = null;
+  if (body.max_uses != null && body.max_uses !== "") {
+    maxUses = Number(body.max_uses);
+    if (!Number.isInteger(maxUses) || maxUses < 1 || maxUses > 10000) {
+      throw new HttpError(400, "Maximum uses has to be at least 1, or leave it empty.");
+    }
+  }
+  let expiresAt = null;
+  if (body.expires_at != null && body.expires_at !== "") {
+    expiresAt = Number(body.expires_at);
+    if (!Number.isInteger(expiresAt) || expiresAt <= now()) throw new HttpError(400, "That expiry is already past.");
+  }
+  const id = `ink_${randomHex(8)}`;
+  await env.DB.prepare(
+    `INSERT INTO network_invites (id, network_id, secret_hash, mode, bound_email, max_uses, uses, expires_at, created_at, revoked_at)
+     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, NULL)`,
+  )
+    .bind(id, row.id, secretHash, mode, bound, maxUses, expiresAt, now())
+    .run();
+  return json({ id });
+}
+
+async function revokeInvite(request, env, account) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "No network.");
+  const { id } = await readJson(request);
+  if (typeof id !== "string" || !id.startsWith("ink_")) throw new HttpError(400, "Unknown network key.");
+  const t = now();
+  await env.DB.prepare("UPDATE network_invites SET revoked_at = ? WHERE id = ? AND network_id = ? AND revoked_at IS NULL")
+    .bind(t, id, row.id)
+    .run();
+  await env.DB.prepare(
+    `UPDATE network_devices SET revoked_at = ?, refresh_hash = ''
+      WHERE network_id = ? AND revoked_at IS NULL
+        AND device_id IN (SELECT device_id FROM network_invite_uses WHERE invite_id = ?)`,
+  )
+    .bind(t, row.id, id)
+    .run();
+  return getNetwork(env, account);
+}
+
+async function redeem(request, env) {
+  const body = await readJson(request);
+  const secret = String(body.secret || "").trim().toLowerCase();
+  const deviceId = String(body.device_id || "");
+  if (!/^[0-9a-f]{64}$/.test(secret)) throw new HttpError(400, "This network key is not valid.");
+  const hash = await sha256Hex(secret);
+  const row = await env.DB.prepare(
+    `SELECT i.*, n.owner_id, n.active_address, n.active_fingerprint, n.standby_address, n.standby_fingerprint, n.require_accounts, n.name, n.id AS nid
+       FROM network_invites i JOIN networks n ON n.id = i.network_id
+      WHERE i.secret_hash = ?`,
+  )
+    .bind(hash)
+    .first();
+  if (!row) throw new HttpError(400, "This network key is not valid.");
+  let caller = null;
+  const header = request.headers.get("authorization") || "";
+  if (header) {
+    try {
+      caller = await session(request, env);
+    } catch {
+      caller = null;
+    }
+  }
+  const reason = inviteError({
+    revoked: !!row.revoked_at,
+    expiresAt: row.expires_at,
+    uses: row.uses || 0,
+    maxUses: row.max_uses,
+    now: now(),
+    boundEmail: row.bound_email,
+    callerEmail: caller?.email || "",
+  });
+  if (reason) throw new HttpError(400, reason);
+  if (row.bound_email) {
+    const member = await env.DB.prepare(
+      "SELECT revoked_at FROM network_members WHERE network_id = ? AND email = ?",
+    )
+      .bind(row.network_id, row.bound_email)
+      .first();
+    const owner = await env.DB.prepare("SELECT email FROM accounts WHERE id = ?").bind(row.owner_id).first();
+    if (owner?.email !== row.bound_email && (!member || member.revoked_at)) {
+      throw new HttpError(400, "This network key was revoked.");
+    }
+  }
+  const claimed = await env.DB.prepare(
+    `UPDATE network_invites SET uses = uses + 1
+      WHERE id = ? AND revoked_at IS NULL AND (max_uses IS NULL OR uses < max_uses)`,
+  )
+    .bind(row.id)
+    .run();
+  if (!claimed.meta || !claimed.meta.changes) {
+    throw new HttpError(400, "This network key has already been used the maximum number of times.");
+  }
+  const owner = await env.DB.prepare("SELECT id, email FROM accounts WHERE id = ?").bind(row.owner_id).first();
+  if (!owner) throw new HttpError(400, "This network key is not valid.");
+  const enrollAccount = row.bound_email && caller ? caller : { accountId: owner.id, email: owner.email };
+  const network = {
+    id: row.network_id,
+    active_address: row.active_address,
+    active_fingerprint: row.active_fingerprint,
+    standby_address: row.standby_address,
+    standby_fingerprint: row.standby_fingerprint,
+  };
+  const issued = await issue(env, enrollAccount, network, deviceId, body.device_name || "Network key", null);
+  await env.DB.prepare(
+    "INSERT INTO network_invite_uses (invite_id, device_id, device_name, email, used_at) VALUES (?, ?, ?, ?, ?)",
+  )
+    .bind(row.id, deviceId, String(body.device_name || "").slice(0, 80), enrollAccount.email, now())
+    .run();
+  return json(issued);
 }

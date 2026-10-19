@@ -67,6 +67,34 @@ object CloudAuth {
         return session("", deviceId, reply)
     }
 
+    /** Enrolls from a network key. A bound key also needs that account's email and password. */
+    fun redeem(blob: String, passphrase: String, deviceId: String, deviceName: String, email: String = "", password: String = ""): Session {
+        val opened = NetKey.open(blob, passphrase)
+        val bearer = if (email.isNotBlank() && password.isNotBlank()) loginToken(email, password) else null
+        val reply = post(
+            "$API/api/network/redeem",
+            bearer,
+            JSONObject().put("secret", opened.secretHex).put("device_id", deviceId).put("device_name", deviceName),
+        )
+        val session = session("", deviceId, reply)
+        return session.copy(
+            address = session.address.ifBlank { opened.active },
+            fingerprint = session.fingerprint.ifBlank { opened.activeFingerprint },
+            standbyAddress = session.standbyAddress.ifBlank { opened.standby },
+            standbyFingerprint = session.standbyFingerprint.ifBlank { opened.standbyFingerprint },
+        )
+    }
+
+    private fun loginToken(email: String, password: String): String {
+        val auth = authKeyHex(email, password)
+        val login = post(
+            "$API/api/login",
+            null,
+            JSONObject().put("email", email.trim().lowercase()).put("auth_key", auth).put("device", "PJDesk"),
+        )
+        return login.getString("token")
+    }
+
     fun enroll(code: String, deviceId: String, deviceName: String): Session {
         val reply = post(
             "$API/api/network/enroll",

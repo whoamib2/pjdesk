@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonical, decide, normalizeFingerprint } from "../src/network.js";
+import { canonical, decide, inviteError, normalizeFingerprint } from "../src/network.js";
 
 test("canonical matches the shared fixture", () => {
   const text = canonical({
@@ -42,6 +42,22 @@ test("decide matches grace, expiry, the wrong server, and revoke", () => {
     }),
     "signed",
   );
+});
+
+test("a network key is refused when it is expired, revoked, or used up", () => {
+  assert.equal(inviteError({ revoked: true, uses: 0, now: 10 }), "This network key was revoked.");
+  assert.equal(inviteError({ expiresAt: 10, uses: 0, now: 10 }), "This network key has expired.");
+  assert.equal(inviteError({ expiresAt: 11, uses: 0, now: 10 }), null);
+  assert.equal(
+    inviteError({ uses: 2, maxUses: 2, now: 10 }),
+    "This network key has already been used the maximum number of times.",
+  );
+  assert.equal(inviteError({ uses: 1, maxUses: 2, now: 10 }), null);
+  assert.equal(
+    inviteError({ uses: 0, now: 10, boundEmail: "Ben@Spader.us" }),
+    "This network key is for a specific account. Sign in as that account.",
+  );
+  assert.equal(inviteError({ uses: 0, now: 10, boundEmail: "ben@spader.us", callerEmail: "ben@spader.us" }), null);
 });
 
 test("a saved computer has no password field in the canonical record", () => {

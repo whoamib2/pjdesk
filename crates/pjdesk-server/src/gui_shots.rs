@@ -58,6 +58,54 @@ fn server_shots() {
         image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
         eprintln!("wrote {}", path.display());
     }
+    for (name, theme) in [("server-netkey-dark", egui::Theme::Dark), ("server-netkey-light", egui::Theme::Light)] {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(960.0, 720.0))
+            .with_pixels_per_point(1.0)
+            .with_theme(theme)
+            .wgpu()
+            .build_eframe(move |cc| {
+                let mut app = preview(cc, false, false);
+                app.preview_netkey = true;
+                let theme_name = match theme {
+                    egui::Theme::Light => "light",
+                    egui::Theme::Dark => "dark",
+                };
+                crate::ui_theme::apply(&cc.egui_ctx, theme_name);
+                let secret = [0x11u8; 32];
+                let contents = pjdesk_proto::netkey::Contents {
+                    network_id: "net_office",
+                    active: "office.example:21200",
+                    active_fingerprint: "abcd",
+                    standby: "cabin.example:21200",
+                    standby_fingerprint: "00112233",
+                };
+                app.nk_blob = pjdesk_proto::netkey::seal_embedded(&contents, &secret).unwrap_or_default();
+                app.nk_embedded = true;
+                app.nk_open = true;
+                app.nk_loaded = true;
+                app.nk_invites = vec![crate::cloud::NetworkInvite {
+                    id: "ink_office".into(),
+                    mode: "passphrase".into(),
+                    bound_email: String::new(),
+                    max_uses: Some(5),
+                    uses: 1,
+                    expires_at: None,
+                    revoked_at: None,
+                    history: vec![crate::cloud::InviteUse {
+                        device_name: "Laptop".into(),
+                        email: "ben@spader.us".into(),
+                        used_at: 1_728_100_000,
+                    }],
+                }];
+                app
+            });
+        harness.step();
+        let image = harness.render().unwrap_or_else(|e| panic!("render {name}: {e}"));
+        let path = dir.join(format!("{name}.png"));
+        image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
+        eprintln!("wrote {}", path.display());
+    }
 }
 
 fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -> App {

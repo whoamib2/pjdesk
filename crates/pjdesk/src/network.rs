@@ -192,6 +192,60 @@ pub fn refresh(refresh_token: &str, device_id: &str, computers: Option<&serde_js
     session_from(&email, device_id, reply)
 }
 
+/// Opens a network key and enrolls this device. No PJDesk password is required
+/// unless the key is limited to one account, in which case `account` is that
+/// account's email and password.
+pub fn redeem(blob: &str, passphrase: &str, device_id: &str, device_name: &str, account: Option<(&str, &str)>) -> Result<Session> {
+    let opened = pjdesk_proto::netkey::open(blob, passphrase).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let bearer = match account {
+        Some((email, password)) if !email.trim().is_empty() => Some(login_token(email, password)?),
+        _ => None,
+    };
+    let text = post_json(
+        &format!("{}/api/network/redeem", api_base()),
+        bearer.as_deref(),
+        &serde_json::json!({
+            "secret": opened.secret_hex,
+            "device_id": device_id,
+            "device_name": device_name,
+        }),
+    )?;
+    let reply: NetworkReply = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
+    let mut session = session_from("", device_id, reply)?;
+    if session.address.is_empty() {
+        session.address = opened.active;
+    }
+    if session.fingerprint.is_empty() {
+        session.fingerprint = opened.active_fingerprint;
+    }
+    if session.standby_address.is_empty() {
+        session.standby_address = opened.standby;
+    }
+    if session.standby_fingerprint.is_empty() {
+        session.standby_fingerprint = opened.standby_fingerprint;
+    }
+    Ok(session)
+}
+
+fn login_token(email: &str, password: &str) -> Result<String> {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() || password.is_empty() {
+        bail!("Enter the email and password for the account this network key is for.");
+    }
+    let (auth, _sync) = pjdesk_proto::access::derive_account_keys(&email, password);
+    let login: LoginReply = serde_json::from_str(&post_json(
+        &format!("{}/api/login", api_base()),
+        None,
+        &serde_json::json!({
+            "email": email,
+            "auth_key": hex::encode(auth),
+            "device": "PJDesk",
+        }),
+    )?)
+    .context("unexpected reply from PJDesk")?;
+    Ok(login.token)
+}
+
 /// Enrolls this device with a one-time code from My network. No password is typed.
 pub fn enroll(code: &str, device_id: &str, device_name: &str) -> Result<Session> {
     let text = post_json(

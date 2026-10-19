@@ -1686,6 +1686,175 @@ pub fn push_require_accounts(data_dir: &Path, require: bool) {
     }
 }
 
+/// A network key the owner created. The blob itself is not stored.
+#[derive(Clone, Deserialize)]
+pub struct NetworkInvite {
+    pub id: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub bound_email: String,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub uses: u32,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    #[serde(default)]
+    pub revoked_at: Option<u64>,
+    #[serde(default)]
+    pub history: Vec<InviteUse>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct InviteUse {
+    #[serde(default)]
+    pub device_name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub used_at: u64,
+}
+
+pub struct CreatedKey {
+    pub blob: String,
+    pub embedded: bool,
+}
+
+fn account_cfg(data_dir: &Path) -> Result<CloudConfig> {
+    let cfg = CloudConfig::load(data_dir).context("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → My network.")?;
+    if !cfg.is_account() || cfg.token.is_empty() {
+        bail!("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → My network.");
+    }
+    Ok(cfg)
+}
+
+fn cloud_api_error(err: ureq::Error) -> anyhow::Error {
+    match err {
+        ureq::Error::Status(_, resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            let message = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                .unwrap_or_else(|| "PJDesk could not update the network key.".into());
+            anyhow::anyhow!(message)
+        }
+        ureq::Error::Transport(_) => anyhow::anyhow!("Could not reach pjdesk.com."),
+    }
+}
+
+/// Creates a network key. The blob is returned once and is not written to disk.
+/// Call this off the UI thread: a passphrase key runs Argon2id.
+pub fn create_network_key(
+    data_dir: &Path,
+    passphrase: Option<&str>,
+    days: Option<u64>,
+    max_uses: Option<u32>,
+    bound_email: &str,
+) -> Result<CreatedKey> {
+    let cfg = account_cfg(data_dir)?;
+    #[derive(Deserialize)]
+    struct Net {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        active_address: String,
+        #[serde(default)]
+        active_fingerprint: String,
+        #[serde(default)]
+        standby_address: String,
+        #[serde(default)]
+        standby_fingerprint: String,
+    }
+    #[derive(Deserialize)]
+    struct Doc {
+        #[serde(default)]
+        network: Option<Net>,
+    }
+    let doc: Doc = match agent()
+        .get(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(resp) => serde_json::from_str(&resp.into_string().unwrap_or_default()).context("unexpected reply from PJDesk")?,
+        Err(e) => return Err(cloud_api_error(e)),
+    };
+    let net = doc.network.context("Set the server address on pjdesk.com → My network first.")?;
+    if net.active_address.trim().is_empty() || net.active_fingerprint.trim().is_empty() {
+        bail!("Set the server address and its fingerprint on pjdesk.com → My network first.");
+    }
+    let secret = pjdesk_proto::random_bytes::<32>();
+    let secret_hex = hex::encode(secret);
+    let hash = pjdesk_proto::netkey::secret_hash(&secret_hex);
+    let expires_at = days.map(|d| {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_secs()).unwrap_or(0) + d.saturating_mul(86_400)
+    });
+    let body = serde_json::json!({
+        "secret_hash": hash,
+        "mode": if passphrase.is_some() { "passphrase" } else { "embedded" },
+        "bound_email": bound_email.trim(),
+        "max_uses": max_uses,
+        "expires_at": expires_at,
+    });
+    match agent()
+        .post(&format!("{}/api/network/invites", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string())
+    {
+        Ok(_) => {}
+        Err(e) => return Err(cloud_api_error(e)),
+    }
+    let contents = pjdesk_proto::netkey::Contents {
+        network_id: &net.id,
+        active: &net.active_address,
+        active_fingerprint: &net.active_fingerprint,
+        standby: &net.standby_address,
+        standby_fingerprint: &net.standby_fingerprint,
+    };
+    let embedded = passphrase.is_none();
+    let blob = if let Some(pass) = passphrase {
+        pjdesk_proto::netkey::seal_passphrase(&contents, &secret, pass).map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        pjdesk_proto::netkey::seal_embedded(&contents, &secret).map_err(|e| anyhow::anyhow!(e.to_string()))?
+    };
+    Ok(CreatedKey { blob, embedded })
+}
+
+pub fn list_network_keys(data_dir: &Path) -> Result<Vec<NetworkInvite>> {
+    let cfg = account_cfg(data_dir)?;
+    #[derive(Deserialize)]
+    struct Doc {
+        #[serde(default)]
+        invites: Vec<NetworkInvite>,
+    }
+    match agent()
+        .get(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(resp) => {
+            let doc: Doc = serde_json::from_str(&resp.into_string().unwrap_or_default()).context("unexpected reply from PJDesk")?;
+            Ok(doc.invites)
+        }
+        Err(e) => Err(cloud_api_error(e)),
+    }
+}
+
+pub fn revoke_network_key(data_dir: &Path, id: &str) -> Result<()> {
+    let cfg = account_cfg(data_dir)?;
+    let body = serde_json::json!({ "id": id }).to_string();
+    match agent()
+        .post(&format!("{}/api/network/invites/revoke", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body)
+    {
+        Ok(_) => Ok(()),
+        Err(e) => Err(cloud_api_error(e)),
+    }
+}
+
 /// Other servers' health reports. Empty when sync is off or the website has
 /// not been redeployed with the health route yet.
 pub fn peer_health(data_dir: &Path) -> Vec<PeerHealth> {

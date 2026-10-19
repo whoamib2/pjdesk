@@ -11,6 +11,10 @@
     "test": "node --test test/plans.test.js"
   },
   "devDependencies": {
+    "@noble/ciphers": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
+    "esbuild": "^0.25.0",
+    "qrcode": "^1.5.4",
     "wrangler": "^4"
   }
 }

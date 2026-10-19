@@ -57,6 +57,19 @@
         { id: "123456789", name: "Office", os_family: "windows", os_version: "11" },
         { id: "555000111", name: "Pixel", os_family: "android", os_version: "15" },
       ],
+      invites: [
+        {
+          id: "ink_office01",
+          mode: "passphrase",
+          bound_email: "",
+          max_uses: 5,
+          uses: 1,
+          expires_at: null,
+          created_at: 1728000000,
+          revoked_at: null,
+          history: [{ device_id: "laptop-1", device_name: "Laptop", email: "ben@spader.us", used_at: 1728100000 }],
+        },
+      ],
     },
   };
 
@@ -658,6 +671,43 @@
     devices.append(codeBtn, codeOut);
     root.append(devices);
 
+    const keys = el("div", null, "panel");
+    keys.append(el("h2", "Network keys"));
+    keys.append(el("p", "A copy-paste key joins this network without typing the server address. The key itself is shown once and is not stored here.", "muted"));
+    const invites = data.invites || [];
+    if (!invites.length) keys.append(el("p", "No network keys yet.", "muted"));
+    invites.forEach((inv) => {
+      const row = el("div", null, "key-row");
+      const limit = inv.max_uses == null ? "no use limit" : `${inv.uses || 0} of ${inv.max_uses} uses`;
+      const exp = inv.expires_at ? `expires ${date(inv.expires_at)}` : "no expiry";
+      const bound = inv.bound_email ? `only ${inv.bound_email}` : "any device";
+      const state = inv.revoked_at ? "revoked" : inv.mode === "embedded" ? "self-contained" : "passphrase";
+      row.append(el("div", `${state} · ${limit} · ${exp} · ${bound}`));
+      (inv.history || []).forEach((use) => {
+        row.append(el("div", `${use.device_name || use.device_id} · ${use.email || "enrolled"} · ${date(use.used_at)}`, "muted"));
+      });
+      if (!inv.revoked_at) {
+        const revoke = el("button", "Revoke", "ghost");
+        revoke.type = "button";
+        revoke.addEventListener("click", async () => {
+          if (preview) {
+            row.append(el("span", "revoked", "muted"));
+            revoke.remove();
+            return;
+          }
+          await PJ.call("POST", "/api/network/invites/revoke", { id: inv.id });
+          renderNetwork();
+        });
+        row.append(revoke);
+      }
+      keys.append(row);
+    });
+    const make = el("button", "Create a network key", "primary");
+    make.type = "button";
+    make.addEventListener("click", () => openInvite(net));
+    keys.append(make);
+    root.append(keys);
+
     const comps = el("div", null, "panel");
     comps.append(el("h2", "Saved computers"));
     comps.append(el("p", "Names and IDs from this account. Passwords are not stored here.", "muted"));
@@ -667,7 +717,150 @@
       comps.append(el("div", `${c.name || "Computer"} · ${c.id} · ${c.os_family || "unknown"} ${c.os_version || ""}`.trim()));
     });
     root.append(comps);
+    if (preview && params.get("invite") === "1" && window.PJNetKey) {
+      const secretHex = "11".repeat(32);
+      PJNetKey.sealEmbedded({
+        networkId: net.id || "net_office",
+        secretHex,
+        active: net.active_address,
+        activeFingerprint: net.active_fingerprint,
+        standby: net.standby_address || "",
+        standbyFingerprint: net.standby_fingerprint || "",
+      }).then((blob) => showInviteResult(blob, true));
+    }
   }
+
+  let inviteNet = null;
+
+  function clearInviteSecret() {
+    const blob = $("invite-blob");
+    if (blob) blob.value = "";
+    const img = $("invite-qr");
+    if (img) img.removeAttribute("src");
+    const pass = $("invite-pass");
+    if (pass) pass.value = "";
+  }
+
+  function syncInviteMode() {
+    const embedded = $("invite-mode").value === "embedded";
+    $("invite-warn").classList.toggle("hidden", !embedded);
+    $("invite-pass-label").classList.toggle("hidden", embedded);
+  }
+
+  function showInviteResult(blob, embedded) {
+    $("invite-editor").classList.add("hidden");
+    $("invite-result").classList.remove("hidden");
+    $("invite-result-warn").classList.toggle("hidden", !embedded);
+    $("invite-blob").value = blob;
+    if (window.PJNetKey) {
+      PJNetKey.qrDataUrl(blob).then((url) => {
+        $("invite-qr").src = url;
+      });
+    }
+    $("invite").classList.remove("hidden");
+  }
+
+  function openInvite(net) {
+    inviteNet = net;
+    clearInviteSecret();
+    $("invite-editor").classList.remove("hidden");
+    $("invite-result").classList.add("hidden");
+    $("invite-msg").textContent = "";
+    $("invite-mode").value = "passphrase";
+    syncInviteMode();
+    $("invite").classList.remove("hidden");
+  }
+
+  function closeInvite() {
+    clearInviteSecret();
+    $("invite").classList.add("hidden");
+  }
+
+  $("invite-mode").addEventListener("change", syncInviteMode);
+  $("invite-pass-toggle").addEventListener("click", () => {
+    const input = $("invite-pass");
+    const show = input.type === "password";
+    input.type = show ? "text" : "password";
+    $("invite-pass-toggle").textContent = show ? "Hide" : "Show";
+  });
+  $("invite-cancel").addEventListener("click", closeInvite);
+  $("invite-done").addEventListener("click", closeInvite);
+  $("invite-copy").addEventListener("click", async () => {
+    const text = $("invite-blob").value;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      $("invite-blob").focus();
+      $("invite-blob").select();
+    }
+  });
+  $("invite-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const net = inviteNet;
+    const msg = $("invite-msg");
+    if (!net || !net.active_address || !net.active_fingerprint) {
+      msg.textContent = "Save the server address and its fingerprint first.";
+      return;
+    }
+    if (!window.PJNetKey) {
+      msg.textContent = "The network key tools did not load.";
+      return;
+    }
+    const embedded = $("invite-mode").value === "embedded";
+    const passphrase = $("invite-pass").value;
+    if (!embedded && passphrase.length < 8) {
+      msg.textContent = "Use a passphrase of at least 8 characters.";
+      return;
+    }
+    const days = $("invite-days").value.trim();
+    const maxText = $("invite-max").value.trim();
+    let expiresAt = null;
+    if (days) {
+      const n = Number(days);
+      if (!Number.isInteger(n) || n < 1) {
+        msg.textContent = "Expiry has to be a number of days, or empty.";
+        return;
+      }
+      expiresAt = Math.floor(Date.now() / 1000) + n * 86400;
+    }
+    let maxUses = null;
+    if (maxText) {
+      maxUses = Number(maxText);
+      if (!Number.isInteger(maxUses) || maxUses < 1) {
+        msg.textContent = "Maximum uses has to be at least 1, or leave it empty.";
+        return;
+      }
+    }
+    const secret = PJNetKey.randomBytes(32);
+    const secretHex = [...secret].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const contents = {
+      networkId: net.id || "net",
+      secretHex,
+      active: net.active_address,
+      activeFingerprint: net.active_fingerprint,
+      standby: net.standby_address || "",
+      standbyFingerprint: net.standby_fingerprint || "",
+    };
+    try {
+      if (!preview) {
+        const hash = await PJNetKey.secretHash(secretHex);
+        await PJ.call("POST", "/api/network/invites", {
+          secret_hash: hash,
+          mode: embedded ? "embedded" : "passphrase",
+          bound_email: $("invite-bound").value.trim(),
+          max_uses: maxUses,
+          expires_at: expiresAt,
+        });
+      }
+      const blob = embedded ? await PJNetKey.sealEmbedded(contents) : await PJNetKey.sealPassphrase(contents, passphrase);
+      secret.fill(0);
+      $("invite-pass").value = "";
+      showInviteResult(blob, embedded);
+      if (!preview) renderNetwork();
+    } catch (e) {
+      msg.textContent = e.message || "Could not create the network key.";
+    }
+  });
 
   async function boot() {
     if (!preview && !PJ.token()) { location.href = "/account/"; return; }

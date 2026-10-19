@@ -228,7 +228,13 @@ pub struct App {
     net_pass: String,
     net_show: bool,
     net_code: String,
-    net_use_code: bool,
+    /// 0 account, 1 enrollment code, 2 network key.
+    net_mode: u8,
+    net_blob: String,
+    net_key_pass: String,
+    net_key_show: bool,
+    /// The key is limited to one account, so email and password are shown too.
+    net_key_account: bool,
     net_busy: bool,
     net_error: String,
     show_net_sign_in: bool,
@@ -309,7 +315,11 @@ impl App {
             net_pass: String::new(),
             net_show: false,
             net_code: String::new(),
-            net_use_code: false,
+            net_mode: 0,
+            net_blob: String::new(),
+            net_key_pass: String::new(),
+            net_key_show: false,
+            net_key_account: false,
             net_busy: false,
             net_error: String::new(),
             show_net_sign_in: false,
@@ -434,7 +444,18 @@ impl App {
         self.net_email = "ben@spader.us".into();
         self.net_pass.clear();
         self.net_show = false;
+        self.net_mode = 0;
         self.show_net_sign_in = true;
+    }
+
+    #[cfg(feature = "ui-shots")]
+    fn load_network_key_preview(&mut self) {
+        self.load_sign_in_preview();
+        self.net_mode = 2;
+        self.net_blob = "pjdesk-net1:paste-the-key-here".into();
+        self.net_key_pass.clear();
+        self.net_key_show = false;
+        self.net_key_account = false;
     }
 
     #[cfg(feature = "ui-shots")]
@@ -659,6 +680,8 @@ impl App {
                 self.net_rx = None;
                 self.net_pass.clear();
                 self.net_code.clear();
+                self.net_blob.clear();
+                self.net_key_pass.clear();
                 self.net_error.clear();
                 self.show_net_sign_in = false;
                 if session.email.is_empty() {
@@ -700,12 +723,26 @@ impl App {
         self.net_rx = Some(rx);
         self.net_busy = true;
         self.net_error.clear();
-        if self.net_use_code {
+        if self.net_mode == 1 {
             let code = self.net_code.clone();
             std::thread::Builder::new()
                 .name("network-sign-in".into())
                 .spawn(move || {
                     let result = crate::network::enroll(&code, &device, &name).map_err(|e| e.to_string());
+                    let _ = tx.send(result);
+                })
+                .ok();
+        } else if self.net_mode == 2 {
+            let blob = self.net_blob.clone();
+            let passphrase = self.net_key_pass.clone();
+            let email = self.net_email.clone();
+            let password = self.net_pass.clone();
+            let account = self.net_key_account;
+            std::thread::Builder::new()
+                .name("network-sign-in".into())
+                .spawn(move || {
+                    let creds = if account { Some((email.as_str(), password.as_str())) } else { None };
+                    let result = crate::network::redeem(&blob, &passphrase, &device, &name, creds).map_err(|e| e.to_string());
                     let _ = tx.send(result);
                 })
                 .ok();

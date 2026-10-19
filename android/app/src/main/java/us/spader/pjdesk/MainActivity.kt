@@ -9,6 +9,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -50,6 +51,7 @@ import us.spader.pjdesk.service.HostService
 import us.spader.pjdesk.ui.HomeScreen
 import us.spader.pjdesk.ui.OnboardingScreen
 import us.spader.pjdesk.ui.PjTheme
+import us.spader.pjdesk.ui.QrScan
 import us.spader.pjdesk.ui.SavedScreen
 import us.spader.pjdesk.ui.SessionScreen
 import us.spader.pjdesk.ui.SettingsScreen
@@ -124,10 +126,17 @@ class MainActivity : ComponentActivity() {
             var netPass by remember { mutableStateOf("") }
             var netCode by remember { mutableStateOf("") }
             var netUseCode by remember { mutableStateOf(false) }
+            var netUseKey by remember { mutableStateOf(false) }
+            var netBlob by remember { mutableStateOf("") }
+            var netKeyPass by remember { mutableStateOf("") }
+            var netScan by remember { mutableStateOf(false) }
             var netBusy by remember { mutableStateOf(false) }
             var netError by remember { mutableStateOf("") }
             var savePassword by remember { mutableStateOf(false) }
             val scope = rememberCoroutineScope()
+            val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                if (granted) netScan = true else netError = "Camera permission is needed to scan a network key."
+            }
             var showPermanent by remember { mutableStateOf(false) }
             val capture by captureReady.collectAsState()
             LaunchedEffect(account) {
@@ -193,29 +202,66 @@ class MainActivity : ComponentActivity() {
                         onEnd = { engine.stop() },
                         decoder = sessionDecoder,
                     )
+                } else if (netScan) {
+                    QrScan(
+                        onResult = {
+                            netBlob = it
+                            netScan = false
+                        },
+                        onClose = { netScan = false },
+                    )
                 } else if (account.isEmpty() && state.server.isEmpty()) {
                     SignInScreen(
                         email = netEmail,
                         password = netPass,
                         code = netCode,
                         useCode = netUseCode,
+                        useKey = netUseKey,
+                        blob = netBlob,
+                        keyPass = netKeyPass,
                         busy = netBusy,
                         error = netError,
                         onEmail = { netEmail = it },
                         onPassword = { netPass = it },
                         onCode = { netCode = it },
-                        onUseCode = { netUseCode = it },
+                        onBlob = { netBlob = it },
+                        onKeyPass = { netKeyPass = it },
+                        onUseCode = { netUseCode = it; if (it) netUseKey = false },
+                        onUseKey = { netUseKey = it; if (it) netUseCode = false },
+                        onScan = {
+                            val granted = ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                            if (granted) netScan = true else cameraPermission.launch(Manifest.permission.CAMERA)
+                        },
+                        accountForKey = netError.contains("specific account"),
                         onSubmit = {
                             val device = app.store.networkDeviceId.ifBlank {
                                 UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
                             }
+                            val bound = netError.contains("specific account")
                             netBusy = true
                             netError = ""
+                            val email = netEmail
+                            val pass = netPass
+                            val code = netCode
+                            val blob = netBlob
+                            val keyPass = netKeyPass
+                            val useCode = netUseCode
+                            val useKey = netUseKey
                             scope.launch {
                                 val result = withContext(Dispatchers.IO) {
                                     runCatching {
-                                        if (netUseCode) CloudAuth.enroll(netCode, device, "Android")
-                                        else CloudAuth.signIn(netEmail, netPass, device, "Android")
+                                        when {
+                                            useKey -> CloudAuth.redeem(
+                                                blob,
+                                                keyPass,
+                                                device,
+                                                "Android",
+                                                if (bound) email else "",
+                                                if (bound) pass else "",
+                                            )
+                                            useCode -> CloudAuth.enroll(code, device, "Android")
+                                            else -> CloudAuth.signIn(email, pass, device, "Android")
+                                        }
                                     }
                                 }
                                 netBusy = false
@@ -228,6 +274,8 @@ class MainActivity : ComponentActivity() {
                                     engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
                                     session.computers.filter { it.id.length == 9 }.forEach { app.store.remember(it) }
                                     netPass = ""
+                                    netKeyPass = ""
+                                    netBlob = ""
                                     account = email
                                 }.onFailure { netError = it.message ?: "Could not sign in." }
                             }
