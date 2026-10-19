@@ -34,6 +34,9 @@ pub struct SavedRow {
     /// This row is the computer the window is running on.
     pub this_computer: bool,
     pub sort_order: u32,
+    /// Name chosen on that computer. A nickname typed here replaces it on this row only.
+    pub display_name: String,
+    pub in_book: bool,
 }
 
 pub fn os_icon(family: &str) -> Icon {
@@ -97,30 +100,49 @@ pub fn sort_rows(rows: &mut [SavedRow], sort: SavedSort) {
 }
 
 impl App {
-    pub(super) fn saved_page(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn computer_list(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
         let mut submitted = false;
         theme::card(ui, |ui| {
-            ui.label(RichText::new("Saved computers").size(22.0).strong().color(p.text));
-            if let Some(email) = self.cfg.network_email.as_deref().filter(|s| !s.is_empty()) {
-                ui.label(widgets::muted(
-                    ui,
-                    &format!(
-                        "Signed in as {email}. This list syncs with your account. Passwords stay on this computer."
-                    ),
-                ));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (tab, label) in [
+                    (super::DeskTab::Saved, "Saved"),
+                    (super::DeskTab::Recent, "Recent"),
+                    (super::DeskTab::Lan, "On this network"),
+                ] {
+                    let selected = self.desk_tab == tab;
+                    let text = if selected {
+                        RichText::new(label).strong().color(p.text)
+                    } else {
+                        RichText::new(label).color(p.muted)
+                    };
+                    let fill = if selected { p.elev } else { egui::Color32::TRANSPARENT };
+                    if ui.add(egui::Button::new(text).fill(fill).frame(selected)).clicked() {
+                        self.desk_tab = tab;
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            if self.desk_tab == super::DeskTab::Saved {
+                if let Some(email) = self.cfg.network_email.as_deref().filter(|s| !s.is_empty()) {
+                    ui.label(widgets::muted(
+                        ui,
+                        &format!("Signed in as {email}. This list syncs with your account. Passwords stay on this computer."),
+                    ));
+                } else {
+                    ui.label(widgets::muted(ui, "Sign in at pjdesk.com to sync across your computers."));
+                }
+            } else if self.desk_tab == super::DeskTab::Recent {
+                ui.label(widgets::muted(ui, "Computers you have connected to on this computer."));
             } else {
-                ui.label(widgets::muted(ui, "Sign in at pjdesk.com to sync across your computers."));
+                ui.label(widgets::muted(ui, "PJDesk computers that answered on this network."));
             }
-            ui.label(widgets::muted(
-                ui,
-                "Search by nickname, computer name, user, ID, or operating system. Enter connects to the first match.",
-            ));
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             let search = widgets::text_field(ui, &mut self.saved_query, "Search nickname, name, ID, or OS", false);
             submitted = search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
                 ui.label(widgets::muted(ui, "Sort"));
                 egui::ComboBox::from_id_salt("saved-sort")
                     .selected_text(match self.saved_sort {
@@ -138,9 +160,17 @@ impl App {
                 widgets::checkbox(ui, &mut self.saved_favorites, "Favorites");
             });
         });
-        ui.add_space(12.0);
+        ui.add_space(8.0);
 
-        let mut rows = self.saved_rows();
+        let mut rows = match self.desk_tab {
+            super::DeskTab::Recent => {
+                let mut rows = self.saved_rows();
+                rows.retain(|r| r.last_connected > 0 && !r.this_computer);
+                rows
+            }
+            super::DeskTab::Lan => self.lan_rows(),
+            super::DeskTab::Saved => self.saved_rows(),
+        };
         if self.saved_favorites {
             rows.retain(|r| r.favorite);
         }
@@ -159,7 +189,7 @@ impl App {
                 ui.label(widgets::muted(ui, "No saved computers match."));
                 return;
             }
-            egui::ScrollArea::vertical().id_salt("saved-rows").auto_shrink([false, false]).show(ui, |ui| {
+            egui::ScrollArea::both().id_salt("saved-rows").auto_shrink([false, false]).show(ui, |ui| {
                 let mut action: Option<RowCmd> = None;
                 egui::Grid::new("saved-table").num_columns(11).spacing(egui::vec2(6.0, 4.0)).min_col_width(0.0).show(
                     ui,
@@ -218,9 +248,62 @@ impl App {
                 last_seen: note.map(|n| n.last_seen).unwrap_or(0),
                 this_computer: self.is_this_computer(&id),
                 sort_order: note.map(|n| n.sort_order).unwrap_or(0),
+                display_name: note.map(|n| n.display_name.clone()).unwrap_or_default(),
+                in_book: entry.is_some(),
             });
         }
         rows
+    }
+
+    fn lan_rows(&self) -> Vec<SavedRow> {
+        let mut rows = Vec::new();
+        for (name, id, _addr) in &self.lan {
+            let id = normalize_id(id);
+            if !pjdesk_proto::is_valid_id(&id) {
+                continue;
+            }
+            let entry = self.cfg.address_book.iter().find(|e| e.id == id);
+            let note = self.cfg.settings.peers.get(&id);
+            let hostname = note
+                .map(|n| n.hostname.trim().to_string())
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| name.trim().to_string());
+            let alias = entry.map(|e| e.alias.clone()).unwrap_or_default();
+            rows.push(SavedRow {
+                id: id.clone(),
+                nickname: crate::config::nickname_text(&alias, &id, &hostname),
+                hostname,
+                os_family: note.map(|n| n.os_family.clone()).unwrap_or_default(),
+                os_version: note.map(|n| n.os_version.clone()).unwrap_or_default(),
+                last_connected: note.map(|n| n.last_connected).unwrap_or(0),
+                favorite: note.map(|n| n.favorite).unwrap_or(false),
+                has_password: self.cfg.saved_password(&id).is_some(),
+                online: true,
+                console_user: note.map(|n| n.console_user.clone()).unwrap_or_default(),
+                last_seen: note.map(|n| n.last_seen).unwrap_or(0),
+                this_computer: self.is_this_computer(&id),
+                sort_order: note.map(|n| n.sort_order).unwrap_or(0),
+                display_name: note.map(|n| n.display_name.clone()).unwrap_or_default(),
+                in_book: entry.is_some() && !self.cfg.is_saved_hidden(&id),
+            });
+        }
+        rows
+    }
+
+    /// Adds a computer from Recent or On this network to the saved list.
+    /// Signed-in computers upload it. Passwords stay on this computer.
+    fn save_computer(&mut self, id: &str) {
+        let id = normalize_id(id);
+        if !pjdesk_proto::is_valid_id(&id) {
+            return;
+        }
+        self.cfg.saved_hidden.retain(|h| h != &id);
+        if !self.cfg.address_book.iter().any(|e| e.id == id) {
+            self.cfg.address_book.push(pjdesk_proto::signal::AddressEntry { id: id.clone(), alias: String::new(), ..Default::default() });
+        }
+        self.desk_tab = super::DeskTab::Saved;
+        self.sync_address_book();
+        self.toast.show("Saved");
     }
 
     fn is_this_computer(&self, id: &str) -> bool {
@@ -245,7 +328,7 @@ impl App {
                 *action = Some(RowCmd::CommitRename(id.clone()));
             }
         } else {
-            name_cell(ui, &row.nickname, &row.hostname, p.text, p.muted);
+            name_cell(ui, &row.nickname, &row.display_name, &row.hostname, p.text, p.muted);
         }
         fixed(ui, W_ID, |ui| {
             ui.add(egui::Label::new(RichText::new(format_id(&id)).monospace().color(p.muted)).truncate());
@@ -295,8 +378,8 @@ impl App {
                     *action = Some(RowCmd::Rename(id.clone()));
                     ui.close();
                 }
-                if ui.button("Transfer file").clicked() {
-                    *action = Some(RowCmd::Files(id.clone()));
+                if !row.in_book && ui.button("Save").clicked() {
+                    *action = Some(RowCmd::Save(id.clone()));
                     ui.close();
                 }
                 let fav = if row.favorite { "Unfavorite" } else { "Favorite" };
@@ -312,7 +395,7 @@ impl App {
                     *action = Some(RowCmd::Move(id.clone(), false));
                     ui.close();
                 }
-                if row.has_password && ui.button("Remove saved password").clicked() {
+                if row.has_password && ui.button("Forget saved password").clicked() {
                     *action = Some(RowCmd::ForgetPassword(id.clone()));
                     ui.close();
                 }
@@ -327,7 +410,8 @@ impl App {
     fn apply_saved(&mut self, cmd: RowCmd) {
         match cmd {
             RowCmd::Connect(id) => self.connect_to(&id, None, false),
-            RowCmd::Files(id) => self.connect_to(&id, None, true),
+            RowCmd::Files(id) => self.connect_to(&id, None, false),
+            RowCmd::Save(id) => self.save_computer(&id),
             RowCmd::Favorite(id) => self.toggle_favorite(&id),
             RowCmd::ForgetPassword(id) => {
                 self.cfg.remember_password(&id, None);
@@ -424,17 +508,26 @@ impl App {
         }
         let mut close = false;
         let mut go = false;
-        let name = self.row_title(&self.prompt_id);
+        let name = if self.prompt_direct.is_some() {
+            self.prompt_id.clone()
+        } else {
+            self.row_title(&self.prompt_id)
+        };
         let title = format!("Password for {name}");
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label(RichText::new(format_id(&self.prompt_id)).monospace().color(theme::paint(ui).muted));
+                let id_line = if self.prompt_direct.is_some() { self.prompt_id.clone() } else { format_id(&self.prompt_id) };
+                ui.label(RichText::new(id_line).monospace().color(theme::paint(ui).muted));
                 if self.prompt_rejected {
                     ui.add_space(4.0);
-                    ui.label("That saved password was rejected. Enter the current one for this computer.");
+                    ui.label("That password was rejected. Enter the current one for this computer.");
+                }
+                if self.prompt_checking {
+                    ui.add_space(4.0);
+                    ui.label("Checking the password…");
                 }
                 ui.add_space(8.0);
                 let label = format!("Password for {name}");
@@ -452,23 +545,44 @@ impl App {
                     if ui.button("Cancel").clicked() {
                         close = true;
                     }
-                    if widgets::accent_button(ui, "Connect", Vec2::new(120.0, 36.0)) || enter {
+                    if !self.prompt_checking && (widgets::accent_button(ui, "Connect", Vec2::new(120.0, 36.0)) || enter) {
                         go = true;
                     }
                 });
             });
         if close {
+            self.write_ask_reply("cancel\n");
             self.prompt_open = false;
+            self.prompt_checking = false;
+            self.ask_alive = false;
+            self.ask_path = None;
         }
         if go {
-            let (id, pw, files, remember) =
-                (self.prompt_id.clone(), self.prompt_password.clone(), self.prompt_files, self.prompt_remember);
+            let pw = self.prompt_password.clone();
             if pw.trim().is_empty() {
                 self.status = "Enter the password.".into();
+            } else if self.ask_alive {
+                self.remember = self.prompt_remember;
+                let body = format!("password\n{}\n", hex::encode(pw.as_bytes()));
+                self.write_ask_reply(&body);
+                self.prompt_checking = true;
+                self.prompt_rejected = false;
+                if self.prompt_remember {
+                    // The viewer stores it after the computer accepts, when PJDESK_REMEMBER is set.
+                }
             } else {
-                self.prompt_open = false;
+                let (id, files, remember) = (self.prompt_id.clone(), self.prompt_files, self.prompt_remember);
                 self.remember = remember;
-                self.spawn_viewer(&id, &pw, files, remember, false);
+                self.prompt_open = false;
+                self.prompt_checking = false;
+                self.prompt_rejected = false;
+                self.ask_alive = false;
+                self.ask_path = None;
+                if self.prompt_direct.is_some() {
+                    self.spawn_direct_with_password(&id, &pw);
+                } else {
+                    self.spawn_viewer(&id, &pw, files, remember, false);
+                }
             }
         }
     }
@@ -477,6 +591,7 @@ impl App {
 enum RowCmd {
     Connect(String),
     Files(String),
+    Save(String),
     Favorite(String),
     ForgetPassword(String),
     Remove(String),
@@ -538,14 +653,25 @@ fn icon_cell(ui: &mut egui::Ui, icon: Icon, color: egui::Color32) {
     super::icons::paint(ui.painter(), icon_rect, icon, color);
 }
 
-fn name_cell(ui: &mut egui::Ui, nickname: &str, hostname: &str, text: egui::Color32, muted: egui::Color32) {
-    let (primary, secondary, placeholder) = if !nickname.is_empty() {
-        (nickname.to_string(), hostname.to_string(), false)
+fn name_cell(
+    ui: &mut egui::Ui,
+    nickname: &str,
+    display_name: &str,
+    hostname: &str,
+    text: egui::Color32,
+    muted: egui::Color32,
+) {
+    let primary = if !nickname.is_empty() {
+        nickname.to_string()
+    } else if !display_name.is_empty() {
+        display_name.to_string()
     } else if !hostname.is_empty() {
-        (hostname.to_string(), String::new(), false)
+        hostname.to_string()
     } else {
-        ("No name yet".into(), String::new(), true)
+        "No name yet".into()
     };
+    let secondary = if !hostname.is_empty() && hostname != primary { hostname.to_string() } else { String::new() };
+    let placeholder = primary == "No name yet";
     let layout = if secondary.is_empty() {
         egui::Layout::left_to_right(egui::Align::Center)
     } else {
@@ -647,6 +773,8 @@ mod tests {
                 last_seen: 0,
                 this_computer: false,
                 sort_order: 0,
+                display_name: String::new(),
+                in_book: true,
             },
             SavedRow {
                 id: "111111111".into(),
@@ -662,6 +790,8 @@ mod tests {
                 last_seen: 40,
                 this_computer: false,
                 sort_order: 0,
+                display_name: String::new(),
+                in_book: true,
             },
         ];
         sort_rows(&mut rows, SavedSort::Name);

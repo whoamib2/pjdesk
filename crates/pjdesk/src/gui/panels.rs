@@ -7,16 +7,6 @@ use pjdesk_proto::{format_id, normalize_id};
 use super::icons::Icon;
 use super::{theme, widgets, App};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RowAction {
-    Connect,
-    Files,
-    Favorite,
-    Forget,
-    Remove,
-    CopyId,
-}
-
 impl App {
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
@@ -29,17 +19,6 @@ impl App {
             }
             ui.label(RichText::new("PJDesk").size(20.0).strong().color(p.text));
             ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(p.muted).size(12.5));
-            ui.add_space(12.0);
-            let connect_on = self.page == super::MainPage::Connect;
-            let saved_on = self.page == super::MainPage::Saved;
-            if ui.selectable_label(connect_on, "Connect").clicked() {
-                self.page = super::MainPage::Connect;
-            }
-            if ui.selectable_label(saved_on, "Saved computers").clicked() {
-                self.page = super::MainPage::Saved;
-                self.reload_peer_reports();
-                self.request_saved_refresh();
-            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if widgets::icon_button(ui, Icon::Gear, "Settings (Ctrl+,)").clicked() {
@@ -49,6 +28,10 @@ impl App {
                 let email = self.cfg.network_email.clone().unwrap_or_default();
                 if !email.trim().is_empty() {
                     ui.menu_button(RichText::new(email.trim()).color(p.ok), |ui| {
+                        if ui.button("Manage account").clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab("https://pjdesk.com/account"));
+                            ui.close();
+                        }
                         if ui.button("Sign out").clicked() {
                             self.sign_out_network();
                             ui.close();
@@ -75,47 +58,35 @@ impl App {
             self.sign_in_panel(ui);
             return;
         }
-        if self.page != super::MainPage::Saved && self.cfg.network_email.as_deref().map(str::trim).unwrap_or("").is_empty() {
-            let mut open = false;
-            theme::card(ui, |ui| {
-                ui.label("Sign in with your PJDesk account for this network and its servers. That sign-in is not the password for a computer.");
-                if ui.button("Sign in").clicked() {
-                    open = true;
-                }
-            });
-            if open {
-                self.show_net_sign_in = true;
-            }
-            ui.add_space(8.0);
-        }
-        if self.page == super::MainPage::Saved {
-            self.saved_page(ui);
-            return;
-        }
         let width = ui.available_width();
         let height = ui.available_height();
-        if width < 900.0 {
+        // Narrow windows stack. The computer list then gets the full width so
+        // Connect and Menu are not clipped off the right edge.
+        if width < 960.0 {
             ScrollArea::vertical().id_salt("stacked").auto_shrink([false, false]).show(ui, |ui| {
+                self.remote(ui);
+                ui.add_space(12.0);
                 self.rail(ui);
                 ui.add_space(12.0);
-                self.remote(ui);
+                self.computer_list(ui);
             });
             return;
         }
         let gap = 12.0;
-        let left = 360.0;
+        let left = 400.0_f32.min((width * 0.34).max(340.0));
         let right = (width - left - gap).max(320.0);
         ui.horizontal(|ui| {
             ui.allocate_ui_with_layout(Vec2::new(left, height), egui::Layout::top_down(egui::Align::Min), |ui| {
-                ScrollArea::vertical().id_salt("rail").auto_shrink([false, false]).show(ui, |ui| {
+                ScrollArea::vertical().id_salt("connect-col").auto_shrink([false, false]).show(ui, |ui| {
+                    ui.set_min_width(left - 8.0);
+                    self.remote(ui);
+                    ui.add_space(12.0);
                     self.rail(ui);
                 });
             });
             ui.add_space(gap);
             ui.allocate_ui_with_layout(Vec2::new(right, height), egui::Layout::top_down(egui::Align::Min), |ui| {
-                ScrollArea::vertical().id_salt("remote").auto_shrink([false, false]).show(ui, |ui| {
-                    self.remote(ui);
-                });
+                self.computer_list(ui);
             });
         });
     }
@@ -494,14 +465,28 @@ impl App {
                 .horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     let menu_w = 96.0;
-                    let width = (ui.available_width() - menu_w - 8.0).max(80.0);
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.connect_id)
-                            .hint_text("123 456 789")
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(width)
-                            .margin(egui::Margin::symmetric(12, 10)),
-                    );
+                    let width = (ui.available_width() - menu_w - 8.0).max(120.0);
+                    let before = self.connect_id.clone();
+                    let mut output = egui::TextEdit::singleline(&mut self.connect_id)
+                        .hint_text("123 456 789")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(width)
+                        .margin(egui::Margin::symmetric(12, 10))
+                        .show(ui);
+                    if output.response.changed() {
+                        let after_caret = output
+                            .state
+                            .cursor
+                            .char_range()
+                            .map(|range| usize::from(range.primary.index))
+                            .unwrap_or_else(|| self.connect_id.chars().count());
+                        let (formatted, caret) = crate::idfmt::reformat_id_change(&before, &self.connect_id, after_caret, 9);
+                        self.connect_id = formatted;
+                        let cursor = egui::text::CCursor::new(caret);
+                        output.state.cursor.set_char_range(Some(egui::text::CCursorRange::one(cursor)));
+                        output.state.store(ui.ctx(), output.response.id);
+                    }
+                    let resp = output.response;
                     let recent = self.recent_ids();
                     ui.menu_button("Recent", |ui| {
                         if recent.is_empty() {
@@ -510,7 +495,7 @@ impl App {
                         for id in recent {
                             let label = self.row_title(&id);
                             if ui.button(label).clicked() {
-                                self.connect_id = format_typed_id(&id);
+                                self.connect_id = crate::idfmt::format_typed_id(&id);
                                 ui.close();
                             }
                         }
@@ -520,47 +505,18 @@ impl App {
                     resp
                 })
                 .inner;
-            if id_resp.changed() {
-                let formatted = format_typed_id(&self.connect_id);
-                if formatted != self.connect_id {
-                    self.connect_id = formatted;
-                }
-            }
 
             ui.add_space(8.0);
-            let pw_label = self.computer_password_label(&self.connect_id);
-            widgets::field_label(ui, &pw_label);
-            let pw_resp = widgets::password_field(
-                ui,
-                &mut self.connect_password,
-                "Computer password",
-                &mut self.show_connect_password,
-            );
-            ui.add_space(4.0);
-            widgets::checkbox(ui, &mut self.remember, "Save password for this computer");
             ui.label(widgets::muted(
                 ui,
-                "The password on that computer. Your PJDesk account password is not filled in here. A saved password stays on this computer and is not uploaded.",
+                "Enter the ID and click Connect. A saved password is used on its own. Otherwise PJDesk asks after that computer answers.",
             ));
-
             ui.add_space(8.0);
-            let enter = (id_resp.lost_focus() || pw_resp.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let mut connect = false;
-            let mut files = false;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let total = ui.available_width();
-                let primary = (total * 0.58).max(120.0);
-                let secondary = (total - primary - 8.0).max(120.0);
-                connect = widgets::accent_button(ui, "Connect", Vec2::new(primary, 40.0));
-                files = ui
-                    .add_sized([secondary, 40.0], egui::Button::new(RichText::new("Transfer file").strong()))
-                    .on_hover_text("Connect and open file transfer")
-                    .clicked();
-            });
-            if connect || files || enter {
-                let (id, pw) = (self.connect_id.clone(), self.connect_password.clone());
-                self.connect_to(&id, Some(pw), files);
+            let enter = id_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let connect = widgets::accent_button(ui, "Connect", Vec2::new(ui.available_width(), 40.0));
+            if connect || enter {
+                let id = self.connect_id.clone();
+                self.connect_to(&id, None, false);
             }
 
             ui.add_space(12.0);
@@ -580,241 +536,6 @@ impl App {
                 }
             });
         });
-
-        ui.add_space(12.0);
-        self.desk_tabs(ui);
-    }
-
-    fn desk_tabs(&mut self, ui: &mut egui::Ui) {
-        let p = theme::paint(ui);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (tab, label) in [
-                (super::DeskTab::Recent, "Recent"),
-                (super::DeskTab::Favorites, "Favorites"),
-                (super::DeskTab::Address, "Address book"),
-                (super::DeskTab::Lan, "Discovered"),
-            ] {
-                let selected = self.desk_tab == tab;
-                let text = if selected {
-                    RichText::new(label).strong().color(p.text)
-                } else {
-                    RichText::new(label).color(p.muted)
-                };
-                let fill = if selected { p.elev } else { egui::Color32::TRANSPARENT };
-                if ui.add(egui::Button::new(text).fill(fill).frame(selected)).clicked() {
-                    self.desk_tab = tab;
-                }
-            }
-            if self.cfg.account.is_some() && self.desk_tab == super::DeskTab::Address {
-                ui.label(widgets::muted(ui, "synced"));
-            }
-        });
-        ui.add_space(8.0);
-
-        let rows = self.rows_for_tab();
-        if rows.is_empty() {
-            ui.label(widgets::muted(ui, self.empty_hint()));
-            if self.desk_tab == super::DeskTab::Address && ui.button("Add the ID above").clicked() {
-                self.book_target = Some(normalize_id(&self.connect_id));
-                self.book_alias.clear();
-            }
-            return;
-        }
-
-        let mut action: Option<(RowAction, String)> = None;
-        for row in rows {
-            let id = row.id.clone();
-            theme::card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    let family = self.cfg.settings.peers.get(&row.id).map(|n| n.os_family.as_str()).unwrap_or("");
-                    let icon = if family.is_empty() { Icon::Monitor } else { super::saved::os_icon(family) };
-                    theme::icon_in(ui, icon, 22.0, p.muted);
-                    if row.online {
-                        theme::icon_in(ui, Icon::Check, 10.0, p.ok);
-                    }
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&row.title).strong().color(p.text));
-                        ui.label(widgets::muted(ui, &row.detail));
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Connect").clicked() {
-                            action = Some((RowAction::Connect, id.clone()));
-                        }
-                        let star_tip = if row.favorite { "Remove from favorites" } else { "Add to favorites" };
-                        if widgets::icon_button_active(ui, Icon::Star, star_tip, row.favorite).clicked() {
-                            action = Some((RowAction::Favorite, id.clone()));
-                        }
-                        if self.desk_tab == super::DeskTab::Address
-                            && widgets::icon_button(ui, Icon::Trash, "Remove").clicked()
-                        {
-                            action = Some((RowAction::Remove, id.clone()));
-                        }
-                    });
-                })
-                .response
-                .context_menu(|ui| {
-                    if ui.button("Connect").clicked() {
-                        action = Some((RowAction::Connect, id.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Transfer file").clicked() {
-                        action = Some((RowAction::Files, id.clone()));
-                        ui.close();
-                    }
-                    if ui.button(if row.favorite { "Remove from favorites" } else { "Add to favorites" }).clicked() {
-                        action = Some((RowAction::Favorite, id.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Copy ID").clicked() {
-                        action = Some((RowAction::CopyId, id.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Forget").clicked() {
-                        action = Some((RowAction::Forget, id.clone()));
-                        ui.close();
-                    }
-                    if row.in_book && ui.button("Remove from address book").clicked() {
-                        action = Some((RowAction::Remove, id.clone()));
-                        ui.close();
-                    }
-                });
-            });
-            ui.add_space(8.0);
-        }
-
-        if self.desk_tab == super::DeskTab::Address && ui.button("Add the ID above").clicked() {
-            self.book_target = Some(normalize_id(&self.connect_id));
-            self.book_alias.clear();
-        }
-
-        if let Some((kind, id)) = action {
-            self.apply_row(kind, &id);
-        }
-    }
-
-    fn apply_row(&mut self, kind: RowAction, id: &str) {
-        match kind {
-            RowAction::Connect => self.connect_to(id, None, false),
-            RowAction::Files => self.connect_to(id, None, true),
-            RowAction::Favorite => self.toggle_favorite(id),
-            RowAction::Forget => {
-                self.cfg.settings.peers.remove(id);
-                self.save_cfg();
-                self.toast.show("Forgotten");
-            }
-            RowAction::Remove => {
-                self.cfg.address_book.retain(|e| e.id != id);
-                self.cfg.remember_password(id, None);
-                self.sync_address_book();
-                self.toast.show("Removed");
-            }
-            RowAction::CopyId => {
-                if widgets::copy_to_clipboard(&normalize_id(id)) {
-                    self.toast.show("ID copied");
-                }
-            }
-        }
-    }
-
-    fn rows_for_tab(&self) -> Vec<DeskRow> {
-        match self.desk_tab {
-            super::DeskTab::Recent => {
-                let mut ids = self.recent_ids();
-                ids.truncate(12);
-                ids.into_iter().map(|id| self.desk_row(&id, false)).collect()
-            }
-            super::DeskTab::Favorites => self
-                .cfg
-                .settings
-                .peers
-                .iter()
-                .filter(|(_, n)| n.favorite)
-                .map(|(id, _)| id.clone())
-                .map(|id| self.desk_row(&id, false))
-                .collect(),
-            super::DeskTab::Address => self.cfg.address_book.iter().map(|e| self.desk_row(&e.id, false)).collect(),
-            super::DeskTab::Lan => self
-                .lan
-                .iter()
-                .map(|(name, id, addr)| DeskRow {
-                    id: id.clone(),
-                    title: name.clone(),
-                    detail: format!("{} · {addr}", format_id(id)),
-                    favorite: self.cfg.settings.peers.get(id).is_some_and(|n| n.favorite),
-                    online: true,
-                    in_book: self.cfg.address_book.iter().any(|e| e.id == *id),
-                })
-                .collect(),
-        }
-    }
-
-    fn desk_row(&self, id: &str, online: bool) -> DeskRow {
-        let title = self.row_title(id);
-        let hostname = self.cfg.settings.peers.get(id).map(|n| n.hostname.trim().to_string()).unwrap_or_default();
-        let mut bits = Vec::new();
-        if !hostname.is_empty() && hostname != title {
-            bits.push(hostname);
-        }
-        if title != format_id(id) {
-            bits.push(format_id(id));
-        }
-        if let Some(note) = self.cfg.settings.peers.get(id) {
-            if note.last_connected > 0 {
-                bits.push(ago(note.last_connected));
-            }
-        }
-        if let Some(note) = self.cfg.settings.peers.get(id) {
-            if !note.os_family.is_empty() {
-                bits.push(super::saved::os_label(&note.os_family).to_string());
-            }
-        }
-        if self.saved_for(id).is_some() {
-            bits.push("Password saved".into());
-        }
-        if bits.is_empty() {
-            bits.push(format_id(id));
-        }
-        DeskRow {
-            id: id.to_string(),
-            title,
-            detail: bits.join(" · "),
-            favorite: self.cfg.settings.peers.get(id).is_some_and(|n| n.favorite),
-            online,
-            in_book: self.cfg.address_book.iter().any(|e| e.id == id),
-        }
-    }
-
-    /// The connect field. Never the PJDesk account password.
-    pub(super) fn computer_password_label(&self, id: &str) -> String {
-        let id = normalize_id(id);
-        if id.is_empty() {
-            return "Password for this computer".into();
-        }
-        format!("Password for {}", self.row_title(&id))
-    }
-
-    pub(super) fn row_title(&self, id: &str) -> String {
-        let hostname = self.cfg.settings.peers.get(id).map(|n| n.hostname.trim().to_string()).unwrap_or_default();
-        let alias = self.cfg.address_book.iter().find(|e| e.id == id).map(|e| e.alias.clone()).unwrap_or_default();
-        let nick = crate::config::nickname_text(&alias, id, &hostname);
-        if !nick.is_empty() {
-            return nick;
-        }
-        if !hostname.is_empty() {
-            return hostname;
-        }
-        format_id(id)
-    }
-
-    fn empty_hint(&self) -> &'static str {
-        match self.desk_tab {
-            super::DeskTab::Recent => "Computers you connect to show up here.",
-            super::DeskTab::Favorites => "Star a computer to keep it here.",
-            super::DeskTab::Address => "No saved computers yet. Connect to one, or add the ID above.",
-            super::DeskTab::Lan => "Choose Find on this network to look for PJDesk on this LAN.",
-        }
     }
 
     pub(super) fn add_book_window(&mut self, ctx: &egui::Context) {
@@ -1001,27 +722,24 @@ impl App {
             });
         }
     }
-}
 
-struct DeskRow {
-    id: String,
-    title: String,
-    detail: String,
-    favorite: bool,
-    online: bool,
-    in_book: bool,
-}
-
-pub(super) fn format_typed_id(raw: &str) -> String {
-    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).take(9).collect();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            out.push(' ');
+    /// Nickname, then the name this computer chose, then its hostname.
+    pub(super) fn row_title(&self, id: &str) -> String {
+        let hostname = self.cfg.settings.peers.get(id).map(|n| n.hostname.trim().to_string()).unwrap_or_default();
+        let display = self.cfg.settings.peers.get(id).map(|n| n.display_name.trim().to_string()).unwrap_or_default();
+        let alias = self.cfg.address_book.iter().find(|e| e.id == id).map(|e| e.alias.clone()).unwrap_or_default();
+        let nick = crate::config::nickname_text(&alias, id, &hostname);
+        if !nick.is_empty() {
+            return nick;
         }
-        out.push(c);
+        if !display.is_empty() {
+            return display;
+        }
+        if !hostname.is_empty() {
+            return hostname;
+        }
+        format_id(id)
     }
-    out
 }
 
 fn server_host(server: &str) -> String {

@@ -10,8 +10,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
@@ -24,7 +29,11 @@ fun OnboardingScreen(
     onAccessibility: () -> Unit,
     onCapture: () -> Unit,
     onDone: () -> Unit,
+    computerName: String = "",
+    deviceLabel: String = "",
+    onComputerName: (String) -> Unit = {},
 ) {
+    var name by rememberSaveable { mutableStateOf(computerName) }
     Column(
         Modifier
             .fillMaxSize()
@@ -36,6 +45,17 @@ fun OnboardingScreen(
         Text(
             "Three permissions. Each one is asked by Android itself. You can control other computers without all three, but this phone cannot be controlled until they are granted.",
             color = pjMuted(),
+        )
+        OutlinedTextField(
+            value = name,
+            onValueChange = { name = it.take(64) },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Name this phone") },
+            supportingText = {
+                val shown = deviceLabel.ifBlank { "this phone" }
+                Text("Optional. Computer name: $shown. Leave blank to use that.")
+            },
         )
         Step(
             index = "1",
@@ -62,7 +82,10 @@ fun OnboardingScreen(
             onAction = onCapture,
         )
         Button(
-            onClick = onDone,
+            onClick = {
+                onComputerName(name.trim())
+                onDone()
+            },
             enabled = notificationsGranted && accessibilityEnabled && captureReady,
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Continue") }

@@ -18,7 +18,11 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.DeskState
 
@@ -26,13 +30,9 @@ import us.spader.pjdesk.core.DeskState
 fun HomeScreen(
     state: DeskState,
     connectId: String,
-    connectPassword: String,
     connectName: String = "",
     onConnectId: (String) -> Unit,
-    onConnectPassword: (String) -> Unit,
     onConnect: () -> Unit,
-    savePassword: Boolean = false,
-    onSavePassword: (Boolean) -> Unit = {},
     onCopyId: () -> Unit,
     onCopyPassword: () -> Unit,
     onRegenerate: () -> Unit,
@@ -130,34 +130,57 @@ fun HomeScreen(
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Connect", style = MaterialTheme.typography.titleMedium)
                 OutlinedTextField(
-                    value = connectId,
-                    onValueChange = onConnectId,
+                    value = connectId.filter { it.isDigit() }.take(9),
+                    onValueChange = { onConnectId(it.filter { ch -> ch.isDigit() }.take(9)) },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     label = { Text("Partner ID") },
-                )
-                SecretField(
-                    value = connectPassword,
-                    onValueChange = onConnectPassword,
-                    label = if (connectName.isBlank()) "Password for this computer" else "Password for $connectName",
+                    visualTransformation = IdGroupTransformation,
+                    textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace),
                 )
                 Text(
-                    "The password on that computer. Your PJDesk account password is not filled in here.",
-                    color = pjMuted(),
-                    style = MaterialTheme.typography.labelMedium,
-                )
-                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                    Checkbox(checked = savePassword, onCheckedChange = onSavePassword)
-                    Text("Save password for this computer")
-                }
-                Text(
-                    "Stored on this phone only, in the Android Keystore. It is not uploaded.",
+                    "A saved password is used on its own. Otherwise PJDesk asks after that computer answers.",
                     color = pjMuted(),
                     style = MaterialTheme.typography.labelMedium,
                 )
                 Button(onClick = onConnect, modifier = Modifier.fillMaxWidth()) { Text("Connect") }
             }
         }
+    }
+}
+
+/** Groups of three digits. The field value stays raw digits, so the caret does not fight the spaces. */
+private object IdGroupTransformation : VisualTransformation {
+    override fun filter(text: AnnotatedString): TransformedText {
+        val digits = text.text
+        val out = StringBuilder()
+        val map = ArrayList<Int>(digits.length + 1)
+        for (i in digits.indices) {
+            if (i > 0 && i % 3 == 0) out.append(' ')
+            map.add(out.length)
+            out.append(digits[i])
+        }
+        val transformed = out.toString()
+        val offset = object : OffsetMapping {
+            override fun originalToTransformed(offset: Int): Int {
+                if (digits.isEmpty()) return 0
+                val at = offset.coerceIn(0, digits.length)
+                return if (at == digits.length) transformed.length else map[at]
+            }
+            override fun transformedToOriginal(offset: Int): Int {
+                if (digits.isEmpty()) return 0
+                val at = offset.coerceIn(0, transformed.length)
+                var digitsBefore = 0
+                var seen = 0
+                for (ch in transformed) {
+                    if (seen >= at) break
+                    if (ch.isDigit()) digitsBefore++
+                    seen++
+                }
+                return digitsBefore.coerceIn(0, digits.length)
+            }
+        }
+        return TransformedText(AnnotatedString(transformed), offset)
     }
 }
 

@@ -64,6 +64,8 @@ pub struct HostPresence {
     pub os_family: String,
     pub os_version: String,
     pub console_user: String,
+    /// None when an older account service omitted the field. Some("") clears it.
+    pub display_name: Option<String>,
     pub last_seen: u64,
     pub online: bool,
 }
@@ -184,6 +186,8 @@ struct PresenceBody {
     #[serde(default)]
     console_user: String,
     #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
     last_seen: u64,
     #[serde(default)]
     online: bool,
@@ -200,9 +204,32 @@ struct ErrorBody {
 }
 
 struct ApiFail {
+    status: u16,
     message: String,
     code: String,
     role: String,
+}
+
+/// A failed token refresh. `revoked` is an explicit 401 or a revoked key.
+/// Anything else is transient and must not sign the computer out.
+#[derive(Debug)]
+pub struct RefreshError {
+    pub revoked: bool,
+    pub message: String,
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
+pub fn refresh_failure_revokes(status: u16, message: &str) -> bool {
+    status == 401
+        || message.to_ascii_lowercase().contains("revoked")
+        || message.contains("Sign in required")
 }
 
 fn api_base() -> String {
@@ -238,9 +265,10 @@ fn post_api(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> std::r
             } else {
                 format!("PJDesk could not sign in ({code}).")
             };
-            Err(ApiFail { message, code: parsed.code, role: parsed.role })
+            Err(ApiFail { status: code, message, code: parsed.code, role: parsed.role })
         }
         Err(ureq::Error::Transport(_)) => Err(ApiFail {
+            status: 0,
             message: "Could not reach pjdesk.com.".into(),
             code: String::new(),
             role: String::new(),
@@ -288,6 +316,7 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
                 os_family: c.os_family,
                 os_version: c.os_version,
                 console_user: c.console_user,
+                display_name: c.display_name,
                 last_seen: c.last_seen,
                 online: c.online,
             })
@@ -371,7 +400,16 @@ pub fn refresh(refresh_token: &str, device_id: &str, computers: Option<&serde_js
             body["computers"] = list.clone();
         }
     }
-    let text = post_json(&format!("{}/api/network/refresh", api_base()), None, &body)?;
+    let text = match post_api(&format!("{}/api/network/refresh", api_base()), None, &body) {
+        Ok(text) => text,
+        Err(fail) => {
+            return Err(RefreshError {
+                revoked: refresh_failure_revokes(fail.status, &fail.message),
+                message: fail.message,
+            }
+            .into());
+        }
+    };
     let reply: NetworkReply = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
     let email = String::new();
     session_from(&email, device_id, reply)
@@ -537,15 +575,37 @@ fn refresh_config_inner(config: &mut Config, force: bool) {
     if !force && config.network_access_exp > now + 120 && !config.network_access_token().is_empty() {
         return;
     }
+    if !force && now < NEXT_REFRESH_AT.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let body = computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden);
-    if let Ok(mut session) = refresh(&refresh_token, &device, Some(&body)) {
-        if session.email.is_empty() {
-            session.email = config.network_email.clone().unwrap_or_default();
+    match refresh(&refresh_token, &device, Some(&body)) {
+        Ok(mut session) => {
+            REFRESH_BACKOFF_SECS.store(15, std::sync::atomic::Ordering::Relaxed);
+            NEXT_REFRESH_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+            if session.email.is_empty() {
+                session.email = config.network_email.clone().unwrap_or_default();
+            }
+            config.apply_network_session(&session);
+            let _ = config.save();
         }
-        config.apply_network_session(&session);
-        let _ = config.save();
+        Err(err) => {
+            let revoked = err.downcast_ref::<RefreshError>().is_some_and(|e| e.revoked);
+            if revoked {
+                config.leave_network_sign_in();
+                let _ = config.save();
+                NEXT_REFRESH_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                let wait = REFRESH_BACKOFF_SECS.load(std::sync::atomic::Ordering::Relaxed).clamp(15, 300);
+                NEXT_REFRESH_AT.store(now.saturating_add(wait), std::sync::atomic::Ordering::Relaxed);
+                REFRESH_BACKOFF_SECS.store((wait.saturating_mul(2)).min(300), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 }
+
+static REFRESH_BACKOFF_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(15);
+static NEXT_REFRESH_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Copies the signed-in network onto the service config so an unattended host
 /// keeps the server after this user signs out of Windows.
@@ -596,6 +656,24 @@ pub fn clear_installer_network_key() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_transport_error_does_not_count_as_signed_out() {
+        assert!(!refresh_failure_revokes(0, "Could not reach pjdesk.com."));
+        assert!(!refresh_failure_revokes(503, "PJDesk could not sign in (503)."));
+        assert!(refresh_failure_revokes(401, "Sign in required."));
+        assert!(refresh_failure_revokes(401, "This network key was revoked."));
+    }
+
+    #[test]
+    fn an_old_config_file_is_still_signed_in() {
+        let raw = r#"{"network_email":"ben@spader.us","network_refresh":"plain:616263","device_id":"123456789","address_book":[{"id":"902488771","alias":"Cabin","password":null,"group":""}]}"#;
+        let cfg: crate::config::Config = serde_json::from_str(raw).unwrap();
+        assert_eq!(cfg.network_email.as_deref(), Some("ben@spader.us"));
+        assert!(!cfg.network_refresh_token().is_empty() || cfg.network_refresh.is_some());
+        assert_eq!(cfg.address_book.len(), 1);
+        assert_eq!(cfg.device_id.as_deref(), Some("123456789"));
+    }
 
     #[test]
     fn the_uploaded_computer_list_has_no_password() {

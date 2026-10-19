@@ -21,6 +21,7 @@ mod handoff;
 mod host;
 mod hostfacts;
 mod identity;
+mod idfmt;
 mod network;
 mod p2p;
 mod platform;
@@ -222,6 +223,26 @@ impl Default for HostArgs {
     }
 }
 
+/// Empty, or the word Desktop, is this user's Desktop. The word Downloads is that folder.
+pub fn resolve_receive_dir(configured: &str) -> String {
+    let text = configured.trim();
+    if text.eq_ignore_ascii_case("downloads") {
+        return home_folder("Downloads");
+    }
+    if !text.is_empty() && !text.eq_ignore_ascii_case("desktop") {
+        return text.to_string();
+    }
+    home_folder("Desktop")
+}
+
+fn home_folder(name: &str) -> String {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    match home {
+        Some(home) => std::path::PathBuf::from(home).join(name).to_string_lossy().into_owned(),
+        None => String::new(),
+    }
+}
+
 impl HostArgs {
     /// Builds host arguments from saved settings, using the permanent password
     /// if one is set (otherwise a fresh random password each start).
@@ -237,7 +258,7 @@ impl HostArgs {
             view_only: settings.view_only,
             follow_desktop: false,
             approval: if settings.approval == "unattended" { "unattended".into() } else { "prompt".into() },
-            receive_dir: settings.receive_dir.clone(),
+            receive_dir: resolve_receive_dir(&settings.receive_dir),
             allow_direct: settings.allow_direct,
             tunnel_ports: settings.tunnel_ports.clone(),
             service_host: false,
@@ -458,7 +479,7 @@ fn login_command(config: &mut Config, args: LoginArgs, server_flag: Option<Strin
 
 fn update_command(check: bool) -> Result<()> {
     use pjdesk_proto::update::Outcome;
-    match pjdesk_proto::update::perform(pjdesk_proto::UPDATE_REPO, env!("CARGO_PKG_VERSION"), "PJDesk-Setup", check)? {
+    match pjdesk_proto::update::perform_client(pjdesk_proto::UPDATE_REPO, env!("CARGO_PKG_VERSION"), check)? {
         Outcome::UpToDate(v) => println!("PJDesk {v} is up to date."),
         Outcome::Found(v) => println!("PJDesk {v} is available (run `pjdesk update` to install it)."),
         Outcome::Installing(v) => println!("Installing PJDesk {v}..."),

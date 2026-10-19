@@ -14,8 +14,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.ui.Alignment
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
@@ -142,6 +147,7 @@ class MainActivity : ComponentActivity() {
             var importPass by remember { mutableStateOf("") }
             var importFromPaste by remember { mutableStateOf(true) }
             var savePassword by remember { mutableStateOf(false) }
+            var askedPassword by remember { mutableStateOf("") }
             val scope = rememberCoroutineScope()
             val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
                 if (granted) netScan = true else netError = "Camera permission is needed to scan a network key."
@@ -426,6 +432,9 @@ class MainActivity : ComponentActivity() {
                         onNotifications = { askNotifications() },
                         onAccessibility = { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
                         onCapture = { askProjection(acceptAfter = false) },
+                        computerName = app.store.computerName,
+                        deviceLabel = engine.deviceLabel(),
+                        onComputerName = { engine.setDisplayName(it) },
                         onDone = {
                             app.store.onboarded = true
                             showOnboarding = false
@@ -447,18 +456,11 @@ class MainActivity : ComponentActivity() {
                                 0 -> HomeScreen(
                                     state = state,
                                     connectId = connectId,
-                                    connectPassword = connectPassword,
                                     connectName = connectComputerName(saved, connectId),
                                     onConnectId = { connectId = it },
-                                    onConnectPassword = { connectPassword = it },
-                                    savePassword = savePassword,
-                                    onSavePassword = { savePassword = it },
                                     onConnect = {
                                         val id = connectId.filter { it.isDigit() }
-                                        if (savePassword && connectPassword.isNotBlank()) {
-                                            app.store.saveComputerPassword(id, connectPassword)
-                                        }
-                                        val password = connectPassword.ifBlank { app.store.computerPassword(id) }
+                                        val password = app.store.computerPassword(id)
                                         engine.connect(connectId, password)
                                     },
                                     onCopyId = { copy(state.idFormatted) },
@@ -530,6 +532,9 @@ class MainActivity : ComponentActivity() {
                                 )
                                 else -> SettingsScreen(
                                     state = state,
+                                    computerName = app.store.computerName,
+                                    deviceLabel = engine.deviceLabel(),
+                                    onComputerName = { engine.setDisplayName(it) },
                                     theme = theme.value,
                                     onTheme = {
                                         theme.value = it
@@ -589,6 +594,43 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
+                }
+                if (state.askPassword) {
+                    AlertDialog(
+                        onDismissRequest = { engine.cancelPassword() },
+                        title = { Text("Password for ${state.askName.ifBlank { "this computer" }}") },
+                        text = {
+                            Column {
+                                if (state.askRejected) {
+                                    Text("That password was rejected. Enter the current one for this computer.")
+                                }
+                                OutlinedTextField(
+                                    value = askedPassword,
+                                    onValueChange = { askedPassword = it },
+                                    singleLine = true,
+                                    label = { Text("Computer password") },
+                                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                                )
+                                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                    Checkbox(checked = savePassword, onCheckedChange = { savePassword = it })
+                                    Text("Save password for this computer")
+                                }
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                val id = connectId.filter { it.isDigit() }
+                                if (savePassword && askedPassword.isNotBlank()) {
+                                    app.store.saveComputerPassword(id, askedPassword)
+                                }
+                                engine.submitPassword(askedPassword)
+                                askedPassword = ""
+                            }) { Text("Connect") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { engine.cancelPassword(); askedPassword = "" }) { Text("Cancel") }
+                        },
+                    )
                 }
                 val incoming = state.incoming
                 if (incoming != null && !pendingAccept) {

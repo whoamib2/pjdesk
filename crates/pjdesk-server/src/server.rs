@@ -856,6 +856,12 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
         },
 
+        ClientMsg::ReportDisplayName { name } => {
+            let Some(id) = conn.host_id.clone() else { return };
+            let name = name.chars().filter(|c| !c.is_control()).take(64).collect::<String>();
+            st.registry.note_display_name(&id, &name);
+        }
+
         ClientMsg::ReportHost { hostname, os_family, os_version, console_user } => {
             let Some(id) = conn.host_id.clone() else { return };
             let hostname = hostname.chars().filter(|c| !c.is_control()).take(64).collect::<String>();

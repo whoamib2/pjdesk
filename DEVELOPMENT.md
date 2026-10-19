@@ -142,7 +142,7 @@ pjdesk/
 │
 └── installer/
     ├── build.sh                       # builds both NSIS installers: installer/build.sh <version>
-    ├── pjdesk-client.nsi              # → PJDesk-Setup-<ver>.exe  (installs to C:\Program Files\PJDesk)
+    ├── pjdesk-client.nsi              # → PJDesk-Client-Setup-<ver>.exe (also copied to PJDesk-Setup-<ver>.exe)
     └── pjdesk-server.nsi              # → PJDesk-Server-Setup-<ver>.exe (installs to C:\Program Files\PJDesk Server)
 ```
 
@@ -293,10 +293,11 @@ in the server window; then Build 2 = clipboard sync + multi‑monitor tabs; then
 ### Release contract (what the auto‑updater requires)
 A GitHub Release whose **tag** parses to a version **higher** than installed
 (e.g. `v0.3.0`), containing assets named:
-- `PJDesk-Setup-<ver>.exe` (client installer, NSIS, supports `/S`)
+- `PJDesk-Client-Setup-<ver>.exe` (client installer, NSIS, supports `/S`)
+- `PJDesk-Setup-<ver>.exe` (the same bytes; installed 0.5.x and 0.6.x clients look up this name)
 - `PJDesk-Server-Setup-<ver>.exe` (server installer)
 - `SHA256SUMS` (lines `"<sha256>  <filename>"`; the updater verifies the installer
-  it downloads against this).
+  it downloads against this). Both client filenames are listed, with the same hash.
 Miss the naming or the checksum and auto‑update silently no‑ops or fails.
 
 ---

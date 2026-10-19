@@ -520,6 +520,7 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                     if since_report >= 5 {
                         since_report = 0;
                         signal.send(crate::hostfacts::report())?;
+                        signal.send(crate::hostfacts::display_name_report())?;
                     }
                 }
             }
@@ -596,6 +597,7 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                         report_host = true;
                         since_report = 0;
                         signal.send(crate::hostfacts::report())?;
+                        signal.send(crate::hostfacts::display_name_report())?;
                     }
                     ServerMsg::Error { message, .. } => warn!("Server: {message}"),
                     other => debug!("ignoring {other:?}"),
@@ -678,7 +680,7 @@ async fn session_inner(
     let punching = p2p::spawn_punching(binding.punch_socket, targets, session_id, Duration::from_secs(8));
 
     let passwords = state.auth_passwords();
-    let accepted = accept_authenticated(&endpoint, &passwords, &state.name, Duration::from_secs(20)).await;
+    let accepted = accept_authenticated(&endpoint, &passwords, &state.name, Duration::from_secs(90)).await;
     punching.abort();
     let (connection, auth) = accepted?;
     state.reset_failures();
@@ -747,9 +749,10 @@ async fn accept_authenticated(
     my_name: &str,
     limit: Duration,
 ) -> Result<(Connection, Authenticated)> {
-    const MAX_CONNECTIONS: usize = 4;
+    const MAX_CONNECTIONS: usize = 8;
     let deadline = tokio::time::Instant::now() + limit;
     let attempt_used = Arc::new(AtomicBool::new(false));
+    let mut wrong = 0u32;
     let mut pending: JoinSet<Result<(Connection, Authenticated)>> = JoinSet::new();
     let mut accepted = 0;
     loop {
@@ -770,7 +773,15 @@ async fn accept_authenticated(
             }
             Some(joined) = pending.join_next(), if !pending.is_empty() => match joined {
                 Ok(Ok(done)) => return Ok(done),
-                Ok(Err(e)) if e.is::<WrongPassword>() => return Err(e),
+                Ok(Err(e)) if e.is::<WrongPassword>() => {
+                    // The person can correct the password without asking this
+                    // computer to allow the session again.
+                    attempt_used.store(false, Ordering::SeqCst);
+                    wrong += 1;
+                    if wrong >= 5 {
+                        return Err(e);
+                    }
+                }
                 Ok(Err(e)) => debug!("a connection attempt failed: {e:#}"),
                 Err(_) => {}
             },
@@ -859,7 +870,12 @@ fn consent_grant(policy: &Policy, reply: ConsentReply) -> Option<(u32, String)> 
         return None;
     }
     let mut bits = reply.permissions & policy.max_permissions;
-    let dir = if bits & perms::FILE != 0 { reply.receive_dir } else { String::new() };
+    let dir = if bits & perms::FILE != 0 {
+        let chosen = reply.receive_dir.trim();
+        if chosen.is_empty() { crate::resolve_receive_dir("") } else { chosen.to_string() }
+    } else {
+        String::new()
+    };
     if dir.is_empty() {
         bits &= !perms::FILE;
     }

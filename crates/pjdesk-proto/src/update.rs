@@ -111,6 +111,41 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// True for the Windows client installer, including the older `PJDesk-Setup` name
+/// and a network-key rename. Never the server installer.
+pub fn is_client_installer(name: &str) -> bool {
+    let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    if !name.ends_with(".exe") || name.starts_with("PJDesk-Server-Setup") {
+        return false;
+    }
+    name.starts_with("PJDesk-Client-Setup") || name.starts_with("PJDesk-Setup")
+}
+
+fn pick_client_asset(assets: &[Asset]) -> Option<&Asset> {
+    assets
+        .iter()
+        .filter(|a| is_client_installer(&a.name) && !a.name.contains("pjdesk-net1:"))
+        .min_by_key(|a| if a.name.starts_with("PJDesk-Client-Setup") { 0 } else { 1 })
+}
+
+/// Latest client installer. Prefers `PJDesk-Client-Setup`, then `PJDesk-Setup`.
+pub fn check_client(repo: &str, current: &str) -> Result<Option<Available>> {
+    let body = http_get(&format!("https://api.github.com/repos/{repo}/releases/latest"))?;
+    let release: Release = serde_json::from_slice(&body).context("parsing the GitHub release")?;
+    if !is_newer(current, &release.tag_name) {
+        return Ok(None);
+    }
+    let installer = pick_client_asset(&release.assets)
+        .with_context(|| format!("release {} has no PJDesk client installer", release.tag_name))?;
+    let sums_url = release.assets.iter().find(|a| a.name == "SHA256SUMS").map(|a| a.browser_download_url.clone());
+    Ok(Some(Available {
+        version: release.tag_name.trim_start_matches('v').to_string(),
+        installer_name: installer.name.clone(),
+        installer_url: installer.browser_download_url.clone(),
+        sums_url,
+    }))
+}
+
 /// Looks up the repo's latest release and the installer whose name starts with
 /// `installer_prefix` (e.g. `PJDesk-Setup`). Returns `None` if not newer.
 pub fn check(repo: &str, current: &str, installer_prefix: &str) -> Result<Option<Available>> {
@@ -387,6 +422,20 @@ pub fn install_available(update: &Available) -> Result<()> {
     Ok(())
 }
 
+/// Client self-update. Prefers `PJDesk-Client-Setup` and still accepts `PJDesk-Setup`.
+pub fn perform_client(repo: &str, current: &str, check_only: bool) -> Result<Outcome> {
+    match check_client(repo, current)? {
+        None => Ok(Outcome::UpToDate(current.to_string())),
+        Some(update) => {
+            if check_only {
+                return Ok(Outcome::Found(update.version));
+            }
+            install_available(&update)?;
+            Ok(Outcome::Installing(update.version))
+        }
+    }
+}
+
 /// The whole flow: check, and unless `check_only`, download + verify + launch.
 pub fn perform(repo: &str, current: &str, installer_prefix: &str, check_only: bool) -> Result<Outcome> {
     match check(repo, current, installer_prefix)? {
@@ -467,8 +516,20 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa *PJDesk-Server-
     #[test]
     fn picks_right_installer_name() {
         // The client prefix must not match the server asset and vice versa.
-        assert!("PJDesk-Setup-0.3.0.exe".starts_with("PJDesk-Setup"));
+        assert!(is_client_installer("PJDesk-Setup-0.3.0.exe"));
+        assert!(is_client_installer("PJDesk-Client-Setup-0.6.2.exe"));
+        assert!(is_client_installer("PJDesk-Client-Setup-0.6.2--pjdesk-net1:abc.exe"));
+        assert!(is_client_installer("PJDesk-Setup-0.6.2--pjdesk-net1:abc.exe"));
+        assert!(!is_client_installer("PJDesk-Server-Setup-0.3.0.exe"));
         assert!(!"PJDesk-Server-Setup-0.3.0.exe".starts_with("PJDesk-Setup"));
         assert!("PJDesk-Server-Setup-0.3.0.exe".starts_with("PJDesk-Server-Setup"));
+        let assets = vec![
+            Asset { name: "PJDesk-Server-Setup-0.6.2.exe".into(), browser_download_url: "s".into() },
+            Asset { name: "PJDesk-Setup-0.6.2.exe".into(), browser_download_url: "old".into() },
+            Asset { name: "PJDesk-Client-Setup-0.6.2.exe".into(), browser_download_url: "new".into() },
+        ];
+        assert_eq!(pick_client_asset(&assets).map(|a| a.name.as_str()), Some("PJDesk-Client-Setup-0.6.2.exe"));
+        let legacy = vec![Asset { name: "PJDesk-Setup-0.6.2.exe".into(), browser_download_url: "old".into() }];
+        assert_eq!(pick_client_asset(&legacy).map(|a| a.name.as_str()), Some("PJDesk-Setup-0.6.2.exe"));
     }
 }

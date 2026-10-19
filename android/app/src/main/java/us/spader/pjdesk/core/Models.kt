@@ -39,6 +39,9 @@ data class DeskState(
     val session: SessionInfo? = null,
     val error: String? = null,
     val notice: String? = null,
+    val askPassword: Boolean = false,
+    val askName: String = "",
+    val askRejected: Boolean = false,
 )
 
 data class SavedComputer(

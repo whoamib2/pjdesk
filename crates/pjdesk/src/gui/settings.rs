@@ -44,6 +44,7 @@ pub struct SettingsDraft {
     theme: String,
     approval: String,
     receive_dir: String,
+    computer_name: String,
     allow_direct: bool,
     tunnel_ports: String,
 }
@@ -75,6 +76,7 @@ impl SettingsDraft {
             theme: normalize_theme(&s.theme),
             approval: if s.approval == "unattended" { "unattended".into() } else { "prompt".into() },
             receive_dir: s.receive_dir.clone(),
+            computer_name: crate::hostfacts::read_computer_name(),
             allow_direct: s.allow_direct,
             tunnel_ports: s.tunnel_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
         }
@@ -217,37 +219,30 @@ impl App {
 
     fn account_tab(&mut self, ui: &mut egui::Ui) {
         widgets::heading(ui, "PJDESK ACCOUNT");
-        match self.cfg.account.clone() {
-            Some(acct) => {
-                let who = if acct.display_name.is_empty() { acct.username.clone() } else { acct.display_name.clone() };
-                ui.label(RichText::new(who).strong().size(16.0));
-                ui.label(widgets::muted(ui, &format!("Signed in as {}", acct.username)));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Sign out").clicked() {
-                        self.sign_out();
-                    }
-                    if ui.button("Change password").clicked() {
-                        self.password_notice =
-                            "Choose a new password: at least 12 characters, with upper and lower case, a digit, and a symbol."
-                                .into();
-                        self.show_change = true;
-                    }
-                });
+        let email = self.cfg.network_email.clone().unwrap_or_default();
+        if email.trim().is_empty() {
+            ui.label("Sign in with your pjdesk.com account.");
+            ui.add_space(8.0);
+            if ui.button("Sign in").clicked() {
+                self.show_net_sign_in = true;
+                self.show_settings = false;
             }
-            None => {
-                ui.label("An older local account syncs an address book with the server you run. It is not the password for a computer.");
-                ui.add_space(8.0);
-                if ui.button("Sign in").clicked() {
-                    self.show_login = true;
-                    self.status.clear();
+        } else {
+            ui.label(RichText::new(email.trim()).strong().size(16.0));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Manage account").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab("https://pjdesk.com/account"));
                 }
-            }
+                if ui.button("Sign out").clicked() {
+                    self.sign_out_network();
+                }
+            });
         }
         ui.add_space(8.0);
         ui.label(widgets::muted(
             ui,
-            "Account passwords are checked by your server (12 characters, mixed case, a digit, a symbol). That rule does not apply to the permanent password for this computer.",
+            "The account is managed at pjdesk.com. Passwords for individual computers stay on this computer.",
         ));
     }
 
@@ -339,6 +334,10 @@ impl App {
             self.toast.show("Approve the administrator prompt to change automatic updates");
         }
 
+        if let Err(e) = crate::hostfacts::write_computer_name(d.computer_name.trim()) {
+            self.status = format!("Could not save this computer's name: {e}");
+        }
+
         self.save_cfg();
 
         if server_changed && self.scm_known && self.scm_installed {
@@ -417,6 +416,14 @@ fn nav(ui: &mut egui::Ui, tab: &mut Tab) {
 }
 
 fn general_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
+    widgets::heading(ui, "THIS COMPUTER");
+    ui.label("This computer's name");
+    widgets::text_field(ui, &mut d.computer_name, "Leave blank to use the Windows name", false);
+    ui.label(widgets::muted(
+        ui,
+        "Shown in Saved computers on every signed-in computer. A nickname typed in Saved computers replaces it on that screen only.",
+    ));
+    ui.add_space(12.0);
     widgets::heading(ui, "APPEARANCE");
     ui.label(widgets::muted(ui, "Match Windows follows the Windows app theme."));
     let before = d.theme.clone();
@@ -479,8 +486,11 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
     ui.add_space(12.0);
     widgets::heading(ui, "INCOMING FILES");
     widgets::field_label(ui, "Folder for files people send you");
-    widgets::text_field(ui, &mut d.receive_dir, "Empty refuses incoming files", false);
-    ui.label(widgets::muted(ui, "Leave this empty to refuse file transfer. Files are never executed."));
+    widgets::text_field(ui, &mut d.receive_dir, "Empty uses this computer's Desktop", false);
+    ui.label(widgets::muted(
+        ui,
+        "Files dropped on a remote session are saved here. Leave this empty to use the Desktop. Type Downloads to use that folder. Files are never executed.",
+    ));
 
     ui.add_space(12.0);
     widgets::heading(ui, "BACKGROUND SERVICE");

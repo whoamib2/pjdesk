@@ -230,7 +230,7 @@ Signature V4 for a customer's own bucket matches the AWS GET example and was not
 
 ### A4. Installers are not code-signed
 
-**Where:** release assets `PJDesk-Setup-<ver>.exe` and `PJDesk-Server-Setup-<ver>.exe`.
+**Where:** release assets `PJDesk-Client-Setup-<ver>.exe` (also published as `PJDesk-Setup-<ver>.exe`) and `PJDesk-Server-Setup-<ver>.exe`.
 
 **Status:** Deferred until there is a certificate. Checksums are required (H1). Do not turn on "reject unsigned" until releases are actually signed, or updates stop.
 

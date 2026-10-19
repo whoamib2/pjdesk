@@ -44,8 +44,12 @@ fun SettingsScreen(
     onImportPass: (String) -> Unit = {},
     onAcceptImport: () -> Unit = {},
     onDismissImport: () -> Unit = {},
+    computerName: String = "",
+    deviceLabel: String = "",
+    onComputerName: (String) -> Unit = {},
 ) {
     var server by rememberSaveable(state.server) { mutableStateOf(state.server) }
+    var name by rememberSaveable(computerName) { mutableStateOf(computerName) }
     Column(
         Modifier
             .fillMaxSize()
@@ -54,6 +58,20 @@ fun SettingsScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("Settings", style = MaterialTheme.typography.titleLarge)
+        Section("This phone") {
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it.take(64) },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("This phone's name") },
+                supportingText = {
+                    val shown = deviceLabel.ifBlank { "this phone" }
+                    Text("Computer name: $shown. Leave blank to use that. Other computers see this name unless they set a nickname.")
+                },
+            )
+            Button(onClick = { onComputerName(name.trim()) }) { Text("Save name") }
+        }
         Section("ID/Relay Server") {
             if (importOffer != null) {
                 ServerConfigOffer(
@@ -114,7 +132,7 @@ fun SettingsScreen(
             }
         }
         Section("About") {
-            Text("PJDesk 0.6.4", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.5", style = MaterialTheme.typography.titleMedium)
             Text(
                 "Android host and controller. Video is H.264 Annex-B from the hardware encoder, the same stream the Windows client decodes with OpenH264. The server comes from your PJDesk account after you sign in.",
                 color = pjMuted(),

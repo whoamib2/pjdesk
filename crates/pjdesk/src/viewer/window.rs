@@ -1702,7 +1702,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::DroppedFile(path) => {
-                let _ = self.cmds.send(super::controls::Cmd::SendFile(path));
+                for file in expand_drop(&path) {
+                    let _ = self.cmds.send(super::controls::Cmd::SendFile(file));
+                }
                 self.panel.open = true;
                 self.panel.tab = 0;
                 if let Some(window) = &self.window {
@@ -1754,4 +1756,29 @@ fn display_key(code: KeyCode) -> Option<usize> {
         KeyCode::Digit9 | KeyCode::Numpad9 => 8,
         _ => return None,
     })
+}
+
+/// A dropped file is sent as itself. A dropped folder is the files inside it.
+fn expand_drop(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    walk_drop(path, 0, &mut out);
+    out.truncate(200);
+    out
+}
+
+fn walk_drop(path: &std::path::Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+    if out.len() >= 200 || depth > 6 {
+        return;
+    }
+    if path.is_file() {
+        out.push(path.to_path_buf());
+        return;
+    }
+    if !path.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else { return };
+    for entry in entries.flatten() {
+        walk_drop(&entry.path(), depth + 1, out);
+    }
 }

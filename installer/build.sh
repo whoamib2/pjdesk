@@ -46,7 +46,8 @@ PJDesk - quick start
 1. Open PJDesk (Start menu or desktop).
 2. Your computer shows an ID and a one-time password. Give those to
    someone to let them control it - no setup or sign-in needed.
-3. To control another computer, type its ID and password, then Connect.
+3. To control another computer, type its ID and click Connect.
+   Enter the password when that computer answers.
 
 PJDesk connects through pjdesk.spader.us by default. To point it at your
 own PJDesk server instead, set the address in Settings (default port 21200).
@@ -64,13 +65,17 @@ cd "$WORK"
 makensis -DVERSION="$VERSION" pjdesk-client.nsi
 makensis -DVERSION="$VERSION" pjdesk-server.nsi
 
-mv -f "PJDesk-Setup-$VERSION.exe" "PJDesk-Server-Setup-$VERSION.exe" "$HERE/"
+mv -f "PJDesk-Client-Setup-$VERSION.exe" "PJDesk-Server-Setup-$VERSION.exe" "$HERE/"
+# Installed 0.5.x and 0.6.x clients look up PJDesk-Setup-<ver>.exe on GitHub.
+# The copy is byte-identical. SHA256SUMS lists both names with the same hash.
+cp -f "$HERE/PJDesk-Client-Setup-$VERSION.exe" "$HERE/PJDesk-Setup-$VERSION.exe"
 
 # Checksums the auto-updater verifies downloads against (upload with the release).
 cd "$HERE"
-sha256sum "PJDesk-Setup-$VERSION.exe" "PJDesk-Server-Setup-$VERSION.exe" > SHA256SUMS
+sha256sum "PJDesk-Client-Setup-$VERSION.exe" "PJDesk-Setup-$VERSION.exe" "PJDesk-Server-Setup-$VERSION.exe" > SHA256SUMS
 
 echo "Built:"
+echo "  $HERE/PJDesk-Client-Setup-$VERSION.exe"
 echo "  $HERE/PJDesk-Setup-$VERSION.exe"
 echo "  $HERE/PJDesk-Server-Setup-$VERSION.exe"
 echo "  $HERE/SHA256SUMS"

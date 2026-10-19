@@ -45,6 +45,10 @@ struct DeviceRecord {
     /// Missing before 0.6.2. Shown only to the account owner, not to other peers.
     #[serde(default)]
     console_user: String,
+    /// Friendly name chosen on the computer. Empty means show the hostname.
+    /// An empty report clears it. Missing before the display-name report.
+    #[serde(default)]
+    display_name: String,
 }
 
 /// One computer for the account's saved list. The user name stays on this server
@@ -55,6 +59,7 @@ pub struct PresenceRow {
     pub os_family: String,
     pub os_version: String,
     pub console_user: String,
+    pub display_name: String,
     pub last_seen: u64,
     pub signed_in: bool,
 }
@@ -292,6 +297,7 @@ impl Registry {
                 os_family: String::new(),
                 os_version: String::new(),
                 console_user: String::new(),
+                display_name: String::new(),
             },
         );
         self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
@@ -353,6 +359,16 @@ impl Registry {
         }
     }
 
+    /// Stores the friendly name. Unlike the hostname, an empty name clears it.
+    pub fn note_display_name(&mut self, id: &str, name: &str) {
+        let Some(record) = self.data.devices.get_mut(id) else { return };
+        record.display_name = clip(name, 64);
+        record.last_seen = now();
+        if let Err(e) = self.save() {
+            tracing::warn!("could not save a display name: {e}");
+        }
+    }
+
     /// Every registered computer, for the account list. Online is decided by the caller.
     pub fn presence(&self) -> Vec<PresenceRow> {
         self.data
@@ -364,6 +380,7 @@ impl Registry {
                 os_family: d.os_family.clone(),
                 os_version: d.os_version.clone(),
                 console_user: d.console_user.clone(),
+                display_name: d.display_name.clone(),
                 last_seen: d.last_seen,
                 signed_in: d.signed_in,
             })

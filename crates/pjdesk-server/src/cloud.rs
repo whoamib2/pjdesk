@@ -1657,6 +1657,7 @@ fn publish_presence(data_dir: &Path) {
             "os_family": row.os_family,
             "os_version": row.os_version,
             "console_user": row.console_user,
+            "display_name": row.display_name,
             "last_seen": row.last_seen,
             "online": online.contains(&row.id),
             "signed_in": row.signed_in,

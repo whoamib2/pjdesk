@@ -77,6 +77,10 @@ pub enum ClientMsg {
         os_version: String,
         console_user: String,
     },
+    /// 0.6.2+. Friendly name for this computer. Sent only after
+    /// [`ServerMsg::WantHostReport`]. An empty name clears the stored one
+    /// so other computers show the hostname.
+    ReportDisplayName { name: String },
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -295,6 +299,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(report[0], 17, "ReportHost is appended after PresentAccess");
+        let named = postcard::to_stdvec(&ClientMsg::ReportDisplayName { name: "Cabin".into() }).unwrap();
+        assert_eq!(named[0], 18, "ReportDisplayName is appended after ReportHost");
         let ask = postcard::to_stdvec(&ServerMsg::WantHostReport).unwrap();
         assert_eq!(ask[0], 12, "WantHostReport is appended after Audit");
         let back: ClientMsg = postcard::from_bytes(&ping).unwrap();

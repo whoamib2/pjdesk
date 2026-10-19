@@ -54,6 +54,7 @@ class Engine(context: Context) : EngineListener {
                 .put("os_family", "android")
                 .put("os_version", Build.VERSION.RELEASE ?: "")
                 .put("console_user", profileName(app))
+                .put("display_name", store.computerName)
                 .toString(),
         )
         pushPermanent()
@@ -69,6 +70,21 @@ class Engine(context: Context) : EngineListener {
         val h = handle.get()
         if (h != 0L) Native.nativeSubmitVideo(h, data, width, height, keyframe, encodeUs)
     }
+
+    fun submitPassword(password: String) = command(
+        JSONObject().put("cmd", "submitPassword").put("password", password).toString(),
+    )
+
+    fun cancelPassword() = command("""{"cmd":"cancelPassword"}""")
+
+    /** Blank clears the friendly name so other computers see the device name. */
+    fun setDisplayName(name: String) {
+        val cleaned = name.trim().filter { !it.isISOControl() }.take(64)
+        store.computerName = cleaned
+        command(JSONObject().put("cmd", "hostFacts").put("display_name", cleaned).toString())
+    }
+
+    fun deviceLabel(): String = deviceName(app)
 
     fun connect(id: String, password: String) = command(
         JSONObject().put("cmd", "connect").put("id", id).put("password", password).toString(),
@@ -250,7 +266,15 @@ class Engine(context: Context) : EngineListener {
                 if (text == "Ready" && (it.hosting || it.incoming != null || it.session != null)) it
                 else it.copy(status = text)
             }
-            "error" -> update { it.copy(error = event.optString("text")) }
+            "needPassword" -> update {
+                it.copy(
+                    askPassword = true,
+                    askName = event.optString("name"),
+                    askRejected = event.optBoolean("rejected"),
+                    error = if (event.optBoolean("rejected")) "That password was rejected." else it.error,
+                )
+            }
+            "error" -> update { it.copy(error = event.optString("text"), askPassword = false) }
             "incoming" -> update {
                 it.copy(
                     incoming = IncomingCall(event.optString("name"), event.optString("ip")),
@@ -260,6 +284,7 @@ class Engine(context: Context) : EngineListener {
             "hosting" -> update { it.copy(hosting = true, incoming = null, status = "Being controlled by ${event.optString("peer")}") }
             "controlling" -> update {
                 it.copy(
+                    askPassword = false,
                     session = SessionInfo(
                         peer = event.optString("peer"),
                         id = event.optString("id"),

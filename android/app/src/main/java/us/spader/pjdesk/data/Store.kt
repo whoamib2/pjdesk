@@ -39,6 +39,17 @@ class Store(context: Context) {
         get() = prefs.getString("theme", "system") ?: "system"
         set(value) { prefs.edit().putString("theme", value).apply() }
 
+    /**
+     * The name this phone reports to other computers. Empty means the Android
+     * device name (or the model) is used. Survives an app update; uninstall clears it.
+     */
+    var computerName: String
+        get() = prefs.getString("computerName", "") ?: ""
+        set(value) {
+            val cleaned = value.trim().filter { !it.isISOControl() }.take(64)
+            prefs.edit().putString("computerName", cleaned).apply()
+        }
+
     /** Decrypted permanent password, or empty when none is saved. */
     val permanent: String
         get() = secret.read()

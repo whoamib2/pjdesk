@@ -683,12 +683,27 @@ async function adminSetSync(request, env) {
 const RELEASE_TTL_MS = 10 * 60 * 1000;
 let releaseMemo = null; // { info, at } — kept for the life of this Worker instance
 
-function releaseInfo(repo, tag) {
+async function assetExists(url) {
+  try {
+    const res = await fetch(url, { method: "HEAD", redirect: "manual", headers: { "user-agent": "pjdesk-cloud" } });
+    return res.status === 200 || res.status === 301 || res.status === 302;
+  } catch {
+    return false;
+  }
+}
+
+async function releaseInfo(repo, tag) {
   const version = tag.replace(/^v/, "");
   const base = `https://github.com/${repo}/releases/download/${tag}`;
+  const clientNew = `${base}/PJDesk-Client-Setup-${version}.exe`;
+  const clientOld = `${base}/PJDesk-Setup-${version}.exe`;
+  // HEAD the release asset. Do not call the GitHub API: that limit is shared
+  // by every Worker on this Cloudflare address. 200 or 302 means the file is there.
+  let client = clientNew;
+  if (!(await assetExists(clientNew)) && (await assetExists(clientOld))) client = clientOld;
   return {
     version,
-    client: `${base}/PJDesk-Setup-${version}.exe`,
+    client,
     server: `${base}/PJDesk-Server-Setup-${version}.exe`,
     sums: `${base}/SHA256SUMS`,
     notes: `https://github.com/${repo}/releases/tag/${tag}`,
@@ -736,7 +751,7 @@ async function latestRelease(env) {
     if (releaseMemo) return releaseMemo.info; // stale is better than nothing
     throw new HttpError(502, "Couldn't reach GitHub for the latest release.");
   }
-  const info = releaseInfo(env.RELEASE_REPO, tag);
+  const info = await releaseInfo(env.RELEASE_REPO, tag);
   releaseMemo = { info, at: Date.now() };
   return info;
 }

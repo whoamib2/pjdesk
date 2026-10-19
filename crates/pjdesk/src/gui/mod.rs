@@ -39,12 +39,11 @@ enum MainPage {
     Saved,
 }
 
-/// Which list is showing under the connect form.
+/// Which computer list is showing beside Connect.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DeskTab {
+    Saved,
     Recent,
-    Favorites,
-    Address,
     Lan,
 }
 
@@ -60,8 +59,8 @@ pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([1040.0, 680.0])
+            .with_inner_size([1360.0, 840.0])
+            .with_min_inner_size([920.0, 680.0])
             .with_title("PJDesk")
             .with_app_id("pjdesk")
             .with_icon(std::sync::Arc::new(app_icon())),
@@ -222,6 +221,11 @@ pub struct App {
     prompt_remember: bool,
     prompt_files: bool,
     prompt_rejected: bool,
+    prompt_checking: bool,
+    prompt_direct: Option<String>,
+    /// Viewer is waiting for a password after the other computer answered.
+    ask_path: Option<std::path::PathBuf>,
+    ask_alive: bool,
     viewer_rx: Vec<Receiver<(String, i32, bool)>>,
 
     /// Background service / scheduled-task snapshot. Never queried on this thread.
@@ -316,7 +320,7 @@ impl App {
             settings,
             book_alias: String::new(),
             book_target: None,
-            desk_tab: DeskTab::Recent,
+            desk_tab: DeskTab::Saved,
             page: MainPage::Connect,
             saved_query: String::new(),
             saved_sort: saved::SavedSort::Recent,
@@ -331,6 +335,10 @@ impl App {
             prompt_remember: false,
             prompt_files: false,
             prompt_rejected: false,
+            prompt_checking: false,
+            prompt_direct: None,
+            ask_path: None,
+            ask_alive: false,
             viewer_rx: Vec::new(),
             probe: if preview { None } else { Some(probe::Probe::start(cc.egui_ctx.clone())) },
             scm_installed: false,
@@ -1141,10 +1149,10 @@ impl App {
         let from_store = typed.trim().is_empty();
         let password = if from_store { self.cfg.saved_password(&id).unwrap_or_default() } else { typed };
         if password.is_empty() {
-            self.open_prompt(&id, files, false);
+            self.spawn_ask(&id, files, None);
             return;
         }
-        let remember = !from_store && self.remember;
+        let remember = !from_store && self.prompt_remember;
         self.spawn_viewer(&id, &password, files, remember, from_store);
     }
 
@@ -1176,6 +1184,11 @@ impl App {
         cmd.arg("--server").arg(server).arg("connect").arg(id);
         if !password.is_empty() {
             cmd.env("PJDESK_PASSWORD", password);
+        }
+        if let Some(path) = &self.ask_path {
+            if password.is_empty() {
+                cmd.env("PJDESK_ASK", path);
+            }
         }
         if files {
             cmd.env("PJDESK_OPEN_PANEL", "files");
@@ -1241,8 +1254,76 @@ impl App {
             }
         }
         if let Some((id, files)) = reopen {
-            self.open_prompt(&id, files, true);
+            self.ask_alive = false;
+            self.prompt_checking = false;
+            self.prompt_id = id;
+            self.prompt_files = files;
+            self.prompt_rejected = true;
+            self.prompt_open = true;
+            if self.prompt_password.is_empty() {
+                self.prompt_show = false;
+            }
         }
+    }
+
+    /// Starts a viewer that asks for the password only after the other computer answers.
+    fn spawn_ask(&mut self, id: &str, files: bool, direct: Option<String>) {
+        let path = std::env::temp_dir().join(format!("pjdesk-ask-{}", std::process::id()));
+        let _ = std::fs::write(&path, "wait\n");
+        let mut reply = path.as_os_str().to_os_string();
+        reply.push(".reply");
+        let _ = std::fs::remove_file(reply);
+        self.ask_path = Some(path);
+        self.ask_alive = true;
+        self.prompt_open = false;
+        self.prompt_checking = false;
+        self.prompt_rejected = false;
+        self.prompt_password.clear();
+        self.prompt_id = id.to_string();
+        self.prompt_files = files;
+        self.prompt_direct = direct.clone();
+        self.prompt_remember = self.cfg.settings.remember_passwords;
+        if let Some(addr) = direct {
+            self.spawn_direct_viewer(&addr);
+        } else {
+            self.spawn_viewer(id, "", files, false, false);
+        }
+    }
+
+    fn poll_ask(&mut self) {
+        let Some(path) = self.ask_path.clone() else { return };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        if text.starts_with("accepted") {
+            if self.prompt_remember && self.prompt_direct.is_none() {
+                let id = normalize_id(&self.prompt_id);
+                if is_valid_id(&id) && !self.prompt_password.is_empty() {
+                    self.cfg.remember_password(&id, Some(&self.prompt_password));
+                    let _ = self.cfg.save();
+                }
+            }
+            self.prompt_open = false;
+            self.prompt_checking = false;
+            self.ask_path = None;
+            self.ask_alive = false;
+            return;
+        }
+        if text.starts_with("ready") || text.starts_with("rejected") {
+            if !self.prompt_open {
+                self.prompt_open = true;
+                self.prompt_remember = self.cfg.settings.remember_passwords;
+            }
+            if text.starts_with("rejected") {
+                self.prompt_rejected = true;
+                self.prompt_checking = false;
+            }
+        }
+    }
+
+    fn write_ask_reply(&self, body: &str) {
+        let Some(path) = &self.ask_path else { return };
+        let mut reply = path.as_os_str().to_os_string();
+        reply.push(".reply");
+        let _ = std::fs::write(reply, body);
     }
 
     fn connect_direct(&mut self, addr: &str) {
@@ -1251,8 +1332,11 @@ impl App {
             self.status = "Enter an address, such as 192.168.1.20.".into();
             return;
         }
+        self.spawn_ask(&addr, false, Some(addr.clone()));
+    }
+
+    fn spawn_direct_with_password(&mut self, addr: &str, password: &str) {
         let server = self.cfg.effective_server();
-        let password = self.connect_password.clone();
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(e) => {
@@ -1261,9 +1345,40 @@ impl App {
             }
         };
         let mut cmd = std::process::Command::new(exe);
-        cmd.arg("--server").arg(server).arg("connect").arg("--direct").arg(&addr);
-        if !password.is_empty() {
-            cmd.env("PJDESK_PASSWORD", &password);
+        cmd.arg("--server").arg(server).arg("connect").arg("--direct").arg(addr);
+        cmd.env("PJDESK_PASSWORD", password);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let id = addr.to_string();
+                std::thread::spawn(move || {
+                    let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+                    let _ = tx.send((id, code, false));
+                });
+                self.viewer_rx.push(rx);
+            }
+            Err(e) => self.status = format!("Could not open the viewer: {e}"),
+        }
+    }
+
+    fn spawn_direct_viewer(&mut self, addr: &str) {
+        let server = self.cfg.effective_server();
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                self.status = format!("Can't find the PJDesk program: {e}");
+                return;
+            }
+        };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--server").arg(server).arg("connect").arg("--direct").arg(addr);
+        if let Some(path) = &self.ask_path {
+            cmd.env("PJDESK_ASK", path);
         }
         #[cfg(windows)]
         {
@@ -1271,7 +1386,16 @@ impl App {
             cmd.creation_flags(0x0800_0000);
         }
         match cmd.spawn() {
-            Ok(_) => self.toast.show(format!("Opening {addr}")),
+            Ok(mut child) => {
+                self.toast.show(format!("Opening {addr}"));
+                let (tx, rx) = std::sync::mpsc::channel();
+                let id = addr.to_string();
+                std::thread::spawn(move || {
+                    let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+                    let _ = tx.send((id, code, false));
+                });
+                self.viewer_rx.push(rx);
+            }
             Err(e) => self.status = format!("Could not open the viewer: {e}"),
         }
     }
@@ -1353,6 +1477,7 @@ impl eframe::App for App {
         self.poll_saved_refresh();
         self.poll_password();
         self.poll_probe();
+        self.poll_ask();
         self.poll_viewers();
         self.notice_sign_in_paste(&ctx);
 

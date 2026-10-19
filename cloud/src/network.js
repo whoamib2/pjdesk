@@ -533,6 +533,9 @@ export function applyPresence(prev, next) {
     os_family: osFamily || prev.os_family || "",
     os_version: osVersion || prev.os_version || "",
     console_user: user || prev.console_user || "",
+    display_name: Object.prototype.hasOwnProperty.call(next, "display_name")
+      ? cleanLabel(next.display_name, 64)
+      : prev.display_name || "",
     last_seen: Math.max(Number(prev.last_seen) || 0, last),
     online: next.online ? 1 : 0,
     signed_in: next.signed_in ? 1 : 0,
@@ -547,6 +550,7 @@ export function presenceView(row, role) {
     os_family: row.os_family || "",
     os_version: row.os_version || "",
     console_user: role === "owner" ? row.console_user || "" : "",
+    display_name: row.display_name || "",
     last_seen: Number(row.last_seen) || 0,
     online: !!row.online,
     signed_in: !!row.signed_in,
@@ -558,11 +562,16 @@ function missingPresence(err) {
   return /no such table/i.test(message);
 }
 
+function missingDisplay(err) {
+  const message = String(err?.message || err);
+  return /no such column: display_name/i.test(message);
+}
+
 async function presenceFor(env, networkId, role) {
   try {
     const cutoff = now() - 90 * 24 * 3600;
     const { results } = await env.DB.prepare(
-      `SELECT pjdesk_id, hostname, os_family, os_version, console_user, last_seen, online, signed_in
+      `SELECT pjdesk_id, hostname, os_family, os_version, console_user, display_name, last_seen, online, signed_in
          FROM network_presence WHERE network_id = ? AND last_seen >= ? ORDER BY last_seen DESC LIMIT 500`,
     )
       .bind(networkId, cutoff)
@@ -575,6 +584,7 @@ async function presenceFor(env, networkId, role) {
           os_family: row.os_family,
           os_version: row.os_version,
           console_user: row.console_user,
+          display_name: row.display_name,
           last_seen: row.last_seen,
           online: row.online,
           signed_in: row.signed_in,
@@ -583,9 +593,35 @@ async function presenceFor(env, networkId, role) {
       ),
     );
   } catch (err) {
+    if (missingDisplay(err)) return presenceForLegacy(env, networkId, role);
     if (missingPresence(err)) return [];
     throw err;
   }
+}
+
+async function presenceForLegacy(env, networkId, role) {
+  const cutoff = now() - 90 * 24 * 3600;
+  const { results } = await env.DB.prepare(
+    `SELECT pjdesk_id, hostname, os_family, os_version, console_user, last_seen, online, signed_in
+       FROM network_presence WHERE network_id = ? AND last_seen >= ? ORDER BY last_seen DESC LIMIT 500`,
+  )
+    .bind(networkId, cutoff)
+    .all();
+  return (results || []).map((row) =>
+    presenceView(
+      {
+        id: row.pjdesk_id,
+        hostname: row.hostname,
+        os_family: row.os_family,
+        os_version: row.os_version,
+        console_user: row.console_user,
+        last_seen: row.last_seen,
+        online: row.online,
+        signed_in: row.signed_in,
+      },
+      role,
+    ),
+  );
 }
 
 async function accountRole(env, network, account) {
@@ -977,13 +1013,14 @@ async function postPresence(request, env, account) {
     stmts.push(
       env.DB.prepare(
         `INSERT INTO network_presence
-           (network_id, pjdesk_id, hostname, os_family, os_version, console_user, last_seen, online, signed_in)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           (network_id, pjdesk_id, hostname, os_family, os_version, console_user, display_name, last_seen, online, signed_in)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(network_id, pjdesk_id) DO UPDATE SET
            hostname = CASE WHEN excluded.hostname != '' THEN excluded.hostname ELSE network_presence.hostname END,
            os_family = CASE WHEN excluded.os_family != '' THEN excluded.os_family ELSE network_presence.os_family END,
            os_version = CASE WHEN excluded.os_version != '' THEN excluded.os_version ELSE network_presence.os_version END,
            console_user = CASE WHEN excluded.console_user != '' THEN excluded.console_user ELSE network_presence.console_user END,
+           display_name = excluded.display_name,
            last_seen = CASE WHEN excluded.last_seen > network_presence.last_seen THEN excluded.last_seen ELSE network_presence.last_seen END,
            online = excluded.online,
            signed_in = excluded.signed_in`,
@@ -994,6 +1031,7 @@ async function postPresence(request, env, account) {
         next.os_family,
         next.os_version,
         next.console_user,
+        next.display_name,
         next.last_seen,
         next.online,
         next.signed_in,
@@ -1004,7 +1042,7 @@ async function postPresence(request, env, account) {
   try {
     await env.DB.batch(stmts);
   } catch (err) {
-    if (missingPresence(err)) return json({ ok: false, count: 0 });
+    if (missingDisplay(err) || missingPresence(err)) return json({ ok: false, count: 0 });
     throw err;
   }
   return json({ ok: true, count: stmts.length });

@@ -268,3 +268,14 @@ test("a saved computer has no password field in the canonical record", () => {
   });
   assert.equal(text.includes("password"), false);
 });
+
+test("an empty display name clears, and a missing one does not", () => {
+  const named = applyPresence({ hostname: "CABINDESK", display_name: "Cabin" }, { display_name: "" });
+  assert.equal(named.display_name, "");
+  assert.equal(named.hostname, "CABINDESK");
+  const kept = applyPresence({ display_name: "Cabin", hostname: "CABINDESK" }, { hostname: "" });
+  assert.equal(kept.display_name, "Cabin");
+  const view = presenceView({ id: "1", hostname: "CABINDESK", display_name: "Cabin", console_user: "Ben" }, "member");
+  assert.equal(view.display_name, "Cabin");
+  assert.equal(view.console_user, "");
+});

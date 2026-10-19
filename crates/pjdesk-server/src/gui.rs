@@ -76,16 +76,10 @@ struct App {
     log_tail: String,
     status: String,
 
-    new_user: String,
-    new_pass: String,
-    new_admin: bool,
-    /// The optional form for an older local account. Hidden until opened.
-    legacy_add: bool,
     last_refresh: std::time::Instant,
     tray: Option<crate::tray::Tray>,
     really_quit: bool,
     told_tray: bool,
-    show_new_pass: bool,
     update_start: String,
     update_end: String,
 
@@ -216,15 +210,10 @@ impl App {
             online: HashMap::new(),
             log_tail: String::new(),
             status: String::new(),
-            new_user: String::new(),
-            new_pass: String::new(),
-            new_admin: false,
-            legacy_add: false,
             last_refresh: std::time::Instant::now(),
             tray: crate::tray::Tray::new(&cc.egui_ctx),
             really_quit: false,
             told_tray: false,
-            show_new_pass: false,
             update_start: String::new(),
             update_end: String::new(),
             cloud: None,
@@ -1177,17 +1166,22 @@ impl App {
         }
         let may_edit = self.may_edit_settings();
         card(ui, |ui| {
-            heading(ui, "OLDER LOCAL ACCOUNTS");
+            heading(ui, "PJDESK ACCOUNT");
+            if self.signed_in_email().is_empty() {
+                ui.label(RichText::new("Sign in with your pjdesk.com account.").strong().color(p(ui).text));
+            } else {
+                ui.label(RichText::new(format!("Signed in as {}", self.signed_in_email())).strong().color(p(ui).text));
+            }
             ui.label(
                 RichText::new(
-                    "Kept so an older client can still sign in and sync its address book. A new server does not need these. Computers sign in with the PJDesk account, and network access follows that account.",
+                    "Older local accounts in accounts.json are left on this computer and are not used to sign in. Connections keep working.",
                 )
                 .color(p(ui).muted)
                 .size(12.0),
             );
             ui.add_space(6.0);
 
-            if self.accounts.is_empty() && !self.legacy_add {
+            if self.accounts.is_empty() {
                 ui.label(
                     RichText::new("None. A new server does not need these. Computers sign in with the PJDesk account.")
                         .color(p(ui).muted),
@@ -1217,7 +1211,7 @@ impl App {
                 });
             }
 
-            if !may_edit && (!self.accounts.is_empty() || self.legacy_add) {
+            if !may_edit && !self.accounts.is_empty() {
                 let why = if !self.can_write {
                     "Restart as administrator to change these. Windows protects the data folder. There is no separate PJDesk password."
                 } else {
@@ -1227,67 +1221,7 @@ impl App {
             }
 
             ui.add_space(8.0);
-            if !self.legacy_add {
-                if ui.button("Add an older local account").clicked() {
-                    self.legacy_add = true;
-                }
-            } else {
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(RichText::new("Add an older local account").color(p(ui).muted).size(12.0));
-                ui.add_enabled_ui(may_edit, |ui| {
-                    egui::Grid::new("newacct").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                        ui.label("Username");
-                        ui.text_edit_singleline(&mut self.new_user);
-                        ui.end_row();
-                        ui.label("Password");
-                        ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut self.new_pass).password(!self.show_new_pass));
-                            reveal_toggle(ui, &mut self.show_new_pass);
-                        });
-                        ui.end_row();
-                    });
-                    if !self.new_pass.is_empty() {
-                        let report = crate::password_policy::evaluate(&self.new_pass, &self.new_user);
-                        let word = match report.score {
-                            0 => "empty",
-                            1 => "too weak",
-                            2 => "acceptable",
-                            3 => "strong",
-                            _ => "very strong",
-                        };
-                        ui.label(
-                            RichText::new(format!("Strength: {word}"))
-                                .color(if report.ok { p(ui).ok } else { p(ui).warn })
-                                .size(12.0),
-                        );
-                        for check in &report.checks {
-                            let mark = if check.met { "Met" } else { "Need" };
-                            let color = if check.met { p(ui).ok } else { p(ui).muted };
-                            ui.label(RichText::new(format!("{mark} — {}", check.label)).color(color).size(11.0));
-                        }
-                    }
-                    ui.horizontal(|ui| {
-                        ui_widgets::checkbox(ui, &mut self.new_admin, "Administrator");
-                        if ui.add(egui::Button::new("Add").fill(p(ui).accent)).clicked() {
-                            let (u, p, admin) =
-                                (self.new_user.trim().to_string(), self.new_pass.clone(), self.new_admin);
-                            if let Some(mut accts) = self.accounts_mut() {
-                                match accts.create(&u, &p, admin, false) {
-                                    Ok(()) => {
-                                        self.status = format!("Added account \"{}\"", accounts::normalize_username(&u));
-                                        self.new_user.clear();
-                                        self.new_pass.clear();
-                                        self.new_admin = false;
-                                        self.refresh();
-                                    }
-                                    Err(e) => self.status = format!("{e}"),
-                                }
-                            }
-                        }
-                    });
-                });
-            }
+            ui.label(RichText::new("Manage the account at pjdesk.com.").color(p(ui).muted).size(12.0));
 
             if let Some(u) = remove {
                 if let Some(mut accts) = self.accounts_mut() {

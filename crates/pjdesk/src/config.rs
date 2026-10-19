@@ -184,6 +184,9 @@ pub struct PeerNote {
     /// User order in Saved. 0 means unordered. Not a password and not uploaded by itself.
     #[serde(default)]
     pub sort_order: u32,
+    /// Friendly name reported by that computer. A nickname typed here still wins on this screen.
+    #[serde(default)]
+    pub display_name: String,
     /// When the account's server last saw this computer. 0 until then.
     #[serde(default)]
     pub last_seen: u64,
@@ -607,6 +610,9 @@ impl Config {
             if !row.console_user.trim().is_empty() {
                 note.console_user = row.console_user.trim().to_string();
             }
+            if let Some(name) = &row.display_name {
+                note.display_name = name.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+            }
             if row.last_seen > note.last_seen {
                 note.last_seen = row.last_seen;
             }
@@ -995,6 +1001,7 @@ mod tests {
                 os_family: "android".into(),
                 os_version: "16".into(),
                 console_user: String::new(),
+                display_name: Some("Pocket".into()),
                 last_seen: 20,
                 online: true,
             },
@@ -1004,6 +1011,7 @@ mod tests {
                 os_family: "windows".into(),
                 os_version: "11".into(),
                 console_user: "SPADER\\Ben".into(),
+                display_name: None,
                 last_seen: 50,
                 online: false,
             },
@@ -1011,6 +1019,7 @@ mod tests {
         assert_eq!(c.address_book.iter().find(|e| e.id == "386626882").unwrap().alias, "Pixel");
         let pixel = c.settings.peers.get("386626882").unwrap();
         assert_eq!(pixel.hostname, "Pixel 11");
+        assert_eq!(pixel.display_name, "Pocket");
         assert_eq!(pixel.console_user, "Ben");
         assert_eq!(pixel.os_family, "android");
         assert!(pixel.reported_online);

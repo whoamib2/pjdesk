@@ -14,7 +14,7 @@ Connections are **peer-to-peer** whenever UDP hole punching works, and are **rel
 ## Getting started
 
 1. **Run the server.** Install `PJDesk-Server-Setup` on a computer that stays on (or build it and run `pjdesk-server`). Tick "run as a service" so it starts with Windows. Note its address — a hostname or LAN IP — and, for use over the internet, forward TCP + UDP 21200 to it.
-2. **Install the app.** Run `PJDesk-Setup` on each computer. Open PJDesk, go to **Settings ▸ Network**, and enter your server's address.
+2. **Install the app.** Run `PJDesk-Client-Setup` on each computer (the same file is also published as `PJDesk-Setup` so an already-installed copy can update). Open PJDesk, go to **Settings ▸ Network**, and enter your server's address.
 3. **Connect.** Your computer now shows a 9-digit **ID** and a password. Give those to someone, or type another computer's ID and password to control it.
 4. **(Optional) Always-on access.** In **Settings ▸ Security**, install the **background service** to reach this computer before anyone signs in and during UAC prompts. Set a permanent password there too.
 5. **Sign in.** Use the same PJDesk account (pjdesk.com) in the app and in the PJDesk Server window. That one login is Cloud Sync, the server's role, and My network. An older local account (`pjdesk-server account add`) still works for an address book. A new server does not need one.

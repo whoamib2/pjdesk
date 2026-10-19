@@ -35,6 +35,44 @@ pub fn remember_console_user(path: &Path, live: &str) -> String {
     std::fs::read_to_string(path).ok().map(|s| sanitize(&s, 80)).unwrap_or_default()
 }
 
+pub fn computer_name_path() -> std::path::PathBuf {
+    crate::syspaths::program_data_dir().join("computer-name.txt")
+}
+
+/// The friendly name saved for this computer. Empty means use the hostname.
+pub fn read_computer_name() -> String {
+    std::fs::read_to_string(computer_name_path()).ok().map(|s| sanitize(&s, 64)).unwrap_or_default()
+}
+
+/// Writes the friendly name where the installer, the app, and the service can read it.
+pub fn write_computer_name(name: &str) -> std::io::Result<()> {
+    let path = computer_name_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let name = sanitize(name, 64);
+    std::fs::write(&path, &name)?;
+    #[cfg(windows)]
+    grant_users_modify(&path);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn grant_users_modify(path: &Path) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F", "*S-1-5-32-545:M", "/Q"])
+        .creation_flags(0x0800_0000)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+pub fn display_name_report() -> ClientMsg {
+    ClientMsg::ReportDisplayName { name: read_computer_name() }
+}
+
 pub fn report() -> ClientMsg {
     let (os_family, os_version) = os_facts();
     ClientMsg::ReportHost {

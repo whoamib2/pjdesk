@@ -33,7 +33,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.4";
+pub const APP_VERSION: &str = "0.6.5";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -70,6 +70,7 @@ struct HostFacts {
     os_family: String,
     os_version: String,
     console_user: String,
+    display_name: String,
 }
 
 struct State {
@@ -90,6 +91,7 @@ struct State {
     /// Bumped to end the current session. The host registration keeps running.
     gen: AtomicU64,
     approval_tx: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
+    password_tx: Mutex<Option<oneshot::Sender<String>>>,
     end_reason: Mutex<String>,
     control: Mutex<Option<mpsc::UnboundedSender<ControlMsg>>>,
     video: Mutex<Option<Arc<VideoOut>>>,
@@ -154,6 +156,7 @@ impl Engine {
             capture: Mutex::new((1080, 2400)),
             gen: AtomicU64::new(1),
             approval_tx: Mutex::new(None),
+            password_tx: Mutex::new(None),
             end_reason: Mutex::new(String::new()),
             control: Mutex::new(None),
             video: Mutex::new(None),
@@ -327,6 +330,10 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             if let Some(user) = cmd.get("console_user").and_then(|v| v.as_str()).map(str::trim) {
                 facts.console_user = user.chars().filter(|c| !c.is_control()).take(80).collect();
             }
+            if cmd.get("display_name").is_some() {
+                let name = cmd.get("display_name").and_then(|v| v.as_str()).unwrap_or("");
+                facts.display_name = name.chars().filter(|c| !c.is_control()).take(64).collect();
+            }
         }
         "accessToken" => {
             let token = cmd.get("token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -367,10 +374,6 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 emit(cb, &json!({"event":"error","text":"That isn't a 9-digit PJDesk ID."}));
                 return;
             }
-            if password.is_empty() {
-                emit(cb, &json!({"event":"error","text":"Enter the password from the other computer."}));
-                return;
-            }
             state.gen.fetch_add(1, Ordering::SeqCst);
             let gen = state.gen.load(Ordering::SeqCst);
             let (state, cb) = (state.clone(), cb.clone());
@@ -380,6 +383,17 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                     emit(&cb, &json!({"event":"disconnected","role":"controller","reason": format!("{e:#}")}));
                 }
             });
+        }
+        "submitPassword" => {
+            let password = cmd.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if let Some(tx) = state.password_tx.lock().unwrap().take() {
+                let _ = tx.send(password);
+            }
+        }
+        "cancelPassword" => {
+            if let Some(tx) = state.password_tx.lock().unwrap().take() {
+                let _ = tx.send(String::new());
+            }
         }
         "accept" => {
             log_line(cb, "approval: allow");
@@ -574,6 +588,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
                     if since_report >= 5 {
                         since_report = 0;
                         let _ = signal.send(host_report(&state));
+                        let _ = signal.send(display_name_report(&state));
                     }
                 }
             }
@@ -647,6 +662,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
                         report_host = true;
                         since_report = 0;
                         let _ = signal.send(host_report(&state));
+                        let _ = signal.send(display_name_report(&state));
                     }
                     ServerMsg::Pong | ServerMsg::UpdateNow => {}
                     _ => {}
@@ -654,6 +670,11 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
             }
         }
     }
+}
+
+fn display_name_report(state: &State) -> ClientMsg {
+    let name = state.facts.lock().unwrap().display_name.clone();
+    ClientMsg::ReportDisplayName { name }
 }
 
 fn host_report(state: &State) -> ClientMsg {
@@ -996,7 +1017,7 @@ async fn accept_authenticated(
     passwords: &[String],
     my_name: &str,
 ) -> Result<(quinn::Connection, session::Authenticated)> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let attempt_used = Arc::new(AtomicBool::new(false));
     let mut pending: JoinSet<Result<(quinn::Connection, session::Authenticated)>> = JoinSet::new();
     let mut accepted = 0usize;
@@ -1018,11 +1039,25 @@ async fn accept_authenticated(
             }
             Some(joined) = pending.join_next(), if !pending.is_empty() => match joined {
                 Ok(Ok(done)) => return Ok(done),
-                Ok(Err(e)) if e.is::<WrongPassword>() => return Err(e),
+                Ok(Err(e)) if e.is::<WrongPassword>() => {
+                    attempt_used.store(false, Ordering::SeqCst);
+                }
                 Ok(Err(e)) => info!("a connection attempt failed: {e:#}"),
                 Err(_) => {}
             },
             _ = tokio::time::sleep_until(deadline) => bail!("the controller did not connect in time"),
+        }
+    }
+}
+
+async fn wait_typed_password(state: &State) -> Result<String> {
+    let (tx, rx) = oneshot::channel();
+    *state.password_tx.lock().unwrap() = Some(tx);
+    match tokio::time::timeout(Duration::from_secs(90), rx).await {
+        Ok(Ok(password)) => Ok(password),
+        _ => {
+            *state.password_tx.lock().unwrap() = None;
+            bail!("the password was not entered in time");
         }
     }
 }
@@ -1088,18 +1123,38 @@ async fn controller_session(
     drop(signal);
     let endpoint = p2p::controller_endpoint(binding.socket, fingerprint)?;
     let candidates = p2p::candidates(peer_public, &peer_local);
-    let punching = p2p::spawn_punching(binding.punch_socket, candidates.clone(), session_id, Duration::from_secs(5));
-    let connected = p2p::connect_to_host(&endpoint, &candidates, server_udp, false).await;
-    punching.abort();
-    let (connection, path) = connected?;
-    let auth = match session::controller_auth(&connection, password, &state.hostname).await {
-        Ok(auth) => auth,
-        Err(e) => {
-            connection.close(1u32.into(), b"authentication failed");
-            if e.is::<WrongPassword>() {
-                bail!("wrong password for {}", format_id(target));
+    let mut password = password.to_string();
+    let mut rejected = false;
+    let (connection, path, auth) = loop {
+        if password.is_empty() {
+            emit(
+                &cb,
+                &json!({"event":"needPassword","id": target, "name": host_name, "rejected": rejected}),
+            );
+            password = wait_typed_password(&state).await?;
+            if password.is_empty() {
+                bail!("cancelled");
             }
-            return Err(e);
+        }
+        let punching = binding.punch_socket.try_clone().ok().map(|sock| {
+            p2p::spawn_punching(sock, candidates.clone(), session_id, Duration::from_secs(8))
+        });
+        let connected = p2p::connect_to_host(&endpoint, &candidates, server_udp, false).await;
+        if let Some(punching) = punching {
+            punching.abort();
+        }
+        let (connection, path) = connected?;
+        match session::controller_auth(&connection, &password, &state.hostname).await {
+            Ok(auth) => break (connection, path, auth),
+            Err(e) if e.is::<WrongPassword>() => {
+                connection.close(1u32.into(), b"authentication failed");
+                password.clear();
+                rejected = true;
+            }
+            Err(e) => {
+                connection.close(1u32.into(), b"authentication failed");
+                return Err(e);
+            }
         }
     };
     let peer = if auth.peer_name.is_empty() { host_name } else { auth.peer_name };
@@ -1320,6 +1375,7 @@ mod tests {
             capture: Mutex::new((1080, 2400)),
             gen: AtomicU64::new(1),
             approval_tx: Mutex::new(None),
+            password_tx: Mutex::new(None),
             end_reason: Mutex::new(String::new()),
             control: Mutex::new(None),
             video: Mutex::new(None),
