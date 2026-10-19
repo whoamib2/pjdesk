@@ -18,7 +18,7 @@ import javax.crypto.spec.SecretKeySpec
 object CloudAuth {
     const val API = "https://pjdesk.com"
     const val NO_SERVER =
-        "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Admin → My network."
+        "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network."
 
     /** The owner of an empty network can publish the server this phone already uses. */
     fun offerCurrentServer(role: String, server: String, fingerprint: String): Boolean =

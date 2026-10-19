@@ -118,7 +118,7 @@ fun SignInScreen(
                         singleLine = true,
                         label = { Text("Enrollment code") },
                     )
-                    Text("From pjdesk.com → My network. One device, one hour.", color = pjMuted())
+                    Text("From pjdesk.com → Account → My network. One device, one hour.", color = pjMuted())
                 }
                 if (error.isNotEmpty()) Text(error, color = MaterialTheme.colorScheme.error)
                 if (offerCurrent) {

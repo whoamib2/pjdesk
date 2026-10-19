@@ -223,6 +223,7 @@ async function api(request, env, url, ctx) {
   if (p === "/api/admin/audit" && m === "GET") return adminAudit(request, env);
   if (p === "/api/admin/plan" && m === "POST") return adminSetPlan(request, env);
   if (p === "/api/admin/sync" && m === "POST") return adminSetSync(request, env);
+  // Signed-in account, then the network owner. Not a site-admin check.
   if (p.startsWith("/api/network")) {
     const handled = await networkRoute(request, env, url);
     if (handled) return handled;

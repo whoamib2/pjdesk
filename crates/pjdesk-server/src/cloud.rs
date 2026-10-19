@@ -1813,9 +1813,9 @@ pub struct CreatedKey {
 }
 
 fn account_cfg(data_dir: &Path) -> Result<CloudConfig> {
-    let cfg = CloudConfig::load(data_dir).context("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → My network.")?;
+    let cfg = CloudConfig::load(data_dir).context("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → Account → My network.")?;
     if !cfg.is_account() || cfg.token.is_empty() {
-        bail!("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → My network.");
+        bail!("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → Account → My network.");
     }
     Ok(cfg)
 }
@@ -1870,9 +1870,9 @@ pub fn create_network_key(
         Ok(resp) => serde_json::from_str(&resp.into_string().unwrap_or_default()).context("unexpected reply from PJDesk")?,
         Err(e) => return Err(cloud_api_error(e)),
     };
-    let net = doc.network.context("Set the server address on pjdesk.com → My network first.")?;
+    let net = doc.network.context("Set the server address on pjdesk.com → Account → My network first.")?;
     if net.active_address.trim().is_empty() || net.active_fingerprint.trim().is_empty() {
-        bail!("Set the server address and its fingerprint on pjdesk.com → My network first.");
+        bail!("Set the server address and its fingerprint on pjdesk.com → Account → My network first.");
     }
     let secret = pjdesk_proto::random_bytes::<32>();
     let secret_hex = hex::encode(secret);

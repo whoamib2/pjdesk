@@ -64,7 +64,7 @@ export function canonical({ email, networkId, fingerprints, deviceId, exp }) {
 /** Mirrors the server's admit() for the pure cases the Worker can see. */
 /** Why a network key cannot be redeemed. Null means it can. Matches pjdesk-proto. */
 export const NO_SERVER_MESSAGE =
-  "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Admin → My network.";
+  "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network.";
 
 function hostOf(address) {
   const text = String(address || "").trim();
@@ -212,6 +212,8 @@ async function sha256Hex(text) {
   return toHex(await crypto.subtle.digest("SHA-256", encoder.encode(text)));
 }
 
+// Any signed-in account. Site admin is not required and is not checked.
+// Mutations call owned() and apply only to the network this account owns.
 async function session(request, env) {
   const m = (request.headers.get("authorization") || "").match(/^Bearer\s+([A-Za-z0-9_-]{20,128})$/);
   if (!m) throw new HttpError(401, "Please sign in.");
@@ -485,6 +487,8 @@ async function putNetwork(request, env, account) {
   const body = await readJson(request);
   let row = await owned(env, account.accountId);
   if (!row) {
+    const member = await membership(env, account.email);
+    if (member) throw new HttpError(403, "Only the network owner can change this network.");
     const id = `net_${randomHex(8)}`;
     await env.DB.prepare(
       `INSERT INTO networks (id, owner_id, name, active_address, active_fingerprint, standby_address, standby_fingerprint, require_accounts, created_at)

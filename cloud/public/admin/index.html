@@ -9,6 +9,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="/admin/admin.css">
+<link rel="stylesheet" href="/network.css">
 </head>
 <body class="dark">
 <div class="shell">
@@ -78,55 +79,8 @@
   </form>
 </div>
 
-<div id="invite" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="invite-title">
-  <form class="dialog wide" id="invite-form">
-    <h2 id="invite-title">Network key</h2>
-    <div id="invite-editor">
-      <label>Protection
-        <select id="invite-mode">
-          <option value="passphrase">Passphrase, shared separately</option>
-          <option value="embedded">Self-contained</option>
-        </select>
-      </label>
-      <p id="invite-warn" class="msg hidden">Anyone who has this network key can join. Share it like a password.</p>
-      <label id="invite-pass-label">Passphrase
-        <span class="row">
-          <input id="invite-pass" type="password" autocomplete="new-password" minlength="8">
-          <button type="button" id="invite-pass-toggle" class="ghost">Show</button>
-        </span>
-      </label>
-      <label>Expires in days (optional)
-        <input id="invite-days" type="text" inputmode="numeric" placeholder="Leave empty for no expiry">
-      </label>
-      <label>Maximum uses (optional)
-        <input id="invite-max" type="text" inputmode="numeric" placeholder="Leave empty for no limit">
-      </label>
-      <label>Limit to this account (optional)
-        <input id="invite-bound" type="email" placeholder="ada@example.com">
-      </label>
-      <p id="invite-msg" class="msg"></p>
-      <div class="row">
-        <button type="button" id="invite-cancel" class="ghost">Cancel</button>
-        <span class="spacer"></span>
-        <button type="submit" id="invite-create" class="primary">Create network key</button>
-      </div>
-    </div>
-    <div id="invite-result" class="hidden">
-      <p class="note">Copy this now. It is shown once and is not saved here.</p>
-      <p id="invite-result-warn" class="msg hidden">Anyone who has this network key can join. Share it like a password.</p>
-      <textarea id="invite-blob" readonly rows="4" spellcheck="false"></textarea>
-      <img id="invite-qr" alt="QR code of the network key" width="180" height="180">
-      <div class="row">
-        <button type="button" id="invite-copy" class="primary">Copy</button>
-        <span class="spacer"></span>
-        <button type="button" id="invite-done" class="ghost">Close</button>
-      </div>
-    </div>
-  </form>
-</div>
-
 <script src="/app.js"></script>
-<script src="/admin/netkey.js"></script>
+<script src="/network-page.js"></script>
 <script src="/admin/admin.js"></script>
 </body>
 </html>

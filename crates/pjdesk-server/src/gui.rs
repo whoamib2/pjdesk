@@ -1543,7 +1543,7 @@ impl App {
             ui.add_space(8.0);
             ui.label(RichText::new("Allowed accounts").strong());
             if policy.allowed_accounts.is_empty() {
-                ui.label(RichText::new("Any account with a token for this server. Invite or remove people on pjdesk.com → My network.").color(p(ui).muted));
+                ui.label(RichText::new("Any account with a token for this server. Invite or remove people on pjdesk.com → Account → My network.").color(p(ui).muted));
             } else {
                 for email in &policy.allowed_accounts {
                     ui.label(email);

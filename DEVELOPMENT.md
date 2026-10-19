@@ -277,7 +277,7 @@ in the server window; then Build 2 = clipboard sync + multi‑monitor tabs; then
 
 ### Networking
 - Server listens on **TCP + UDP 21200** (`DEFAULT_PORT`). The name you set on
-  pjdesk.com → My network must resolve to the server host and have **both** TCP
+  pjdesk.com → Account → My network must resolve to the server host and have **both** TCP
   and UDP 21200 port‑forwarded/allowed (firewall rule `PJDesk Server`).
 - Clients reach GitHub directly over HTTPS for updates
   (`https://api.github.com/repos/whoamib2/pjdesk/releases/latest` + asset

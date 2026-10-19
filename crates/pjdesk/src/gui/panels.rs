@@ -244,7 +244,7 @@ impl App {
                 } else {
                     widgets::field_label(ui, "Enrollment code");
                     widgets::text_field(ui, &mut self.net_code, "ABCD-EFGH", true);
-                    ui.label(widgets::muted(ui, "From pjdesk.com → My network. One device, one hour."));
+                    ui.label(widgets::muted(ui, "From pjdesk.com → Account → My network. One device, one hour."));
                 }
                 ui.add_space(8.0);
                 if !self.net_error.is_empty() {

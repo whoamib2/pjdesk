@@ -17,7 +17,7 @@ use crate::config::{Config, PeerNote};
 const DEFAULT_API: &str = "https://pjdesk.com";
 
 pub const NO_SERVER: &str =
-    "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Admin → My network.";
+    "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network.";
 
 /// The owner of an empty network can publish the server this computer already uses.
 pub fn offer_current_server(role: &str, server: &str, fingerprint: &str) -> bool {
@@ -505,7 +505,7 @@ mod tests {
         assert!(!offer_current_server("owner", "pjdesk.spader.us:21200", ""));
         assert_eq!(
             NO_SERVER,
-            "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Admin → My network."
+            "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network."
         );
     }
 }
