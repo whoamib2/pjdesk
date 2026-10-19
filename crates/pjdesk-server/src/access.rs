@@ -22,6 +22,10 @@ pub const FILE_NAME: &str = "network-access.json";
 pub struct Policy {
     #[serde(default)]
     pub require_accounts: bool,
+    /// Set when an operator turns the switch on or off. A 0.6.0 file that has
+    /// the switch on without this was the upgrade bug, and is put back to grace.
+    #[serde(default)]
+    pub require_chosen: bool,
     /// Hex of the pjdesk.com Ed25519 public key. Empty until the first cloud pull.
     #[serde(default)]
     pub public_key: String,
@@ -39,6 +43,7 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             require_accounts: false,
+            require_chosen: false,
             public_key: String::new(),
             fingerprint: String::new(),
             allowed_accounts: Vec::new(),
@@ -65,6 +70,37 @@ impl Policy {
         std::fs::write(&tmp, serde_json::to_vec_pretty(self).unwrap_or_default())?;
         std::fs::rename(&tmp, path)
     }
+}
+
+/// Cloud `require_accounts` is adopted only after an operator has used the switch.
+/// A missing choice, including a 0.5.2 upgrade and a fresh network row, stays off.
+pub fn adopt_cloud_require(chosen: bool, cloud_on: bool) -> bool {
+    if chosen {
+        cloud_on
+    } else {
+        false
+    }
+}
+
+/// Writes grace mode when this data folder has no policy yet (a 0.5.2 upgrade)
+/// or when 0.6.0 turned the switch on without an operator choosing it.
+/// Returns true when a file that said on was put back to off.
+pub fn restore_grace(dir: &Path) -> bool {
+    let path = dir.join(FILE_NAME);
+    let existed = path.exists();
+    let mut policy = Policy::load(dir);
+    if !existed {
+        policy.require_accounts = false;
+        policy.require_chosen = false;
+        let _ = policy.save(dir);
+        return false;
+    }
+    if policy.require_accounts && !policy.require_chosen {
+        policy.require_accounts = false;
+        let _ = policy.save(dir);
+        return true;
+    }
+    false
 }
 
 /// Records this process's certificate fingerprint when the file does not have one.
@@ -173,6 +209,7 @@ mod tests {
         let (token, public) = sign_seed(&seed, &claims).unwrap();
         let policy = Policy {
             require_accounts: require,
+            require_chosen: require,
             public_key: hex::encode(public),
             fingerprint: "aabb".into(),
             allowed_accounts: Vec::new(),
@@ -188,6 +225,34 @@ mod tests {
         let (closed, _, _) = policy_with(true);
         assert_eq!(admit(&closed, "", 1_700_000_000), Err(Deny::Missing));
         assert_eq!(peer_message(), "Sign in required");
+    }
+
+    #[test]
+    fn upgrading_from_0_5_2_and_a_fresh_network_leaves_require_off() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-grace-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!restore_grace(&dir), "a 0.5.2 folder has no policy file");
+        let fresh = Policy::load(&dir);
+        assert!(!fresh.require_accounts);
+        assert!(!adopt_cloud_require(false, false), "a fresh network row is off");
+        assert!(!adopt_cloud_require(false, true), "a sync must not turn grace off");
+
+        let mut mistaken = Policy::default();
+        mistaken.require_accounts = true;
+        mistaken.save(&dir).unwrap();
+        assert!(restore_grace(&dir));
+        assert!(!Policy::load(&dir).require_accounts);
+
+        let mut chosen = Policy::load(&dir);
+        chosen.require_accounts = true;
+        chosen.require_chosen = true;
+        chosen.save(&dir).unwrap();
+        assert!(!restore_grace(&dir));
+        assert!(Policy::load(&dir).require_accounts);
+        assert!(adopt_cloud_require(true, true));
+        assert!(!adopt_cloud_require(true, false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

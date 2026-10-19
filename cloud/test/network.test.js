@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonical, decide, inviteError, isPrivateAddress, normalizeFingerprint, planRegistration } from "../src/network.js";
+import { canonical, decide, inviteError, isPrivateAddress, normalizeFingerprint, planRegistration, requireAccountsOn } from "../src/network.js";
 
 test("canonical matches the shared fixture", () => {
   const text = canonical({
@@ -12,6 +12,17 @@ test("canonical matches the shared fixture", () => {
   });
   assert.equal(text, "PJN1\nben@spader.us\nnet_1\n00112233,aabbccdd\ndevice-1\n2000000000\n");
   assert.equal(normalizeFingerprint("sha256:AB-CD"), "abcd");
+});
+
+test("a fresh network leaves require signed-in off", () => {
+  assert.equal(requireAccountsOn(0), false);
+  assert.equal(requireAccountsOn(false), false);
+  assert.equal(requireAccountsOn(null), false);
+  assert.equal(requireAccountsOn(undefined), false);
+  assert.equal(requireAccountsOn("0"), false);
+  assert.equal(requireAccountsOn(""), false);
+  assert.equal(requireAccountsOn(1), true);
+  assert.equal(requireAccountsOn(true), true);
 });
 
 test("decide matches grace, expiry, the wrong server, and revoke", () => {
@@ -77,19 +88,71 @@ test("an owner server fills an empty slot and does not overwrite a different key
   assert.equal(empty.next.activeAddress, "pjdesk.spader.us:21200");
   assert.equal(empty.next.activeFingerprint, "abcd");
 
-  const same = planRegistration({
+  const sharedKey = planRegistration({
     owner: true,
     role: "standby",
-    address: "cabin.example:21200",
+    address: "68.234.75.68:21200",
     fingerprint: "abcd",
     activeAddress: "pjdesk.spader.us:21200",
     activeFingerprint: "abcd",
     standbyAddress: "",
     standbyFingerprint: "",
   });
-  assert.equal(same.status, 200);
-  assert.equal(same.next.activeAddress, "");
-  assert.equal(same.next.standbyAddress, "cabin.example:21200");
+  assert.equal(sharedKey.status, 200);
+  assert.equal(sharedKey.next.activeAddress, "pjdesk.spader.us:21200");
+  assert.equal(sharedKey.next.standbyAddress, "68.234.75.68:21200");
+
+  const flap = planRegistration({
+    owner: true,
+    role: "standby",
+    address: "204.248.122.44:21200",
+    fingerprint: "abcd",
+    instance: "desk",
+    activeAddress: "",
+    activeFingerprint: "",
+    standbyAddress: "68.234.75.68:21200",
+    standbyFingerprint: "abcd",
+    standbyInstance: "cabin",
+  });
+  assert.equal(flap.status, 409);
+  assert.equal(flap.changed, false);
+  assert.equal(flap.next.standbyAddress, "68.234.75.68:21200");
+
+  const owned = planRegistration({
+    owner: true,
+    role: "active",
+    address: "pjdesk.spader.us:21200",
+    fingerprint: "abcd",
+    instance: "desk",
+    lan: ["192.168.1.20:21200"],
+    publicIp: "204.248.122.44",
+    activeAddress: "204.248.122.44:21200",
+    activeFingerprint: "abcd",
+    activeInstance: "desk",
+    standbyAddress: "68.234.75.68:21200",
+    standbyFingerprint: "abcd",
+    standbyInstance: "cabin",
+  });
+  assert.equal(owned.status, 200);
+  assert.equal(owned.changed, true);
+  assert.equal(owned.next.activeAddress, "pjdesk.spader.us:21200");
+  assert.equal(owned.next.activePublicIp, "204.248.122.44");
+  assert.equal(owned.next.activeLan, "192.168.1.20:21200");
+  assert.equal(owned.next.standbyAddress, "68.234.75.68:21200");
+
+  const quiet = planRegistration({
+    owner: true,
+    role: "active",
+    address: "pjdesk.spader.us:21200",
+    fingerprint: "abcd",
+    instance: "desk",
+    publicIp: "204.248.122.44",
+    activeAddress: "pjdesk.spader.us:21200",
+    activeFingerprint: "abcd",
+    activeInstance: "desk",
+    activePublicIp: "204.248.122.44",
+  });
+  assert.equal(quiet.changed, false);
 
   const blocked = planRegistration({
     owner: true,

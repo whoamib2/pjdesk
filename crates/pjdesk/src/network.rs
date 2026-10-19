@@ -19,9 +19,17 @@ const DEFAULT_API: &str = "https://pjdesk.com";
 pub const NO_SERVER: &str =
     "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network.";
 
+fn is_old_no_server(message: &str) -> bool {
+    message.contains("Set the server address in My network first")
+        || message.contains("Set the server address on pjdesk.com")
+        || message.contains("Set the server address and its fingerprint")
+}
+
 /// The owner of an empty network can publish the server this computer already uses.
 pub fn offer_current_server(role: &str, server: &str, fingerprint: &str) -> bool {
-    role == "owner" && !server.trim().is_empty() && pjdesk_proto::tls::parse_fingerprint(fingerprint).is_ok()
+    (role == "owner" || role.is_empty())
+        && !server.trim().is_empty()
+        && pjdesk_proto::tls::parse_fingerprint(fingerprint).is_ok()
 }
 
 /// Account sign-in finished, or the account's network has no server yet.
@@ -52,7 +60,36 @@ pub struct Session {
     pub fingerprint: String,
     pub standby_address: String,
     pub standby_fingerprint: String,
+    pub lan: Vec<String>,
+    pub public_ip: String,
     pub computers: Vec<SavedComputer>,
+}
+
+/// A hostname is kept when a later update only has the raw IP it points at.
+pub fn keep_hostname(current: &str, incoming: &str) -> String {
+    let incoming = incoming.trim();
+    if incoming.is_empty() {
+        return current.trim().to_string();
+    }
+    if is_hostname_address(current) && !is_hostname_address(incoming) {
+        return current.trim().to_string();
+    }
+    incoming.to_string()
+}
+
+pub fn is_hostname_address(address: &str) -> bool {
+    let text = address.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let host = if let Some(rest) = text.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if let Some((host, port)) = text.rsplit_once(':') {
+        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) { host } else { text }
+    } else {
+        text
+    };
+    !host.is_empty() && host.parse::<std::net::IpAddr>().is_err()
 }
 
 #[derive(Deserialize)]
@@ -86,6 +123,10 @@ struct NetworkBody {
     standby_address: String,
     #[serde(default)]
     standby_fingerprint: String,
+    #[serde(default)]
+    active_lan: String,
+    #[serde(default)]
+    active_public_ip: String,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +217,8 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
         fingerprint: network.active_fingerprint,
         standby_address: network.standby_address,
         standby_fingerprint: network.standby_fingerprint,
+        lan: network.active_lan.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        public_ip: network.active_public_ip,
         computers: reply
             .computers
             .into_iter()
@@ -216,9 +259,18 @@ pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) 
     ) {
         Ok(text) => {
             let reply: NetworkReply = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
-            Ok(SignIn::Ready(session_from(&email, device_id, reply)?))
+            match session_from(&email, device_id, reply) {
+                Ok(session) => Ok(SignIn::Ready(session)),
+                Err(err) if err.to_string() == NO_SERVER => {
+                    Ok(SignIn::NoServer { role: "owner".into(), login_token: login.token })
+                }
+                Err(err) => Err(err),
+            }
         }
-        Err(fail) if fail.code == "no_server" => Ok(SignIn::NoServer { role: fail.role, login_token: login.token }),
+        Err(fail) if fail.code == "no_server" || is_old_no_server(&fail.message) => {
+            let role = if fail.role.is_empty() { "owner".into() } else { fail.role };
+            Ok(SignIn::NoServer { role, login_token: login.token })
+        }
         Err(fail) => bail!(fail.message),
     }
 }
@@ -388,13 +440,23 @@ pub fn push_saved_computers_from_disk() -> Result<()> {
 /// Refreshes the access token when it is close to expiring. Safe to call from
 /// the host thread. A failure leaves the current token in place.
 pub fn refresh_config(config: &mut Config) {
+    refresh_config_inner(config, false);
+}
+
+/// Refreshes even when the access token is still fresh, so a reconnect picks
+/// up a new server address, LAN address, or public IP.
+pub fn refresh_config_now(config: &mut Config) {
+    refresh_config_inner(config, true);
+}
+
+fn refresh_config_inner(config: &mut Config, force: bool) {
     let refresh_token = config.network_refresh_token();
     let device = config.network_device_id.clone().unwrap_or_default();
     if refresh_token.is_empty() || device.is_empty() {
         return;
     }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    if config.network_access_exp > now + 120 && !config.network_access_token().is_empty() {
+    if !force && config.network_access_exp > now + 120 && !config.network_access_token().is_empty() {
         return;
     }
     let body = computers_body(&config.address_book, &config.settings.peers);
@@ -421,6 +483,8 @@ pub fn copy_to_service(user: &Config) {
     cfg.network_device_id = user.network_device_id.clone();
     cfg.network_standby = user.network_standby.clone();
     cfg.network_standby_fingerprint = user.network_standby_fingerprint.clone();
+    cfg.network_lan = user.network_lan.clone();
+    cfg.network_public_ip = user.network_public_ip.clone();
     let _ = cfg.save_to(&path);
 }
 
@@ -503,9 +567,19 @@ mod tests {
         assert!(!offer_current_server("member", "pjdesk.spader.us:21200", fp));
         assert!(!offer_current_server("owner", "", fp));
         assert!(!offer_current_server("owner", "pjdesk.spader.us:21200", ""));
+        assert!(offer_current_server("", "pjdesk.spader.us:21200", fp));
         assert_eq!(
             NO_SERVER,
             "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network."
         );
+    }
+
+    #[test]
+    fn a_hostname_is_kept_when_the_update_is_only_an_ip() {
+        assert_eq!(keep_hostname("pjdesk.spader.us:21200", "204.248.122.44:21200"), "pjdesk.spader.us:21200");
+        assert_eq!(keep_hostname("204.248.122.44:21200", "pjdesk.spader.us:21200"), "pjdesk.spader.us:21200");
+        assert_eq!(keep_hostname("pjdesk.spader.us:21200", ""), "pjdesk.spader.us:21200");
+        assert!(is_old_no_server("Set the server address in My network first."));
+        assert!(!is_old_no_server(NO_SERVER));
     }
 }

@@ -104,13 +104,41 @@ fn local_ip_toward(target: SocketAddr) -> Option<IpAddr> {
     (!ip.is_unspecified()).then_some(ip)
 }
 
-/// All addresses worth trying for a peer: its public address plus its LAN
-/// addresses, without duplicates.
+/// True for a private or link-local address (a same-LAN candidate).
+pub fn is_lan_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            (octets[0] & 0xfe) == 0xfc || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        }
+    }
+}
+
+/// All addresses worth trying for a peer. LAN addresses come first so two
+/// computers on the same network do not hairpin out through the public IP.
 pub fn candidates(public: SocketAddr, local: &[SocketAddr]) -> Vec<SocketAddr> {
-    let mut out = vec![public];
+    let mut lan = Vec::new();
+    let mut other = Vec::new();
     for addr in local {
-        if !out.contains(addr) && addr.is_ipv4() && !addr.ip().is_unspecified() {
-            out.push(*addr);
+        if *addr == public || !addr.is_ipv4() || addr.ip().is_unspecified() || addr.ip().is_loopback() {
+            continue;
+        }
+        if is_lan_ip(addr.ip()) {
+            if !lan.contains(addr) {
+                lan.push(*addr);
+            }
+        } else if !other.contains(addr) {
+            other.push(*addr);
+        }
+    }
+    let mut out = lan;
+    if !out.contains(&public) {
+        out.push(public);
+    }
+    for addr in other {
+        if !out.contains(&addr) {
+            out.push(addr);
         }
     }
     out
@@ -209,8 +237,9 @@ pub enum LinkPath {
 impl fmt::Display for LinkPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LinkPath::Direct(addr) => write!(f, "direct P2P to {addr}"),
-            LinkPath::Relay(addr) => write!(f, "relayed via {addr}"),
+            LinkPath::Direct(addr) if is_lan_ip(addr.ip()) => write!(f, "LAN ({addr})"),
+            LinkPath::Direct(addr) => write!(f, "Internet ({addr})"),
+            LinkPath::Relay(addr) => write!(f, "Internet, relayed via {addr}"),
         }
     }
 }
@@ -223,10 +252,18 @@ pub async fn connect_to_host(
     force_relay: bool,
 ) -> Result<(quinn::Connection, LinkPath)> {
     if !force_relay && !candidates.is_empty() {
+        let any_lan = candidates.iter().any(|addr| is_lan_ip(addr.ip()));
         let mut attempts = JoinSet::new();
         for &addr in candidates {
             let endpoint = endpoint.clone();
+            // A LAN candidate starts immediately. The public address waits so a
+            // same-LAN handshake wins when both are reachable. The host key is
+            // checked on every path by this endpoint's pinned verifier.
+            let delay = if any_lan && !is_lan_ip(addr.ip()) { Duration::from_millis(300) } else { Duration::ZERO };
             attempts.spawn(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 let connection = endpoint.connect(addr, PEER_SERVER_NAME)?.await?;
                 Ok::<_, anyhow::Error>((connection, addr))
             });
@@ -256,4 +293,30 @@ pub async fn connect_to_host(
         .await
         .map_err(|_| anyhow!("could not reach the host, even through the relay"))??;
     Ok((connection, LinkPath::Relay(relay)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+
+    #[test]
+    fn lan_candidates_are_tried_before_the_public_address() {
+        let public = "203.0.113.5:21116".parse().unwrap();
+        let local = vec!["192.168.1.20:9".parse().unwrap(), "10.0.0.4:9".parse().unwrap(), public];
+        let got = candidates(public, &local);
+        assert!(is_lan_ip(got[0].ip()));
+        assert!(is_lan_ip(got[1].ip()));
+        assert_eq!(*got.last().unwrap(), public);
+    }
+
+    #[test]
+    fn the_path_says_lan_or_internet() {
+        let lan: SocketAddr = "192.168.1.9:1".parse().unwrap();
+        let wan: SocketAddr = "203.0.113.8:1".parse().unwrap();
+        assert_eq!(LinkPath::Direct(lan).to_string(), "LAN (192.168.1.9:1)");
+        assert_eq!(LinkPath::Direct(wan).to_string(), "Internet (203.0.113.8:1)");
+        assert_eq!(LinkPath::Relay(wan).to_string(), "Internet, relayed via 203.0.113.8:1");
+    }
 }

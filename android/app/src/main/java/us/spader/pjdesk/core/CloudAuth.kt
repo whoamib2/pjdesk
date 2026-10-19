@@ -64,7 +64,11 @@ object CloudAuth {
             )
             return session(email.trim().lowercase(), deviceId, reply)
         } catch (e: CloudAuthException) {
-            if (e.code == "no_server") throw CloudAuthException(e.message ?: NO_SERVER, e.code, e.role, token)
+            val old = e.message?.contains("Set the server address") == true
+            if (e.code == "no_server" || old || e.message == NO_SERVER) {
+                val role = if (e.role.isBlank()) "owner" else e.role
+                throw CloudAuthException(NO_SERVER, "no_server", role, token)
+            }
             throw e
         }
     }
@@ -152,7 +156,7 @@ object CloudAuth {
     private fun session(email: String, deviceId: String, reply: JSONObject): Session {
         val network = reply.optJSONObject("network") ?: throw CloudAuthException("This account has no network yet.")
         val address = network.optString("active_address")
-        if (address.isBlank()) throw CloudAuthException(NO_SERVER)
+        if (address.isBlank()) throw CloudAuthException(NO_SERVER, "no_server", "owner")
         val computers = mutableListOf<SavedComputer>()
         val list = reply.optJSONArray("computers")
         if (list != null) {

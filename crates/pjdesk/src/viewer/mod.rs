@@ -63,7 +63,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         let link = if let Some(addr) = direct.clone() {
             runtime.block_on(connect_direct(&mut config, &addr, &password, args.trust && !waiting))
         } else {
-            runtime.block_on(connect(&server, &mut config, &target, &password, args.force_relay))
+            runtime.block_on(connect(&server, &mut config, &target, &password, args.force_relay, waiting))
         };
         let link = match link {
             Ok(link) => link,
@@ -116,12 +116,20 @@ async fn connect(
     target: &str,
     password: &str,
     force_relay: bool,
+    waiting_retry: bool,
 ) -> Result<Link> {
     tracing::info!("Connecting to {} through {server}", format_id(target));
     println!("Connecting to {} through {server}...", format_id(target));
-    crate::network::refresh_config(config);
+    if waiting_retry {
+        crate::network::refresh_config_now(config);
+    } else {
+        crate::network::refresh_config(config);
+    }
+    let server = ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone());
     let access = config.network_access_token();
-    let mut signal = SignalClient::connect(server, config).await?;
+    let mut signal = SignalClient::connect(&server, config).await?;
+    tracing::info!("Reached the server via {}", signal.via);
+    println!("Server path: {}.", signal.via);
     if !access.is_empty() {
         let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
     }
@@ -138,7 +146,7 @@ async fn connect(
         match timeout(Duration::from_secs(90), signal.recv()).await {
             Ok(None) if !access.is_empty() && !retried_without_token => {
                 retried_without_token = true;
-                signal = SignalClient::connect(server, config).await?;
+                signal = SignalClient::connect(&server, config).await?;
                 signal.send(connect.clone())?;
                 continue;
             }

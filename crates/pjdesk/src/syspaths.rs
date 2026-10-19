@@ -51,6 +51,9 @@ pub struct ServiceStatus {
     /// Last measured round-trip to the server, in milliseconds. 0 means unknown.
     #[serde(default)]
     pub rtt_ms: u64,
+    /// `LAN` or `Internet` once the service has reached the server.
+    #[serde(default)]
+    pub reach: String,
     #[serde(default)]
     pub updated_unix: u64,
 }
@@ -70,6 +73,7 @@ impl ServiceStatus {
             password,
             permanent_set,
             rtt_ms: 0,
+            reach: String::new(),
             updated_unix: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         }
     }

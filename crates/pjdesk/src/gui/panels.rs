@@ -260,7 +260,7 @@ impl App {
                 }
                 if self.net_offer
                     && !self.net_busy
-                    && ui.button("Use this computer's current server for my network").clicked()
+                    && ui.button(format!("Use this computer's current server ({}) for my network", self.cfg.effective_server())).clicked()
                 {
                     self.claim_current_server();
                 }
@@ -376,6 +376,12 @@ impl App {
             return;
         }
         let server = server_host(&self.cfg.effective_server());
+        let reach = if self.engine.service_running {
+            self.svc_status.reach.clone()
+        } else {
+            self.engine.shared.reach()
+        };
+        let server = if reach.is_empty() { server } else { format!("{server} · {reach}") };
         let rtt = self.share_rtt();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;

@@ -103,11 +103,27 @@ export function isPrivateAddress(address) {
   return false;
 }
 
+/** True only for an explicit on. `0`, `"0"`, null, and a missing value stay off. */
+export function requireAccountsOn(value) {
+  return value === true || value === 1;
+}
+
+function lanText(lan) {
+  const parts = Array.isArray(lan) ? lan : String(lan || "").split(",");
+  return parts
+    .map((part) => String(part || "").trim())
+    .filter(Boolean)
+    .slice(0, 8)
+    .join(",")
+    .slice(0, 500);
+}
+
 /**
  * What an owner's server may write. A non-owner never writes. A different
- * fingerprint is kept unless `replace` is set. A private address is kept
- * unless `confirm` is set. Moving off a slot this server already holds is
- * applied even when the new slot needs confirmation.
+ * fingerprint is kept unless `replace` is set. A different address is kept
+ * unless this same server instance already owns the slot, or `replace` is set.
+ * A private address is kept unless `confirm` is set. A shared certificate
+ * (the standby holds the active server's key) does not clear the other slot.
  */
 export function planRegistration({
   owner,
@@ -116,10 +132,22 @@ export function planRegistration({
   fingerprint,
   confirm,
   replace,
+  instance,
+  lan,
+  publicIp,
+  checkedAt,
   activeAddress,
   activeFingerprint,
   standbyAddress,
   standbyFingerprint,
+  activeLan,
+  standbyLan,
+  activePublicIp,
+  standbyPublicIp,
+  activeInstance,
+  standbyInstance,
+  activeCheckedAt,
+  standbyCheckedAt,
 }) {
   const slot = role === "standby" ? "standby" : role === "active" ? "active" : "";
   if (!slot) return { status: 400, error: "Say whether this server is active or on standby." };
@@ -134,46 +162,69 @@ export function planRegistration({
       error: "Confirm the public address in the PJDesk Server window. A local network address is not published on its own.",
     };
   }
+  const id = String(instance || "").trim().slice(0, 64);
   const current = {
     activeAddress: String(activeAddress || ""),
     activeFingerprint: normalizeFingerprint(activeFingerprint),
     standbyAddress: String(standbyAddress || ""),
     standbyFingerprint: normalizeFingerprint(standbyFingerprint),
+    activeLan: String(activeLan || ""),
+    standbyLan: String(standbyLan || ""),
+    activePublicIp: String(activePublicIp || ""),
+    standbyPublicIp: String(standbyPublicIp || ""),
+    activeInstance: String(activeInstance || ""),
+    standbyInstance: String(standbyInstance || ""),
+    activeCheckedAt: Number(activeCheckedAt) || 0,
+    standbyCheckedAt: Number(standbyCheckedAt) || 0,
   };
   const next = { ...current };
-  const changes = [];
-  const other = slot === "active" ? "standby" : "active";
-  const otherFp = current[`${other}Fingerprint`];
-  if (otherFp && otherFp === fp) {
-    next[`${other}Address`] = "";
-    next[`${other}Fingerprint`] = "";
-    changes.push({ action: `clear-${other}`, detail: "This server changed role." });
-  }
   const slotAddr = current[`${slot}Address`].trim();
   const slotFp = current[`${slot}Fingerprint`];
+  const slotInstance = current[`${slot}Instance`];
+  const sameMachine = id !== "" && slotInstance === id;
   const differentFp = slotFp !== "" && slotFp !== fp;
   const differentAddr = slotAddr !== "" && slotAddr !== nextAddress;
-  if (!replace && (differentFp || (slotFp === "" && differentAddr))) {
+  if (!replace && (differentFp || (differentAddr && !sameMachine))) {
     return {
-      status: changes.length ? 200 : 409,
+      status: 409,
       needsConfirm: true,
       error: "My network already lists a different server. Confirm in the PJDesk Server window to replace it.",
-      changed: changes.length > 0,
-      next,
-      changes,
+      changed: false,
+      next: current,
+      changes: [],
     };
   }
+  const changes = [];
+  const other = slot === "active" ? "standby" : "active";
+  const otherInstance = current[`${other}Instance`];
+  if (id && otherInstance === id) {
+    next[`${other}Address`] = "";
+    next[`${other}Fingerprint`] = "";
+    next[`${other}Lan`] = "";
+    next[`${other}PublicIp`] = "";
+    next[`${other}Instance`] = "";
+    next[`${other}CheckedAt`] = 0;
+    changes.push({ action: `clear-${other}`, detail: "This server changed role." });
+  }
+  const nextLan = lanText(lan);
+  const nextIp = String(publicIp || "").trim().slice(0, 80);
+  const nextChecked = Number(checkedAt) || 0;
+  const unchanged =
+    slotAddr === nextAddress &&
+    slotFp === fp &&
+    current[`${slot}Lan`] === nextLan &&
+    (nextIp === "" || current[`${slot}PublicIp`] === nextIp) &&
+    (id === "" || slotInstance === id) &&
+    changes.length === 0;
+  if (unchanged) return { status: 200, changed: false, next: current, changes: [] };
   next[`${slot}Address`] = nextAddress;
   next[`${slot}Fingerprint`] = fp;
-  const changed =
-    next.activeAddress !== current.activeAddress ||
-    next.activeFingerprint !== current.activeFingerprint ||
-    next.standbyAddress !== current.standbyAddress ||
-    next.standbyFingerprint !== current.standbyFingerprint;
-  if (next[`${slot}Address`] !== current[`${slot}Address`] || next[`${slot}Fingerprint`] !== current[`${slot}Fingerprint`]) {
-    changes.unshift({ action: `register-${slot}`, detail: nextAddress });
-  }
-  return { status: 200, changed, next, changes };
+  next[`${slot}Lan`] = nextLan;
+  if (nextIp) next[`${slot}PublicIp`] = nextIp;
+  if (id) next[`${slot}Instance`] = id;
+  if (nextChecked) next[`${slot}CheckedAt`] = nextChecked;
+  changes.unshift({ action: `register-${slot}`, detail: nextAddress });
+  return { status: 200, changed: true, next, changes };
 }
 
 export function inviteError({ revoked, expiresAt, uses, maxUses, now, boundEmail, callerEmail }) {
@@ -266,7 +317,13 @@ function networkView(row) {
     active_fingerprint: row.active_fingerprint || "",
     standby_address: row.standby_address || "",
     standby_fingerprint: row.standby_fingerprint || "",
-    require_accounts: !!row.require_accounts,
+    require_accounts: requireAccountsOn(row.require_accounts),
+    active_lan: row.active_lan || "",
+    standby_lan: row.standby_lan || "",
+    active_public_ip: row.active_public_ip || "",
+    standby_public_ip: row.standby_public_ip || "",
+    active_ip_checked_at: row.active_ip_checked_at || 0,
+    standby_ip_checked_at: row.standby_ip_checked_at || 0,
   };
 }
 
@@ -506,7 +563,11 @@ async function putNetwork(request, env, account) {
     standby_address: body.standby_address != null ? String(body.standby_address).trim().slice(0, 200) : row.standby_address,
     standby_fingerprint:
       body.standby_fingerprint != null ? normalizeFingerprint(body.standby_fingerprint).slice(0, 64) : row.standby_fingerprint,
-    require_accounts: body.require_accounts != null ? (body.require_accounts ? 1 : 0) : row.require_accounts,
+    require_accounts: body.require_accounts === true || body.require_accounts === 1
+      ? 1
+      : body.require_accounts === false || body.require_accounts === 0
+        ? 0
+        : requireAccountsOn(row.require_accounts) ? 1 : 0,
   };
   await env.DB.prepare(
     `UPDATE networks SET name = ?, active_address = ?, active_fingerprint = ?, standby_address = ?, standby_fingerprint = ?, require_accounts = ?
@@ -544,10 +605,22 @@ async function registerServer(request, env, account) {
     fingerprint: body.fingerprint,
     confirm: !!body.confirm,
     replace: !!body.replace,
+    instance: body.instance,
+    lan: body.lan,
+    publicIp: body.public_ip,
+    checkedAt: body.checked_at,
     activeAddress: row.active_address,
     activeFingerprint: row.active_fingerprint,
     standbyAddress: row.standby_address,
     standbyFingerprint: row.standby_fingerprint,
+    activeLan: row.active_lan,
+    standbyLan: row.standby_lan,
+    activePublicIp: row.active_public_ip,
+    standbyPublicIp: row.standby_public_ip,
+    activeInstance: row.active_instance,
+    standbyInstance: row.standby_instance,
+    activeCheckedAt: row.active_ip_checked_at,
+    standbyCheckedAt: row.standby_ip_checked_at,
   });
   if (plan.changed) {
     await writeSlots(env, row, plan.next);
@@ -655,9 +728,26 @@ async function changesFor(env, networkId) {
 
 async function writeSlots(env, row, next) {
   await env.DB.prepare(
-    `UPDATE networks SET active_address = ?, active_fingerprint = ?, standby_address = ?, standby_fingerprint = ? WHERE id = ?`,
+    `UPDATE networks SET active_address = ?, active_fingerprint = ?, standby_address = ?, standby_fingerprint = ?,
+        active_lan = ?, standby_lan = ?, active_public_ip = ?, standby_public_ip = ?,
+        active_instance = ?, standby_instance = ?, active_ip_checked_at = ?, standby_ip_checked_at = ?
+      WHERE id = ?`,
   )
-    .bind(next.activeAddress, next.activeFingerprint, next.standbyAddress, next.standbyFingerprint, row.id)
+    .bind(
+      next.activeAddress,
+      next.activeFingerprint,
+      next.standbyAddress,
+      next.standbyFingerprint,
+      next.activeLan || "",
+      next.standbyLan || "",
+      next.activePublicIp || "",
+      next.standbyPublicIp || "",
+      next.activeInstance || "",
+      next.standbyInstance || "",
+      next.activeCheckedAt || 0,
+      next.standbyCheckedAt || 0,
+      row.id,
+    )
     .run();
 }
 
@@ -695,7 +785,7 @@ async function refresh(request, env) {
   if (member?.revoked_at) throw new HttpError(401, "Sign in required.");
   if (owner?.email !== row.email && !member) throw new HttpError(401, "Sign in required.");
   const account = { accountId: row.account_id, email: row.email };
-  if (row.require_accounts && !row.active_address) throw new HttpError(401, "Sign in required.");
+  if (requireAccountsOn(row.require_accounts) && !row.active_address) throw new HttpError(401, "Sign in required.");
   const { access, exp } = await signToken(env, { email: account.email, network: row, deviceId });
   if (body.computers) await saveComputers(env, row.id, account.accountId, body.computers);
   const saved = await computersFor(env, row.id, account.accountId);
@@ -775,7 +865,7 @@ async function policy(env, account) {
     .all();
   return json({
     network_id: network.id,
-    require_accounts: !!network.require_accounts,
+    require_accounts: requireAccountsOn(network.require_accounts),
     public_key: publicKey,
     allowed_accounts: [...new Set(allowed)],
     revoked_devices: (revoked.results || []).map((r) => r.device_id),
@@ -822,7 +912,7 @@ async function invitesFor(env, networkId) {
 async function createInvite(request, env, account) {
   const row = await owned(env, account.accountId);
   if (!row) throw new HttpError(404, "Set your network before creating a network key.");
-  if (!row.active_address) throw new HttpError(400, "Set the server address in My network first.");
+  if (!row.active_address) throw new HttpError(400, NO_SERVER_MESSAGE);
   const body = await readJson(request);
   const secretHash = String(body.secret_hash || "").trim().toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(secretHash)) throw new HttpError(400, "This network key is not valid.");

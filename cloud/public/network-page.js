@@ -56,6 +56,20 @@
     return new Date(unix * 1000).toLocaleString();
   }
 
+  function ipLine(ip, checked) {
+    if (!ip) return "—";
+    return checked ? `${ip} (last checked ${date(checked)})` : ip;
+  }
+
+  function reachLines(net) {
+    const lines = [];
+    if (net.active_public_ip) lines.push(`Active public IP: ${ipLine(net.active_public_ip, net.active_ip_checked_at)}`);
+    if (net.active_lan) lines.push(`Active LAN: ${net.active_lan}`);
+    if (net.standby_public_ip) lines.push(`Standby public IP: ${ipLine(net.standby_public_ip, net.standby_ip_checked_at)}`);
+    if (net.standby_lan) lines.push(`Standby LAN: ${net.standby_lan}`);
+    return lines;
+  }
+
   function field(label, id, value) {
     const wrap = el("label", label);
     const input = document.createElement("input");
@@ -298,6 +312,7 @@
       form.append(field("Active server key fingerprint", "net-active-fp", net.active_fingerprint));
       form.append(field("Standby server", "net-standby", net.standby_address));
       form.append(field("Standby server key fingerprint", "net-standby-fp", net.standby_fingerprint));
+      reachLines(net).forEach((line) => form.append(el("p", line, "net-muted")));
       const requireRow = el("div", null, "net-check");
       const sw = el("label", null, "net-switch");
       const box = document.createElement("input");
@@ -353,6 +368,10 @@
         ["Standby server", net.standby_address || "—"],
         ["Standby key", net.standby_fingerprint || "—"],
         ["Require signed-in accounts", net.require_accounts ? "On" : "Off"],
+        ["Active public IP", ipLine(net.active_public_ip, net.active_ip_checked_at)],
+        ["Active LAN", net.active_lan || "—"],
+        ["Standby public IP", ipLine(net.standby_public_ip, net.standby_ip_checked_at)],
+        ["Standby LAN", net.standby_lan || "—"],
       ];
       for (const [k, v] of rows) {
         kv.append(el("dt", k), el("dd", v, k.includes("key") ? "net-mono" : ""));

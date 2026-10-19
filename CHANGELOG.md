@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.1
+
+Fixes the 0.6.0 upgrade that turned **Require signed-in accounts** on, published both servers as standby, and emptied the active slot. Desktop and server are 0.6.1. Android stays 0.6.3. Run `cloud\deploy.cmd` from your PC (it applies `0007_reach.sql` and deploys the worker). Do not deploy from CI, and do not turn **Require signed-in accounts** on until every computer has signed in.
+
+* Grace mode is the default again. A 0.5.2 upgrade, a new network, and a server that never had the switch turned on all leave **Require signed-in accounts** off. A 0.6.0 server that pulled "on" from the cloud turns it back off and pushes that off. The switch stays on only after you turn it on.
+* The server that owns the cloud copy stays the active server even when no computer is online. An explicit standby stays standby. A server publishes its own address, fingerprint, LAN addresses, and instance id, and only when something changed. It does not clear the other slot just because both servers share a fingerprint, and it does not overwrite a slot held by a different machine unless you confirm.
+* A hostname in the Public address field is never replaced by a raw IP. If the saved address is the raw IP that `pjdesk.spader.us` already points at, the server puts the hostname back. **Use this computer's current server** publishes the address the computer is already using, and the button shows that address.
+* The server checks its public IP about every five minutes at `https://pjdesk.com/api/ip` (the caller's address, two matching reads before a change counts). It updates only the slot it owns. A hostname is left alone. The Server window and Account → My network show **Public IP** and the LAN addresses. A signed-in client refreshes the network on a failed reconnect so it follows a new address.
+* A client on the same LAN as the server connects to the server's private address first (about 1.5 seconds) and falls back to the public address or hostname. It does that when its own public IP matches the server's published public IP, or when a short LAN probe succeeds. LAN and public are also tried together, and the first handshake that finishes is kept. Every path checks the server key fingerprint, so a LAN address cannot be spoofed. The status line shows **LAN** or **Internet**. Two computers on the same LAN prefer each other's private addresses the same way; the viewer title says which path connected.
+
+### Recover BENLENOVODESK
+
+Do this in order. Installing 0.6.1 on the server fixes grace mode and the active role. The slot flap stops only after `cloud\deploy.cmd`, because the worker that is live today still has the 0.6.0 publish rules.
+
+1. Install **PJDesk Server 0.6.1** on BENLENOVODESK and restart the service. Leave **Require signed-in accounts** off. Do not delete `cloud-sync.json` or `cloud-state.json`. Computers can connect again after this step, still using the address they already have.
+2. On your PC, in the `cloud` folder, run `cloud\deploy.cmd`. That applies `0007_reach.sql` and deploys the worker, including `GET /api/ip`. Do this before any SQL that names the new columns.
+3. After that deploy, clear the bad slots and this account's change log. From the `cloud` folder:
+
+```
+npx wrangler d1 execute pjdesk-cloud --remote --command "UPDATE networks SET require_accounts = 0, active_address = '', active_fingerprint = '', standby_address = '', standby_fingerprint = '', active_lan = '', standby_lan = '', active_public_ip = '', standby_public_ip = '', active_instance = '', standby_instance = '', active_ip_checked_at = 0, standby_ip_checked_at = 0 WHERE owner_id = (SELECT id FROM accounts WHERE email = 'ben@spader.us'); DELETE FROM network_changes WHERE network_id IN (SELECT id FROM networks WHERE owner_id = (SELECT id FROM accounts WHERE email = 'ben@spader.us'));"
+```
+
+4. Restart BENLENOVODESK (or wait about 30 seconds). It publishes `pjdesk.spader.us:21200` into the empty active slot when that hostname is the public address, or when the saved address is the raw IP that name points at. If the Public address field still shows the raw IP, type `pjdesk.spader.us:21200` and click **Update My network**.
+5. Install 0.6.1 on the standby (`68.234.75.68`) and restart it. It fills the standby slot. If the window asks to replace a slot held by the other machine, confirm once.
+6. Install 0.6.1 on the clients. A client that already saved `204.248.122.44:21200` should be set back to `pjdesk.spader.us:21200`, or signed in again after the server publishes the hostname. Do not click the fallback button while that field shows the raw IP.
+
+While 0.6.0 is still running, editing `network-access.json` is not enough: the next cloud pull turns **Require signed-in accounts** back on if the database still has it on. Stop that service, or install 0.6.1, before relying on the file.
+
 ## 0.6.0
 
 * Connecting to a computer still asks for that computer's own permanent or one-time password. Signing in with the PJDesk account does not fill that in and does not skip it. The connect dialog says **Password for** the computer's name, with **Save password for this computer**. That saved password stays on the computer (Windows DPAPI, or the Android Keystore) and is not uploaded. The account sign-in is labeled for the network and its servers.

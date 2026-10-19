@@ -195,6 +195,9 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     crate::public_addr::remember_port(&data_dir, opts.port);
     let identity = load_identity(&data_dir)?;
     crate::access::remember_fingerprint(&data_dir, &identity.fingerprint());
+    if crate::access::restore_grace(&data_dir) {
+        info!("Require signed-in accounts was on without being chosen. Grace mode is on again, so existing computers can connect.");
+    }
     let registry = Registry::load(data_dir.join("devices.json"))?;
     let device_count = registry.len();
     let accounts = crate::accounts::Accounts::load(&data_dir)?;

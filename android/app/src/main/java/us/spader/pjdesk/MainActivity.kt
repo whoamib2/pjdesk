@@ -406,7 +406,11 @@ class MainActivity : ComponentActivity() {
                                     saved = app.store.saved()
                                 }.onFailure { err ->
                                     val cloud = err as? CloudAuthException
-                                    netOffer = cloud != null && CloudAuth.offerCurrentServer(cloud.role, state.server, state.fingerprint)
+                                    netOffer = cloud != null && cloud.code == "no_server" && CloudAuth.offerCurrentServer(
+                                        if (cloud.role.isBlank()) "owner" else cloud.role,
+                                        state.server,
+                                        state.fingerprint,
+                                    )
                                     netLogin = if (netOffer) cloud?.loginToken.orEmpty() else ""
                                     netError = err.message ?: "Could not sign in."
                                 }

@@ -208,6 +208,9 @@ async function api(request, env, url, ctx) {
   const p = url.pathname;
   const m = request.method;
   if (p === "/api/health") return json({ ok: true });
+  if (p === "/api/ip" && (m === "GET" || m === "HEAD")) {
+    return json({ ip: request.headers.get("cf-connecting-ip") || "" });
+  }
   if (p === "/api/signup" && m === "POST") return signup(request, env);
   if (p === "/api/login" && m === "POST") return login(request, env);
   if (p === "/api/logout" && m === "POST") return logout(request, env);

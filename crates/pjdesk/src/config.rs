@@ -62,6 +62,12 @@ pub struct Config {
     pub network_standby: Option<String>,
     #[serde(default)]
     pub network_standby_fingerprint: Option<String>,
+    /// LAN addresses of the active server (`ip:port`), published with its public address.
+    #[serde(default)]
+    pub network_lan: Vec<String>,
+    /// The active server's observed public IP, without a port. Empty until it publishes one.
+    #[serde(default)]
+    pub network_public_ip: String,
     /// The encrypted network key last applied on this computer. The passphrase
     /// is not stored. Export copies this string; nothing logs it.
     #[serde(default)]
@@ -476,8 +482,13 @@ impl Config {
             self.network_device_id = Some(session.device_id.clone());
         }
         if !session.address.trim().is_empty() {
-            self.server = Some(session.address.trim().to_string());
+            let next = crate::network::keep_hostname(self.server.as_deref().unwrap_or(""), session.address.trim());
+            if !next.is_empty() {
+                self.server = Some(next);
+            }
         }
+        self.network_lan = session.lan.clone();
+        self.network_public_ip = session.public_ip.clone();
         if let Ok(fp) = parse_fingerprint(&session.fingerprint) {
             self.server_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         }

@@ -1048,8 +1048,9 @@ async fn controller_session(
     };
     let peer = if auth.peer_name.is_empty() { host_name } else { auth.peer_name };
     let path = match path {
-        LinkPath::Direct(_) => "direct",
-        LinkPath::Relay(_) => "relay",
+        LinkPath::Direct(addr) if p2p::is_lan_ip(addr.ip()) => "LAN",
+        LinkPath::Direct(_) => "Internet",
+        LinkPath::Relay(_) => "Internet, relayed",
     };
     emit(
         &cb,

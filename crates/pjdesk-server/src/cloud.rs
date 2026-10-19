@@ -1089,10 +1089,12 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
-fn effective_role(st: &SyncState, heuristic: Role) -> Role {
+fn effective_role(st: &SyncState, mine: &str, heuristic: Role) -> Role {
     match st.desired.as_str() {
         "active" => Role::Active,
         "standby" => Role::Standby,
+        _ if !st.active_instance.is_empty() && st.active_instance == mine => Role::Active,
+        _ if !st.active_instance.is_empty() => Role::Standby,
         _ => heuristic,
     }
 }
@@ -1114,7 +1116,8 @@ pub fn sync_once(data_dir: &Path, role: Role, force_push: bool) -> bool {
         return false;
     };
     let mut applied = false;
-    let mut effective = effective_role(&SyncState::load(data_dir), role);
+    let mine = instance_id(data_dir);
+    let mut effective = effective_role(&SyncState::load(data_dir), &mine, role);
     let result = (|| -> Result<()> {
         match absorb(data_dir, &cfg)? {
             Fence::Superseded => {
@@ -1128,7 +1131,7 @@ pub fn sync_once(data_dir: &Path, role: Role, force_push: bool) -> bool {
                 }
             }
             Fence::MayUpload => {
-                effective = effective_role(&SyncState::load(data_dir), role);
+                effective = effective_role(&SyncState::load(data_dir), &mine, role);
                 match effective {
                     Role::Standby => {
                         if pull(data_dir, &cfg, false)? {
@@ -1628,6 +1631,7 @@ fn publish_health(data_dir: &Path, role: Role) {
     if let Err(e) = pull_network_policy(data_dir, &cfg) {
         tracing::debug!("network policy: {e:#}");
     }
+    let _ = crate::public_addr::poll_public_ip(data_dir, now());
     register_network(data_dir, role, false);
 }
 
@@ -1661,13 +1665,18 @@ fn pull_network_policy(data_dir: &Path, cfg: &CloudConfig) -> Result<()> {
         Err(e) => return Err(api_error(&cfg.api, &cfg.email, e)),
     };
     let mut policy = crate::access::Policy::load(data_dir);
-    policy.require_accounts = reply.require_accounts;
+    let cloud_on = reply.require_accounts;
+    let push_off = cloud_on && !policy.require_chosen;
+    policy.require_accounts = crate::access::adopt_cloud_require(policy.require_chosen, cloud_on);
     if reply.public_key.len() == 64 {
         policy.public_key = reply.public_key;
     }
     policy.allowed_accounts = reply.allowed_accounts;
     policy.revoked_devices = reply.revoked_devices;
     policy.save(data_dir).context("saving network policy")?;
+    if push_off {
+        push_require_accounts(data_dir, false);
+    }
     Ok(())
 }
 
@@ -1677,7 +1686,7 @@ fn pull_network_policy(data_dir: &Path, cfg: &CloudConfig) -> Result<()> {
 /// server already listed there should be overwritten.
 pub fn publish_network(data_dir: &Path, online: usize, replace: bool) {
     let hint = if online > 0 { Role::Active } else { Role::Standby };
-    let role = effective_role(&SyncState::load(data_dir), hint);
+    let role = effective_role(&SyncState::load(data_dir), &instance_id(data_dir), hint);
     register_network(data_dir, role, replace);
 }
 
@@ -1704,10 +1713,34 @@ fn register_network(data_dir: &Path, role: Role, replace: bool) {
         crate::public_addr::save(data_dir, &record);
         return;
     }
+    let watch = crate::public_addr::IpWatch::load(data_dir);
+    let lan = crate::public_addr::lan_endpoints(port);
+    let publication = serde_json::json!({
+        "role": role_name(role),
+        "address": record.address.trim(),
+        "fingerprint": fingerprint,
+        "instance": instance_id(data_dir),
+        "lan": lan,
+        "public_ip": watch.observed,
+        "checked_at": watch.checked_at,
+        "replace": replace,
+    });
+    let stamp = data_dir.join("network-publish.json");
+    if !replace {
+        if let Ok(prev) = std::fs::read(&stamp) {
+            if serde_json::from_slice::<serde_json::Value>(&prev).ok().as_ref() == Some(&publication) {
+                return;
+            }
+        }
+    }
     let body = serde_json::json!({
         "role": role_name(role),
         "address": record.address.trim(),
         "fingerprint": fingerprint,
+        "instance": instance_id(data_dir),
+        "lan": lan,
+        "public_ip": watch.observed,
+        "checked_at": watch.checked_at,
         "confirm": record.confirmed || !crate::public_addr::is_private_address(&record.address),
         "replace": replace,
     });
@@ -1735,7 +1768,13 @@ fn register_network(data_dir: &Path, role: Role, replace: bool) {
             };
             crate::public_addr::save(data_dir, &record);
             if !needs {
-                tracing::info!("network: published this server as {}", role_name(role));
+                let changed = value.get("changed").and_then(|v| v.as_bool()).unwrap_or(true);
+                if changed {
+                    tracing::info!("network: published this server as {}", role_name(role));
+                }
+                if let Ok(bytes) = serde_json::to_vec(&publication) {
+                    let _ = std::fs::write(&stamp, bytes);
+                }
             }
         }
         Err(ureq::Error::Status(code, resp)) => {
@@ -1870,9 +1909,13 @@ pub fn create_network_key(
         Ok(resp) => serde_json::from_str(&resp.into_string().unwrap_or_default()).context("unexpected reply from PJDesk")?,
         Err(e) => return Err(cloud_api_error(e)),
     };
-    let net = doc.network.context("Set the server address on pjdesk.com → Account → My network first.")?;
+    let net = doc.network.context(
+        "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network.",
+    )?;
     if net.active_address.trim().is_empty() || net.active_fingerprint.trim().is_empty() {
-        bail!("Set the server address and its fingerprint on pjdesk.com → Account → My network first.");
+        bail!(
+            "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network."
+        );
     }
     let secret = pjdesk_proto::random_bytes::<32>();
     let secret_hex = hex::encode(secret);
@@ -2194,6 +2237,24 @@ mod tests {
         assert_eq!(next_epoch(0), 1);
         assert_eq!(next_epoch(7), 8);
         assert_eq!(next_epoch(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn the_server_that_owns_the_cloud_copy_stays_active_with_no_computers_online() {
+        let mine = "1b401af7870a921b0629820f04e82433";
+        let st = SyncState {
+            active_instance: mine.into(),
+            active_name: "BENLENOVODESK".into(),
+            ..SyncState::default()
+        };
+        assert_eq!(effective_role(&st, mine, Role::Standby), Role::Active);
+        let other = SyncState { active_instance: mine.into(), ..SyncState::default() };
+        assert_eq!(effective_role(&other, "someone-else", Role::Active), Role::Standby);
+        let stepped = SyncState { desired: "standby".into(), active_instance: mine.into(), ..SyncState::default() };
+        assert_eq!(effective_role(&stepped, mine, Role::Active), Role::Standby);
+        let fresh = SyncState::default();
+        assert_eq!(effective_role(&fresh, mine, Role::Standby), Role::Standby);
+        assert_eq!(effective_role(&fresh, mine, Role::Active), Role::Active);
     }
 
     #[test]

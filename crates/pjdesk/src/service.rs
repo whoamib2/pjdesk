@@ -542,6 +542,7 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
             shared.permanent_set(),
         );
         status.rtt_ms = shared.rtt_ms();
+        status.reach = shared.reach();
         status.write();
         std::thread::sleep(Duration::from_secs(2));
     }

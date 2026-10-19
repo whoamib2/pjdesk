@@ -1808,6 +1808,21 @@ impl App {
                     .desired_width(360.0)
                     .font(egui::TextStyle::Monospace),
             );
+            ui.label(RichText::new(crate::public_addr::IpWatch::load(&self.data_dir).line()).color(p(ui).muted).size(12.0));
+            let hostname = crate::public_addr::is_hostname(self.pub_addr.trim());
+            let mut watch = crate::public_addr::IpWatch::load(&self.data_dir);
+            let mut auto = watch.enabled(self.pub_addr.trim());
+            if hostname {
+                ui.label(RichText::new(
+                    "This address is a hostname, so a public IP change does not replace it.",
+                ).color(p(ui).muted).size(12.0));
+            }
+            ui.add_enabled_ui(may_edit && !hostname, |ui| {
+                if ui.checkbox(&mut auto, "Update the address when my public IP changes").changed() {
+                    watch.auto = Some(auto);
+                    watch.save(&self.data_dir);
+                }
+            });
             if !self.pub_addr_note.is_empty() {
                 let color = if self.pub_addr_needs_confirm
                     || crate::public_addr::is_private_address(self.pub_addr.trim()) && !self.pub_addr_confirmed
@@ -1933,8 +1948,9 @@ impl App {
                 self.spawn_revoke_key(id);
             }
         });
-        if changed {
+            if changed {
             policy.require_accounts = require;
+            policy.require_chosen = true;
             if let Err(e) = policy.save(&self.data_dir) {
                 self.status = format!("Could not save the signed-in accounts setting: {e}");
             } else {

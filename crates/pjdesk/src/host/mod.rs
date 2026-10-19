@@ -41,6 +41,8 @@ pub struct HostShared {
     pub online: AtomicBool,
     /// Round-trip of the last server ping, in milliseconds. 0 until the first reply.
     pub rtt_ms: AtomicU64,
+    /// `LAN` or `Internet` once the signaling connection is up.
+    pub reach: Mutex<String>,
     /// This device's ID once registered.
     pub id: Mutex<Option<String>>,
     /// The password a controller must enter right now.
@@ -110,6 +112,9 @@ impl HostShared {
     }
     pub fn rtt_ms(&self) -> u64 {
         self.rtt_ms.load(Ordering::Relaxed)
+    }
+    pub fn reach(&self) -> String {
+        self.reach.lock().unwrap().clone()
     }
     pub fn permanent_set(&self) -> bool {
         self.permanent_set.load(Ordering::SeqCst)
@@ -359,14 +364,17 @@ async fn host_main(
     state.publish_password();
 
     let mut delay = Duration::from_secs(2);
+    let mut force_refresh = false;
     loop {
         if state.shared.as_ref().is_some_and(|s| s.stopping()) {
             return Ok(());
         }
-        let outcome = signaling_loop(&server, &mut config, &state).await;
+        let outcome = signaling_loop(&server, &mut config, &state, force_refresh).await;
+        force_refresh = true;
         if let Some(shared) = &state.shared {
             shared.online.store(false, Ordering::SeqCst);
             *shared.connected.lock().unwrap() = None;
+            *shared.reach.lock().unwrap() = String::new();
             if shared.stopping() {
                 return Ok(());
             }
@@ -394,11 +402,15 @@ async fn host_main(
 
 /// One signaling connection: register, then handle incoming sessions.
 /// Returns `Ok` if we were registered before the connection dropped.
-async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<HostState>) -> Result<()> {
+async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<HostState>, force_refresh: bool) -> Result<()> {
     tokio::task::spawn_blocking({
         let mut copy = config.clone();
         move || {
-            crate::network::refresh_config(&mut copy);
+            if force_refresh {
+                crate::network::refresh_config_now(&mut copy);
+            } else {
+                crate::network::refresh_config(&mut copy);
+            }
             copy
         }
     })
@@ -411,9 +423,12 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
         config.network_email = refreshed.network_email;
         config.server = refreshed.server;
         config.server_fingerprint = refreshed.server_fingerprint;
+        config.network_lan = refreshed.network_lan;
+        config.network_public_ip = refreshed.network_public_ip;
     });
+    let server = ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone());
     let token = config.network_access_token();
-    let mut signal = SignalClient::connect(server, config).await?;
+    let mut signal = SignalClient::connect(&server, config).await?;
     if !token.is_empty() {
         let _ = signal.send(ClientMsg::PresentAccess { token: token.clone() });
     }
@@ -433,7 +448,7 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
         Ok(None) if !token.is_empty() => {
             // A server from before 0.6.0 cannot decode PresentAccess and drops
             // the socket. Try once without the token so this computer stays online.
-            signal = SignalClient::connect(server, config).await?;
+            signal = SignalClient::connect(&server, config).await?;
             signal.send(register)?;
             timeout(Duration::from_secs(10), signal.recv()).await
         }
@@ -463,11 +478,12 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
         config.save()?;
     }
     let has_permanent = state.permanent.lock().unwrap().is_some();
-    print_banner(&device_id, &state.password.lock().unwrap(), has_permanent, server);
+    print_banner(&device_id, &state.password.lock().unwrap(), has_permanent, &server);
     crate::HOST_ONLINE.store(true, Ordering::SeqCst);
     if let Some(shared) = &state.shared {
         *shared.id.lock().unwrap() = Some(device_id.clone());
         *shared.last_error.lock().unwrap() = None;
+        *shared.reach.lock().unwrap() = signal.via.to_string();
         shared.online.store(true, Ordering::SeqCst);
     }
     state.publish_password();
@@ -662,8 +678,15 @@ async fn session_inner(
         bail!("another controller connected first");
     }
 
-    let path = if connection.remote_address() == server_udp { "relayed via the server" } else { "direct P2P" };
-    info!("\"{}\" connected ({path}, {})", auth.peer_name, connection.remote_address());
+    let remote = connection.remote_address();
+    let path = if remote == server_udp {
+        "Internet, relayed via the server"
+    } else if p2p::is_lan_ip(remote.ip()) {
+        "LAN"
+    } else {
+        "Internet"
+    };
+    info!("\"{}\" connected ({path}, {})", auth.peer_name, remote);
     if let Some(shared) = &state.shared {
         *shared.connected.lock().unwrap() = Some(auth.peer_name.clone());
     }

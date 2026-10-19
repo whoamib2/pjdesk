@@ -389,6 +389,7 @@ impl App {
             password: Some("a1b2c3d4".into()),
             permanent_set: false,
             rtt_ms: 18,
+            reach: "Internet".into(),
             updated_unix: unix_now(),
         };
         self.connect_id = "123 456 789".into();
