@@ -44,11 +44,26 @@ fun SignInScreen(
     onScan: () -> Unit = {},
     accountForKey: Boolean = false,
     onSubmit: () -> Unit,
+    importOffer: String? = null,
+    importPass: String = "",
+    onImportPass: (String) -> Unit = {},
+    onAcceptImport: () -> Unit = {},
+    onDismissImport: () -> Unit = {},
 ) {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        if (importOffer != null) {
+            ServerConfigOffer(
+                blob = importOffer,
+                pass = importPass,
+                onPass = onImportPass,
+                onImport = onAcceptImport,
+                onCancel = onDismissImport,
+                fromPaste = true,
+            )
+        }
         Text("Sign in", style = MaterialTheme.typography.headlineMedium)
         Text(
             if (useKey) "Paste a network key, or scan its QR code. This phone enrolls and stays signed in after a restart."
@@ -123,6 +138,36 @@ fun SignInScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun ServerConfigOffer(
+    blob: String,
+    pass: String,
+    onPass: (String) -> Unit,
+    onImport: () -> Unit,
+    onCancel: () -> Unit,
+    fromPaste: Boolean,
+) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                if (fromPaste) "Import this server config?" else "Import server config",
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Text(
+                if (fromPaste) "A network key was pasted. Importing it sets this phone's server and enrolls it."
+                else "Enter the passphrase for this server config. It was shared separately from the key.",
+                color = pjMuted(),
+            )
+            when (NetKey.kind(blob)) {
+                "embedded" -> Text("Anyone who has this network key can join.", color = MaterialTheme.colorScheme.error)
+                "passphrase" -> SecretField(value = pass, onValueChange = onPass, label = "Passphrase")
+            }
+            Button(onClick = onImport, modifier = Modifier.fillMaxWidth()) { Text("Import server config") }
+            TextButton(onClick = onCancel) { Text("Cancel") }
         }
     }
 }

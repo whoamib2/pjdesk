@@ -145,6 +145,23 @@ pub fn is_embedded(blob: &str) -> bool {
     matches!(kind(blob), Ok(KeyKind::Embedded))
 }
 
+/// Pulls a `pjdesk-net1:` blob out of clipboard text or a file name.
+///
+/// The returned string is still the encrypted blob. A RustDesk-style
+/// `host=` / reversed-base64 config is ignored, so a file name never carries
+/// the server address in the clear.
+pub fn blob_from_text(text: &str) -> Option<String> {
+    let idx = text.find(PREFIX)?;
+    let rest = &text[idx + PREFIX.len()..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(rest.len());
+    if end < 16 {
+        return None;
+    }
+    Some(format!("{PREFIX}{}", &rest[..end]))
+}
+
 pub fn kind(blob: &str) -> Result<KeyKind, NetKeyError> {
     let raw = decode_blob(blob)?;
     match raw.get(1).copied() {
@@ -394,6 +411,24 @@ mod tests {
         raw[n] ^= 0x01;
         let tampered = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(raw));
         assert_eq!(open(&tampered, "correct horse"), Err(NetKeyError::CouldNotOpen));
+    }
+
+    #[test]
+    fn filename_and_clipboard_keep_the_encrypted_blob() {
+        let blob = seal_embedded_with(&sample(), &secret(), &[0x44; 32], &[0x33; 24]).unwrap();
+        assert!(!blob.contains("office.example"));
+        let name = format!("PJDesk-Setup-0.6.0--{blob}.exe");
+        // NTFS allows 255 characters in one file name. A real encrypted blob
+        // plus the setup prefix is longer than that, so the rename often
+        // cannot be created. The parser still has to accept it when the
+        // name does fit, and must not fall back to a plaintext host string.
+        assert!(name.len() > 255);
+        assert_eq!(blob_from_text(&name).as_deref(), Some(blob.as_str()));
+        let copied = format!(r"C:\Users\Ben\Downloads\PJDesk-Setup-0.6.0--{blob} (1).exe");
+        assert_eq!(blob_from_text(&copied).as_deref(), Some(blob.as_str()));
+        assert_eq!(blob_from_text(&format!("\n{blob} \n")).as_deref(), Some(blob.as_str()));
+        assert!(blob_from_text("PJDesk-Setup-0.6.0--host=office.example,key=abc.exe").is_none());
+        assert!(blob_from_text("just some text").is_none());
     }
 
     #[test]

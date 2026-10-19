@@ -49,6 +49,10 @@ fn client_shots() {
         ("signin-light", egui::Theme::Light, Prep::SignIn),
         ("netkey-dark", egui::Theme::Dark, Prep::NetworkKey),
         ("netkey-light", egui::Theme::Light, Prep::NetworkKey),
+        ("servercfg-dark", egui::Theme::Dark, Prep::ServerConfig),
+        ("servercfg-light", egui::Theme::Light, Prep::ServerConfig),
+        ("import-offer-dark", egui::Theme::Dark, Prep::ImportOffer),
+        ("import-offer-light", egui::Theme::Light, Prep::ImportOffer),
     ] {
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(1180.0, 760.0))
@@ -68,6 +72,8 @@ fn client_shots() {
                     Prep::Password => app.load_password_preview(),
                     Prep::SignIn => app.load_sign_in_preview(),
                     Prep::NetworkKey => app.load_network_key_preview(),
+                    Prep::ServerConfig => app.load_server_config_preview(),
+                    Prep::ImportOffer => app.load_import_offer_preview(),
                 }
                 app
             });
@@ -87,4 +93,6 @@ enum Prep {
     Password,
     SignIn,
     NetworkKey,
+    ServerConfig,
+    ImportOffer,
 }

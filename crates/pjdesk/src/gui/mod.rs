@@ -49,7 +49,7 @@ enum DeskTab {
 }
 
 /// Launches the app and blocks until the window is closed.
-pub fn run(server_flag: Option<String>) -> Result<()> {
+pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result<()> {
     let mut config = Config::load().unwrap_or_default();
     if let Some(flag) = &server_flag {
         if let Ok(addr) = ServerAddr::parse(flag) {
@@ -69,8 +69,16 @@ pub fn run(server_flag: Option<String>) -> Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native("PJDesk", options, Box::new(|cc| Ok(Box::new(App::new(cc, config)))))
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    eframe::run_native(
+        "PJDesk",
+        options,
+        Box::new(move |cc| {
+            let mut app = App::new(cc, config);
+            app.take_installer_key(import_config);
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn app_icon() -> egui::IconData {
@@ -239,6 +247,19 @@ pub struct App {
     net_error: String,
     show_net_sign_in: bool,
     net_rx: Option<Receiver<Result<crate::network::Session, String>>>,
+    /// Network key waiting in the import dialog. Not logged.
+    import_blob: Option<String>,
+    import_pass: String,
+    import_show: bool,
+    /// True when a paste offered the import. False when Import was already clicked
+    /// and the dialog is only collecting a passphrase.
+    import_confirm: bool,
+    import_hint: String,
+    /// Blob in flight for the current enroll, stored only after the server accepts it.
+    pending_blob: Option<String>,
+    net_importing: bool,
+    /// A paste the user dismissed, so the same clipboard event is not offered again.
+    dismissed_paste: Option<String>,
     toast: widgets::Toast,
     tray: Option<tray::Tray>,
     logo: Option<egui::TextureHandle>,
@@ -324,6 +345,14 @@ impl App {
             net_error: String::new(),
             show_net_sign_in: false,
             net_rx: None,
+            import_blob: None,
+            import_pass: String::new(),
+            import_show: false,
+            import_confirm: false,
+            import_hint: String::new(),
+            pending_blob: None,
+            net_importing: false,
+            dismissed_paste: None,
             toast: widgets::Toast::default(),
             tray: tray::Tray::new(&cc.egui_ctx),
             logo: Some(cc.egui_ctx.load_texture(
@@ -456,6 +485,23 @@ impl App {
         self.net_key_pass.clear();
         self.net_key_show = false;
         self.net_key_account = false;
+    }
+
+    #[cfg(feature = "ui-shots")]
+    fn load_server_config_preview(&mut self) {
+        self.cfg.server = Some("office.example:21200".into());
+        self.cfg.server_fingerprint = Some("ab:cd:ef:01".into());
+        self.cfg.network_key = Some("pjdesk-net1:paste-the-key-here".into());
+        self.load_preview(true);
+        self.settings.preview_network();
+    }
+
+    #[cfg(feature = "ui-shots")]
+    fn load_import_offer_preview(&mut self) {
+        self.load_sign_in_preview();
+        self.import_blob = Some("pjdesk-net1:paste-the-key-here".into());
+        self.import_confirm = true;
+        self.import_hint = "A network key was pasted. Importing it sets this computer's server and enrolls it.".into();
     }
 
     #[cfg(feature = "ui-shots")]
@@ -678,10 +724,17 @@ impl App {
             Ok(Ok(session)) => {
                 self.net_busy = false;
                 self.net_rx = None;
+                if let Some(blob) = self.pending_blob.take().or_else(|| pjdesk_proto::netkey::blob_from_text(&self.net_blob)) {
+                    self.cfg.network_key = Some(blob);
+                    crate::network::clear_installer_network_key();
+                }
+                let imported = self.net_importing;
+                self.net_importing = false;
                 self.net_pass.clear();
                 self.net_code.clear();
                 self.net_blob.clear();
                 self.net_key_pass.clear();
+                self.import_pass.clear();
                 self.net_error.clear();
                 self.show_net_sign_in = false;
                 if session.email.is_empty() {
@@ -695,14 +748,26 @@ impl App {
                 }
                 self.cfg.apply_network_session(&session);
                 self.net_email = self.cfg.network_email.clone().unwrap_or_default();
+                self.settings.set_server_text(&self.cfg.effective_server());
                 self.save_cfg();
                 crate::network::copy_to_service(&self.cfg);
                 self.engine.retarget(&self.cfg);
-                self.toast.show(format!("Signed in as {}", self.net_email));
+                if imported {
+                    self.toast.show("Import server configuration successfully");
+                } else {
+                    self.toast.show(format!("Signed in as {}", self.net_email));
+                }
             }
             Ok(Err(e)) => {
                 self.net_busy = false;
                 self.net_rx = None;
+                self.net_importing = false;
+                self.pending_blob = None;
+                if e.contains("specific account") {
+                    self.show_net_sign_in = true;
+                    self.net_mode = 2;
+                    self.net_key_account = true;
+                }
                 self.net_error = e;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -734,6 +799,9 @@ impl App {
                 .ok();
         } else if self.net_mode == 2 {
             let blob = self.net_blob.clone();
+            if let Some(found) = pjdesk_proto::netkey::blob_from_text(&blob) {
+                self.pending_blob = Some(found);
+            }
             let passphrase = self.net_key_pass.clone();
             let email = self.net_email.clone();
             let password = self.net_pass.clone();
@@ -757,6 +825,123 @@ impl App {
                 })
                 .ok();
         }
+    }
+
+    /// Applies a network key carried by the installer file name or `--config`.
+    /// An embedded key enrolls immediately. A passphrase key asks for the
+    /// passphrase first. The blob stays encrypted on disk until then.
+    fn take_installer_key(&mut self, explicit: Option<String>) {
+        let Some(blob) = crate::network::installer_network_key(explicit.as_deref()) else { return };
+        if self.cfg.network_key.as_deref() == Some(blob.as_str()) && !self.cfg.network_refresh_token().is_empty() {
+            crate::network::clear_installer_network_key();
+            return;
+        }
+        if pjdesk_proto::netkey::is_embedded(&blob) {
+            self.begin_import(blob, String::new());
+            return;
+        }
+        if pjdesk_proto::netkey::needs_passphrase(&blob) {
+            self.import_blob = Some(blob);
+            self.import_pass.clear();
+            self.import_show = false;
+            self.import_confirm = false;
+            self.import_hint = "This copy of PJDesk includes a network key. Enter the passphrase that was shared separately.".into();
+        }
+    }
+
+    fn begin_import(&mut self, blob: String, passphrase: String) {
+        if self.net_busy {
+            return;
+        }
+        self.import_blob = None;
+        self.import_hint.clear();
+        self.net_blob = blob;
+        self.net_key_pass = passphrase;
+        self.net_mode = 2;
+        self.net_key_account = false;
+        self.net_importing = true;
+        self.net_error.clear();
+        self.start_network_sign_in();
+    }
+
+    fn import_server_config(&mut self) {
+        let text = crate::clip::get_text().unwrap_or_default();
+        let Some(blob) = pjdesk_proto::netkey::blob_from_text(&text) else {
+            self.toast.show(if text.trim().is_empty() { "Clipboard is empty" } else { "Invalid server configuration" });
+            return;
+        };
+        self.queue_import(blob, true);
+    }
+
+    fn export_server_config(&mut self) {
+        let Some(blob) = self.cfg.network_key.clone().filter(|s| pjdesk_proto::netkey::blob_from_text(s).is_some()) else {
+            self.toast.show("There is no server config to export.");
+            return;
+        };
+        if widgets::copy_to_clipboard(&blob) {
+            self.toast.show("Export server configuration successfully");
+        } else {
+            self.toast.show("Could not copy the server config.");
+        }
+    }
+
+    /// `immediate` is the Settings button: apply a self-contained key at once.
+    /// A paste on the sign-in screen always offers first.
+    fn queue_import(&mut self, blob: String, immediate: bool) {
+        if pjdesk_proto::netkey::needs_passphrase(&blob) {
+            self.import_blob = Some(blob);
+            self.import_pass.clear();
+            self.import_show = false;
+            self.import_confirm = !immediate;
+            self.import_hint = if immediate {
+                "Enter the passphrase for this server config. It was shared separately from the key.".into()
+            } else {
+                "A network key was pasted. Importing it sets this computer's server and enrolls it.".into()
+            };
+            return;
+        }
+        if !pjdesk_proto::netkey::is_embedded(&blob) {
+            self.toast.show("Invalid server configuration");
+            return;
+        }
+        if immediate {
+            self.begin_import(blob, String::new());
+        } else {
+            self.import_blob = Some(blob);
+            self.import_pass.clear();
+            self.import_show = false;
+            self.import_confirm = true;
+            self.import_hint = "A network key was pasted. Importing it sets this computer's server and enrolls it.".into();
+        }
+    }
+
+    fn showing_sign_in(&self) -> bool {
+        self.cfg.effective_server().trim().is_empty() || self.show_net_sign_in
+    }
+
+    fn notice_sign_in_paste(&mut self, ctx: &egui::Context) {
+        if !self.showing_sign_in() {
+            return;
+        }
+        let found = ctx.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Paste(text) => pjdesk_proto::netkey::blob_from_text(text),
+                _ => None,
+            })
+        });
+        let Some(blob) = found else { return };
+        if self.dismissed_paste.as_deref() == Some(blob.as_str()) {
+            return;
+        }
+        self.queue_import(blob, false);
+    }
+
+    fn dismiss_import(&mut self) {
+        self.dismissed_paste = self.import_blob.clone();
+        self.import_blob = None;
+        self.import_pass.clear();
+        self.import_hint.clear();
+        self.import_show = false;
     }
 
     fn poll_password(&mut self) {
@@ -1009,6 +1194,7 @@ impl eframe::App for App {
         self.poll_password();
         self.poll_probe();
         self.poll_viewers();
+        self.notice_sign_in_paste(&ctx);
 
         if ctx
             .input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma)))
@@ -1042,6 +1228,7 @@ impl eframe::App for App {
 
         let pending = self.login_rx.is_some()
             || self.change_rx.is_some()
+            || self.net_rx.is_some()
             || self.lan_rx.is_some()
             || !self.viewer_rx.is_empty()
             || !self.engine.ready;
@@ -1061,6 +1248,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.body(ui));
 
         self.settings_window(&ctx);
+        self.import_prompt(&ctx);
         self.password_prompt(&ctx);
         self.login_window(&ctx);
         self.change_password_window(&ctx);

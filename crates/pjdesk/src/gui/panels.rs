@@ -288,6 +288,63 @@ impl App {
         }
     }
 
+    pub(super) fn import_prompt(&mut self, ctx: &egui::Context) {
+        if self.import_blob.is_none() {
+            return;
+        }
+        let blob = self.import_blob.clone().unwrap_or_default();
+        let needs = pjdesk_proto::netkey::needs_passphrase(&blob);
+        let embedded = pjdesk_proto::netkey::is_embedded(&blob);
+        let confirm = self.import_confirm;
+        let hint = self.import_hint.clone();
+        let mut go = false;
+        let mut cancel = false;
+        let mut open = true;
+        egui::Window::new("Import server config")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                if confirm {
+                    ui.label(RichText::new("Import this server config?").strong());
+                    ui.add_space(4.0);
+                }
+                if !hint.is_empty() {
+                    ui.label(widgets::muted(ui, &hint));
+                }
+                if embedded {
+                    ui.add_space(6.0);
+                    ui.colored_label(theme::paint(ui).warn, "Anyone who has this network key can join.");
+                }
+                if needs {
+                    ui.add_space(8.0);
+                    widgets::field_label(ui, "Passphrase");
+                    widgets::password_field(ui, &mut self.import_pass, "Passphrase", &mut self.import_show);
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("Import server config").clicked() {
+                        go = true;
+                    }
+                });
+            });
+        if cancel || !open {
+            self.dismiss_import();
+        } else if go {
+            if needs && self.import_pass.trim().is_empty() {
+                self.import_hint = "Enter the passphrase.".into();
+                return;
+            }
+            let pass = self.import_pass.clone();
+            self.begin_import(blob, pass);
+        }
+    }
+
     fn share_status(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
         if !self.engine.ready {

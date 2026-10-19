@@ -12,6 +12,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -36,6 +37,13 @@ fun SettingsScreen(
     onClearPermanent: () -> Unit = {},
     onUnattended: (Boolean) -> Unit = {},
     onShareLogs: () -> Unit = {},
+    onImportConfig: () -> Unit = {},
+    onExportConfig: () -> Unit = {},
+    importOffer: String? = null,
+    importPass: String = "",
+    onImportPass: (String) -> Unit = {},
+    onAcceptImport: () -> Unit = {},
+    onDismissImport: () -> Unit = {},
 ) {
     var server by rememberSaveable(state.server) { mutableStateOf(state.server) }
     Column(
@@ -46,7 +54,27 @@ fun SettingsScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("Settings", style = MaterialTheme.typography.titleLarge)
-        Section("Server") {
+        Section("ID/Relay Server") {
+            if (importOffer != null) {
+                ServerConfigOffer(
+                    blob = importOffer,
+                    pass = importPass,
+                    onPass = onImportPass,
+                    onImport = onAcceptImport,
+                    onCancel = onDismissImport,
+                    fromPaste = false,
+                )
+            }
+            OutlinedButton(onClick = onImportConfig, modifier = Modifier.fillMaxWidth()) {
+                Text("Import server config")
+            }
+            OutlinedButton(onClick = onExportConfig, modifier = Modifier.fillMaxWidth()) {
+                Text("Export server config")
+            }
+            Text(
+                "Import reads a network key from the clipboard and applies it. Export copies this phone's network key. The text is encrypted, so it does not show the server address.",
+                color = pjMuted(),
+            )
             OutlinedTextField(
                 value = server,
                 onValueChange = { server = it },

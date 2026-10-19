@@ -2,6 +2,7 @@ package us.spader.pjdesk
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import us.spader.pjdesk.core.CloudAuthException
 import us.spader.pjdesk.core.NetKey
@@ -24,6 +25,17 @@ class NetKeyTest {
         val alone = NetKey.open(embedded, "")
         assertEquals("office.example:21200", alone.active)
         assertEquals("embedded", NetKey.kind(embedded))
+    }
+
+    @Test
+    fun filenameAndClipboardKeepTheEncryptedBlob() {
+        assertFalse(embedded.contains("office.example"))
+        val name = "PJDesk-Setup-0.6.0--$embedded.exe"
+        assertTrue(name.length > 255)
+        assertEquals(embedded, NetKey.blobIn(name))
+        assertEquals(embedded, NetKey.blobIn("C:\\Users\\Ben\\Downloads\\PJDesk-Setup-0.6.0--$embedded (1).exe"))
+        assertEquals(embedded, NetKey.blobIn("\n$embedded \n"))
+        assertEquals(null, NetKey.blobIn("PJDesk-Setup-0.6.0--host=office.example,key=abc.exe"))
     }
 
     @Test

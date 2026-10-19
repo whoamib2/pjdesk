@@ -62,6 +62,10 @@ pub struct Config {
     pub network_standby: Option<String>,
     #[serde(default)]
     pub network_standby_fingerprint: Option<String>,
+    /// The encrypted network key last applied on this computer. The passphrase
+    /// is not stored. Export copies this string; nothing logs it.
+    #[serde(default)]
+    pub network_key: Option<String>,
 }
 
 /// Quality, behaviour and startup preferences.
@@ -447,6 +451,11 @@ impl Config {
                 self.network_device_id = disk.network_device_id;
                 self.network_standby = disk.network_standby;
                 self.network_standby_fingerprint = disk.network_standby_fingerprint;
+            }
+            if self.network_key.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                if disk.network_key.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                    self.network_key = disk.network_key;
+                }
             }
         }
     }

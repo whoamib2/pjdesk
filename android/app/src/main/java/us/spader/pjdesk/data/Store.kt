@@ -92,6 +92,11 @@ class Store(context: Context) {
         get() = prefs.getString("networkEmail", "") ?: ""
         set(value) { prefs.edit().putString("networkEmail", value).apply() }
 
+    /** The encrypted network key last applied here. The passphrase is not stored. */
+    var networkKey: String
+        get() = prefs.getString("networkKey", "") ?: ""
+        set(value) { prefs.edit().putString("networkKey", value).apply() }
+
     var networkDeviceId: String
         get() = prefs.getString("networkDevice", "") ?: ""
         set(value) { prefs.edit().putString("networkDevice", value).apply() }

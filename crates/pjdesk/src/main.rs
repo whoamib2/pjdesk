@@ -51,6 +51,10 @@ struct Cli {
     /// Server address as host[:port] (overrides the saved setting).
     #[arg(long, global = true)]
     server: Option<String>,
+    /// Apply an encrypted network key (`pjdesk-net1:…`). The same blob is read
+    /// from a renamed installer, `PJDesk-Setup-<version>--<blob>.exe`.
+    #[arg(long = "config", global = true, value_name = "BLOB")]
+    import_config: Option<String>,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -299,7 +303,7 @@ fn main() {
         None => {
             // Default: the graphical app.
             init_gui_logging();
-            if let Err(e) = gui::run(cli.server.clone()) {
+            if let Err(e) = gui::run(cli.server.clone(), cli.import_config.clone()) {
                 fatal(&format!("PJDesk could not start: {e:#}"));
             }
         }

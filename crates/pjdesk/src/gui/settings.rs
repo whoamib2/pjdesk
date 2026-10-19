@@ -84,6 +84,15 @@ impl SettingsDraft {
     pub(crate) fn preview_security(&mut self) {
         self.tab = Tab::Security;
     }
+
+    #[cfg(feature = "ui-shots")]
+    pub(crate) fn preview_network(&mut self) {
+        self.tab = Tab::Network;
+    }
+
+    pub(crate) fn set_server_text(&mut self, server: &str) {
+        self.server = server.to_string();
+    }
 }
 
 fn normalize_theme(theme: &str) -> String {
@@ -178,7 +187,7 @@ impl App {
                                                     self.scm_running,
                                                     self.scm_known,
                                                 ),
-                                                Tab::Network => network_tab(ui, &mut self.settings),
+                                                Tab::Network => self.network_tab(ui),
                                                 Tab::Display => display_tab(ui, &mut self.settings),
                                                 Tab::Account => self.account_tab(ui),
                                                 Tab::About => about_tab(ui),
@@ -548,22 +557,64 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
     }
 }
 
-fn network_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
-    widgets::heading(ui, "YOUR PJDESK SERVER");
-    widgets::field_label(ui, "Address (host or host:port)");
-    widgets::text_field(ui, &mut d.server, "desk.example.com  or  192.168.1.10", false);
-    ui.label(widgets::muted(
-        ui,
-        "This is the self-hosted PJDesk server your computers connect through. The default port is 21200.",
-    ));
+impl App {
+    fn network_tab(&mut self, ui: &mut egui::Ui) {
+        let mut do_import = false;
+        let mut do_export = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("ID/RELAY SERVER").color(theme::paint(ui).muted).size(11.5).strong());
+            ui.add_space(8.0);
+            if ui.button("Import server config").on_hover_text("Read a network key from the clipboard and apply it").clicked() {
+                do_import = true;
+            }
+            if ui.button("Export server config").on_hover_text("Copy this computer's network key").clicked() {
+                do_export = true;
+            }
+        });
+        ui.add_space(4.0);
+        widgets::field_label(ui, "Address (host or host:port)");
+        widgets::text_field(ui, &mut self.settings.server, "desk.example.com  or  192.168.1.10", false);
+        let pinned = self.cfg.server_fingerprint.clone().unwrap_or_default();
+        ui.label(widgets::muted(
+            ui,
+            if pinned.is_empty() {
+                "Filled in when you import a server config or sign in. The default port is 21200."
+            } else {
+                "The pinned key is saved with the server. The default port is 21200."
+            },
+        ));
+        if !pinned.is_empty() {
+            ui.add_space(6.0);
+            widgets::field_label(ui, "Key");
+            ui.label(RichText::new(&pinned).monospace().size(13.0));
+        }
+        ui.add_space(6.0);
+        ui.label(widgets::muted(
+            ui,
+            "Import reads a network key from the clipboard and applies it. Export copies this computer's network key. The text is encrypted, so it does not show the server address.",
+        ));
 
-    ui.add_space(12.0);
-    widgets::heading(ui, "DIRECT CONNECTIONS");
-    widgets::checkbox(ui, &mut d.allow_direct, "Allow direct IP connections and announce this computer on the local network");
-    ui.add_space(8.0);
-    widgets::field_label(ui, "Ports a remote session may forward");
-    widgets::text_field(ui, &mut d.tunnel_ports, "22, 3389", false);
-    ui.label(widgets::muted(ui, "Comma-separated. Empty means no ports. Forwarding stays on this computer unless the server policy says otherwise."));
+        ui.add_space(12.0);
+        widgets::heading(ui, "DIRECT CONNECTIONS");
+        widgets::checkbox(
+            ui,
+            &mut self.settings.allow_direct,
+            "Allow direct IP connections and announce this computer on the local network",
+        );
+        ui.add_space(8.0);
+        widgets::field_label(ui, "Ports a remote session may forward");
+        widgets::text_field(ui, &mut self.settings.tunnel_ports, "22, 3389", false);
+        ui.label(widgets::muted(
+            ui,
+            "Comma-separated. Empty means no ports. Forwarding stays on this computer unless the server policy says otherwise.",
+        ));
+        if do_import {
+            self.import_server_config();
+        }
+        if do_export {
+            self.export_server_config();
+        }
+    }
 }
 
 fn display_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {

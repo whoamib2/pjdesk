@@ -27,6 +27,8 @@ RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 
 !include "MUI2.nsh"
+!include "WordFunc.nsh"
+!insertmacro StrStr
 
 !define MUI_ICON "pjdesk.ico"
 !define MUI_UNICON "pjdesk.ico"
@@ -88,6 +90,8 @@ Section "PJDesk (required)" SecCore
   nsExec::ExecToLog '"$INSTDIR\${EXE}" update-handoff'
   nsExec::Exec 'net start ${APPNAME}'
 
+  Call RememberNetworkKey
+
   CreateDirectory "$SMPROGRAMS\${APPNAME}"
   CreateShortcut "$SMPROGRAMS\${APPNAME}\PJDesk.lnk" "$INSTDIR\${EXE}"
   CreateShortcut "$SMPROGRAMS\${APPNAME}\Uninstall PJDesk.lnk" "$INSTDIR\uninstall.exe"
@@ -119,6 +123,20 @@ SectionEnd
   !insertmacro MUI_DESCRIPTION_TEXT ${SecService} "Run PJDesk from startup as a background service, so you can connect before anyone signs in and during UAC prompts. Needs Administrator rights; a one-time password is shown during setup."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
+; If the setup file was renamed to PJDesk-Setup-<version>--pjdesk-net1:<blob>.exe,
+; remember that name beside the installed exe. The blob stays encrypted.
+; The passphrase is not written. The path is not printed.
+Function RememberNetworkKey
+  ${StrStr} $0 $EXEPATH "pjdesk-net1:"
+  StrCmp $0 "" network_key_done
+  ClearErrors
+  FileOpen $1 "$INSTDIR\network-key.name" w
+  IfErrors network_key_done
+  FileWrite $1 $EXEPATH
+  FileClose $1
+  network_key_done:
+FunctionEnd
+
 Section "Uninstall"
   nsExec::Exec 'schtasks /Delete /TN "PJDesk Update" /F'
   ; Remove the service if it was installed (ignored if it wasn't).
@@ -129,6 +147,7 @@ Section "Uninstall"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\QUICKSTART.txt"
   Delete "$INSTDIR\uninstall.exe"
+  Delete "$INSTDIR\network-key.name"
   RMDir "$INSTDIR"
 
   Delete "$SMPROGRAMS\${APPNAME}\PJDesk.lnk"

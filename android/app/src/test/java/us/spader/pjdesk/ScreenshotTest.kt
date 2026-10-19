@@ -76,7 +76,7 @@ class ScreenshotTest {
     }
 
     @Test
-    fun settings() = shot("settings") {
+    fun settings() = shot("servercfg-dark") {
         SettingsScreen(
             state = DeskState(
                 server = "office.example:21200",
@@ -88,6 +88,46 @@ class ScreenshotTest {
             onTheme = {},
             onServer = {},
             onResetFingerprint = {},
+        )
+    }
+
+    @Test
+    fun settingsLight() = shot("servercfg-light", "light") {
+        SettingsScreen(
+            state = DeskState(
+                server = "office.example:21200",
+                fingerprint = "12:34:56:78:9a:bc:de:f0:11:22:33:44:55:66:77:88",
+                hasPermanent = true,
+                approval = "prompt",
+            ),
+            theme = "light",
+            onTheme = {},
+            onServer = {},
+            onResetFingerprint = {},
+        )
+    }
+
+    @Test
+    fun importOfferDark() = shot("import-offer-dark", "dark") { importOffer() }
+
+    @Test
+    fun importOfferLight() = shot("import-offer-light", "light") { importOffer() }
+
+    @Composable
+    private fun importOffer() {
+        SignInScreen(
+            email = "ben@spader.us",
+            password = "",
+            code = "",
+            useCode = false,
+            busy = false,
+            error = "",
+            onEmail = {},
+            onPassword = {},
+            onCode = {},
+            onUseCode = {},
+            onSubmit = {},
+            importOffer = "pjdesk-net1:paste-the-key-here",
         )
     }
 

@@ -314,6 +314,33 @@ pub fn copy_to_service(user: &Config) {
     let _ = cfg.save_to(&path);
 }
 
+/// A network key carried by `--config`, by this executable's file name
+/// (`PJDesk-Setup-0.6.0--pjdesk-net1:….exe`), or by `network-key.name` written
+/// next to the exe at install. Only an encrypted `pjdesk-net1:` blob matches.
+pub fn installer_network_key(explicit: Option<&str>) -> Option<String> {
+    if let Some(text) = explicit {
+        if let Some(blob) = pjdesk_proto::netkey::blob_from_text(text) {
+            return Some(blob);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    if let Some(name) = exe.file_name().and_then(|s| s.to_str()) {
+        if let Some(blob) = pjdesk_proto::netkey::blob_from_text(name) {
+            return Some(blob);
+        }
+    }
+    let path = exe.parent()?.join("network-key.name");
+    let text = std::fs::read_to_string(path).ok()?;
+    pjdesk_proto::netkey::blob_from_text(&text)
+}
+
+/// Removes the installer's pending file after the key has been applied.
+pub fn clear_installer_network_key() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(path) = exe.parent().map(|dir| dir.join("network-key.name")) else { return };
+    let _ = std::fs::remove_file(path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

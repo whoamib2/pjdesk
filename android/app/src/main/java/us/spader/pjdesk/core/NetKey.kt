@@ -23,6 +23,26 @@ object NetKey {
         val standbyFingerprint: String,
     )
 
+    /**
+     * Pulls a `pjdesk-net1:` blob out of pasted text or a file name.
+     * The result is still encrypted. A `host=` string is ignored.
+     */
+    fun blobIn(text: String): String? {
+        val idx = text.indexOf(PREFIX)
+        if (idx < 0) return null
+        val rest = text.substring(idx + PREFIX.length)
+        var end = rest.length
+        for (i in rest.indices) {
+            val c = rest[i]
+            if (!(c.isLetterOrDigit() || c == '-' || c == '_')) {
+                end = i
+                break
+            }
+        }
+        if (end < 16) return null
+        return PREFIX + rest.substring(0, end)
+    }
+
     fun kind(blob: String): String {
         val raw = decode(blob) ?: return ""
         return when (raw.getOrNull(1)?.toInt()) {

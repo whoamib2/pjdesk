@@ -41,6 +41,7 @@ import kotlinx.coroutines.withContext
 import androidx.compose.runtime.rememberCoroutineScope
 import org.json.JSONObject
 import us.spader.pjdesk.core.CloudAuth
+import us.spader.pjdesk.core.NetKey
 import us.spader.pjdesk.ui.SignInScreen
 import java.util.UUID
 import us.spader.pjdesk.a11y.PjAccessibilityService
@@ -132,10 +133,75 @@ class MainActivity : ComponentActivity() {
             var netScan by remember { mutableStateOf(false) }
             var netBusy by remember { mutableStateOf(false) }
             var netError by remember { mutableStateOf("") }
+            var importOffer by remember { mutableStateOf<String?>(null) }
+            var importPass by remember { mutableStateOf("") }
+            var importFromPaste by remember { mutableStateOf(true) }
             var savePassword by remember { mutableStateOf(false) }
             val scope = rememberCoroutineScope()
             val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
                 if (granted) netScan = true else netError = "Camera permission is needed to scan a network key."
+            }
+            fun clipboardText(): String {
+                val clip = getSystemService(ClipboardManager::class.java).primaryClip ?: return ""
+                if (clip.itemCount == 0) return ""
+                return clip.getItemAt(0).coerceToText(this@MainActivity)?.toString().orEmpty()
+            }
+            fun notePaste(value: String): Boolean {
+                val blob = NetKey.blobIn(value) ?: return false
+                importOffer = blob
+                importPass = ""
+                importFromPaste = true
+                return true
+            }
+            fun applyImported(blob: String, passphrase: String, bound: Boolean) {
+                val device = app.store.networkDeviceId.ifBlank {
+                    UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
+                }
+                netBusy = true
+                netError = ""
+                val email = netEmail
+                val pass = netPass
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching {
+                            CloudAuth.redeem(
+                                blob,
+                                passphrase,
+                                device,
+                                "Android",
+                                if (bound) email else "",
+                                if (bound) pass else "",
+                            )
+                        }
+                    }
+                    netBusy = false
+                    result.onSuccess { session ->
+                        val who = session.email.ifBlank { email.trim() }
+                        app.store.networkEmail = who
+                        app.store.networkDeviceId = session.deviceId
+                        app.store.networkKey = blob
+                        app.store.saveNetworkRefresh(session.refresh)
+                        engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
+                        engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
+                        session.computers.filter { it.id.length == 9 }.forEach { app.store.remember(it) }
+                        netPass = ""
+                        netKeyPass = ""
+                        importPass = ""
+                        netBlob = ""
+                        importOffer = null
+                        account = who
+                        saved = app.store.saved()
+                        snackbar.showSnackbar("Import server configuration successfully")
+                    }.onFailure {
+                        val message = it.message ?: "Could not sign in."
+                        netError = message
+                        if (message.contains("specific account")) {
+                            netUseKey = true
+                            netBlob = blob
+                            netKeyPass = passphrase
+                        }
+                    }
+                }
             }
             var showPermanent by remember { mutableStateOf(false) }
             val capture by captureReady.collectAsState()
@@ -221,11 +287,16 @@ class MainActivity : ComponentActivity() {
                         keyPass = netKeyPass,
                         busy = netBusy,
                         error = netError,
-                        onEmail = { netEmail = it },
-                        onPassword = { netPass = it },
-                        onCode = { netCode = it },
-                        onBlob = { netBlob = it },
-                        onKeyPass = { netKeyPass = it },
+                        onEmail = { if (!notePaste(it)) netEmail = it },
+                        onPassword = { if (!notePaste(it)) netPass = it },
+                        onCode = { if (!notePaste(it)) netCode = it },
+                        onBlob = {
+                            if (notePaste(it)) {
+                                netBlob = NetKey.blobIn(it) ?: it
+                                netUseKey = true
+                            } else netBlob = it
+                        },
+                        onKeyPass = { if (!notePaste(it)) netKeyPass = it },
                         onUseCode = { netUseCode = it; if (it) netUseKey = false },
                         onUseKey = { netUseKey = it; if (it) netUseCode = false },
                         onScan = {
@@ -233,6 +304,15 @@ class MainActivity : ComponentActivity() {
                             if (granted) netScan = true else cameraPermission.launch(Manifest.permission.CAMERA)
                         },
                         accountForKey = netError.contains("specific account"),
+                        importOffer = if (importFromPaste) importOffer else null,
+                        importPass = importPass,
+                        onImportPass = { if (!notePaste(it)) importPass = it },
+                        onAcceptImport = {
+                            val blob = importOffer ?: return@SignInScreen
+                            val bound = netError.contains("specific account")
+                            applyImported(blob, importPass, bound)
+                        },
+                        onDismissImport = { importOffer = null; importPass = "" },
                         onSubmit = {
                             val device = app.store.networkDeviceId.ifBlank {
                                 UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
@@ -269,6 +349,7 @@ class MainActivity : ComponentActivity() {
                                     val email = session.email.ifBlank { netEmail.trim() }
                                     app.store.networkEmail = email
                                     app.store.networkDeviceId = session.deviceId
+                                    if (useKey) NetKey.blobIn(blob)?.let { app.store.networkKey = it }
                                     app.store.saveNetworkRefresh(session.refresh)
                                     engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
                                     engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
@@ -385,6 +466,39 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
                                     onShareLogs = { AppLog.share(this@MainActivity) },
+                                    onImportConfig = {
+                                        val text = clipboardText()
+                                        val blob = NetKey.blobIn(text)
+                                        when {
+                                            blob == null -> scope.launch {
+                                                snackbar.showSnackbar(if (text.isBlank()) "Clipboard is empty" else "Invalid server configuration")
+                                            }
+                                            NetKey.kind(blob) == "embedded" -> applyImported(blob, "", false)
+                                            NetKey.kind(blob) == "passphrase" -> {
+                                                importOffer = blob
+                                                importPass = ""
+                                                importFromPaste = false
+                                            }
+                                            else -> scope.launch { snackbar.showSnackbar("Invalid server configuration") }
+                                        }
+                                    },
+                                    onExportConfig = {
+                                        val blob = app.store.networkKey
+                                        if (blob.isBlank()) {
+                                            scope.launch { snackbar.showSnackbar("There is no server config to export.") }
+                                        } else {
+                                            copy(blob)
+                                            scope.launch { snackbar.showSnackbar("Export server configuration successfully") }
+                                        }
+                                    },
+                                    importOffer = if (!importFromPaste) importOffer else null,
+                                    importPass = importPass,
+                                    onImportPass = { if (!notePaste(it)) importPass = it },
+                                    onAcceptImport = {
+                                        val blob = importOffer ?: return@SettingsScreen
+                                        applyImported(blob, importPass, netError.contains("specific account"))
+                                    },
+                                    onDismissImport = { importOffer = null; importPass = "" },
                                 )
                             }
                         }
