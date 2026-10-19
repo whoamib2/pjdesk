@@ -32,19 +32,25 @@ pub fn write_service_config(server: Option<&str>, password: Option<&str>) -> Res
     let path = crate::syspaths::service_config_path();
     let mut cfg = Config::load_from(&path).unwrap_or_default();
 
-    // Server: explicit flag, else keep existing, else copy the installing user's,
-    // else the baked-in default — so the service can always register, even when
-    // it's installed as SYSTEM and the user hasn't signed in yet.
+    // Server: explicit flag, else keep existing, else copy the installing user's.
+    // A fresh install has no server until someone signs in. An install that
+    // already registered keeps that address through effective_server.
     if let Some(s) = server {
         cfg.server = Some(s.to_string());
-    } else if cfg.server.is_none() {
+    } else if cfg.server.as_deref().map(str::trim).unwrap_or("").is_empty() {
         if let Ok(user) = Config::load() {
-            cfg.server = user.server;
-            cfg.server_fingerprint = user.server_fingerprint;
+            cfg.server = user.server.clone();
+            cfg.server_fingerprint = user.server_fingerprint.clone();
+            if cfg.network_refresh.is_none() {
+                cfg.network_email = user.network_email;
+                cfg.network_refresh = user.network_refresh;
+                cfg.network_access = user.network_access;
+                cfg.network_access_exp = user.network_access_exp;
+                cfg.network_device_id = user.network_device_id;
+                cfg.network_standby = user.network_standby;
+                cfg.network_standby_fingerprint = user.network_standby_fingerprint;
+            }
         }
-    }
-    if cfg.server.as_deref().map(str::trim).unwrap_or("").is_empty() {
-        cfg.server = Some(pjdesk_proto::DEFAULT_SERVER.to_string());
     }
 
     // Unattended password: set a *permanent* one only when explicitly provided
@@ -497,8 +503,17 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
             let _ = config.save();
         }
     }
-    // Falls back to the baked-in default server, so the service registers and
-    // gets an ID even if its config was never seeded with one.
+    // No server until this computer has signed in (or it already registered,
+    // in which case effective_server keeps the previous address).
+    if config.effective_server().trim().is_empty() {
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            config = Config::load().unwrap_or_default();
+            if !config.effective_server().trim().is_empty() {
+                break;
+            }
+        }
+    }
     let server = ServerAddr::parse(&config.effective_server())
         .map_err(|e| anyhow::anyhow!("invalid server address \"{}\": {e}", config.effective_server()))?;
 

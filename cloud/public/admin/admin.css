@@ -95,13 +95,15 @@ main { flex: 1; min-width: 0; padding: 28px 32px 48px; }
 .stat-label { color: var(--muted); font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.04em; }
 .panel { margin-top: 14px; }
 .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-input[type="search"], input[type="text"], input[type="date"], select {
+input[type="search"], input[type="text"], input[type="email"], input[type="date"], select {
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 8px 10px;
   min-width: 0;
 }
+.panel > label { display: flex; flex-direction: column; gap: 4px; margin: 10px 0; font-size: 13px; color: var(--muted); }
+.panel > label input { width: min(420px, 100%); }
 input[type="search"] { width: min(320px, 100%); }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }

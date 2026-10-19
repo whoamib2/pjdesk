@@ -141,6 +141,11 @@ impl Engine {
             spawn_host(server, config.clone(), self.shared.clone());
         }
     }
+
+    fn retarget(&mut self, config: &Config) {
+        let running = self.service_running;
+        self.restart(config, running);
+    }
 }
 
 fn spawn_host(server: ServerAddr, config: Config, shared: Arc<HostShared>) {
@@ -219,6 +224,15 @@ pub struct App {
     svc_status: crate::syspaths::ServiceStatus,
 
     status: String,
+    net_email: String,
+    net_pass: String,
+    net_show: bool,
+    net_code: String,
+    net_use_code: bool,
+    net_busy: bool,
+    net_error: String,
+    show_net_sign_in: bool,
+    net_rx: Option<Receiver<Result<crate::network::Session, String>>>,
     toast: widgets::Toast,
     tray: Option<tray::Tray>,
     logo: Option<egui::TextureHandle>,
@@ -237,6 +251,7 @@ impl App {
         let engine = Engine::idle(&cfg);
         let settings = settings::SettingsDraft::from_config(&cfg, None);
         let remember = cfg.settings.remember_passwords;
+        let net_email = cfg.network_email.clone().unwrap_or_default();
         let mut app = Self {
             cfg,
             engine,
@@ -290,6 +305,15 @@ impl App {
             scm_known: false,
             svc_status: crate::syspaths::ServiceStatus::default(),
             status: String::new(),
+            net_email,
+            net_pass: String::new(),
+            net_show: false,
+            net_code: String::new(),
+            net_use_code: false,
+            net_busy: false,
+            net_error: String::new(),
+            show_net_sign_in: false,
+            net_rx: None,
             toast: widgets::Toast::default(),
             tray: tray::Tray::new(&cc.egui_ctx),
             logo: Some(cc.egui_ctx.load_texture(
@@ -323,7 +347,8 @@ impl App {
             updated_unix: unix_now(),
         };
         self.connect_id = "123 456 789".into();
-        self.cfg.server = Some(pjdesk_proto::DEFAULT_SERVER.into());
+        self.cfg.server = Some("office.example:21200".into());
+        self.cfg.network_email = Some("ben@spader.us".into());
         self.cfg.address_book = vec![
             pjdesk_proto::signal::AddressEntry {
                 id: "123456789".into(),
@@ -398,6 +423,18 @@ impl App {
         self.lan = vec![("Office PC".into(), "123456789".into(), "192.168.1.20:21201".into())];
         self.page = MainPage::Saved;
         self.saved_query.clear();
+    }
+
+    #[cfg(feature = "ui-shots")]
+    fn load_sign_in_preview(&mut self) {
+        self.engine.ready = true;
+        self.cfg.server = None;
+        self.cfg.device_id = None;
+        self.cfg.network_email = None;
+        self.net_email = "ben@spader.us".into();
+        self.net_pass.clear();
+        self.net_show = false;
+        self.show_net_sign_in = true;
     }
 
     #[cfg(feature = "ui-shots")]
@@ -611,6 +648,77 @@ impl App {
                 self.login_busy = false;
                 self.login_rx = None;
             }
+        }
+    }
+
+    fn poll_network(&mut self) {
+        let Some(rx) = &self.net_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(session)) => {
+                self.net_busy = false;
+                self.net_rx = None;
+                self.net_pass.clear();
+                self.net_code.clear();
+                self.net_error.clear();
+                self.show_net_sign_in = false;
+                if session.email.is_empty() {
+                    if self.cfg.network_email.is_none() {
+                        self.cfg.network_email = Some(self.net_email.trim().to_string());
+                    }
+                }
+                let mut session = session;
+                if session.email.is_empty() {
+                    session.email = self.net_email.trim().to_lowercase();
+                }
+                self.cfg.apply_network_session(&session);
+                self.net_email = self.cfg.network_email.clone().unwrap_or_default();
+                self.save_cfg();
+                crate::network::copy_to_service(&self.cfg);
+                self.engine.retarget(&self.cfg);
+                self.toast.show(format!("Signed in as {}", self.net_email));
+            }
+            Ok(Err(e)) => {
+                self.net_busy = false;
+                self.net_rx = None;
+                self.net_error = e;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.net_busy = false;
+                self.net_rx = None;
+            }
+        }
+    }
+
+    fn start_network_sign_in(&mut self) {
+        if self.net_busy {
+            return;
+        }
+        let device = self.cfg.network_device();
+        let name = crate::hostname();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.net_rx = Some(rx);
+        self.net_busy = true;
+        self.net_error.clear();
+        if self.net_use_code {
+            let code = self.net_code.clone();
+            std::thread::Builder::new()
+                .name("network-sign-in".into())
+                .spawn(move || {
+                    let result = crate::network::enroll(&code, &device, &name).map_err(|e| e.to_string());
+                    let _ = tx.send(result);
+                })
+                .ok();
+        } else {
+            let email = self.net_email.clone();
+            let password = self.net_pass.clone();
+            std::thread::Builder::new()
+                .name("network-sign-in".into())
+                .spawn(move || {
+                    let result = crate::network::sign_in(&email, &password, &device, &name).map_err(|e| e.to_string());
+                    let _ = tx.send(result);
+                })
+                .ok();
         }
     }
 
@@ -860,6 +968,7 @@ impl eframe::App for App {
         self.ctx = ui.ctx().clone();
         let ctx = self.ctx.clone();
         self.poll_login();
+        self.poll_network();
         self.poll_password();
         self.poll_probe();
         self.poll_viewers();

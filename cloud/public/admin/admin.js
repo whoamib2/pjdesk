@@ -8,6 +8,7 @@
     servers: ["Servers & devices", "Servers that published a health record, plus account sign-ins."],
     plans: ["Plans", "Free is the default. Cloud Sync is the only paid-style switch the site offers. There is no price list."],
     audit: ["Audit log", "Who changed a plan, and what it was before."],
+    network: ["My network", "The private server this account signs in to, and who else may use it."],
   };
 
   const fixture = {
@@ -33,6 +34,30 @@
       { at: 1727000000, actor: "expiry", email: "old@example.com", old_plan: "cloud", new_plan: "free", expires_at: 1727000000, note: "Cloud Sync grant expired" },
     ],
     latest: "0.5.2",
+    network: {
+      role: "owner",
+      note: "Computers that have not signed in are listed in the PJDesk Server window until you turn on Require signed-in accounts.",
+      network: {
+        id: "net_office",
+        name: "Office",
+        active_address: "office.example:21200",
+        active_fingerprint: "ab12cd34",
+        standby_address: "cabin.example:21200",
+        standby_fingerprint: "ef56ab78",
+        require_accounts: false,
+      },
+      members: [
+        { email: "ada@example.com", created_at: 1720000000, revoked_at: null },
+      ],
+      devices: [
+        { device_id: "office-pc", email: "ben@spader.us", name: "Office PC", enrolled_at: 1728000000, revoked_at: null },
+        { device_id: "old-phone", email: "ada@example.com", name: "Old phone", enrolled_at: 1727000000, revoked_at: 1728500000 },
+      ],
+      computers: [
+        { id: "123456789", name: "Office", os_family: "windows", os_version: "11" },
+        { id: "555000111", name: "Pixel", os_family: "android", os_version: "15" },
+      ],
+    },
   };
 
   let accounts = [];
@@ -75,6 +100,7 @@
     if (page === "servers") renderServers();
     if (page === "plans") renderPlans();
     if (page === "audit") renderAudit();
+    if (page === "network") renderNetwork();
   }
 
   async function loadJson(path, fallback) {
@@ -464,6 +490,184 @@
     ev.preventDefault();
     if (pending) sendGrant(pending);
   });
+
+  function field(label, id, value) {
+    const wrap = el("label", label);
+    const input = document.createElement("input");
+    input.id = id;
+    input.value = value || "";
+    wrap.append(input);
+    return wrap;
+  }
+
+  async function renderNetwork() {
+    const root = $("network");
+    root.replaceChildren(el("p", "Loading…", "muted"));
+    let data;
+    try {
+      data = preview ? fixture.network : await PJ.call("GET", "/api/network");
+    } catch (e) {
+      root.replaceChildren(el("p", e.message || "Could not load your network.", "msg"));
+      return;
+    }
+    root.replaceChildren();
+    const net = (data && data.network) || {
+      name: "",
+      active_address: "",
+      active_fingerprint: "",
+      standby_address: "",
+      standby_fingerprint: "",
+      require_accounts: false,
+    };
+    const form = el("form", null, "panel");
+    form.append(el("h2", "Servers"));
+    form.append(el("p", "Clients get this address and key when they sign in. Nothing is typed by hand on the computer.", "muted"));
+    form.append(field("Name", "net-name", net.name));
+    form.append(field("Active server (host or host:port)", "net-active", net.active_address));
+    form.append(field("Active server key fingerprint", "net-active-fp", net.active_fingerprint));
+    form.append(field("Standby server", "net-standby", net.standby_address));
+    form.append(field("Standby server key fingerprint", "net-standby-fp", net.standby_fingerprint));
+    const requireRow = el("label", null, "row");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.id = "net-require";
+    box.checked = !!net.require_accounts;
+    requireRow.append(box, document.createTextNode(" Require signed-in accounts"));
+    form.append(requireRow);
+    form.append(el("p", data.note || "Turn this on only after every computer has signed in. Until then, computers that already registered keep working.", "muted"));
+    const save = el("button", "Save network", "primary");
+    save.type = "submit";
+    form.append(save);
+    const msg = el("p", "", "msg");
+    form.append(msg);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const body = {
+        name: $("net-name").value,
+        active_address: $("net-active").value,
+        active_fingerprint: $("net-active-fp").value,
+        standby_address: $("net-standby").value,
+        standby_fingerprint: $("net-standby-fp").value,
+        require_accounts: $("net-require").checked,
+      };
+      if (preview) {
+        msg.textContent = "Saved in this preview.";
+        return;
+      }
+      try {
+        await PJ.call("PUT", "/api/network", body);
+        msg.textContent = "Saved.";
+        renderNetwork();
+      } catch (e) {
+        msg.textContent = e.message;
+      }
+    });
+    root.append(form);
+
+    const people = el("div", null, "panel");
+    people.append(el("h2", "People"));
+    people.append(el("p", "These accounts can sign in and use this server. Revoking one stops new tokens and cuts off its devices.", "muted"));
+    const table = document.createElement("table");
+    const head = document.createElement("tr");
+    ["Email", ""].forEach((h) => head.append(el("th", h)));
+    table.append(head);
+    const members = (data.members || []).filter((m) => !m.revoked_at);
+    if (!members.length) {
+      const tr = document.createElement("tr");
+      const td = el("td", "No one else yet. You always have access.", "muted");
+      td.colSpan = 2;
+      tr.append(td);
+      table.append(tr);
+    }
+    members.forEach((m) => {
+      const tr = document.createElement("tr");
+      tr.append(el("td", m.email));
+      const td = document.createElement("td");
+      const revoke = el("button", "Revoke", "ghost");
+      revoke.type = "button";
+      revoke.addEventListener("click", async () => {
+        if (preview) {
+          tr.remove();
+          return;
+        }
+        await PJ.call("DELETE", "/api/network/members", { email: m.email });
+        renderNetwork();
+      });
+      td.append(revoke);
+      tr.append(td);
+      table.append(tr);
+    });
+    people.append(table);
+    const invite = el("form", null, "row");
+    const email = document.createElement("input");
+    email.type = "email";
+    email.placeholder = "ada@example.com";
+    email.required = true;
+    const add = el("button", "Allow this account", "primary");
+    add.type = "submit";
+    invite.append(email, add);
+    invite.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      if (preview) {
+        const tr = document.createElement("tr");
+        tr.append(el("td", email.value), el("td", "Allowed"));
+        table.append(tr);
+        email.value = "";
+        return;
+      }
+      await PJ.call("POST", "/api/network/members", { email: email.value });
+      renderNetwork();
+    });
+    people.append(invite);
+    root.append(people);
+
+    const devices = el("div", null, "panel");
+    devices.append(el("h2", "Devices"));
+    devices.append(el("p", "A device that signed in, or enrolled with a one-time code. Revoke cuts it off.", "muted"));
+    (data.devices || []).forEach((d) => {
+      const row = el("div", null, "row");
+      const label = `${d.name || d.device_id} · ${d.email}${d.revoked_at ? " · revoked" : ""}`;
+      row.append(el("span", label));
+      if (!d.revoked_at) {
+        const btn = el("button", "Revoke", "ghost");
+        btn.type = "button";
+        btn.addEventListener("click", async () => {
+          if (preview) {
+            row.append(el("span", "revoked", "muted"));
+            btn.remove();
+            return;
+          }
+          await PJ.call("POST", "/api/network/revoke-device", { device_id: d.device_id });
+          renderNetwork();
+        });
+        row.append(btn);
+      }
+      devices.append(row);
+    });
+    const codeBtn = el("button", "Create a one-time enrollment code", "ghost");
+    codeBtn.type = "button";
+    const codeOut = el("p", "", "muted");
+    codeBtn.addEventListener("click", async () => {
+      if (preview) {
+        codeOut.textContent = "Code ABCD-EFGH, valid for one hour, one device.";
+        return;
+      }
+      const got = await PJ.call("POST", "/api/network/enroll-code");
+      codeOut.textContent = `Code ${got.code}. It works once, for one hour.`;
+    });
+    devices.append(codeBtn, codeOut);
+    root.append(devices);
+
+    const comps = el("div", null, "panel");
+    comps.append(el("h2", "Saved computers"));
+    comps.append(el("p", "Names and IDs from this account. Passwords are not stored here.", "muted"));
+    const list = data.computers || [];
+    if (!list.length) comps.append(el("p", "No saved computers yet.", "muted"));
+    list.forEach((c) => {
+      comps.append(el("div", `${c.name || "Computer"} · ${c.id} · ${c.os_family || "unknown"} ${c.os_version || ""}`.trim()));
+    });
+    root.append(comps);
+  }
 
   async function boot() {
     if (!preview && !PJ.token()) { location.href = "/account/"; return; }

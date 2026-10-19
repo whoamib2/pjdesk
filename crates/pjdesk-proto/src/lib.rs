@@ -14,6 +14,7 @@
 //!   between controller and host, either direct or through the relay. The
 //!   password is checked with SPAKE2 ([`auth`]) so it never crosses the wire.
 
+pub mod access;
 pub mod auth;
 pub mod discover;
 pub mod filesafe;
@@ -65,10 +66,15 @@ pub const DISCOVERY_PORT: u16 = 21202;
 /// Default port of the server, used for TCP (signaling) and UDP (rendezvous/relay).
 pub const DEFAULT_PORT: u16 = 21200;
 
-/// The server a fresh install points at until the user sets their own in
-/// Settings. Baking this in means the app gets an ID and is reachable out of the
-/// box, without a sign-in — the way a self-hosted RustDesk points at its server.
-pub const DEFAULT_SERVER: &str = "pjdesk.spader.us:21200";
+/// A fresh install has no server until the user signs in to their PJDesk account.
+/// The account supplies the address and the pinned key. Nothing is baked in.
+pub const DEFAULT_SERVER: &str = "";
+
+/// Address an install that already registered (it has a device id) keeps using
+/// when its saved server is empty. This is only so an update does not take an
+/// existing computer offline. A fresh install has no device id and does not use it.
+/// Do not show this name in the client, the website, or the installer.
+pub const LEGACY_REGISTERED_SERVER: &str = "pjdesk.spader.us:21200";
 
 /// ALPN protocol id for the signaling TLS connection.
 pub const ALPN_SIGNAL: &[u8] = b"pjdesk-signal/1";

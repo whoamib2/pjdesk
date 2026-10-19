@@ -31,6 +31,7 @@
 // Everything else is the static website in ./public.
 
 import { effectivePlan, isPlan } from "./plans.js";
+import { route as networkRoute } from "./network.js";
 
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 const AUTH_HASH_ITERATIONS = 100000; // the Workers PBKDF2 maximum
@@ -222,6 +223,10 @@ async function api(request, env, url, ctx) {
   if (p === "/api/admin/audit" && m === "GET") return adminAudit(request, env);
   if (p === "/api/admin/plan" && m === "POST") return adminSetPlan(request, env);
   if (p === "/api/admin/sync" && m === "POST") return adminSetSync(request, env);
+  if (p.startsWith("/api/network")) {
+    const handled = await networkRoute(request, env, url);
+    if (handled) return handled;
+  }
   if (p === "/api/release" && m === "GET") {
     return json(await latestRelease(env), 200, { "cache-control": "public, max-age=300" });
   }

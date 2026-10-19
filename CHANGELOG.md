@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.0
+
+* A fresh install has no server until you sign in with a PJDesk account. The account's My network (pjdesk.com → Admin → My network) holds the active server address, its pinned key, a standby, and the accounts allowed to use it. The client receives that address after sign-in. Passwords for remote computers stay on the device (Windows DPAPI, or the Android Keystore) and are not uploaded.
+* The server can require a short-lived access token, signed by pjdesk.com, before registration, ID lookup, punch, or relay. Until **Require signed-in accounts** is turned on, computers that already registered keep working. The Server window lists computers that have not signed in. Revoking an account or a device cuts it off. A refused peer is told "Sign in required" and learns nothing else.
+* Unattended hosts sign in once, or enroll with a one-time code from My network, and keep a refresh token so they stay registered after a reboot.
+
+### Rollout (do this in order)
+
+1. On your PC, run `cloud\deploy.cmd`. That applies `cloud/migrations/0003_networks.sql` and deploys the Worker. Do not deploy from CI. Leave **Require signed-in accounts** off.
+2. Open pjdesk.com → Admin → My network. Set the active server address and its key fingerprint, and the standby. The signing key is created the first time that page (or a client) talks to the network API.
+3. Update **PJDesk Server** to 0.6.0 before any client. It stays in grace mode. Existing computers keep connecting. The Server window shows which ones have not signed in.
+4. On each computer, Windows and Android, sign in with the PJDesk account (or an invited account, or a one-time enrollment code for a computer with nobody at it). Confirm it disappears from "Not signed in yet".
+5. Only then turn on **Require signed-in accounts**, in the Server window or on My network. After that, a peer without a valid token cannot register, look up an ID, or use the relay.
+6. Do not put 0.6.0 clients on a 0.5.2 server first. A 0.6.0 client that sends the new sign-in message to an older server drops that connection and retries once without it. A 0.5.2 client never sends it and keeps working until you turn the switch on.
+7. Publish the release yourself after the computers are signed in. This change does not tag or deploy a release.
+
 ## Unreleased
 
 * Android 0.6.3. Save on the permanent password writes it to the Android Keystore and gives it to the running host immediately. A confirmation stays on screen. The password and the "when someone connects" choice are still there after the app restarts. The password is not written to the log or to the plain preference file.
@@ -28,7 +44,7 @@
 
 ## 0.4.1
 
-* The Cloud Sync panel's backup-server note, and the README section **Backup server & moving the server**, describe the current switch: sign in on another PJDesk Server with the same account (it becomes the standby), then choose **Make this the primary** there, or use the tray, or `pjdesk-server cloud promote`. Computers still reach whichever server `pjdesk.spader.us` points to, so DNS and the port forward have to move if the new primary is on a different network.
+* The Cloud Sync panel's backup-server note, and the README section **Backup server & moving the server**, describe the current switch: sign in on another PJDesk Server with the same account (it becomes the standby), then choose **Make this the primary** there, or use the tray, or `pjdesk-server cloud promote`. Computers still reach whichever server the account's network names, so DNS and the port forward have to move if the new primary is on a different network.
 * The installers read the workspace version from `Cargo.toml` when none is passed. `installer/build.sh` and both NSIS scripts no longer fall back to 0.2.0.
 * Unused imports and unused code the compiler warned about are removed. What the programs do is unchanged.
 

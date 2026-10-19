@@ -73,6 +73,12 @@ impl App {
         let mut submitted = false;
         theme::card(ui, |ui| {
             ui.label(RichText::new("Saved computers").size(22.0).strong().color(p.text));
+            if let Some(email) = self.cfg.network_email.as_deref().filter(|s| !s.is_empty()) {
+                ui.label(widgets::muted(
+                    ui,
+                    &format!("Signed in as {email}. This list is your account's computers. Passwords stay on this computer."),
+                ));
+            }
             ui.label(widgets::muted(ui, "Search by name, ID, or operating system. Enter connects to the first match."));
             ui.add_space(8.0);
             let search = widgets::text_field(ui, &mut self.saved_query, "Search name, ID, or OS", false);
@@ -227,7 +233,7 @@ impl App {
                     *action = Some(RowCmd::Favorite(id.clone()));
                     ui.close();
                 }
-                if row.has_password && ui.button("Forget saved password").clicked() {
+                if row.has_password && ui.button("Remove saved password").clicked() {
                     *action = Some(RowCmd::ForgetPassword(id.clone()));
                     ui.close();
                 }
@@ -334,7 +340,11 @@ impl App {
                 widgets::field_label(ui, "Password");
                 let resp = widgets::password_field(ui, &mut self.prompt_password, "Password", &mut self.prompt_show);
                 ui.add_space(4.0);
-                widgets::checkbox(ui, &mut self.prompt_remember, "Remember password");
+                widgets::checkbox(ui, &mut self.prompt_remember, "Save password for this computer");
+                ui.label(widgets::muted(
+                    ui,
+                    "Stored on this computer only, with Windows encryption. It is not uploaded.",
+                ));
                 ui.add_space(8.0);
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.horizontal(|ui| {

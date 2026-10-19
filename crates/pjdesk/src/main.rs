@@ -20,6 +20,7 @@ mod gui;
 mod handoff;
 mod host;
 mod identity;
+mod network;
 mod p2p;
 mod platform;
 mod secure;

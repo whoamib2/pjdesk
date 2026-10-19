@@ -33,7 +33,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import androidx.compose.runtime.rememberCoroutineScope
+import org.json.JSONObject
+import us.spader.pjdesk.core.CloudAuth
+import us.spader.pjdesk.ui.SignInScreen
+import java.util.UUID
 import us.spader.pjdesk.a11y.PjAccessibilityService
 import us.spader.pjdesk.core.permanentIssue
 import us.spader.pjdesk.core.SavedComputer
@@ -111,8 +119,29 @@ class MainActivity : ComponentActivity() {
             var query by remember { mutableStateOf("") }
             var saved by remember { mutableStateOf(app.store.saved()) }
             var showOnboarding by remember { mutableStateOf(!app.store.onboarded) }
+            var account by remember { mutableStateOf(app.store.networkEmail) }
+            var netEmail by remember { mutableStateOf(app.store.networkEmail) }
+            var netPass by remember { mutableStateOf("") }
+            var netCode by remember { mutableStateOf("") }
+            var netUseCode by remember { mutableStateOf(false) }
+            var netBusy by remember { mutableStateOf(false) }
+            var netError by remember { mutableStateOf("") }
+            var savePassword by remember { mutableStateOf(false) }
+            val scope = rememberCoroutineScope()
             var showPermanent by remember { mutableStateOf(false) }
             val capture by captureReady.collectAsState()
+            LaunchedEffect(account) {
+                val refresh = app.store.networkRefresh()
+                val device = app.store.networkDeviceId
+                if (account.isBlank() || refresh.isBlank() || device.isBlank()) return@LaunchedEffect
+                val session = withContext(Dispatchers.IO) {
+                    runCatching { CloudAuth.refresh(refresh, device) }.getOrNull()
+                } ?: return@LaunchedEffect
+                engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
+                if (session.address.isNotBlank()) {
+                    engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
+                }
+            }
             LaunchedEffect(state.error) {
                 val text = state.error ?: return@LaunchedEffect
                 snackbar.showSnackbar(text)
@@ -164,6 +193,46 @@ class MainActivity : ComponentActivity() {
                         onEnd = { engine.stop() },
                         decoder = sessionDecoder,
                     )
+                } else if (account.isEmpty() && state.server.isEmpty()) {
+                    SignInScreen(
+                        email = netEmail,
+                        password = netPass,
+                        code = netCode,
+                        useCode = netUseCode,
+                        busy = netBusy,
+                        error = netError,
+                        onEmail = { netEmail = it },
+                        onPassword = { netPass = it },
+                        onCode = { netCode = it },
+                        onUseCode = { netUseCode = it },
+                        onSubmit = {
+                            val device = app.store.networkDeviceId.ifBlank {
+                                UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
+                            }
+                            netBusy = true
+                            netError = ""
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) {
+                                    runCatching {
+                                        if (netUseCode) CloudAuth.enroll(netCode, device, "Android")
+                                        else CloudAuth.signIn(netEmail, netPass, device, "Android")
+                                    }
+                                }
+                                netBusy = false
+                                result.onSuccess { session ->
+                                    val email = session.email.ifBlank { netEmail.trim() }
+                                    app.store.networkEmail = email
+                                    app.store.networkDeviceId = session.deviceId
+                                    app.store.saveNetworkRefresh(session.refresh)
+                                    engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
+                                    engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
+                                    session.computers.filter { it.id.length == 9 }.forEach { app.store.remember(it) }
+                                    netPass = ""
+                                    account = email
+                                }.onFailure { netError = it.message ?: "Could not sign in." }
+                            }
+                        },
+                    )
                 } else if (showOnboarding) {
                     OnboardingScreen(
                         notificationsGranted = notificationsGranted(),
@@ -196,7 +265,16 @@ class MainActivity : ComponentActivity() {
                                     connectPassword = connectPassword,
                                     onConnectId = { connectId = it },
                                     onConnectPassword = { connectPassword = it },
-                                    onConnect = { engine.connect(connectId, connectPassword) },
+                                    savePassword = savePassword,
+                                    onSavePassword = { savePassword = it },
+                                    onConnect = {
+                                        val id = connectId.filter { it.isDigit() }
+                                        if (savePassword && connectPassword.isNotBlank()) {
+                                            app.store.saveComputerPassword(id, connectPassword)
+                                        }
+                                        val password = connectPassword.ifBlank { app.store.computerPassword(id) }
+                                        engine.connect(connectId, password)
+                                    },
                                     onCopyId = { copy(state.idFormatted) },
                                     onCopyPassword = { copy(state.password) },
                                     onRegenerate = engine::regenerate,
@@ -228,6 +306,10 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onForget = {
                                         app.store.forget(it.id)
+                                        saved = app.store.saved()
+                                    },
+                                    onRemovePassword = {
+                                        app.store.saveComputerPassword(it.id, "")
                                         saved = app.store.saved()
                                     },
                                 )

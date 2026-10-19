@@ -32,6 +32,10 @@ struct DeviceRecord {
     /// Missing in files written before 0.4.0.
     #[serde(default)]
     group: String,
+    /// True after a registration that presented a valid network access token.
+    /// Missing in files written before 0.6.0, which means not signed in.
+    #[serde(default)]
+    signed_in: bool,
 }
 
 /// A registered device, for the management window.
@@ -43,6 +47,8 @@ pub struct DeviceRow {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub first_seen: u64,
     pub last_seen: u64,
+    /// False until this computer registers with a network access token.
+    pub signed_in: bool,
 }
 
 pub struct Registry {
@@ -113,6 +119,7 @@ impl Registry {
                 group: d.group.clone(),
                 first_seen: d.first_seen,
                 last_seen: d.last_seen,
+                signed_in: d.signed_in,
             })
             .collect();
         rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
@@ -137,6 +144,18 @@ impl Registry {
     #[cfg(test)]
     pub fn group_of(&self, id: &str) -> Option<String> {
         self.data.devices.get(id).map(|d| d.group.clone())
+    }
+
+    /// Marks whether the latest registration presented a valid network token.
+    pub fn mark_signed_in(&mut self, id: &str, signed_in: bool) {
+        let Some(record) = self.data.devices.get_mut(id) else { return };
+        if record.signed_in == signed_in {
+            return;
+        }
+        record.signed_in = signed_in;
+        if let Err(e) = self.save() {
+            tracing::warn!("could not record sign-in state for {id}: {e}");
+        }
     }
 
     pub fn remove(&mut self, id: &str) -> Result<()> {
@@ -221,6 +240,7 @@ impl Registry {
                 first_seen: now,
                 last_seen: now,
                 group: String::new(),
+                signed_in: false,
             },
         );
         self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
@@ -403,5 +423,21 @@ mod tests {
         let reg = Registry::load(path.clone()).unwrap();
         assert_eq!(reg.list()[0].group, "Office");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_pre_060_registry_loads_as_not_signed_in() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-reg-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("devices.json");
+        std::fs::write(
+            &path,
+            r#"{"devices":{"123456789":{"secret_sha256":"aa","hostname":"Office","app_version":"0.5.2","first_seen":1,"last_seen":2,"group":""}}}"#,
+        )
+        .unwrap();
+        let reg = Registry::load(path).unwrap();
+        assert!(!reg.list()[0].signed_in);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

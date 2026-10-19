@@ -119,16 +119,29 @@ async fn connect(
 ) -> Result<Link> {
     tracing::info!("Connecting to {} through {server}", format_id(target));
     println!("Connecting to {} through {server}...", format_id(target));
+    crate::network::refresh_config(config);
+    let access = config.network_access_token();
     let mut signal = SignalClient::connect(server, config).await?;
-    signal.send(ClientMsg::Connect {
+    if !access.is_empty() {
+        let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
+    }
+    let connect = ClientMsg::Connect {
         proto: PROTOCOL_VERSION,
         target_id: target.into(),
         controller_name: crate::hostname(),
-    })?;
+    };
+    signal.send(connect.clone())?;
 
     tracing::info!("Waiting for {} to allow the connection", format_id(target));
+    let mut retried_without_token = false;
     let (session_id, token, udp_port, host_name) = loop {
         match timeout(Duration::from_secs(90), signal.recv()).await {
+            Ok(None) if !access.is_empty() && !retried_without_token => {
+                retried_without_token = true;
+                signal = SignalClient::connect(server, config).await?;
+                signal.send(connect.clone())?;
+                continue;
+            }
             Ok(Some(ServerMsg::SessionReady { session_id, token, udp_port, host_name })) => {
                 tracing::info!("Host accepted session {session_id:x}");
                 break (session_id, token, udp_port, host_name);

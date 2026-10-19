@@ -17,7 +17,7 @@ Repo: `https://github.com/whoamib2/pjdesk` (public). Site: `https://pjdesk.com`.
 ### What is LIVE right now
 | Thing | Where | Notes |
 |---|---|---|
-| **PJDesk server** | `pjdesk.spader.us:21200` (TCP signaling + UDP rendezvous/relay) | Windows service **`PJDeskServer`**, `C:\Program Files\PJDesk Server\pjdesk-server.exe`, data in `C:\ProgramData\PJDesk\server`. Real clients connect through it. |
+| **PJDesk server** | the address you sign in to (TCP signaling + UDP rendezvous/relay, port 21200) | Windows service **`PJDeskServer`**, `C:\Program Files\PJDesk Server\pjdesk-server.exe`, data in `C:\ProgramData\PJDesk\server`. Real clients connect through it. |
 | **Public download site** | `https://pjdesk.com` | GitHub Pages from the **`gh-pages`** branch (has `CNAME`). Porkbun DNS A‑records → GitHub Pages IPs. Currently serves the **0.2.0** installers. |
 | **Auto‑update feed** | GitHub Releases of `whoamib2/pjdesk` | The updater (`pjdesk-proto::update`) reads `releases/latest` and **silently installs any newer version as SYSTEM**. |
 | **Deployed client** | one machine (`benlenovodesk`), device ID `326 135 922` | Running "Build 1" (`pjdesk.exe` + two bundled MinGW DLLs — see §3). End‑to‑end connect to the live server is confirmed working. |
@@ -276,8 +276,8 @@ in the server window; then Build 2 = clipboard sync + multi‑monitor tabs; then
   `whoamib2/pjdesk` (releases **and** the `gh-pages` branch).
 
 ### Networking
-- Server listens on **TCP + UDP 21200** (`DEFAULT_PORT`). The public endpoint
-  `pjdesk.spader.us:21200` must resolve to the server host and have **both** TCP
+- Server listens on **TCP + UDP 21200** (`DEFAULT_PORT`). The name you set on
+  pjdesk.com → My network must resolve to the server host and have **both** TCP
   and UDP 21200 port‑forwarded/allowed (firewall rule `PJDesk Server`).
 - Clients reach GitHub directly over HTTPS for updates
   (`https://api.github.com/repos/whoamib2/pjdesk/releases/latest` + asset

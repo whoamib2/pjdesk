@@ -25,6 +25,39 @@ fn server_shots() {
         image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
         eprintln!("wrote {}", path.display());
     }
+    for (name, theme) in [("server-network-dark", egui::Theme::Dark), ("server-network-light", egui::Theme::Light)] {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(960.0, 720.0))
+            .with_pixels_per_point(1.0)
+            .with_theme(theme)
+            .wgpu()
+            .build_eframe(move |cc| {
+                let mut app = preview(cc, false, false);
+                app.preview_network = true;
+                let theme_name = match theme {
+                    egui::Theme::Light => "light",
+                    egui::Theme::Dark => "dark",
+                };
+                crate::ui_theme::apply(&cc.egui_ctx, theme_name);
+                std::fs::write(
+                    app.data_dir.join(crate::access::FILE_NAME),
+                    r#"{"require_accounts":true,"public_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","fingerprint":"cd","allowed_accounts":["ben@spader.us","ada@example.com"],"revoked_devices":[]}"#,
+                )
+                .unwrap();
+                std::fs::write(
+                    app.data_dir.join("devices.json"),
+                    r#"{"devices":{"123456789":{"secret_sha256":"hidden","hostname":"Office","app_version":"0.5.1","first_seen":1,"last_seen":2,"signed_in":true},"555666777":{"secret_sha256":"hidden","hostname":"Laptop","app_version":"0.5.2","first_seen":1,"last_seen":2,"signed_in":false},"902488771":{"secret_sha256":"hidden","hostname":"This PC","app_version":"0.6.0","first_seen":1,"last_seen":2,"signed_in":true}}}"#,
+                )
+                .unwrap();
+                app.refresh();
+                app
+            });
+        harness.step();
+        let image = harness.render().unwrap_or_else(|e| panic!("render {name}: {e}"));
+        let path = dir.join(format!("{name}.png"));
+        image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
+        eprintln!("wrote {}", path.display());
+    }
 }
 
 fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -> App {
@@ -108,12 +141,14 @@ fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -
                     hostname: "Office".into(),
                     version: "0.5.1".into(),
                     online: true,
+                    signed_in: true,
                 },
                 crate::status_view::ListedDevice {
                     id: "444555666".into(),
                     hostname: "Old laptop".into(),
                     version: String::new(),
                     online: false,
+                    signed_in: false,
                 },
             ],
             ..Snapshot::default()

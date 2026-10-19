@@ -28,6 +28,7 @@ fun SavedScreen(
     onQuery: (String) -> Unit,
     onOpen: (SavedComputer) -> Unit,
     onForget: (SavedComputer) -> Unit,
+    onRemovePassword: (SavedComputer) -> Unit = {},
 ) {
     val q = query.trim().lowercase()
     val shown = computers.filter {
@@ -67,7 +68,12 @@ fun SavedScreen(
                             }
                             Text(detail, color = pjMuted(), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelMedium)
                         }
-                        TextButton(onClick = { onForget(computer) }) { Text("Remove") }
+                        Column {
+                            if (computer.passwordSaved) {
+                                TextButton(onClick = { onRemovePassword(computer) }) { Text("Remove password") }
+                            }
+                            TextButton(onClick = { onForget(computer) }) { Text("Remove") }
+                        }
                     }
                 }
             }

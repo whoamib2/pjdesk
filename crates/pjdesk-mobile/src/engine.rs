@@ -25,7 +25,7 @@ use pjdesk_proto::quality::{self, StreamQuality};
 use pjdesk_proto::signal::{ClientMsg, ServerMsg};
 use pjdesk_proto::tls::TlsIdentity;
 use pjdesk_proto::udp::Role;
-use pjdesk_proto::{derive_device_secret, format_id, is_valid_id, normalize_id, DEFAULT_SERVER, PROTOCOL_VERSION};
+use pjdesk_proto::{derive_device_secret, format_id, is_valid_id, normalize_id, LEGACY_REGISTERED_SERVER, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -84,6 +84,9 @@ struct State {
     control: Mutex<Option<mpsc::UnboundedSender<ControlMsg>>>,
     video: Mutex<Option<Arc<VideoOut>>>,
     app_stop: AtomicBool,
+    access_token: Mutex<String>,
+    /// Set when a server from before 0.6.0 drops the connection after PresentAccess.
+    suppress_token: AtomicBool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -97,6 +100,8 @@ struct Disk {
     /// Used only when the device has no Android id to derive a secret from.
     #[serde(default)]
     secret_hex: String,
+    #[serde(default)]
+    access_token: String,
 }
 
 pub struct Engine {
@@ -109,7 +114,14 @@ impl Engine {
         std::fs::create_dir_all(&dir)?;
         let disk = load_disk(&dir);
         let secret = device_secret(&android_id, &disk);
-        let server = if disk.server.trim().is_empty() { DEFAULT_SERVER.to_string() } else { disk.server.clone() };
+        let server = if !disk.server.trim().is_empty() {
+            disk.server.clone()
+        } else if !disk.device_id.trim().is_empty() {
+            // Already registered before 0.6.0. Keep it online. Do not write the name back.
+            LEGACY_REGISTERED_SERVER.to_string()
+        } else {
+            String::new()
+        };
         let identity = TlsIdentity::load_or_create(&dir.join("host.crt"), &dir.join("host.key"), "pjdesk-host")?;
         let mut stored = disk;
         if android_id.trim().is_empty() && stored.secret_hex.is_empty() {
@@ -135,6 +147,8 @@ impl Engine {
             control: Mutex::new(None),
             video: Mutex::new(None),
             app_stop: AtomicBool::new(false),
+            access_token: Mutex::new(stored.access_token.clone()),
+            suppress_token: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let engine = Self { state: state.clone(), cmds: tx };
@@ -197,6 +211,7 @@ fn persist(state: &State) {
         fingerprint: state.fingerprint.lock().unwrap().clone().unwrap_or_default(),
         device_id: state.device_id.lock().unwrap().clone().unwrap_or_default(),
         secret_hex: String::new(),
+        access_token: state.access_token.lock().unwrap().clone(),
     };
     // Keep a derived secret out of the file. A random one (no Android id) is rewritten
     // only when it was already stored.
@@ -286,6 +301,12 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         "regenerate" => {
             *state.otp.lock().unwrap() = generate_password();
             publish(state, cb);
+        }
+        "accessToken" => {
+            let token = cmd.get("token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            *state.access_token.lock().unwrap() = token;
+            state.suppress_token.store(false, Ordering::SeqCst);
+            persist(state);
         }
         "server" => {
             let address = cmd.get("address").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -475,6 +496,10 @@ async fn host_loop(state: Arc<State>, cb: Arc<dyn Callbacks>) {
 
 async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
     let server_text = state.server.lock().unwrap().clone();
+    if server_text.trim().is_empty() {
+        emit(&cb, &json!({"event":"status","text":"Sign in required"}));
+        bail!("Sign in required");
+    }
     let server = ServerAddr::parse(&server_text)?;
     let pinned = state.fingerprint.lock().unwrap().clone().and_then(|s| pjdesk_proto::tls::parse_fingerprint(&s).ok());
     let mut signal = SignalClient::connect(&server, pinned).await?;
@@ -483,6 +508,15 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
         *state.fingerprint.lock().unwrap() = Some(text);
         persist(&state);
         publish(&state, &cb);
+    }
+    let token = if state.suppress_token.swap(false, Ordering::SeqCst) {
+        String::new()
+    } else {
+        state.access_token.lock().unwrap().clone()
+    };
+    let presented = !token.is_empty();
+    if presented {
+        let _ = signal.send(ClientMsg::PresentAccess { token });
     }
     let device_id = state.device_id.lock().unwrap().clone().filter(|id| is_valid_id(id));
     signal.send(ClientMsg::Register {
@@ -496,6 +530,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
     let mut ping = tokio::time::interval(Duration::from_secs(25));
     ping.tick().await;
     let mut routes: HashMap<u64, mpsc::UnboundedSender<ServerMsg>> = HashMap::new();
+    let mut saw_registered = false;
     loop {
         if state.app_stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -503,9 +538,15 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
         tokio::select! {
             _ = ping.tick() => { signal.send(ClientMsg::Ping)?; }
             msg = signal.recv() => {
-                let Some(msg) = msg else { return Ok(()) };
+                let Some(msg) = msg else {
+                    if presented && !saw_registered {
+                        state.suppress_token.store(true, Ordering::SeqCst);
+                    }
+                    return Ok(());
+                };
                 match msg {
                     ServerMsg::Registered { device_id } => {
+                        saw_registered = true;
                         *state.device_id.lock().unwrap() = Some(device_id.clone());
                         persist(&state);
                         publish(&state, &cb);
@@ -946,6 +987,10 @@ async fn controller_session(
         *state.fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         persist(&state);
     }
+    let access = state.access_token.lock().unwrap().clone();
+    if !access.is_empty() {
+        let _ = signal.send(ClientMsg::PresentAccess { token: access });
+    }
     signal.send(ClientMsg::Connect {
         proto: PROTOCOL_VERSION,
         target_id: target.into(),
@@ -1188,7 +1233,7 @@ mod tests {
 
     #[test]
     fn disk_round_trip_ignores_unknown_future_fields() {
-        let raw = r#"{"server":"pjdesk.spader.us:21200","fingerprint":"abcd","device_id":"123456789","extra":1}"#;
+        let raw = r#"{"server":"office.example:21200","fingerprint":"abcd","device_id":"123456789","extra":1}"#;
         let disk: Disk = serde_json::from_str(raw).unwrap();
         assert_eq!(disk.device_id, "123456789");
         assert!(disk.secret_hex.is_empty());
@@ -1208,7 +1253,7 @@ mod tests {
             secret: [7u8; 32],
             identity,
             device_id: Mutex::new(None),
-            server: Mutex::new(DEFAULT_SERVER.into()),
+            server: Mutex::new("office.example:21200".into()),
             fingerprint: Mutex::new(None),
             otp: Mutex::new(generate_password()),
             permanent: Mutex::new(None),
@@ -1221,6 +1266,8 @@ mod tests {
             control: Mutex::new(None),
             video: Mutex::new(None),
             app_stop: AtomicBool::new(false),
+            access_token: Mutex::new(String::new()),
+            suppress_token: AtomicBool::new(false),
         })
     }
 

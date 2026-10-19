@@ -70,6 +70,23 @@ impl App {
     }
 
     pub(super) fn body(&mut self, ui: &mut egui::Ui) {
+        if self.cfg.effective_server().trim().is_empty() || self.show_net_sign_in {
+            self.sign_in_panel(ui);
+            return;
+        }
+        if self.cfg.network_email.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            let mut open = false;
+            theme::card(ui, |ui| {
+                ui.label("Sign in to your PJDesk account so this computer keeps working after signed-in accounts are required.");
+                if ui.button("Sign in").clicked() {
+                    open = true;
+                }
+            });
+            if open {
+                self.show_net_sign_in = true;
+            }
+            ui.add_space(8.0);
+        }
         if self.page == super::MainPage::Saved {
             self.saved_page(ui);
             return;
@@ -166,6 +183,65 @@ impl App {
                 self.chat_box(ui);
             }
         });
+    }
+
+    fn sign_in_panel(&mut self, ui: &mut egui::Ui) {
+        let p = theme::paint(ui);
+        let mut go = false;
+        let mut cancel = false;
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(440.0);
+            ui.add_space(24.0);
+            ui.label(RichText::new("Sign in").size(26.0).strong().color(p.text));
+            ui.add_space(4.0);
+            ui.label(widgets::muted(
+                ui,
+                "Use your PJDesk account. The client gets your private server from the account. Nothing is typed by hand.",
+            ));
+            ui.add_space(16.0);
+        });
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(440.0);
+            theme::card(ui, |ui| {
+                if !self.net_use_code {
+                    widgets::field_label(ui, "Email");
+                    widgets::text_field(ui, &mut self.net_email, "you@example.com", false);
+                    ui.add_space(8.0);
+                    widgets::field_label(ui, "Password");
+                    widgets::password_field(ui, &mut self.net_pass, "Password", &mut self.net_show);
+                } else {
+                    widgets::field_label(ui, "Enrollment code");
+                    widgets::text_field(ui, &mut self.net_code, "ABCD-EFGH", true);
+                    ui.label(widgets::muted(ui, "From pjdesk.com → My network. One device, one hour."));
+                }
+                ui.add_space(8.0);
+                if !self.net_error.is_empty() {
+                    ui.colored_label(p.warn, &self.net_error);
+                    ui.add_space(6.0);
+                }
+                let label = if self.net_busy { "Signing in…" } else { "Sign in" };
+                if widgets::accent_button(ui, label, egui::vec2(ui.available_width(), 40.0)) && !self.net_busy {
+                    go = true;
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let toggle = if self.net_use_code { "Use email and password" } else { "I have an enrollment code" };
+                    if ui.button(toggle).clicked() && !self.net_busy {
+                        self.net_use_code = !self.net_use_code;
+                        self.net_error.clear();
+                    }
+                    if self.show_net_sign_in && !self.cfg.effective_server().is_empty() && ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        });
+        if cancel {
+            self.show_net_sign_in = false;
+        }
+        if go {
+            self.start_network_sign_in();
+        }
     }
 
     fn share_status(&mut self, ui: &mut egui::Ui) {

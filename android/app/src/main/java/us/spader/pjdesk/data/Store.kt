@@ -16,6 +16,8 @@ class Store(context: Context) {
     private val dir = context.filesDir
     private val prefs = context.getSharedPreferences("pjdesk", Context.MODE_PRIVATE)
     private val secret = PermanentSecret(context.applicationContext)
+    private val refreshBlob = KeystoreBlob(context.applicationContext, "pjdesk-network-refresh", "refresh")
+    private val passwordBlob = KeystoreBlob(context.applicationContext, "pjdesk-computer-passwords", "passwords")
     private val savedFile = File(dir, "saved.json")
 
     init {
@@ -62,6 +64,7 @@ class Store(context: Context) {
                             name = o.optString("name"),
                             osFamily = o.optString("osFamily"),
                             osVersion = o.optString("osVersion"),
+                            passwordSaved = computerPassword(o.optString("id")).isNotEmpty(),
                         ),
                     )
                 }
@@ -85,7 +88,33 @@ class Store(context: Context) {
         savedFile.writeText(array.toString())
     }
 
+    var networkEmail: String
+        get() = prefs.getString("networkEmail", "") ?: ""
+        set(value) { prefs.edit().putString("networkEmail", value).apply() }
+
+    var networkDeviceId: String
+        get() = prefs.getString("networkDevice", "") ?: ""
+        set(value) { prefs.edit().putString("networkDevice", value).apply() }
+
+    fun networkRefresh(): String = refreshBlob.read()
+
+    fun saveNetworkRefresh(token: String): Boolean = refreshBlob.write(token)
+
+    /** A password for one remote computer. It stays in the Keystore on this phone. */
+    fun computerPassword(id: String): String {
+        val raw = passwordBlob.read()
+        if (raw.isEmpty()) return ""
+        return runCatching { JSONObject(raw).optString(id) }.getOrDefault("")
+    }
+
+    fun saveComputerPassword(id: String, password: String): Boolean {
+        val obj = runCatching { JSONObject(passwordBlob.read().ifEmpty { "{}" }) }.getOrDefault(JSONObject())
+        if (password.isEmpty()) obj.remove(id) else obj.put(id, password)
+        return passwordBlob.write(obj.toString())
+    }
+
     fun forget(id: String) {
+        saveComputerPassword(id, "")
         val next = saved().filterNot { it.id == id }
         val array = JSONArray()
         next.forEach { c ->

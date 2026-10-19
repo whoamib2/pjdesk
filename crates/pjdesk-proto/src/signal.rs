@@ -64,6 +64,10 @@ pub enum ClientMsg {
     /// Version 3. The signed-in user replaces their own password. The server
     /// drops saved tokens, so the client signs in again.
     ChangePassword { token: String, new_password: String },
+    /// Presents a pjdesk.com network access token. Sent only by 0.6.0+ clients
+    /// that have one, before Register or Connect. Older servers cannot decode
+    /// this variant and drop the connection; those clients retry once without it.
+    PresentAccess { token: String },
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -269,6 +273,8 @@ mod tests {
         assert_eq!(ping[0], 8);
         let update = postcard::to_stdvec(&ServerMsg::UpdateNow).unwrap();
         assert_eq!(update[0], 8);
+        let access = postcard::to_stdvec(&ClientMsg::PresentAccess { token: "t".into() }).unwrap();
+        assert_eq!(access[0], 16, "PresentAccess is appended after ChangePassword");
         let back: ClientMsg = postcard::from_bytes(&ping).unwrap();
         assert!(matches!(back, ClientMsg::Ping));
     }

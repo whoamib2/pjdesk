@@ -1,0 +1,489 @@
+// Private-network access for PJDesk 0.6.0.
+//
+// A short-lived Ed25519 token, signed by a key that lives only in D1, names
+// the account, the network, the server fingerprints, the device, and the
+// expiry. The PJDesk server pins the public key and refuses register, lookup,
+// and relay without a valid token once the owner turns that on.
+//
+// The canonical body must match crates/pjdesk-proto/src/access.rs and the
+// Android client:
+//   PJN1\n{email}\n{network id}\n{sorted fingerprints}\n{device id}\n{exp}\n
+
+const TOKEN_TTL = 15 * 60;
+const REFRESH_TTL = 365 * 24 * 3600;
+const ENROLL_TTL = 60 * 60;
+
+const encoder = new TextEncoder();
+const now = () => Math.floor(Date.now() / 1000);
+
+export class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function json(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
+function toHex(buf) {
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function fromHex(s) {
+  const out = new Uint8Array(s.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
+  return out;
+}
+
+function randomHex(n) {
+  return toHex(crypto.getRandomValues(new Uint8Array(n)));
+}
+
+const normEmail = (e) => String(e || "").trim().toLowerCase();
+const validEmail = (e) => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+
+export function normalizeFingerprint(text) {
+  const raw = String(text || "").trim().replace(/^sha256:/i, "");
+  return raw.toLowerCase().replace(/[^0-9a-f]/g, "");
+}
+
+export function canonical({ email, networkId, fingerprints, deviceId, exp }) {
+  const fps = [...new Set((fingerprints || []).map(normalizeFingerprint).filter(Boolean))].sort();
+  return `PJN1\n${normEmail(email)}\n${String(networkId).trim()}\n${fps.join(",")}\n${String(deviceId).trim()}\n${exp}\n`;
+}
+
+/** Mirrors the server's admit() for the pure cases the Worker can see. */
+export function decide({ requireAccounts, verified, expired, wrongServer, revoked, allowed, email }) {
+  if (!verified || expired || wrongServer) {
+    return requireAccounts ? "deny" : "open";
+  }
+  if (revoked) return "deny";
+  const list = allowed || [];
+  if (list.length && !list.some((e) => e.toLowerCase() === String(email || "").toLowerCase())) return "deny";
+  return "signed";
+}
+
+async function readJson(request) {
+  try {
+    return await request.json();
+  } catch {
+    throw new HttpError(400, "Bad request.");
+  }
+}
+
+async function sha256Hex(text) {
+  return toHex(await crypto.subtle.digest("SHA-256", encoder.encode(text)));
+}
+
+async function session(request, env) {
+  const m = (request.headers.get("authorization") || "").match(/^Bearer\s+([A-Za-z0-9_-]{20,128})$/);
+  if (!m) throw new HttpError(401, "Please sign in.");
+  const tokenHash = await sha256Hex(m[1]);
+  const row = await env.DB.prepare(
+    `SELECT s.account_id, a.email FROM sessions s JOIN accounts a ON a.id = s.account_id WHERE s.token_hash = ?`,
+  )
+    .bind(tokenHash)
+    .first();
+  if (!row) throw new HttpError(401, "Please sign in.");
+  return { accountId: row.account_id, email: row.email };
+}
+
+async function signingKey(env) {
+  const row = await env.DB.prepare("SELECT public_key, private_pkcs8 FROM network_keys WHERE id = 1").first();
+  if (row) {
+    const privateKey = await crypto.subtle.importKey("pkcs8", fromHex(row.private_pkcs8), { name: "Ed25519" }, false, ["sign"]);
+    return { publicKey: row.public_key, privateKey };
+  }
+  const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  const pub = toHex(await crypto.subtle.exportKey("raw", pair.publicKey));
+  const pkcs8 = toHex(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
+  await env.DB.prepare("INSERT INTO network_keys (id, public_key, private_pkcs8) VALUES (1, ?, ?)").bind(pub, pkcs8).run();
+  return { publicKey: pub, privateKey: pair.privateKey };
+}
+
+function fingerprintsOf(network) {
+  return [network.active_fingerprint, network.standby_fingerprint].map(normalizeFingerprint).filter(Boolean);
+}
+
+async function signToken(env, { email, network, deviceId }) {
+  const exp = now() + TOKEN_TTL;
+  const body = canonical({
+    email,
+    networkId: network.id,
+    fingerprints: fingerprintsOf(network),
+    deviceId,
+    exp,
+  });
+  const { privateKey } = await signingKey(env);
+  const sig = await crypto.subtle.sign("Ed25519", privateKey, encoder.encode(body));
+  return { access: `${toHex(encoder.encode(body))}.${toHex(sig)}`, exp };
+}
+
+function networkView(row) {
+  return {
+    id: row.id,
+    name: row.name || "",
+    active_address: row.active_address || "",
+    active_fingerprint: row.active_fingerprint || "",
+    standby_address: row.standby_address || "",
+    standby_fingerprint: row.standby_fingerprint || "",
+    require_accounts: !!row.require_accounts,
+  };
+}
+
+async function owned(env, accountId) {
+  return env.DB.prepare("SELECT * FROM networks WHERE owner_id = ?").bind(accountId).first();
+}
+
+async function membership(env, email) {
+  return env.DB.prepare(
+    `SELECT n.*, m.revoked_at AS member_revoked
+       FROM network_members m JOIN networks n ON n.id = m.network_id
+      WHERE m.email = ? AND m.revoked_at IS NULL`,
+  )
+    .bind(email)
+    .first();
+}
+
+async function networkFor(env, account) {
+  const own = await owned(env, account.accountId);
+  if (own) return { network: own, role: "owner" };
+  const member = await membership(env, account.email);
+  if (member && !member.member_revoked) return { network: member, role: "member" };
+  return { network: null, role: null };
+}
+
+function cleanComputer(row) {
+  const id = String(row.id || row.device_id || "").replace(/\D/g, "");
+  if (id.length !== 9) return null;
+  return {
+    id,
+    name: String(row.name || "").slice(0, 80),
+    os_family: String(row.os_family || row.osFamily || "").slice(0, 32),
+    os_version: String(row.os_version || row.osVersion || "").slice(0, 40),
+  };
+}
+
+async function computersFor(env, networkId, accountId) {
+  const { results } = await env.DB.prepare(
+    `SELECT device_id, name, os_family, os_version FROM network_computers
+      WHERE network_id = ? AND account_id = ? ORDER BY updated_at DESC LIMIT 500`,
+  )
+    .bind(networkId, accountId)
+    .all();
+  return (results || []).map((r) => ({
+    id: r.device_id,
+    name: r.name,
+    os_family: r.os_family,
+    os_version: r.os_version,
+  }));
+}
+
+async function saveComputers(env, networkId, accountId, list) {
+  const rows = (Array.isArray(list) ? list : []).map(cleanComputer).filter(Boolean).slice(0, 500);
+  const t = now();
+  const stmts = rows.map((c) =>
+    env.DB.prepare(
+      `INSERT INTO network_computers (network_id, account_id, device_id, name, os_family, os_version, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(network_id, account_id, device_id) DO UPDATE SET
+         name = excluded.name, os_family = excluded.os_family, os_version = excluded.os_version, updated_at = excluded.updated_at`,
+    ).bind(networkId, accountId, c.id, c.name, c.os_family, c.os_version, t),
+  );
+  if (stmts.length) await env.DB.batch(stmts);
+}
+
+function validDevice(id) {
+  return typeof id === "string" && /^[A-Za-z0-9._-]{1,80}$/.test(id);
+}
+
+async function issue(env, account, network, deviceId, deviceName, computers) {
+  if (!validDevice(deviceId)) throw new HttpError(400, "This device needs an id.");
+  if (!network.active_address) throw new HttpError(400, "Set the server address in My network first.");
+  const { access, exp } = await signToken(env, { email: account.email, network, deviceId });
+  const refresh = randomHex(32);
+  const refreshHash = await sha256Hex(refresh);
+  await env.DB.prepare(
+    `INSERT INTO network_devices (network_id, device_id, account_id, email, name, refresh_hash, enrolled_at, revoked_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+     ON CONFLICT(network_id, device_id) DO UPDATE SET
+       account_id = excluded.account_id, email = excluded.email, name = excluded.name,
+       refresh_hash = excluded.refresh_hash, revoked_at = NULL`,
+  )
+    .bind(network.id, deviceId, account.accountId, account.email, String(deviceName || "").slice(0, 80), refreshHash, now())
+    .run();
+  if (computers) await saveComputers(env, network.id, account.accountId, computers);
+  const saved = await computersFor(env, network.id, account.accountId);
+  return {
+    access,
+    exp,
+    refresh,
+    device_id: deviceId,
+    network: networkView(network),
+    computers: saved,
+  };
+}
+
+export async function route(request, env, url) {
+  try {
+    return await handle(request, env, url);
+  } catch (e) {
+    if (e instanceof HttpError) return json({ error: e.message }, e.status);
+    throw e;
+  }
+}
+
+async function handle(request, env, url) {
+  const p = url.pathname;
+  const m = request.method;
+  if (p === "/api/network/key" && m === "GET") {
+    const { publicKey } = await signingKey(env);
+    return json({ public_key: publicKey });
+  }
+  if (!p.startsWith("/api/network")) return null;
+
+  if (p === "/api/network/enroll" && m === "POST") return enroll(request, env);
+  if (p === "/api/network/refresh" && m === "POST") return refresh(request, env);
+
+  const account = await session(request, env);
+
+  if (p === "/api/network" && m === "GET") return getNetwork(env, account);
+  if (p === "/api/network" && m === "PUT") return putNetwork(request, env, account);
+  if (p === "/api/network/members" && m === "POST") return addMember(request, env, account);
+  if (p === "/api/network/members" && m === "DELETE") return removeMember(request, env, account);
+  if (p === "/api/network/revoke-device" && m === "POST") return revokeDevice(request, env, account);
+  if (p === "/api/network/token" && m === "POST") return token(request, env, account);
+  if (p === "/api/network/computers" && m === "GET") return listComputers(env, account);
+  if (p === "/api/network/computers" && m === "PUT") return putComputers(request, env, account);
+  if (p === "/api/network/enroll-code" && m === "POST") return enrollCode(env, account);
+  if (p === "/api/network/policy" && m === "GET") return policy(env, account);
+  return null;
+}
+
+async function getNetwork(env, account) {
+  const { network, role } = await networkFor(env, account);
+  if (!network) return json({ network: null, role: null, computers: [] });
+  const computers = await computersFor(env, network.id, account.accountId);
+  const body = { role, network: networkView(network), computers };
+  if (role === "owner") {
+    const members = await env.DB.prepare(
+      "SELECT email, created_at, revoked_at FROM network_members WHERE network_id = ? ORDER BY email",
+    )
+      .bind(network.id)
+      .all();
+    const devices = await env.DB.prepare(
+      "SELECT device_id, email, name, enrolled_at, revoked_at FROM network_devices WHERE network_id = ? ORDER BY enrolled_at DESC",
+    )
+      .bind(network.id)
+      .all();
+    body.members = members.results || [];
+    body.devices = devices.results || [];
+    body.note = "Computers that have not signed in are listed in the PJDesk Server window until you turn on Require signed-in accounts.";
+  }
+  return json(body);
+}
+
+async function putNetwork(request, env, account) {
+  const body = await readJson(request);
+  let row = await owned(env, account.accountId);
+  if (!row) {
+    const id = `net_${randomHex(8)}`;
+    await env.DB.prepare(
+      `INSERT INTO networks (id, owner_id, name, active_address, active_fingerprint, standby_address, standby_fingerprint, require_accounts, created_at)
+       VALUES (?, ?, '', '', '', '', '', 0, ?)`,
+    )
+      .bind(id, account.accountId, now())
+      .run();
+    row = await owned(env, account.accountId);
+  }
+  const next = {
+    name: body.name != null ? String(body.name).slice(0, 80) : row.name,
+    active_address: body.active_address != null ? String(body.active_address).trim().slice(0, 200) : row.active_address,
+    active_fingerprint:
+      body.active_fingerprint != null ? normalizeFingerprint(body.active_fingerprint).slice(0, 64) : row.active_fingerprint,
+    standby_address: body.standby_address != null ? String(body.standby_address).trim().slice(0, 200) : row.standby_address,
+    standby_fingerprint:
+      body.standby_fingerprint != null ? normalizeFingerprint(body.standby_fingerprint).slice(0, 64) : row.standby_fingerprint,
+    require_accounts: body.require_accounts != null ? (body.require_accounts ? 1 : 0) : row.require_accounts,
+  };
+  await env.DB.prepare(
+    `UPDATE networks SET name = ?, active_address = ?, active_fingerprint = ?, standby_address = ?, standby_fingerprint = ?, require_accounts = ?
+      WHERE id = ?`,
+  )
+    .bind(next.name, next.active_address, next.active_fingerprint, next.standby_address, next.standby_fingerprint, next.require_accounts, row.id)
+    .run();
+  return getNetwork(env, account);
+}
+
+async function addMember(request, env, account) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "Set your network before inviting someone.");
+  const { email: raw } = await readJson(request);
+  const email = normEmail(raw);
+  if (!validEmail(email)) throw new HttpError(400, "Enter a valid email address.");
+  if (email === account.email) throw new HttpError(400, "You already have access as the owner.");
+  const existing = await env.DB.prepare("SELECT id FROM accounts WHERE email = ?").bind(email).first();
+  await env.DB.prepare(
+    `INSERT INTO network_members (network_id, email, account_id, created_at, revoked_at)
+     VALUES (?, ?, ?, ?, NULL)
+     ON CONFLICT(network_id, email) DO UPDATE SET account_id = excluded.account_id, revoked_at = NULL`,
+  )
+    .bind(row.id, email, existing?.id || null, now())
+    .run();
+  return getNetwork(env, account);
+}
+
+async function removeMember(request, env, account) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "No network.");
+  const { email: raw } = await readJson(request);
+  const email = normEmail(raw);
+  await env.DB.prepare("UPDATE network_members SET revoked_at = ? WHERE network_id = ? AND email = ?")
+    .bind(now(), row.id, email)
+    .run();
+  await env.DB.prepare("UPDATE network_devices SET revoked_at = ? WHERE network_id = ? AND email = ? AND revoked_at IS NULL")
+    .bind(now(), row.id, email)
+    .run();
+  return getNetwork(env, account);
+}
+
+async function revokeDevice(request, env, account) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "No network.");
+  const { device_id } = await readJson(request);
+  if (!validDevice(device_id)) throw new HttpError(400, "Unknown device.");
+  await env.DB.prepare(
+    "UPDATE network_devices SET revoked_at = ?, refresh_hash = '' WHERE network_id = ? AND device_id = ?",
+  )
+    .bind(now(), row.id, device_id)
+    .run();
+  return getNetwork(env, account);
+}
+
+async function token(request, env, account) {
+  const body = await readJson(request);
+  const found = await networkFor(env, account);
+  if (!found.network) throw new HttpError(403, "This account is not on a network.");
+  return json(await issue(env, account, found.network, String(body.device_id || ""), body.device_name, body.computers));
+}
+
+async function refresh(request, env) {
+  const body = await readJson(request);
+  const refreshToken = String(body.refresh || "");
+  const deviceId = String(body.device_id || "");
+  if (!validDevice(deviceId) || !/^[0-9a-f]{64}$/.test(refreshToken)) throw new HttpError(401, "Sign in required.");
+  const hash = await sha256Hex(refreshToken);
+  const row = await env.DB.prepare(
+    `SELECT d.network_id, d.account_id, d.email, d.revoked_at, d.enrolled_at, n.*
+       FROM network_devices d JOIN networks n ON n.id = d.network_id
+      WHERE d.device_id = ? AND d.refresh_hash = ?`,
+  )
+    .bind(deviceId, hash)
+    .first();
+  if (!row || row.revoked_at) throw new HttpError(401, "Sign in required.");
+  if (now() - row.enrolled_at > REFRESH_TTL) throw new HttpError(401, "Sign in required.");
+  const member = await env.DB.prepare(
+    "SELECT revoked_at FROM network_members WHERE network_id = ? AND email = ?",
+  )
+    .bind(row.network_id, row.email)
+    .first();
+  const owner = await env.DB.prepare("SELECT email FROM accounts WHERE id = ?").bind(row.owner_id).first();
+  if (member?.revoked_at) throw new HttpError(401, "Sign in required.");
+  if (owner?.email !== row.email && !member) throw new HttpError(401, "Sign in required.");
+  const account = { accountId: row.account_id, email: row.email };
+  if (row.require_accounts && !row.active_address) throw new HttpError(401, "Sign in required.");
+  const { access, exp } = await signToken(env, { email: account.email, network: row, deviceId });
+  if (body.computers) await saveComputers(env, row.id, account.accountId, body.computers);
+  const saved = await computersFor(env, row.id, account.accountId);
+  return json({
+    access,
+    exp,
+    refresh: refreshToken,
+    device_id: deviceId,
+    network: networkView(row),
+    computers: saved,
+  });
+}
+
+async function listComputers(env, account) {
+  const found = await networkFor(env, account);
+  if (!found.network) return json({ computers: [] });
+  return json({ computers: await computersFor(env, found.network.id, account.accountId) });
+}
+
+async function putComputers(request, env, account) {
+  const found = await networkFor(env, account);
+  if (!found.network) throw new HttpError(403, "This account is not on a network.");
+  const body = await readJson(request);
+  await saveComputers(env, found.network.id, account.accountId, body.computers);
+  return json({ computers: await computersFor(env, found.network.id, account.accountId) });
+}
+
+async function enrollCode(env, account) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "Set your network before creating a code.");
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  let code = "";
+  for (const b of bytes) code += alphabet[b % alphabet.length];
+  const shown = `${code.slice(0, 4)}-${code.slice(4)}`;
+  const expires = now() + ENROLL_TTL;
+  await env.DB.prepare("INSERT INTO enroll_codes (code_hash, network_id, created_at, expires_at) VALUES (?, ?, ?, ?)")
+    .bind(await sha256Hex(code), row.id, now(), expires)
+    .run();
+  return json({ code: shown, expires_at: expires });
+}
+
+async function enroll(request, env) {
+  const body = await readJson(request);
+  const code = String(body.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const deviceId = String(body.device_id || "");
+  if (code.length !== 8) throw new HttpError(400, "That enrollment code is not valid.");
+  const hash = await sha256Hex(code);
+  const row = await env.DB.prepare(
+    `SELECT c.expires_at, c.used_at, n.* FROM enroll_codes c JOIN networks n ON n.id = c.network_id WHERE c.code_hash = ?`,
+  )
+    .bind(hash)
+    .first();
+  if (!row || row.used_at || row.expires_at < now()) throw new HttpError(400, "That enrollment code is not valid.");
+  const owner = await env.DB.prepare("SELECT id, email FROM accounts WHERE id = ?").bind(row.owner_id).first();
+  if (!owner) throw new HttpError(400, "That enrollment code is not valid.");
+  await env.DB.prepare("UPDATE enroll_codes SET used_at = ? WHERE code_hash = ?").bind(now(), hash).run();
+  return json(await issue(env, { accountId: owner.id, email: owner.email }, row, deviceId, body.device_name || "Enrolled device", null));
+}
+
+async function policy(env, account) {
+  const found = await networkFor(env, account);
+  if (!found.network) throw new HttpError(404, "No network.");
+  const network = found.network;
+  const { publicKey } = await signingKey(env);
+  const members = await env.DB.prepare(
+    "SELECT email FROM network_members WHERE network_id = ? AND revoked_at IS NULL",
+  )
+    .bind(network.id)
+    .all();
+  const owner = await env.DB.prepare("SELECT email FROM accounts WHERE id = ?").bind(network.owner_id).first();
+  const allowed = [owner?.email, ...(members.results || []).map((r) => r.email)].filter(Boolean);
+  const revoked = await env.DB.prepare(
+    "SELECT device_id FROM network_devices WHERE network_id = ? AND revoked_at IS NOT NULL",
+  )
+    .bind(network.id)
+    .all();
+  return json({
+    network_id: network.id,
+    require_accounts: !!network.require_accounts,
+    public_key: publicKey,
+    allowed_accounts: [...new Set(allowed)],
+    revoked_devices: (revoked.results || []).map((r) => r.device_id),
+    fingerprints: fingerprintsOf(network),
+  });
+}

@@ -100,6 +100,8 @@ struct App {
     preview_locked: bool,
     /// Headless shot of the computer list.
     preview_devices: bool,
+    /// Headless shot of the signed-in-accounts card.
+    preview_network: bool,
     /// Latest client release from pjdesk.com, fetched off this thread.
     latest_release: Option<String>,
     release_at: Option<Instant>,
@@ -195,6 +197,7 @@ impl App {
             svc_override: None,
             preview_locked: false,
             preview_devices: false,
+            preview_network: false,
             latest_release: None,
             release_at: None,
             release_rx: None,
@@ -402,7 +405,15 @@ impl eframe::App for App {
                     self.devices_card(ui);
                     return;
                 }
+                if self.preview_network {
+                    ui.label(RichText::new(format!("This server  v{}", env!("CARGO_PKG_VERSION"))).strong().size(18.0));
+                    ui.add_space(8.0);
+                    self.network_card(ui);
+                    return;
+                }
                 self.service_card(ui);
+                ui.add_space(8.0);
+                self.network_card(ui);
                 ui.add_space(8.0);
                 self.updates_card(ui);
                 ui.add_space(8.0);
@@ -848,7 +859,7 @@ impl App {
         }
         let mut act: Option<CloudAct> = None;
         let busy = self.cloud_job.is_some();
-        let dns = pjdesk_proto::DEFAULT_SERVER.split(':').next().unwrap_or("your server's name").to_string();
+        let dns = "your server's name".to_string();
         let online = self.online.len();
         let can_write = self.can_write;
         card(ui, |ui| {
@@ -1346,6 +1357,91 @@ impl App {
         }
     }
 
+    fn network_card(&mut self, ui: &mut egui::Ui) {
+        if self.access != Access::Readable {
+            card(ui, |ui| {
+                heading(ui, "SIGNED-IN ACCOUNTS");
+                if let Some(live) = &self.live {
+                    let on = live.require_accounts;
+                    ui.label(if on {
+                        "Require signed-in accounts is on."
+                    } else {
+                        "Require signed-in accounts is off. Already-registered computers keep connecting."
+                    });
+                    let waiting: Vec<_> = live.devices.iter().filter(|d| !d.signed_in).cloned().collect();
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Not signed in yet").strong());
+                    if waiting.is_empty() {
+                        ui.label(RichText::new("No computer is waiting to sign in.").color(p(ui).muted));
+                    } else {
+                        for d in waiting {
+                            ui.label(format!("{}  {}", pjdesk_proto::format_id(&d.id), d.hostname));
+                        }
+                    }
+                }
+                self.locked_line(ui);
+            });
+            return;
+        }
+        let mut policy = crate::access::Policy::load(&self.data_dir);
+        let unsigned: Vec<(String, String)> = self
+            .devices
+            .iter()
+            .filter(|d| !d.signed_in)
+            .map(|d| (pjdesk_proto::format_id(&d.id), d.hostname.clone()))
+            .collect();
+        let mut require = policy.require_accounts;
+        let mut changed = false;
+        card(ui, |ui| {
+            heading(ui, "SIGNED-IN ACCOUNTS");
+            ui.label(RichText::new(
+                "Off by default, so an update does not take a computer offline. Turn this on only after every computer below has signed in.",
+            ).color(p(ui).muted));
+            ui.add_space(6.0);
+            if ui.checkbox(&mut require, "Require signed-in accounts").changed() && self.can_write {
+                changed = true;
+            }
+            if !self.can_write {
+                ui.label(RichText::new("Restart as administrator to change this.").color(p(ui).muted).size(12.0));
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("Not signed in yet").strong());
+            if unsigned.is_empty() {
+                ui.label(RichText::new("Every registered computer has signed in, or none have registered.").color(p(ui).muted));
+            } else {
+                for (id, name) in &unsigned {
+                    ui.horizontal(|ui| {
+                        ui_widgets::dot(ui, p(ui).warn);
+                        ui.label(format!("{id}  {name}"));
+                    });
+                }
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("Allowed accounts").strong());
+            if policy.allowed_accounts.is_empty() {
+                ui.label(RichText::new("Any account with a token for this server. Invite or remove people on pjdesk.com → My network.").color(p(ui).muted));
+            } else {
+                for email in &policy.allowed_accounts {
+                    ui.label(email);
+                }
+            }
+            if policy.public_key.is_empty() {
+                ui.label(RichText::new("The cloud signing key is saved here the next time this server checks in.").color(p(ui).muted).size(12.0));
+            } else {
+                ui.label(RichText::new("Cloud signing key is pinned.").color(p(ui).muted).size(12.0));
+            }
+        });
+        if changed {
+            policy.require_accounts = require;
+            if let Err(e) = policy.save(&self.data_dir) {
+                self.status = format!("Could not save the signed-in accounts setting: {e}");
+            } else {
+                let dir = self.data_dir.clone();
+                std::thread::spawn(move || crate::cloud::push_require_accounts(&dir, require));
+            }
+        }
+    }
+
     fn devices_card(&mut self, ui: &mut egui::Ui) {
         let locked = self.access != Access::Readable;
         if locked && self.live.as_ref().map(|s| s.devices.is_empty()).unwrap_or(true) {
@@ -1412,6 +1508,9 @@ impl App {
                         } else {
                             format!("Last seen {}", format_local(d.last_seen))
                         };
+                        if !d.signed_in {
+                            ui.label(RichText::new("not signed in").color(p(ui).warn).size(11.0));
+                        }
                         if d.online {
                             ui.horizontal(|ui| {
                                 ui_widgets::dot(ui, p(ui).ok);
@@ -1458,13 +1557,14 @@ impl App {
                 .map(|s| {
                     s.devices
                         .iter()
-                        .map(|d| ShownDevice {
+                        .map(|d|                         ShownDevice {
                             id: d.id.clone(),
                             hostname: d.hostname.clone(),
                             version: d.version.clone(),
                             online: d.online,
                             last_seen: 0,
                             first_seen: 0,
+                            signed_in: d.signed_in,
                         })
                         .collect()
                 })
@@ -1481,6 +1581,7 @@ impl App {
                     online: live.is_some(),
                     last_seen: d.last_seen,
                     first_seen: d.first_seen,
+                    signed_in: d.signed_in,
                 }
             })
             .collect()
@@ -1650,6 +1751,7 @@ struct ShownDevice {
     online: bool,
     last_seen: u64,
     first_seen: u64,
+    signed_in: bool,
 }
 
 fn version_text(version: &str) -> String {

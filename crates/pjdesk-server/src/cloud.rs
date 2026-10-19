@@ -131,20 +131,7 @@ pub struct AccountKeys {
 }
 
 pub fn derive_account_keys(email: &str, password: &str) -> AccountKeys {
-    let email = email.trim().to_lowercase();
-    let salt = Sha256::digest(format!("pjdesk-cloud-v1\0{email}").as_bytes());
-    let mut master = [0u8; 32];
-    ring::pbkdf2::derive(
-        ring::pbkdf2::PBKDF2_HMAC_SHA256,
-        std::num::NonZeroU32::new(600_000).expect("non-zero"),
-        &salt,
-        password.as_bytes(),
-        &mut master,
-    );
-    let mut auth = [0u8; 32];
-    let mut sync = [0u8; 32];
-    auth.copy_from_slice(&hmac(&master, "pjdesk-cloud-auth"));
-    sync.copy_from_slice(&hmac(&master, "pjdesk-cloud-sync-key"));
+    let (auth, sync) = pjdesk_proto::access::derive_account_keys(email, password);
     AccountKeys { auth, sync }
 }
 
@@ -1635,6 +1622,67 @@ fn publish_health(data_dir: &Path, role: Role) {
     };
     if let Err(e) = write_health(&cfg, &me) {
         tracing::debug!("cloud health: {e:#}");
+    }
+    if let Err(e) = pull_network_policy(data_dir, &cfg) {
+        tracing::debug!("network policy: {e:#}");
+    }
+}
+
+/// Copies the account's network policy into `network-access.json`. The local
+/// certificate fingerprint is kept. Failure leaves the current file alone.
+fn pull_network_policy(data_dir: &Path, cfg: &CloudConfig) -> Result<()> {
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return Ok(());
+    }
+    #[derive(Deserialize)]
+    struct Reply {
+        #[serde(default)]
+        require_accounts: bool,
+        #[serde(default)]
+        public_key: String,
+        #[serde(default)]
+        allowed_accounts: Vec<String>,
+        #[serde(default)]
+        revoked_devices: Vec<String>,
+    }
+    let reply = match agent()
+        .get(&format!("{}/api/network/policy", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            serde_json::from_str::<Reply>(&text).context("unexpected network policy")?
+        }
+        Err(ureq::Error::Status(404, _)) => return Ok(()),
+        Err(e) => return Err(api_error(&cfg.api, &cfg.email, e)),
+    };
+    let mut policy = crate::access::Policy::load(data_dir);
+    policy.require_accounts = reply.require_accounts;
+    if reply.public_key.len() == 64 {
+        policy.public_key = reply.public_key;
+    }
+    policy.allowed_accounts = reply.allowed_accounts;
+    policy.revoked_devices = reply.revoked_devices;
+    policy.save(data_dir).context("saving network policy")?;
+    Ok(())
+}
+
+/// Tells pjdesk.com that this server now requires (or no longer requires) a
+/// signed-in account. The local file is already updated by the caller.
+pub fn push_require_accounts(data_dir: &Path, require: bool) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return;
+    }
+    let body = serde_json::json!({ "require_accounts": require }).to_string();
+    let result = agent()
+        .put(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body);
+    if let Err(e) = result {
+        tracing::debug!("could not publish the signed-in-accounts switch: {e}");
     }
 }
 

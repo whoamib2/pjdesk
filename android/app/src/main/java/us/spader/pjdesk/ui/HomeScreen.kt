@@ -10,6 +10,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -29,6 +30,8 @@ fun HomeScreen(
     onConnectId: (String) -> Unit,
     onConnectPassword: (String) -> Unit,
     onConnect: () -> Unit,
+    savePassword: Boolean = false,
+    onSavePassword: (Boolean) -> Unit = {},
     onCopyId: () -> Unit,
     onCopyPassword: () -> Unit,
     onRegenerate: () -> Unit,
@@ -115,6 +118,15 @@ fun HomeScreen(
                     value = connectPassword,
                     onValueChange = onConnectPassword,
                     label = "Password",
+                )
+                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    Checkbox(checked = savePassword, onCheckedChange = onSavePassword)
+                    Text("Save password for this computer")
+                }
+                Text(
+                    "Stored on this phone only, in the Android Keystore. It is not uploaded.",
+                    color = pjMuted(),
+                    style = MaterialTheme.typography.labelMedium,
                 )
                 Button(onClick = onConnect, modifier = Modifier.fillMaxWidth()) { Text("Connect") }
             }

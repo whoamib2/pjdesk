@@ -53,7 +53,7 @@ fun SettingsScreen(
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 label = { Text("Address") },
-                supportingText = { Text("Default is pjdesk.spader.us:21200") },
+                supportingText = { Text("Filled in when you sign in. Add :port if it is not 21200.") },
             )
             Button(onClick = { onServer(server.trim()) }) { Text("Save server") }
             Text("Key fingerprint", color = pjMuted(), style = MaterialTheme.typography.labelMedium)
@@ -88,7 +88,7 @@ fun SettingsScreen(
         Section("About") {
             Text("PJDesk 0.6.3", style = MaterialTheme.typography.titleMedium)
             Text(
-                "Android host and controller. Video is H.264 Annex-B from the hardware encoder, the same stream the Windows client decodes with OpenH264. The server default is pjdesk.spader.us:21200.",
+                "Android host and controller. Video is H.264 Annex-B from the hardware encoder, the same stream the Windows client decodes with OpenH264. The server comes from your PJDesk account after you sign in.",
                 color = pjMuted(),
             )
             TextButton(onClick = onShareLogs) { Text("Share logs") }

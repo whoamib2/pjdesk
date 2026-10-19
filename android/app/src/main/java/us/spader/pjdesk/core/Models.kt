@@ -31,7 +31,7 @@ data class DeskState(
     val password: String = "",
     val hasPermanent: Boolean = false,
     val fingerprint: String = "",
-    val server: String = "pjdesk.spader.us:21200",
+    val server: String = "",
     val approval: String = "prompt",
     val status: String = "Connecting…",
     val incoming: IncomingCall? = null,
@@ -46,6 +46,7 @@ data class SavedComputer(
     val name: String,
     val osFamily: String = "",
     val osVersion: String = "",
+    val passwordSaved: Boolean = false,
 )
 
 fun permanentOk(password: String): Boolean =

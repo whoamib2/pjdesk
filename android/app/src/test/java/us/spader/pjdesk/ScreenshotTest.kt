@@ -28,6 +28,7 @@ import us.spader.pjdesk.ui.HomeScreen
 import us.spader.pjdesk.ui.OnboardingScreen
 import us.spader.pjdesk.ui.PjTheme
 import us.spader.pjdesk.ui.SavedScreen
+import us.spader.pjdesk.ui.SignInScreen
 import us.spader.pjdesk.ui.SessionChrome
 import us.spader.pjdesk.ui.SettingsScreen
 import java.io.File
@@ -44,7 +45,7 @@ class ScreenshotTest {
                 idFormatted = "123 456 789",
                 password = "k7mw4qpn",
                 status = "Online",
-                server = "pjdesk.spader.us:21200",
+                server = "office.example:21200",
                 fingerprint = "ab:cd:ef",
             ),
             connectId = "",
@@ -78,7 +79,7 @@ class ScreenshotTest {
     fun settings() = shot("settings") {
         SettingsScreen(
             state = DeskState(
-                server = "pjdesk.spader.us:21200",
+                server = "office.example:21200",
                 fingerprint = "12:34:56:78:9a:bc:de:f0:11:22:33:44:55:66:77:88",
                 hasPermanent = true,
                 approval = "prompt",
@@ -87,6 +88,29 @@ class ScreenshotTest {
             onTheme = {},
             onServer = {},
             onResetFingerprint = {},
+        )
+    }
+
+    @Test
+    fun signInDark() = shot("signin-dark", "dark") { signIn() }
+
+    @Test
+    fun signInLight() = shot("signin-light", "light") { signIn() }
+
+    @Composable
+    private fun signIn() {
+        SignInScreen(
+            email = "ben@spader.us",
+            password = "",
+            code = "",
+            useCode = false,
+            busy = false,
+            error = "",
+            onEmail = {},
+            onPassword = {},
+            onCode = {},
+            onUseCode = {},
+            onSubmit = {},
         )
     }
 
@@ -132,9 +156,9 @@ class ScreenshotTest {
         }
     }
 
-    private fun shot(name: String, content: @Composable () -> Unit) {
+    private fun shot(name: String, theme: String = "dark", content: @Composable () -> Unit) {
         val activity = Robolectric.buildActivity(ComponentActivity::class.java).setup().get()
-        activity.setContent { PjTheme(theme = "dark") { content() } }
+        activity.setContent { PjTheme(theme = theme) { content() } }
         ShadowLooper.idleMainLooper()
         val view = activity.window.decorView
         val width = 1080

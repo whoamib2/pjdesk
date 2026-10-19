@@ -395,18 +395,51 @@ async fn host_main(
 /// One signaling connection: register, then handle incoming sessions.
 /// Returns `Ok` if we were registered before the connection dropped.
 async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<HostState>) -> Result<()> {
+    tokio::task::spawn_blocking({
+        let mut copy = config.clone();
+        move || {
+            crate::network::refresh_config(&mut copy);
+            copy
+        }
+    })
+    .await
+    .ok()
+    .map(|refreshed| {
+        config.network_access = refreshed.network_access;
+        config.network_access_exp = refreshed.network_access_exp;
+        config.network_refresh = refreshed.network_refresh;
+        config.network_email = refreshed.network_email;
+        config.server = refreshed.server;
+        config.server_fingerprint = refreshed.server_fingerprint;
+    });
+    let token = config.network_access_token();
     let mut signal = SignalClient::connect(server, config).await?;
+    if !token.is_empty() {
+        let _ = signal.send(ClientMsg::PresentAccess { token: token.clone() });
+    }
     let device_secret = config.device_secret()?;
     let register_proto = state.server_proto.load(Ordering::SeqCst);
-    signal.send(ClientMsg::Register {
+    let register = ClientMsg::Register {
         proto: register_proto,
         device_id: config.device_id.clone(),
         device_secret,
         hostname: state.name.clone(),
         app_version: env!("CARGO_PKG_VERSION").into(),
-    })?;
+    };
+    signal.send(register.clone())?;
 
-    let device_id = match timeout(Duration::from_secs(10), signal.recv()).await {
+    let first = timeout(Duration::from_secs(10), signal.recv()).await;
+    let device_id = match first {
+        Ok(None) if !token.is_empty() => {
+            // A server from before 0.6.0 cannot decode PresentAccess and drops
+            // the socket. Try once without the token so this computer stays online.
+            signal = SignalClient::connect(server, config).await?;
+            signal.send(register)?;
+            timeout(Duration::from_secs(10), signal.recv()).await
+        }
+        other => other,
+    };
+    let device_id = match device_id {
         Ok(Some(ServerMsg::Registered { device_id })) => device_id,
         Ok(Some(ServerMsg::Error { code: ErrorCode::IdConflict, message })) => {
             config.device_id = None;

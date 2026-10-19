@@ -286,8 +286,8 @@ offline, so you do not stop it yourself. The primary can **Step down to
 standby** (`pjdesk-server cloud demote`); that does not promote the other
 server — you still choose **Make this the primary** there.
 
-Computers connect to whichever server the DNS name points to (for example
-`pjdesk.spader.us`). If the new primary is on a different network, forward
+Computers connect to whichever server the account's network names (the active
+address on pjdesk.com → My network). If the new primary is on a different network, forward
 TCP + UDP 21200 to it and point that name at its public IP. A short TTL
 (1–5 minutes) makes the change quick. Computers reconnect within a couple of
 minutes (a client that hears nothing from its server for 70 s reconnects and

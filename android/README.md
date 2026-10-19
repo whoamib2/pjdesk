@@ -1,6 +1,6 @@
 # PJDesk for Android
 
-The Android app is both a host and a controller. It speaks the same protocol as the Windows client and uses the same relay (`pjdesk.spader.us:21200` by default). The Rust core is `crates/pjdesk-mobile` (`libpjdesk_mobile`), built with cargo-ndk and called through JNI. The UI is Kotlin and Jetpack Compose.
+The Android app is both a host and a controller. It speaks the same protocol as the Windows client. A fresh install has no server until you sign in with a PJDesk account; the account supplies the private server address and key. The Rust core is `crates/pjdesk-mobile` (`libpjdesk_mobile`), built with cargo-ndk and called through JNI. The UI is Kotlin and Jetpack Compose.
 
 ## Codec
 

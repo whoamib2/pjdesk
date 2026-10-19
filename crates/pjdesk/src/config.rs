@@ -41,8 +41,27 @@ pub struct Config {
     pub address_book: Vec<AddressEntry>,
     /// Remembered passwords for direct connections, by device ID (encrypted).
     /// The account address book is the synced store; this is the local one.
+    /// Passwords stay on this computer. They are not uploaded.
     #[serde(default)]
     saved_passwords: BTreeMap<String, String>,
+    /// PJDesk account that owns the private server this client uses.
+    #[serde(default)]
+    pub network_email: Option<String>,
+    /// Refresh token for that account, sealed so the background service can read it.
+    #[serde(default)]
+    pub network_refresh: Option<String>,
+    /// Short-lived access token for the private server.
+    #[serde(default)]
+    pub network_access: Option<String>,
+    #[serde(default)]
+    pub network_access_exp: u64,
+    /// Stable id named by the access token. Not the nine-digit PJDesk ID.
+    #[serde(default)]
+    pub network_device_id: Option<String>,
+    #[serde(default)]
+    pub network_standby: Option<String>,
+    #[serde(default)]
+    pub network_standby_fingerprint: Option<String>,
 }
 
 /// Quality, behaviour and startup preferences.
@@ -318,14 +337,92 @@ impl Config {
         self.server_fingerprint.as_deref().and_then(|s| parse_fingerprint(s).ok())
     }
 
-    /// The server to use: the one the user set, else the baked-in default, so a
-    /// fresh install is reachable without any configuration.
+    /// The server to use. An explicit address wins. An install that already has
+    /// a device id keeps the server it registered with, so an update does not
+    /// take it offline. A fresh install has neither, and waits for sign-in.
     pub fn effective_server(&self) -> String {
-        self.server
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| pjdesk_proto::DEFAULT_SERVER.to_string())
+        if let Some(s) = self.server.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return s.to_string();
+        }
+        if self.device_id.is_some() {
+            return pjdesk_proto::LEGACY_REGISTERED_SERVER.to_string();
+        }
+        String::new()
+    }
+
+    pub fn network_access_token(&self) -> String {
+        self.network_access.as_deref().and_then(secure::reveal).filter(|s| !s.is_empty()).unwrap_or_default()
+    }
+
+    pub fn network_refresh_token(&self) -> String {
+        self.network_refresh.as_deref().and_then(secure::reveal).filter(|s| !s.is_empty()).unwrap_or_default()
+    }
+
+    /// Ensures this install has a stable id to put in a network access token.
+    pub fn network_device(&mut self) -> String {
+        if let Some(id) = self.network_device_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return id.to_string();
+        }
+        let id = hex::encode(pjdesk_proto::random_bytes::<16>());
+        self.network_device_id = Some(id.clone());
+        id
+    }
+
+    pub fn apply_network_session(&mut self, session: &crate::network::Session) {
+        self.network_email = Some(session.email.clone());
+        if !session.refresh.is_empty() {
+            self.network_refresh = Some(secure::protect_machine(&session.refresh));
+        }
+        if !session.access.is_empty() {
+            self.network_access = Some(secure::protect(&session.access));
+        }
+        self.network_access_exp = session.exp;
+        if !session.device_id.is_empty() {
+            self.network_device_id = Some(session.device_id.clone());
+        }
+        if !session.address.trim().is_empty() {
+            self.server = Some(session.address.trim().to_string());
+        }
+        if let Ok(fp) = parse_fingerprint(&session.fingerprint) {
+            self.server_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
+        }
+        if !session.standby_address.trim().is_empty() {
+            self.network_standby = Some(session.standby_address.trim().to_string());
+        }
+        if let Ok(fp) = parse_fingerprint(&session.standby_fingerprint) {
+            self.network_standby_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
+        }
+        self.merge_computers(&session.computers);
+    }
+
+    /// Adds the account's saved computers. Local passwords are left as they are.
+    pub fn merge_computers(&mut self, computers: &[crate::network::SavedComputer]) {
+        for computer in computers {
+            let id = pjdesk_proto::normalize_id(&computer.id);
+            if !pjdesk_proto::is_valid_id(&id) {
+                continue;
+            }
+            if let Some(entry) = self.address_book.iter_mut().find(|e| e.id == id) {
+                if entry.alias.trim().is_empty() && !computer.name.trim().is_empty() {
+                    entry.alias = computer.name.trim().to_string();
+                }
+                entry.password = None;
+            } else {
+                self.address_book.push(AddressEntry {
+                    id: id.clone(),
+                    alias: computer.name.trim().to_string(),
+                    password: None,
+                    ..Default::default()
+                });
+            }
+            let note = self.settings.peers.entry(id).or_default();
+            if note.os_family.is_empty() {
+                note.os_family = computer.os_family.clone();
+            }
+            if note.os_version.is_empty() {
+                note.os_version = computer.os_version.clone();
+            }
+        }
     }
 
     /// Re-reads the device identity and pinned fingerprint from disk. The host
@@ -341,6 +438,15 @@ impl Config {
             }
             if disk.server_fingerprint.is_some() {
                 self.server_fingerprint = disk.server_fingerprint;
+            }
+            if disk.network_refresh.is_some() {
+                self.network_email = disk.network_email;
+                self.network_refresh = disk.network_refresh;
+                self.network_access = disk.network_access;
+                self.network_access_exp = disk.network_access_exp;
+                self.network_device_id = disk.network_device_id;
+                self.network_standby = disk.network_standby;
+                self.network_standby_fingerprint = disk.network_standby_fingerprint;
             }
         }
     }
@@ -425,6 +531,34 @@ mod tests {
         assert!(old.favorite);
         assert!(old.os_family.is_empty());
         assert_eq!(old.view_mode, 0);
+    }
+
+    #[test]
+    fn a_fresh_install_has_no_server_until_sign_in() {
+        let fresh = Config::default();
+        assert!(fresh.effective_server().is_empty());
+        let mut registered = Config::default();
+        registered.device_id = Some("123456789".into());
+        assert_eq!(registered.effective_server(), pjdesk_proto::LEGACY_REGISTERED_SERVER);
+        registered.server = Some("office.example:21200".into());
+        assert_eq!(registered.effective_server(), "office.example:21200");
+    }
+
+    #[test]
+    fn save_password_stays_on_this_computer() {
+        let mut c = Config::default();
+        c.remember_password("123456789", Some("correct horse"));
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("correct horse"));
+        assert!(json.contains("dpapi:") || json.contains("plain:"));
+        c.merge_computers(&[crate::network::SavedComputer {
+            id: "123456789".into(),
+            name: "Office".into(),
+            os_family: "windows".into(),
+            os_version: "11".into(),
+        }]);
+        assert_eq!(c.saved_password("123456789").as_deref(), Some("correct horse"));
+        assert!(c.address_book.iter().all(|e| e.password.is_none()));
     }
 
     #[test]
