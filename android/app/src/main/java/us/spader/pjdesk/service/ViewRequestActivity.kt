@@ -185,3 +185,149 @@ object ViewPrompt {
         )
     }
 }
+
+/**
+ * Screen-share consent after a password was accepted. The heads-up notification
+ * can appear while PJDesk is in the background. Tapping Allow starts Android's
+ * own MediaProjection dialog. Appearing over the lock screen does not share
+ * the screen by itself.
+ */
+class CaptureConsentActivity : ComponentActivity() {
+    private var launchNow: Boolean = false
+
+    private val projection = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        HostService.consentInProgress = false
+        val data = result.data
+        val engine = (application as PjApp).engine
+        if (result.resultCode == RESULT_OK && data != null) {
+            HostService.onCapture = { ok, reason ->
+                runOnUiThread {
+                    HostService.onCapture = null
+                    if (!ok) engine.captureDenied(reason.ifBlank { "Screen capture permission denied" })
+                    CapturePrompt.cancel(this)
+                    finish()
+                }
+            }
+            HostService.capture(this, result.resultCode, data)
+        } else {
+            engine.captureDenied("Screen capture permission denied")
+            CapturePrompt.cancel(this)
+            finish()
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= 27) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        }
+        HostService.arm(this)
+        val allow = intent.getBooleanExtra(EXTRA_ALLOW, false)
+        if (HostService.capturing) {
+            (application as PjApp).engine.setCapturing(true)
+            CapturePrompt.cancel(this)
+            finish()
+            return
+        }
+        if (allow) {
+            launchNow = true
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.allow_screen_share))
+            .setMessage(getString(R.string.allow_screen_share_body))
+            .setPositiveButton(getString(R.string.allow_screen_share)) { _, _ -> launchProjection() }
+            .setNegativeButton("Deny") { _, _ ->
+                (application as PjApp).engine.captureDenied("Screen capture permission denied")
+                CapturePrompt.cancel(this)
+                finish()
+            }
+            .setOnCancelListener {
+                (application as PjApp).engine.captureDenied("Screen capture permission denied")
+                CapturePrompt.cancel(this)
+                finish()
+            }
+            .show()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (!launchNow) return
+        launchNow = false
+        if (HostService.capturing) {
+            (application as PjApp).engine.setCapturing(true)
+            CapturePrompt.cancel(this)
+            finish()
+        } else {
+            launchProjection()
+        }
+    }
+
+    private fun launchProjection() {
+        HostService.consentInProgress = true
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        projection.launch(manager.createScreenCaptureIntent())
+    }
+
+    companion object {
+        const val EXTRA_ALLOW = "allow"
+    }
+}
+
+object CapturePrompt {
+    private const val CHANNEL = "pjdesk-screen-share"
+    private const val NOTIF = 9
+
+    fun show(context: Context) {
+        val app = context.applicationContext
+        if (HostService.capturing) {
+            (app as PjApp).engine.setCapturing(true)
+            return
+        }
+        if (HostService.consentInProgress) return
+        HostService.arm(app)
+        val manager = app.getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT >= 26) {
+            val channel = NotificationChannel(CHANNEL, app.getString(R.string.channel_share), NotificationManager.IMPORTANCE_HIGH)
+            channel.description = app.getString(R.string.allow_screen_share_body)
+            channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            manager.createNotificationChannel(channel)
+        }
+        val open = Intent(app, CaptureConsentActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val allow = Intent(open).putExtra(CaptureConsentActivity.EXTRA_ALLOW, true)
+        val content = PendingIntent.getActivity(
+            app,
+            3,
+            open,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val allowIntent = PendingIntent.getActivity(
+            app,
+            4,
+            allow,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(app, CHANNEL)
+            .setSmallIcon(R.drawable.ic_stat)
+            .setContentTitle(app.getString(R.string.allow_screen_share))
+            .setContentText(app.getString(R.string.allow_screen_share_body))
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setContentIntent(content)
+            .setFullScreenIntent(content, true)
+            .setAutoCancel(false)
+            .setOngoing(true)
+            .addAction(0, app.getString(R.string.allow_screen_share), allowIntent)
+            .build()
+        manager.notify(NOTIF, notification)
+        runCatching { app.startActivity(open) }
+    }
+
+    fun cancel(context: Context) {
+        context.applicationContext.getSystemService(NotificationManager::class.java).cancel(NOTIF)
+    }
+}

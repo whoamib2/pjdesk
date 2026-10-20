@@ -62,6 +62,18 @@ class Engine(context: Context) : EngineListener {
         pushPermanent()
         command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
         pushTrusted()
+        setCapturing(us.spader.pjdesk.service.HostService.capturing)
+    }
+
+    /** MediaProjection is producing frames, or it stopped. */
+    fun setCapturing(on: Boolean) {
+        command(JSONObject().put("cmd", "capturing").put("on", on).toString())
+    }
+
+    /** The person denied screen sharing, or Android refused the consent. */
+    fun captureDenied(reason: String) {
+        val text = reason.ifBlank { "Screen capture permission denied" }
+        command(JSONObject().put("cmd", "captureDenied").put("reason", text).toString())
     }
 
     fun pushTrusted() {
@@ -349,6 +361,13 @@ class Engine(context: Context) : EngineListener {
                     }
                 }
             }
+            "needCapture" -> {
+                if (us.spader.pjdesk.service.HostService.capturing) {
+                    setCapturing(true)
+                } else {
+                    us.spader.pjdesk.service.CapturePrompt.show(app)
+                }
+            }
             "hosting" -> {
                 us.spader.pjdesk.service.ViewPrompt.cancel(app)
                 update {
@@ -357,18 +376,25 @@ class Engine(context: Context) : EngineListener {
                 }
             }
             "controlling" -> update {
+                val peer = event.optString("peer")
+                val path = event.optString("path")
+                val how = when (path) {
+                    "LAN" -> "over LAN"
+                    "Internet, relayed" -> "through the relay"
+                    else -> "($path)"
+                }
                 it.copy(
                     askPassword = false,
                     session = SessionInfo(
-                        peer = event.optString("peer"),
+                        peer = peer,
                         id = event.optString("id"),
-                        path = event.optString("path"),
+                        path = path,
                         platform = event.optString("platform"),
                         version = event.optString("version"),
                         layout = event.optBoolean("layout"),
                         displays = it.session?.displays ?: emptyList(),
                     ),
-                    status = "Controlling ${event.optString("peer")}",
+                    status = "Controlling $peer $how",
                 )
             }
             "platform" -> update { state ->
@@ -397,6 +423,7 @@ class Engine(context: Context) : EngineListener {
             "input" -> RemoteControl.handle(event)
             "disconnected" -> {
                 us.spader.pjdesk.service.ViewPrompt.cancel(app)
+                us.spader.pjdesk.service.CapturePrompt.cancel(app)
                 val role = event.optString("role")
                 val reason = event.optString("reason").ifBlank { "the session ended" }
                 update {

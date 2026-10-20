@@ -10,4 +10,7 @@
     <string name="channel_online">Host status</string>
     <string name="channel_live">Being controlled</string>
     <string name="stop">Stop</string>
+    <string name="allow_screen_share">Allow screen sharing</string>
+    <string name="allow_screen_share_body">Tap to let PJDesk share this screen. Android may also ask.</string>
+    <string name="channel_share">Screen sharing</string>
 </resources>

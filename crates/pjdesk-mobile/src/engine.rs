@@ -35,7 +35,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.8";
+pub const APP_VERSION: &str = "0.6.9";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -90,6 +90,10 @@ struct State {
     approval: Mutex<String>,
     policy: Mutex<pjdesk_proto::signal::Policy>,
     capture: Mutex<(u16, u16)>,
+    /// True while MediaProjection is producing frames.
+    capturing: AtomicBool,
+    /// Set when the person denies screen sharing, or the consent fails.
+    capture_deny: Mutex<String>,
     /// Bumped to end the current session. The host registration keeps running.
     gen: AtomicU64,
     approval_tx: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
@@ -162,6 +166,8 @@ impl Engine {
             approval: Mutex::new("prompt".into()),
             policy: Mutex::new(pjdesk_proto::signal::Policy::default()),
             capture: Mutex::new((1080, 2400)),
+            capturing: AtomicBool::new(false),
+            capture_deny: Mutex::new(String::new()),
             gen: AtomicU64::new(1),
             approval_tx: Mutex::new(None),
             password_tx: Mutex::new(None),
@@ -387,6 +393,18 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             if w > 0 && h > 0 {
                 *state.capture.lock().unwrap() = (w, h);
             }
+        }
+        "capturing" => {
+            let on = cmd.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+            state.capturing.store(on, Ordering::SeqCst);
+            if on {
+                *state.capture_deny.lock().unwrap() = String::new();
+            }
+        }
+        "captureDenied" => {
+            let reason = cmd.get("reason").and_then(|v| v.as_str()).unwrap_or("Screen capture permission denied");
+            *state.capture_deny.lock().unwrap() = reason.chars().filter(|c| !c.is_control()).take(200).collect();
+            state.capturing.store(false, Ordering::SeqCst);
         }
         "connect" => {
             let id = normalize_id(cmd.get("id").and_then(|v| v.as_str()).unwrap_or(""));
@@ -946,7 +964,20 @@ async fn host_session(
         connection.close(0u32.into(), b"stopped");
         bail!("stopped");
     }
-    emit(&cb, &json!({"event":"hosting","peer": auth.peer_name}));
+    // The password (or Allow) is done. The picture still needs MediaProjection.
+    // Tell the controller before the video stream opens, and keep this session
+    // up while the phone shows the consent notification.
+    let mut share_deadline = None;
+    if !state.capturing.load(Ordering::SeqCst) {
+        *state.capture_deny.lock().unwrap() = String::new();
+        let _ = write_msg(&mut auth.send, &HostMsg::Notice(SCREEN_WAIT.into())).await;
+        emit(&cb, &json!({"event":"needCapture","text": SCREEN_WAIT}));
+        log_line(&cb, SCREEN_WAIT.to_string());
+        share_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(60));
+    }
+    if share_deadline.is_none() {
+        emit(&cb, &json!({"event":"hosting","peer": auth.peer_name}));
+    }
     let video_out = Arc::new(VideoOut {
         latest: Mutex::new(None),
         notify: Notify::new(),
@@ -999,8 +1030,31 @@ async fn host_session(
             let saved = if saved.is_empty() { "stopped".to_string() } else { saved };
             break Err(anyhow!("{saved}"));
         }
+        if let Some(deadline) = share_deadline {
+            if state.capturing.load(Ordering::SeqCst) {
+                share_deadline = None;
+                log_line(&cb, "screen sharing is on");
+                emit(&cb, &json!({"event":"hosting","peer": auth.peer_name}));
+                emit(&cb, &json!({"event":"keyframe"}));
+            } else {
+                let deny = state.capture_deny.lock().unwrap().clone();
+                let failed = if !deny.is_empty() {
+                    Some(screen_share_failure(&deny))
+                } else if tokio::time::Instant::now() >= deadline {
+                    Some(screen_share_failure(""))
+                } else {
+                    None
+                };
+                if let Some(reason) = failed {
+                    let _ = write_msg(&mut control_send, &HostMsg::Notice(reason.clone())).await;
+                    log_line(&cb, reason.clone());
+                    break Err(anyhow!(reason));
+                }
+            }
+        }
+        let idle = if share_deadline.is_some() { Duration::from_millis(250) } else { Duration::from_secs(20) };
         let msg = tokio::time::timeout(
-            Duration::from_secs(20),
+            idle,
             read_msg::<_, ControlMsg>(&mut control_recv, MAX_CONTROL_FRAME),
         )
         .await;
@@ -1081,8 +1135,31 @@ async fn host_session(
     };
     video_task.abort();
     *state.video.lock().unwrap() = None;
-    connection.close(0u32.into(), b"session ended");
+    let sharing = result.as_ref().err().is_some_and(|e| e.to_string().contains("screen sharing"));
+    connection.close(0u32.into(), if sharing { b"screen sharing not allowed" } else { b"session ended" });
     result
+}
+
+/// Shown to the controller until MediaProjection is producing frames.
+const SCREEN_WAIT: &str = "Waiting for the phone to allow screen sharing";
+
+/// A reason the Windows client can show instead of a generic picture timeout.
+fn screen_share_failure(reason: &str) -> String {
+    let text = reason.trim();
+    let lower = text.to_ascii_lowercase();
+    if text.is_empty() {
+        return "screen sharing not allowed on the phone: tap the PJDesk notification to allow".into();
+    }
+    if lower.contains("foreground") || lower.contains("could not start the screen-capture service") {
+        return "screen sharing not allowed on the phone: the foreground service is not running".into();
+    }
+    if lower.contains("expired") || lower.contains("missing") {
+        return "screen sharing not allowed on the phone: MediaProjection consent missing or expired".into();
+    }
+    if lower.contains("denied") || lower.contains("not allowed") || lower.contains("stopped") {
+        return format!("screen sharing not allowed on the phone: {text}");
+    }
+    format!("screen sharing not allowed on the phone: {text}")
 }
 
 fn auth_passwords(state: &State) -> Vec<String> {
@@ -1394,6 +1471,10 @@ async fn controller_session(
         let punching = binding.punch_socket.try_clone().ok().map(|sock| {
             p2p::spawn_punching(sock, candidates.clone(), session_id, Duration::from_secs(8))
         });
+        log_line(
+            &cb,
+            "Trying a direct connection on this network first (UDP 21201), then the relay",
+        );
         let connected = p2p::connect_to_host(&endpoint, &candidates, server_udp, false).await;
         if let Some(punching) = punching {
             punching.abort();
@@ -1477,9 +1558,22 @@ async fn controller_session(
     let cb_v = cb.clone();
     let tx_ack = control_tx.clone();
     let video_task = tokio::spawn(async move {
-        let mut video = match tokio::time::timeout(Duration::from_secs(15), conn.accept_uni()).await {
+        let mut video = match tokio::time::timeout(Duration::from_secs(70), conn.accept_uni()).await {
             Ok(Ok(v)) => v,
-            _ => return,
+            Ok(Err(e)) => {
+                emit(
+                    &cb_v,
+                    &json!({"event":"error","text": format!("The other computer did not open the video stream: {e}")}),
+                );
+                return;
+            }
+            Err(_) => {
+                emit(
+                    &cb_v,
+                    &json!({"event":"error","text": "No picture arrived. That computer did not start sending its screen."}),
+                );
+                return;
+            }
         };
         let mut data = Vec::new();
         loop {
@@ -1619,6 +1713,26 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_screen_share_names_the_reason() {
+        assert_eq!(
+            screen_share_failure(""),
+            "screen sharing not allowed on the phone: tap the PJDesk notification to allow"
+        );
+        assert_eq!(
+            screen_share_failure("Could not start the screen-capture service"),
+            "screen sharing not allowed on the phone: the foreground service is not running"
+        );
+        assert_eq!(
+            screen_share_failure("MediaProjection consent expired"),
+            "screen sharing not allowed on the phone: MediaProjection consent missing or expired"
+        );
+        assert_eq!(
+            screen_share_failure("Screen capture permission denied"),
+            "screen sharing not allowed on the phone: Screen capture permission denied"
+        );
+    }
+
+    #[test]
     fn a_trusted_account_or_computer_or_permanent_password_skips_the_view_prompt() {
         let dir = std::env::temp_dir().join(format!("pjdesk-trust-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1670,6 +1784,8 @@ mod tests {
             approval: Mutex::new("prompt".into()),
             policy: Mutex::new(pjdesk_proto::signal::Policy::default()),
             capture: Mutex::new((1080, 2400)),
+            capturing: AtomicBool::new(false),
+            capture_deny: Mutex::new(String::new()),
             gen: AtomicU64::new(1),
             approval_tx: Mutex::new(None),
             password_tx: Mutex::new(None),

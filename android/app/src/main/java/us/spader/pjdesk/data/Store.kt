@@ -300,6 +300,40 @@ class Store(context: Context) {
         writeSaved(saved().filterNot { it.id == id })
     }
 
+    /** Computers this phone has connected to, newest first. Stays on this phone. */
+    fun touchRecent(id: String) {
+        val digits = id.filter { it.isDigit() }
+        if (digits.length != 9) return
+        val obj = readRecent()
+        obj.put(digits, System.currentTimeMillis())
+        val ranked = buildList {
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                if (key.length == 9) add(key to obj.optLong(key))
+            }
+        }.sortedByDescending { it.second }.take(40)
+        val kept = JSONObject()
+        ranked.forEach { (key, whenMs) -> kept.put(key, whenMs) }
+        prefs.edit().putString("recent", kept.toString()).apply()
+    }
+
+    fun recentIds(): List<String> {
+        val obj = readRecent()
+        return buildList {
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                if (key.length == 9) add(key to obj.optLong(key))
+            }
+        }.sortedByDescending { it.second }.map { it.first }
+    }
+
+    private fun readRecent(): JSONObject {
+        val raw = prefs.getString("recent", "{}") ?: "{}"
+        return runCatching { JSONObject(raw) }.getOrDefault(JSONObject())
+    }
+
     /** Older builds kept this secret in the plain preference file. Move it once, then delete the plain copy. */
     private fun movePlainPermanentIntoKeystore() {
         if (!prefs.contains(PLAIN_PERMANENT)) return

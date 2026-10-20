@@ -354,8 +354,16 @@ fn on_host(
         }
         HostMsg::Notice(text) => {
             tracing::info!("Host says: {text}");
-            crate::note_status(&format!("Host: {text}"));
-            g.note(text);
+            if screen_share_failure_text(&text) {
+                crate::note_failure(&text);
+                g.closed = Some(text);
+            } else if screen_share_waiting(&text) {
+                crate::note_status(&text);
+                g.note(text);
+            } else {
+                crate::note_status(&format!("Host: {text}"));
+                g.note(text);
+            }
         }
         HostMsg::Denied { what, reason } => g.note(format!("{what}: {reason}")),
         HostMsg::Chat { text } => g.chat.push((false, text)),
@@ -729,6 +737,43 @@ async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &
     Ok(())
 }
 
+/// The phone asked the person to allow screen sharing. Keep waiting.
+pub(crate) fn screen_share_waiting(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("allow screen sharing")
+}
+
+/// A specific reason from the phone, shown instead of the generic picture timeout.
+pub(crate) fn screen_share_failure_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("screen sharing not allowed")
+        || text.contains("mediaprojection")
+        || text.contains("foreground service is not running")
+}
+
+/// How long to wait for the first frame. A phone that is asking for screen
+/// sharing gets a minute. Anything else stays at 15 seconds.
+pub(crate) fn picture_limit_secs(notices: &[String]) -> u64 {
+    if notices.iter().any(|note| screen_share_waiting(note)) {
+        60
+    } else {
+        15
+    }
+}
+
+/// The line the main window shows when no frame arrived.
+pub(crate) fn picture_gave_up(host: &str, notices: &[String]) -> String {
+    if let Some(reason) = notices.iter().rev().find(|note| screen_share_failure_text(note)) {
+        return reason.clone();
+    }
+    if notices.iter().any(|note| screen_share_waiting(note)) {
+        return "Timed out. No one at that phone allowed screen sharing.".into();
+    }
+    format!(
+        "No picture arrived from {host}. The password was accepted, but that computer did not start sending its screen. {}",
+        crate::host_log_hint()
+    )
+}
+
 async fn dispatch_uni(
     connection: Connection,
     frames: std::sync::mpsc::Sender<(VideoHeader, Vec<u8>)>,
@@ -940,6 +985,20 @@ mod tests {
     use super::*;
     use std::net::UdpSocket;
     use std::time::Duration;
+
+    #[test]
+    fn a_phone_that_is_asking_for_the_screen_waits_a_minute_and_names_the_reason() {
+        assert_eq!(picture_limit_secs(&[]), 15);
+        let waiting = "Waiting for the phone to allow screen sharing".to_string();
+        assert_eq!(picture_limit_secs(&[waiting.clone()]), 60);
+        assert_eq!(
+            picture_gave_up("Pixel", &[waiting]),
+            "Timed out. No one at that phone allowed screen sharing."
+        );
+        let denied = "screen sharing not allowed on the phone: Screen capture permission denied".to_string();
+        assert_eq!(picture_gave_up("Pixel", &[denied.clone()]), denied);
+        assert!(picture_gave_up("Pixel", &[]).contains("No picture arrived from Pixel"));
+    }
 
     /// The window thread calls `start` after `block_on` has returned, so there
     /// is no current reactor. 0.6.6 panicked here.

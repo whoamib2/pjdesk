@@ -90,7 +90,7 @@ class HostService : Service() {
         val previous = projection
         encoder = null
         projection = null
-        capturing = false
+        syncCapture(false)
         previousEncoder?.stop()
         runCatching { previous?.stop() }
         if (!promoteToProjection()) {
@@ -143,7 +143,7 @@ class HostService : Service() {
             onReady = {
                 main.post {
                     if (generation != mine) return@post
-                    capturing = true
+                    syncCapture(true)
                     AppLog.i("screen capture started ${w}x$h")
                     report(true, "")
                 }
@@ -191,12 +191,19 @@ class HostService : Service() {
     private fun report(ok: Boolean, reason: String) {
         if (reported) return
         reported = true
+        val engine = (application as PjApp).engine
+        if (ok) engine.setCapturing(true) else engine.captureDenied(reason.ifBlank { "Screen capture permission denied" })
         val callback = onCapture
         if (callback == null) {
             AppLog.i("capture result with no listener: ok=$ok $reason")
             return
         }
         callback(ok, reason)
+    }
+
+    private fun syncCapture(on: Boolean) {
+        capturing = on
+        runCatching { (application as PjApp).engine.setCapturing(on) }
     }
 
     private fun captureMessage(error: Exception): String {
@@ -268,7 +275,7 @@ class HostService : Service() {
         val token = projection
         encoder = null
         projection = null
-        capturing = false
+        syncCapture(false)
         runCatching { enc?.stop() }
         runCatching { token?.stop() }
     }
@@ -296,6 +303,10 @@ class HostService : Service() {
         private const val CHANNEL_LIVE = "pjdesk-live"
         @Volatile
         var capturing: Boolean = false
+
+        /** A system screen-share dialog is already on screen. Don't stack another one. */
+        @Volatile
+        var consentInProgress: Boolean = false
 
         /** Called on the main thread after a capture attempt. One result per consent. */
         @Volatile

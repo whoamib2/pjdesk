@@ -33,6 +33,11 @@ VER="${VER:-0.6.0}"
 mkdir -p "$ROOT/dist"
 cp -f app/build/outputs/apk/debug/app-debug.apk "$ROOT/dist/PJDesk-Android-${VER}-debug.apk"
 REL="$(find app/build/outputs/apk/release -name '*.apk' | head -1)"
-cp -f "$REL" "$ROOT/dist/PJDesk-Android-${VER}.apk"
+if "$ANDROID_HOME/build-tools/"*/apksigner verify "$REL" >/dev/null 2>&1; then
+  cp -f "$REL" "$ROOT/dist/PJDesk-Android-${VER}.apk"
+  echo "release $ROOT/dist/PJDesk-Android-${VER}.apk (signed)"
+else
+  cp -f "$REL" "$ROOT/dist/PJDesk-Android-${VER}-unsigned.apk"
+  echo "release $ROOT/dist/PJDesk-Android-${VER}-unsigned.apk (unsigned)"
+fi
 echo "debug  $ROOT/dist/PJDesk-Android-${VER}-debug.apk"
-echo "release $ROOT/dist/PJDesk-Android-${VER}.apk"

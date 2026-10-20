@@ -34,8 +34,9 @@ Requirements: Rust (stable), `cargo-ndk`, the Android SDK (platform 35, build-to
 
 The script writes:
 
-* `dist/PJDesk-Android-0.6.0-debug.apk`
-* `dist/PJDesk-Android-0.6.0.apk` (unsigned, unless the keystore variables below are set)
+* `dist/PJDesk-Android-<ver>-debug.apk`
+* `dist/PJDesk-Android-<ver>.apk` when the four keystore variables below are set
+* `dist/PJDesk-Android-<ver>-unsigned.apk` otherwise
 
 `ANDROID_HOME` defaults to `$HOME/android-sdk`. `ANDROID_NDK_HOME` defaults to `$ANDROID_HOME/ndk/27.2.12479018`.
 
@@ -45,6 +46,16 @@ To sign the release APK, set these in the environment. Do not commit the keystor
 * `PJDESK_KEYSTORE_PASSWORD`
 * `PJDESK_KEY_ALIAS`
 * `PJDESK_KEY_PASSWORD`
+
+All four have to be set. A partial set leaves the APK unsigned.
+
+On Windows, sign an unsigned APK without saving the passwords:
+
+```bat
+android\sign-release.cmd dist\PJDesk-Android-0.6.9-unsigned.apk
+```
+
+The script uses `apksigner` from `ANDROID_HOME`. If `PJDESK_KEYSTORE` is unset and `C:\Users\BenSpader\AndroidStudioProjects\upload.jks` exists, that path is suggested. It is not confirmed to be the key that signed the installed app. Use the existing release key. A new key will not update the phone.
 
 The later release asset name is `PJDesk-Android-<ver>.apk`.
 

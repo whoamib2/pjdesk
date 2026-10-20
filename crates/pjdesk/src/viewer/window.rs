@@ -158,22 +158,41 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
     let host_for_watch = app.host_name.clone();
     let proxy_watch = proxy.clone();
     runtime.spawn(async move {
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        if saw_watch.load(Ordering::Relaxed) {
+        let started = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if saw_watch.load(Ordering::Relaxed) {
+                return;
+            }
+            let guard = live_watch.lock().unwrap();
+            if guard.restart {
+                return;
+            }
+            if let Some(text) = guard.closed.clone() {
+                drop(guard);
+                let _ = proxy_watch.send_event(UserEvent::Closed(text));
+                return;
+            }
+            let notices = guard.notices.clone();
+            drop(guard);
+            let limit = super::controls::picture_limit_secs(&notices);
+            if started.elapsed() < Duration::from_secs(limit) {
+                continue;
+            }
+            if saw_watch.load(Ordering::Relaxed) {
+                return;
+            }
+            let text = super::controls::picture_gave_up(&host_for_watch, &notices);
+            let mut guard = live_watch.lock().unwrap();
+            if guard.closed.is_some() || guard.restart || saw_watch.load(Ordering::Relaxed) {
+                return;
+            }
+            crate::note_failure(&text);
+            guard.closed = Some(text.clone());
+            drop(guard);
+            let _ = proxy_watch.send_event(UserEvent::Closed(text));
             return;
         }
-        let mut guard = live_watch.lock().unwrap();
-        if guard.closed.is_some() || guard.restart {
-            return;
-        }
-        let text = format!(
-            "No picture arrived from {host_for_watch}. The password was accepted, but that computer did not start sending its screen. {}",
-            crate::host_log_hint()
-        );
-        crate::note_failure(&text);
-        guard.closed = Some(text.clone());
-        drop(guard);
-        let _ = proxy_watch.send_event(UserEvent::Closed(text));
     });
     if std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files") {
         app.panel.open = true;
@@ -515,6 +534,8 @@ impl App {
         } else if self.current.is_none() {
             let waiting = if let Some(reason) = &snap.closed {
                 reason.clone()
+            } else if let Some(note) = snap.notices.iter().rev().find(|note| super::controls::screen_share_waiting(note)) {
+                note.clone()
             } else {
                 format!("Waiting for the picture from {}", self.host_name)
             };

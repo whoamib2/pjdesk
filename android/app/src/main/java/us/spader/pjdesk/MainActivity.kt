@@ -75,6 +75,7 @@ class MainActivity : ComponentActivity() {
     private val projection = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val data = result.data
         val acceptAfter = pendingAccept
+        HostService.consentInProgress = false
         if (result.resultCode == RESULT_OK && data != null) {
             if (acceptAfter) {
                 AppLog.i("screen-share consent granted for an incoming connection")
@@ -137,6 +138,7 @@ class MainActivity : ComponentActivity() {
             var connectPassword by remember { mutableStateOf("") }
             var query by remember { mutableStateOf("") }
             var saved by remember { mutableStateOf(app.store.saved()) }
+            var recentIds by remember { mutableStateOf(app.store.recentIds()) }
             var trustedAccounts by remember { mutableStateOf(app.store.trustedAccounts()) }
             var trustedComputers by remember { mutableStateOf(app.store.trustedComputers()) }
             var showOnboarding by remember { mutableStateOf(!app.store.onboarded) }
@@ -414,7 +416,9 @@ class MainActivity : ComponentActivity() {
                 val session = state.session ?: return@LaunchedEffect
                 if (session.id.isBlank()) return@LaunchedEffect
                 app.store.noteRemote(session.id, session.peer, session.platform, session.version)
+                app.store.touchRecent(session.id)
                 saved = app.store.saved()
+                recentIds = app.store.recentIds()
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                 val device = app.store.networkDeviceId
                 if (!temporarySession && refresh.isNotBlank() && device.isNotBlank()) {
@@ -622,6 +626,10 @@ class MainActivity : ComponentActivity() {
                                     onConnect = {
                                         val id = connectId.filter { it.isDigit() }
                                         val password = app.store.computerPassword(id)
+                                        if (id.length == 9) {
+                                            app.store.touchRecent(id)
+                                            recentIds = app.store.recentIds()
+                                        }
                                         engine.connect(connectId, password)
                                     },
                                     onCopyId = { copy(state.idFormatted) },
@@ -669,11 +677,22 @@ class MainActivity : ComponentActivity() {
                                 1 -> SavedScreen(
                                     signedIn = account.isNotEmpty(),
                                     computers = saved,
+                                    recentIds = recentIds,
                                     query = query,
                                     onQuery = { query = it },
+                                    onConnect = { computer ->
+                                        connectId = computer.id
+                                        val password = app.store.computerPassword(computer.id)
+                                        app.store.touchRecent(computer.id)
+                                        recentIds = app.store.recentIds()
+                                        engine.connect(computer.id, password)
+                                    },
                                     onOpen = {
                                         connectId = it.id
-                                        tab = 0
+                                        val password = app.store.computerPassword(it.id)
+                                        app.store.touchRecent(it.id)
+                                        recentIds = app.store.recentIds()
+                                        engine.connect(it.id, password)
                                     },
                                     onForget = {
                                         app.store.forget(it.id)
@@ -897,6 +916,7 @@ class MainActivity : ComponentActivity() {
         // Android 14 and later consume each consent on one virtual display.
         // Always ask again for a real session, including when setup already did.
         pendingAccept = acceptAfter
+        HostService.consentInProgress = true
         if (acceptAfter) app.engine.showStatus("Waiting for screen sharing")
         AppLog.i(if (acceptAfter) "asking to share the screen for an incoming connection" else "asking to share the screen during setup")
         val manager = getSystemService(MediaProjectionManager::class.java)

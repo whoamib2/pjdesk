@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -35,20 +36,36 @@ fun SavedScreen(
     onForget: (SavedComputer) -> Unit,
     onRemovePassword: (SavedComputer) -> Unit = {},
     onRename: (SavedComputer, String) -> Unit = { _, _ -> },
+    onConnect: (SavedComputer) -> Unit = {},
+    recentIds: List<String> = emptyList(),
     selfId: String = "",
     signedIn: Boolean = false,
 ) {
+    var recentTab by remember { mutableStateOf(false) }
+    val source = if (recentTab) {
+        recentIds.map { id -> computers.find { it.id == id } ?: SavedComputer(id = id) }
+    } else {
+        computers
+    }
     val q = query.trim()
-    val shown = computers.filter { matches(it, q) }
+    val shown = source.filter { matches(it, q) }
     var editing by remember { mutableStateOf<String?>(null) }
     var draft by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Saved computers", style = MaterialTheme.typography.titleLarge)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = { recentTab = false }) {
+                Text("Saved", color = if (recentTab) pjMuted() else MaterialTheme.colorScheme.primary)
+            }
+            TextButton(onClick = { recentTab = true }) {
+                Text("Recent", color = if (recentTab) MaterialTheme.colorScheme.primary else pjMuted())
+            }
+        }
         Text(
-            if (signedIn) {
-                "This list syncs with your account. Passwords stay on this phone."
-            } else {
-                "Sign in at pjdesk.com to sync across your computers."
+            when {
+                recentTab -> "Computers you have connected to on this phone."
+                signedIn -> "This list syncs with your account. Passwords stay on this phone."
+                else -> "Sign in at pjdesk.com to sync across your computers. This list stays on this phone."
             },
             color = pjMuted(),
             style = MaterialTheme.typography.bodySmall,
@@ -126,6 +143,9 @@ fun SavedScreen(
                             }
                         }
                         Column {
+                            if (!mine) {
+                                Button(onClick = { onConnect(computer) }) { Text("Connect") }
+                            }
                             TextButton(onClick = {
                                 editing = computer.id
                                 draft = nick
