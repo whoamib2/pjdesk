@@ -13,8 +13,8 @@ android {
         applicationId = "us.spader.pjdesk"
         minSdk = 26
         targetSdk = 35
-        versionCode = 61100
-        versionName = "0.6.11"
+        versionCode = 61200
+        versionName = "0.6.12"
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
         }
@@ -75,6 +75,8 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-core")
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.fragment:fragment-ktx:1.8.5")
     implementation("androidx.biometric:biometric:1.1.0")
@@ -94,4 +96,40 @@ dependencies {
     testImplementation("androidx.compose.ui:ui-test-junit4")
     testImplementation("androidx.compose.ui:ui-test-manifest")
     testImplementation("androidx.test:core:1.6.1")
+}
+
+// assembleRelease does not compile libpjdesk_mobile.so. cargo-ndk writes it
+// into jniLibs first. A release task fails when that library is missing.
+val nativeAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+
+tasks.register("requireNativeRelease") {
+    group = "build"
+    description = "Fail the release build when libpjdesk_mobile.so was not built with cargo-ndk."
+    doLast {
+        val missing = nativeAbis.filter { abi ->
+            !file("src/main/jniLibs/$abi/libpjdesk_mobile.so").isFile
+        }
+        if (missing.isNotEmpty()) {
+            val lines = missing.joinToString("\n") { abi -> "  src/main/jniLibs/$abi/libpjdesk_mobile.so" }
+            throw GradleException(
+                "Engine library missing from this build.\n" +
+                    "assembleRelease does not compile libpjdesk_mobile.so. cargo-ndk has to run first.\n" +
+                    "Missing:\n" +
+                    lines + "\n" +
+                    "Windows steps: android/BUILD-WINDOWS.md",
+            )
+        }
+    }
+}
+
+afterEvaluate {
+    listOf(
+        "compileReleaseKotlin",
+        "mergeReleaseNativeLibs",
+        "packageRelease",
+        "assembleRelease",
+        "bundleRelease",
+    ).forEach { name ->
+        tasks.findByName(name)?.dependsOn("requireNativeRelease")
+    }
 }

@@ -106,8 +106,25 @@ impl SignalClient {
     /// reader/writer tasks. A computer on the server's LAN tries the published
     /// private address first and keeps the public address as a fallback.
     pub async fn connect(server: &ServerAddr, config: &mut Config) -> Result<Self> {
-        let public_addr = server.resolve().await?;
-        let lan = lan_targets(&config.network_lan, server.port, public_addr);
+        let (resolved, heard) = tokio::join!(
+            server.resolve(),
+            tokio::task::spawn_blocking(|| pjdesk_proto::discover::listen_servers(Duration::from_millis(250))),
+        );
+        let public_addr = resolved?;
+        let mut entries = config.network_lan.clone();
+        let key = net_key(public_addr);
+        if let Some(cached) = config.lan_path_cache.get(&key) {
+            entries.push(cached.clone());
+        }
+        let pinned_now = config.pinned_fingerprint();
+        if let Ok(found) = heard {
+            for (addr, fp) in found {
+                if pinned_now.is_none_or(|expected| expected == fp) {
+                    entries.push(addr.to_string());
+                }
+            }
+        }
+        let lan = lan_targets(&entries, server.port, public_addr);
         let pinned = config.pinned_fingerprint();
         let expected = config.server_fingerprint.clone();
         let ready = if lan.is_empty() {
@@ -127,6 +144,14 @@ impl SignalClient {
             }
         }
         info!("Connected to {server} via {} ({})", ready.via, ready.addr);
+        if ready.via == "LAN" {
+            let key = net_key(public_addr);
+            let value = ready.addr.to_string();
+            if config.lan_path_cache.get(&key).map(String::as_str) != Some(value.as_str()) {
+                config.lan_path_cache.insert(key, value);
+                let _ = config.save();
+            }
+        }
 
         let addr = ready.addr;
         let via = ready.via;
@@ -198,6 +223,18 @@ fn lan_targets(entries: &[String], fallback_port: u16, public_addr: SocketAddr) 
         }
     }
     out
+}
+
+/// Local IPv4 used to reach `toward`. A different network gets a different key.
+fn net_key(toward: SocketAddr) -> String {
+    let ip = std::net::UdpSocket::bind("0.0.0.0:0").ok().and_then(|socket| {
+        socket.connect(toward).ok()?;
+        match socket.local_addr().ok()?.ip() {
+            IpAddr::V4(ip) if !ip.is_unspecified() && !ip.is_loopback() => Some(ip.to_string()),
+            _ => None,
+        }
+    });
+    format!("ip:{}", ip.unwrap_or_else(|| "unknown".into()))
 }
 
 fn same_public_ip(mine: Option<&str>, published: &str) -> bool {

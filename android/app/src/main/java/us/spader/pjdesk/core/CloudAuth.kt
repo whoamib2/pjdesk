@@ -151,6 +151,17 @@ object CloudAuth {
         return login.getString("token")
     }
 
+    /** This device's address as pjdesk.com sees it. Blank when the call does not answer. */
+    fun publicIp(): String = runCatching {
+        val conn = (URL("$API/api/ip").openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 3_000
+            readTimeout = 3_000
+        }
+        val text = conn.inputStream.bufferedReader().use { it.readText() }
+        JSONObject(text).optString("ip").trim()
+    }.getOrDefault("")
+
     fun enroll(code: String, deviceId: String, deviceName: String): Session {
         val reply = post(
             "$API/api/network/enroll",
@@ -283,6 +294,8 @@ object CloudAuth {
             fingerprint = network.optString("active_fingerprint"),
             standbyAddress = network.optString("standby_address"),
             standbyFingerprint = network.optString("standby_fingerprint"),
+            lan = network.optString("active_lan").split(',').map { it.trim() }.filter { it.isNotEmpty() },
+            publicIp = network.optString("active_public_ip"),
             computers = mergePresence(computers, presence),
         )
     }
@@ -353,5 +366,7 @@ data class Session(
     val fingerprint: String,
     val standbyAddress: String,
     val standbyFingerprint: String,
+    val lan: List<String> = emptyList(),
+    val publicIp: String = "",
     val computers: List<SavedComputer>,
 )

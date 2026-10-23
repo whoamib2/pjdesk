@@ -75,7 +75,6 @@ class ScreenshotTest {
             ),
             query = "",
             onQuery = {},
-            onOpen = {},
             onForget = {},
         )
     }

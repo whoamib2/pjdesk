@@ -75,6 +75,9 @@ pub struct Config {
     /// The active server's observed public IP, without a port. Empty until it publishes one.
     #[serde(default)]
     pub network_public_ip: String,
+    /// LAN address that completed a handshake on this network, keyed by the local IPv4 (`ip:10.0.0.8`).
+    #[serde(default)]
+    pub lan_path_cache: BTreeMap<String, String>,
     /// The encrypted network key last applied on this computer. The passphrase
     /// is not stored. Export copies this string; nothing logs it.
     #[serde(default)]
@@ -499,6 +502,7 @@ impl Config {
             writing.network_standby_fingerprint = disk.network_standby_fingerprint;
             writing.network_lan = disk.network_lan;
             writing.network_public_ip = disk.network_public_ip;
+            writing.lan_path_cache = disk.lan_path_cache;
             writing.network_key = disk.network_key;
             writing.server = disk.server;
             writing.server_fingerprint = disk.server_fingerprint;

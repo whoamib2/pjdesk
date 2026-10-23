@@ -19,8 +19,8 @@ use pjdesk_proto::auth::generate_password;
 use pjdesk_proto::framing::{read_msg, write_msg, MAX_CONTROL_FRAME};
 use pjdesk_proto::gesture::{Gesture, PointerAdapter, GESTURE_LONG_PRESS, GESTURE_PINCH, GESTURE_SWIPE, GESTURE_TAP};
 use pjdesk_proto::peer::{
-    read_video_frame, write_video_frame, ControlMsg, DisplayLayout, HostMsg, InputEvent, KeyboardMode, MonitorInfo,
-    SpecialCommand, VideoHeader, VIEW_SINGLE,
+    read_video_frame, write_video_frame, ClipKind, Clipboard, ControlMsg, DisplayLayout, HostMsg, InputEvent, KeyboardMode,
+    MonitorInfo, SpecialCommand, VideoHeader, MAX_CLIP_TEXT, VIEW_SINGLE,
 };
 use pjdesk_proto::perms::{self, grant};
 use pjdesk_proto::quality::{self, StreamQuality};
@@ -35,7 +35,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.11";
+pub const APP_VERSION: &str = "0.6.12";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -84,6 +84,12 @@ struct State {
     identity: TlsIdentity,
     device_id: Mutex<Option<String>>,
     server: Mutex<String>,
+    /// Private addresses of the active server, from the account (`ip` or `ip:port`).
+    lan: Mutex<Vec<String>>,
+    /// Public IP the account published for the active server.
+    public_ip: Mutex<String>,
+    /// This phone's public IP from pjdesk.com, used to decide the LAN path.
+    my_public_ip: Mutex<String>,
     fingerprint: Mutex<Option<String>>,
     otp: Mutex<String>,
     permanent: Mutex<Option<String>>,
@@ -117,6 +123,12 @@ struct State {
 struct Disk {
     #[serde(default)]
     server: String,
+    #[serde(default)]
+    lan: String,
+    #[serde(default)]
+    public_ip: String,
+    #[serde(default)]
+    my_public_ip: String,
     #[serde(default)]
     fingerprint: String,
     #[serde(default)]
@@ -160,6 +172,9 @@ impl Engine {
             identity,
             device_id: Mutex::new((!stored.device_id.is_empty()).then_some(stored.device_id)),
             server: Mutex::new(server),
+            lan: Mutex::new(split_lan(&stored.lan)),
+            public_ip: Mutex::new(stored.public_ip),
+            my_public_ip: Mutex::new(stored.my_public_ip),
             fingerprint: Mutex::new((!stored.fingerprint.is_empty()).then_some(stored.fingerprint)),
             otp: Mutex::new(generate_password()),
             permanent: Mutex::new(None),
@@ -241,6 +256,9 @@ fn save_disk(dir: &Path, disk: &Disk) {
 fn persist(state: &State) {
     let disk = Disk {
         server: state.server.lock().unwrap().clone(),
+        lan: state.lan.lock().unwrap().join(","),
+        public_ip: state.public_ip.lock().unwrap().clone(),
+        my_public_ip: state.my_public_ip.lock().unwrap().clone(),
         fingerprint: state.fingerprint.lock().unwrap().clone().unwrap_or_default(),
         device_id: state.device_id.lock().unwrap().clone().unwrap_or_default(),
         secret_hex: String::new(),
@@ -381,6 +399,15 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                     }
                 }
                 *state.server.lock().unwrap() = address.clone();
+                if let Some(list) = cmd.get("lan").and_then(|v| v.as_array()) {
+                    *state.lan.lock().unwrap() = list.iter().filter_map(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                }
+                if let Some(ip) = cmd.get("publicIp").and_then(|v| v.as_str()) {
+                    *state.public_ip.lock().unwrap() = ip.trim().to_string();
+                }
+                if let Some(ip) = cmd.get("myPublicIp").and_then(|v| v.as_str()) {
+                    *state.my_public_ip.lock().unwrap() = ip.trim().to_string();
+                }
                 persist(state);
                 publish(state, cb);
                 log_line(
@@ -562,6 +589,17 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             }
         }
         "keyframe" => send_control(state, ControlMsg::RequestKeyframe),
+        "paste" => {
+            let text = cmd.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let bytes = clip_text(text);
+            if !bytes.is_empty() {
+                let len = bytes.len() as u32;
+                send_control(
+                    state,
+                    ControlMsg::Clipboard(Clipboard { kind: ClipKind::Text, bytes, byte_len: len }),
+                );
+            }
+        }
         "shutdown" => state.app_stop.store(true, Ordering::SeqCst),
         _ => {}
     }
@@ -605,14 +643,31 @@ fn gesture_from(cmd: &Value) -> Option<InputEvent> {
     Some(InputEvent::Gesture { kind, duration_ms, x, y })
 }
 
+fn mouse_button(name: &str) -> pjdesk_proto::peer::MouseButton {
+    match name {
+        "right" => pjdesk_proto::peer::MouseButton::Right,
+        "middle" => pjdesk_proto::peer::MouseButton::Middle,
+        _ => pjdesk_proto::peer::MouseButton::Left,
+    }
+}
+
+fn clip_text(text: &str) -> Vec<u8> {
+    let mut end = text.len().min(MAX_CLIP_TEXT);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.as_bytes()[..end].to_vec()
+}
+
 fn mouse_from(cmd: &Value) -> Option<InputEvent> {
     let kind = cmd.get("kind").and_then(|v| v.as_str())?;
     let x = cmd.get("x").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
     let y = cmd.get("y").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let button = mouse_button(cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left"));
     Some(match kind {
         "move" => InputEvent::MouseMove { x, y },
-        "down" => InputEvent::MouseButton { button: pjdesk_proto::peer::MouseButton::Left, down: true },
-        "up" => InputEvent::MouseButton { button: pjdesk_proto::peer::MouseButton::Left, down: false },
+        "down" => InputEvent::MouseButton { button, down: true },
+        "up" => InputEvent::MouseButton { button, down: false },
         "wheel" => {
             let dy = cmd.get("dy").and_then(|v| v.as_i64()).unwrap_or(0).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
             InputEvent::Wheel { dx: 0, dy }
@@ -621,14 +676,69 @@ fn mouse_from(cmd: &Value) -> Option<InputEvent> {
     })
 }
 
+fn split_lan(text: &str) -> Vec<String> {
+    text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+}
+
+/// TCP 21200 to the account's LAN address and the public address, the same race Windows uses.
+async fn open_signal(
+    state: &State,
+    cb: &Arc<dyn Callbacks>,
+    server: &ServerAddr,
+    pinned: Option<pjdesk_proto::tls::Fingerprint>,
+) -> Result<SignalClient> {
+    let lan = state.lan.lock().unwrap().clone();
+    let published = state.public_ip.lock().unwrap().clone();
+    let mine = state.my_public_ip.lock().unwrap().clone();
+    let public = server.to_string();
+    if !lan.is_empty() {
+        log_line(cb, format!("trying the server on LAN ({}) and {public}", lan.join(", ")));
+    }
+    match SignalClient::connect_reaching(server, pinned, &lan, &published, &mine).await {
+        Ok(signal) => {
+            log_line(cb, format!("signaling via {} {} (TCP 21200)", signal.via, signal.server_addr));
+            emit(
+                cb,
+                &json!({
+                    "event": "signal",
+                    "via": signal.via,
+                    "reached": signal.server_addr.to_string(),
+                    "error": "",
+                    "lan": lan.join(", "),
+                    "public": public,
+                }),
+            );
+            Ok(signal)
+        }
+        Err(e) => {
+            let text = format!("{e:#}");
+            log_line(cb, format!("signaling failed: {text}"));
+            emit(
+                cb,
+                &json!({
+                    "event": "signal",
+                    "via": "",
+                    "reached": "",
+                    "error": text,
+                    "lan": lan.join(", "),
+                    "public": public,
+                }),
+            );
+            Err(e)
+        }
+    }
+}
+
 async fn host_loop(state: Arc<State>, cb: Arc<dyn Callbacks>) {
     let mut wait = Duration::from_secs(1);
     while !state.app_stop.load(Ordering::SeqCst) {
         match host_once(state.clone(), cb.clone()).await {
             Ok(()) => wait = Duration::from_secs(1),
             Err(e) => {
-                warn!("host signaling: {e:#}");
-                emit(&cb, &json!({"event":"status","text": format!("{e:#}")}));
+                let full = format!("{e:#}");
+                let head = full.lines().next().unwrap_or("could not reach the PJDesk server").trim();
+                warn!("host signaling: {full}");
+                emit(&cb, &json!({"event":"status","text": head}));
                 wait = (wait * 2).min(Duration::from_secs(20));
             }
         }
@@ -644,7 +754,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
     }
     let server = ServerAddr::parse(&server_text)?;
     let pinned = state.fingerprint.lock().unwrap().clone().and_then(|s| pjdesk_proto::tls::parse_fingerprint(&s).ok());
-    let mut signal = SignalClient::connect(&server, pinned).await?;
+    let mut signal = open_signal(&state, &cb, &server, pinned).await?;
     if let Some(fp) = signal.observed {
         let text = pjdesk_proto::tls::format_fingerprint(&fp);
         *state.fingerprint.lock().unwrap() = Some(text);
@@ -1488,7 +1598,7 @@ async fn controller_session(
     }
     let server = ServerAddr::parse(&server_text)?;
     let pinned = state.fingerprint.lock().unwrap().clone().and_then(|s| pjdesk_proto::tls::parse_fingerprint(&s).ok());
-    let mut signal = SignalClient::connect(&server, pinned).await?;
+    let mut signal = open_signal(&state, &cb, &server, pinned).await?;
     if let Some(fp) = signal.observed {
         *state.fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         persist(&state);
@@ -1775,6 +1885,15 @@ mod tests {
     }
 
     #[test]
+    fn mouse_buttons_follow_the_command() {
+        let right = mouse_from(&json!({"kind":"down","button":"right","x":1,"y":2})).unwrap();
+        assert!(matches!(right, InputEvent::MouseButton { button: pjdesk_proto::peer::MouseButton::Right, down: true }));
+        let left = mouse_from(&json!({"kind":"up","x":1,"y":2})).unwrap();
+        assert!(matches!(left, InputEvent::MouseButton { button: pjdesk_proto::peer::MouseButton::Left, down: false }));
+        assert_eq!(clip_text("héllo").len(), "héllo".len());
+    }
+
+    #[test]
     fn specials_keep_the_windows_indexes_and_append_android() {
         assert_eq!(special_index(SpecialCommand::CtrlAltDel), 0);
         assert_eq!(special_index(SpecialCommand::Back), 3);
@@ -1913,6 +2032,9 @@ mod tests {
             identity,
             device_id: Mutex::new(None),
             server: Mutex::new("office.example:21200".into()),
+            lan: Mutex::new(Vec::new()),
+            public_ip: Mutex::new(String::new()),
+            my_public_ip: Mutex::new(String::new()),
             fingerprint: Mutex::new(None),
             otp: Mutex::new(generate_password()),
             permanent: Mutex::new(None),

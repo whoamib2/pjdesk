@@ -5,6 +5,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import us.spader.pjdesk.input.GestureMap
+import us.spader.pjdesk.input.PictureView
 import us.spader.pjdesk.input.PointerSession
 import us.spader.pjdesk.input.StrokeTracker
 
@@ -105,6 +106,32 @@ class GestureMapTest {
         click.down(0, listOf(4000 to 4000))
         val pressed = click.up(40)
         assertEquals(listOf("down", "up"), pressed.map { (it as PointerSession.Out.Mouse).kind })
+    }
+
+    @Test
+    fun twoFingerTapIsALongPressAndThreeFingersAreMiddle() {
+        val phone = PointerSession(android = true)
+        phone.down(0, listOf(1000 to 1000, 1200 to 1200))
+        val right = phone.up(80).filterIsInstance<PointerSession.Out.Gesture>().single()
+        assertEquals(GestureMap.LONG_PRESS, right.gesture.kind)
+
+        val pad = PointerSession(android = false)
+        pad.down(0, listOf(1 to 1, 2 to 2, 3 to 3))
+        val middle = pad.up(40).filterIsInstance<PointerSession.Out.Mouse>()
+        assertEquals(listOf("down", "up"), middle.map { it.kind })
+        assertTrue(middle.all { it.button == "middle" })
+    }
+
+    @Test
+    fun fitScaleMapsTheCenterAndZoomKeepsItUnderTheFinger() {
+        val center = PictureView.screenToNorm(1920, 1080, 1920, 1080, PictureView.fit(), 960f, 540f)
+        assertTrue(center!!.first in 32000..33500)
+        val zoomed = PictureView.zoomAbout(1920, 1080, 1920, 1080, PictureView.fit(), 960f, 540f, 2f)
+        assertTrue(zoomed.scale > 1.5f)
+        val again = PictureView.screenToNorm(1920, 1080, 1920, 1080, zoomed, 960f, 540f)
+        assertTrue(again!!.first in 32000..33500)
+        assertEquals(1f, PictureView.fit().scale, 0.01f)
+        assertTrue(PictureView.oneToOne(1920, 480) > 3f)
     }
 
     @Test

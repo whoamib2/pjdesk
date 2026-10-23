@@ -64,6 +64,9 @@ fun SettingsScreen(
     onChangePin: () -> Unit = {},
     onToggleBiometrics: (Boolean) -> Unit = {},
     onAutoLock: (Int) -> Unit = {},
+    engineDetail: String = "",
+    accountEmail: String = "",
+    onSignOut: (() -> Unit)? = null,
 ) {
     var server by rememberSaveable(state.server) { mutableStateOf(state.server) }
     var name by rememberSaveable(computerName) { mutableStateOf(computerName) }
@@ -74,7 +77,22 @@ fun SettingsScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("Settings", style = MaterialTheme.typography.titleLarge)
+        Section("Diagnostics") {
+            DiagnosticLine("Engine", engineDetail.ifBlank { "Starting PJDesk…" })
+            DiagnosticLine("Server", state.server.ifBlank { "Not set" })
+            DiagnosticLine("LAN", state.serverLan.ifBlank { "None published" })
+            val path = when {
+                state.signalError.isNotBlank() -> state.signalError
+                state.signalVia.isBlank() -> "Not connected yet"
+                else -> "${state.signalVia} ${state.signalReached}".trim()
+            }
+            DiagnosticLine("Path", path)
+            DiagnosticLine(
+                "Relay",
+                if (state.signalReached.isNotBlank()) state.signalReached else state.server.ifBlank { "Not set" },
+            )
+            DiagnosticLine("Account", accountEmail.ifBlank { "Not signed in" })
+        }
         Section("This phone") {
             OutlinedTextField(
                 value = name,
@@ -180,6 +198,9 @@ fun SettingsScreen(
             }
         }
         Section("Sign-in") {
+            if (onSignOut != null) {
+                Button(onClick = onSignOut, modifier = Modifier.fillMaxWidth()) { Text("Sign out") }
+            }
             Text("Temporary sign-in", style = MaterialTheme.typography.titleMedium)
             Text(
                 "Minutes with no PJDesk activity before a temporary sign-in ends. The sign-in checkbox starts unchecked, so this phone stays signed in.",
@@ -197,7 +218,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.11", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.12", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }
@@ -207,6 +228,14 @@ fun SettingsScreen(
             )
             TextButton(onClick = onShareLogs) { Text("Share logs") }
         }
+    }
+}
+
+@Composable
+private fun DiagnosticLine(label: String, value: String) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(label, color = pjMuted(), style = MaterialTheme.typography.labelMedium)
+        Text(value, style = MaterialTheme.typography.bodyLarge)
     }
 }
 

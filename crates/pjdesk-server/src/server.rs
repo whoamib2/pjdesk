@@ -236,6 +236,12 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     // Swappable, so a standby server can take on the key it syncs from the cloud.
     let acceptor = Arc::new(RwLock::new(TlsAcceptor::from(Arc::new(tls::server_config(&identity, ALPN_SIGNAL)?))));
 
+    let beacon_port = opts.port;
+    let beacon_fp = identity.fingerprint();
+    let _ = std::thread::Builder::new().name("lan-beacon".into()).spawn(move || {
+        crate::public_addr::announce_lan(beacon_port, beacon_fp);
+    });
+
     let relay = tokio::spawn(crate::relay::run(Arc::new(udp), state.clone()));
     let janitor = tokio::spawn(janitor(state.clone()));
     let fleet = tokio::spawn(fleet_sync(state.clone()));

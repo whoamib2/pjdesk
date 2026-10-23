@@ -250,6 +250,37 @@ class Store(context: Context) {
         get() = prefs.getString("accountFingerprint", "") ?: ""
         set(value) { prefs.edit().putString("accountFingerprint", value).apply() }
 
+    /** Comma-separated private addresses of the active server, from the account. */
+    var accountLan: String
+        get() = prefs.getString("accountLan", "") ?: ""
+        set(value) { prefs.edit().putString("accountLan", value).apply() }
+
+    var accountPublicIp: String
+        get() = prefs.getString("accountPublicIp", "") ?: ""
+        set(value) { prefs.edit().putString("accountPublicIp", value).apply() }
+
+    var myPublicIp: String
+        get() = prefs.getString("myPublicIp", "") ?: ""
+        set(value) { prefs.edit().putString("myPublicIp", value).apply() }
+
+    /** LAN address that finished the handshake on this network, keyed by gateway or Wi-Fi name. */
+    fun lanPath(networkKey: String): String {
+        if (networkKey.isBlank()) return ""
+        return lanPaths().optString(networkKey)
+    }
+
+    fun rememberLanPath(networkKey: String, address: String) {
+        if (networkKey.isBlank() || address.isBlank()) return
+        val map = lanPaths()
+        map.put(networkKey, address)
+        prefs.edit().putString("lanPaths", map.toString()).apply()
+    }
+
+    private fun lanPaths(): org.json.JSONObject {
+        val raw = prefs.getString("lanPaths", "") ?: ""
+        return runCatching { org.json.JSONObject(raw) }.getOrDefault(org.json.JSONObject())
+    }
+
     var pinWrap: String
         get() = prefs.getString("pinWrap", "") ?: ""
         set(value) { prefs.edit().putString("pinWrap", value).commit() }

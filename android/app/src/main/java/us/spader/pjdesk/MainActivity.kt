@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+
 package us.spader.pjdesk
 
 import android.Manifest
@@ -6,6 +8,8 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -22,9 +26,16 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.ui.Alignment
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
@@ -51,6 +62,7 @@ import us.spader.pjdesk.core.AppLockPolicy
 import us.spader.pjdesk.core.BioVault
 import us.spader.pjdesk.core.CloudAuth
 import us.spader.pjdesk.core.CloudAuthException
+import us.spader.pjdesk.core.EnginePhase
 import us.spader.pjdesk.core.NetKey
 import us.spader.pjdesk.core.PasswordSync
 import us.spader.pjdesk.core.PinWrap
@@ -65,6 +77,9 @@ import us.spader.pjdesk.ui.UnlockScreen
 import java.util.UUID
 import us.spader.pjdesk.a11y.PjAccessibilityService
 import us.spader.pjdesk.core.SavedComputer
+import us.spader.pjdesk.core.SavedFilter
+import us.spader.pjdesk.core.SavedSort
+import us.spader.pjdesk.data.SavedListPrefs
 import us.spader.pjdesk.core.nickname
 import us.spader.pjdesk.core.permanentIssue
 import us.spader.pjdesk.media.ScreenDecoder
@@ -170,6 +185,10 @@ class MainActivity : FragmentActivity() {
         setContent {
             val theme = remember { mutableStateOf(app.store.theme) }
             val state by engine.state.collectAsStateWithLifecycle()
+            val readiness by engine.readiness.collectAsStateWithLifecycle()
+            val listPrefs = remember { SavedListPrefs(applicationContext) }
+            val savedSort by listPrefs.sort.collectAsStateWithLifecycle(SavedSort.Online)
+            val savedFilter by listPrefs.filter.collectAsStateWithLifecycle(SavedFilter.All)
             val snackbar = remember { SnackbarHostState() }
             var tab by remember { mutableIntStateOf(0) }
             var connectId by remember { mutableStateOf("") }
@@ -200,6 +219,7 @@ class MainActivity : FragmentActivity() {
             var savePassword by remember { mutableStateOf(false) }
             var signOutWhenDone by remember { mutableStateOf(false) }
             var changingPin by remember { mutableStateOf(false) }
+            var pinRejects by remember { mutableIntStateOf(0) }
             var lockBusy by remember { mutableStateOf(false) }
             var lockError by remember { mutableStateOf("") }
             var vaultRejected by remember { mutableStateOf(false) }
@@ -243,12 +263,17 @@ class MainActivity : FragmentActivity() {
                     if (changed) saved = app.store.saved()
                 }
             }
-            fun rememberAccountServer(address: String, fingerprint: String) {
+            fun rememberAccountServer(address: String, fingerprint: String, lan: List<String>, publicIp: String) {
                 if (address.isBlank()) return
                 app.store.accountServer = address
                 app.store.accountFingerprint = fingerprint
+                app.store.accountLan = lan.joinToString(",")
+                app.store.accountPublicIp = publicIp
                 engine.applyAccountServer(address, fingerprint, quiet = true)
-                AppLog.i("account server $address fingerprint=${if (fingerprint.isBlank()) "missing" else "set"}")
+                AppLog.i(
+                    "account server $address lan=${lan.joinToString(",").ifBlank { "none" }} " +
+                        "public=${publicIp.ifBlank { "none" }} fingerprint=${if (fingerprint.isBlank()) "missing" else "set"}",
+                )
             }
             fun holdDerivedKey(email: String, password: String, upload: Boolean) {
                 if (email.isBlank() || password.isBlank()) return
@@ -343,7 +368,7 @@ class MainActivity : FragmentActivity() {
                         }
                         accountComputers = enrolled.computers
                         enrolledFor = if (pjdeskId.length == 9) pjdeskId else ""
-                        rememberAccountServer(enrolled.address, enrolled.fingerprint)
+                        rememberAccountServer(enrolled.address, enrolled.fingerprint, enrolled.lan, enrolled.publicIp)
                         engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", enrolled.access).toString())
                         account = who
                         signingIn = false
@@ -372,6 +397,7 @@ class MainActivity : FragmentActivity() {
             var connectError by remember { mutableStateOf<String?>(null) }
             var offlineRetry by remember { mutableStateOf<SavedComputer?>(null) }
             var lastConnectMs by remember { mutableLongStateOf(0L) }
+            var connectGen by remember { mutableIntStateOf(0) }
             fun launchConnect(id: String, name: String, password: String, askPerson: Boolean = false) {
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (connecting && now - lastConnectMs < 700) {
@@ -387,9 +413,22 @@ class MainActivity : FragmentActivity() {
                 app.store.touchRecent(digits)
                 recentIds = app.store.recentIds()
                 val label = connectStatusLabel(name, digits)
+                val gen = connectGen + 1
+                connectGen = gen
                 AppLog.i("$label password=${if (askPerson) "ask-person" else if (password.isEmpty()) "none" else "present"}")
-                engine.showStatus(label)
-                engine.connect(digits, if (askPerson) "" else password, askPerson, name)
+                if (engine.readiness.value.phase != EnginePhase.Ready) engine.showStatus("Starting PJDesk…") else engine.showStatus(label)
+                scope.launch {
+                    val problem = engine.awaitReady(15_000)
+                    if (gen != connectGen) return@launch
+                    if (problem != null) {
+                        connecting = false
+                        connectError = problem
+                        AppLog.e("connect failed: $problem")
+                        return@launch
+                    }
+                    engine.showStatus(label)
+                    engine.connect(digits, if (askPerson) "" else password, askPerson, name)
+                }
             }
             fun beginConnect(rawId: String, ignoreOffline: Boolean = false) {
                 val digits = rawId.filter { it.isDigit() }
@@ -439,7 +478,7 @@ class MainActivity : FragmentActivity() {
                                 AppLog.e(connectError.orEmpty())
                                 return@launch
                             }
-                            rememberAccountServer(fetched.address, fetched.fingerprint)
+                            rememberAccountServer(fetched.address, fetched.fingerprint, fetched.lan, fetched.publicIp)
                             engine.command(JSONObject().put("cmd", "accessToken").put("token", fetched.access).toString())
                             beginConnect(rawId, ignoreOffline)
                         }
@@ -518,6 +557,22 @@ class MainActivity : FragmentActivity() {
                 }
             }
             var showPermanent by remember { mutableStateOf(false) }
+            DisposableEffect(Unit) {
+                val cm = getSystemService(ConnectivityManager::class.java)
+                val callback = object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        val address = app.store.accountServer
+                        if (address.isNotBlank()) engine.applyAccountServer(address, app.store.accountFingerprint, quiet = true)
+                    }
+
+                    override fun onLinkPropertiesChanged(network: Network, linkProperties: android.net.LinkProperties) {
+                        val address = app.store.accountServer
+                        if (address.isNotBlank()) engine.applyAccountServer(address, app.store.accountFingerprint, quiet = true)
+                    }
+                }
+                runCatching { cm.registerDefaultNetworkCallback(callback) }
+                onDispose { runCatching { cm.unregisterNetworkCallback(callback) } }
+            }
             val capture by captureReady.collectAsState()
             LaunchedEffect(account, memoryRefresh, temporarySession) {
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
@@ -528,6 +583,8 @@ class MainActivity : FragmentActivity() {
                 if (account.isBlank() || refresh.isBlank() || device.isBlank()) return@LaunchedEffect
                 val computers = if (temporarySession) null else CloudAuth.computersJson(app.store.saved())
                 val session = withContext(Dispatchers.IO) {
+                    val mine = CloudAuth.publicIp()
+                    if (mine.isNotBlank()) app.store.myPublicIp = mine
                     runCatching { CloudAuth.refresh(refresh, device, computers) }
                         .onFailure { AppLog.e("account refresh failed: ${it.message}") }
                         .getOrNull()
@@ -540,7 +597,7 @@ class MainActivity : FragmentActivity() {
                 }
                 engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
                 if (!temporarySession) {
-                    rememberAccountServer(session.address, session.fingerprint)
+                    rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp)
                     app.store.mergeCloud(session.computers)
                     saved = app.store.saved()
                     if (app.vaultKey != null) syncPasswords(true)
@@ -680,6 +737,7 @@ class MainActivity : FragmentActivity() {
                     if (key == null) {
                         val fails = app.store.pinFails + 1
                         app.store.pinFails = fails
+                        pinRejects++
                         lockError = if (fails >= AppLockPolicy.MAX_FAILS) {
                             ""
                         } else {
@@ -722,7 +780,7 @@ class MainActivity : FragmentActivity() {
                             account = who
                             netEmail = who
                             if (signed.refresh.isNotBlank()) app.store.saveNetworkRefresh(signed.refresh)
-                            rememberAccountServer(signed.address, signed.fingerprint)
+                            rememberAccountServer(signed.address, signed.fingerprint, signed.lan, signed.publicIp)
                             engine.command(JSONObject().put("cmd", "accessToken").put("token", signed.access).toString())
                             commitAutofill()
                         }
@@ -783,7 +841,7 @@ class MainActivity : FragmentActivity() {
                         account = who
                         netEmail = who
                         if (signed.refresh.isNotBlank()) app.store.saveNetworkRefresh(signed.refresh)
-                        rememberAccountServer(signed.address, signed.fingerprint)
+                        rememberAccountServer(signed.address, signed.fingerprint, signed.lan, signed.publicIp)
                         engine.command(JSONObject().put("cmd", "accessToken").put("token", signed.access).toString())
                         app.store.clearPinMaterial()
                         BioVault.forget()
@@ -844,6 +902,7 @@ class MainActivity : FragmentActivity() {
                         busy = lockBusy,
                         error = lockError,
                         biometrics = bioAvailable && app.store.biometricsOn && app.store.bioWrap.isNotBlank(),
+                        rejectCount = pinRejects,
                         onSubmit = { submitPin(it) },
                         onBiometric = { tryBio() },
                     )
@@ -877,6 +936,14 @@ class MainActivity : FragmentActivity() {
                         onQuality = engine::quality,
                         onDisplay = { index -> engine.display(index, session.layout) },
                         onEnd = { engine.stop() },
+                        onClipboard = {
+                            val text = clipboardText()
+                            if (text.isBlank()) {
+                                scope.launch { snackbar.showSnackbar("Clipboard is empty") }
+                            } else {
+                                engine.paste(text)
+                            }
+                        },
                         decoder = sessionDecoder,
                     )
                 } else if (netScan) {
@@ -1040,11 +1107,47 @@ class MainActivity : FragmentActivity() {
                 } else {
                     Scaffold(
                         snackbarHost = { SnackbarHost(snackbar) },
+                        containerColor = androidx.compose.material3.MaterialTheme.colorScheme.background,
+                        topBar = {
+                            TopAppBar(
+                                title = {
+                                    Text(
+                                        when (tab) {
+                                            0 -> "PJDesk"
+                                            1 -> "Saved computers"
+                                            else -> "Settings"
+                                        },
+                                    )
+                                },
+                                colors = TopAppBarDefaults.topAppBarColors(
+                                    containerColor = androidx.compose.material3.MaterialTheme.colorScheme.background,
+                                    titleContentColor = androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
+                                ),
+                            )
+                        },
                         bottomBar = {
-                            NavigationBar {
-                                NavigationBarItem(selected = tab == 0, onClick = { tab = 0 }, icon = { Text("Home") }, label = { Text("Home") })
-                                NavigationBarItem(selected = tab == 1, onClick = { tab = 1 }, icon = { Text("Saved") }, label = { Text("Saved") })
-                                NavigationBarItem(selected = tab == 2, onClick = { tab = 2 }, icon = { Text("Settings") }, label = { Text("Settings") })
+                            NavigationBar(containerColor = androidx.compose.material3.MaterialTheme.colorScheme.surface) {
+                                NavigationBarItem(
+                                    selected = tab == 0,
+                                    onClick = { tab = 0 },
+                                    icon = { Icon(Icons.Filled.Home, contentDescription = null) },
+                                    label = { Text("Home") },
+                                    alwaysShowLabel = true,
+                                )
+                                NavigationBarItem(
+                                    selected = tab == 1,
+                                    onClick = { tab = 1 },
+                                    icon = { Icon(Icons.Filled.List, contentDescription = null) },
+                                    label = { Text("Saved") },
+                                    alwaysShowLabel = true,
+                                )
+                                NavigationBarItem(
+                                    selected = tab == 2,
+                                    onClick = { tab = 2 },
+                                    icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
+                                    label = { Text("Settings") },
+                                    alwaysShowLabel = true,
+                                )
                             }
                         },
                     ) { padding ->
@@ -1083,18 +1186,8 @@ class MainActivity : FragmentActivity() {
                                     },
                                     accountEmail = account,
                                     temporary = temporarySession,
-                                    onSignOut = {
-                                        if (temporarySession) {
-                                            signOutTemporary()
-                                            scope.launch { snackbar.showSnackbar("Signed out") }
-                                        } else {
-                                            app.store.networkEmail = ""
-                                            app.store.saveNetworkRefresh("")
-                                            app.lockUi()
-                                            engine.command(JSONObject().put("cmd", "accessToken").put("token", "").toString())
-                                            account = ""
-                                        }
-                                    },
+                                    recent = saved.filter { recentIds.contains(it.id) }.take(3),
+                                    onRecent = { beginConnect(it) },
                                 )
                                 1 -> SavedScreen(
                                     signedIn = account.isNotEmpty(),
@@ -1104,14 +1197,21 @@ class MainActivity : FragmentActivity() {
                                     onQuery = { query = it },
                                     status = if (
                                         connecting && !promptBeforeConnect && !state.askPassword &&
-                                        (state.status.startsWith("Connecting") || state.status.startsWith("Getting your PJDesk server"))
+                                        (
+                                            state.status.startsWith("Connecting") ||
+                                                state.status.startsWith("Getting your PJDesk server") ||
+                                                state.status.startsWith("Starting PJDesk")
+                                            )
                                     ) {
                                         state.status
                                     } else {
                                         ""
                                     },
+                                    sort = savedSort,
+                                    filter = savedFilter,
+                                    onSort = { chosen -> scope.launch { listPrefs.setSort(chosen) } },
+                                    onFilter = { chosen -> scope.launch { listPrefs.setFilter(chosen) } },
                                     onConnect = { beginConnect(it.id) },
-                                    onOpen = { beginConnect(it.id) },
                                     onForget = {
                                         app.store.forget(it.id)
                                         saved = app.store.saved()
@@ -1219,6 +1319,24 @@ class MainActivity : FragmentActivity() {
                                         }
                                     },
                                     onAutoLock = { app.store.autoLockSeconds = it },
+                                    engineDetail = readiness.detail,
+                                    accountEmail = account,
+                                    onSignOut = if (account.isEmpty()) {
+                                        null
+                                    } else {
+                                        {
+                                            if (temporarySession) {
+                                                signOutTemporary()
+                                                scope.launch { snackbar.showSnackbar("Signed out") }
+                                            } else {
+                                                app.store.networkEmail = ""
+                                                app.store.saveNetworkRefresh("")
+                                                app.lockUi()
+                                                engine.command(JSONObject().put("cmd", "accessToken").put("token", "").toString())
+                                                account = ""
+                                            }
+                                        }
+                                    },
                                     onImportConfig = {
                                         val text = clipboardText()
                                         val blob = NetKey.blobIn(text)

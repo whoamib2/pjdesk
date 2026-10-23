@@ -80,13 +80,20 @@ pub extern "system" fn Java_us_spader_pjdesk_core_Native_nativeCreate(
     let hostname: String = env.get_string(&hostname).map(|s| s.into()).unwrap_or_default();
     let listener = match env.new_global_ref(listener) {
         Ok(r) => r,
-        Err(_) => return 0,
+        Err(e) => {
+            let message = format!("The PJDesk engine did not start: {e}");
+            tracing::error!("{message}");
+            let _ = env.throw_new("java/lang/RuntimeException", message);
+            return 0;
+        }
     };
     let cb = Arc::new(JavaCb { listener });
     match Engine::start(dir.into(), android_id, hostname, cb) {
         Ok(engine) => Box::into_raw(Box::new(engine)) as jlong,
         Err(e) => {
-            tracing::error!("engine start failed: {e:#}");
+            let message = format!("The PJDesk engine did not start: {e}");
+            tracing::error!("{message}");
+            let _ = env.throw_new("java/lang/RuntimeException", message);
             0
         }
     }

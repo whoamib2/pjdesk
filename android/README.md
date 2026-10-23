@@ -26,7 +26,9 @@ Unattended access matches the Windows client: an optional permanent password of 
 
 ## Build
 
-Requirements: Rust (stable), `cargo-ndk`, the Android SDK (platform 35, build-tools 35), NDK 27, and JDK 17 or 21.
+Requirements: Rust (stable), `cargo-ndk`, the Android SDK (platform 35, build-tools 35), NDK 27.2.12479018, and JDK 21.
+
+`gradlew assembleRelease` does not compile `libpjdesk_mobile.so`. Build that library first or the release task fails. On Windows, follow [BUILD-WINDOWS.md](BUILD-WINDOWS.md).
 
 ```bash
 ./android/build.sh
@@ -52,7 +54,7 @@ All four have to be set. A partial set leaves the APK unsigned.
 On Windows, sign an unsigned APK without saving the passwords:
 
 ```bat
-android\sign-release.cmd dist\PJDesk-Android-0.6.11-unsigned.apk
+android\sign-release.cmd dist\PJDesk-Android-0.6.12-unsigned.apk
 ```
 
 The script uses `apksigner` from `ANDROID_HOME`. The release key is `C:\Users\BenSpader\.pjdesk-android\pjdesk-release.jks`, alias `pjdesk`. Those are the defaults when `PJDESK_KEYSTORE` and `PJDESK_KEY_ALIAS` are unset. The script asks for the passwords and does not save them. A different key will not update the phone.

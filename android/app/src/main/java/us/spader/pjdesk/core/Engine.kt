@@ -11,6 +11,9 @@ import android.provider.Settings
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 import org.json.JSONObject
 import us.spader.pjdesk.AppLog
@@ -19,12 +22,19 @@ import us.spader.pjdesk.input.GestureMap
 import us.spader.pjdesk.service.RemoteControl
 import java.util.concurrent.atomic.AtomicLong
 
+enum class EnginePhase { Starting, Ready, Failed }
+
+data class EngineReadiness(val phase: EnginePhase, val detail: String)
+
 class Engine(context: Context) : EngineListener {
     private val app = context.applicationContext
     private val store = Store(app)
     private val main = Handler(Looper.getMainLooper())
     private val handle = AtomicLong(0)
+    private val startOnce = AtomicBoolean(false)
     private val pending = ArrayDeque<String>()
+    private val _ready = MutableStateFlow(EngineReadiness(EnginePhase.Starting, "Starting PJDesk…"))
+    val readiness: StateFlow<EngineReadiness> = _ready.asStateFlow()
     /** One retry when a registration event disagrees with the Keystore, so a stale event cannot loop. */
     private var permanentRepush = false
 
@@ -41,30 +51,75 @@ class Engine(context: Context) : EngineListener {
     var onKeyframe: (() -> Unit)? = null
 
     fun start() {
-        if (!Native.loaded || handle.get() != 0L) return
-        val androidId = Settings.Secure.getString(app.contentResolver, Settings.Secure.ANDROID_ID) ?: ""
-        val host = deviceName(app)
-        val created = Native.nativeCreate(app.filesDir.absolutePath, androidId, host, this)
-        handle.set(created)
-        if (created == 0L) {
-            update { it.copy(status = "The PJDesk engine did not start.", error = "nativeCreate returned 0") }
+        if (!startOnce.compareAndSet(false, true)) return
+        if (!Native.loaded) {
+            fail(Native.loadError.ifBlank { ENGINE_LIBRARY_MISSING })
             return
         }
-        command(
-            JSONObject()
-                .put("cmd", "hostFacts")
-                .put("hostname", host)
-                .put("os_family", "android")
-                .put("os_version", Build.VERSION.RELEASE ?: "")
-                .put("console_user", profileName(app))
-                .put("display_name", store.computerName)
-                .toString(),
-        )
-        pushPermanent()
-        command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
-        pushTrusted()
-        setCapturing(us.spader.pjdesk.service.HostService.capturing)
-        flushCommands()
+        val androidId = Settings.Secure.getString(app.contentResolver, Settings.Secure.ANDROID_ID) ?: ""
+        val host = deviceName(app)
+        Thread({
+            val created = try {
+                Native.nativeCreate(app.filesDir.absolutePath, androidId, host, this)
+            } catch (error: Throwable) {
+                main.post { fail(error.message?.ifBlank { null } ?: "The PJDesk engine did not start.") }
+                return@Thread
+            }
+            main.post {
+                if (created == 0L) {
+                    fail("The PJDesk engine did not start.")
+                    return@post
+                }
+                handle.set(created)
+                command(
+                    JSONObject()
+                        .put("cmd", "hostFacts")
+                        .put("hostname", host)
+                        .put("os_family", "android")
+                        .put("os_version", Build.VERSION.RELEASE ?: "")
+                        .put("console_user", profileName(app))
+                        .put("display_name", store.computerName)
+                        .toString(),
+                )
+                pushPermanent()
+                command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
+                pushTrusted()
+                setCapturing(us.spader.pjdesk.service.HostService.capturing)
+                flushCommands()
+                _ready.value = EngineReadiness(EnginePhase.Ready, "Ready")
+                AppLog.i("engine ready")
+            }
+        }, "pjdesk-start").start()
+    }
+
+    /**
+     * Waits until the engine can take a connect, or returns the reason it cannot.
+     * A missing library fails immediately. A start that is still running is waited out.
+     */
+    suspend fun awaitReady(timeoutMs: Long = 15_000): String? {
+        val current = _ready.value
+        if (current.phase == EnginePhase.Failed) return current.detail
+        if (current.phase == EnginePhase.Ready && handle.get() != 0L) return null
+        val done = withTimeoutOrNull(timeoutMs) {
+            _ready.first { it.phase != EnginePhase.Starting }
+        }
+        if (done == null) {
+            return _ready.value.detail.ifBlank { "PJDesk did not finish starting." }.let { detail ->
+                if (_ready.value.phase == EnginePhase.Starting) "PJDesk did not finish starting." else detail
+            }
+        }
+        return if (done.phase == EnginePhase.Ready && handle.get() != 0L) {
+            null
+        } else {
+            done.detail.ifBlank { "The PJDesk engine did not start." }
+        }
+    }
+
+    private fun fail(message: String) {
+        val text = message.ifBlank { "The PJDesk engine did not start." }
+        AppLog.e(text)
+        _ready.value = EngineReadiness(EnginePhase.Failed, text)
+        update { it.copy(status = text, error = text) }
     }
 
     /** MediaProjection is producing frames, or it stopped. */
@@ -129,6 +184,15 @@ class Engine(context: Context) : EngineListener {
         if (address.isBlank()) return
         val body = JSONObject().put("cmd", "server").put("address", address).put("quiet", quiet)
         if (fingerprint.isNotBlank()) body.put("fingerprint", fingerprint)
+        if (quiet) {
+            body.put("lan", lanForEngine())
+            body.put("publicIp", store.accountPublicIp)
+            body.put("myPublicIp", store.myPublicIp)
+        } else {
+            body.put("lan", JSONArray())
+            body.put("publicIp", "")
+            body.put("myPublicIp", "")
+        }
         command(body.toString())
     }
 
@@ -172,7 +236,8 @@ class Engine(context: Context) : EngineListener {
         }
         AppLog.i("engine connect id=$digits password=$how handle=${handle.get()}")
         if (handle.get() == 0L) {
-            showError("PJDesk is still starting. Wait a moment and try Connect again.")
+            val why = _ready.value.detail.ifBlank { "The PJDesk engine did not start." }
+            showError(if (_ready.value.phase == EnginePhase.Failed) why else "PJDesk did not finish starting.")
             return
         }
         command(
@@ -227,8 +292,35 @@ class Engine(context: Context) : EngineListener {
         )
     }
 
-    fun mouse(kind: String, x: Int, y: Int, dy: Int = 0) {
-        command(JSONObject().put("cmd", "mouse").put("kind", kind).put("x", x).put("y", y).put("dy", dy).toString())
+    fun mouse(kind: String, x: Int, y: Int, dy: Int = 0, button: String = "left") {
+        command(
+            JSONObject()
+                .put("cmd", "mouse")
+                .put("kind", kind)
+                .put("button", button)
+                .put("x", x)
+                .put("y", y)
+                .put("dy", dy)
+                .toString(),
+        )
+    }
+
+    fun paste(text: String) {
+        if (text.isBlank()) return
+        command(JSONObject().put("cmd", "paste").put("text", text.take(48_000)).toString())
+    }
+
+    private fun lanForEngine(): JSONArray {
+        val lan = JSONArray()
+        val seen = HashSet<String>()
+        fun add(raw: String) {
+            val text = raw.trim()
+            if (text.isEmpty() || !seen.add(text)) return
+            lan.put(text)
+        }
+        store.accountLan.split(',').forEach { add(it) }
+        add(store.lanPath(NetworkPath.key(app)))
+        return lan
     }
 
     fun text(chars: String) = command(JSONObject().put("cmd", "text").put("chars", chars).toString())
@@ -344,7 +436,8 @@ class Engine(context: Context) : EngineListener {
                     pushPermanent()
                 }
                 update {
-                    val ready = it.status == "Connecting…" || it.status == "Online" || it.status.isBlank()
+                    val ready = it.status == "Connecting…" || it.status == "Online" || it.status.isBlank() ||
+                    it.status.startsWith("Starting PJDesk")
                     it.copy(
                         id = event.optString("id"),
                         idFormatted = event.optString("idFormatted"),
@@ -360,7 +453,23 @@ class Engine(context: Context) : EngineListener {
             "status" -> update {
                 val text = event.optString("text")
                 if (text == "Ready" && (it.hosting || it.incoming != null || it.session != null)) it
-                else it.copy(status = text)
+                else it.copy(status = text, signalError = if (text == "Ready") "" else it.signalError)
+            }
+            "signal" -> {
+                val via = event.optString("via")
+                val reached = event.optString("reached")
+                if (via == "LAN" && reached.isNotBlank()) {
+                    store.rememberLanPath(NetworkPath.key(app), reached)
+                }
+                update {
+                    it.copy(
+                        signalVia = via,
+                        signalReached = reached,
+                        signalError = event.optString("error"),
+                        serverLan = event.optString("lan"),
+                        server = event.optString("public").ifBlank { it.server },
+                    )
+                }
             }
             "openUrl" -> {
                 val url = event.optString("url")

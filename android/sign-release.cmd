@@ -4,7 +4,7 @@ rem Signs an unsigned PJDesk APK with apksigner.
 rem Passwords are asked in this window when they are not already in the
 rem environment, and they are not written to a file.
 rem
-rem   android\sign-release.cmd PJDesk-Android-0.6.11-unsigned.apk
+rem   android\sign-release.cmd PJDesk-Android-0.6.12-unsigned.apk
 rem   android\sign-release.cmd unsigned.apk signed.apk
 rem
 rem Environment, all optional:

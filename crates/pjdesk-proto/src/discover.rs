@@ -34,6 +34,72 @@ pub fn encode(beacon: &LanBeacon) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Magic for a server announcing its signaling address on the LAN.
+/// Separate from [`BEACON_MAGIC`], so a computer beacon is never read as a server.
+pub const SERVER_MAGIC: &[u8; 8] = b"PJDESKSV";
+
+/// The PJDesk server's LAN signaling endpoint. The packet's source address is
+/// the LAN IP. `port` is the TCP/UDP server port (21200). The fingerprint is
+/// the server key, so a client with a pinned key can ignore a different server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerBeacon {
+    pub port: u16,
+    pub fingerprint: [u8; 32],
+}
+
+pub fn encode_server(beacon: &ServerBeacon) -> Vec<u8> {
+    let mut out = Vec::with_capacity(42);
+    out.extend_from_slice(SERVER_MAGIC);
+    out.extend_from_slice(&beacon.port.to_be_bytes());
+    out.extend_from_slice(&beacon.fingerprint);
+    out
+}
+
+pub fn decode_server(packet: &[u8]) -> Result<ServerBeacon> {
+    if packet.len() != 42 || &packet[..8] != SERVER_MAGIC {
+        bail!("not a PJDesk server beacon");
+    }
+    let port = u16::from_be_bytes([packet[8], packet[9]]);
+    if port == 0 {
+        bail!("server beacon has no port");
+    }
+    let mut fingerprint = [0u8; 32];
+    fingerprint.copy_from_slice(&packet[10..42]);
+    Ok(ServerBeacon { port, fingerprint })
+}
+
+/// Listens on UDP 21202 for [ServerBeacon]s. The returned address uses the
+/// sender's IP and the port inside the packet. A busy port returns nothing.
+pub fn listen_servers(limit: std::time::Duration) -> Vec<(std::net::SocketAddr, [u8; 32])> {
+    let socket = match std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, crate::DISCOVERY_PORT)) {
+        Ok(socket) => socket,
+        Err(_) => return Vec::new(),
+    };
+    let _ = socket.set_read_timeout(Some(std::time::Duration::from_millis(80)));
+    let deadline = std::time::Instant::now() + limit;
+    let mut found = Vec::new();
+    let mut buf = [0u8; 128];
+    while std::time::Instant::now() < deadline {
+        match socket.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                if let Ok(beacon) = decode_server(&buf[..n]) {
+                    if let std::net::IpAddr::V4(ip) = src.ip() {
+                        if ip.is_private() || ip.is_link_local() {
+                            let addr = std::net::SocketAddr::from((ip, beacon.port));
+                            if !found.iter().any(|(have, fp)| *have == addr && *fp == beacon.fingerprint) {
+                                found.push((addr, beacon.fingerprint));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+    found
+}
+
 pub fn decode(packet: &[u8]) -> Result<LanBeacon> {
     if packet.len() < 10 || &packet[..8] != BEACON_MAGIC {
         bail!("not a PJDesk discovery beacon");
@@ -78,6 +144,18 @@ mod tests {
         assert_eq!(decode(&bytes).unwrap(), b);
         assert!(decode(b"nope").is_err());
         assert!(decode(&bytes[..9]).is_err());
+        let server = encode_server(&ServerBeacon { port: crate::DEFAULT_PORT, fingerprint: [9u8; 32] });
+        assert!(decode(&server).is_err());
+    }
+
+    #[test]
+    fn server_beacon_is_a_fixed_packet() {
+        let beacon = ServerBeacon { port: crate::DEFAULT_PORT, fingerprint: [4u8; 32] };
+        let bytes = encode_server(&beacon);
+        assert_eq!(&bytes[..8], b"PJDESKSV");
+        assert_eq!(decode_server(&bytes).unwrap(), beacon);
+        assert!(decode_server(b"PJDESKSV").is_err());
+        assert!(decode_server(&[0u8; 42]).is_err());
     }
 
     #[test]

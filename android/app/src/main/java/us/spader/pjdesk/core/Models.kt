@@ -48,6 +48,11 @@ data class DeskState(
     val askRejected: Boolean = false,
     /** Why the password dialog is open again, or empty on the first ask. */
     val askNote: String = "",
+    /** LAN, Internet, or blank when the last signaling attempt failed. */
+    val signalVia: String = "",
+    val signalReached: String = "",
+    val signalError: String = "",
+    val serverLan: String = "",
 )
 
 data class SavedComputer(

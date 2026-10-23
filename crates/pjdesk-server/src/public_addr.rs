@@ -340,6 +340,20 @@ impl IpWatch {
     }
 }
 
+/// Broadcasts this server's signaling port and key on UDP 21202 until the process ends.
+/// Clients on the same LAN learn the private address without waiting for the account.
+pub fn announce_lan(port: u16, fingerprint: [u8; 32]) {
+    let port = if port == 0 { pjdesk_proto::DEFAULT_PORT } else { port };
+    let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else { return };
+    let _ = socket.set_broadcast(true);
+    let dest = std::net::SocketAddr::from(([255, 255, 255, 255], pjdesk_proto::DISCOVERY_PORT));
+    let packet = pjdesk_proto::discover::encode_server(&pjdesk_proto::discover::ServerBeacon { port, fingerprint });
+    loop {
+        let _ = socket.send_to(&packet, dest);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
 /// Private IPv4 addresses of the interfaces this host would use.
 pub fn lan_endpoints(port: u16) -> Vec<String> {
     let port = if port == 0 { pjdesk_proto::DEFAULT_PORT } else { port };
