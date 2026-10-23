@@ -14,6 +14,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -55,6 +56,14 @@ fun SettingsScreen(
     tempIdleMinutes: Int = 30,
     onTempIdleMinutes: (Int) -> Unit = {},
     onCheckUpdate: () -> Unit = {},
+    signedIn: Boolean = false,
+    hasPin: Boolean = false,
+    biometricsOn: Boolean = false,
+    biometricsAvailable: Boolean = false,
+    autoLockSeconds: Int = 120,
+    onChangePin: () -> Unit = {},
+    onToggleBiometrics: (Boolean) -> Unit = {},
+    onAutoLock: (Int) -> Unit = {},
 ) {
     var server by rememberSaveable(state.server) { mutableStateOf(state.server) }
     var name by rememberSaveable(computerName) { mutableStateOf(computerName) }
@@ -146,10 +155,34 @@ fun SettingsScreen(
                 }
             }
         }
+        if (signedIn) {
+            Section("App lock") {
+                Text("PJDesk asks for the PIN or biometrics when you open it, and after it has been in the background.", color = pjMuted())
+                if (hasPin) {
+                    Button(onClick = onChangePin, modifier = Modifier.fillMaxWidth()) { Text("Change PIN") }
+                }
+                if (biometricsAvailable) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                        Text("Unlock with fingerprint or face", modifier = Modifier.weight(1f))
+                        Switch(checked = biometricsOn, onCheckedChange = onToggleBiometrics)
+                    }
+                }
+                Text("Lock after", color = pjMuted())
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(60 to "1 min", 120 to "2 min", 300 to "5 min").forEach { (seconds, label) ->
+                        FilterChip(
+                            selected = autoLockSeconds == seconds,
+                            onClick = { onAutoLock(seconds) },
+                            label = { Text(label) },
+                        )
+                    }
+                }
+            }
+        }
         Section("Sign-in") {
             Text("Temporary sign-in", style = MaterialTheme.typography.titleMedium)
             Text(
-                "Minutes with no PJDesk activity before a temporary sign-in ends. The sign-in checkbox on the sign-in screen starts checked.",
+                "Minutes with no PJDesk activity before a temporary sign-in ends. The sign-in checkbox starts unchecked, so this phone stays signed in.",
                 color = pjMuted(),
             )
             var idle by rememberSaveable(tempIdleMinutes) { mutableStateOf(tempIdleMinutes.toString()) }
@@ -164,7 +197,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.10", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.11", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }

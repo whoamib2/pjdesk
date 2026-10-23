@@ -9,9 +9,10 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.autofill.AutofillManager
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
@@ -46,12 +47,21 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.rememberCoroutineScope
 import org.json.JSONObject
+import us.spader.pjdesk.core.AppLockPolicy
+import us.spader.pjdesk.core.BioVault
 import us.spader.pjdesk.core.CloudAuth
 import us.spader.pjdesk.core.CloudAuthException
 import us.spader.pjdesk.core.NetKey
+import us.spader.pjdesk.core.PasswordSync
+import us.spader.pjdesk.core.PinWrap
+import us.spader.pjdesk.core.VaultKeyRejected
 import us.spader.pjdesk.core.connectFailureText
 import us.spader.pjdesk.core.connectStatusLabel
+import us.spader.pjdesk.ui.ReauthScreen
+import us.spader.pjdesk.ui.SecretField
+import us.spader.pjdesk.ui.SetPinScreen
 import us.spader.pjdesk.ui.SignInScreen
+import us.spader.pjdesk.ui.UnlockScreen
 import java.util.UUID
 import us.spader.pjdesk.a11y.PjAccessibilityService
 import us.spader.pjdesk.core.SavedComputer
@@ -67,7 +77,7 @@ import us.spader.pjdesk.ui.SavedScreen
 import us.spader.pjdesk.ui.SessionScreen
 import us.spader.pjdesk.ui.SettingsScreen
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     private val captureReady = MutableStateFlow(HostService.capturing)
     private var pendingAccept by mutableStateOf(false)
     private var decoder: ScreenDecoder? = null
@@ -123,9 +133,35 @@ class MainActivity : ComponentActivity() {
         interaction.intValue++
     }
 
+    override fun onStop() {
+        super.onStop()
+        if (!app.bioPrompt) app.backgroundAt = android.os.SystemClock.elapsedRealtime()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val away = app.backgroundAt
+        app.backgroundAt = 0L
+        if (away > 0L && !app.bioPrompt && app.uiUnlocked.value) {
+            val delay = app.store.autoLockSeconds * 1000L
+            if (AppLockPolicy.relock(android.os.SystemClock.elapsedRealtime() - away, delay)) {
+                app.lockUi()
+                AppLog.i("app locked after background")
+            }
+        }
+    }
+
+    private fun commitAutofill() {
+        val mgr = getSystemService(AutofillManager::class.java) ?: return
+        if (mgr.hasEnabledAutofillServices()) mgr.commit()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (app.store.temporaryActive() && !tempFlag.get()) app.store.endTemporaryVisit()
+        if (app.store.accountServer.isNotBlank()) {
+            app.engine.applyAccountServer(app.store.accountServer, app.store.accountFingerprint, quiet = true)
+        }
         enableEdgeToEdge()
         HostService.arm(this)
         captureReady.value = HostService.capturing || app.store.captureTried
@@ -162,7 +198,12 @@ class MainActivity : ComponentActivity() {
             var importPass by remember { mutableStateOf("") }
             var importFromPaste by remember { mutableStateOf(true) }
             var savePassword by remember { mutableStateOf(false) }
-            var signOutWhenDone by remember { mutableStateOf(true) }
+            var signOutWhenDone by remember { mutableStateOf(false) }
+            var changingPin by remember { mutableStateOf(false) }
+            var lockBusy by remember { mutableStateOf(false) }
+            var lockError by remember { mutableStateOf("") }
+            var vaultRejected by remember { mutableStateOf(false) }
+            val uiUnlocked by app.uiUnlocked.collectAsStateWithLifecycle()
             var temporarySession by remember { mutableStateOf(false) }
             var memoryRefresh by remember { mutableStateOf("") }
             var enrolledFor by remember { mutableStateOf("") }
@@ -171,11 +212,13 @@ class MainActivity : ComponentActivity() {
             var tempLeft by remember { mutableIntStateOf(0) }
             var lastActivity by remember { mutableLongStateOf(android.os.SystemClock.elapsedRealtime()) }
             val bumps = interaction.intValue
+            val scope = rememberCoroutineScope()
             fun signOutTemporary() {
                 tempFlag.set(false)
                 temporarySession = false
                 memoryRefresh = ""
                 app.store.endTemporaryVisit()
+                app.clearVaultKey()
                 engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", "").toString())
                 account = ""
                 saved = app.store.saved()
@@ -183,7 +226,40 @@ class MainActivity : ComponentActivity() {
                 enrolledFor = ""
                 accountComputers = emptyList()
             }
-            val scope = rememberCoroutineScope()
+            fun syncPasswords(upload: Boolean) {
+                val key = app.vaultKey ?: return
+                val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                val device = app.store.networkDeviceId
+                if (refresh.isBlank() || device.isBlank()) return
+                scope.launch {
+                    val changed = try {
+                        withContext(Dispatchers.IO) { PasswordSync.pull(app.store, key, refresh, device, upload) }
+                    } catch (e: VaultKeyRejected) {
+                        vaultRejected = true
+                        app.lockUi()
+                        lockError = e.message ?: "Saved passwords need your account password again."
+                        false
+                    }
+                    if (changed) saved = app.store.saved()
+                }
+            }
+            fun rememberAccountServer(address: String, fingerprint: String) {
+                if (address.isBlank()) return
+                app.store.accountServer = address
+                app.store.accountFingerprint = fingerprint
+                engine.applyAccountServer(address, fingerprint, quiet = true)
+                AppLog.i("account server $address fingerprint=${if (fingerprint.isBlank()) "missing" else "set"}")
+            }
+            fun holdDerivedKey(email: String, password: String, upload: Boolean) {
+                if (email.isBlank() || password.isBlank()) return
+                scope.launch {
+                    val key = withContext(Dispatchers.IO) {
+                        runCatching { CloudAuth.vaultKey(email, password) }.getOrNull()
+                    } ?: return@launch
+                    app.holdVaultKey(key)
+                    syncPasswords(upload)
+                }
+            }
             fun applySignedIn(
                 session: us.spader.pjdesk.core.Session,
                 emailHint: String,
@@ -191,6 +267,7 @@ class MainActivity : ComponentActivity() {
                 temporaryNow: Boolean,
                 enrollOnlyNow: Boolean,
                 notice: String? = null,
+                accountPassword: String = "",
             ) {
                 val pjdeskId = state.id.filter { it.isDigit() }
                 if (enrollOnlyNow && pjdeskId.length != 9) {
@@ -238,6 +315,7 @@ class MainActivity : ComponentActivity() {
                         netOffer = false
                         netLogin = ""
                         importOffer = null
+                        commitAutofill()
                         if (enrollOnlyNow) {
                             signingIn = false
                             scope.launch {
@@ -261,14 +339,16 @@ class MainActivity : ComponentActivity() {
                             if (!keyBlob.isNullOrBlank()) {
                                 us.spader.pjdesk.core.NetKey.blobIn(keyBlob)?.let { app.store.networkKey = it }
                             }
+                            app.markUnlocked()
                         }
                         accountComputers = enrolled.computers
                         enrolledFor = if (pjdeskId.length == 9) pjdeskId else ""
-                        engine.command(org.json.JSONObject().put("cmd", "server").put("address", enrolled.address).toString())
+                        rememberAccountServer(enrolled.address, enrolled.fingerprint)
                         engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", enrolled.access).toString())
                         account = who
                         signingIn = false
                         saved = app.store.saved()
+                        if (!enrollOnlyNow) holdDerivedKey(who, accountPassword, upload = !temporaryNow)
                         if (temporaryNow) {
                             scope.launch { snackbar.showSnackbar("Signed in until you close PJDesk") }
                         } else if (!notice.isNullOrBlank()) {
@@ -334,7 +414,37 @@ class MainActivity : ComponentActivity() {
                     AppLog.e(connectError.orEmpty())
                     return
                 }
-                if (state.server.isBlank()) {
+                val knownServer = state.server.ifBlank { app.store.accountServer }
+                if (state.server.isBlank() && knownServer.isNotBlank()) {
+                    engine.applyAccountServer(knownServer, app.store.accountFingerprint, quiet = true)
+                }
+                if (knownServer.isBlank()) {
+                    val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                    val device = app.store.networkDeviceId
+                    if (account.isNotBlank() && refresh.isNotBlank() && device.isNotBlank()) {
+                        connecting = true
+                        connectError = null
+                        engine.showStatus("Getting your PJDesk server…")
+                        AppLog.i("Connect fetching the account server")
+                        val computers = if (temporarySession) null else CloudAuth.computersJson(app.store.saved())
+                        scope.launch {
+                            val fetched = withContext(Dispatchers.IO) {
+                                runCatching { CloudAuth.refresh(refresh, device, computers) }
+                                    .onFailure { AppLog.e("account refresh failed: ${it.message}") }
+                                    .getOrNull()
+                            }
+                            if (fetched == null || fetched.address.isBlank()) {
+                                connecting = false
+                                connectError = "This phone has no server address yet. Sign in again, or set the server in Settings."
+                                AppLog.e(connectError.orEmpty())
+                                return@launch
+                            }
+                            rememberAccountServer(fetched.address, fetched.fingerprint)
+                            engine.command(JSONObject().put("cmd", "accessToken").put("token", fetched.access).toString())
+                            beginConnect(rawId, ignoreOffline)
+                        }
+                        return
+                    }
                     connecting = false
                     connectError = "This phone has no server address yet. Sign in again, or set the server in Settings."
                     AppLog.e(connectError.orEmpty())
@@ -394,7 +504,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     result.onSuccess { session ->
-                        applySignedIn(session, email, blob, signOutWhenDone, false, "Import server configuration successfully")
+                        applySignedIn(session, email, blob, signOutWhenDone, false, "Import server configuration successfully", if (bound) pass else "")
                     }.onFailure {
                         netBusy = false
                         val message = it.message ?: "Could not sign in."
@@ -412,18 +522,28 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(account, memoryRefresh, temporarySession) {
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                 val device = app.store.networkDeviceId
+                if (!temporarySession && state.server.isBlank() && app.store.accountServer.isNotBlank()) {
+                    engine.applyAccountServer(app.store.accountServer, app.store.accountFingerprint, quiet = true)
+                }
                 if (account.isBlank() || refresh.isBlank() || device.isBlank()) return@LaunchedEffect
                 val computers = if (temporarySession) null else CloudAuth.computersJson(app.store.saved())
                 val session = withContext(Dispatchers.IO) {
-                    runCatching { CloudAuth.refresh(refresh, device, computers) }.getOrNull()
-                } ?: return@LaunchedEffect
-                engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
-                if (session.address.isNotBlank() && !temporarySession) {
-                    engine.command(JSONObject().put("cmd", "server").put("address", session.address).toString())
+                    runCatching { CloudAuth.refresh(refresh, device, computers) }
+                        .onFailure { AppLog.e("account refresh failed: ${it.message}") }
+                        .getOrNull()
                 }
+                if (session == null) {
+                    if (!temporarySession && app.store.accountServer.isNotBlank()) {
+                        engine.applyAccountServer(app.store.accountServer, app.store.accountFingerprint, quiet = true)
+                    }
+                    return@LaunchedEffect
+                }
+                engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
                 if (!temporarySession) {
+                    rememberAccountServer(session.address, session.fingerprint)
                     app.store.mergeCloud(session.computers)
                     saved = app.store.saved()
+                    if (app.vaultKey != null) syncPasswords(true)
                 }
             }
             LaunchedEffect(bumps, state.session?.id) {
@@ -526,9 +646,216 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+            fun tryBio() {
+                val stored = app.store.bioWrap
+                if (stored.isBlank() || !BioVault.available(this@MainActivity)) return
+                app.bioPrompt = true
+                BioVault.openWithAuth(
+                    this@MainActivity,
+                    stored,
+                    onKey = { key ->
+                        app.bioPrompt = false
+                        app.holdVaultKey(key)
+                        app.store.pinFails = 0
+                        lockError = ""
+                        app.markUnlocked()
+                        syncPasswords(!temporarySession)
+                    },
+                    onCancel = { app.bioPrompt = false },
+                    onError = {
+                        app.bioPrompt = false
+                        lockError = it
+                    },
+                )
+            }
+            fun submitPin(pin: String) {
+                val salt = app.store.pinSaltBytes()
+                val wrapped = app.store.pinWrap
+                if (salt == null || wrapped.isBlank()) return
+                lockBusy = true
+                lockError = ""
+                scope.launch {
+                    val key = withContext(Dispatchers.IO) { PinWrap.unwrap(wrapped, pin, salt) }
+                    lockBusy = false
+                    if (key == null) {
+                        val fails = app.store.pinFails + 1
+                        app.store.pinFails = fails
+                        lockError = if (fails >= AppLockPolicy.MAX_FAILS) {
+                            ""
+                        } else {
+                            "Wrong PIN. ${AppLockPolicy.MAX_FAILS - fails} left."
+                        }
+                        AppLog.i("app pin rejected fails=$fails")
+                        return@launch
+                    }
+                    app.store.pinFails = 0
+                    app.holdVaultKey(key)
+                    lockError = ""
+                    app.markUnlocked()
+                    syncPasswords(!temporarySession)
+                }
+            }
+            fun finishPin(pin: String, password: String, enableBio: Boolean) {
+                val email = netEmail.ifBlank { account }.trim()
+                lockBusy = true
+                lockError = ""
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching {
+                            val existing = if (password.isBlank()) app.vaultKey?.copyOf() else null
+                            if (existing != null) {
+                                existing to null
+                            } else {
+                                val device = app.store.networkDeviceId.ifBlank {
+                                    UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
+                                }
+                                val signed = CloudAuth.signIn(email, password, device, "Android")
+                                CloudAuth.vaultKey(email, password) to signed
+                            }
+                        }
+                    }
+                    lockBusy = false
+                    result.onSuccess { (key, signed) ->
+                        if (signed != null) {
+                            val who = signed.email.ifBlank { email }
+                            app.store.networkEmail = who
+                            account = who
+                            netEmail = who
+                            if (signed.refresh.isNotBlank()) app.store.saveNetworkRefresh(signed.refresh)
+                            rememberAccountServer(signed.address, signed.fingerprint)
+                            engine.command(JSONObject().put("cmd", "accessToken").put("token", signed.access).toString())
+                            commitAutofill()
+                        }
+                        val salt = PinWrap.newSalt()
+                        app.store.savePinSalt(salt)
+                        app.store.pinWrap = PinWrap.wrap(key, pin, salt)
+                        app.store.pinFails = 0
+                        app.holdVaultKey(key)
+                        changingPin = false
+                        vaultRejected = false
+                        app.markUnlocked()
+                        if (enableBio && BioVault.available(this@MainActivity)) {
+                            app.bioPrompt = true
+                            BioVault.sealWithAuth(
+                                this@MainActivity,
+                                key,
+                                onSealed = { wrap ->
+                                    app.bioPrompt = false
+                                    app.store.bioWrap = wrap
+                                    app.store.biometricsOn = true
+                                },
+                                onCancel = { app.bioPrompt = false },
+                                onError = {
+                                    app.bioPrompt = false
+                                    lockError = it
+                                },
+                            )
+                        } else if (!enableBio) {
+                            app.store.biometricsOn = false
+                            app.store.bioWrap = ""
+                            BioVault.forget()
+                        }
+                        syncPasswords(true)
+                    }.onFailure {
+                        lockError = it.message ?: "Could not save the PIN."
+                    }
+                }
+            }
+            fun reauth(password: String) {
+                val email = netEmail.ifBlank { account }.trim()
+                lockBusy = true
+                lockError = ""
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching {
+                            val device = app.store.networkDeviceId.ifBlank {
+                                UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
+                            }
+                            val signed = CloudAuth.signIn(email, password, device, "Android")
+                            signed to CloudAuth.vaultKey(email, password)
+                        }
+                    }
+                    lockBusy = false
+                    result.onSuccess { (signed, key) ->
+                        commitAutofill()
+                        val who = signed.email.ifBlank { email }
+                        app.store.networkEmail = who
+                        account = who
+                        netEmail = who
+                        if (signed.refresh.isNotBlank()) app.store.saveNetworkRefresh(signed.refresh)
+                        rememberAccountServer(signed.address, signed.fingerprint)
+                        engine.command(JSONObject().put("cmd", "accessToken").put("token", signed.access).toString())
+                        app.store.clearPinMaterial()
+                        BioVault.forget()
+                        app.holdVaultKey(key)
+                        app.store.pinFails = 0
+                        vaultRejected = false
+                        lockError = ""
+                        changingPin = false
+                        app.markUnlocked()
+                    }.onFailure {
+                        lockError = it.message ?: "Could not sign in."
+                    }
+                }
+            }
+            LaunchedEffect(account, temporarySession, uiUnlocked) {
+                val persistent = account.isNotEmpty() && !temporarySession
+                if (!persistent || uiUnlocked || vaultRejected || !app.store.hasPin()) return@LaunchedEffect
+                if (app.store.pinFails >= AppLockPolicy.MAX_FAILS) return@LaunchedEffect
+                if (!app.store.biometricsOn || app.store.bioWrap.isBlank()) return@LaunchedEffect
+                tryBio()
+            }
             PjTheme(theme.value) {
                 val session = state.session
-                if (session != null) {
+                val persistent = account.isNotEmpty() && !temporarySession
+                val bioAvailable = BioVault.available(this@MainActivity)
+                val gate = when {
+                    !persistent -> null
+                    vaultRejected || (app.store.hasPin() && app.store.pinFails >= AppLockPolicy.MAX_FAILS) -> "reauth"
+                    !app.store.hasPin() -> "pin"
+                    !uiUnlocked -> "unlock"
+                    changingPin -> "change"
+                    else -> null
+                }
+                if (gate == "pin" || gate == "change") {
+                    SetPinScreen(
+                        email = netEmail.ifBlank { account },
+                        onEmail = { netEmail = it },
+                        needPassword = app.vaultKey == null,
+                        busy = lockBusy,
+                        error = lockError,
+                        biometricsAvailable = bioAvailable,
+                        biometricsDefault = if (gate == "change") app.store.biometricsOn else bioAvailable,
+                        title = if (gate == "change") "Change PIN" else "Set an app PIN",
+                        detail = if (gate == "change") {
+                            "Choose a new 4 to 8 digit PIN. Your account stays signed in."
+                        } else {
+                            "PJDesk stays signed in. Choose a PIN so opening the app asks for it."
+                        },
+                        onSave = { pin, password, enableBio -> finishPin(pin, password, enableBio) },
+                        onCancel = if (gate == "change") {
+                            { changingPin = false }
+                        } else {
+                            null
+                        },
+                    )
+                } else if (gate == "unlock") {
+                    UnlockScreen(
+                        busy = lockBusy,
+                        error = lockError,
+                        biometrics = bioAvailable && app.store.biometricsOn && app.store.bioWrap.isNotBlank(),
+                        onSubmit = { submitPin(it) },
+                        onBiometric = { tryBio() },
+                    )
+                } else if (gate == "reauth") {
+                    ReauthScreen(
+                        email = netEmail.ifBlank { account },
+                        onEmail = { netEmail = it },
+                        busy = lockBusy,
+                        error = lockError,
+                        onSubmit = { reauth(it) },
+                    )
+                } else if (session != null) {
                     val sessionDecoder = remember {
                         ScreenDecoder { _, _ -> engine.keyframe() }
                     }
@@ -539,6 +866,7 @@ class MainActivity : ComponentActivity() {
                             if (decoder === sessionDecoder) decoder = null
                         }
                     }
+                    LaunchedEffect(session.id) { engine.keyframe() }
                     SessionScreen(
                         session = session,
                         onGesture = engine::gesture,
@@ -634,7 +962,7 @@ class MainActivity : ComponentActivity() {
                                     runCatching { CloudAuth.claimCurrentServer(token, address, fingerprint, device, "Android") }
                                 }
                                 result.onSuccess { session ->
-                                    applySignedIn(session, netEmail, null, signOutWhenDone, false)
+                                    applySignedIn(session, netEmail, null, signOutWhenDone, false, accountPassword = netPass)
                                 }.onFailure {
                                     netBusy = false
                                     netError = it.message ?: "Could not sign in."
@@ -673,7 +1001,12 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                                 result.onSuccess { session ->
-                                    applySignedIn(session, email, if (useKey) blob else null, signOutWhenDone, false)
+                                    val accountPassword = when {
+                                        useKey -> if (bound) pass else ""
+                                        useCode -> ""
+                                        else -> pass
+                                    }
+                                    applySignedIn(session, email, if (useKey) blob else null, signOutWhenDone, false, accountPassword = accountPassword)
                                 }.onFailure { err ->
                                     netBusy = false
                                     val cloud = err as? CloudAuthException
@@ -744,10 +1077,7 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
                                     onSignIn = if (account.isEmpty() && state.server.isNotEmpty()) {
-                                        {
-                                            signOutWhenDone = true
-                                            signingIn = true
-                                        }
+                                        { signingIn = true }
                                     } else {
                                         null
                                     },
@@ -760,6 +1090,7 @@ class MainActivity : ComponentActivity() {
                                         } else {
                                             app.store.networkEmail = ""
                                             app.store.saveNetworkRefresh("")
+                                            app.lockUi()
                                             engine.command(JSONObject().put("cmd", "accessToken").put("token", "").toString())
                                             account = ""
                                         }
@@ -773,7 +1104,7 @@ class MainActivity : ComponentActivity() {
                                     onQuery = { query = it },
                                     status = if (
                                         connecting && !promptBeforeConnect && !state.askPassword &&
-                                        state.status.startsWith("Connecting")
+                                        (state.status.startsWith("Connecting") || state.status.startsWith("Getting your PJDesk server"))
                                     ) {
                                         state.status
                                     } else {
@@ -784,10 +1115,12 @@ class MainActivity : ComponentActivity() {
                                     onForget = {
                                         app.store.forget(it.id)
                                         saved = app.store.saved()
+                                        syncPasswords(true)
                                     },
                                     onRemovePassword = {
-                                        app.store.saveComputerPassword(it.id, "")
+                                        app.store.stampPassword(it.id, "")
                                         saved = app.store.saved()
+                                        syncPasswords(true)
                                     },
                                     selfId = state.id,
                                     onRename = { computer, nickname ->
@@ -851,6 +1184,41 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onShareLogs = { AppLog.share(this@MainActivity) },
                                     onCheckUpdate = { engine.checkForUpdate() },
+                                    signedIn = account.isNotEmpty() && !temporarySession,
+                                    hasPin = app.store.hasPin(),
+                                    biometricsOn = app.store.biometricsOn,
+                                    biometricsAvailable = BioVault.available(this@MainActivity),
+                                    autoLockSeconds = app.store.autoLockSeconds,
+                                    onChangePin = { changingPin = true; lockError = "" },
+                                    onToggleBiometrics = { enabled ->
+                                        if (!enabled) {
+                                            app.store.biometricsOn = false
+                                            app.store.bioWrap = ""
+                                            BioVault.forget()
+                                        } else {
+                                            val key = app.vaultKey
+                                            if (key == null) {
+                                                scope.launch { snackbar.showSnackbar("Unlock PJDesk before turning on biometrics.") }
+                                            } else {
+                                                app.bioPrompt = true
+                                                BioVault.sealWithAuth(
+                                                    this@MainActivity,
+                                                    key,
+                                                    onSealed = { wrap ->
+                                                        app.bioPrompt = false
+                                                        app.store.bioWrap = wrap
+                                                        app.store.biometricsOn = true
+                                                    },
+                                                    onCancel = { app.bioPrompt = false },
+                                                    onError = {
+                                                        app.bioPrompt = false
+                                                        scope.launch { snackbar.showSnackbar(it) }
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    },
+                                    onAutoLock = { app.store.autoLockSeconds = it },
                                     onImportConfig = {
                                         val text = clipboardText()
                                         val blob = NetKey.blobIn(text)
@@ -928,12 +1296,10 @@ class MainActivity : ComponentActivity() {
                                 } else if (state.askRejected) {
                                     Text("Incorrect password. Enter the current one for this computer.")
                                 }
-                                OutlinedTextField(
+                                SecretField(
                                     value = askedPassword,
                                     onValueChange = { askedPassword = it },
-                                    singleLine = true,
-                                    label = { Text("Computer password") },
-                                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                                    label = "Computer password",
                                 )
                                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                                     Checkbox(checked = savePassword, onCheckedChange = { savePassword = it })
@@ -947,9 +1313,10 @@ class MainActivity : ComponentActivity() {
                                 if (typed.isBlank()) return@TextButton
                                 val id = connectId.filter { it.isDigit() }
                                 if (savePassword) {
-                                    app.store.saveComputerPassword(id, typed)
+                                    app.store.stampPassword(id, typed)
                                     if (temporarySession) app.store.noteTemporaryPassword(id)
                                     saved = app.store.saved()
+                                    syncPasswords(true)
                                 }
                                 askedPassword = ""
                                 if (state.askPassword) {

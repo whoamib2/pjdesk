@@ -4,9 +4,11 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import us.spader.pjdesk.core.SavedComputer
+import us.spader.pjdesk.core.VaultEntry
 import us.spader.pjdesk.core.isIdLabel
 import us.spader.pjdesk.core.nickname
 import java.io.File
+import java.util.Base64
 
 /**
  * App-private preferences. The permanent password is encrypted with an
@@ -154,7 +156,7 @@ class Store(context: Context) {
     /**
      * Fills the local Saved list from the account.
      * On first sign-in (`preferAccount`) the account nickname wins a conflict.
-     * A later refresh leaves a nickname typed on this phone. Passwords stay here.
+     * A later refresh leaves a nickname typed on this phone. Passwords are a separate sealed vault.
      */
     fun mergeCloud(remote: List<SavedComputer>, preferAccount: Boolean = false) {
         val local = saved().toMutableList()
@@ -239,6 +241,63 @@ class Store(context: Context) {
         get() = prefs.getString("networkDevice", "") ?: ""
         set(value) { prefs.edit().putString("networkDevice", value).apply() }
 
+    /** Last account server, so Connect can proceed if the engine has not applied it yet. */
+    var accountServer: String
+        get() = prefs.getString("accountServer", "") ?: ""
+        set(value) { prefs.edit().putString("accountServer", value).apply() }
+
+    var accountFingerprint: String
+        get() = prefs.getString("accountFingerprint", "") ?: ""
+        set(value) { prefs.edit().putString("accountFingerprint", value).apply() }
+
+    var pinWrap: String
+        get() = prefs.getString("pinWrap", "") ?: ""
+        set(value) { prefs.edit().putString("pinWrap", value).commit() }
+
+    var pinSalt: String
+        get() = prefs.getString("pinSalt", "") ?: ""
+        set(value) { prefs.edit().putString("pinSalt", value).commit() }
+
+    var bioWrap: String
+        get() = prefs.getString("bioWrap", "") ?: ""
+        set(value) { prefs.edit().putString("bioWrap", value).commit() }
+
+    var pinFails: Int
+        get() = prefs.getInt("pinFails", 0)
+        set(value) { prefs.edit().putInt("pinFails", value).commit() }
+
+    var biometricsOn: Boolean
+        get() = prefs.getBoolean("biometricsOn", false)
+        set(value) { prefs.edit().putBoolean("biometricsOn", value).commit() }
+
+    var autoLockSeconds: Int
+        get() {
+            val value = prefs.getInt("autoLockSeconds", 120)
+            return if (value == 60 || value == 120 || value == 300) value else 120
+        }
+        set(value) {
+            val kept = if (value == 60 || value == 120 || value == 300) value else 120
+            prefs.edit().putInt("autoLockSeconds", kept).apply()
+        }
+
+    fun hasPin(): Boolean = pinWrap.isNotEmpty() && pinSaltBytes()?.size == 16
+
+    fun pinSaltBytes(): ByteArray? = runCatching { Base64.getDecoder().decode(pinSalt) }.getOrNull()
+
+    fun savePinSalt(salt: ByteArray) {
+        pinSalt = Base64.getEncoder().encodeToString(salt)
+    }
+
+    fun clearPinMaterial() {
+        prefs.edit()
+            .putString("pinWrap", "")
+            .putString("pinSalt", "")
+            .putString("bioWrap", "")
+            .putInt("pinFails", 0)
+            .putBoolean("biometricsOn", false)
+            .commit()
+    }
+
     /** Minutes with no PJDesk activity before a temporary sign-in ends. */
     var tempIdleMinutes: Int
         get() = (prefs.getInt("tempIdleMinutes", 30)).coerceIn(1, 24 * 60)
@@ -282,7 +341,7 @@ class Store(context: Context) {
 
     fun saveNetworkRefresh(token: String): Boolean = refreshBlob.write(token)
 
-    /** A password for one remote computer. It stays in the Keystore on this phone. */
+    /** A password for one remote computer, sealed on this phone and synced as ciphertext. */
     fun computerPassword(id: String): String {
         val raw = passwordBlob.read()
         if (raw.isEmpty()) return ""
@@ -295,9 +354,64 @@ class Store(context: Context) {
         return passwordBlob.write(obj.toString())
     }
 
+    /** Saves a password or a deletion and stamps the time the account vault uses. */
+    fun stampPassword(id: String, password: String): Boolean {
+        if (id.length != 9) return false
+        val ok = saveComputerPassword(id, password)
+        val times = readTimes()
+        times.put(id, System.currentTimeMillis() / 1000)
+        writeTimes(times)
+        return ok
+    }
+
+    fun vaultEntries(): List<VaultEntry> {
+        val passwords = readPasswords()
+        val times = readTimes()
+        val ids = linkedSetOf<String>()
+        val passwordKeys = passwords.keys()
+        while (passwordKeys.hasNext()) {
+            val id = passwordKeys.next()
+            if (id.length == 9) ids.add(id)
+        }
+        val timeKeys = times.keys()
+        while (timeKeys.hasNext()) {
+            val id = timeKeys.next()
+            if (id.length == 9) ids.add(id)
+        }
+        return ids.map { id -> VaultEntry(id, passwords.optString(id), times.optLong(id)) }
+            .filter { it.password.isNotEmpty() || it.updated > 0 }
+    }
+
+    fun applyVault(entries: List<VaultEntry>) {
+        val passwords = readPasswords()
+        val times = readTimes()
+        for (entry in entries) {
+            if (entry.id.length != 9) continue
+            if (entry.password.isEmpty()) passwords.remove(entry.id) else passwords.put(entry.id, entry.password)
+            if (entry.updated > 0) times.put(entry.id, entry.updated) else times.remove(entry.id)
+        }
+        passwordBlob.write(passwords.toString())
+        writeTimes(times)
+    }
+
     fun forget(id: String) {
-        saveComputerPassword(id, "")
+        stampPassword(id, "")
         writeSaved(saved().filterNot { it.id == id })
+    }
+
+    private fun readPasswords(): JSONObject {
+        val raw = passwordBlob.read()
+        if (raw.isEmpty()) return JSONObject()
+        return runCatching { JSONObject(raw) }.getOrDefault(JSONObject())
+    }
+
+    private fun readTimes(): JSONObject {
+        val raw = prefs.getString("passwordTimes", "{}") ?: "{}"
+        return runCatching { JSONObject(raw) }.getOrDefault(JSONObject())
+    }
+
+    private fun writeTimes(obj: JSONObject) {
+        prefs.edit().putString("passwordTimes", obj.toString()).commit()
     }
 
     /** Computers this phone has connected to, newest first. Stays on this phone. */

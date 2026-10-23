@@ -40,10 +40,17 @@ pub struct Config {
     #[serde(default)]
     pub address_book: Vec<AddressEntry>,
     /// Remembered passwords for direct connections, by device ID (encrypted).
-    /// The account address book is the synced store; this is the local one.
-    /// Passwords stay on this computer. They are not uploaded.
+    /// The account also keeps a sealed copy. This file never stores them in
+    /// the clear, and the account service only stores ciphertext.
     #[serde(default)]
     pub(crate) saved_passwords: BTreeMap<String, String>,
+    /// When each saved password was last changed here, including a deletion.
+    /// An id with a time and no password was deleted.
+    #[serde(default)]
+    pub(crate) password_vault_times: BTreeMap<String, u64>,
+    /// Hex vault key, sealed with DPAPI. Empty for a temporary sign-in.
+    #[serde(default)]
+    pub password_vault_key: Option<String>,
     /// PJDesk account that owns the private server this client uses.
     #[serde(default)]
     pub network_email: Option<String>,
@@ -147,6 +154,10 @@ pub struct Settings {
 
 fn yes() -> bool {
     true
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(1)
 }
 fn default_theme() -> String {
     "system".into()
@@ -494,6 +505,8 @@ impl Config {
             writing.address_book = disk.address_book;
             writing.saved_hidden = disk.saved_hidden;
             writing.saved_passwords = disk.saved_passwords;
+            writing.password_vault_times = disk.password_vault_times;
+            writing.password_vault_key = disk.password_vault_key;
             writing.settings.peers = disk.settings.peers;
             let mut removed = disk.account_removed;
             for id in &self.account_removed {
@@ -527,6 +540,8 @@ impl Config {
             writing.saved_hidden.clear();
             writing.account_removed.clear();
             writing.saved_passwords.clear();
+            writing.password_vault_times.clear();
+            writing.password_vault_key = None;
             writing.settings.peers.clear();
             writing.server = None;
             writing.server_fingerprint = None;
@@ -657,6 +672,30 @@ impl Config {
         self.network_access = None;
         self.network_access_exp = 0;
         self.network_list_merged = false;
+        self.password_vault_key = None;
+    }
+
+    pub(crate) fn password_vault_times(&self) -> &BTreeMap<String, u64> {
+        &self.password_vault_times
+    }
+
+    pub(crate) fn saved_password_ids(&self) -> Vec<String> {
+        self.saved_passwords.keys().cloned().collect()
+    }
+
+    /// Stores a password or a deletion at a known time, without treating the
+    /// write as a new local edit.
+    pub fn set_saved_password_at(&mut self, id: &str, password: &str, updated: u64) {
+        let id = pjdesk_proto::normalize_id(id);
+        if !pjdesk_proto::is_valid_id(&id) {
+            return;
+        }
+        if password.is_empty() {
+            self.saved_passwords.remove(&id);
+        } else {
+            self.saved_passwords.insert(id.clone(), secure::protect(password));
+        }
+        self.password_vault_times.insert(id, updated);
     }
 
     pub fn is_saved_hidden(&self, id: &str) -> bool {
@@ -674,6 +713,7 @@ impl Config {
         }
         self.address_book.retain(|e| e.id != id);
         self.saved_passwords.remove(&id);
+        self.password_vault_times.insert(id.clone(), unix_now());
         if !self.saved_hidden.iter().any(|h| h == &id) {
             self.saved_hidden.push(id);
         }
@@ -688,6 +728,7 @@ impl Config {
         }
         self.address_book.retain(|e| e.id != id);
         self.saved_passwords.remove(&id);
+        self.password_vault_times.insert(id.clone(), unix_now());
         self.settings.peers.remove(&id);
         self.saved_hidden.retain(|h| h != &id);
         if !self.account_removed.iter().any(|h| h == &id) {
@@ -841,14 +882,9 @@ impl Config {
 
     /// Remembers (encrypted) or, with `None`, forgets a device's password.
     pub fn remember_password(&mut self, id: &str, password: Option<&str>) {
-        match password.filter(|p| !p.is_empty()) {
-            Some(pw) => {
-                self.saved_passwords.insert(id.to_string(), secure::protect(pw));
-            }
-            None => {
-                self.saved_passwords.remove(id);
-            }
-        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(1);
+        let password = password.unwrap_or("");
+        self.set_saved_password_at(id, password, now);
     }
 
     /// A remembered password for `id`. The encrypted local copy wins. A password

@@ -53,7 +53,7 @@ fun SignInScreen(
     onDismissImport: () -> Unit = {},
     offerCurrent: Boolean = false,
     onUseCurrent: () -> Unit = {},
-    temporary: Boolean = true,
+    temporary: Boolean = false,
     onTemporary: (Boolean) -> Unit = {},
     onEnrollOnly: () -> Unit = {},
 ) {
@@ -97,24 +97,12 @@ fun SignInScreen(
                         Text("Scan QR code")
                     }
                     if (accountForKey || error.contains("specific account")) {
-                        OutlinedTextField(
-                            value = email,
-                            onValueChange = onEmail,
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            label = { Text("Account email") },
-                        )
-                        SecretField(value = password, onValueChange = onPassword, label = "Account password")
+                    AccountEmailField(value = email, onValueChange = onEmail, label = "Account email")
+                    AccountPasswordField(value = password, onValueChange = onPassword, label = "Account password")
                     }
                 } else if (!useCode) {
-                    OutlinedTextField(
-                        value = email,
-                        onValueChange = onEmail,
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        label = { Text("Email") },
-                    )
-                    SecretField(value = password, onValueChange = onPassword, label = "PJDesk account password")
+                    AccountEmailField(value = email, onValueChange = onEmail, label = "Email")
+                    AccountPasswordField(value = password, onValueChange = onPassword, label = "PJDesk account password")
                 } else {
                     OutlinedTextField(
                         value = code,

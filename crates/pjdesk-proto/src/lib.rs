@@ -16,6 +16,7 @@
 
 pub mod access;
 pub mod netkey;
+pub mod vault;
 pub mod auth;
 pub mod discover;
 pub mod filesafe;

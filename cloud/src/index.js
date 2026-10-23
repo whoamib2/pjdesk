@@ -5,6 +5,9 @@
 //   auth_key = HMAC-SHA256(master, "pjdesk-cloud-auth")      → sent to sign in
 //   sync_key = HMAC-SHA256(master, "pjdesk-cloud-sync-key")  → stays on the server,
 //              seals the server copy (ChaCha20-Poly1305) before upload
+//   vault_key = HMAC-SHA256(master, "pjdesk-cloud-password-vault") → stays on the
+//              device. It seals saved computer passwords. The service stores
+//              only that ciphertext, never the key.
 // The service stores a salted PBKDF2 hash of auth_key and the sealed bytes.
 //
 // Routes:

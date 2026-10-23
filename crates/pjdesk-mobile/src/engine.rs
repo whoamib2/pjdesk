@@ -35,7 +35,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.10";
+pub const APP_VERSION: &str = "0.6.11";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -370,16 +370,33 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         }
         "server" => {
             let address = cmd.get("address").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let quiet = cmd.get("quiet").and_then(|v| v.as_bool()).unwrap_or(false);
             if ServerAddr::parse(&address).is_err() {
                 emit(cb, &json!({"event":"error","text":"That server address is not host or host:port."}));
+                log_line(cb, format!("server rejected address len={}", address.len()));
             } else {
-                *state.server.lock().unwrap() = address;
+                if let Some(fp) = cmd.get("fingerprint").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                    if let Ok(parsed) = pjdesk_proto::tls::parse_fingerprint(fp) {
+                        *state.fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&parsed));
+                    }
+                }
+                *state.server.lock().unwrap() = address.clone();
                 persist(state);
                 publish(state, cb);
-                emit(
+                log_line(
                     cb,
-                    &json!({"event":"status","text":"Server saved. Reconnect by leaving and opening PJDesk if the old server is still up."}),
+                    format!(
+                        "server set {} fingerprint={}",
+                        address,
+                        if state.fingerprint.lock().unwrap().is_some() { "set" } else { "missing" }
+                    ),
                 );
+                if !quiet {
+                    emit(
+                        cb,
+                        &json!({"event":"status","text":"Server saved. Reconnect by leaving and opening PJDesk if the old server is still up."}),
+                    );
+                }
             }
         }
         "resetFingerprint" => {

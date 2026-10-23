@@ -128,7 +128,7 @@ impl App {
                 if let Some(email) = self.cfg.network_email.as_deref().filter(|s| !s.is_empty()) {
                     ui.label(widgets::muted(
                         ui,
-                        &format!("Signed in as {email}. This list syncs with your account. Passwords stay on this computer."),
+                        &format!("Signed in as {email}. This list syncs with your account. Saved passwords sync too, encrypted so the server cannot read them."),
                     ));
                 } else {
                     ui.label(widgets::muted(ui, "Sign in at pjdesk.com to sync across your computers."));
@@ -295,7 +295,7 @@ impl App {
     }
 
     /// Adds a computer from Recent or On this network to the saved list.
-    /// Signed-in computers upload it. Passwords stay on this computer.
+    /// Signed-in computers upload it. Passwords travel in the sealed vault, not in this list.
     fn save_computer(&mut self, id: &str) {
         let id = normalize_id(id);
         if !pjdesk_proto::is_valid_id(&id) {
@@ -439,6 +439,7 @@ impl App {
                     entry.password = None;
                 }
                 self.sync_address_book();
+                self.sync_passwords(true);
                 self.toast.show("Saved password forgotten");
             }
             RowCmd::Remove(id) => self.confirm_remove = Some(id),

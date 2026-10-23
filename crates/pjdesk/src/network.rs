@@ -3,8 +3,9 @@
 //! Key derivation (600,000 rounds of PBKDF2) is slow on purpose. Call these
 //! functions from a background thread, never from the UI thread.
 //!
-//! Saved-computer passwords are not part of this. The list uploaded here is
-//! the nickname, the hostname, the ID, and the operating system.
+//! The saved-computer list uploaded here is the nickname, the hostname, the ID,
+//! and the operating system. Passwords travel separately, sealed, in the
+//! password vault.
 
 use std::time::Duration;
 
@@ -91,6 +92,8 @@ pub struct Session {
     pub presence: Vec<HostPresence>,
     /// PJDesk IDs deleted from the account. Empty when the service is older.
     pub removed: Vec<String>,
+    /// Present only when this sign-in had the account password. Not serialized.
+    pub vault_key: Option<[u8; 32]>,
 }
 
 /// A hostname is kept when a later update only has the raw IP it points at.
@@ -286,6 +289,31 @@ fn post_api(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> std::r
     }
 }
 
+pub fn fetch_password_vault(refresh: &str, device_id: &str) -> Result<String> {
+    let text = post_json(
+        &format!("{}/api/network/passwords", api_base()),
+        None,
+        &serde_json::json!({ "refresh": refresh, "device_id": device_id }),
+    )?;
+    let parsed: VaultReply = serde_json::from_str(&text).context("the account sent an unexpected password vault")?;
+    Ok(parsed.vault)
+}
+
+pub fn put_password_vault(refresh: &str, device_id: &str, vault: &str) -> Result<()> {
+    post_json(
+        &format!("{}/api/network/passwords", api_base()),
+        None,
+        &serde_json::json!({ "refresh": refresh, "device_id": device_id, "vault": vault }),
+    )?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct VaultReply {
+    #[serde(default)]
+    vault: String,
+}
+
 fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Session> {
     let network = reply.network.context("the account has no network")?;
     if network.active_address.trim().is_empty() {
@@ -333,6 +361,7 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
             })
             .collect(),
         removed: reply.removed.into_iter().map(|id| pjdesk_proto::normalize_id(&id)).filter(|id| pjdesk_proto::is_valid_id(id)).collect(),
+        vault_key: None,
     })
 }
 
@@ -363,7 +392,10 @@ pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) 
         Ok(text) => {
             let reply: NetworkReply = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
             match session_from(&email, device_id, reply) {
-                Ok(session) => Ok(SignIn::Ready(session)),
+                Ok(mut session) => {
+                    session.vault_key = Some(pjdesk_proto::access::derive_password_vault_key(&email, password));
+                    Ok(SignIn::Ready(session))
+                }
                 Err(err) if err.to_string() == NO_SERVER => {
                     Ok(SignIn::NoServer { role: "owner".into(), login_token: login.token })
                 }
@@ -506,6 +538,14 @@ pub fn redeem(blob: &str, passphrase: &str, device_id: &str, device_name: &str, 
     if session.standby_fingerprint.is_empty() {
         session.standby_fingerprint = opened.standby_fingerprint;
     }
+    if let Some((email, password)) = account {
+        if !email.trim().is_empty() && !password.is_empty() {
+            session.vault_key = Some(pjdesk_proto::access::derive_password_vault_key(email, password));
+            if session.email.is_empty() {
+                session.email = email.trim().to_lowercase();
+            }
+        }
+    }
     Ok(session)
 }
 
@@ -646,6 +686,7 @@ pub fn publish_this_computer(session: &Session, this: &ThisComputer, local: &[Sa
         next.address = session.address.clone();
         next.fingerprint = session.fingerprint.clone();
     }
+    next.vault_key = session.vault_key;
     Ok(next)
 }
 
@@ -674,6 +715,7 @@ pub fn enroll_known(
         computers: account.to_vec(),
         presence: Vec::new(),
         removed: Vec::new(),
+        vault_key: None,
     };
     let _ = publish_this_computer(&session, this, local)?;
     Ok(())
@@ -821,6 +863,12 @@ fn refresh_config_inner(config: &mut Config, force: bool) {
             }
             config.apply_network_session(&session);
             let _ = config.save();
+            if let Some(key) = crate::vault::key_from(config) {
+                let local = crate::vault::local_entries(config);
+                let refresh = config.network_refresh_token();
+                let device = config.network_device_id.clone().unwrap_or_default();
+                crate::vault::schedule(refresh, device, key, local, !config.ephemeral_network);
+            }
         }
         Err(err) => {
             let revoked = err.downcast_ref::<RefreshError>().is_some_and(|e| e.revoked);

@@ -13,7 +13,8 @@ import javax.crypto.spec.SecretKeySpec
 /**
  * PJDesk account sign-in. The 600,000-round derivation must run off the UI
  * thread. Only the auth key is sent. The sync key is derived and discarded
- * here, because this phone does not seal a server backup.
+ * The password-vault key is kept on the phone and seals saved computer
+ * passwords. pjdesk.com stores only that ciphertext.
  */
 object CloudAuth {
     const val API = "https://pjdesk.com"
@@ -34,12 +35,34 @@ object CloudAuth {
         return raw.lowercase().filter { it.isDigit() || it in 'a'..'f' }
     }
 
-    fun authKeyHex(email: String, password: String): String {
+    fun masterKey(email: String, password: String): ByteArray {
         val salt = MessageDigest.getInstance("SHA-256")
             .digest("pjdesk-cloud-v1\u0000${email.trim().lowercase()}".toByteArray())
         val spec = PBEKeySpec(password.toCharArray(), salt, 600_000, 256)
-        val master = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
-        return hmac(master, "pjdesk-cloud-auth").joinToString("") { "%02x".format(it) }
+        return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
+    }
+
+    fun authKeyHex(email: String, password: String): String =
+        hmac(masterKey(email, password), "pjdesk-cloud-auth").joinToString("") { "%02x".format(it) }
+
+    /** 32 bytes. Never send this. It seals the saved-computer password vault. */
+    fun vaultKey(email: String, password: String): ByteArray = hmac(masterKey(email, password), "pjdesk-cloud-password-vault")
+
+    fun fetchPasswordVault(refresh: String, deviceId: String): String {
+        val reply = post(
+            "$API/api/network/passwords",
+            null,
+            JSONObject().put("refresh", refresh).put("device_id", deviceId),
+        )
+        return reply.optString("vault")
+    }
+
+    fun putPasswordVault(refresh: String, deviceId: String, vault: String) {
+        post(
+            "$API/api/network/passwords",
+            null,
+            JSONObject().put("refresh", refresh).put("device_id", deviceId).put("vault", vault),
+        )
     }
 
     private fun hmac(key: ByteArray, data: String): ByteArray {

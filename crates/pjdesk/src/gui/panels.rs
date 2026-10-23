@@ -215,17 +215,17 @@ impl App {
                         self.net_key_account = true;
                         ui.add_space(8.0);
                         widgets::field_label(ui, "Account email");
-                        widgets::text_field(ui, &mut self.net_email, "you@example.com", false);
+                        widgets::account_email_field(ui, &mut self.net_email);
                         ui.add_space(8.0);
                         widgets::field_label(ui, "Account password");
-                        widgets::password_field(ui, &mut self.net_pass, "Password", &mut self.net_show);
+                        widgets::account_password_field(ui, &mut self.net_pass, &mut self.net_show);
                     }
                 } else if self.net_mode == 0 {
                     widgets::field_label(ui, "Email");
-                    widgets::text_field(ui, &mut self.net_email, "you@example.com", false);
+                    widgets::account_email_field(ui, &mut self.net_email);
                     ui.add_space(8.0);
                     widgets::field_label(ui, "PJDesk account password");
-                    widgets::password_field(ui, &mut self.net_pass, "Account password", &mut self.net_show);
+                    widgets::account_password_field(ui, &mut self.net_pass, &mut self.net_show);
                 } else {
                     widgets::field_label(ui, "Enrollment code");
                     widgets::text_field(ui, &mut self.net_code, "ABCD-EFGH", true);

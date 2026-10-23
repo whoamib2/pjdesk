@@ -24,6 +24,7 @@ class Engine(context: Context) : EngineListener {
     private val store = Store(app)
     private val main = Handler(Looper.getMainLooper())
     private val handle = AtomicLong(0)
+    private val pending = ArrayDeque<String>()
     /** One retry when a registration event disagrees with the Keystore, so a stale event cannot loop. */
     private var permanentRepush = false
 
@@ -63,6 +64,7 @@ class Engine(context: Context) : EngineListener {
         command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
         pushTrusted()
         setCapturing(us.spader.pjdesk.service.HostService.capturing)
+        flushCommands()
     }
 
     /** MediaProjection is producing frames, or it stopped. */
@@ -101,7 +103,33 @@ class Engine(context: Context) : EngineListener {
 
     fun command(json: String) {
         val h = handle.get()
-        if (h != 0L) Native.nativeCommand(h, json)
+        if (h == 0L) {
+            synchronized(pending) {
+                if (pending.size >= 40) pending.removeFirst()
+                pending.addLast(json)
+            }
+            return
+        }
+        Native.nativeCommand(h, json)
+    }
+
+    private fun flushCommands() {
+        val h = handle.get()
+        if (h == 0L) return
+        val queued = synchronized(pending) {
+            val copy = pending.toList()
+            pending.clear()
+            copy
+        }
+        queued.forEach { Native.nativeCommand(h, it) }
+    }
+
+    /** Account sync sets the address and pinned key without replacing "Connecting…". */
+    fun applyAccountServer(address: String, fingerprint: String = "", quiet: Boolean = true) {
+        if (address.isBlank()) return
+        val body = JSONObject().put("cmd", "server").put("address", address).put("quiet", quiet)
+        if (fingerprint.isNotBlank()) body.put("fingerprint", fingerprint)
+        command(body.toString())
     }
 
     fun submitVideo(data: ByteArray, width: Int, height: Int, keyframe: Boolean, encodeUs: Int) {
@@ -264,7 +292,7 @@ class Engine(context: Context) : EngineListener {
     }
 
     fun regenerate() = command("""{"cmd":"regenerate"}""")
-    fun setServer(address: String) = command(JSONObject().put("cmd", "server").put("address", address).toString())
+    fun setServer(address: String) = applyAccountServer(address, "", quiet = false)
     fun resetFingerprint() = command("""{"cmd":"resetFingerprint"}""")
     fun captureSize(width: Int, height: Int) =
         command(JSONObject().put("cmd", "capture").put("width", width).put("height", height).toString())

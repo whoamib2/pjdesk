@@ -705,6 +705,7 @@ impl App {
         self.account_computers.clear();
         self.temp_left = 0;
         crate::temp_sign::clear_marker();
+        crate::vault::clear_session_key();
         self.engine.retarget(&self.cfg);
         self.settings.set_server_text(&self.cfg.effective_server());
         self.toast.show("Signed out");
@@ -1113,8 +1114,15 @@ impl App {
                 let temporary = self.pending_temporary;
                 self.pending_temporary = false;
                 self.pending_enroll_only = false;
+                if let Some(key) = session.vault_key.take() {
+                    crate::vault::set_session_key(key);
+                    if !temporary {
+                        self.cfg.password_vault_key = Some(crate::secure::protect(&hex::encode(key)));
+                    }
+                }
                 if temporary {
                     self.begin_temporary(session);
+                    self.sync_passwords(false);
                 } else {
                     self.note_enrolled(&session.computers);
                     self.cfg.apply_network_session(&session);
@@ -1123,6 +1131,7 @@ impl App {
                     self.save_cfg();
                     crate::network::copy_to_service(&self.cfg);
                     self.engine.retarget(&self.cfg);
+                    self.sync_passwords(true);
                     if imported {
                         self.toast.show("Import server configuration successfully");
                     } else {
@@ -1148,6 +1157,36 @@ impl App {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.net_busy = false;
                 self.net_rx = None;
+            }
+        }
+    }
+
+    fn sync_passwords(&mut self, upload: bool) {
+        let Some(key) = crate::vault::key_from(&self.cfg) else { return };
+        let refresh = self.cfg.network_refresh_token();
+        let device = self.cfg.network_device_id.clone().unwrap_or_default();
+        let local = if upload { crate::vault::local_entries(&self.cfg) } else { Vec::new() };
+        crate::vault::schedule(refresh, device, key, local, upload);
+    }
+
+    fn poll_vault(&mut self) {
+        let Some(result) = crate::vault::take_result() else { return };
+        match result {
+            Ok(entries) => {
+                let ephemeral = self.cfg.ephemeral_network;
+                crate::vault::apply_entries(&mut self.cfg, &entries);
+                if ephemeral {
+                    for entry in &entries {
+                        if !entry.password.is_empty() {
+                            crate::temp_sign::note_password(&entry.id);
+                        }
+                    }
+                } else if let Err(e) = self.cfg.save() {
+                    self.status = format!("Could not save settings: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::info!("password vault: {e}");
             }
         }
     }
@@ -1778,6 +1817,7 @@ impl App {
                 if is_valid_id(&id) && !self.prompt_password.is_empty() {
                     self.cfg.remember_password(&id, Some(&self.prompt_password));
                     let _ = self.cfg.save();
+                    self.sync_passwords(true);
                 }
             }
             self.prompt_open = false;
@@ -2059,6 +2099,7 @@ impl eframe::App for App {
         let ctx = self.ctx.clone();
         self.poll_login();
         self.poll_network();
+        self.poll_vault();
         self.poll_temporary(&ctx);
         self.poll_self_enroll();
         self.maybe_pull_account();

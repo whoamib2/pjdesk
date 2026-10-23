@@ -157,6 +157,23 @@ pub fn derive_account_keys(email: &str, password: &str) -> ([u8; 32], [u8; 32]) 
     (auth, sync)
 }
 
+/// Key for the saved-computer password vault. It is derived like the Cloud Sync
+/// key and never sent to pjdesk.com. The service stores only ciphertext sealed
+/// with this key.
+pub fn derive_password_vault_key(email: &str, password: &str) -> [u8; 32] {
+    let email = email.trim().to_lowercase();
+    let salt = Sha256::digest(format!("pjdesk-cloud-v1\0{email}").as_bytes());
+    let mut master = [0u8; 32];
+    ring::pbkdf2::derive(
+        ring::pbkdf2::PBKDF2_HMAC_SHA256,
+        std::num::NonZeroU32::new(600_000).expect("non-zero"),
+        &salt,
+        password.as_bytes(),
+        &mut master,
+    );
+    hmac32(&master, "pjdesk-cloud-password-vault")
+}
+
 fn hmac32(key: &[u8], data: &str) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC takes any key length");
     mac.update(data.as_bytes());

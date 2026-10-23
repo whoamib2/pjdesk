@@ -373,6 +373,22 @@ function cleanComputer(row) {
 }
 
 /** Fields the account stores for one saved computer. Passwords are not among them. */
+/** Null when `text` is empty or a sealed PJVAULT1 blob. A string is the reason to reject it. */
+export function acceptVault(text) {
+  if (text == null || text === "") return null;
+  if (typeof text !== "string") return "That password copy is not valid.";
+  if (text.length > 200000) return "That password copy is too large.";
+  let raw;
+  try {
+    raw = atob(text);
+  } catch {
+    return "That password copy is not valid.";
+  }
+  if (raw.length < 8 + 12 + 16) return "That password copy is not valid.";
+  if (raw.slice(0, 8) !== "PJVAULT1") return "That password copy is not valid.";
+  return null;
+}
+
 export function savedShape(row) {
   return cleanComputer(row);
 }
@@ -868,6 +884,7 @@ async function handle(request, env, url) {
 
   if (p === "/api/network/enroll" && m === "POST") return enroll(request, env);
   if (p === "/api/network/refresh" && m === "POST") return refresh(request, env);
+  if (p === "/api/network/passwords" && m === "POST") return passwordVault(request, env);
   if (p === "/api/network/redeem" && m === "POST") return redeem(request, env);
   if (p === "/api/network/computers/delete" && m === "POST") return deleteComputer(request, env);
 
@@ -1126,6 +1143,70 @@ async function writeSlots(env, row, next) {
       row.id,
     )
     .run();
+}
+
+async function openedDevice(env, body) {
+  const refreshToken = String(body.refresh || "");
+  const deviceId = String(body.device_id || "");
+  if (!validDevice(deviceId) || !/^[0-9a-f]{64}$/.test(refreshToken)) throw new HttpError(401, "Sign in required.");
+  const hash = await sha256Hex(refreshToken);
+  const row = await env.DB.prepare(
+    `SELECT d.network_id, d.account_id, d.email, d.revoked_at, d.enrolled_at
+       FROM network_devices d WHERE d.device_id = ? AND d.refresh_hash = ?`,
+  )
+    .bind(deviceId, hash)
+    .first();
+  if (!row || row.revoked_at) throw new HttpError(401, "Sign in required.");
+  if (now() - row.enrolled_at > REFRESH_TTL) throw new HttpError(401, "Sign in required.");
+  const network = await env.DB.prepare("SELECT owner_id FROM networks WHERE id = ?").bind(row.network_id).first();
+  if (!network) throw new HttpError(401, "Sign in required.");
+  const owner = await env.DB.prepare("SELECT email FROM accounts WHERE id = ?").bind(network.owner_id).first();
+  const member = await env.DB.prepare(
+    "SELECT revoked_at FROM network_members WHERE network_id = ? AND email = ?",
+  )
+    .bind(row.network_id, row.email)
+    .first();
+  if (member?.revoked_at) throw new HttpError(401, "Sign in required.");
+  if (owner?.email !== row.email && !member) throw new HttpError(401, "Sign in required.");
+  return { networkId: row.network_id, accountId: row.account_id, email: row.email };
+}
+
+async function passwordVault(request, env) {
+  const body = await readJson(request);
+  const device = await openedDevice(env, body);
+  if (Object.prototype.hasOwnProperty.call(body, "vault")) {
+    const vault = String(body.vault ?? "");
+    const problem = acceptVault(vault);
+    if (problem) throw new HttpError(400, problem);
+    const updated = now();
+    try {
+      await env.DB.prepare(
+        `INSERT INTO network_password_vault (network_id, account_id, ciphertext, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(network_id, account_id) DO UPDATE SET
+           ciphertext = excluded.ciphertext, updated_at = excluded.updated_at`,
+      )
+        .bind(device.networkId, device.accountId, vault, updated)
+        .run();
+    } catch (err) {
+      if (/no such table/i.test(String(err?.message || err))) {
+        throw new HttpError(503, "Password sync is not ready yet. Run cloud\\deploy.cmd.");
+      }
+      throw err;
+    }
+    return json({ ok: true, updated_at: updated });
+  }
+  try {
+    const row = await env.DB.prepare(
+      "SELECT ciphertext, updated_at FROM network_password_vault WHERE network_id = ? AND account_id = ?",
+    )
+      .bind(device.networkId, device.accountId)
+      .first();
+    return json({ vault: row?.ciphertext || "", updated_at: row?.updated_at || 0 });
+  } catch (err) {
+    if (/no such table/i.test(String(err?.message || err))) return json({ vault: "", updated_at: 0 });
+    throw err;
+  }
 }
 
 async function refresh(request, env) {

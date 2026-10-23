@@ -33,6 +33,7 @@ mod session;
 mod signaling;
 mod syspaths;
 mod temp_sign;
+mod vault;
 mod viewer;
 
 use std::io::{BufRead, Write};

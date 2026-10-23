@@ -71,7 +71,7 @@ fun SavedScreen(
         Text(
             when {
                 recentTab -> "Computers you have connected to on this phone."
-                signedIn -> "This list syncs with your account. Passwords stay on this phone."
+                signedIn -> "This list syncs with your account. Saved passwords sync too, encrypted so the server cannot read them."
                 else -> "Sign in at pjdesk.com to sync across your computers. This list stays on this phone."
             },
             color = pjMuted(),

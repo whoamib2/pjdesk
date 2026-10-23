@@ -70,6 +70,41 @@ pub fn field_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
 }
 
+/// Account email. The widget id is stable so a password manager that can see
+/// this window (Windows UI Automation) can treat it as the username.
+pub fn account_email_field(ui: &mut egui::Ui, value: &mut String) -> egui::Response {
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .id(egui::Id::new("pjdesk-account-username"))
+            .hint_text("you@example.com")
+            .desired_width(f32::INFINITY)
+            .margin(egui::Margin::symmetric(12, 10)),
+    )
+}
+
+/// Account password, with Show / Hide. The widget id is the current-password field.
+pub fn account_password_field(ui: &mut egui::Ui, value: &mut String, shown: &mut bool) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let show_w = 64.0;
+        let width = (ui.available_width() - show_w - 8.0).max(48.0);
+        let resp = ui.add(
+            egui::TextEdit::singleline(value)
+                .id(egui::Id::new("pjdesk-account-password"))
+                .hint_text("Password")
+                .password(!*shown)
+                .desired_width(width)
+                .margin(egui::Margin::symmetric(12, 10)),
+        );
+        let label = if *shown { "Hide" } else { "Show" };
+        if ui.add_sized([show_w, 36.0], egui::Button::new(label)).on_hover_text(label).clicked() {
+            *shown = !*shown;
+        }
+        resp
+    })
+    .inner
+}
+
 pub fn text_field(ui: &mut egui::Ui, value: &mut String, hint: &str, monospace: bool) -> egui::Response {
     let font = if monospace { egui::TextStyle::Monospace } else { egui::TextStyle::Body };
     ui.add(

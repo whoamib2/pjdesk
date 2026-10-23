@@ -90,6 +90,8 @@ features = [
 windows-service = "0.8"
 # System-tray icon + menu (minimize-to-tray, Show/Quit).
 tray-icon = "0.26"
+# UI Automation so a password manager can see the account email and password fields.
+eframe = { version = "0.36", default-features = false, features = ["accesskit"] }
 
 [build-dependencies]
 # Embeds the app icon + version metadata into the Windows .exe.
