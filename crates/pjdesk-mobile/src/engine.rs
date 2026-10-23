@@ -35,7 +35,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.9";
+pub const APP_VERSION: &str = "0.6.10";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -409,17 +409,52 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         "connect" => {
             let id = normalize_id(cmd.get("id").and_then(|v| v.as_str()).unwrap_or(""));
             let password = cmd.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let ask_now = cmd.get("ask").and_then(|v| v.as_bool()).unwrap_or(false);
+            let label = cmd.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let shown = if label.is_empty() { format_id(&id) } else { label.to_string() };
+            let server_text = state.server.lock().unwrap().clone();
+            let pw = if ask_now {
+                "ask-person"
+            } else if password.is_empty() {
+                "none"
+            } else {
+                "present"
+            };
+            log_line(
+                cb,
+                format!(
+                    "connect id={} name={} password={} server={}",
+                    format_id(&id),
+                    if shown.is_empty() { "(unnamed)" } else { shown.as_str() },
+                    pw,
+                    if server_text.trim().is_empty() { "missing" } else { server_text.trim() },
+                ),
+            );
             if !is_valid_id(&id) {
                 emit(cb, &json!({"event":"error","text":"That isn't a 9-digit PJDesk ID."}));
                 return;
             }
+            if server_text.trim().is_empty() {
+                emit(
+                    cb,
+                    &json!({"event":"error","text":"This phone has no server address yet. Sign in again, or set the server in Settings."}),
+                );
+                return;
+            }
+            emit(cb, &json!({"event":"status","text": format!("Connecting to {shown}…")}));
             state.gen.fetch_add(1, Ordering::SeqCst);
             let gen = state.gen.load(Ordering::SeqCst);
             let (state, cb) = (state.clone(), cb.clone());
             tokio::spawn(async move {
-                if let Err(e) = controller_session(state.clone(), cb.clone(), &id, &password, gen).await {
-                    emit(&cb, &json!({"event":"error","text": format!("{e:#}")}));
-                    emit(&cb, &json!({"event":"disconnected","role":"controller","reason": format!("{e:#}")}));
+                if let Err(e) = controller_session(state.clone(), cb.clone(), &id, &password, gen, ask_now).await {
+                    let raw = format!("{e:#}");
+                    let head = raw.lines().next().unwrap_or("").trim().to_string();
+                    log_line(&cb, format!("connect ended: {head}"));
+                    if let Some(text) = surfaced_connect_error(&head) {
+                        let text = explain_connect_error(&id, "", &anyhow::Error::msg(text));
+                        emit(&cb, &json!({"event":"error","text": &text}));
+                        emit(&cb, &json!({"event":"disconnected","role":"controller","reason": &text}));
+                    }
                 }
             });
         }
@@ -1143,6 +1178,43 @@ async fn host_session(
 /// Shown to the controller until MediaProjection is producing frames.
 const SCREEN_WAIT: &str = "Waiting for the phone to allow screen sharing";
 
+/// A replaced Connect (`stopped`) or a dismissed password (`cancelled`) is not a failure to show.
+fn surfaced_connect_error(raw: &str) -> Option<String> {
+    let text = raw.trim();
+    let head = text.lines().next().unwrap_or(text).trim();
+    if head.is_empty() || head == "stopped" || head == "cancelled" {
+        None
+    } else {
+        Some(head.to_string())
+    }
+}
+
+/// Turns a transport failure into a sentence the phone can show. The password is never included.
+fn explain_connect_error(target: &str, host_name: &str, err: &anyhow::Error) -> String {
+    let raw = format!("{err:#}");
+    let head = raw.lines().next().unwrap_or(&raw).trim();
+    let lower = head.to_ascii_lowercase();
+    let who = if host_name.trim().is_empty() { format_id(target) } else { host_name.trim().to_string() };
+    if lower.contains("even through the relay") {
+        format!("Could not reach {who}, even through the relay.")
+    } else if lower.contains("did not respond") || lower.contains("did not finish setting up") || lower.contains("is offline") {
+        if head.contains(&who) {
+            head.to_string()
+        } else {
+            format!("{who} is offline, or it did not answer.")
+        }
+    } else if lower.contains("server address is empty") || lower.contains("no server address") {
+        "This phone has no server address yet. Sign in again, or set the server in Settings.".into()
+    } else if lower.contains("cannot reach the pjdesk server")
+        || lower.contains("timed out connecting to the server")
+        || lower.contains("tls handshake")
+    {
+        format!("Could not reach the PJDesk server, so {who} could not be connected.")
+    } else {
+        head.to_string()
+    }
+}
+
 /// A reason the Windows client can show instead of a generic picture timeout.
 fn screen_share_failure(reason: &str) -> String {
     let text = reason.trim();
@@ -1390,10 +1462,14 @@ async fn controller_session(
     target: &str,
     password: &str,
     gen: u64,
+    ask_now: bool,
 ) -> Result<()> {
     *state.end_reason.lock().unwrap() = String::new();
-    emit(&cb, &json!({"event":"status","text": format!("Connecting to {}", format_id(target))}));
-    let server = ServerAddr::parse(&state.server.lock().unwrap())?;
+    let server_text = state.server.lock().unwrap().clone();
+    if server_text.trim().is_empty() {
+        bail!("This phone has no server address yet. Sign in again, or set the server in Settings.");
+    }
+    let server = ServerAddr::parse(&server_text)?;
     let pinned = state.fingerprint.lock().unwrap().clone().and_then(|s| pjdesk_proto::tls::parse_fingerprint(&s).ok());
     let mut signal = SignalClient::connect(&server, pinned).await?;
     if let Some(fp) = signal.observed {
@@ -1421,7 +1497,7 @@ async fn controller_session(
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
             Ok(Some(_)) => continue,
             Ok(None) => bail!("the server closed the connection"),
-            Err(_) => bail!("the host did not respond"),
+            Err(_) => bail!("{} is offline, or it did not answer.", format_id(target)),
         }
     };
     let server_udp = SocketAddr::new(signal.server_addr.ip(), udp_port);
@@ -1439,17 +1515,17 @@ async fn controller_session(
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
             Ok(Some(_)) => continue,
             Ok(None) => bail!("the server closed the connection"),
-            Err(_) => bail!("the host did not finish setting up the connection"),
+            Err(_) => bail!("{} is offline, or it did not answer.", format_id(target)),
         }
     };
     drop(signal);
     let endpoint = p2p::controller_endpoint(binding.socket, fingerprint)?;
     let candidates = p2p::candidates(peer_public, &peer_local);
-    let mut password = password.to_string();
+    let mut password = if ask_now { String::new() } else { password.to_string() };
     let mut from_store = !password.is_empty();
     let mut rejected = false;
     let mut note = String::new();
-    let mut ask_person = false;
+    let mut ask_person = ask_now;
     let (connection, path, auth) = loop {
         if password.is_empty() && !ask_person {
             emit(
@@ -1479,7 +1555,14 @@ async fn controller_session(
         if let Some(punching) = punching {
             punching.abort();
         }
-        let (connection, path) = connected?;
+        let (connection, path) = match connected {
+            Ok(pair) => pair,
+            Err(e) => {
+                let text = explain_connect_error(target, &host_name, &e);
+                log_line(&cb, format!("connect failed: {text}"));
+                return Err(anyhow::Error::msg(text));
+            }
+        };
         let authed = if ask_person {
             session::controller_ask_person(&connection, &state.hostname).await
         } else {
@@ -1489,10 +1572,15 @@ async fn controller_session(
             Ok(auth) => break (connection, path, auth),
             Err(e) if e.is::<LockedOut>() => {
                 connection.close(1u32.into(), b"locked out");
+                log_line(&cb, format!("connect locked out: {e}"));
                 bail!(e.to_string());
             }
             Err(e) if e.is::<WrongPassword>() => {
                 connection.close(1u32.into(), b"authentication failed");
+                log_line(
+                    &cb,
+                    format!("incorrect password for {} (saved cleared: {from_store})", format_id(target)),
+                );
                 let mut text = format!("Incorrect password for {}", format_id(target));
                 if from_store {
                     emit(&cb, &json!({"event":"clearSaved","id": target}));
@@ -1516,6 +1604,7 @@ async fn controller_session(
         LinkPath::Direct(_) => "Internet",
         LinkPath::Relay(_) => "Internet, relayed",
     };
+    log_line(&cb, format!("controlling {peer} via {path}"));
     emit(
         &cb,
         &json!({
@@ -1710,6 +1799,35 @@ mod tests {
             assert!(!host_accepts_typed(&passwords, "wrong horse battery"));
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_failures_name_the_relay_the_offline_host_and_a_lockout() {
+        assert_eq!(surfaced_connect_error("stopped"), None);
+        assert_eq!(surfaced_connect_error("cancelled"), None);
+        assert_eq!(surfaced_connect_error(""), None);
+        let relay = anyhow::anyhow!("could not reach the host, even through the relay");
+        assert_eq!(
+            explain_connect_error("902488771", "Cabin Desk", &relay),
+            "Could not reach Cabin Desk, even through the relay."
+        );
+        let offline = anyhow::anyhow!("the host did not respond");
+        assert_eq!(
+            explain_connect_error("902488771", "", &offline),
+            "902 488 771 is offline, or it did not answer."
+        );
+        let locked = anyhow::anyhow!("locked out, try again in 20 minutes");
+        assert_eq!(explain_connect_error("902488771", "Cabin Desk", &locked), "locked out, try again in 20 minutes");
+        let empty = anyhow::anyhow!("the server address is empty");
+        assert_eq!(
+            explain_connect_error("902488771", "Cabin Desk", &empty),
+            "This phone has no server address yet. Sign in again, or set the server in Settings."
+        );
+        let down = anyhow::anyhow!("timed out connecting to the server at pjdesk.spader.us:21200");
+        assert_eq!(
+            explain_connect_error("902488771", "Cabin Desk", &down),
+            "Could not reach the PJDesk server, so Cabin Desk could not be connected."
+        );
     }
 
     #[test]

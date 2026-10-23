@@ -4,20 +4,18 @@ rem Signs an unsigned PJDesk APK with apksigner.
 rem Passwords are asked in this window when they are not already in the
 rem environment, and they are not written to a file.
 rem
-rem   android\sign-release.cmd PJDesk-Android-0.6.9-unsigned.apk
+rem   android\sign-release.cmd PJDesk-Android-0.6.10-unsigned.apk
 rem   android\sign-release.cmd unsigned.apk signed.apk
 rem
 rem Environment, all optional:
-rem   PJDESK_KEYSTORE
-rem   PJDESK_KEY_ALIAS
+rem   PJDESK_KEYSTORE   default C:\Users\BenSpader\.pjdesk-android\pjdesk-release.jks
+rem   PJDESK_KEY_ALIAS  default pjdesk
 rem   PJDESK_KEYSTORE_PASSWORD
 rem   PJDESK_KEY_PASSWORD
 rem   ANDROID_HOME
 rem
-rem If PJDESK_KEYSTORE is unset and this file exists, it is the suggested path:
-rem   C:\Users\BenSpader\AndroidStudioProjects\upload.jks
-rem That file is not confirmed to be the key that signed the installed app.
-rem Sign with the same key or the phone will refuse the update.
+rem The release key is C:\Users\BenSpader\.pjdesk-android\pjdesk-release.jks, alias pjdesk.
+rem Sign with that key or the phone will refuse the update. Passwords are not saved.
 
 if "%~1"=="" goto usage
 set "PJDESK_IN=%~f1"
@@ -31,21 +29,13 @@ if "%~2"=="" (
   set "PJDESK_OUT=%~f2"
 )
 
-if not defined PJDESK_KEYSTORE (
-  if exist "C:\Users\BenSpader\AndroidStudioProjects\upload.jks" (
-    set "PJDESK_KEYSTORE=C:\Users\BenSpader\AndroidStudioProjects\upload.jks"
-    echo Using keystore C:\Users\BenSpader\AndroidStudioProjects\upload.jks
-    echo If that is not the key that signed the installed app, type a different path.
-  )
-)
-if not defined PJDESK_KEYSTORE set /p PJDESK_KEYSTORE=Keystore path: 
+if not defined PJDESK_KEYSTORE set "PJDESK_KEYSTORE=C:\Users\BenSpader\.pjdesk-android\pjdesk-release.jks"
+if not defined PJDESK_KEY_ALIAS set "PJDESK_KEY_ALIAS=pjdesk"
+echo Using keystore %PJDESK_KEYSTORE%
+echo Using alias %PJDESK_KEY_ALIAS%
 if not exist "%PJDESK_KEYSTORE%" (
   echo Keystore not found: %PJDESK_KEYSTORE%
-  exit /b 1
-)
-if not defined PJDESK_KEY_ALIAS set /p PJDESK_KEY_ALIAS=Key alias: 
-if "%PJDESK_KEY_ALIAS%"=="" (
-  echo A key alias is required.
+  echo Set PJDESK_KEYSTORE if the release key is somewhere else.
   exit /b 1
 )
 

@@ -49,6 +49,8 @@ import org.json.JSONObject
 import us.spader.pjdesk.core.CloudAuth
 import us.spader.pjdesk.core.CloudAuthException
 import us.spader.pjdesk.core.NetKey
+import us.spader.pjdesk.core.connectFailureText
+import us.spader.pjdesk.core.connectStatusLabel
 import us.spader.pjdesk.ui.SignInScreen
 import java.util.UUID
 import us.spader.pjdesk.a11y.PjAccessibilityService
@@ -285,6 +287,76 @@ class MainActivity : ComponentActivity() {
                 }
             }
             var askedPassword by remember { mutableStateOf("") }
+            var promptBeforeConnect by remember { mutableStateOf(false) }
+            var connecting by remember { mutableStateOf(false) }
+            var connectError by remember { mutableStateOf<String?>(null) }
+            var offlineRetry by remember { mutableStateOf<SavedComputer?>(null) }
+            var lastConnectMs by remember { mutableLongStateOf(0L) }
+            fun launchConnect(id: String, name: String, password: String, askPerson: Boolean = false) {
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (connecting && now - lastConnectMs < 700) {
+                    AppLog.i("Connect ignored, already starting $id")
+                    return
+                }
+                lastConnectMs = now
+                promptBeforeConnect = false
+                connecting = true
+                connectError = null
+                offlineRetry = null
+                val digits = id.filter { it.isDigit() }
+                app.store.touchRecent(digits)
+                recentIds = app.store.recentIds()
+                val label = connectStatusLabel(name, digits)
+                AppLog.i("$label password=${if (askPerson) "ask-person" else if (password.isEmpty()) "none" else "present"}")
+                engine.showStatus(label)
+                engine.connect(digits, if (askPerson) "" else password, askPerson, name)
+            }
+            fun beginConnect(rawId: String, ignoreOffline: Boolean = false) {
+                val digits = rawId.filter { it.isDigit() }
+                val computer = saved.firstOrNull { it.id == digits }
+                val name = connectComputerName(saved, digits)
+                val savedPassword = app.store.computerPassword(digits)
+                val knownOffline = computer != null && !computer.online && (
+                    computer.lastSeen > 0 ||
+                        computer.hostname.isNotBlank() ||
+                        computer.displayName.isNotBlank() ||
+                        computer.osFamily.isNotBlank()
+                    )
+                AppLog.i(
+                    "Connect tapped id=$digits name=${name.ifBlank { "(none)" }} online=${computer?.online} " +
+                        "password=${if (savedPassword.isEmpty()) "none" else "saved"} " +
+                        "server=${if (state.server.isBlank()) "missing" else "set"}",
+                )
+                connectId = digits
+                if (digits.length != 9) {
+                    connecting = false
+                    connectError = "That isn't a 9-digit PJDesk ID."
+                    AppLog.e(connectError.orEmpty())
+                    return
+                }
+                if (state.server.isBlank()) {
+                    connecting = false
+                    connectError = "This phone has no server address yet. Sign in again, or set the server in Settings."
+                    AppLog.e(connectError.orEmpty())
+                    return
+                }
+                if (knownOffline && !ignoreOffline) {
+                    connecting = false
+                    offlineRetry = computer
+                    val who = name.ifBlank { computer?.hostname?.ifBlank { null } ?: "That computer" }
+                    connectError = "$who is offline."
+                    AppLog.i(connectError.orEmpty())
+                    return
+                }
+                if (savedPassword.isEmpty()) {
+                    promptBeforeConnect = true
+                    askedPassword = ""
+                    savePassword = true
+                    AppLog.i("Connect asking for a password for ${name.ifBlank { digits }}")
+                    return
+                }
+                launchConnect(digits, name, savedPassword)
+            }
             val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
                 if (granted) netScan = true else netError = "Camera permission is needed to scan a network key."
             }
@@ -398,8 +470,35 @@ class MainActivity : ComponentActivity() {
             }
             LaunchedEffect(state.error) {
                 val text = state.error ?: return@LaunchedEffect
-                snackbar.showSnackbar(text)
+                val friendly = connectFailureText(text, connectComputerName(saved, connectId))
+                if (friendly == null) {
+                    AppLog.i("connect attempt ended quietly: $text")
+                    engine.dismissError()
+                    return@LaunchedEffect
+                }
+                if (connecting) {
+                    connectError = friendly
+                    offlineRetry = null
+                    connecting = false
+                    AppLog.e("connect failed: $friendly")
+                } else {
+                    snackbar.showSnackbar(friendly)
+                }
                 engine.dismissError()
+            }
+            LaunchedEffect(state.askPassword, state.askRejected, state.askNote) {
+                if (!state.askPassword) return@LaunchedEffect
+                connecting = false
+                promptBeforeConnect = false
+                saved = app.store.saved()
+                AppLog.i("password needed rejected=${state.askRejected}")
+            }
+            LaunchedEffect(state.session?.id) {
+                if (state.session != null) {
+                    connecting = false
+                    promptBeforeConnect = false
+                    connectError = null
+                }
             }
             LaunchedEffect(state.notice) {
                 val text = state.notice ?: return@LaunchedEffect
@@ -623,15 +722,7 @@ class MainActivity : ComponentActivity() {
                                     connectId = connectId,
                                     connectName = connectComputerName(saved, connectId),
                                     onConnectId = { connectId = it },
-                                    onConnect = {
-                                        val id = connectId.filter { it.isDigit() }
-                                        val password = app.store.computerPassword(id)
-                                        if (id.length == 9) {
-                                            app.store.touchRecent(id)
-                                            recentIds = app.store.recentIds()
-                                        }
-                                        engine.connect(connectId, password)
-                                    },
+                                    onConnect = { beginConnect(connectId) },
                                     onCopyId = { copy(state.idFormatted) },
                                     onCopyPassword = { copy(state.password) },
                                     onRegenerate = engine::regenerate,
@@ -680,20 +771,16 @@ class MainActivity : ComponentActivity() {
                                     recentIds = recentIds,
                                     query = query,
                                     onQuery = { query = it },
-                                    onConnect = { computer ->
-                                        connectId = computer.id
-                                        val password = app.store.computerPassword(computer.id)
-                                        app.store.touchRecent(computer.id)
-                                        recentIds = app.store.recentIds()
-                                        engine.connect(computer.id, password)
+                                    status = if (
+                                        connecting && !promptBeforeConnect && !state.askPassword &&
+                                        state.status.startsWith("Connecting")
+                                    ) {
+                                        state.status
+                                    } else {
+                                        ""
                                     },
-                                    onOpen = {
-                                        connectId = it.id
-                                        val password = app.store.computerPassword(it.id)
-                                        app.store.touchRecent(it.id)
-                                        recentIds = app.store.recentIds()
-                                        engine.connect(it.id, password)
-                                    },
+                                    onConnect = { beginConnect(it.id) },
+                                    onOpen = { beginConnect(it.id) },
                                     onForget = {
                                         app.store.forget(it.id)
                                         saved = app.store.saved()
@@ -821,10 +908,19 @@ class MainActivity : ComponentActivity() {
                         },
                     )
                 }
-                if (state.askPassword) {
+                if (promptBeforeConnect || state.askPassword) {
+                    val titleName = state.askName.ifBlank {
+                        connectComputerName(saved, connectId).ifBlank { "this computer" }
+                    }
                     AlertDialog(
-                        onDismissRequest = { engine.cancelPassword() },
-                        title = { Text("Password for ${state.askName.ifBlank { "this computer" }}") },
+                        onDismissRequest = {
+                            if (state.askPassword) engine.cancelPassword()
+                            promptBeforeConnect = false
+                            askedPassword = ""
+                            connecting = false
+                            if (state.status.startsWith("Connecting")) engine.showStatus("Ready")
+                        },
+                        title = { Text("Password for $titleName") },
                         text = {
                             Column {
                                 if (state.askNote.isNotBlank()) {
@@ -847,23 +943,76 @@ class MainActivity : ComponentActivity() {
                         },
                         confirmButton = {
                             TextButton(onClick = {
+                                val typed = askedPassword
+                                if (typed.isBlank()) return@TextButton
                                 val id = connectId.filter { it.isDigit() }
-                                if (savePassword && askedPassword.isNotBlank()) {
-                                    app.store.saveComputerPassword(id, askedPassword)
+                                if (savePassword) {
+                                    app.store.saveComputerPassword(id, typed)
                                     if (temporarySession) app.store.noteTemporaryPassword(id)
+                                    saved = app.store.saved()
                                 }
-                                engine.submitPassword(askedPassword)
                                 askedPassword = ""
+                                if (state.askPassword) {
+                                    connecting = true
+                                    engine.showStatus(connectStatusLabel(connectComputerName(saved, id), id))
+                                    engine.submitPassword(typed)
+                                } else {
+                                    launchConnect(id, connectComputerName(saved, id), typed)
+                                }
                             }) { Text("Connect") }
                         },
                         dismissButton = {
                             Row {
                                 TextButton(onClick = {
+                                    val id = connectId.filter { it.isDigit() }
                                     askedPassword = ""
-                                    engine.askPerson()
+                                    if (state.askPassword) {
+                                        engine.askPerson()
+                                    } else {
+                                        launchConnect(id, connectComputerName(saved, id), "", askPerson = true)
+                                    }
                                 }) { Text("Ask the person instead") }
-                                TextButton(onClick = { engine.cancelPassword(); askedPassword = "" }) { Text("Cancel") }
+                                TextButton(onClick = {
+                                    if (state.askPassword) engine.cancelPassword()
+                                    promptBeforeConnect = false
+                                    askedPassword = ""
+                                    connecting = false
+                                    if (state.status.startsWith("Connecting")) engine.showStatus("Ready")
+                                }) { Text("Cancel") }
                             }
+                        },
+                    )
+                }
+                val failure = connectError
+                if (failure != null) {
+                    AlertDialog(
+                        onDismissRequest = {
+                            connectError = null
+                            offlineRetry = null
+                        },
+                        title = { Text("Couldn't connect") },
+                        text = { Text(failure) },
+                        confirmButton = {
+                            val retry = offlineRetry
+                            if (retry != null) {
+                                TextButton(onClick = {
+                                    offlineRetry = null
+                                    connectError = null
+                                    beginConnect(retry.id, ignoreOffline = true)
+                                }) { Text("Try anyway") }
+                            } else {
+                                TextButton(onClick = { connectError = null }) { Text("OK") }
+                            }
+                        },
+                        dismissButton = if (offlineRetry != null) {
+                            {
+                                TextButton(onClick = {
+                                    offlineRetry = null
+                                    connectError = null
+                                }) { Text("Cancel") }
+                            }
+                        } else {
+                            null
                         },
                     )
                 }

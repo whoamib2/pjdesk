@@ -135,9 +135,28 @@ class Engine(context: Context) : EngineListener {
 
     fun deviceLabel(): String = deviceName(app)
 
-    fun connect(id: String, password: String) = command(
-        JSONObject().put("cmd", "connect").put("id", id).put("password", password).toString(),
-    )
+    fun connect(id: String, password: String, askPerson: Boolean = false, name: String = "") {
+        val digits = id.filter { it.isDigit() }
+        val how = when {
+            askPerson -> "ask-person"
+            password.isEmpty() -> "none"
+            else -> "present"
+        }
+        AppLog.i("engine connect id=$digits password=$how handle=${handle.get()}")
+        if (handle.get() == 0L) {
+            showError("PJDesk is still starting. Wait a moment and try Connect again.")
+            return
+        }
+        command(
+            JSONObject()
+                .put("cmd", "connect")
+                .put("id", digits)
+                .put("password", if (askPerson) "" else password)
+                .put("ask", askPerson)
+                .put("name", name)
+                .toString(),
+        )
+    }
 
     fun accept() {
         AppLog.i("accepting incoming connection")
@@ -338,9 +357,19 @@ class Engine(context: Context) : EngineListener {
                 val id = event.optString("id")
                 if (id.isNotBlank()) store.saveComputerPassword(id, "")
             }
-            "error" -> update {
-                val text = event.optString("text")
-                it.copy(error = text, status = text, askPassword = false, askNote = "")
+            "error" -> {
+                val text = event.optString("text").trim()
+                when (text) {
+                    "stopped" -> AppLog.i("connect replaced by a newer attempt")
+                    "cancelled" -> update {
+                        it.copy(
+                            askPassword = false,
+                            askNote = "",
+                            status = if (it.status.startsWith("Connecting")) "Ready" else it.status,
+                        )
+                    }
+                    else -> update { it.copy(error = text, status = text, askPassword = false, askNote = "") }
+                }
             }
             "incoming" -> {
                 val name = event.optString("name")

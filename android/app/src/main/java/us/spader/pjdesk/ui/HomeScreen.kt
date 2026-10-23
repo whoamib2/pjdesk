@@ -144,7 +144,7 @@ fun HomeScreen(
                     textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace),
                 )
                 Text(
-                    "A saved password is used on its own. Otherwise PJDesk asks after that computer answers.",
+                    "A saved password is used on its own. Otherwise PJDesk asks for the password, then connects.",
                     color = pjMuted(),
                     style = MaterialTheme.typography.labelMedium,
                 )

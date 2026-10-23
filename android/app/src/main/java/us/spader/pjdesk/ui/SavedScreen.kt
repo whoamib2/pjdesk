@@ -24,6 +24,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import us.spader.pjdesk.AppLog
 import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.nickname
 
@@ -40,6 +41,7 @@ fun SavedScreen(
     recentIds: List<String> = emptyList(),
     selfId: String = "",
     signedIn: Boolean = false,
+    status: String = "",
 ) {
     var recentTab by remember { mutableStateOf(false) }
     val source = if (recentTab) {
@@ -53,6 +55,11 @@ fun SavedScreen(
     var draft by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Saved computers", style = MaterialTheme.typography.titleLarge)
+        if (status.isNotBlank()) {
+            Card(Modifier.fillMaxWidth()) {
+                Text(status, Modifier.padding(12.dp), style = MaterialTheme.typography.bodyMedium)
+            }
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = { recentTab = false }) {
                 Text("Saved", color = if (recentTab) pjMuted() else MaterialTheme.colorScheme.primary)
@@ -91,14 +98,18 @@ fun SavedScreen(
                 val title = nick.ifBlank { display.ifBlank { host.ifBlank { "No name yet" } } }
                 val system = osLabel(computer.osFamily).ifBlank { "Unknown" }
                 val mine = selfId.isNotBlank() && computer.id == selfId.filter { it.isDigit() }
-                Card(Modifier.fillMaxWidth().clickable(enabled = !mine) { onOpen(computer) }) {
+                Card(Modifier.fillMaxWidth()) {
                     Row(
                         Modifier.padding(12.dp).fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         OsIcon(computer.osFamily.ifBlank { "unknown" })
-                        Column(Modifier.weight(1f)) {
+                        Column(
+                            Modifier
+                                .weight(1f)
+                                .clickable(enabled = !mine && editing != computer.id) { onOpen(computer) },
+                        ) {
                             Text(
                                 title,
                                 style = MaterialTheme.typography.titleMedium,
@@ -144,7 +155,10 @@ fun SavedScreen(
                         }
                         Column {
                             if (!mine) {
-                                Button(onClick = { onConnect(computer) }) { Text("Connect") }
+                                Button(onClick = {
+                                    AppLog.i("Saved row Connect ${computer.id} online=${computer.online}")
+                                    onConnect(computer)
+                                }) { Text("Connect") }
                             }
                             TextButton(onClick = {
                                 editing = computer.id

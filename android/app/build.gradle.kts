@@ -13,15 +13,17 @@ android {
         applicationId = "us.spader.pjdesk"
         minSdk = 26
         targetSdk = 35
-        versionCode = 60900
-        versionName = "0.6.9"
+        versionCode = 61000
+        versionName = "0.6.10"
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
         }
     }
 
-    // Release signing uses the environment only. android\sign-release.cmd can
-    // sign an already-built unsigned APK on Windows without writing the passwords down.
+    // Release signing uses the environment only. On Ben's PC the keystore is
+    // C:\Users\BenSpader\.pjdesk-android\pjdesk-release.jks and the alias is pjdesk.
+    // android\sign-release.cmd signs an unsigned APK without writing the passwords down.
+    // Set PJDESK_KEYSTORE, PJDESK_KEYSTORE_PASSWORD, PJDESK_KEY_ALIAS, and PJDESK_KEY_PASSWORD.
     signingConfigs {
         val store = System.getenv("PJDESK_KEYSTORE")
         val storePassword = System.getenv("PJDESK_KEYSTORE_PASSWORD")

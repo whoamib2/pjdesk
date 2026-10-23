@@ -42,9 +42,9 @@ The script writes:
 
 To sign the release APK, set these in the environment. Do not commit the keystore.
 
-* `PJDESK_KEYSTORE` — path to the keystore file
+* `PJDESK_KEYSTORE` — path to the keystore file. The release key is `C:\Users\BenSpader\.pjdesk-android\pjdesk-release.jks`
 * `PJDESK_KEYSTORE_PASSWORD`
-* `PJDESK_KEY_ALIAS`
+* `PJDESK_KEY_ALIAS` — `pjdesk` for that keystore
 * `PJDESK_KEY_PASSWORD`
 
 All four have to be set. A partial set leaves the APK unsigned.
@@ -52,10 +52,10 @@ All four have to be set. A partial set leaves the APK unsigned.
 On Windows, sign an unsigned APK without saving the passwords:
 
 ```bat
-android\sign-release.cmd dist\PJDesk-Android-0.6.9-unsigned.apk
+android\sign-release.cmd dist\PJDesk-Android-0.6.10-unsigned.apk
 ```
 
-The script uses `apksigner` from `ANDROID_HOME`. If `PJDESK_KEYSTORE` is unset and `C:\Users\BenSpader\AndroidStudioProjects\upload.jks` exists, that path is suggested. It is not confirmed to be the key that signed the installed app. Use the existing release key. A new key will not update the phone.
+The script uses `apksigner` from `ANDROID_HOME`. The release key is `C:\Users\BenSpader\.pjdesk-android\pjdesk-release.jks`, alias `pjdesk`. Those are the defaults when `PJDESK_KEYSTORE` and `PJDESK_KEY_ALIAS` are unset. The script asks for the passwords and does not save them. A different key will not update the phone.
 
 The later release asset name is `PJDesk-Android-<ver>.apk`.
 
