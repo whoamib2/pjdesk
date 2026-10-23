@@ -102,8 +102,9 @@ mod imp {
     use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess, CREATE_NO_WINDOW,
-        CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+        CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
     };
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
     use windows_service::service::{
         ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo,
         ServiceStartType, ServiceState, ServiceStatus, ServiceType,
@@ -445,9 +446,13 @@ mod imp {
             let mut env_block: *mut core::ffi::c_void = std::ptr::null_mut();
             let have_env = CreateEnvironmentBlock(&mut env_block, Some(token), false).is_ok();
 
+            // Same rule as the post-update relaunch: do not inherit the
+            // service's std handles. They are invalid in the user session.
             let mut si = STARTUPINFOW {
                 cb: std::mem::size_of::<STARTUPINFOW>() as u32,
                 lpDesktop: PWSTR(desktop.as_mut_ptr()),
+                dwFlags: STARTF_USESHOWWINDOW,
+                wShowWindow: SW_HIDE.0 as u16,
                 ..Default::default()
             };
             let mut pi = PROCESS_INFORMATION::default();
@@ -459,7 +464,7 @@ mod imp {
                 Some(PWSTR(cmdline.as_mut_ptr())),
                 None,
                 None,
-                false,
+                crate::handoff::relaunch_inherits_handles(),
                 flags,
                 if have_env { Some(env_block) } else { None },
                 windows::core::PCWSTR::null(),

@@ -9,6 +9,7 @@ Android is 0.6.15 (versionCode 61500). Windows is 0.6.15 as well: the session wi
 * Typing on the PC keyboard goes into the focused field. Enter, Backspace, arrows, and Tab work. Ctrl+V pastes the PC clipboard as text. Backspace deletes the selection or the character before the cursor.
 * Settings → Security → Permanent password shows whether one is set, then Set or Change. The dialog has the password, confirm, Show on each, a length hint, Save, and Remove. The rule is still at least 8 characters, the same as Windows, and it is not the account password. It is stored in the account password vault under this phone's own 9-digit id, so a signed-in computer receives it as the saved password for the phone. A newer vault copy can update the phone.
 * Disconnect ends sharing on both sides. When the PC disconnects, the phone stops MediaProjection, drops the sharing notification, and leaves the phone registered. When the phone stops sharing, the PC session closes with "The phone stopped sharing".
+* A Windows client that the service relaunched after an update could not open any viewer. The window had no console, the viewer inherited those handles, and every View phone or Connect click logged "The handle is invalid. (os error 6)" and never connected. The viewer now gets null std handles, ignores a missing console, and a failed session opens a dialog on the PC.
 
 ## 0.6.14
 

@@ -313,6 +313,10 @@ struct ConfigArgs {
 }
 
 fn main() {
+    // The service relaunches this window with no console. Std handles are then
+    // null, and the first read or write returns "The handle is invalid."
+    #[cfg(windows)]
+    repair_stdio_handles();
     // The service and its helper run with no console and set up their own
     // (file) logging, so route them before touching the console.
     let raw: Vec<String> = std::env::args().collect();
@@ -450,18 +454,74 @@ fn fatal(message: &str) -> ! {
     std::process::exit(1);
 }
 
-/// Attaches to the parent console if there is one, otherwise allocates a new
-/// console, so a `windows_subsystem = "windows"` build still works as a CLI.
+/// Attaches to the parent console if there is one, so a
+/// `windows_subsystem = "windows"` build still works as a CLI.
+///
+/// Never AllocConsole: the app spawns the viewer (`connect`) as a child, and
+/// allocating a console there popped up a command window for every session.
+/// A failed attach is normal when the service relaunched this process. It must
+/// not leave the std handles invalid.
 #[cfg(windows)]
 fn ensure_console() {
     unsafe {
         use windows::Win32::System::Console::{AttachConsole, GetConsoleWindow, ATTACH_PARENT_PROCESS};
         if GetConsoleWindow().0.is_null() {
-            // Attach to the launching terminal if there is one, but never
-            // AllocConsole: the app spawns the viewer (`connect`) as a child
-            // process, and allocating a console there popped up a stray command
-            // window every time you started a remote session.
             let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+    repair_stdio_handles();
+}
+
+/// Point a missing stdin, stdout, or stderr at NUL.
+///
+/// `GetStdHandle` is null or `INVALID_HANDLE_VALUE` when this process was
+/// started by the service (`CreateProcessAsUser`, no inherited console). Rust
+/// then reports os error 6 for a console read, a log line, or a child spawn
+/// that tries to inherit the handle.
+#[cfg(windows)]
+fn repair_stdio_handles() {
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    unsafe {
+        let nul = windows::core::HSTRING::from("NUL");
+        for (id, access) in [
+            (STD_INPUT_HANDLE, GENERIC_READ.0),
+            (STD_OUTPUT_HANDLE, GENERIC_WRITE.0),
+            (STD_ERROR_HANDLE, GENERIC_WRITE.0),
+        ] {
+            if stdio_handle_ok(id) {
+                continue;
+            }
+            let Ok(handle) = CreateFileW(
+                &nul,
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            ) else {
+                continue;
+            };
+            if SetStdHandle(id, handle).is_err() {
+                let _ = CloseHandle(handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn stdio_handle_ok(id: windows::Win32::System::Console::STD_HANDLE) -> bool {
+    unsafe {
+        match windows::Win32::System::Console::GetStdHandle(id) {
+            Ok(handle) => !handle.is_invalid() && handle != windows::Win32::Foundation::HANDLE::default(),
+            Err(_) => false,
         }
     }
 }
@@ -685,6 +745,13 @@ fn init_log_file(default_filter: &str) {
             builder.with_ansi(false).with_writer(std::sync::Mutex::new(file)).try_init().ok();
             return;
         }
+    }
+    // A missing console makes stderr itself os error 6. Drop the line rather
+    // than failing the session while trying to record why it failed.
+    #[cfg(windows)]
+    if !stdio_handle_ok(windows::Win32::System::Console::STD_ERROR_HANDLE) {
+        let _ = builder.with_writer(std::sync::Mutex::new(std::io::sink())).try_init();
+        return;
     }
     let _ = builder.with_writer(std::io::stderr).try_init();
 }

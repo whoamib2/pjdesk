@@ -53,12 +53,15 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
     }
     let label = direct.clone().unwrap_or_else(|| format_id(&target));
     let ask = std::env::var("PJDESK_ASK").ok().map(std::path::PathBuf::from).filter(|p| !p.as_os_str().is_empty());
-    let password = if ask.is_some() {
-        String::new()
-    } else {
-        match args.password.clone() {
-            Some(password) => password,
-            None => rpassword::prompt_password(format!("Password for {label}: "))?,
+    let ask_view = std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1");
+    let ask_person = std::env::var("PJDESK_ASK_PERSON").ok().as_deref() == Some("1");
+    let password = match password_source(args.password.as_deref(), ask.is_some(), ask_view, ask_person, console_available())
+    {
+        PasswordSource::Given(password) => password,
+        PasswordSource::Empty => String::new(),
+        PasswordSource::Prompt => rpassword::prompt_password(format!("Password for {label}: "))?,
+        PasswordSource::NoConsole => {
+            bail!("Enter the password in the PJDesk window.");
         }
     };
 
@@ -120,6 +123,45 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         std::thread::sleep(Duration::from_secs(5));
     }
     Ok(())
+}
+
+/// How the viewer gets the computer password. The PJDesk window passes it in
+/// the environment, or asks after the other computer answers. A console prompt
+/// is only for `pjdesk connect` typed in a terminal. View phone and "ask the
+/// person" send no password. Opening CONIN$ with no console is os error 6.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PasswordSource {
+    Given(String),
+    Empty,
+    Prompt,
+    NoConsole,
+}
+
+pub(crate) fn password_source(
+    supplied: Option<&str>,
+    ask: bool,
+    ask_view: bool,
+    ask_person: bool,
+    console: bool,
+) -> PasswordSource {
+    if ask || ask_view || ask_person {
+        return PasswordSource::Empty;
+    }
+    match supplied {
+        Some(password) => PasswordSource::Given(password.to_string()),
+        None if console => PasswordSource::Prompt,
+        None => PasswordSource::NoConsole,
+    }
+}
+
+#[cfg(windows)]
+fn console_available() -> bool {
+    unsafe { !windows::Win32::System::Console::GetConsoleWindow().0.is_null() }
+}
+
+#[cfg(not(windows))]
+fn console_available() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdin())
 }
 
 /// Signaling → UDP binding → hole punching / relay → QUIC → password check.
@@ -543,4 +585,26 @@ async fn receive_frames(connection: &Connection, control_send: &mut SendStream, 
         println!("Center-row colors: {}", samples.join(" "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{password_source, PasswordSource};
+
+    #[test]
+    fn view_phone_does_not_ask_the_console_for_a_password() {
+        assert_eq!(password_source(None, false, true, false, false), PasswordSource::Empty);
+        assert_eq!(password_source(None, false, false, true, false), PasswordSource::Empty);
+        assert_eq!(password_source(None, true, false, false, false), PasswordSource::Empty);
+    }
+
+    #[test]
+    fn a_window_with_no_console_does_not_open_conin() {
+        assert_eq!(password_source(None, false, false, false, false), PasswordSource::NoConsole);
+        assert_eq!(
+            password_source(Some("secret"), false, false, false, false),
+            PasswordSource::Given("secret".into())
+        );
+        assert_eq!(password_source(None, false, false, false, true), PasswordSource::Prompt);
+    }
 }

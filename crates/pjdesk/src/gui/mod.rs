@@ -300,6 +300,8 @@ pub struct App {
     /// A paste the user dismissed, so the same clipboard event is not offered again.
     dismissed_paste: Option<String>,
     toast: widgets::Toast,
+    /// A session that ended before the viewer window opened. Stays up until dismissed.
+    session_error: Option<String>,
     tray: Option<tray::Tray>,
     logo: Option<egui::TextureHandle>,
     really_quit: bool,
@@ -417,6 +419,7 @@ impl App {
             net_importing: false,
             dismissed_paste: None,
             toast: widgets::Toast::default(),
+            session_error: None,
             tray: tray::Tray::new(&cc.egui_ctx),
             logo: Some(cc.egui_ctx.load_texture(
                 "pjdesk-logo",
@@ -1697,12 +1700,7 @@ impl App {
             cmd.env("PJDESK_VIEW", note.view_mode.to_string());
             cmd.env("PJDESK_DISPLAY", note.last_display.to_string());
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            allow_viewer_foreground();
-            cmd.creation_flags(0x0800_0000);
-        }
+        prepare_viewer(&mut cmd);
         match cmd.spawn() {
             Ok(mut child) => {
                 clear_session_status();
@@ -1717,7 +1715,7 @@ impl App {
                 });
                 self.viewer_rx.push(rx);
             }
-            Err(e) => self.status = format!("Could not open the viewer: {e}"),
+            Err(e) => self.fail_session(format!("Could not open the viewer: {e}")),
         }
     }
 
@@ -1754,10 +1752,13 @@ impl App {
                                 "The session ended before it could start.".into()
                             }
                         });
-                        self.status = reason;
-                        // A saved password was rejected. Ask once, in the prompt.
-                        // Any other failure stays on this page with the reason,
-                        // and the password already typed is left in the field.
+                        // A wrong password comes back in the password dialog.
+                        // Any other failure is a dialog, not only the Opening toast.
+                        if code == 3 {
+                            self.status = reason;
+                        } else {
+                            self.fail_session(reason);
+                        }
                         if code == 3 {
                             reopen = Some((id, files));
                         } else if code == 4 {
@@ -1869,12 +1870,7 @@ impl App {
         if !self.net_email.trim().is_empty() {
             cmd.env("PJDESK_ACCOUNT", self.net_email.trim());
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            allow_viewer_foreground();
-            cmd.creation_flags(0x0800_0000);
-        }
+        prepare_viewer(&mut cmd);
         match cmd.spawn() {
             Ok(mut child) => {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -1885,7 +1881,7 @@ impl App {
                 });
                 self.viewer_rx.push(rx);
             }
-            Err(e) => self.status = format!("Could not open the viewer: {e}"),
+            Err(e) => self.fail_session(format!("Could not open the viewer: {e}")),
         }
     }
 
@@ -1906,12 +1902,7 @@ impl App {
         if !self.net_email.trim().is_empty() {
             cmd.env("PJDESK_ACCOUNT", self.net_email.trim());
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            allow_viewer_foreground();
-            cmd.creation_flags(0x0800_0000);
-        }
+        prepare_viewer(&mut cmd);
         match cmd.spawn() {
             Ok(mut child) => {
                 self.toast.show(format!("Opening {addr}"));
@@ -1923,7 +1914,7 @@ impl App {
                 });
                 self.viewer_rx.push(rx);
             }
-            Err(e) => self.status = format!("Could not open the viewer: {e}"),
+            Err(e) => self.fail_session(format!("Could not open the viewer: {e}")),
         }
     }
 
@@ -2104,6 +2095,52 @@ fn write_service_consent(accept: bool) {
     let _ = std::fs::write(path, body.to_string());
 }
 
+/// The viewer does not inherit this process's std handles.
+///
+/// After an update the service starts the window with `CreateProcessAsUser`.
+/// Those handles are null. Inheriting them, with `CREATE_NO_WINDOW`, makes the
+/// viewer fail with "The handle is invalid. (os error 6)" before it connects.
+fn prepare_viewer(cmd: &mut std::process::Command) {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        allow_viewer_foreground();
+        cmd.creation_flags(0x0800_0000);
+    }
+}
+
+impl App {
+    fn fail_session(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.status = text.clone();
+        self.session_error = Some(text);
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn session_error_dialog(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.session_error.clone() else { return };
+        let mut close = false;
+        egui::Window::new("Could not start the session")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(&text);
+                ui.add_space(12.0);
+                if widgets::accent_button(ui, "OK", egui::Vec2::new(120.0, 36.0)) {
+                    close = true;
+                }
+            });
+        if close {
+            self.session_error = None;
+        }
+    }
+}
+
 /// Lets the viewer process bring its window in front of this one.
 #[cfg(windows)]
 fn allow_viewer_foreground() {
@@ -2224,6 +2261,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.body(ui));
 
         self.settings_window(&ctx);
+        self.session_error_dialog(&ctx);
         self.temporary_warning(&ctx);
         self.import_prompt(&ctx);
         self.password_prompt(&ctx);
