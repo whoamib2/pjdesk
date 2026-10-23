@@ -1,10 +1,14 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+
 package us.spader.pjdesk.ui
 
 import android.app.Activity
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -21,6 +25,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
@@ -29,6 +34,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -76,10 +82,28 @@ fun SessionScreen(
     onEnd: () -> Unit,
     onClipboard: () -> Unit = {},
     decoder: ScreenDecoder?,
+    pointerSpeed: Float = 0.6f,
+    pointerAccel: Boolean = false,
+    dragLock: Boolean = false,
+    onDragLock: (Boolean) -> Unit = {},
+    onPointerSpeed: (Float) -> Unit = {},
+    onPointerAccel: (Boolean) -> Unit = {},
+    idleWarn: Boolean = false,
+    onStay: () -> Unit = {},
+    onActivity: () -> Unit = {},
 ) {
     val android = session.platform == "android"
     var trackpad by remember(session.id) { mutableStateOf(!android) }
     val pointer = remember(trackpad, android) { PointerSession(android, trackpad = trackpad) }
+    pointer.speed = pointerSpeed
+    pointer.accelerate = pointerAccel
+    pointer.dragLock = dragLock
+    var confirmEnd by remember { mutableStateOf(false) }
+    var shownDisplay by remember(session.id) {
+        mutableIntStateOf(session.displays.firstOrNull { it.primary }?.index ?: 0)
+    }
+    val peerName = session.peer.ifBlank { session.id }.ifBlank { "this computer" }
+    BackHandler { confirmEnd = true }
     var viewW by remember { mutableIntStateOf(1) }
     var viewH by remember { mutableIntStateOf(1) }
     var picture by remember(session.id) { mutableStateOf(PictureView.fit()) }
@@ -152,9 +176,12 @@ fun SessionScreen(
                 .pointerInput(trackpad, android, session.frameW, session.frameH, viewW, viewH) {
                     var lastTap = 0L
                     awaitEachGesture {
-                        val first = awaitFirstDown(requireUnconsumed = false)
+                        val first = awaitFirstDown(requireUnconsumed = true)
+                        onActivity()
                         val now = first.uptimeMillis
-                        val doubleTap = !trackpad && now - lastTap in 1..280
+                        val repeat = now - lastTap in 1..280
+                        if (repeat && trackpad) pointer.armDrag()
+                        val doubleTap = repeat && !trackpad
                         if (doubleTap) {
                             val placed = GestureMap.letterbox(
                                 session.frameW.coerceAtLeast(16),
@@ -176,7 +203,12 @@ fun SessionScreen(
                         var startSpan = 0f
                         var startPicture = picture
                         var lastCentroid = Offset.Zero
+                        var lastAt = first.position
+                        var panning = false
                         var moved = 0f
+                        fun dropPointer() {
+                            pointer.cancel().forEach { dispatch(it, onGesture, onMouse) }
+                        }
                         fun pointOf(at: Offset): Pair<Int, Int>? {
                             return if (trackpad) {
                                 GestureMap.viewToNorm(GestureMap.letterbox(viewW, viewH, viewW, viewH), at.x, at.y)
@@ -199,7 +231,7 @@ fun SessionScreen(
                             if (pressed.size > fingers) fingers = pressed.size
                             if (pressed.size >= 3 && trackpad) {
                                 if (sawDown) {
-                                    pointer.cancel()
+                                    dropPointer()
                                     sawDown = false
                                 }
                                 event.changes.forEach { it.consume() }
@@ -213,7 +245,7 @@ fun SessionScreen(
                                     startPicture = picture
                                     lastCentroid = centroid
                                     if (sawDown) {
-                                        pointer.cancel()
+                                        dropPointer()
                                         sawDown = false
                                     }
                                 } else if (trackpad && kotlin.math.abs(span / startSpan - 1f) < 0.08f) {
@@ -244,22 +276,54 @@ fun SessionScreen(
                                 event.changes.forEach { if (it.positionChanged()) it.consume() }
                             } else if (pressed.size == 1 && !zooming && !scrolling && !doubleTap) {
                                 val at = pressed[0].position
-                                val point = pointOf(at)
-                                if (point != null) {
-                                    if (!sawDown) {
-                                        pointer.down(pressed[0].uptimeMillis, listOf(point))
-                                        sawDown = true
-                                    } else {
-                                        pointer.move(listOf(point)).forEach { dispatch(it, onGesture, onMouse) }
-                                        pointer.poll(pressed[0].uptimeMillis)?.let { dispatch(it, onGesture, onMouse) }
-                                    }
-                                    cursor = if (trackpad) pointer.cursorNorm else point
-                                    if (trackpad && picture.scale > 1.05f) {
-                                        picture = PictureView.followCursor(
-                                            viewW, viewH, session.frameW, session.frameH, picture, cursor,
-                                        )
+                                onActivity()
+                                val localPan = !trackpad && picture.scale > 1.05f && !pointer.dragLock && !pointer.dragArmed
+                                if (localPan && !panning) {
+                                    val travel = hypot(
+                                        (at.x - first.position.x).toDouble(),
+                                        (at.y - first.position.y).toDouble(),
+                                    ).toFloat()
+                                    if (travel > 24f) {
+                                        if (sawDown) {
+                                            dropPointer()
+                                            sawDown = false
+                                        }
+                                        panning = true
                                     }
                                 }
+                                if (panning) {
+                                    val placed = GestureMap.letterbox(
+                                        session.frameW.coerceAtLeast(16),
+                                        session.frameH.coerceAtLeast(9),
+                                        viewW,
+                                        viewH,
+                                    )
+                                    picture = PictureView.clamp(
+                                        viewW,
+                                        viewH,
+                                        placed.width,
+                                        placed.height,
+                                        picture.copy(panX = picture.panX + (at.x - lastAt.x), panY = picture.panY + (at.y - lastAt.y)),
+                                    )
+                                } else {
+                                    val point = pointOf(at)
+                                    if (point != null) {
+                                        if (!sawDown) {
+                                            pointer.down(pressed[0].uptimeMillis, listOf(point))
+                                            sawDown = true
+                                        } else {
+                                            pointer.move(listOf(point)).forEach { dispatch(it, onGesture, onMouse) }
+                                            pointer.poll(pressed[0].uptimeMillis)?.let { dispatch(it, onGesture, onMouse) }
+                                        }
+                                        cursor = if (trackpad) pointer.cursorNorm else point
+                                        if (trackpad && picture.scale > 1.05f) {
+                                            picture = PictureView.followCursor(
+                                                viewW, viewH, session.frameW, session.frameH, picture, cursor,
+                                            )
+                                        }
+                                    }
+                                }
+                                lastAt = at
                                 event.changes.forEach { it.consume() }
                             }
                             if (pressed.isEmpty()) {
@@ -282,7 +346,7 @@ fun SessionScreen(
                                     cursor = if (trackpad) pointer.cursorNorm else cursor
                                     lastTap = event.changes.firstOrNull()?.uptimeMillis ?: now
                                 }
-                                pointer.cancel()
+                                dropPointer()
                                 break
                             }
                         }
@@ -311,11 +375,87 @@ fun SessionScreen(
                 onClose = { keyboard = false },
             )
         }
+        if (idleWarn) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 48.dp),
+                shape = RoundedCornerShape(20.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+            ) {
+                TextButton(onClick = onStay, modifier = Modifier.padding(horizontal = 8.dp)) {
+                    Text("Disconnecting in 10s, tap to stay")
+                }
+            }
+        }
+        if (session.displays.size > 1) {
+            Row(
+                Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 48.dp, top = 48.dp)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                session.displays.forEach { display ->
+                    IconButton(
+                        onClick = {
+                            shownDisplay = display.index
+                            onDisplay(display.index)
+                        },
+                        modifier = Modifier.size(48.dp),
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (display.index == shownDisplay) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.surface.copy(alpha = 0.92f)
+                            },
+                        ) {
+                            Box(Modifier.size(36.dp), contentAlignment = Alignment.Center) {
+                                Text("${display.index + 1}", style = MaterialTheme.typography.titleMedium)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = 48.dp, end = 48.dp)
+                .size(48.dp)
+                .combinedClickable(onClick = { confirmEnd = true }, onLongClick = onEnd),
+            shape = CircleShape,
+            color = Color(0xFFC62828),
+        ) {
+            Box(contentAlignment = Alignment.Center) { EndMark() }
+        }
+        if (confirmEnd) {
+            AlertDialog(
+                onDismissRequest = { confirmEnd = false },
+                title = { Text("Disconnect from $peerName?") },
+                confirmButton = {
+                    TextButton(onClick = { confirmEnd = false; onEnd() }) { Text("Disconnect") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmEnd = false }) { Text("Stay") }
+                },
+            )
+        }
         SessionChrome(
             session = session,
-            modifier = Modifier.align(Alignment.TopStart),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 48.dp),
             trackpad = trackpad,
             fitted = picture.scale <= 1.05f,
+            dragLock = dragLock,
+            onDragLock = onDragLock,
+            pointerSpeed = pointerSpeed,
+            onPointerSpeed = onPointerSpeed,
+            pointerAccel = pointerAccel,
+            onPointerAccel = onPointerAccel,
             onTrackpad = { trackpad = it },
             onFit = { fit ->
                 picture = if (fit) {
@@ -338,6 +478,14 @@ fun SessionScreen(
             onClipboard = onClipboard,
             onEnd = onEnd,
         )
+    }
+}
+
+@Composable
+private fun EndMark() {
+    Canvas(Modifier.size(22.dp)) {
+        drawLine(Color.White, Offset(5f, 5f), Offset(size.width - 5f, size.height - 5f), strokeWidth = 2.4.dp.toPx())
+        drawLine(Color.White, Offset(size.width - 5f, 5f), Offset(5f, size.height - 5f), strokeWidth = 2.4.dp.toPx())
     }
 }
 
@@ -375,12 +523,19 @@ fun SessionChrome(
     fitted: Boolean = true,
     onTrackpad: (Boolean) -> Unit = {},
     onFit: (Boolean) -> Unit = {},
+    dragLock: Boolean = false,
+    onDragLock: (Boolean) -> Unit = {},
+    pointerSpeed: Float = 0.6f,
+    onPointerSpeed: (Float) -> Unit = {},
+    pointerAccel: Boolean = false,
+    onPointerAccel: (Boolean) -> Unit = {},
 ) {
     var open by remember { mutableStateOf(false) }
-    var ox by remember { mutableFloatStateOf(16f) }
-    var oy by remember { mutableFloatStateOf(24f) }
+    var ox by remember { mutableFloatStateOf(0f) }
+    var oy by remember { mutableFloatStateOf(0f) }
     var quality by remember { mutableStateOf(false) }
     var displays by remember { mutableStateOf(false) }
+    var speedMenu by remember { mutableStateOf(false) }
     var dragged by remember { mutableFloatStateOf(0f) }
     Surface(
         modifier = modifier
@@ -449,6 +604,27 @@ fun SessionChrome(
                         }
                     }
                     Tool("clip", "Clipboard") { onClipboard() }
+                    Tool(if (dragLock) "dragOn" else "drag", if (dragLock) "Drag on" else "Drag") {
+                        onDragLock(!dragLock)
+                    }
+                }
+                Row {
+                    Box {
+                        Tool("speed", "Speed") { speedMenu = true }
+                        DropdownMenu(expanded = speedMenu, onDismissRequest = { speedMenu = false }) {
+                            listOf(0.25f, 0.6f, 1f, 1.5f, 2f).forEach { value ->
+                                val label = if (value == 0.6f) "0.6×" else if (value % 1f == 0f) "${value.toInt()}×" else "${value}×"
+                                DropdownMenuItem(
+                                    text = { Text(if (pointerSpeed == value) "$label  ✓" else label) },
+                                    onClick = { speedMenu = false; onPointerSpeed(value) },
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text(if (pointerAccel) "Acceleration on  ✓" else "Acceleration") },
+                                onClick = { speedMenu = false; onPointerAccel(!pointerAccel) },
+                            )
+                        }
+                    }
                     Tool("end", "End") { onEnd() }
                 }
             }
@@ -549,6 +725,14 @@ private fun Mark(kind: String) {
                 drawLine(color, Offset(4f, 4f), Offset(4f, size.height * 0.42f), strokeWidth = 1.6.dp.toPx())
                 drawLine(color, Offset(size.width - 4f, size.height - 4f), Offset(size.width * 0.58f, size.height - 4f), strokeWidth = 1.6.dp.toPx())
                 drawLine(color, Offset(size.width - 4f, size.height - 4f), Offset(size.width - 4f, size.height * 0.58f), strokeWidth = 1.6.dp.toPx())
+            }
+            "drag", "dragOn" -> {
+                drawCircle(color, radius = 3.dp.toPx(), center = Offset(size.width * 0.35f, size.height * 0.62f))
+                drawLine(color, Offset(size.width * 0.42f, size.height * 0.55f), Offset(size.width * 0.78f, size.height * 0.28f), strokeWidth = 1.7.dp.toPx())
+            }
+            "speed" -> {
+                drawLine(color, Offset(size.width * 0.2f, size.height * 0.72f), Offset(size.width * 0.8f, size.height * 0.72f), strokeWidth = 1.6.dp.toPx())
+                drawCircle(color, radius = 3.dp.toPx(), center = Offset(size.width * 0.42f, size.height * 0.72f))
             }
             "tools" -> {
                 drawCircle(color, radius = 2.2.dp.toPx(), center = Offset(size.width * 0.3f, size.height / 2f))

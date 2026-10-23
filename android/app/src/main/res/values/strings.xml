@@ -10,6 +10,10 @@
     <string name="channel_online">Host status</string>
     <string name="channel_live">Being controlled</string>
     <string name="stop">Stop</string>
+    <string name="session_disconnect">Disconnect</string>
+    <string name="session_controlling">Controlling %1$s</string>
+    <string name="session_controlling_body">Tap Disconnect to end this remote session.</string>
+    <string name="channel_session">Remote session</string>
     <string name="allow_screen_share">Allow screen sharing</string>
     <string name="allow_screen_share_body">Tap to let PJDesk share this screen. Android may also ask.</string>
     <string name="channel_share">Screen sharing</string>

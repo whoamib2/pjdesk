@@ -372,6 +372,10 @@ impl App {
         fixed(ui, W_CONNECT, |ui| {
             if row.this_computer {
                 ui.add_enabled(false, egui::Button::new("Connect"));
+            } else if row.os_family.eq_ignore_ascii_case("android") {
+                if ui.button("View phone").clicked() {
+                    *action = Some(RowCmd::View(id.clone()));
+                }
             } else if ui.button("Connect").clicked() {
                 *action = Some(RowCmd::Connect(id.clone()));
             }
@@ -629,13 +633,13 @@ impl App {
                     if ui.button("Cancel").clicked() {
                         close = true;
                     }
+                    if !self.prompt_checking && ui.button("Ask to connect instead").clicked() {
+                        ask_person = true;
+                    }
                     if !self.prompt_checking && (widgets::accent_button(ui, "Connect", Vec2::new(120.0, 36.0)) || enter) {
                         go = true;
                     }
                 });
-                if !self.prompt_checking && ui.link("Ask the person instead").clicked() {
-                    ask_person = true;
-                }
             });
         if close {
             self.write_ask_reply("cancel\n");

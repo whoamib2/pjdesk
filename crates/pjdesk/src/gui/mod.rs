@@ -2003,6 +2003,7 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(400));
             return;
         };
+        raise_consent(ctx, id);
         let mut allow = false;
         let mut decline = false;
         egui::Window::new("Allow this connection?")
@@ -2040,6 +2041,50 @@ struct ServiceConsent {
     from: String,
     #[serde(default)]
     ip: String,
+}
+
+fn raise_consent(ctx: &egui::Context, id: u64) {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if LAST.swap(id, std::sync::atomic::Ordering::SeqCst) == id {
+        return;
+    }
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    #[cfg(windows)]
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::MessageBeep(windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK);
+    }
+}
+
+fn poll_client_heartbeat() {
+    let dir = crate::syspaths::service_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("client-alive"), b"1");
+}
+
+fn adopt_service_notice() {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = crate::syspaths::service_dir().join("connect-notice.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        if LAST.swap(0, std::sync::atomic::Ordering::SeqCst) != 0 {
+            crate::host::notice::end();
+        }
+        return;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
+    let seq = value.get("seq").and_then(|v| v.as_u64()).unwrap_or(1);
+    let prev = LAST.swap(seq, std::sync::atomic::Ordering::SeqCst);
+    if prev == seq {
+        return;
+    }
+    let account = value.get("account").and_then(|v| v.as_str()).unwrap_or("");
+    let computer = value.get("computer").and_then(|v| v.as_str()).unwrap_or("");
+    let user = value.get("user").and_then(|v| v.as_str()).unwrap_or("");
+    let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if prev == 0 {
+        crate::host::notice::begin(computer);
+    }
+    crate::host::notice::update(account, computer, user, id);
 }
 
 fn read_service_consent() -> Option<ServiceConsent> {
@@ -2183,6 +2228,8 @@ impl eframe::App for App {
         self.import_prompt(&ctx);
         self.password_prompt(&ctx);
         self.consent_prompt(&ctx);
+        poll_client_heartbeat();
+        adopt_service_notice();
         self.login_window(&ctx);
         self.change_password_window(&ctx);
         self.poll_lan();

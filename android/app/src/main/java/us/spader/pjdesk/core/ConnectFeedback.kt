@@ -23,6 +23,9 @@ fun connectFailureText(raw: String, name: String): String? {
         lower.contains("server address is empty") || lower.contains("no server address") ->
             "This phone has no server address yet. Sign in again, or set the server in Settings."
         lower.contains("locked out") -> head
+        lower == "no answer" || lower.startsWith("no answer") -> "No answer. $who did not accept."
+        lower == "declined" || lower.startsWith("declined") -> "Declined. $who did not allow the connection."
+        lower.contains("no one is available") -> "No one is available to accept."
         else -> head
     }
 }

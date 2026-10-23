@@ -717,6 +717,7 @@ fn install_session_panic_hook() {
 /// Writes the reason a viewer or connect command stopped, next to pjdesk.log.
 /// The main window reads this when the viewer process exits.
 fn note_failure(text: &str) {
+    let text = phone_view_failure(text);
     let connect = std::env::args().any(|a| a == "connect");
     if connect {
         tracing::error!("session failed: {text}");
@@ -725,8 +726,32 @@ fn note_failure(text: &str) {
     }
     if let Some(dir) = Config::path().parent() {
         let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(dir.join("last-session.txt"), text);
-        let _ = std::fs::write(dir.join("session-status.txt"), text);
+        let _ = std::fs::write(dir.join("last-session.txt"), &text);
+        let _ = std::fs::write(dir.join("session-status.txt"), &text);
+    }
+}
+
+/// Clear sentences for a Windows-to-phone view. Other connections keep their own text.
+fn phone_view_failure(text: &str) -> String {
+    if std::env::var("PJDESK_ASK_VIEW").ok().as_deref() != Some("1") {
+        return text.to_string();
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("declin") || lower.contains("not allowed to view") {
+        "Phone declined".into()
+    } else if lower.contains("screen sharing") || lower.contains("screen capture") || lower.contains("mediaprojection") {
+        "Screen sharing not allowed on the phone".into()
+    } else if lower.contains("timed out")
+        || lower.contains("did not answer")
+        || lower.contains("no answer")
+        || lower.contains("offline")
+        || lower.contains("closed")
+        || lower.contains("asleep")
+        || lower.contains("did not finish")
+    {
+        "Phone app is closed or asleep".into()
+    } else {
+        text.to_string()
     }
 }
 

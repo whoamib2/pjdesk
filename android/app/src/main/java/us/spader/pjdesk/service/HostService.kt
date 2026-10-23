@@ -78,6 +78,17 @@ class HostService : Service() {
     }
 
     /**
+     * Swiping the app away ends a session this phone is controlling.
+     * The host service itself keeps running so this phone stays registered.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        AppLog.i("task removed, ending the controller session")
+        (application as PjApp).engine.stopView("closed")
+        SessionNotice.hide(this)
+        super.onTaskRemoved(rootIntent)
+    }
+
+    /**
      * Android 14+ allows getMediaProjection only while this service is already
      * in the foreground with type mediaProjection, and each consent token can
      * create one virtual display. Stopping the previous token must not flip

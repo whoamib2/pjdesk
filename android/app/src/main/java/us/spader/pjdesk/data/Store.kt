@@ -55,6 +55,30 @@ class Store(context: Context) {
             prefs.edit().putString("computerName", cleaned).apply()
         }
 
+    /** Trackpad multiplier from 0.25 to 2. 0.6 is slower than the old 1× speed. */
+    var pointerSpeed: Float
+        get() = prefs.getFloat("pointerSpeed", 0.6f).coerceIn(0.25f, 2f)
+        set(value) { prefs.edit().putFloat("pointerSpeed", value.coerceIn(0.25f, 2f)).apply() }
+
+    /** Off by default, so 0.6× stays linear. */
+    var pointerAccel: Boolean
+        get() = prefs.getBoolean("pointerAccel", false)
+        set(value) { prefs.edit().putBoolean("pointerAccel", value).apply() }
+
+    /**
+     * Minutes with no input before a controller session ends.
+     * 0 is off. The same value applies in the foreground, in the background, and with the screen off.
+     */
+    var sessionIdleMin: Int
+        get() {
+            val stored = prefs.getInt("sessionIdleMin", 1)
+            return if (stored == 0 || stored == 1 || stored == 5 || stored == 15) stored else 1
+        }
+        set(value) {
+            val cleaned = if (value == 0 || value == 1 || value == 5 || value == 15) value else 1
+            prefs.edit().putInt("sessionIdleMin", cleaned).apply()
+        }
+
     /** Decrypted permanent password, or empty when none is saved. */
     val permanent: String
         get() = secret.read()

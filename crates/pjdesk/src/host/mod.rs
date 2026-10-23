@@ -5,7 +5,7 @@ mod ctrl;
 pub(crate) mod direct;
 mod encoder;
 mod input;
-mod notice;
+pub(crate) mod notice;
 mod stream;
 
 use std::collections::HashMap;
@@ -889,6 +889,7 @@ enum Person {
     Yes(u32, String),
     No,
     TimedOut,
+    Unavailable,
 }
 
 async fn open_session(
@@ -922,8 +923,13 @@ async fn open_session(
             bail!(message)
         }
         Person::TimedOut => {
-            let message = format!("No one at {} answered the request", state.name);
-            let _ = refuse_auth(&mut auth.send, &message).await;
+            let message = "No answer";
+            let _ = refuse_auth(&mut auth.send, message).await;
+            bail!(message)
+        }
+        Person::Unavailable => {
+            let message = "No one is available to accept";
+            let _ = refuse_auth(&mut auth.send, message).await;
             bail!(message)
         }
     }
@@ -973,7 +979,7 @@ async fn approve(state: &Arc<HostState>, name: &str, ip: &str) -> Person {
     if let Some(shared) = &state.shared {
         if !state.args.service_host {
             let id = shared.begin_consent(name, ip, policy.max_permissions);
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             loop {
                 if let Some(reply) = shared.take_reply(id) {
                     shared.clear_consent(id);
@@ -1013,19 +1019,36 @@ fn consent_grant(policy: &Policy, reply: ConsentReply) -> Option<(u32, String)> 
 
 /// The service host has no window. It leaves `consent.json` for the signed-in
 /// user's PJDesk window and waits for `consent-reply.json`.
+fn someone_can_answer() -> bool {
+    #[cfg(windows)]
+    {
+        if unsafe { windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId() } == 0xFFFF_FFFF {
+            return false;
+        }
+    }
+    notice::client_alive()
+}
+
 async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) -> Person {
+    if !someone_can_answer() {
+        return Person::Unavailable;
+    }
     let dir = crate::syspaths::service_dir();
     if std::fs::create_dir_all(&dir).is_err() {
-        return Person::TimedOut;
+        return Person::Unavailable;
     }
     let ask_path = dir.join("consent.json");
     let reply_path = dir.join("consent-reply.json");
     let _ = std::fs::remove_file(&reply_path);
-    let ask = serde_json::json!({ "id": 1, "from": name, "ip": ip, "offered": offered });
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1);
+    let ask = serde_json::json!({ "id": id, "from": name, "ip": ip, "offered": offered });
     if std::fs::write(&ask_path, ask.to_string()).is_err() {
-        return Person::TimedOut;
+        return Person::Unavailable;
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let reply = loop {
         if let Ok(bytes) = std::fs::read(&reply_path) {
             if let Ok(reply) = serde_json::from_slice::<ConsentReply>(&bytes) {

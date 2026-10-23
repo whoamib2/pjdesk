@@ -780,16 +780,115 @@ async function clearRemoved(env, networkId, id) {
   }
 }
 
-async function rememberPjdesk(env, networkId, deviceId, pjdesk) {
+async function rememberPjdesk(env, networkId, deviceId, pjdesk, hardwareId) {
   if (!pjdesk || !deviceId) return;
+  const hardware = String(hardwareId || "").trim().slice(0, 64);
+  let previous = "";
   try {
-    await env.DB.prepare(
-      "UPDATE network_devices SET pjdesk_id = ? WHERE network_id = ? AND device_id = ? AND pjdesk_id != ?",
+    const current = await env.DB.prepare(
+      "SELECT pjdesk_id FROM network_devices WHERE network_id = ? AND device_id = ?",
     )
-      .bind(pjdesk, networkId, deviceId, pjdesk)
-      .run();
+      .bind(networkId, deviceId)
+      .first();
+    previous = current?.pjdesk_id || "";
   } catch (err) {
     if (!missingPjdeskColumn(err)) throw err;
+  }
+  if (previous && previous !== pjdesk) await dropStalePresence(env, networkId, previous);
+  if (hardware) await dropSameHardware(env, networkId, hardware, pjdesk);
+  if (hardware) {
+    try {
+      await env.DB.prepare(
+        "UPDATE network_presence SET hardware_id = ? WHERE network_id = ? AND pjdesk_id = ?",
+      )
+        .bind(hardware, networkId, pjdesk)
+        .run();
+    } catch (err) {
+      if (!missingHardwareColumn(err) && !missingPresence(err)) throw err;
+    }
+  }
+  try {
+    if (hardware) {
+      await env.DB.prepare(
+        "UPDATE network_devices SET pjdesk_id = ?, hardware_id = ? WHERE network_id = ? AND device_id = ?",
+      )
+        .bind(pjdesk, hardware, networkId, deviceId)
+        .run();
+    } else {
+      await env.DB.prepare(
+        "UPDATE network_devices SET pjdesk_id = ? WHERE network_id = ? AND device_id = ? AND pjdesk_id != ?",
+      )
+        .bind(pjdesk, networkId, deviceId, pjdesk)
+        .run();
+    }
+  } catch (err) {
+    if (missingHardwareColumn(err) && hardware) {
+      try {
+        await env.DB.prepare(
+          "UPDATE network_devices SET pjdesk_id = ? WHERE network_id = ? AND device_id = ? AND pjdesk_id != ?",
+        )
+          .bind(pjdesk, networkId, deviceId, pjdesk)
+          .run();
+      } catch (again) {
+        if (!missingPjdeskColumn(again)) throw again;
+      }
+    } else if (!missingPjdeskColumn(err)) throw err;
+  }
+}
+
+function missingHardwareColumn(err) {
+  return /no such column/i.test(String(err?.message || err)) && /hardware_id/i.test(String(err?.message || err));
+}
+
+/** Drops an old PJDesk id from the list without deleting this device's sign-in. */
+async function dropStalePresence(env, networkId, oldId) {
+  if (!/^\d{9}$/.test(oldId)) return;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO network_removed (network_id, pjdesk_id, removed_at) VALUES (?, ?, ?)
+       ON CONFLICT(network_id, pjdesk_id) DO UPDATE SET removed_at = excluded.removed_at`,
+    )
+      .bind(networkId, oldId, now())
+      .run();
+  } catch (err) {
+    if (!missingRemoved(err)) throw err;
+  }
+  await env.DB.prepare("DELETE FROM network_computers WHERE network_id = ? AND device_id = ?").bind(networkId, oldId).run();
+  try {
+    await env.DB.prepare("DELETE FROM network_presence WHERE network_id = ? AND pjdesk_id = ?").bind(networkId, oldId).run();
+  } catch (err) {
+    if (!missingPresence(err)) throw err;
+  }
+}
+
+async function dropSameHostname(env, networkId, hostname, keepId) {
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT pjdesk_id FROM network_presence
+        WHERE network_id = ? AND lower(hostname) = lower(?) AND pjdesk_id != ? AND online = 0`,
+    )
+      .bind(networkId, hostname, keepId)
+      .all();
+    for (const row of results || []) {
+      if (row?.pjdesk_id) await dropStalePresence(env, networkId, row.pjdesk_id);
+    }
+  } catch (err) {
+    if (!missingPresence(err)) throw err;
+  }
+}
+
+async function dropSameHardware(env, networkId, hardware, keepId) {
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT pjdesk_id FROM network_presence WHERE network_id = ? AND hardware_id = ? AND pjdesk_id != ?",
+    )
+      .bind(networkId, hardware, keepId)
+      .all();
+    for (const row of results || []) {
+      if (row?.pjdesk_id) await dropStalePresence(env, networkId, row.pjdesk_id);
+    }
+  } catch (err) {
+    if (!missingHardwareColumn(err) && !missingPresence(err)) throw err;
   }
 }
 
@@ -1245,7 +1344,10 @@ async function refresh(request, env) {
   const account = { accountId: row.account_id, email: row.email };
   if (requireAccountsOn(row.require_accounts) && !row.active_address) throw new HttpError(401, "Sign in required.");
   const self = pjdeskId(body.pjdesk_id);
-  if (self) await rememberPjdesk(env, row.id, deviceId, self);
+  const hardware = String(body.hardware_id || "").trim().slice(0, 64);
+  if (self) await rememberPjdesk(env, row.id, deviceId, self, hardware);
+  const reportedName = String(body.hostname || "").trim().slice(0, 64);
+  if (self && reportedName) await dropSameHostname(env, row.id, reportedName, self);
   if (body.reinstate === true && self) await clearRemoved(env, row.id, self);
   const { access, exp } = await signToken(env, { email: account.email, network: row, deviceId });
   if (body.computers) await saveComputers(env, row.id, account.accountId, body.computers);

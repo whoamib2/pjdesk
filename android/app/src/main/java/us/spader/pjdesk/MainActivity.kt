@@ -3,9 +3,12 @@
 package us.spader.pjdesk
 
 import android.Manifest
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.net.ConnectivityManager
@@ -44,6 +47,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -51,6 +55,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -187,7 +194,7 @@ class MainActivity : FragmentActivity() {
             val state by engine.state.collectAsStateWithLifecycle()
             val readiness by engine.readiness.collectAsStateWithLifecycle()
             val listPrefs = remember { SavedListPrefs(applicationContext) }
-            val savedSort by listPrefs.sort.collectAsStateWithLifecycle(SavedSort.Online)
+            val savedSort by listPrefs.sort.collectAsStateWithLifecycle(SavedSort.Recent)
             val savedFilter by listPrefs.filter.collectAsStateWithLifecycle(SavedFilter.All)
             val snackbar = remember { SnackbarHostState() }
             var tab by remember { mutableIntStateOf(0) }
@@ -319,7 +326,7 @@ class MainActivity : FragmentActivity() {
                             val next = if (session.refresh.isBlank()) {
                                 session
                             } else {
-                                us.spader.pjdesk.core.CloudAuth.refresh(
+                                refreshAccount(
                                     session.refresh,
                                     session.deviceId,
                                     us.spader.pjdesk.core.CloudAuth.computersJson(list),
@@ -398,6 +405,15 @@ class MainActivity : FragmentActivity() {
             var offlineRetry by remember { mutableStateOf<SavedComputer?>(null) }
             var lastConnectMs by remember { mutableLongStateOf(0L) }
             var connectGen by remember { mutableIntStateOf(0) }
+            var askChoice by remember { mutableStateOf(false) }
+            var askWaiting by remember { mutableStateOf(false) }
+            var pointerSpeed by remember { mutableFloatStateOf(app.store.pointerSpeed) }
+            var pointerAccel by remember { mutableStateOf(app.store.pointerAccel) }
+            var dragLock by remember { mutableStateOf(false) }
+            var sessionIdleMin by remember { mutableIntStateOf(app.store.sessionIdleMin) }
+            var sessionIdleWarn by remember { mutableStateOf(false) }
+            var screenOff by remember { mutableStateOf(false) }
+            var sessionBackground by remember { mutableStateOf(false) }
             fun launchConnect(id: String, name: String, password: String, askPerson: Boolean = false) {
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (connecting && now - lastConnectMs < 700) {
@@ -468,7 +484,7 @@ class MainActivity : FragmentActivity() {
                         val computers = if (temporarySession) null else CloudAuth.computersJson(app.store.saved())
                         scope.launch {
                             val fetched = withContext(Dispatchers.IO) {
-                                runCatching { CloudAuth.refresh(refresh, device, computers) }
+                                runCatching { refreshAccount(refresh, device, computers) }
                                     .onFailure { AppLog.e("account refresh failed: ${it.message}") }
                                     .getOrNull()
                             }
@@ -498,10 +514,11 @@ class MainActivity : FragmentActivity() {
                     return
                 }
                 if (savedPassword.isEmpty()) {
-                    promptBeforeConnect = true
+                    askChoice = true
+                    promptBeforeConnect = false
                     askedPassword = ""
                     savePassword = true
-                    AppLog.i("Connect asking for a password for ${name.ifBlank { digits }}")
+                    AppLog.i("Connect offering a password or an ask for ${name.ifBlank { digits }}")
                     return
                 }
                 launchConnect(digits, name, savedPassword)
@@ -585,7 +602,7 @@ class MainActivity : FragmentActivity() {
                 val session = withContext(Dispatchers.IO) {
                     val mine = CloudAuth.publicIp()
                     if (mine.isNotBlank()) app.store.myPublicIp = mine
-                    runCatching { CloudAuth.refresh(refresh, device, computers) }
+                    runCatching { refreshAccount(refresh, device, computers) }
                         .onFailure { AppLog.e("account refresh failed: ${it.message}") }
                         .getOrNull()
                 }
@@ -640,7 +657,7 @@ class MainActivity : FragmentActivity() {
                 val ok = withContext(Dispatchers.IO) {
                     runCatching {
                         val list = CloudAuth.prepareEnroll(known, local, uploadLocal, id, hostname, display, osVersion)
-                        CloudAuth.refresh(refresh, device, CloudAuth.computersJson(list))
+                        refreshAccount(refresh, device, CloudAuth.computersJson(list))
                     }.isSuccess
                 }
                 if (ok) enrolledFor = id
@@ -653,10 +670,11 @@ class MainActivity : FragmentActivity() {
                     engine.dismissError()
                     return@LaunchedEffect
                 }
-                if (connecting) {
+                if (connecting || askWaiting) {
                     connectError = friendly
                     offlineRetry = null
                     connecting = false
+                    askWaiting = false
                     AppLog.e("connect failed: $friendly")
                 } else {
                     snackbar.showSnackbar(friendly)
@@ -674,7 +692,67 @@ class MainActivity : FragmentActivity() {
                 if (state.session != null) {
                     connecting = false
                     promptBeforeConnect = false
+                    askChoice = false
+                    askWaiting = false
                     connectError = null
+                    sessionIdleWarn = false
+                }
+            }
+            val lifecycleOwner = LocalLifecycleOwner.current
+            DisposableEffect(lifecycleOwner) {
+                val observer = LifecycleEventObserver { _, event ->
+                    when (event) {
+                        Lifecycle.Event.ON_STOP -> sessionBackground = true
+                        Lifecycle.Event.ON_START -> sessionBackground = false
+                        else -> {}
+                    }
+                }
+                lifecycleOwner.lifecycle.addObserver(observer)
+                onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+            }
+            DisposableEffect(Unit) {
+                val receiver = object : BroadcastReceiver() {
+                    override fun onReceive(context: Context?, intent: Intent?) {
+                        screenOff = intent?.action == Intent.ACTION_SCREEN_OFF
+                    }
+                }
+                val filter = IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                    addAction(Intent.ACTION_SCREEN_ON)
+                }
+                registerReceiver(receiver, filter)
+                onDispose { unregisterReceiver(receiver) }
+            }
+            LaunchedEffect(state.session?.id, bumps, sessionIdleMin) {
+                val minutes = sessionIdleMin
+                if (minutes <= 0 || state.session == null) {
+                    sessionIdleWarn = false
+                    return@LaunchedEffect
+                }
+                val started = android.os.SystemClock.elapsedRealtime()
+                val limit = minutes * 60_000L
+                val warnAt = (limit - 10_000L).coerceAtLeast(0L)
+                while (state.session != null) {
+                    val idle = android.os.SystemClock.elapsedRealtime() - started
+                    val foreground = !sessionBackground && !screenOff
+                    sessionIdleWarn = foreground && idle >= warnAt && idle < limit
+                    if (idle >= limit) {
+                        sessionIdleWarn = false
+                        askWaiting = false
+                        engine.stopView("idle")
+                        break
+                    }
+                    kotlinx.coroutines.delay(500)
+                }
+            }
+            LaunchedEffect(askWaiting) {
+                if (!askWaiting) return@LaunchedEffect
+                kotlinx.coroutines.delay(60_000)
+                if (askWaiting && state.session == null) {
+                    askWaiting = false
+                    connecting = false
+                    engine.stopView("cancelled")
+                    connectError = "No answer"
                 }
             }
             LaunchedEffect(state.notice) {
@@ -699,7 +777,7 @@ class MainActivity : FragmentActivity() {
                 val device = app.store.networkDeviceId
                 if (!temporarySession && refresh.isNotBlank() && device.isNotBlank()) {
                     withContext(Dispatchers.IO) {
-                        runCatching { CloudAuth.refresh(refresh, device, CloudAuth.computersJson(app.store.saved())) }
+                        runCatching { refreshAccount(refresh, device, CloudAuth.computersJson(app.store.saved())) }
                     }
                 }
             }
@@ -935,7 +1013,22 @@ class MainActivity : FragmentActivity() {
                         onKey = engine::key,
                         onQuality = engine::quality,
                         onDisplay = { index -> engine.display(index, session.layout) },
-                        onEnd = { engine.stop() },
+                        onEnd = { engine.stopView("disconnected") },
+                        pointerSpeed = pointerSpeed,
+                        pointerAccel = pointerAccel,
+                        dragLock = dragLock,
+                        onDragLock = { dragLock = it },
+                        onPointerSpeed = {
+                            pointerSpeed = it
+                            app.store.pointerSpeed = it
+                        },
+                        onPointerAccel = {
+                            pointerAccel = it
+                            app.store.pointerAccel = it
+                        },
+                        idleWarn = sessionIdleWarn,
+                        onStay = { sessionIdleWarn = false },
+                        onActivity = {},
                         onClipboard = {
                             val text = clipboardText()
                             if (text.isBlank()) {
@@ -1232,7 +1325,7 @@ class MainActivity : FragmentActivity() {
                                             scope.launch {
                                                 withContext(Dispatchers.IO) {
                                                     runCatching {
-                                                        CloudAuth.refresh(refresh, device, CloudAuth.computersJson(app.store.saved()))
+                                                        refreshAccount(refresh, device, CloudAuth.computersJson(app.store.saved()))
                                                     }
                                                 }
                                             }
@@ -1319,6 +1412,21 @@ class MainActivity : FragmentActivity() {
                                         }
                                     },
                                     onAutoLock = { app.store.autoLockSeconds = it },
+                                    pointerSpeed = pointerSpeed,
+                                    onPointerSpeed = {
+                                        pointerSpeed = it
+                                        app.store.pointerSpeed = it
+                                    },
+                                    pointerAccel = pointerAccel,
+                                    onPointerAccel = {
+                                        pointerAccel = it
+                                        app.store.pointerAccel = it
+                                    },
+                                    sessionIdleMin = sessionIdleMin,
+                                    onSessionIdle = {
+                                        sessionIdleMin = it
+                                        app.store.sessionIdleMin = it
+                                    },
                                     engineDetail = readiness.detail,
                                     accountEmail = account,
                                     onSignOut = if (account.isEmpty()) {
@@ -1394,6 +1502,46 @@ class MainActivity : FragmentActivity() {
                         },
                     )
                 }
+                if (askChoice && !promptBeforeConnect && !state.askPassword) {
+                    val titleName = connectComputerName(saved, connectId).ifBlank { "this computer" }
+                    AlertDialog(
+                        onDismissRequest = { askChoice = false },
+                        title = { Text("Connect to $titleName") },
+                        text = { Text("Enter the password, or ask the person at $titleName to accept.") },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                askChoice = false
+                                promptBeforeConnect = true
+                                askedPassword = ""
+                            }) { Text("Enter password") }
+                        },
+                        dismissButton = {
+                            Row {
+                                TextButton(onClick = {
+                                    askChoice = false
+                                    askWaiting = true
+                                    launchConnect(connectId, titleName, "", askPerson = true)
+                                }) { Text("Ask the person at $titleName") }
+                                TextButton(onClick = { askChoice = false }) { Text("Cancel") }
+                            }
+                        },
+                    )
+                }
+                if (askWaiting && state.session == null && connectError == null && !state.askPassword && !promptBeforeConnect) {
+                    val titleName = connectComputerName(saved, connectId).ifBlank { "that computer" }
+                    AlertDialog(
+                        onDismissRequest = {},
+                        title = { Text("Waiting for $titleName to accept…") },
+                        text = { Text("They can allow or deny this connection. This stops after 60 seconds.") },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                askWaiting = false
+                                connecting = false
+                                engine.stopView("cancelled")
+                            }) { Text("Cancel") }
+                        },
+                    )
+                }
                 if (promptBeforeConnect || state.askPassword) {
                     val titleName = state.askName.ifBlank {
                         connectComputerName(saved, connectId).ifBlank { "this computer" }
@@ -1456,7 +1604,9 @@ class MainActivity : FragmentActivity() {
                                     } else {
                                         launchConnect(id, connectComputerName(saved, id), "", askPerson = true)
                                     }
-                                }) { Text("Ask the person instead") }
+                                    askWaiting = true
+                                    promptBeforeConnect = false
+                                }) { Text("Ask to connect instead") }
                                 TextButton(onClick = {
                                     if (state.askPassword) engine.cancelPassword()
                                     promptBeforeConnect = false
@@ -1527,6 +1677,9 @@ class MainActivity : FragmentActivity() {
     }
 
     override fun onDestroy() {
+        if (isFinishing && !isChangingConfigurations && app.engine.state.value.session != null) {
+            app.engine.stopView("closed")
+        }
         if (isFinishing) {
             decoder?.stop()
             if (tempFlag.get()) {
@@ -1535,6 +1688,22 @@ class MainActivity : FragmentActivity() {
             }
         }
         super.onDestroy()
+    }
+
+    private fun refreshAccount(
+        refresh: String,
+        device: String,
+        computers: org.json.JSONArray?,
+    ): us.spader.pjdesk.core.Session {
+        val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
+        return us.spader.pjdesk.core.CloudAuth.refresh(
+            refresh,
+            device,
+            computers,
+            pjdeskId = app.engine.state.value.id,
+            hardwareId = us.spader.pjdesk.core.CloudAuth.hardwareKey(androidId),
+            hostname = app.engine.deviceLabel(),
+        )
     }
 
     private fun notificationsGranted(): Boolean {

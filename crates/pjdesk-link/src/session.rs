@@ -250,10 +250,19 @@ pub async fn controller_ask_view(connection: &Connection, account: &str, compute
 }
 
 /// Ask the person at the host instead of sending a password.
+/// Password attempts keep [VERDICT_WAIT]. An ask uses a shorter wait.
 pub async fn controller_ask_person(connection: &Connection, my_name: &str) -> Result<Authenticated> {
+    controller_ask_person_for(connection, my_name, VERDICT_WAIT).await
+}
+
+pub async fn controller_ask_person_for(
+    connection: &Connection,
+    my_name: &str,
+    wait: Duration,
+) -> Result<Authenticated> {
     let (mut send, mut recv) = connection.open_bi().await?;
     write_msg(&mut send, &AuthMsg::AskPerson { proto: PROTOCOL_VERSION, controller_name: my_name.into() }).await?;
-    let verdict: AuthMsg = timeout(VERDICT_WAIT, read_msg(&mut recv, MAX_CONTROL_FRAME))
+    let verdict: AuthMsg = timeout(wait, read_msg(&mut recv, MAX_CONTROL_FRAME))
         .await
         .context("the host did not answer")??;
     match verdict {

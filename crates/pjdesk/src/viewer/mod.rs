@@ -112,6 +112,9 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         if !window::run(&runtime, link)? {
             break;
         }
+        if std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1") {
+            break;
+        }
         waiting = true;
         tracing::info!("Waiting for the computer to come back");
         std::thread::sleep(Duration::from_secs(5));
@@ -245,7 +248,9 @@ async fn connect(
             }
             Asked::Person => {
                 tracing::info!("Asking the person at {}", format_id(target));
-                session::controller_ask_person(&connection, &crate::hostname()).await
+                let who = if host_name.trim().is_empty() { format_id(target) } else { host_name.clone() };
+                crate::note_status(&format!("Waiting for {who} to accept..."));
+                session::controller_ask_person_for(&connection, &presenter_name(), std::time::Duration::from_secs(60)).await
             }
             Asked::Password(password) => {
                 tracing::info!("Checking the password with {}", format_id(target));
@@ -351,6 +356,18 @@ fn signed_in_account(cfg: &crate::config::Config) -> String {
     if signed_in { email.trim().chars().filter(|c| !c.is_control()).take(80).collect() } else { String::new() }
 }
 
+/// Account and this computer's name, packed into the one field an ask can send.
+fn presenter_name() -> String {
+    let email = std::env::var("PJDESK_ACCOUNT").unwrap_or_default();
+    let email = email.trim().to_string();
+    let device = crate::hostname();
+    if email.contains('@') {
+        format!("{email} — {device}").chars().take(120).collect()
+    } else {
+        device
+    }
+}
+
 /// Blocks until the window writes a password, asks the person, or cancels.
 /// The host has already answered; this is the only password prompt for the attempt.
 async fn wait_asked_password(path: &std::path::Path, host_name: &str) -> Result<Asked> {
@@ -434,7 +451,7 @@ async fn connect_direct(
         }
     }
     let authed = match &asked {
-        Asked::Person => session::controller_ask_person(&connection, &crate::hostname()).await,
+        Asked::Person => session::controller_ask_person_for(&connection, &presenter_name(), std::time::Duration::from_secs(60)).await,
         Asked::View => {
             let account = signed_in_account(config);
             let id = config.device_id.clone().unwrap_or_default();

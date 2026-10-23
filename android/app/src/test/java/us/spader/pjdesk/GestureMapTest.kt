@@ -97,10 +97,27 @@ class GestureMapTest {
         val desktop = PointerSession(android = false)
         desktop.down(0, listOf(1000 to 1000))
         val moved = desktop.move(listOf((1000 + GestureMap.MOVE_THRESHOLD + 5) to 1000))
-        assertTrue(moved.any { it is PointerSession.Out.Mouse && it.kind == "down" })
+        assertTrue(moved.none { it is PointerSession.Out.Mouse && it.kind == "down" })
         assertTrue(moved.any { it is PointerSession.Out.Mouse && it.kind == "move" })
-        val release = desktop.up(300)
-        assertEquals("up", (release.single() as PointerSession.Out.Mouse).kind)
+        assertTrue(desktop.up(300).none { it is PointerSession.Out.Mouse && it.kind == "down" })
+
+        val locked = PointerSession(android = false)
+        locked.dragLock = true
+        locked.down(0, listOf(1000 to 1000))
+        val held = locked.move(listOf((1000 + GestureMap.MOVE_THRESHOLD + 5) to 1000))
+        assertTrue(held.any { it is PointerSession.Out.Mouse && it.kind == "down" })
+        assertEquals("up", (locked.up(300).single() as PointerSession.Out.Mouse).kind)
+
+        val armed = PointerSession(android = false)
+        armed.armDrag()
+        armed.down(0, listOf(1000 to 1000))
+        val armedMove = armed.move(listOf((1000 + GestureMap.MOVE_THRESHOLD + 5) to 1000))
+        assertTrue(armedMove.any { it is PointerSession.Out.Mouse && it.kind == "down" })
+
+        val touch = PointerSession(android = false, trackpad = false)
+        touch.down(0, listOf(1000 to 1000))
+        val touched = touch.move(listOf((1000 + GestureMap.MOVE_THRESHOLD + 5) to 1000))
+        assertTrue(touched.any { it is PointerSession.Out.Mouse && it.kind == "down" })
 
         val click = PointerSession(android = false)
         click.down(0, listOf(4000 to 4000))

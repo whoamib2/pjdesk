@@ -3,13 +3,15 @@
 package us.spader.pjdesk.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -18,16 +20,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -40,6 +40,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -50,9 +51,8 @@ import us.spader.pjdesk.core.SavedFilter
 import us.spader.pjdesk.core.SavedSort
 import us.spader.pjdesk.core.arrangeSaved
 import us.spader.pjdesk.core.computerTitle
-import us.spader.pjdesk.core.formatSavedId
 import us.spader.pjdesk.core.nickname
-import us.spader.pjdesk.core.osDetail
+import us.spader.pjdesk.core.savedSubtitle
 
 @Composable
 fun SavedScreen(
@@ -67,64 +67,104 @@ fun SavedScreen(
     selfId: String = "",
     signedIn: Boolean = false,
     status: String = "",
-    sort: SavedSort = SavedSort.Online,
+    sort: SavedSort = SavedSort.Recent,
     filter: SavedFilter = SavedFilter.All,
     onSort: (SavedSort) -> Unit = {},
     onFilter: (SavedFilter) -> Unit = {},
 ) {
     var recentTab by remember { mutableStateOf(false) }
-    val shown = arrangeSaved(computers, recentIds, sort, filter, query, recentOnly = recentTab)
+    var searchOpen by remember { mutableStateOf(query.isNotBlank()) }
+    var menu by remember { mutableStateOf(false) }
+    val shown = arrangeSaved(computers, recentIds, sort, filter, query, recentOnly = recentTab, selfId = selfId)
     var editing by remember { mutableStateOf<SavedComputer?>(null) }
     var draft by remember { mutableStateOf("") }
     val self = selfId.filter { it.isDigit() }
-    Column(
-        Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        if (status.isNotBlank()) {
-            Card(Modifier.fillMaxWidth()) {
-                Row(
-                    Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                    Text(status, style = MaterialTheme.typography.bodyMedium)
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .height(48.dp)
+                .padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Segment("Saved", !recentTab) { recentTab = false }
+            Segment("Recent", recentTab) { recentTab = true }
+            Box(Modifier.weight(1f))
+            if (!searchOpen) {
+                IconButton(onClick = { searchOpen = true }, modifier = Modifier.size(48.dp)) {
+                    SearchMark()
+                }
+            }
+            Box {
+                IconButton(onClick = { menu = true }, modifier = Modifier.size(48.dp)) {
+                    FilterMark()
+                }
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    Text(
+                        "Sort",
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = pjMuted(),
+                    )
+                    listOf(
+                        SavedSort.Recent to "Recently used",
+                        SavedSort.Online to "Online first",
+                        SavedSort.Name to "Name",
+                    ).forEach { (value, label) ->
+                        DropdownMenuItem(
+                            text = { Text(if (sort == value) "$label  ✓" else label) },
+                            onClick = { menu = false; onSort(value) },
+                        )
+                    }
+                    HorizontalDivider()
+                    Text(
+                        "Show",
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = pjMuted(),
+                    )
+                    listOf(
+                        SavedFilter.All to "All",
+                        SavedFilter.Online to "Online",
+                        SavedFilter.Offline to "Offline",
+                    ).forEach { (value, label) ->
+                        DropdownMenuItem(
+                            text = { Text(if (filter == value) "$label  ✓" else label) },
+                            onClick = { menu = false; onFilter(value) },
+                        )
+                    }
                 }
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(selected = !recentTab, onClick = { recentTab = false }, label = { Text("Saved") })
-            FilterChip(selected = recentTab, onClick = { recentTab = true }, label = { Text("Recent") })
+        if (searchOpen) {
+            OutlinedTextField(
+                value = query,
+                onValueChange = onQuery,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+                    .padding(horizontal = 12.dp),
+                singleLine = true,
+                textStyle = MaterialTheme.typography.bodyMedium,
+                placeholder = { Text("Name, ID, or OS") },
+                trailingIcon = {
+                    TextButton(onClick = {
+                        onQuery("")
+                        searchOpen = false
+                    }) { Text("Close") }
+                },
+            )
         }
-        Text(
-            when {
-                recentTab -> "Computers you have connected to on this phone."
-                signedIn -> "This list syncs with your account. Saved passwords sync too, encrypted so the server cannot read them."
-                else -> "Sign in at pjdesk.com to sync across your computers. This list stays on this phone."
-            },
-            color = pjMuted(),
-            style = MaterialTheme.typography.bodyMedium,
-        )
-        OutlinedTextField(
-            value = query,
-            onValueChange = onQuery,
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            label = { Text("Search") },
-            placeholder = { Text("Name, ID, or OS") },
-        )
-        if (!recentTab) {
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = sort == SavedSort.Online, onClick = { onSort(SavedSort.Online) }, label = { Text("Online first") })
-                FilterChip(selected = sort == SavedSort.Name, onClick = { onSort(SavedSort.Name) }, label = { Text("Name") })
-                FilterChip(selected = sort == SavedSort.Recent, onClick = { onSort(SavedSort.Recent) }, label = { Text("Recently used") })
+        if (status.isNotBlank()) {
+            Row(
+                Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                Text(status, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-        }
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(selected = filter == SavedFilter.All, onClick = { onFilter(SavedFilter.All) }, label = { Text("All") })
-            FilterChip(selected = filter == SavedFilter.Online, onClick = { onFilter(SavedFilter.Online) }, label = { Text("Online") })
-            FilterChip(selected = filter == SavedFilter.Offline, onClick = { onFilter(SavedFilter.Offline) }, label = { Text("Offline") })
         }
         if (shown.isEmpty()) {
             Text(
@@ -134,14 +174,15 @@ fun SavedScreen(
                     "No computers match."
                 },
                 color = pjMuted(),
-                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                style = MaterialTheme.typography.bodyMedium,
             )
         }
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.weight(1f)) {
+        LazyColumn(modifier = Modifier.weight(1f)) {
             items(shown, key = { it.id }) { computer ->
-                SavedComputerCard(
+                SavedComputerRow(
                     computer = computer,
-                    mine = self.isNotBlank() && computer.id == self,
+                    mine = self.isNotBlank() && computer.id.filter { it.isDigit() } == self,
                     onConnect = {
                         AppLog.i("Saved row Connect ${computer.id} online=${computer.online}")
                         onConnect(computer)
@@ -183,7 +224,22 @@ fun SavedScreen(
 }
 
 @Composable
-private fun SavedComputerCard(
+private fun Segment(label: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(8.dp),
+        color = if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+    ) {
+        Text(
+            label,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            style = MaterialTheme.typography.labelLarge,
+        )
+    }
+}
+
+@Composable
+private fun SavedComputerRow(
     computer: SavedComputer,
     mine: Boolean,
     onConnect: () -> Unit,
@@ -193,100 +249,113 @@ private fun SavedComputerCard(
 ) {
     var menu by remember { mutableStateOf(false) }
     val title = computerTitle(computer)
-    val host = computer.hostname.trim()
-    val showHost = host.isNotBlank() && !host.equals(title, ignoreCase = true)
+    val dark = MaterialTheme.colorScheme.background.luminance() < 0.5f
+    val dot = when {
+        mine -> MaterialTheme.colorScheme.primary
+        computer.online -> if (dark) OkDark else OkLight
+        else -> pjMuted()
+    }
     val user = computer.consoleUser.trim()
-    val idLine = formatSavedId(computer.id)
-    val system = osDetail(computer)
-    Card(Modifier.fillMaxWidth()) {
-        Row(
-            Modifier.padding(16.dp).fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            OsIcon(computer.osFamily.ifBlank { "unknown" }, Modifier.size(36.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+    val host = computer.hostname.trim()
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 56.dp, max = 64.dp)
+            .clickable(enabled = !mine, onClick = onConnect)
+            .padding(horizontal = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+            OsIcon(computer.osFamily.ifBlank { "unknown" }, Modifier.size(28.dp))
+            Box(
+                Modifier
+                    .align(Alignment.BottomEnd)
+                    .size(10.dp)
+                    .clip(CircleShape)
+                    .background(dot),
+            )
+        }
+        Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(
                     title,
-                    style = MaterialTheme.typography.titleMedium,
+                    style = MaterialTheme.typography.bodyLarge,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
                     color = if (title == "No name yet") pjMuted() else MaterialTheme.colorScheme.onSurface,
                 )
-                if (showHost) {
-                    Text(host, color = pjMuted(), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (mine) {
+                    Text(
+                        "This phone",
+                        color = MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                    )
                 }
+            }
+            Text(
+                savedSubtitle(computer),
+                color = pjMuted(),
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (!mine) {
+            IconButton(onClick = onConnect, modifier = Modifier.size(48.dp)) {
+                ConnectMark(if (computer.online) MaterialTheme.colorScheme.primary else pjMuted())
+            }
+        }
+        Box {
+            IconButton(onClick = { menu = true }, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Filled.MoreVert, contentDescription = "More actions")
+            }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 if (user.isNotBlank()) {
-                    Text(user, color = pjMuted(), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    DropdownMenuItem(text = { Text("User: $user") }, onClick = { menu = false }, enabled = false)
                 }
-                if (idLine.isNotBlank()) {
-                    Text(idLine, color = pjMuted(), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (host.isNotBlank() && !host.equals(title, ignoreCase = true)) {
+                    DropdownMenuItem(text = { Text(host) }, onClick = { menu = false }, enabled = false)
                 }
-                if (system.isNotBlank()) {
-                    Text(system, color = pjMuted(), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                DropdownMenuItem(text = { Text("Rename") }, onClick = { menu = false; onRename() })
+                if (computer.passwordSaved) {
+                    DropdownMenuItem(text = { Text("Remove password") }, onClick = { menu = false; onRemovePassword() })
                 }
-                StatusChip(online = computer.online, mine = mine, known = computer.lastSeen > 0 || computer.online || computer.hostname.isNotBlank())
-            }
-            if (!mine) {
-                if (computer.online) {
-                    Button(onClick = onConnect) { Text("Connect") }
-                } else {
-                    OutlinedButton(onClick = onConnect) { Text("Connect") }
-                }
-            }
-            Box {
-                IconButton(onClick = { menu = true }) {
-                    Icon(Icons.Filled.MoreVert, contentDescription = "More actions")
-                }
-                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                    DropdownMenuItem(
-                        text = { Text("Rename") },
-                        onClick = {
-                            menu = false
-                            onRename()
-                        },
-                    )
-                    if (computer.passwordSaved) {
-                        DropdownMenuItem(
-                            text = { Text("Remove password") },
-                            onClick = {
-                                menu = false
-                                onRemovePassword()
-                            },
-                        )
-                    }
-                    DropdownMenuItem(
-                        text = { Text("Remove") },
-                        onClick = {
-                            menu = false
-                            onForget()
-                        },
-                    )
-                }
+                DropdownMenuItem(text = { Text("Remove") }, onClick = { menu = false; onForget() })
             }
         }
     }
 }
 
 @Composable
-private fun StatusChip(online: Boolean, mine: Boolean, known: Boolean) {
-    val dark = MaterialTheme.colorScheme.background.luminance() < 0.5f
-    val onlineColor = if (dark) OkDark else OkLight
-    val idle = pjMuted()
-    val (label, color) = when {
-        mine -> "This phone" to MaterialTheme.colorScheme.primary
-        online -> "Online" to onlineColor
-        known -> "Offline" to idle
-        else -> return
+private fun SearchMark() {
+    val color = MaterialTheme.colorScheme.onSurface
+    androidx.compose.foundation.Canvas(Modifier.size(22.dp)) {
+        drawCircle(color, radius = size.minDimension * 0.28f, center = androidx.compose.ui.geometry.Offset(size.width * 0.42f, size.height * 0.42f), style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.8.dp.toPx()))
+        drawLine(color, androidx.compose.ui.geometry.Offset(size.width * 0.62f, size.height * 0.62f), androidx.compose.ui.geometry.Offset(size.width * 0.84f, size.height * 0.84f), strokeWidth = 1.8.dp.toPx())
     }
-    Surface(shape = RoundedCornerShape(50), color = color.copy(alpha = 0.16f)) {
-        Row(
-            Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Box(Modifier.size(8.dp).clip(CircleShape).background(color))
-            Text(label, color = color, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+}
+
+@Composable
+private fun FilterMark() {
+    val color = MaterialTheme.colorScheme.onSurface
+    androidx.compose.foundation.Canvas(Modifier.size(22.dp)) {
+        drawLine(color, androidx.compose.ui.geometry.Offset(3.dp.toPx(), 5.dp.toPx()), androidx.compose.ui.geometry.Offset(size.width - 3.dp.toPx(), 5.dp.toPx()), strokeWidth = 1.7.dp.toPx())
+        drawLine(color, androidx.compose.ui.geometry.Offset(6.dp.toPx(), size.height / 2), androidx.compose.ui.geometry.Offset(size.width - 6.dp.toPx(), size.height / 2), strokeWidth = 1.7.dp.toPx())
+        drawLine(color, androidx.compose.ui.geometry.Offset(9.dp.toPx(), size.height - 5.dp.toPx()), androidx.compose.ui.geometry.Offset(size.width - 9.dp.toPx(), size.height - 5.dp.toPx()), strokeWidth = 1.7.dp.toPx())
+    }
+}
+
+@Composable
+private fun ConnectMark(color: Color) {
+    androidx.compose.foundation.Canvas(Modifier.size(22.dp)) {
+        val path = androidx.compose.ui.graphics.Path().apply {
+            moveTo(size.width * 0.28f, size.height * 0.18f)
+            lineTo(size.width * 0.82f, size.height * 0.5f)
+            lineTo(size.width * 0.28f, size.height * 0.82f)
+            close()
         }
+        drawPath(path, color)
     }
 }

@@ -14,6 +14,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -67,6 +68,12 @@ fun SettingsScreen(
     engineDetail: String = "",
     accountEmail: String = "",
     onSignOut: (() -> Unit)? = null,
+    pointerSpeed: Float = 0.6f,
+    onPointerSpeed: (Float) -> Unit = {},
+    pointerAccel: Boolean = false,
+    onPointerAccel: (Boolean) -> Unit = {},
+    sessionIdleMin: Int = 1,
+    onSessionIdle: (Int) -> Unit = {},
 ) {
     var server by rememberSaveable(state.server) { mutableStateOf(state.server) }
     var name by rememberSaveable(computerName) { mutableStateOf(computerName) }
@@ -165,6 +172,29 @@ fun SettingsScreen(
                 onForget = onForgetTrusted,
             )
         }
+        Section("Remote control") {
+            Text("Pointer speed ${pointerLabel(pointerSpeed)}", color = pjMuted())
+            Slider(
+                value = pointerSpeed.coerceIn(0.25f, 2f),
+                onValueChange = { onPointerSpeed(it) },
+                valueRange = 0.25f..2f,
+            )
+            Text("0.25× is slow and 2× is fast. 0.6× is the default.", color = pjMuted())
+            Row(Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                Text("Pointer acceleration", modifier = Modifier.weight(1f))
+                Switch(checked = pointerAccel, onCheckedChange = onPointerAccel)
+            }
+            Text("End a remote session after no input. The same time applies in the foreground, in the background, and when the screen is off. In the foreground, PJDesk warns 10 seconds before it disconnects.", color = pjMuted())
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(0 to "Off", 1 to "1 min", 5 to "5 min", 15 to "15 min").forEach { (minutes, label) ->
+                    FilterChip(
+                        selected = sessionIdleMin == minutes,
+                        onClick = { onSessionIdle(minutes) },
+                        label = { Text(label) },
+                    )
+                }
+            }
+        }
         Section("Display") {
             Text("Theme", color = pjMuted())
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -198,6 +228,10 @@ fun SettingsScreen(
             }
         }
         Section("Sign-in") {
+            Text(
+                "Saved computers sync with your account. Saved passwords sync too, encrypted so the server cannot read them.",
+                color = pjMuted(),
+            )
             if (onSignOut != null) {
                 Button(onClick = onSignOut, modifier = Modifier.fillMaxWidth()) { Text("Sign out") }
             }
@@ -218,7 +252,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.12", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.13", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }
@@ -229,6 +263,11 @@ fun SettingsScreen(
             TextButton(onClick = onShareLogs) { Text("Share logs") }
         }
     }
+}
+
+private fun pointerLabel(speed: Float): String {
+    val shown = (speed * 10f).let { kotlin.math.round(it) } / 10f
+    return if (shown % 1f == 0f) "${shown.toInt()}×" else "${shown}×"
 }
 
 @Composable

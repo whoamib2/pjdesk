@@ -35,7 +35,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.12";
+pub const APP_VERSION: &str = "0.6.13";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -102,6 +102,8 @@ struct State {
     capture_deny: Mutex<String>,
     /// Bumped to end the current session. The host registration keeps running.
     gen: AtomicU64,
+    /// Bumped to end a session this phone is controlling, without dropping the host.
+    view_gen: AtomicU64,
     approval_tx: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
     password_tx: Mutex<Option<oneshot::Sender<TypedAuth>>>,
     lockout: Mutex<Lockout>,
@@ -184,6 +186,7 @@ impl Engine {
             capturing: AtomicBool::new(false),
             capture_deny: Mutex::new(String::new()),
             gen: AtomicU64::new(1),
+            view_gen: AtomicU64::new(1),
             approval_tx: Mutex::new(None),
             password_tx: Mutex::new(None),
             lockout: Mutex::new(Lockout::default()),
@@ -488,9 +491,10 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             emit(cb, &json!({"event":"status","text": format!("Connecting to {shown}…")}));
             state.gen.fetch_add(1, Ordering::SeqCst);
             let gen = state.gen.load(Ordering::SeqCst);
+            let view_mark = state.view_gen.load(Ordering::SeqCst);
             let (state, cb) = (state.clone(), cb.clone());
             tokio::spawn(async move {
-                if let Err(e) = controller_session(state.clone(), cb.clone(), &id, &password, gen, ask_now).await {
+                if let Err(e) = controller_session(state.clone(), cb.clone(), &id, &password, gen, view_mark, ask_now).await {
                     let raw = format!("{e:#}");
                     let head = raw.lines().next().unwrap_or("").trim().to_string();
                     log_line(&cb, format!("connect ended: {head}"));
@@ -538,10 +542,25 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 let _ = tx.send(Err(reason));
             }
         }
+        "stopView" => {
+            let reason = cmd.get("reason").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("stopped");
+            let reason = reason.chars().take(200).collect::<String>();
+            *state.end_reason.lock().unwrap() = reason.clone();
+            state.view_gen.fetch_add(1, Ordering::SeqCst);
+            if let Some(tx) = state.password_tx.lock().unwrap().take() {
+                let _ = tx.send(TypedAuth::Cancel);
+            }
+            let active = state.control.lock().unwrap().is_some();
+            *state.control.lock().unwrap() = None;
+            if active {
+                emit(cb, &json!({"event":"disconnected","role":"controller","reason": reason}));
+            }
+        }
         "stop" => {
             let reason = cmd.get("reason").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("stopped");
             let reason = reason.chars().take(200).collect::<String>();
             *state.end_reason.lock().unwrap() = reason.clone();
+            state.view_gen.fetch_add(1, Ordering::SeqCst);
             state.gen.fetch_add(1, Ordering::SeqCst);
             *state.control.lock().unwrap() = None;
             *state.video.lock().unwrap() = None;
@@ -1409,12 +1428,51 @@ fn android_version() -> String {
 
 /// The pjdesk.com account when this phone is signed in, otherwise a blank account
 /// so the other computer names this phone instead.
+/// Account and device name packed into the one name the connect and ask messages carry.
+fn presenter(state: &State) -> String {
+    let account = state.account.lock().unwrap().trim().to_string();
+    let facts = state.facts.lock().unwrap().clone();
+    let named = facts.display_name.trim();
+    let device = if !named.is_empty() {
+        named.to_string()
+    } else if !facts.hostname.trim().is_empty() {
+        facts.hostname.trim().to_string()
+    } else {
+        state.hostname.clone()
+    };
+    let device: String = device.chars().filter(|c| !c.is_control()).take(64).collect();
+    if account.contains('@') {
+        format!("{account} — {device}").chars().take(120).collect()
+    } else {
+        device
+    }
+}
+
 fn android_visitor(state: &State) -> ControlMsg {
     let account = state.account.lock().unwrap().clone();
     let facts = state.facts.lock().unwrap().clone();
-    let computer = if !facts.hostname.trim().is_empty() { facts.hostname } else { state.hostname.clone() };
+    let named = facts.display_name.trim();
+    let computer = if !named.is_empty() {
+        named.to_string()
+    } else if !facts.hostname.trim().is_empty() {
+        facts.hostname.clone()
+    } else {
+        state.hostname.clone()
+    };
     let id = state.device_id.lock().unwrap().clone().unwrap_or_default();
     ControlMsg::Visitor { account, computer, user: facts.console_user, id }
+}
+
+fn ask_sentence(err: &anyhow::Error) -> String {
+    let text = format!("{err:#}");
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("no one is available") {
+        "No one is available to accept".into()
+    } else if lower.contains("timed out") || lower.contains("did not answer") || lower.contains("no answer") {
+        "No answer".into()
+    } else {
+        "Declined".into()
+    }
 }
 
 fn forward_input(cb: &Arc<dyn Callbacks>, adapter: &mut PointerAdapter, event: InputEvent) {
@@ -1589,6 +1647,7 @@ async fn controller_session(
     target: &str,
     password: &str,
     gen: u64,
+    view_mark: u64,
     ask_now: bool,
 ) -> Result<()> {
     *state.end_reason.lock().unwrap() = String::new();
@@ -1607,13 +1666,14 @@ async fn controller_session(
     if !access.is_empty() {
         let _ = signal.send(ClientMsg::PresentAccess { token: access });
     }
+    let label = presenter(&state);
     signal.send(ClientMsg::Connect {
         proto: PROTOCOL_VERSION,
         target_id: target.into(),
-        controller_name: state.hostname.clone(),
+        controller_name: label.clone(),
     })?;
     let (session_id, token, udp_port, host_name) = loop {
-        if state.gen.load(Ordering::SeqCst) != gen {
+        if state.gen.load(Ordering::SeqCst) != gen || state.view_gen.load(Ordering::SeqCst) != view_mark {
             bail!("stopped");
         }
         match tokio::time::timeout(Duration::from_secs(90), signal.recv()).await {
@@ -1691,9 +1751,28 @@ async fn controller_session(
             }
         };
         let authed = if ask_person {
-            session::controller_ask_person(&connection, &state.hostname).await
+            let who = if host_name.trim().is_empty() { format_id(target) } else { host_name.clone() };
+            emit(&cb, &json!({"event":"status","text": format!("Waiting for {who} to accept…")}));
+            let asked = session::controller_ask_person_for(&connection, &label, Duration::from_secs(60));
+            tokio::pin!(asked);
+            let result = loop {
+                tokio::select! {
+                    result = &mut asked => break result,
+                    _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                        if state.view_gen.load(Ordering::SeqCst) != view_mark || state.gen.load(Ordering::SeqCst) != gen {
+                            connection.close(0u32.into(), b"viewer closed");
+                            bail!("cancelled");
+                        }
+                    }
+                }
+            };
+            match result {
+                Ok(auth) => Ok(auth),
+                Err(e) if e.is::<LockedOut>() => Err(e),
+                Err(e) => Err(anyhow::Error::msg(ask_sentence(&e))),
+            }
         } else {
-            session::controller_auth(&connection, &password, &state.hostname).await
+            session::controller_auth(&connection, &password, &label).await
         };
         match authed {
             Ok(auth) => break (connection, path, auth),
@@ -1747,6 +1826,20 @@ async fn controller_session(
     );
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlMsg>();
     *state.control.lock().unwrap() = Some(control_tx.clone());
+    let watch_conn = connection.clone();
+    let watch_state = state.clone();
+    let watcher = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            if watch_state.view_gen.load(Ordering::SeqCst) != view_mark
+                || watch_state.gen.load(Ordering::SeqCst) != gen
+                || watch_state.app_stop.load(Ordering::SeqCst)
+            {
+                watch_conn.close(0u32.into(), b"viewer closed");
+                break;
+            }
+        }
+    });
     if auth.peer_proto >= 3 {
         let _ = control_tx.send(ControlMsg::Hello {
             permissions: perms::ALL | perms::LAYOUT | perms::VISITOR,
@@ -1805,7 +1898,10 @@ async fn controller_session(
     let mut platform = String::new();
     let mut layout = false;
     let end_reason = loop {
-        if state.gen.load(Ordering::SeqCst) != gen || state.app_stop.load(Ordering::SeqCst) {
+        if state.gen.load(Ordering::SeqCst) != gen
+            || state.view_gen.load(Ordering::SeqCst) != view_mark
+            || state.app_stop.load(Ordering::SeqCst)
+        {
             let saved = state.end_reason.lock().unwrap().clone();
             break if saved.is_empty() { "stopped".to_string() } else { saved };
         }
@@ -1852,6 +1948,7 @@ async fn controller_session(
     };
     writer.abort();
     video_task.abort();
+    watcher.abort();
     *state.control.lock().unwrap() = None;
     connection.close(0u32.into(), b"viewer closed");
     log_line(&cb, format!("controller session ended: {end_reason}"));
@@ -1865,6 +1962,27 @@ use tokio::io::AsyncWriteExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presenter_names_the_account_and_the_phone() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-presenter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir);
+        assert_eq!(presenter(&state), "Pixel");
+        state.facts.lock().unwrap().display_name = "Ben Pixel 11".into();
+        *state.account.lock().unwrap() = "ben@spader.us".into();
+        assert_eq!(presenter(&state), "ben@spader.us — Ben Pixel 11");
+        let card = android_visitor(&state);
+        match card {
+            ControlMsg::Visitor { account, computer, .. } => {
+                assert_eq!(account, "ben@spader.us");
+                assert_eq!(computer, "Ben Pixel 11");
+            }
+            _ => panic!("visitor"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn permanent_password_matches_the_windows_rule() {
@@ -2044,6 +2162,7 @@ mod tests {
             capturing: AtomicBool::new(false),
             capture_deny: Mutex::new(String::new()),
             gen: AtomicU64::new(1),
+            view_gen: AtomicU64::new(1),
             approval_tx: Mutex::new(None),
             password_tx: Mutex::new(None),
             lockout: Mutex::new(Lockout::default()),

@@ -116,9 +116,27 @@ object CloudAuth {
         return session("", deviceId, reply)
     }
 
-    fun refresh(refresh: String, deviceId: String, computers: JSONArray? = null): Session {
+    fun hardwareKey(androidId: String): String {
+        val raw = androidId.trim()
+        if (raw.isEmpty()) return ""
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.UTF_8))
+        return digest.take(8).joinToString("") { "%02x".format(it) }
+    }
+
+    fun refresh(
+        refresh: String,
+        deviceId: String,
+        computers: JSONArray? = null,
+        pjdeskId: String = "",
+        hardwareId: String = "",
+        hostname: String = "",
+    ): Session {
         val body = JSONObject().put("refresh", refresh).put("device_id", deviceId)
         if (computers != null) body.put("computers", computers)
+        val id = pjdeskId.filter { it.isDigit() }
+        if (id.length == 9) body.put("pjdesk_id", id)
+        if (hardwareId.isNotBlank()) body.put("hardware_id", hardwareId.take(64))
+        if (hostname.isNotBlank()) body.put("hostname", hostname.take(64))
         val reply = post("$API/api/network/refresh", null, body)
         return session("", deviceId, reply)
     }

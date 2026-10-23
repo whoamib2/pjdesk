@@ -31,22 +31,38 @@ static DISCONNECT: AtomicBool = AtomicBool::new(false);
 static THREAD: AtomicU32 = AtomicU32::new(0);
 #[cfg_attr(not(windows), allow(dead_code))]
 static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
+static HANDED: AtomicBool = AtomicBool::new(false);
 
 const WM_APP_REFRESH: u32 = 0x8000;
 
 /// Hides the notice when the session task ends, including on a disconnect.
-pub struct Guard;
+pub struct Guard {
+    /// The signed-in PJDesk window owns the notice. This process only wrote the file.
+    handed: bool,
+}
 
 impl Guard {
     pub fn begin(computer: &str) -> Self {
         begin(computer);
-        Guard
+        Guard { handed: false }
+    }
+
+    /// Service host: show the notice in the logged-on user's PJDesk window when that
+    /// window is running. Otherwise show it in this process, which is already in
+    /// that user's session.
+    pub fn begin_service(computer: &str) -> Self {
+        if hand_to_client(computer) { Guard { handed: true } } else { Self::begin(computer) }
     }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        end();
+        if self.handed {
+            HANDED.store(false, Ordering::SeqCst);
+            let _ = std::fs::remove_file(crate::syspaths::service_dir().join("connect-notice.json"));
+        } else {
+            end();
+        }
     }
 }
 
@@ -58,6 +74,10 @@ pub fn begin(computer: &str) {
 
 /// Replaces the notice with the account, computer, user, and ID from the controller.
 pub fn update(account: &str, computer: &str, user: &str, id: &str) {
+    if HANDED.load(Ordering::SeqCst) {
+        let _ = write_notice_file(account, computer, user, id);
+        return;
+    }
     let mut who = Who { account: account.to_string(), computer: computer.to_string(), user: user.to_string(), id: id.to_string() };
     if who.computer.trim().is_empty() {
         if let Some(prev) = SLOT.lock().unwrap().who.clone() {
@@ -80,7 +100,49 @@ pub fn end() {
 
 /// True once, when the person at this computer pressed Disconnect.
 pub fn disconnect_requested() -> bool {
-    DISCONNECT.swap(false, Ordering::SeqCst)
+    if DISCONNECT.swap(false, Ordering::SeqCst) {
+        return true;
+    }
+    let path = crate::syspaths::service_dir().join("notice-bye");
+    if path.is_file() {
+        let _ = std::fs::remove_file(&path);
+        return true;
+    }
+    false
+}
+
+/// True when the signed-in PJDesk window wrote a heartbeat in the last 8 seconds.
+pub fn client_alive() -> bool {
+    let path = crate::syspaths::service_dir().join("client-alive");
+    let Ok(meta) = std::fs::metadata(&path) else { return false };
+    let Ok(modified) = meta.modified() else { return false };
+    modified.elapsed().map(|age| age.as_secs() < 8).unwrap_or(false)
+}
+
+fn hand_to_client(computer: &str) -> bool {
+    if !client_alive() {
+        return false;
+    }
+    HANDED.store(true, Ordering::SeqCst);
+    write_notice_file("", computer, "", "").is_ok()
+}
+
+fn write_notice_file(account: &str, computer: &str, user: &str, id: &str) -> std::io::Result<()> {
+    let dir = crate::syspaths::service_dir();
+    std::fs::create_dir_all(&dir)?;
+    let body = serde_json::json!({
+        "account": account,
+        "computer": computer,
+        "user": user,
+        "id": id,
+        "seq": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+    });
+    std::fs::write(dir.join("connect-notice.json"), body.to_string())
+}
+
+fn request_disconnect() {
+    DISCONNECT.store(true, Ordering::SeqCst);
+    let _ = std::fs::write(crate::syspaths::service_dir().join("notice-bye"), b"1");
 }
 
 fn publish(who: Who) {
@@ -146,16 +208,18 @@ fn ui_thread() {
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-        KillTimer, PostQuitMessage, RegisterClassW, SetTimer, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
-        TranslateMessage, HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
+        KillTimer, PostQuitMessage, RegisterClassW, SetTimer, SetWindowDisplayAffinity, SetWindowPos, SetWindowTextW,
+        ShowWindow, TranslateMessage, HWND_NOTOPMOST, HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_SHOWWINDOW, SW_HIDE, SW_MINIMIZE, SW_SHOWNOACTIVATE,
         WINDOW_DISPLAY_AFFINITY, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP,
         WM_MOUSEACTIVATE, WM_PAINT, WM_TIMER, WNDCLASSW,
     };
 
-    const WS_POPUP: u32 = 0x8000_0000;
+    const WS_CAPTION: u32 = 0x00C0_0000;
+    const WS_SYSMENU: u32 = 0x0008_0000;
+    const WS_MINIMIZEBOX: u32 = 0x0002_0000;
     const WS_EX_TOPMOST: u32 = 0x0000_0008;
-    const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
-    const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+    const WS_EX_APPWINDOW: u32 = 0x0004_0000;
     const MA_NOACTIVATE: isize = 3;
     struct Ui {
         collapsed: bool,
@@ -170,13 +234,17 @@ fn ui_thread() {
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE),
             WM_ERASEBKGND => LRESULT(1),
             WM_TIMER => {
-                if let Some(ui) = UI.lock().unwrap().as_mut() {
-                    ui.collapsed = true;
-                    ui.armed = false;
-                }
                 let _ = KillTimer(Some(hwnd), 1);
-                place(hwnd);
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_NOTOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+                let _ = ShowWindow(hwnd, SW_MINIMIZE);
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
@@ -189,7 +257,7 @@ fn ui_thread() {
                     place(hwnd);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 } else if hit_disconnect(hwnd, x, y) {
-                    DISCONNECT.store(true, Ordering::SeqCst);
+                    request_disconnect();
                 } else if hit_collapse(hwnd, x, y) {
                     if let Some(ui) = UI.lock().unwrap().as_mut() {
                         ui.collapsed = true;
@@ -334,17 +402,21 @@ fn ui_thread() {
         if showing {
             let seq = SLOT.lock().unwrap().seq;
             let fresh = LAST_SEQ.swap(seq, Ordering::SeqCst) != seq;
+            if let Some(card) = current_card() {
+                let title: Vec<u16> = card.headline.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(title.as_ptr()));
+            }
             if fresh {
                 if let Some(ui) = UI.lock().unwrap().as_mut() {
                     if !ui.armed {
                         ui.collapsed = false;
                         ui.armed = true;
                         let _ = SetTimer(Some(hwnd), 1, 2000, None);
+                        place(hwnd);
+                        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                     }
                 }
             }
-            place(hwnd);
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = InvalidateRect(Some(hwnd), None, false);
         } else {
             if let Some(ui) = UI.lock().unwrap().as_mut() {
@@ -368,10 +440,10 @@ fn ui_thread() {
             return;
         }
         let Ok(hwnd) = CreateWindowExW(
-            WINDOW_EX_STYLE(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE),
+            WINDOW_EX_STYLE(WS_EX_TOPMOST | WS_EX_APPWINDOW),
             w!("PJDeskConnectNotice"),
             w!("PJDesk"),
-            WINDOW_STYLE(WS_POPUP),
+            WINDOW_STYLE(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX),
             0,
             0,
             10,

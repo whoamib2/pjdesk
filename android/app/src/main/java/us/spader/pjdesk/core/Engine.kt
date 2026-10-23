@@ -240,6 +240,10 @@ class Engine(context: Context) : EngineListener {
             showError(if (_ready.value.phase == EnginePhase.Failed) why else "PJDesk did not finish starting.")
             return
         }
+        val email = store.networkEmail.trim()
+        if (email.isNotEmpty()) {
+            command(JSONObject().put("cmd", "account").put("email", email).toString())
+        }
         command(
             JSONObject()
                 .put("cmd", "connect")
@@ -249,6 +253,28 @@ class Engine(context: Context) : EngineListener {
                 .put("name", name)
                 .toString(),
         )
+    }
+
+    /**
+     * Ends a session this phone is controlling. The host registration keeps
+     * running, so an incoming view request can still arrive.
+     */
+    fun stopView(reason: String = "stopped") {
+        AppLog.i("ending the controller session: $reason")
+        us.spader.pjdesk.service.SessionNotice.hide(app)
+        update {
+            val active = it.session != null ||
+                it.status.startsWith("Connecting") ||
+                it.status.startsWith("Waiting") ||
+                it.status.startsWith("Asking")
+            it.copy(
+                session = null,
+                askPassword = false,
+                askNote = "",
+                status = if (active) "Ready" else it.status,
+            )
+        }
+        command(JSONObject().put("cmd", "stopView").put("reason", reason).toString())
     }
 
     fun accept() {
@@ -541,15 +567,17 @@ class Engine(context: Context) : EngineListener {
                     it.copy(hosting = true, incoming = null, hostWho = who, status = "Being controlled by $who")
                 }
             }
-            "controlling" -> update {
+            "controlling" -> {
                 val peer = event.optString("peer")
+                us.spader.pjdesk.service.SessionNotice.show(app, peer)
+                update {
                 val path = event.optString("path")
                 val how = when (path) {
                     "LAN" -> "over LAN"
                     "Internet, relayed" -> "through the relay"
                     else -> "($path)"
                 }
-                it.copy(
+                    it.copy(
                     askPassword = false,
                     session = SessionInfo(
                         peer = peer,
@@ -562,6 +590,7 @@ class Engine(context: Context) : EngineListener {
                     ),
                     status = "Controlling $peer $how",
                 )
+                }
             }
             "platform" -> update { state ->
                 val session = state.session ?: return@update state
@@ -591,6 +620,9 @@ class Engine(context: Context) : EngineListener {
                 us.spader.pjdesk.service.ViewPrompt.cancel(app)
                 us.spader.pjdesk.service.CapturePrompt.cancel(app)
                 val role = event.optString("role")
+                if (role == "controller" || role == "session") {
+                    us.spader.pjdesk.service.SessionNotice.hide(app)
+                }
                 val reason = event.optString("reason").ifBlank { "the session ended" }
                 update {
                     it.copy(

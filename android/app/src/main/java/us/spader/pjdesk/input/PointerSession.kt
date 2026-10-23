@@ -8,16 +8,26 @@ package us.spader.pjdesk.input
  * is still a pinch for callers that ask for it; the session view uses that
  * motion to zoom the picture instead.
  *
- * Trackpad mode moves a cursor. A short tap clicks, a drag holds the button,
- * two fingers scroll, and three fingers click the middle button.
+ * Trackpad mode moves a cursor. A short tap clicks. A one-finger drag only
+ * moves the pointer. Holding the button takes a drag-lock or a tap followed
+ * by a press-and-drag. Two fingers scroll, and three fingers click the middle
+ * button. [speed] scales that movement (0.6 is the default). [accelerate]
+ * lengthens a fast flick.
  *
  * Touch mode on a desktop remote clicks where the finger is. A long-press or a
- * two-finger tap is the right button. A drag holds the left button.
+ * two-finger tap is the right button. A drag holds the left button. Callers
+ * that pan a zoomed picture should not send those moves here.
  */
 class PointerSession(
     val android: Boolean,
     /** Null keeps the previous split: Android remotes use gestures, desktops use the trackpad. */
     trackpad: Boolean? = null,
+    /** Multiplier for trackpad movement. 1 matches the previous speed. */
+    var speed: Float = 0.6f,
+    /** When on, a faster finger flick moves the pointer further. */
+    var accelerate: Boolean = false,
+    /** When on, a one-finger trackpad drag holds the mouse button. */
+    var dragLock: Boolean = false,
 ) {
     private val relative = trackpad ?: !android
     private val stroke = StrokeTracker()
@@ -32,8 +42,18 @@ class PointerSession(
     private var twoFinger = false
     private var rightSent = false
     private var downMs = 0L
+    /** Finger travel past the move threshold, without a button necessarily held. */
+    private var moved = false
+    /** Set by a tap-then-press so the next drag holds the button. */
+    private var armed = false
 
     val cursorNorm: Pair<Int, Int> get() = cursor
+    val dragArmed: Boolean get() = armed
+
+    /** The next one-finger press-and-drag holds the mouse button. */
+    fun armDrag() {
+        armed = true
+    }
 
     fun down(tMs: Long, points: List<Pair<Int, Int>>) {
         if (points.isEmpty()) return
@@ -51,6 +71,7 @@ class PointerSession(
             origin = points[0]
             last = points[0]
             dragging = false
+            moved = false
             return
         }
         if (android) {
@@ -96,11 +117,15 @@ class PointerSession(
             last = points[0]
             val out = ArrayList<Out>(2)
             val start = origin
-            if (!dragging && start != null && chebyshev(start, points[0]) >= GestureMap.MOVE_THRESHOLD) {
-                dragging = true
-                out.add(Out.Mouse("down", cursor.first, cursor.second, 0))
+            if (start != null && chebyshev(start, points[0]) >= GestureMap.MOVE_THRESHOLD) {
+                moved = true
+                if (!dragging && (dragLock || armed)) {
+                    dragging = true
+                    out.add(Out.Mouse("down", cursor.first, cursor.second, 0))
+                }
             }
-            cursor = GestureMap.trackpadMove(cursor, dx, dy)
+            val (sx, sy) = scaleDelta(dx, dy)
+            cursor = GestureMap.trackpadMove(cursor, sx, sy)
             out.add(Out.Mouse("move", cursor.first, cursor.second, 0))
             return out
         }
@@ -143,11 +168,15 @@ class PointerSession(
             origin = null
             last = null
             if (had == null) return emptyList()
-            return if (dragging) {
-                dragging = false
-                listOf(Out.Mouse("up", cursor.first, cursor.second, 0))
-            } else {
-                listOf(
+            val held = dragging
+            val travelled = moved
+            dragging = false
+            moved = false
+            armed = false
+            return when {
+                held -> listOf(Out.Mouse("up", cursor.first, cursor.second, 0))
+                travelled -> emptyList()
+                else -> listOf(
                     Out.Mouse("down", cursor.first, cursor.second, 0),
                     Out.Mouse("up", cursor.first, cursor.second, 0),
                 )
@@ -219,7 +248,13 @@ class PointerSession(
         return null
     }
 
-    fun cancel() {
+    /** Drops the gesture. A held button is released so a pan cannot leave the mouse down. */
+    fun cancel(): List<Out> {
+        val release = if (dragging) {
+            listOf(Out.Mouse("up", cursor.first, cursor.second, 0))
+        } else {
+            emptyList()
+        }
         stroke.cancel()
         pinchStart = null
         pinchLast = null
@@ -227,9 +262,23 @@ class PointerSession(
         last = null
         scrollY = null
         dragging = false
+        moved = false
+        armed = false
         middle = false
         twoFinger = false
         rightSent = false
+        return release
+    }
+
+    private fun scaleDelta(dx: Int, dy: Int): Pair<Int, Int> {
+        if (!relative) return dx to dy
+        var gain = speed.coerceIn(0.25f, 2f)
+        if (accelerate) {
+            val mag = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+            gain *= 1f + (mag / 8000f).coerceAtMost(1.5f)
+        }
+        return (dx * gain).let { kotlin.math.round(it.toDouble()).toInt() } to
+            (dy * gain).let { kotlin.math.round(it.toDouble()).toInt() }
     }
 
     private fun chebyshev(a: Pair<Int, Int>, b: Pair<Int, Int>): Int =

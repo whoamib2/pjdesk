@@ -125,7 +125,11 @@ pub async fn run(
         ui,
     );
     session.spawn_side_loops();
-    let _notice = super::notice::Guard::begin(&peer_name);
+    let _notice = if args.service_host {
+        super::notice::Guard::begin_service(&peer_name)
+    } else {
+        super::notice::Guard::begin(&peer_name)
+    };
 
     let (cap_err_tx, mut cap_err_rx) = mpsc::channel::<String>(1);
     let capture_thread = {
