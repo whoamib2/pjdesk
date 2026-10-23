@@ -41,6 +41,7 @@ fun SettingsScreen(
     controlBound: Boolean = false,
     onOpenControl: () -> Unit = {},
     onUnattended: (Boolean) -> Unit = {},
+    onUnattendedAccess: (Boolean) -> Unit = {},
     trustedAccounts: List<String> = emptyList(),
     trustedComputers: List<String> = emptyList(),
     onAllowAccount: (String) -> Unit = {},
@@ -166,6 +167,7 @@ fun SettingsScreen(
                 unattended = state.approval == "unattended",
                 onUnattended = onUnattended,
             )
+            UnattendedAccessRow(on = state.unattendedAccess, onChange = onUnattendedAccess)
             TrustedViewAccess(
                 accounts = trustedAccounts,
                 computers = trustedComputers,

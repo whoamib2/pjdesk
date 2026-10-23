@@ -13,6 +13,7 @@ import org.robolectric.annotation.GraphicsMode
 import us.spader.pjdesk.ui.PermanentPasswordFields
 import us.spader.pjdesk.ui.PermanentPasswordSection
 import us.spader.pjdesk.ui.PjTheme
+import us.spader.pjdesk.ui.UnattendedAccessRow
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33], qualifiers = "w400dp-h800dp")
@@ -67,5 +68,17 @@ class PermanentPasswordUiTest {
         rule.onNodeWithText("Change").assertIsDisplayed()
         rule.onNodeWithText("Remove").assertIsDisplayed().performClick()
         rule.runOnIdle { check(removed) }
+    }
+
+    @Test
+    fun unattendedAccessStartsOffAndCanBeSwitched() {
+        var on = false
+        rule.setContent {
+            PjTheme(theme = "dark") {
+                UnattendedAccessRow(on = on, onChange = { on = it })
+            }
+        }
+        rule.onNodeWithText("Unattended access (accept automatically)").assertIsDisplayed().performClick()
+        rule.runOnIdle { check(on) }
     }
 }

@@ -23,6 +23,8 @@ import androidx.fragment.app.FragmentActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
@@ -226,6 +228,8 @@ class MainActivity : FragmentActivity() {
             var savePassword by remember { mutableStateOf(false) }
             var signOutWhenDone by remember { mutableStateOf(false) }
             var changingPin by remember { mutableStateOf(false) }
+            var confirmUnattended by remember { mutableStateOf(false) }
+            var unattendedPin by remember { mutableStateOf("") }
             var pinRejects by remember { mutableIntStateOf(0) }
             var lockBusy by remember { mutableStateOf(false) }
             var lockError by remember { mutableStateOf("") }
@@ -301,8 +305,51 @@ class MainActivity : FragmentActivity() {
             fun removePermanent() {
                 if (!engine.setPermanent("")) return
                 engine.setApproval("prompt")
+                engine.setUnattendedAccess(false)
                 publishPermanent(state.id)
                 syncPasswords(true)
+            }
+            fun pinMatches(pin: String): Boolean {
+                val salt = app.store.pinSaltBytes() ?: return false
+                return PinWrap.unwrap(app.store.pinWrap, pin, salt) != null
+            }
+            fun requestUnattended(on: Boolean) {
+                if (!on) {
+                    engine.setUnattendedAccess(false)
+                    return
+                }
+                when {
+                    !state.hasPermanent -> scope.launch { snackbar.showSnackbar("Save a permanent password first.") }
+                    !PjAccessibilityService.enabled(this@MainActivity) ->
+                        scope.launch { snackbar.showSnackbar("Turn on control in Accessibility first.") }
+                    !app.store.hasPin() && !BioVault.available(this@MainActivity) ->
+                        scope.launch { snackbar.showSnackbar("Set a PIN in App lock before turning this on.") }
+                    else -> {
+                        if (app.store.hasPin()) {
+                            unattendedPin = ""
+                            confirmUnattended = true
+                        }
+                        if (BioVault.available(this@MainActivity)) {
+                            app.bioPrompt = true
+                            BioVault.confirm(
+                                this@MainActivity,
+                                "Turn on unattended access",
+                                "Confirm with your fingerprint or face.",
+                                if (app.store.hasPin()) "Use PIN" else "Cancel",
+                                onSuccess = {
+                                    app.bioPrompt = false
+                                    confirmUnattended = false
+                                    engine.setUnattendedAccess(true)
+                                },
+                                onCancel = { app.bioPrompt = false },
+                                onError = {
+                                    app.bioPrompt = false
+                                    scope.launch { snackbar.showSnackbar(it) }
+                                },
+                            )
+                        }
+                    }
+                }
             }
             fun rememberAccountServer(address: String, fingerprint: String, lan: List<String>, publicIp: String) {
                 if (address.isBlank()) return
@@ -921,8 +968,8 @@ class MainActivity : FragmentActivity() {
                 snackbar.showSnackbar(text)
                 engine.dismissNotice()
             }
-            LaunchedEffect(state.hosting, state.hostWho) {
-                HostService.controlled(this@MainActivity, state.hosting, state.hostWho)
+            LaunchedEffect(state.hosting, state.hostWho, state.acceptedAutomatically) {
+                HostService.controlled(this@MainActivity, state.hosting, state.hostWho, state.acceptedAutomatically)
             }
             LaunchedEffect(account) {
                 engine.command(org.json.JSONObject().put("cmd", "account").put("email", account).toString())
@@ -1504,6 +1551,7 @@ class MainActivity : FragmentActivity() {
                                     controlBound = controlBound,
                                     onOpenControl = { PjAccessibilityService.openSettings(this@MainActivity) },
                                     onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
+                                    onUnattendedAccess = { requestUnattended(it) },
                                     trustedAccounts = trustedAccounts,
                                     trustedComputers = trustedComputers,
                                     onAllowAccount = {
@@ -1616,6 +1664,40 @@ class MainActivity : FragmentActivity() {
                             }
                         }
                     }
+                }
+                if (confirmUnattended) {
+                    AlertDialog(
+                        onDismissRequest = { confirmUnattended = false },
+                        title = { Text("Turn on unattended access") },
+                        text = {
+                            Column {
+                                Text("Enter your PJDesk PIN. Fingerprint or face works too, when this phone has it.")
+                                OutlinedTextField(
+                                    value = unattendedPin,
+                                    onValueChange = { unattendedPin = it.filter { ch -> ch.isDigit() }.take(8) },
+                                    label = { Text("PIN") },
+                                    singleLine = true,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                                )
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(
+                                onClick = {
+                                    if (pinMatches(unattendedPin)) {
+                                        confirmUnattended = false
+                                        engine.setUnattendedAccess(true)
+                                    } else {
+                                        scope.launch { snackbar.showSnackbar("Wrong PIN.") }
+                                    }
+                                },
+                                enabled = AppLockPolicy.pinAcceptable(unattendedPin),
+                            ) { Text("Turn on") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { confirmUnattended = false }) { Text("Cancel") }
+                        },
+                    )
                 }
                 if (state.hosting && !(controlEnabled && controlBound) && !controlDismissed) {
                     AlertDialog(

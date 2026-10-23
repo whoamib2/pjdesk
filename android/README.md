@@ -18,11 +18,17 @@ The user grants these before this phone can be controlled:
 
 1. **Notifications**, so the foreground service can show a persistent notification. While a session is active the notification says the phone is being controlled and has a one-tap **Stop**.
 2. **Accessibility** (`PjAccessibilityService`). Remote taps, swipes, long-press, and pinch use `dispatchGesture`. Back, Home, and Recents are global actions. Typed text uses `ACTION_SET_TEXT` on the focused field. Volume uses `AudioManager`. Power locks the screen on Android 9+ and opens the power dialog on older releases. The service does not turn on touch exploration.
-3. **Screen capture** (`MediaProjection`), started inside `HostService` with the media-projection foreground type. Android shows a system consent. That consent does not survive process death or a reboot: open PJDesk and allow the screen again.
+3. **Screen capture** (`MediaProjection`), started inside `HostService` with the media-projection foreground type. Android shows a system consent. Android 14 and later give each consent one capture, so every session asks again after sharing stops. The foreground service stays up and switches to the media-projection type before `getMediaProjection`.
 
 Controlling another computer needs only the network permission.
 
-Unattended access matches the Windows client: an optional permanent password of at least 8 characters, plus a choice to ask every time or accept with that password. Every password field has Show and Hide.
+Unattended access has two switches under Settings → Security. **Use the permanent password** skips PJDesk's Allow prompt for a password that matches. **Unattended access (accept automatically)** is off by default. Turning it on needs a permanent password, the accessibility service, and a PIN or fingerprint. When it is on, a session that authenticated with the permanent password, or a trusted account or computer, also skips Allow and Deny. PJDesk then opens Android's screen-share dialog and the accessibility service taps it.
+
+The tap uses SystemUI resource ids first (`screen_share_mode_options`, `screen_share_mode_spinner`, `android:id/button1`), then text. The English labels are Entire screen, Share entire screen, A single app, Start, Share screen, and Start now. A few other locales are recognized, and a two-row list taps the row that is not "a single app". The service is marked `isAccessibilityTool` so Android 12 and later will let it read a dialog marked accessibility-data-sensitive. It does not use root, a device owner, or an adb grant.
+
+The sharing notification stays visible. Each auto-accept is written to the PJDesk log, and the phone's connection notice says "Accepted automatically". If the tap does not land within about twelve seconds, the normal "Allow screen sharing" prompt is what the person sees, and the PC already has "Waiting for the phone to allow screen sharing".
+
+What was verified: the choice of which control to tap, in `ProjectionConsentTest`, including the Android 14 spinner, the Share entire screen row, Start now, Share screen, a Spanish "Pantalla completa" row, and an unknown-language row next to "A single app". Those tests do not drive a phone. This environment has no Pixel and no Android 17 image. `compileSdk` and `targetSdk` are 35 (Android 15). Android 10 through 13 are the older Start now button with no spinner; the same code clicks that button, and that path was not run on a device either. If a later Android release hides this dialog from accessibility tools, the click fails and the normal prompt remains. That limit is accessibility-only. It is not worked around with root, a device owner, or adb.
 
 ## Build
 

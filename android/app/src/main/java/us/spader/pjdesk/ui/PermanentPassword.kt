@@ -15,6 +15,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -169,6 +170,37 @@ fun WhenSomeoneConnects(
                 style = MaterialTheme.typography.bodySmall,
             )
         }
+    }
+}
+
+/**
+ * Off until the person turns it on. Turning it on is confirmed with a PIN or
+ * fingerprint in the activity that owns this screen.
+ */
+@Composable
+fun UnattendedAccessRow(on: Boolean, onChange: (Boolean) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(
+            Modifier.fillMaxWidth().clickable { onChange(!on) },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "Unattended access (accept automatically)",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Switch(checked = on, onCheckedChange = onChange)
+        }
+        Text(
+            "A connection that uses the permanent password, or a trusted account or computer, skips Allow and Deny. PJDesk then taps Android's screen-share dialog. Android 14 and later still ask once per session. The sharing notification stays on.",
+            color = pjMuted(),
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Text(
+            "This stays off until a permanent password is set, control is turned on, and you confirm with your PIN or fingerprint.",
+            color = pjMuted(),
+            style = MaterialTheme.typography.bodySmall,
+        )
     }
 }
 

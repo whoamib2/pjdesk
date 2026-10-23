@@ -100,6 +100,9 @@ struct State {
     capture: Mutex<(u16, u16)>,
     /// True while MediaProjection is producing frames.
     capturing: AtomicBool,
+    /// Settings → Security → Unattended access. Off until the person turns it on.
+    /// A permanent-password or trusted session then accepts the screen-share dialog.
+    unattended_access: AtomicBool,
     /// The accessibility service is connected and can turn input into taps.
     control_ready: AtomicBool,
     /// A notice the open host session should send, such as control being off.
@@ -202,6 +205,7 @@ impl Engine {
             policy: Mutex::new(pjdesk_proto::signal::Policy::default()),
             capture: Mutex::new((1080, 2400)),
             capturing: AtomicBool::new(false),
+            unattended_access: AtomicBool::new(false),
             control_ready: AtomicBool::new(false),
             control_note: Mutex::new(None),
             session_wake: Notify::new(),
@@ -355,6 +359,7 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             if pw.is_empty() {
                 *state.permanent.lock().unwrap() = None;
                 *state.approval.lock().unwrap() = "prompt".into();
+                state.unattended_access.store(false, Ordering::SeqCst);
                 publish(state, cb);
             } else if permanent_ok(&pw) {
                 *state.permanent.lock().unwrap() = Some(pw);
@@ -383,6 +388,14 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             } else {
                 *state.approval.lock().unwrap() = if allowed { "unattended".into() } else { "prompt".into() };
                 publish(state, cb);
+            }
+        }
+        "setUnattendedAccess" => {
+            let on = cmd.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+            let allowed = on && state.permanent.lock().unwrap().as_deref().is_some_and(|p| !p.trim().is_empty());
+            state.unattended_access.store(allowed, Ordering::SeqCst);
+            if on && !allowed {
+                emit(cb, &json!({"event":"error","text":"Save a permanent password first."}));
             }
         }
         "regenerate" => {
@@ -1085,6 +1098,13 @@ fn trusted_list(value: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// True when this session may accept Android's screen-share dialog by itself.
+/// The permanent password has to be the one that matched, or the view request
+/// has to be from a trusted account or computer. The one-time password does not.
+pub(crate) fn should_auto_share(unattended_access: bool, matched_permanent: bool, trusted_view: bool) -> bool {
+    unattended_access && (matched_permanent || trusted_view)
+}
+
 /// A view request skips the PJDesk prompt when this account or computer is
 /// trusted, or when unattended mode is using the permanent password.
 fn view_is_preapproved(state: &State, ask: &ViewAsk) -> bool {
@@ -1191,20 +1211,30 @@ async fn host_session(
         &controller_name,
     );
     *state.view_ask.lock().unwrap() = ask.clone();
+    let mut auto_share = false;
     let ceiling = if auth.password_slot == ASK_SLOT {
         let who = if ask.view && !auth.peer_name.trim().is_empty() { auth.peer_name.clone() } else { controller_name.clone() };
         let bypass = ask.view && view_is_preapproved(&state, &ask);
-        if bypass {
-            log_line(&cb, format!("view request from {who} is pre-approved"));
-        }
-        match approve(&state, &cb, &who, &controller_ip, ask.view, bypass).await {
-            Approval::Yes(bits) => {
-                grant_auth(&mut auth.send, &state.hostname).await?;
-                bits
+        let auto = should_auto_share(state.unattended_access.load(Ordering::SeqCst), false, bypass);
+        if auto {
+            log_line(&cb, format!("view request from {who} is accepted automatically"));
+            grant_auth(&mut auth.send, &state.hostname).await?;
+            auto_share = true;
+            let policy = state.policy.lock().unwrap().clone();
+            grant(perms::KEYBOARD | perms::MOUSE, policy.max_permissions, false)
+        } else {
+            if bypass {
+                log_line(&cb, format!("view request from {who} is pre-approved"));
             }
-            Approval::No(reason) => {
-                let _ = refuse_auth(&mut auth.send, &reason).await;
-                bail!(reason);
+            match approve(&state, &cb, &who, &controller_ip, ask.view, bypass).await {
+                Approval::Yes(bits) => {
+                    grant_auth(&mut auth.send, &state.hostname).await?;
+                    bits
+                }
+                Approval::No(reason) => {
+                    let _ = refuse_auth(&mut auth.send, &reason).await;
+                    bail!(reason);
+                }
             }
         }
     } else {
@@ -1215,6 +1245,7 @@ async fn host_session(
         let policy = state.policy.lock().unwrap().clone();
         match admit::after_password(&approval, matched, permanent_set, &policy, false) {
             Admit::Open(bits) => {
+                auto_share = should_auto_share(state.unattended_access.load(Ordering::SeqCst), matched, false);
                 log_line(&cb, "accepting with the permanent password, without asking");
                 grant_auth(&mut auth.send, &state.hostname).await?;
                 bits
@@ -1245,12 +1276,14 @@ async fn host_session(
     if !state.capturing.load(Ordering::SeqCst) {
         *state.capture_deny.lock().unwrap() = String::new();
         let _ = write_msg(&mut auth.send, &HostMsg::Notice(SCREEN_WAIT.into())).await;
-        emit(&cb, &json!({"event":"needCapture","text": SCREEN_WAIT}));
+        emit(&cb, &json!({"event":"needCapture","text": SCREEN_WAIT, "auto": auto_share}));
         log_line(&cb, SCREEN_WAIT.to_string());
         share_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(60));
     }
     if share_deadline.is_none() {
-        emit(&cb, &json!({"event":"hosting","peer": auth.peer_name}));
+        // Already sharing, so there is no dialog. Tell the phone this session
+        // was accepted on its own. A dialog that appears later must not reuse this.
+        emit(&cb, &json!({"event":"hosting","peer": auth.peer_name, "auto": auto_share}));
     }
     let video_out = Arc::new(VideoOut {
         latest: Mutex::new(None),
@@ -1320,7 +1353,7 @@ async fn host_session(
             if state.capturing.load(Ordering::SeqCst) {
                 share_deadline = None;
                 log_line(&cb, "screen sharing is on");
-                emit(&cb, &json!({"event":"hosting","peer": auth.peer_name}));
+                emit(&cb, &json!({"event":"hosting","peer": auth.peer_name, "auto": false}));
                 emit(&cb, &json!({"event":"keyframe"}));
             } else {
                 let deny = state.capture_deny.lock().unwrap().clone();
@@ -2353,6 +2386,15 @@ mod tests {
     }
 
     #[test]
+    fn unattended_access_accepts_the_permanent_password_and_a_trusted_view() {
+        assert!(!should_auto_share(false, true, false));
+        assert!(!should_auto_share(true, false, false));
+        assert!(should_auto_share(true, true, false));
+        assert!(should_auto_share(true, false, true));
+        assert!(!should_auto_share(false, false, true));
+    }
+
+    #[test]
     fn disk_round_trip_ignores_unknown_future_fields() {
         let raw = r#"{"server":"office.example:21200","fingerprint":"abcd","device_id":"123456789","extra":1}"#;
         let disk: Disk = serde_json::from_str(raw).unwrap();
@@ -2386,6 +2428,7 @@ mod tests {
             policy: Mutex::new(pjdesk_proto::signal::Policy::default()),
             capture: Mutex::new((1080, 2400)),
             capturing: AtomicBool::new(false),
+            unattended_access: AtomicBool::new(false),
             control_ready: AtomicBool::new(false),
             control_note: Mutex::new(None),
             session_wake: Notify::new(),

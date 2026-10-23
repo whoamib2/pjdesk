@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 import org.json.JSONObject
 import us.spader.pjdesk.AppLog
+import us.spader.pjdesk.a11y.PjAccessibilityService
 import us.spader.pjdesk.data.Store
 import us.spader.pjdesk.input.GestureMap
 import us.spader.pjdesk.service.RemoteControl
@@ -42,6 +43,7 @@ class Engine(context: Context) : EngineListener {
         DeskState(
             approval = store.approval,
             hasPermanent = store.permanent.isNotEmpty(),
+            unattendedAccess = store.unattendedAccess && store.permanent.isNotEmpty(),
         ),
     )
     val state: StateFlow<DeskState> = _state.asStateFlow()
@@ -85,6 +87,7 @@ class Engine(context: Context) : EngineListener {
                 )
                 pushPermanent()
                 command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
+                setUnattendedAccess(store.unattendedAccess)
                 pushTrusted()
                 setCapturing(us.spader.pjdesk.service.HostService.capturing)
                 setControl(us.spader.pjdesk.a11y.PjAccessibilityService.ready(app))
@@ -397,11 +400,15 @@ class Engine(context: Context) : EngineListener {
             update { it.copy(error = "Couldn't save the permanent password on this phone.") }
             return false
         }
-        if (trimmed.isEmpty()) store.approval = "prompt"
+        if (trimmed.isEmpty()) {
+            store.approval = "prompt"
+            store.unattendedAccess = false
+        }
         update {
             it.copy(
                 hasPermanent = trimmed.isNotEmpty(),
                 approval = store.approval,
+                unattendedAccess = store.unattendedAccess && trimmed.isNotEmpty(),
                 notice = when {
                     quiet -> it.notice
                     trimmed.isEmpty() -> "Permanent password removed."
@@ -410,8 +417,23 @@ class Engine(context: Context) : EngineListener {
             )
         }
         pushPermanent()
-        if (trimmed.isEmpty()) command("""{"cmd":"setApproval","mode":"prompt"}""")
+        if (trimmed.isEmpty()) {
+            command("""{"cmd":"setApproval","mode":"prompt"}""")
+            command("""{"cmd":"setUnattendedAccess","on":false}""")
+        }
         return true
+    }
+
+    /**
+     * Unattended access accepts a permanent-password or trusted session and then
+     * the system screen-share dialog. It stays off without a permanent password
+     * and without the accessibility service.
+     */
+    fun setUnattendedAccess(on: Boolean) {
+        val allowed = on && store.permanent.isNotEmpty() && PjAccessibilityService.enabled(app)
+        store.unattendedAccess = allowed
+        update { it.copy(unattendedAccess = allowed) }
+        command(org.json.JSONObject().put("cmd", "setUnattendedAccess").put("on", allowed).toString())
     }
 
     fun setApproval(mode: String) {
@@ -581,17 +603,31 @@ class Engine(context: Context) : EngineListener {
                 }
             }
             "needCapture" -> {
+                val auto = event.optBoolean("auto") && store.unattendedAccess
                 if (us.spader.pjdesk.service.HostService.capturing) {
+                    if (auto) us.spader.pjdesk.a11y.ProjectionConsent.markAlreadySharing()
                     setCapturing(true)
+                } else if (auto) {
+                    us.spader.pjdesk.a11y.ProjectionConsent.request(app)
                 } else {
                     us.spader.pjdesk.service.CapturePrompt.show(app)
                 }
             }
             "hosting" -> {
                 us.spader.pjdesk.service.ViewPrompt.cancel(app)
+                us.spader.pjdesk.service.CapturePrompt.cancel(app)
+                val auto = us.spader.pjdesk.a11y.ProjectionConsent.takeAutomatic() || event.optBoolean("auto")
+                if (auto) AppLog.i(us.spader.pjdesk.a11y.ProjectionConsent.NOTICE)
                 update {
                     val who = event.optString("who").ifBlank { event.optString("peer") }
-                    it.copy(hosting = true, incoming = null, hostWho = who, status = "Being controlled by $who")
+                    val status = if (auto) us.spader.pjdesk.a11y.ProjectionConsent.NOTICE else "Being controlled by $who"
+                    it.copy(
+                        hosting = true,
+                        incoming = null,
+                        hostWho = who,
+                        acceptedAutomatically = auto,
+                        status = status,
+                    )
                 }
             }
             "controlling" -> {
@@ -679,6 +715,7 @@ class Engine(context: Context) : EngineListener {
                 if (!RemoteControl.handle(event)) setControl(false)
             }
             "disconnected" -> {
+                us.spader.pjdesk.a11y.ProjectionConsent.reset()
                 us.spader.pjdesk.service.ViewPrompt.cancel(app)
                 us.spader.pjdesk.service.CapturePrompt.cancel(app)
                 val role = event.optString("role")
@@ -693,6 +730,7 @@ class Engine(context: Context) : EngineListener {
                     it.copy(
                         hosting = if (role == "host" || role == "session") false else it.hosting,
                         hostWho = if (role == "host" || role == "session") "" else it.hostWho,
+                        acceptedAutomatically = if (role == "host" || role == "session") false else it.acceptedAutomatically,
                         session = if (role == "controller" || role == "session") null else it.session,
                         incoming = null,
                         status = "Ended: $reason",

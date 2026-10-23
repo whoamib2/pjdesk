@@ -41,7 +41,11 @@ data class DeskState(
     val fingerprint: String = "",
     val server: String = "",
     val approval: String = "prompt",
+    /** Settings → Security. Off until a PIN or biometric turns it on. */
+    val unattendedAccess: Boolean = false,
     val status: String = "Connecting…",
+    /** This host session was accepted without a tap on the phone. */
+    val acceptedAutomatically: Boolean = false,
     val incoming: IncomingCall? = null,
     val hosting: Boolean = false,
     val hostWho: String = "",

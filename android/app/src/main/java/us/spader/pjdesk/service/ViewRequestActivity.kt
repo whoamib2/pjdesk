@@ -279,13 +279,13 @@ object CapturePrompt {
     private const val CHANNEL = "pjdesk-screen-share"
     private const val NOTIF = 9
 
-    fun show(context: Context) {
+    fun show(context: Context, launch: Boolean = true) {
         val app = context.applicationContext
         if (HostService.capturing) {
             (app as PjApp).engine.setCapturing(true)
             return
         }
-        if (HostService.consentInProgress) return
+        if (launch && HostService.consentInProgress) return
         HostService.arm(app)
         val manager = app.getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) {
@@ -324,7 +324,17 @@ object CapturePrompt {
             .addAction(0, app.getString(R.string.allow_screen_share), allowIntent)
             .build()
         manager.notify(NOTIF, notification)
-        runCatching { app.startActivity(open) }
+        if (launch) runCatching { app.startActivity(open) }
+    }
+
+    /**
+     * The system dialog is already up and the auto-click did not land.
+     * Keep a visible prompt without opening a second capture dialog.
+     */
+    fun nudge(context: Context) {
+        val app = context.applicationContext
+        if (HostService.capturing) return
+        show(app, launch = false)
     }
 
     fun cancel(context: Context) {

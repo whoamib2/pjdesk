@@ -34,6 +34,7 @@ class HostService : Service() {
     private var encoder: ScreenEncoder? = null
     private var controlled = false
     private var controlledBy = ""
+    private var automatic = false
     /** Bumped before a capture is replaced so the old token's onStop cannot tear down the new one. */
     private var generation = 0
     private var reported = false
@@ -54,11 +55,13 @@ class HostService : Service() {
             ACTION_CONTROLLED -> {
                 controlled = true
                 controlledBy = intent.getStringExtra(EXTRA_WHO).orEmpty()
+                automatic = intent.getBooleanExtra(EXTRA_AUTOMATIC, false)
                 show(controlled = true, projection != null)
             }
             ACTION_IDLE -> {
                 controlled = false
                 controlledBy = ""
+                automatic = false
                 show(controlled = false, projection != null)
             }
             ACTION_RELEASE -> {
@@ -266,7 +269,11 @@ class HostService : Service() {
         } else {
             getString(R.string.host_online)
         }
-        val text = if (controlled) getString(R.string.being_controlled_body) else getString(R.string.host_online_body)
+        val text = when {
+            controlled && automatic -> getString(R.string.accepted_automatically)
+            controlled -> getString(R.string.being_controlled_body)
+            else -> getString(R.string.host_online_body)
+        }
         return NotificationCompat.Builder(this, if (controlled) CHANNEL_LIVE else CHANNEL_ONLINE)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle(title)
@@ -320,6 +327,7 @@ class HostService : Service() {
         private const val EXTRA_CODE = "code"
         private const val EXTRA_DATA = "data"
         private const val EXTRA_WHO = "who"
+        private const val EXTRA_AUTOMATIC = "automatic"
         private const val NOTIF_ID = 7
         private const val CHANNEL_ONLINE = "pjdesk-online"
         private const val CHANNEL_LIVE = "pjdesk-live"
@@ -353,10 +361,13 @@ class HostService : Service() {
             context.startService(Intent(context, HostService::class.java).setAction(ACTION_RELEASE))
         }
 
-        fun controlled(context: Context, on: Boolean, who: String = "") {
+        fun controlled(context: Context, on: Boolean, who: String = "", automatic: Boolean = false) {
             val intent = Intent(context, HostService::class.java).apply {
                 action = if (on) ACTION_CONTROLLED else ACTION_IDLE
-                if (on) putExtra(EXTRA_WHO, who)
+                if (on) {
+                    putExtra(EXTRA_WHO, who)
+                    putExtra(EXTRA_AUTOMATIC, automatic)
+                }
             }
             androidx.core.content.ContextCompat.startForegroundService(context, intent)
         }

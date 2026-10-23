@@ -8,7 +8,11 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
 import android.provider.Settings
+import android.os.Handler
+import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import org.json.JSONObject
 import us.spader.pjdesk.AppLog
 import us.spader.pjdesk.PjApp
@@ -22,6 +26,11 @@ import us.spader.pjdesk.service.setFocusedText
  * does nothing until a PJDesk session delivers an input event.
  */
 class PjAccessibilityService : AccessibilityService() {
+    private val main = Handler(Looper.getMainLooper())
+    private var polls = 0
+    private var onGiveUp: (() -> Unit)? = null
+    private val held = ArrayList<AccessibilityNodeInfo>()
+
     override fun onServiceConnected() {
         RemoteControl.service = this
         dropAccessibilityButton()
@@ -34,7 +43,96 @@ class PjAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (!ProjectionConsent.armed) return
+        val type = event?.eventType ?: return
+        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return
+        main.post { pollConsent() }
+    }
+
+    fun beginConsentWatch(giveUp: () -> Unit) {
+        polls = 0
+        onGiveUp = giveUp
+        main.removeCallbacks(poll)
+        main.post(poll)
+    }
+
+    private val poll = Runnable { pollConsent() }
+
+    private fun pollConsent() {
+        if (!ProjectionConsent.armed) return
+        polls += 1
+        val nodes = snapshot()
+        when (val step = ProjectionConsent.decide(nodes)) {
+            is ConsentStep.Click -> {
+                val info = held.getOrNull(step.index)
+                val fired = info?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
+                AppLog.i("screen share auto-click ${step.why} fired=$fired")
+                if (fired && step.why == "share") {
+                    ProjectionConsent.markClicked()
+                    ProjectionConsent.stopWatching()
+                }
+            }
+            ConsentStep.Wait -> Unit
+        }
+        if (ProjectionConsent.armed && polls < POLL_LIMIT) {
+            main.postDelayed(poll, POLL_MS)
+        } else if (ProjectionConsent.armed) {
+            val giveUp = onGiveUp
+            onGiveUp = null
+            giveUp?.invoke()
+        }
+    }
+
+    private fun snapshot(): List<ConsentNode> {
+        held.asReversed().forEach { runCatching { it.recycle() } }
+        held.clear()
+        val nodes = ArrayList<ConsentNode>()
+        val open = this.windows ?: return nodes
+        for (window in open) {
+            val root = window.root
+            if (root != null) append(root, windowClass(window), nodes)
+            runCatching { window.recycle() }
+        }
+        return nodes
+    }
+
+    private fun append(info: AccessibilityNodeInfo, windowClass: String, nodes: ArrayList<ConsentNode>) {
+        val text = info.text?.toString().orEmpty()
+        val description = info.contentDescription?.toString().orEmpty()
+        val own = listOf(text, description).filter { it.isNotBlank() }.joinToString(" ")
+        val childText = StringBuilder()
+        val children = ArrayList<AccessibilityNodeInfo>()
+        for (i in 0 until info.childCount) {
+            val child = info.getChild(i) ?: continue
+            children.add(child)
+            val bit = child.text?.toString().orEmpty()
+            if (bit.isNotBlank()) {
+                if (childText.isNotEmpty()) childText.append(' ')
+                childText.append(bit)
+            }
+        }
+        val subtree = listOf(own, childText.toString()).filter { it.isNotBlank() }.joinToString(" ")
+        held.add(info)
+        nodes.add(
+            ConsentNode(
+                packageName = info.packageName?.toString().orEmpty(),
+                className = info.className?.toString().orEmpty(),
+                windowClass = windowClass,
+                viewId = info.viewIdResourceName.orEmpty(),
+                text = own,
+                subtree = subtree,
+                clickable = info.isClickable,
+                enabled = info.isEnabled,
+                checked = info.isChecked,
+            ),
+        )
+        children.forEach { append(it, windowClass, nodes) }
+    }
+
+    private fun windowClass(window: AccessibilityWindowInfo): String {
+        return window.title?.toString().orEmpty()
+    }
 
     override fun onInterrupt() {}
 
@@ -141,5 +239,17 @@ class PjAccessibilityService : AccessibilityService() {
             val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             runCatching { context.startActivity(intent) }
         }
+
+        fun watchConsent(giveUp: () -> Unit) {
+            val service = RemoteControl.service
+            if (service == null) {
+                giveUp()
+                return
+            }
+            service.beginConsentWatch(giveUp)
+        }
+
+        private const val POLL_LIMIT = 30
+        private const val POLL_MS = 400L
     }
 }

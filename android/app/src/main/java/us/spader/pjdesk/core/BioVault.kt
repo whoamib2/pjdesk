@@ -143,6 +143,32 @@ object BioVault {
     private fun strong(context: Context): Boolean =
         BiometricManager.from(context).canAuthenticate(STRONG) == BiometricManager.BIOMETRIC_SUCCESS
 
+    /**
+     * Confirms the person at the phone. This does not unlock the password vault.
+     * [negative] is the button that leaves the prompt, usually "Use PIN".
+     */
+    fun confirm(
+        activity: FragmentActivity,
+        title: String,
+        subtitle: String,
+        negative: String,
+        onSuccess: () -> Unit,
+        onCancel: () -> Unit,
+        onError: (String) -> Unit,
+    ) {
+        prompt(
+            activity,
+            title,
+            subtitle,
+            ANY,
+            null,
+            onSuccess = { onSuccess() },
+            onCancel = onCancel,
+            onError = onError,
+            negative = negative,
+        )
+    }
+
     private fun prompt(
         activity: FragmentActivity,
         title: String,
@@ -152,6 +178,7 @@ object BioVault {
         onSuccess: (Cipher?) -> Unit,
         onCancel: () -> Unit,
         onError: (String) -> Unit,
+        negative: String = "Use PIN",
     ) {
         val prompt = BiometricPrompt(
             activity,
@@ -176,7 +203,7 @@ object BioVault {
         val info = BiometricPrompt.PromptInfo.Builder()
             .setTitle(title)
             .setSubtitle(subtitle)
-            .setNegativeButtonText("Use PIN")
+            .setNegativeButtonText(negative)
             .setAllowedAuthenticators(authenticators)
             .build()
         if (cipher == null) prompt.authenticate(info) else prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))

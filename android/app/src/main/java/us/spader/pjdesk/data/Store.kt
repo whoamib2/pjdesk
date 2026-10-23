@@ -135,6 +135,11 @@ class Store(context: Context) {
         get() = prefs.getString("approval", "prompt") ?: "prompt"
         set(value) { prefs.edit().putString("approval", value).commit() }
 
+    /** Unattended access (accept automatically). Off until the person turns it on. */
+    var unattendedAccess: Boolean
+        get() = prefs.getBoolean("unattendedAccess", false)
+        set(value) { prefs.edit().putBoolean("unattendedAccess", value).commit() }
+
     fun trustedAccounts(): List<String> = readTrusted("trustedAccounts")
 
     fun trustedComputers(): List<String> = readTrusted("trustedComputers")
