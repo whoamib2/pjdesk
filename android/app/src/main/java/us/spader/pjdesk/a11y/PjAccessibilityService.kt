@@ -8,6 +8,8 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
 import android.provider.Settings
+import android.graphics.Path
+import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
@@ -27,84 +29,105 @@ import us.spader.pjdesk.service.setFocusedText
  */
 class PjAccessibilityService : AccessibilityService() {
     private val main = Handler(Looper.getMainLooper())
-    private var polls = 0
-    private var onGiveUp: (() -> Unit)? = null
-    private var lastDialog = ""
     private val held = ArrayList<AccessibilityNodeInfo>()
+    private val heldWindows = ArrayList<AccessibilityWindowInfo>()
 
     override fun onServiceConnected() {
+        AppLog.i("accessibility service connected service=${System.identityHashCode(this)}")
         RemoteControl.service = this
-        dropAccessibilityButton()
-        (application as? PjApp)?.engine?.setControl(true)
+        runCatching { dropAccessibilityButton() }.onFailure { AppLog.e("accessibility button cleanup failed", it) }
+        runCatching { (application as? PjApp)?.engine?.setControl(true) }
+            .onFailure { AppLog.e("could not report control on", it) }
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        AppLog.i("accessibility service unbound service=${System.identityHashCode(this)}")
+        detach()
+        return super.onUnbind(intent)
     }
 
     override fun onDestroy() {
-        if (RemoteControl.service === this) RemoteControl.service = null
-        (application as? PjApp)?.engine?.setControl(false)
+        AppLog.i("accessibility service destroyed service=${System.identityHashCode(this)}")
+        detach()
         super.onDestroy()
     }
 
+    private fun detach() {
+        releaseNodes()
+        if (RemoteControl.service !== this) return
+        RemoteControl.service = null
+        runCatching { (application as? PjApp)?.engine?.setControl(false) }
+            .onFailure { AppLog.e("could not report control off", it) }
+    }
+
+    private fun releaseNodes() {
+        held.asReversed().forEach { runCatching { it.recycle() } }
+        held.clear()
+        heldWindows.forEach { runCatching { it.recycle() } }
+        heldWindows.clear()
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (!ProjectionConsent.armed) return
-        val type = event?.eventType ?: return
-        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return
-        main.post { pollConsent() }
+        // The consent watch polls on its own. Driving it from these events made
+        // the deadline depend on how chatty the dialog was.
     }
 
-    fun beginConsentWatch(giveUp: () -> Unit) {
-        polls = 0
-        lastDialog = ""
-        onGiveUp = giveUp
-        main.removeCallbacks(poll)
-        main.post(poll)
+    fun collectConsent(): List<ConsentNode> {
+        return runCatching { snapshot() }.getOrElse {
+            AppLog.e("could not read the screen share dialog", it)
+            emptyList()
+        }
     }
 
-    private val poll = Runnable { pollConsent() }
+    fun activate(index: Int, node: ConsentNode?, why: String): ConsentWatch.ClickResult {
+        val info = held.getOrNull(index)
+        val action = info?.let {
+            runCatching { it.performAction(AccessibilityNodeInfo.ACTION_CLICK) }.getOrDefault(false)
+        } ?: false
+        if (action) return ConsentWatch.ClickResult(action = true, gesture = false, bounds = boundsText(node))
+        val gestured = tap(node, why)
+        return ConsentWatch.ClickResult(action = false, gesture = gestured, bounds = boundsText(node))
+    }
 
-    private fun pollConsent() {
-        if (!ProjectionConsent.armed) return
-        polls += 1
-        val nodes = snapshot()
-        val step = ProjectionConsent.decide(nodes)
-        if (ProjectionConsent.looksLikeConsent(nodes)) {
-            val mode = nodes.firstOrNull { ProjectionConsent.isModeControl(it) }
-            val button = nodes.firstOrNull { it.viewId == "android:id/button1" }
-            val line = "screen share dialog mode='${mode?.text.orEmpty()}' child='${mode?.subtree.orEmpty()}' button='${button?.text.orEmpty()}' step=$step"
-            if (line != lastDialog) {
-                lastDialog = line
-                AppLog.i(line)
-            }
-        }
-        when (step) {
-            is ConsentStep.Click -> {
-                val info = held.getOrNull(step.index)
-                val fired = info?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
-                AppLog.i("screen share auto-click ${step.why} fired=$fired")
-                if (fired && step.why == "share") {
-                    ProjectionConsent.markClicked()
-                    ProjectionConsent.stopWatching()
-                }
-            }
-            ConsentStep.Wait -> Unit
-        }
-        if (ProjectionConsent.armed && polls < POLL_LIMIT) {
-            main.postDelayed(poll, POLL_MS)
-        } else if (ProjectionConsent.armed) {
-            val giveUp = onGiveUp
-            onGiveUp = null
-            giveUp?.invoke()
-        }
+    private fun boundsText(node: ConsentNode?): String {
+        if (node == null) return "none"
+        return "${node.left},${node.top},${node.right},${node.bottom}"
+    }
+
+    /** A system dialog often ignores ACTION_CLICK. A short tap at its center does land. */
+    private fun tap(node: ConsentNode?, why: String): Boolean {
+        if (node == null) return false
+        val width = node.right - node.left
+        val height = node.bottom - node.top
+        if (width <= 0 || height <= 0) return false
+        val path = Path().apply { moveTo(node.left + width / 2f, node.top + height / 2f) }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 60)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        return runCatching {
+            dispatchGesture(
+                gesture,
+                object : GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        main.post { ConsentWatcher.gestureFinished(true, why) }
+                    }
+
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        main.post { ConsentWatcher.gestureFinished(false, why) }
+                    }
+                },
+                null,
+            )
+        }.getOrDefault(false)
     }
 
     private fun snapshot(): List<ConsentNode> {
-        held.asReversed().forEach { runCatching { it.recycle() } }
-        held.clear()
+        releaseNodes()
         val nodes = ArrayList<ConsentNode>()
         val open = this.windows ?: return nodes
         for (window in open) {
+            heldWindows.add(window)
             val root = window.root
             if (root != null) append(root, windowClass(window), nodes)
-            runCatching { window.recycle() }
         }
         return nodes
     }
@@ -125,6 +148,8 @@ class PjAccessibilityService : AccessibilityService() {
             }
         }
         val subtree = listOf(own, childText.toString()).filter { it.isNotBlank() }.joinToString(" ")
+        val bounds = Rect()
+        runCatching { info.getBoundsInScreen(bounds) }
         held.add(info)
         nodes.add(
             ConsentNode(
@@ -137,6 +162,10 @@ class PjAccessibilityService : AccessibilityService() {
                 clickable = info.isClickable,
                 enabled = info.isEnabled,
                 checked = info.isChecked,
+                left = bounds.left,
+                top = bounds.top,
+                right = bounds.right,
+                bottom = bounds.bottom,
             ),
         )
         children.forEach { append(it, windowClass, nodes) }
@@ -198,6 +227,20 @@ class PjAccessibilityService : AccessibilityService() {
      * and drop this service from the shortcut target list when the platform allows.
      */
     private fun dropAccessibilityButton() {
+        // Writing serviceInfo or the shortcut settings restarts this service.
+        // Doing it on every connect turned into control off, control on, and a
+        // new activity about every few seconds. The choice is saved before the
+        // write, so a restart cannot try again.
+        val prefs = getSharedPreferences("pjdesk", Context.MODE_PRIVATE)
+        if (prefs.getBoolean(BUTTON_CLEANUP, false)) {
+            val flags = serviceInfo?.flags ?: 0
+            val button = AccessibilityServiceInfo.FLAG_REQUEST_ACCESSIBILITY_BUTTON
+            if ((flags and button) != 0) {
+                AppLog.i("accessibility button flag is still set; leaving it so the service is not restarted")
+            }
+            return
+        }
+        prefs.edit().putBoolean(BUTTON_CLEANUP, true).commit()
         val info = serviceInfo ?: return
         val without = info.flags and AccessibilityServiceInfo.FLAG_REQUEST_ACCESSIBILITY_BUTTON.inv()
         if (without != info.flags) {
@@ -252,16 +295,6 @@ class PjAccessibilityService : AccessibilityService() {
             runCatching { context.startActivity(intent) }
         }
 
-        fun watchConsent(giveUp: () -> Unit) {
-            val service = RemoteControl.service
-            if (service == null) {
-                giveUp()
-                return
-            }
-            service.beginConsentWatch(giveUp)
-        }
-
-        private const val POLL_LIMIT = 30
-        private const val POLL_MS = 400L
+        private const val BUTTON_CLEANUP = "a11yButtonCleanup"
     }
 }

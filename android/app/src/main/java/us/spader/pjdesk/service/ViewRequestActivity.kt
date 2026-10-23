@@ -99,6 +99,7 @@ class ViewRequestActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        us.spader.pjdesk.a11y.ScreenAlert.prepare(this)
         if (!startCapture) return
         startCapture = false
         val engine = (application as PjApp).engine
@@ -286,6 +287,7 @@ class CaptureConsentActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        us.spader.pjdesk.a11y.ScreenAlert.prepare(this)
         if (!launchNow) return
         launchNow = false
         if (HostService.capturing) {

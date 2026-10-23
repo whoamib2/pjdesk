@@ -21,6 +21,10 @@ data class ConsentNode(
     val clickable: Boolean = false,
     val enabled: Boolean = true,
     val checked: Boolean = false,
+    val left: Int = 0,
+    val top: Int = 0,
+    val right: Int = 0,
+    val bottom: Int = 0,
 )
 
 sealed class ConsentStep {
@@ -61,9 +65,10 @@ object ProjectionConsent {
         armed = true
         AppLog.i("unattended access opening the screen share dialog")
         automatic = false
-        PjAccessibilityService.watchConsent {
+        ScreenAlert.wake(app)
+        ConsentWatcher.start {
             armed = false
-            if (HostService.capturing) return@watchConsent
+            if (HostService.capturing) return@start
             AppLog.i("auto-accept could not click the screen share dialog")
             if (HostService.consentInProgress) CapturePrompt.nudge(app) else CapturePrompt.show(app)
         }
@@ -90,6 +95,7 @@ object ProjectionConsent {
     /** The share button was clicked. Stop polling without forgetting that it fired. */
     fun stopWatching() {
         armed = false
+        ConsentWatcher.stop()
     }
 
     fun takeAutomatic(): Boolean {
@@ -102,6 +108,7 @@ object ProjectionConsent {
     fun reset() {
         armed = false
         automatic = false
+        ConsentWatcher.stop()
     }
 
     fun decide(nodes: List<ConsentNode>): ConsentStep {
@@ -162,11 +169,14 @@ object ProjectionConsent {
     }
 
     fun isPositive(node: ConsentNode): Boolean {
-        if (!node.clickable || !node.enabled || isModeControl(node)) return false
+        if (!node.enabled || isModeControl(node)) return false
         if (node.viewId == "android:id/button2") return false
         if (isSingleApp(node.text) || isEntireLabel(node.text)) return false
         val confirm = isConfirm(node.text)
+        // button1 is the share button even when the tree does not mark it clickable.
+        // The tap then uses its screen bounds.
         if (node.viewId == "android:id/button1") return confirm || node.text.isBlank()
+        if (!node.clickable) return false
         return confirm && (node.packageName == SYSTEM_UI || node.windowClass.contains("MediaProjection"))
     }
 

@@ -103,6 +103,27 @@ class ProjectionConsentTest {
     }
 
     @Test
+    fun shareScreenIsTappedWhenTheButtonIsNotMarkedClickable() {
+        val button = ConsentNode(
+            packageName = ProjectionConsent.SYSTEM_UI,
+            className = "android.widget.Button",
+            windowClass = "com.android.systemui.mediaprojection.permission.MediaProjectionPermissionActivity",
+            viewId = "android:id/button1",
+            text = "Share screen",
+            subtree = "Share screen",
+            clickable = false,
+            enabled = true,
+            left = 100,
+            top = 1800,
+            right = 900,
+            bottom = 2000,
+        )
+        val step = ProjectionConsent.decide(listOf(mode("Share entire screen"), button))
+        assertEquals(ConsentStep.Click(1, "share"), step)
+        assertTrue(ProjectionConsent.isPositive(button))
+    }
+
+    @Test
     fun pixelAndroid17ShareEntireScreenChildThenShareScreen() {
         val spinner = ConsentNode(
             packageName = ProjectionConsent.SYSTEM_UI,

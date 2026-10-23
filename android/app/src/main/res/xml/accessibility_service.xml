@@ -11,5 +11,4 @@
     android:canRetrieveWindowContent="true"
     android:isAccessibilityTool="true"
     android:description="@string/a11y_desc"
-    android:notificationTimeout="100"
-    android:settingsActivity="us.spader.pjdesk.MainActivity" />
+    android:notificationTimeout="100" />

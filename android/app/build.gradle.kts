@@ -13,8 +13,8 @@ android {
         applicationId = "us.spader.pjdesk"
         minSdk = 26
         targetSdk = 35
-        versionCode = 61800
-        versionName = "0.6.18"
+        versionCode = 61900
+        versionName = "0.6.19"
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
         }
@@ -41,7 +41,11 @@ android {
 
     buildTypes {
         release {
+            // Minify stays off. The rules still keep Log.w and Log.e if it is turned on,
+            // because R8's default file deletes Log.i and a release device drops INFO.
             isMinifyEnabled = false
+            isShrinkResources = false
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.findByName("release")
         }
     }

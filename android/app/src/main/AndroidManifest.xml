@@ -26,6 +26,7 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize"
             android:exported="true"
             android:importantForAutofill="yes"
+            android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

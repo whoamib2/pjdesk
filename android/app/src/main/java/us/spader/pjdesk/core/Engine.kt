@@ -35,6 +35,13 @@ class Engine(context: Context) : EngineListener {
         }
     }
     private val main = Handler(Looper.getMainLooper())
+    private val controlGate = ControlGate()
+    private var controlDropPosted = false
+    private val controlDrop = Runnable {
+        controlDropPosted = false
+        val decision = controlGate.offer(false, android.os.SystemClock.elapsedRealtime())
+        if (decision == false) pushControl(false)
+    }
     private val handle = AtomicLong(0)
     private val startOnce = AtomicBoolean(false)
     private val pending = ArrayDeque<String>()
@@ -134,6 +141,23 @@ class Engine(context: Context) : EngineListener {
 
     /** The accessibility service can turn PC input into taps and typing. */
     fun setControl(on: Boolean) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val decision = controlGate.offer(on, now)
+        if (on) {
+            controlDropPosted = false
+            main.removeCallbacks(controlDrop)
+        }
+        if (decision != null) {
+            pushControl(decision)
+            return
+        }
+        if (!on && controlGate.holdingDrop() && !controlDropPosted) {
+            controlDropPosted = true
+            main.postDelayed(controlDrop, controlGate.remaining(now).coerceAtLeast(1L))
+        }
+    }
+
+    private fun pushControl(on: Boolean) {
         command(JSONObject().put("cmd", "setControl").put("on", on).toString())
     }
 

@@ -31,7 +31,8 @@ object SessionNotice {
         val open = PendingIntent.getActivity(
             context,
             3,
-            Intent(context, MainActivity::class.java),
+            Intent(context, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE,
         )
         val disconnect = PendingIntent.getBroadcast(

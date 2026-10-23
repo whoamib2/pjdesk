@@ -191,6 +191,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AppLog.i("main activity created task=$taskId")
         if (app.store.temporaryActive() && !tempFlag.get()) app.store.endTemporaryVisit()
         if (app.store.accountServer.isNotBlank()) {
             app.engine.applyAccountServer(app.store.accountServer, app.store.accountFingerprint, quiet = true)
@@ -715,12 +716,19 @@ class MainActivity : FragmentActivity() {
             var controlBound by remember { mutableStateOf(RemoteControl.service != null) }
             var controlDismissed by remember { mutableStateOf(false) }
             LaunchedEffect(Unit) {
+                // The service connection is what changes control. This only refreshes
+                // the screen, and tells the engine when that value actually changes.
+                var reported: Boolean? = null
                 while (true) {
                     val enabled = PjAccessibilityService.enabled(this@MainActivity)
                     val bound = RemoteControl.service != null
                     controlEnabled = enabled
                     controlBound = bound
-                    engine.setControl(enabled && bound)
+                    val on = enabled && bound
+                    if (on != reported) {
+                        reported = on
+                        engine.setControl(on)
+                    }
                     kotlinx.coroutines.delay(1_500)
                 }
             }
@@ -1921,7 +1929,14 @@ class MainActivity : FragmentActivity() {
         captureReady.value = HostService.capturing || app.store.captureTried
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        AppLog.i("main activity reused task=$taskId")
+    }
+
     override fun onDestroy() {
+        AppLog.i("main activity destroyed finishing=$isFinishing task=$taskId")
         if (isFinishing && !isChangingConfigurations && app.engine.state.value.session != null) {
             app.engine.stopView("closed")
         }
