@@ -1703,6 +1703,7 @@ impl App {
             allow_viewer_foreground();
             cmd.creation_flags(0x0800_0000);
         }
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         match cmd.spawn() {
             Ok(mut child) => {
                 clear_session_status();
@@ -1875,6 +1876,7 @@ impl App {
             allow_viewer_foreground();
             cmd.creation_flags(0x0800_0000);
         }
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         match cmd.spawn() {
             Ok(mut child) => {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -1912,6 +1914,7 @@ impl App {
             allow_viewer_foreground();
             cmd.creation_flags(0x0800_0000);
         }
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         match cmd.spawn() {
             Ok(mut child) => {
                 self.toast.show(format!("Opening {addr}"));

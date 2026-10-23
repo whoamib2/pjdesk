@@ -53,12 +53,18 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
     }
     let label = direct.clone().unwrap_or_else(|| format_id(&target));
     let ask = std::env::var("PJDESK_ASK").ok().map(std::path::PathBuf::from).filter(|p| !p.as_os_str().is_empty());
-    let password = if ask.is_some() {
+    let ask_view = std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1");
+    let password = if ask.is_some() || ask_view {
+        // "Request view access" sends no password; never prompt on a console
+        // the GUI-spawned viewer does not have (that fails with os error 6).
         String::new()
     } else {
         match args.password.clone() {
             Some(password) => password,
-            None => rpassword::prompt_password(format!("Password for {label}: "))?,
+            None if std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+                rpassword::prompt_password(format!("Password for {label}: "))?
+            }
+            None => bail!("No password for {label}, and there is no console to ask for one."),
         }
     };
 
