@@ -29,7 +29,7 @@ import us.spader.pjdesk.ui.OnboardingScreen
 import us.spader.pjdesk.ui.PjTheme
 import us.spader.pjdesk.ui.SavedScreen
 import us.spader.pjdesk.ui.SignInScreen
-import us.spader.pjdesk.ui.SessionChrome
+import us.spader.pjdesk.ui.SessionScreen
 import us.spader.pjdesk.ui.SettingsScreen
 import java.io.File
 
@@ -203,9 +203,7 @@ class ScreenshotTest {
 
     @Test
     fun sessionToolbar() = shot("session") {
-        Box(Modifier.fillMaxSize().background(Color.Black)) {
-        SessionChrome(
-            modifier = Modifier.align(Alignment.BottomCenter),
+        SessionScreen(
             session = SessionInfo(
                 peer = "Pixel",
                 id = "555000111",
@@ -220,14 +218,16 @@ class ScreenshotTest {
                 frameW = 1080,
                 frameH = 2400,
             ),
+            onGesture = {},
+            onMouse = { _, _, _, _, _ -> },
             onText = {},
             onSpecial = {},
             onKey = { _, _ -> },
             onQuality = {},
             onDisplay = {},
             onEnd = {},
+            decoder = null,
         )
-        }
     }
 
     private fun shot(name: String, theme: String = "dark", content: @Composable () -> Unit) {

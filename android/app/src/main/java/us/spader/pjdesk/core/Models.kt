@@ -26,6 +26,11 @@ data class SessionInfo(
     val displays: List<DisplayInfo>,
     val frameW: Int = 0,
     val frameH: Int = 0,
+    /** Permission bits from Welcome. Negative until the host answers. */
+    val permissions: Int = -1,
+    val fps: Int = 0,
+    val bitrateKbps: Int = 0,
+    val latencyMs: Int = -1,
 )
 
 data class DeskState(

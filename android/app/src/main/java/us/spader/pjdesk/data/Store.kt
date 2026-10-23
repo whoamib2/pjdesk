@@ -3,6 +3,7 @@ package us.spader.pjdesk.data
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
+import us.spader.pjdesk.core.RemoteOptions
 import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.VaultEntry
 import us.spader.pjdesk.core.isIdLabel
@@ -78,6 +79,39 @@ class Store(context: Context) {
             val cleaned = if (value == 0 || value == 1 || value == 5 || value == 15) value else 1
             prefs.edit().putInt("sessionIdleMin", cleaned).apply()
         }
+
+    /** Defaults for every computer. Pointer speed, acceleration, and idle minutes stay on their own keys. */
+    fun remoteGlobal(): RemoteOptions {
+        val parsed = RemoteOptions.fromJson(prefs.getString("remoteOptions", null))
+        return parsed.copy(
+            pointerSpeed = pointerSpeed,
+            pointerAccel = pointerAccel,
+            sessionIdleMin = sessionIdleMin,
+        ).cleaned()
+    }
+
+    fun saveRemoteGlobal(options: RemoteOptions) {
+        val cleaned = options.cleaned()
+        pointerSpeed = cleaned.pointerSpeed
+        pointerAccel = cleaned.pointerAccel
+        sessionIdleMin = cleaned.sessionIdleMin
+        prefs.edit().putString("remoteOptions", cleaned.toJson().toString()).apply()
+    }
+
+    /** A full copy for one 9-digit id, or null when that computer uses the defaults. */
+    fun remoteOverride(id: String): RemoteOptions? {
+        if (id.length != 9) return null
+        val all = runCatching { JSONObject(prefs.getString("remoteOverrides", "{}") ?: "{}") }.getOrElse { return null }
+        val one = all.optJSONObject(id) ?: return null
+        return RemoteOptions.fromJson(one.toString())
+    }
+
+    fun saveRemoteOverride(id: String, options: RemoteOptions?) {
+        if (id.length != 9) return
+        val all = runCatching { JSONObject(prefs.getString("remoteOverrides", "{}") ?: "{}") }.getOrElse { JSONObject() }
+        if (options == null) all.remove(id) else all.put(id, options.cleaned().toJson())
+        prefs.edit().putString("remoteOverrides", all.toString()).apply()
+    }
 
     /** Decrypted permanent password, or empty when none is saved. */
     val permanent: String

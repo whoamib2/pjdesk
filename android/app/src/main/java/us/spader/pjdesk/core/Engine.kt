@@ -48,6 +48,8 @@ class Engine(context: Context) : EngineListener {
 
     var onVideo: ((ByteArray, Int, Int, Boolean) -> Unit)? = null
     var onQuality: ((Int, Int, Int) -> Unit)? = null
+    var onClipboard: ((String) -> Unit)? = null
+    var onFiles: ((List<String>) -> Unit)? = null
     var onKeyframe: (() -> Unit)? = null
 
     fun start() {
@@ -354,6 +356,21 @@ class Engine(context: Context) : EngineListener {
     fun key(scan: Int, down: Boolean) = command(JSONObject().put("cmd", "key").put("scan", scan).put("down", down).toString())
     fun releaseKeys() = command("""{"cmd":"release"}""")
     fun quality(name: String) = command(JSONObject().put("cmd", "quality").put("name", name).toString())
+    fun qualityCustom(fps: Int, bitrate: Int) = command(
+        JSONObject()
+            .put("cmd", "quality")
+            .put("name", "custom")
+            .put("fps", fps.coerceIn(5, 60))
+            .put("bitrate", bitrate.coerceIn(200, 20_000))
+            .put("maxWidth", 1920)
+            .toString(),
+    )
+    fun privacy(enabled: Boolean) = command(JSONObject().put("cmd", "privacy").put("enabled", enabled).toString())
+    fun keyboardMode(mode: String) = command(JSONObject().put("cmd", "keyboardMode").put("mode", mode).toString())
+    fun restart() = command("""{"cmd":"restart"}""")
+    fun ping(tUs: Long) = command(JSONObject().put("cmd", "ping").put("t_us", tUs).toString())
+    fun fileList() = command("""{"cmd":"fileList"}""")
+    fun sendFile(path: String) = command(JSONObject().put("cmd", "fileSend").put("path", path).toString())
     fun display(index: Int, layout: Boolean) =
         command(JSONObject().put("cmd", "display").put("index", index).put("layout", layout).toString())
 
@@ -605,15 +622,48 @@ class Engine(context: Context) : EngineListener {
                 val fromWelcome = parseDisplays(event.optJSONArray("displays")).ifEmpty {
                     parseDisplays(event.optJSONArray("monitors"))
                 }
+                val permissions = if (event.has("permissions")) event.getInt("permissions") else session.permissions
                 state.copy(
                     session = session.copy(
                         layout = event.optBoolean("layout"),
                         platform = event.optString("platform", session.platform),
                         displays = fromWelcome.ifEmpty { session.displays },
+                        permissions = permissions,
                     ),
                 )
             }
-            "quality" -> onQuality?.invoke(event.optInt("fps"), event.optInt("bitrate"), event.optInt("maxWidth"))
+            "quality" -> {
+                onQuality?.invoke(event.optInt("fps"), event.optInt("bitrate"), event.optInt("maxWidth"))
+                update { state ->
+                    val session = state.session ?: return@update state
+                    state.copy(
+                        session = session.copy(
+                            fps = event.optInt("fps"),
+                            bitrateKbps = event.optInt("bitrate"),
+                        ),
+                    )
+                }
+            }
+            "pong" -> update { state ->
+                val session = state.session ?: return@update state
+                val sent = event.optLong("t_us")
+                val now = System.nanoTime() / 1_000L
+                val ms = if (sent <= 0L) session.latencyMs else ((now - sent) / 1_000L).toInt().coerceIn(0, 60_000)
+                state.copy(session = session.copy(latencyMs = ms))
+            }
+            "clipboard" -> onClipboard?.invoke(event.optString("text"))
+            "files" -> {
+                val names = event.optJSONArray("names")
+                val list = buildList {
+                    if (names != null) {
+                        for (i in 0 until names.length()) {
+                            val name = names.optString(i)
+                            if (name.isNotBlank()) add(name)
+                        }
+                    }
+                }
+                onFiles?.invoke(list)
+            }
             "keyframe" -> onKeyframe?.invoke()
             "input" -> RemoteControl.handle(event)
             "disconnected" -> {

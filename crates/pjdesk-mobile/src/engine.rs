@@ -18,9 +18,11 @@ use pjdesk_link::signal::{ServerAddr, SignalClient};
 use pjdesk_proto::auth::generate_password;
 use pjdesk_proto::framing::{read_msg, write_msg, MAX_CONTROL_FRAME};
 use pjdesk_proto::gesture::{Gesture, PointerAdapter, GESTURE_LONG_PRESS, GESTURE_PINCH, GESTURE_SWIPE, GESTURE_TAP};
+use pjdesk_proto::filesafe::{self, MAX_TRANSFER_BYTES};
 use pjdesk_proto::peer::{
-    read_video_frame, write_video_frame, ClipKind, Clipboard, ControlMsg, DisplayLayout, HostMsg, InputEvent, KeyboardMode,
-    MonitorInfo, SpecialCommand, VideoHeader, MAX_CLIP_TEXT, VIEW_SINGLE,
+    read_video_frame, write_side_chunk, write_side_header, write_video_frame, ClipKind, Clipboard, ControlMsg, DisplayLayout,
+    FileMsg, HostMsg, InputEvent, KeyboardMode, MonitorInfo, SideHeader, SpecialCommand, VideoHeader, FILE_MAGIC, MAX_CLIP_TEXT,
+    VIEW_SINGLE,
 };
 use pjdesk_proto::perms::{self, grant};
 use pjdesk_proto::quality::{self, StreamQuality};
@@ -35,7 +37,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.13";
+pub const APP_VERSION: &str = "0.6.14";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -119,6 +121,16 @@ struct State {
     view_ask: Mutex<ViewAsk>,
     /// Set when a server from before 0.6.0 drops the connection after PresentAccess.
     suppress_token: AtomicBool,
+    /// Connection for the session this phone is controlling. File bytes use it.
+    viewer: Mutex<Option<quinn::Connection>>,
+    files: Mutex<HashMap<u64, FileOffer>>,
+    file_seq: AtomicU64,
+}
+
+#[derive(Clone)]
+struct FileOffer {
+    path: PathBuf,
+    name: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -200,6 +212,9 @@ impl Engine {
             trusted_computers: Mutex::new(Vec::new()),
             view_ask: Mutex::new(ViewAsk::default()),
             suppress_token: AtomicBool::new(false),
+            viewer: Mutex::new(None),
+            files: Mutex::new(HashMap::new()),
+            file_seq: AtomicU64::new(1),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let engine = Self { state: state.clone(), cmds: tx };
@@ -593,10 +608,49 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         }
         "release" => send_control(state, ControlMsg::Input(InputEvent::ReleaseAll)),
         "quality" => {
-            let name = cmd.get("name").and_then(|v| v.as_str()).unwrap_or("balanced");
-            if let Some(q) = quality::preset(name) {
+            if let Some(q) = stream_quality(&cmd) {
                 send_control(state, ControlMsg::SetQuality(q));
             }
+        }
+        "privacy" => {
+            let enabled = cmd.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            send_control(state, ControlMsg::Privacy { enabled });
+        }
+        "keyboardMode" => {
+            let mode = match cmd.get("mode").and_then(|v| v.as_str()).unwrap_or("translate") {
+                "map" => KeyboardMode::Map,
+                _ => KeyboardMode::Translate,
+            };
+            send_control(state, ControlMsg::SetKeyboardMode(mode));
+        }
+        "restart" => send_control(state, ControlMsg::Restart),
+        "ping" => {
+            let t_us = cmd.get("t_us").and_then(|v| v.as_u64()).unwrap_or(0);
+            send_control(state, ControlMsg::Ping { t_us });
+        }
+        "fileList" => {
+            let id = state.file_seq.fetch_add(1, Ordering::SeqCst);
+            send_control(state, ControlMsg::File(FileMsg::List { id, path: String::new() }));
+        }
+        "fileSend" => {
+            let path = PathBuf::from(cmd.get("path").and_then(|v| v.as_str()).unwrap_or(""));
+            let Some(name) = path.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
+                emit(cb, &json!({"event":"status","text":"That file cannot be sent"}));
+                return;
+            };
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if filesafe::sanitize_name(&name).is_err() || size == 0 || size > MAX_TRANSFER_BYTES {
+                emit(cb, &json!({"event":"status","text":"That file cannot be sent"}));
+                return;
+            }
+            if state.viewer.lock().unwrap().is_none() {
+                emit(cb, &json!({"event":"status","text":"Not connected"}));
+                return;
+            }
+            let id = state.file_seq.fetch_add(1, Ordering::SeqCst);
+            state.files.lock().unwrap().insert(id, FileOffer { path, name: name.clone() });
+            send_control(state, ControlMsg::File(FileMsg::Offer { id, name: name.clone(), size, resume_from: 0 }));
+            emit(cb, &json!({"event":"status","text": format!("Offering {name}")}));
         }
         "display" => {
             let index = cmd.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
@@ -627,6 +681,25 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
 fn send_control(state: &State, msg: ControlMsg) {
     if let Some(tx) = state.control.lock().unwrap().as_ref() {
         let _ = tx.send(msg);
+    }
+}
+
+/// Preset names, plus Best/Speed aliases and a custom fps/bitrate.
+fn stream_quality(cmd: &Value) -> Option<StreamQuality> {
+    let name = cmd.get("name").and_then(|v| v.as_str()).unwrap_or("balanced");
+    if let Some(q) = quality::preset(name) {
+        return Some(q);
+    }
+    match name {
+        "best" => quality::preset("high"),
+        "speed" => quality::preset("smooth"),
+        "custom" => {
+            let fps = cmd.get("fps").and_then(|v| v.as_u64()).unwrap_or(30) as u32;
+            let bitrate = cmd.get("bitrate").and_then(|v| v.as_u64()).unwrap_or(6_000) as u32;
+            let max_width = cmd.get("maxWidth").and_then(|v| v.as_u64()).unwrap_or(1920) as u32;
+            Some(StreamQuality { fps, bitrate_kbps: bitrate, max_width }.clamp())
+        }
+        _ => None,
     }
 }
 
@@ -1826,6 +1899,7 @@ async fn controller_session(
     );
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlMsg>();
     *state.control.lock().unwrap() = Some(control_tx.clone());
+    *state.viewer.lock().unwrap() = Some(connection.clone());
     let watch_conn = connection.clone();
     let watch_state = state.clone();
     let watcher = tokio::spawn(async move {
@@ -1936,6 +2010,38 @@ async fn controller_session(
             Ok(HostMsg::Denied { what, reason }) => {
                 emit(&cb, &json!({"event":"status","text": format!("{what}: {reason}")}))
             }
+            Ok(HostMsg::Pong { t_us }) => emit(&cb, &json!({"event":"pong","t_us": t_us})),
+            Ok(HostMsg::Privacy { enabled }) => emit(&cb, &json!({"event":"privacy","enabled": enabled})),
+            Ok(HostMsg::Restarting) => {
+                emit(&cb, &json!({"event":"status","text": "The other computer is restarting"}))
+            }
+            Ok(HostMsg::Clipboard(clip)) => {
+                if matches!(clip.kind, ClipKind::Text) {
+                    if let Ok(text) = String::from_utf8(clip.bytes) {
+                        emit(&cb, &json!({"event":"clipboard","text": text}));
+                    }
+                }
+            }
+            Ok(HostMsg::File(msg)) => match msg {
+                FileMsg::Entries { names, .. } => emit(&cb, &json!({"event":"files","names": names})),
+                FileMsg::Accept { id, resume_from } => {
+                    let job = state.files.lock().unwrap().get(&id).cloned();
+                    let conn = state.viewer.lock().unwrap().clone();
+                    if let (Some(job), Some(conn)) = (job, conn) {
+                        let cb_file = cb.clone();
+                        tokio::spawn(async move {
+                            match send_file_bytes(conn, id, &job.path, resume_from).await {
+                                Ok(()) => emit(&cb_file, &json!({"event":"status","text": format!("Sent {}", job.name)})),
+                                Err(e) => emit(&cb_file, &json!({"event":"status","text": format!("Could not send the file: {e}")})),
+                            }
+                        });
+                    }
+                }
+                FileMsg::Reject { reason, .. } | FileMsg::Error { reason, .. } => {
+                    emit(&cb, &json!({"event":"status","text": reason}))
+                }
+                _ => {}
+            },
             Ok(_) => {}
             Err(e) => {
                 break if connection.close_reason().is_some() {
@@ -1950,9 +2056,30 @@ async fn controller_session(
     video_task.abort();
     watcher.abort();
     *state.control.lock().unwrap() = None;
+    *state.viewer.lock().unwrap() = None;
+    state.files.lock().unwrap().clear();
     connection.close(0u32.into(), b"viewer closed");
     log_line(&cb, format!("controller session ended: {end_reason}"));
     emit(&cb, &json!({"event":"disconnected","role":"controller","reason": end_reason}));
+    Ok(())
+}
+
+async fn send_file_bytes(conn: quinn::Connection, id: u64, path: &Path, resume: u64) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(resume))?;
+    let mut uni = conn.open_uni().await?;
+    write_side_header(&mut uni, FILE_MAGIC, &SideHeader { id, offset: resume, a: 0, b: 0 }).await?;
+    let mut buf = vec![0u8; pjdesk_proto::peer::SIDE_CHUNK];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        write_side_chunk(&mut uni, &buf[..n]).await?;
+    }
+    write_side_chunk(&mut uni, &[]).await?;
+    let _ = uni.finish();
     Ok(())
 }
 
@@ -1962,6 +2089,17 @@ use tokio::io::AsyncWriteExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_quality_is_clamped_and_aliases_map() {
+        let q = stream_quality(&json!({"name":"custom","fps":120,"bitrate":10,"maxWidth":100})).unwrap();
+        assert_eq!(q.fps, 60);
+        assert_eq!(q.bitrate_kbps, 200);
+        assert_eq!(q.max_width, 640);
+        assert_eq!(stream_quality(&json!({"name":"speed"})).unwrap().fps, 24);
+        assert_eq!(stream_quality(&json!({"name":"best"})).unwrap().fps, 60);
+        assert!(stream_quality(&json!({"name":"nope"})).is_none());
+    }
 
     #[test]
     fn presenter_names_the_account_and_the_phone() {
@@ -2176,6 +2314,9 @@ mod tests {
             trusted_computers: Mutex::new(Vec::new()),
             view_ask: Mutex::new(ViewAsk::default()),
             suppress_token: AtomicBool::new(false),
+            viewer: Mutex::new(None),
+            files: Mutex::new(HashMap::new()),
+            file_seq: AtomicU64::new(1),
         })
     }
 

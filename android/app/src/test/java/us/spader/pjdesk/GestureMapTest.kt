@@ -152,6 +152,23 @@ class GestureMapTest {
     }
 
     @Test
+    fun fasterScrollSendsALargerWheelAndInvertFlipsIt() {
+        val pointer = PointerSession(android = false, trackpad = true)
+        pointer.scrollSpeed = 2f
+        pointer.down(0, listOf(100 to 1000, 120 to 1000))
+        val wheel = pointer.move(listOf(100 to 3000, 120 to 3000))
+            .filterIsInstance<PointerSession.Out.Mouse>()
+            .first { it.kind == "wheel" }
+        assertEquals(-240, wheel.dy)
+        pointer.invertScroll = true
+        pointer.down(10, listOf(100 to 1000, 120 to 1000))
+        val flipped = pointer.move(listOf(100 to 3000, 120 to 3000))
+            .filterIsInstance<PointerSession.Out.Mouse>()
+            .first { it.kind == "wheel" }
+        assertEquals(240, flipped.dy)
+    }
+
+    @Test
     fun pinchUsesFourPoints() {
         val phone = PointerSession(android = true)
         phone.down(0, listOf(1000 to 1000, 4000 to 4000))

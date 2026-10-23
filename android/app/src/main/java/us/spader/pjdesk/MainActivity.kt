@@ -47,7 +47,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -407,10 +406,57 @@ class MainActivity : FragmentActivity() {
             var connectGen by remember { mutableIntStateOf(0) }
             var askChoice by remember { mutableStateOf(false) }
             var askWaiting by remember { mutableStateOf(false) }
-            var pointerSpeed by remember { mutableFloatStateOf(app.store.pointerSpeed) }
-            var pointerAccel by remember { mutableStateOf(app.store.pointerAccel) }
-            var dragLock by remember { mutableStateOf(false) }
-            var sessionIdleMin by remember { mutableIntStateOf(app.store.sessionIdleMin) }
+            var remote by remember { mutableStateOf(app.store.remoteGlobal()) }
+            var peerOnly by remember { mutableStateOf(false) }
+            var peerRemote by remember { mutableStateOf<us.spader.pjdesk.core.RemoteOptions?>(null) }
+            val sessionRemote = if (peerOnly && peerRemote != null) peerRemote!! else remote
+            var fileNames by remember { mutableStateOf(listOf<String>()) }
+            var clipEcho by remember { mutableStateOf("") }
+            val clipSync = remember { mutableStateOf(false) }
+            clipSync.value = sessionRemote.clipboardSync
+            val sendFile = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                if (uri == null) return@rememberLauncherForActivityResult
+                scope.launch {
+                    val name = (uri.lastPathSegment ?: "file").substringAfterLast('/').filter { ch ->
+                        ch.isLetterOrDigit() || ch == '.' || ch == '-' || ch == '_'
+                    }.take(80).ifBlank { "file" }
+                    val dir = java.io.File(cacheDir, "pjdesk-send").apply { mkdirs() }
+                    val dest = java.io.File(dir, name)
+                    val copied = withContext(Dispatchers.IO) {
+                        runCatching {
+                            contentResolver.openInputStream(uri)?.use { input ->
+                                dest.outputStream().use { input.copyTo(it) }
+                            }
+                            dest.length() > 0L
+                        }.getOrDefault(false)
+                    }
+                    if (copied) engine.sendFile(dest.absolutePath)
+                    else snackbar.showSnackbar("That file cannot be sent")
+                }
+            }
+            fun saveSessionRemote(next: us.spader.pjdesk.core.RemoteOptions) {
+                if (peerOnly) {
+                    val id = state.session?.id.orEmpty()
+                    peerRemote = next
+                    if (id.length == 9) app.store.saveRemoteOverride(id, next)
+                } else {
+                    remote = next
+                    app.store.saveRemoteGlobal(next)
+                }
+            }
+            fun setPeerOnly(on: Boolean) {
+                val id = state.session?.id.orEmpty()
+                if (on && id.length == 9) {
+                    val seed = peerRemote ?: sessionRemote
+                    peerRemote = seed
+                    peerOnly = true
+                    app.store.saveRemoteOverride(id, seed)
+                } else {
+                    peerOnly = false
+                    peerRemote = null
+                    if (id.length == 9) app.store.saveRemoteOverride(id, null)
+                }
+            }
             var sessionIdleWarn by remember { mutableStateOf(false) }
             var screenOff by remember { mutableStateOf(false) }
             var sessionBackground by remember { mutableStateOf(false) }
@@ -723,8 +769,50 @@ class MainActivity : FragmentActivity() {
                 registerReceiver(receiver, filter)
                 onDispose { unregisterReceiver(receiver) }
             }
-            LaunchedEffect(state.session?.id, bumps, sessionIdleMin) {
-                val minutes = sessionIdleMin
+            DisposableEffect(Unit) {
+                engine.onFiles = { fileNames = it }
+                engine.onClipboard = { text ->
+                    if (clipSync.value && text.isNotBlank() && text != clipEcho) {
+                        clipEcho = text
+                        getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("pjdesk", text))
+                    }
+                }
+                onDispose {
+                    engine.onFiles = null
+                    engine.onClipboard = null
+                }
+            }
+            DisposableEffect(state.session?.id, sessionRemote.clipboardSync) {
+                if (state.session == null || !sessionRemote.clipboardSync) {
+                    return@DisposableEffect onDispose {}
+                }
+                val clipboard = getSystemService(ClipboardManager::class.java)
+                val listener = ClipboardManager.OnPrimaryClipChangedListener {
+                    val text = clipboardText()
+                    if (text.isNotBlank() && text != clipEcho) {
+                        clipEcho = text
+                        engine.paste(text)
+                    }
+                }
+                clipboard.addPrimaryClipChangedListener(listener)
+                onDispose { clipboard.removePrimaryClipChangedListener(listener) }
+            }
+            LaunchedEffect(state.session?.id) {
+                fileNames = emptyList()
+                val id = state.session?.id.orEmpty()
+                val over = if (id.length == 9) app.store.remoteOverride(id) else null
+                peerOnly = over != null
+                peerRemote = over
+            }
+            LaunchedEffect(state.session?.id, sessionRemote.showStats) {
+                if (state.session == null || !sessionRemote.showStats) return@LaunchedEffect
+                while (true) {
+                    engine.ping(System.nanoTime() / 1_000L)
+                    kotlinx.coroutines.delay(2_000)
+                }
+            }
+            LaunchedEffect(state.session?.id, bumps, sessionRemote.sessionIdleMin) {
+                val minutes = sessionRemote.sessionIdleMin
                 if (minutes <= 0 || state.session == null) {
                     sessionIdleWarn = false
                     return@LaunchedEffect
@@ -1012,20 +1100,19 @@ class MainActivity : FragmentActivity() {
                         onSpecial = engine::special,
                         onKey = engine::key,
                         onQuality = engine::quality,
+                        onQualityCustom = engine::qualityCustom,
+                        onPrivacy = engine::privacy,
+                        onKeyboardMode = engine::keyboardMode,
                         onDisplay = { index -> engine.display(index, session.layout) },
                         onEnd = { engine.stopView("disconnected") },
-                        pointerSpeed = pointerSpeed,
-                        pointerAccel = pointerAccel,
-                        dragLock = dragLock,
-                        onDragLock = { dragLock = it },
-                        onPointerSpeed = {
-                            pointerSpeed = it
-                            app.store.pointerSpeed = it
-                        },
-                        onPointerAccel = {
-                            pointerAccel = it
-                            app.store.pointerAccel = it
-                        },
+                        remote = sessionRemote,
+                        onRemote = { saveSessionRemote(it) },
+                        forThisComputer = peerOnly,
+                        onForThisComputer = { setPeerOnly(it) },
+                        fileNames = fileNames,
+                        onFileList = { engine.fileList() },
+                        onSendFile = { sendFile.launch("*/*") },
+                        onRestart = { engine.restart() },
                         idleWarn = sessionIdleWarn,
                         onStay = { sessionIdleWarn = false },
                         onActivity = {},
@@ -1412,20 +1499,10 @@ class MainActivity : FragmentActivity() {
                                         }
                                     },
                                     onAutoLock = { app.store.autoLockSeconds = it },
-                                    pointerSpeed = pointerSpeed,
-                                    onPointerSpeed = {
-                                        pointerSpeed = it
-                                        app.store.pointerSpeed = it
-                                    },
-                                    pointerAccel = pointerAccel,
-                                    onPointerAccel = {
-                                        pointerAccel = it
-                                        app.store.pointerAccel = it
-                                    },
-                                    sessionIdleMin = sessionIdleMin,
-                                    onSessionIdle = {
-                                        sessionIdleMin = it
-                                        app.store.sessionIdleMin = it
+                                    remote = remote,
+                                    onRemote = {
+                                        remote = it
+                                        app.store.saveRemoteGlobal(it)
                                     },
                                     engineDetail = readiness.detail,
                                     accountEmail = account,

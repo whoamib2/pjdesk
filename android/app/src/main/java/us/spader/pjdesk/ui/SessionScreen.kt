@@ -6,42 +6,49 @@ import android.app.Activity
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.systemGestures
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,22 +59,34 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.layout
-import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kotlin.math.hypot
 import kotlin.math.roundToInt
+import us.spader.pjdesk.core.ControlPad
+import us.spader.pjdesk.core.RemoteOptions
+import us.spader.pjdesk.core.SessionHit
 import us.spader.pjdesk.core.SessionInfo
 import us.spader.pjdesk.input.GestureMap
 import us.spader.pjdesk.input.PictureView
 import us.spader.pjdesk.input.PointerSession
 import us.spader.pjdesk.media.ScreenDecoder
+
+private class OverlaySpace {
+    val pads = HashMap<String, ControlPad>()
+    var origin = Offset.Zero
+}
 
 @Composable
 fun SessionScreen(
@@ -78,37 +97,43 @@ fun SessionScreen(
     onSpecial: (Int) -> Unit,
     onKey: (Int, Boolean) -> Unit,
     onQuality: (String) -> Unit,
+    onQualityCustom: (Int, Int) -> Unit = { _, _ -> },
+    onPrivacy: (Boolean) -> Unit = {},
+    onKeyboardMode: (String) -> Unit = {},
     onDisplay: (Int) -> Unit,
     onEnd: () -> Unit,
     onClipboard: () -> Unit = {},
     decoder: ScreenDecoder?,
-    pointerSpeed: Float = 0.6f,
-    pointerAccel: Boolean = false,
-    dragLock: Boolean = false,
-    onDragLock: (Boolean) -> Unit = {},
-    onPointerSpeed: (Float) -> Unit = {},
-    onPointerAccel: (Boolean) -> Unit = {},
+    remote: RemoteOptions = RemoteOptions(),
+    onRemote: (RemoteOptions) -> Unit = {},
+    forThisComputer: Boolean = false,
+    onForThisComputer: (Boolean) -> Unit = {},
+    fileNames: List<String> = emptyList(),
+    onFileList: () -> Unit = {},
+    onSendFile: () -> Unit = {},
+    onRestart: () -> Unit = {},
     idleWarn: Boolean = false,
     onStay: () -> Unit = {},
     onActivity: () -> Unit = {},
 ) {
     val android = session.platform == "android"
-    var trackpad by remember(session.id) { mutableStateOf(!android) }
+    val trackpad = remote.trackpadFor(android)
     val pointer = remember(trackpad, android) { PointerSession(android, trackpad = trackpad) }
-    pointer.speed = pointerSpeed
-    pointer.accelerate = pointerAccel
-    pointer.dragLock = dragLock
+    val options = rememberUpdatedState(remote)
+    val space = remember { OverlaySpace() }
     var confirmEnd by remember { mutableStateOf(false) }
+    var sheet by remember { mutableStateOf(false) }
     var shownDisplay by remember(session.id) {
         mutableIntStateOf(session.displays.firstOrNull { it.primary }?.index ?: 0)
     }
     val peerName = session.peer.ifBlank { session.id }.ifBlank { "this computer" }
-    BackHandler { confirmEnd = true }
+    BackHandler {
+        if (sheet) sheet = false else confirmEnd = true
+    }
     var viewW by remember { mutableIntStateOf(1) }
     var viewH by remember { mutableIntStateOf(1) }
     var picture by remember(session.id) { mutableStateOf(PictureView.fit()) }
     var cursor by remember { mutableStateOf(pointer.cursorNorm) }
-    var keyboard by remember { mutableStateOf(false) }
     val view = LocalView.current
     DisposableEffect(Unit) {
         val window = (view.context as? Activity)?.window
@@ -117,11 +142,32 @@ fun SessionScreen(
         controller?.hide(WindowInsetsCompat.Type.systemBars())
         onDispose { controller?.show(WindowInsetsCompat.Type.systemBars()) }
     }
+    LaunchedEffect(session.id, remote.quality, remote.customFps, remote.customBitrate) {
+        if (remote.quality == "custom") onQualityCustom(remote.customFps, remote.customBitrate)
+        else onQuality(RemoteOptions.preset(remote.quality))
+    }
+    LaunchedEffect(session.id, remote.privacy) { onPrivacy(remote.privacy) }
+    LaunchedEffect(session.id, remote.keyboardMode) { onKeyboardMode(remote.keyboardMode) }
+    LaunchedEffect(remote.scale, session.frameW, viewW, viewH) {
+        picture = when (remote.scale) {
+            "original" -> {
+                val placed = GestureMap.letterbox(
+                    session.frameW.coerceAtLeast(16),
+                    session.frameH.coerceAtLeast(9),
+                    viewW,
+                    viewH,
+                )
+                PictureView.Frame(PictureView.oneToOne(session.frameW, placed.width), 0f, 0f)
+            }
+            else -> PictureView.fit()
+        }
+    }
+    val bars = WindowInsets.safeDrawing.union(WindowInsets.systemGestures).union(WindowInsets.displayCutout)
     Box(
         Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .onSizeChanged {
+            .onSizeChangedSafe {
                 viewW = it.width.coerceAtLeast(1)
                 viewH = it.height.coerceAtLeast(1)
             },
@@ -130,6 +176,8 @@ fun SessionScreen(
             AndroidView(
                 factory = { context ->
                     SurfaceView(context).apply {
+                        setZOrderOnTop(false)
+                        setZOrderMediaOverlay(false)
                         holder.addCallback(object : SurfaceHolder.Callback {
                             override fun surfaceCreated(holder: SurfaceHolder) {
                                 decoder.setSurface(holder.surface)
@@ -143,44 +191,71 @@ fun SessionScreen(
                         })
                     }
                 },
-                modifier = Modifier.layout { measurable, constraints ->
-                    val placed = GestureMap.letterbox(
-                        session.frameW.coerceAtLeast(16),
-                        session.frameH.coerceAtLeast(9),
-                        constraints.maxWidth,
-                        constraints.maxHeight,
-                    )
-                    val placeable = measurable.measure(
-                        androidx.compose.ui.unit.Constraints.fixed(
-                            placed.width.coerceAtLeast(1),
-                            placed.height.coerceAtLeast(1),
-                        ),
-                    )
-                    layout(constraints.maxWidth, constraints.maxHeight) {
-                        placeable.place(placed.x, placed.y)
+                modifier = Modifier.zIndex(0f).layout { measurable, constraints ->
+                    if (options.value.scale == "stretch") {
+                        val placeable = measurable.measure(
+                            androidx.compose.ui.unit.Constraints.fixed(
+                                constraints.maxWidth.coerceAtLeast(1),
+                                constraints.maxHeight.coerceAtLeast(1),
+                            ),
+                        )
+                        layout(constraints.maxWidth, constraints.maxHeight) { placeable.place(0, 0) }
+                    } else {
+                        val placed = GestureMap.letterbox(
+                            session.frameW.coerceAtLeast(16),
+                            session.frameH.coerceAtLeast(9),
+                            constraints.maxWidth,
+                            constraints.maxHeight,
+                        )
+                        val placeable = measurable.measure(
+                            androidx.compose.ui.unit.Constraints.fixed(
+                                placed.width.coerceAtLeast(1),
+                                placed.height.coerceAtLeast(1),
+                            ),
+                        )
+                        layout(constraints.maxWidth, constraints.maxHeight) {
+                            placeable.place(placed.x, placed.y)
+                        }
                     }
                 },
                 update = { surface ->
                     surface.pivotX = surface.width / 2f
                     surface.pivotY = surface.height / 2f
-                    surface.scaleX = picture.scale
-                    surface.scaleY = picture.scale
-                    surface.translationX = picture.panX
-                    surface.translationY = picture.panY
+                    surface.scaleX = if (options.value.scale == "stretch") 1f else picture.scale
+                    surface.scaleY = if (options.value.scale == "stretch") 1f else picture.scale
+                    surface.translationX = if (options.value.scale == "stretch") 0f else picture.panX
+                    surface.translationY = if (options.value.scale == "stretch") 0f else picture.panY
                 },
             )
         }
         Box(
             Modifier
                 .fillMaxSize()
+                .zIndex(1f)
+                .onGloballyPositioned { space.origin = it.positionInRoot() }
                 .pointerInput(trackpad, android, session.frameW, session.frameH, viewW, viewH) {
                     var lastTap = 0L
                     awaitEachGesture {
                         val first = awaitFirstDown(requireUnconsumed = true)
+                        if (SessionHit.covered(first.position.x, first.position.y, space.pads.values.toList())) {
+                            return@awaitEachGesture
+                        }
                         onActivity()
+                        val current = options.value
+                        pointer.speed = current.pointerSpeed
+                        pointer.accelerate = current.pointerAccel
+                        pointer.dragLock = current.dragLock
+                        pointer.scrollSpeed = current.scrollSpeed
+                        pointer.invertScroll = current.invertScroll
+                        val viewOnly = current.viewOnly
+                        val stretch = current.scale == "stretch"
+                        fun send(out: PointerSession.Out) {
+                            if (viewOnly) return
+                            dispatch(out, onGesture, onMouse)
+                        }
                         val now = first.uptimeMillis
                         val repeat = now - lastTap in 1..280
-                        if (repeat && trackpad) pointer.armDrag()
+                        if (repeat && trackpad && !viewOnly) pointer.armDrag()
                         val doubleTap = repeat && !trackpad
                         if (doubleTap) {
                             val placed = GestureMap.letterbox(
@@ -207,9 +282,15 @@ fun SessionScreen(
                         var panning = false
                         var moved = 0f
                         fun dropPointer() {
-                            pointer.cancel().forEach { dispatch(it, onGesture, onMouse) }
+                            pointer.cancel().forEach { send(it) }
                         }
                         fun pointOf(at: Offset): Pair<Int, Int>? {
+                            if (stretch) {
+                                if (viewW < 2 || viewH < 2) return null
+                                val nx = (at.x / viewW * GestureMap.NORM).roundToInt().coerceIn(0, GestureMap.NORM)
+                                val ny = (at.y / viewH * GestureMap.NORM).roundToInt().coerceIn(0, GestureMap.NORM)
+                                return nx to ny
+                            }
                             return if (trackpad) {
                                 GestureMap.viewToNorm(GestureMap.letterbox(viewW, viewH, viewW, viewH), at.x, at.y)
                             } else {
@@ -218,7 +299,7 @@ fun SessionScreen(
                                 )
                             }
                         }
-                        if (!doubleTap) {
+                        if (!doubleTap && !viewOnly) {
                             pointOf(first.position)?.let {
                                 pointer.down(first.uptimeMillis, listOf(it))
                                 sawDown = true
@@ -248,7 +329,7 @@ fun SessionScreen(
                                         dropPointer()
                                         sawDown = false
                                     }
-                                } else if (trackpad && kotlin.math.abs(span / startSpan - 1f) < 0.08f) {
+                                } else if (trackpad && kotlin.math.abs(span / startSpan - 1f) < 0.08f && !viewOnly) {
                                     scrolling = true
                                     val p1 = pointOf(a)
                                     val p2 = pointOf(b)
@@ -257,7 +338,7 @@ fun SessionScreen(
                                             pointer.down(pressed[0].uptimeMillis, listOf(p1, p2))
                                             sawDown = true
                                         } else {
-                                            pointer.move(listOf(p1, p2)).forEach { dispatch(it, onGesture, onMouse) }
+                                            pointer.move(listOf(p1, p2)).forEach { send(it) }
                                         }
                                     }
                                 } else {
@@ -305,15 +386,15 @@ fun SessionScreen(
                                         placed.height,
                                         picture.copy(panX = picture.panX + (at.x - lastAt.x), panY = picture.panY + (at.y - lastAt.y)),
                                     )
-                                } else {
+                                } else if (!viewOnly) {
                                     val point = pointOf(at)
                                     if (point != null) {
                                         if (!sawDown) {
                                             pointer.down(pressed[0].uptimeMillis, listOf(point))
                                             sawDown = true
                                         } else {
-                                            pointer.move(listOf(point)).forEach { dispatch(it, onGesture, onMouse) }
-                                            pointer.poll(pressed[0].uptimeMillis)?.let { dispatch(it, onGesture, onMouse) }
+                                            pointer.move(listOf(point)).forEach { send(it) }
+                                            pointer.poll(pressed[0].uptimeMillis)?.let { send(it) }
                                         }
                                         cursor = if (trackpad) pointer.cursorNorm else point
                                         if (trackpad && picture.scale > 1.05f) {
@@ -327,22 +408,24 @@ fun SessionScreen(
                                 event.changes.forEach { it.consume() }
                             }
                             if (pressed.isEmpty()) {
-                                if (fingers >= 3 && trackpad) {
+                                if (fingers >= 3 && trackpad && !viewOnly) {
                                     onMouse("down", cursor.first, cursor.second, 0, "middle")
                                     onMouse("up", cursor.first, cursor.second, 0, "middle")
-                                } else if (startSpan > 0f && moved < 36f && !trackpad && !scrolling) {
-                                    val point = PictureView.screenToNorm(
-                                        viewW, viewH, session.frameW, session.frameH, picture,
-                                        lastCentroid.x, lastCentroid.y,
-                                    )
+                                } else if (startSpan > 0f && moved < 36f && !trackpad && !scrolling && !viewOnly) {
+                                    val point = if (stretch) {
+                                        pointOf(lastCentroid)
+                                    } else {
+                                        PictureView.screenToNorm(
+                                            viewW, viewH, session.frameW, session.frameH, picture,
+                                            lastCentroid.x, lastCentroid.y,
+                                        )
+                                    }
                                     if (point != null) {
                                         onMouse("down", point.first, point.second, 0, "right")
                                         onMouse("up", point.first, point.second, 0, "right")
                                     }
                                 } else if ((scrolling || !zooming) && !doubleTap && sawDown) {
-                                    pointer.up(event.changes.firstOrNull()?.uptimeMillis ?: now).forEach {
-                                        dispatch(it, onGesture, onMouse)
-                                    }
+                                    pointer.up(event.changes.firstOrNull()?.uptimeMillis ?: now).forEach { send(it) }
                                     cursor = if (trackpad) pointer.cursorNorm else cursor
                                     lastTap = event.changes.firstOrNull()?.uptimeMillis ?: now
                                 }
@@ -353,83 +436,188 @@ fun SessionScreen(
                     }
                 },
         ) {
-            val placed = GestureMap.letterbox(
-                session.frameW.coerceAtLeast(16),
-                session.frameH.coerceAtLeast(9),
-                viewW,
-                viewH,
-            )
-            val dw = placed.width * picture.scale
-            val dh = placed.height * picture.scale
-            val left = viewW / 2f + picture.panX - dw / 2f
-            val top = viewH / 2f + picture.panY - dh / 2f
-            val px = left + (cursor.first / GestureMap.NORM.toFloat()) * dw
-            val py = top + (cursor.second / GestureMap.NORM.toFloat()) * dh
-            CursorMark(px, py)
-        }
-        if (keyboard) {
-            ModifierBar(
-                modifier = Modifier.align(Alignment.BottomCenter),
-                onText = onText,
-                onKey = onKey,
-                onClose = { keyboard = false },
-            )
-        }
-        if (idleWarn) {
-            Surface(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 48.dp),
-                shape = RoundedCornerShape(20.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
-            ) {
-                TextButton(onClick = onStay, modifier = Modifier.padding(horizontal = 8.dp)) {
-                    Text("Disconnecting in 10s, tap to stay")
+            if (remote.showLocalCursor) {
+                val placed = GestureMap.letterbox(
+                    session.frameW.coerceAtLeast(16),
+                    session.frameH.coerceAtLeast(9),
+                    viewW,
+                    viewH,
+                )
+                val px: Float
+                val py: Float
+                if (remote.scale == "stretch") {
+                    px = (cursor.first / GestureMap.NORM.toFloat()) * viewW
+                    py = (cursor.second / GestureMap.NORM.toFloat()) * viewH
+                } else {
+                    val dw = placed.width * picture.scale
+                    val dh = placed.height * picture.scale
+                    val left = viewW / 2f + picture.panX - dw / 2f
+                    val top = viewH / 2f + picture.panY - dh / 2f
+                    px = left + (cursor.first / GestureMap.NORM.toFloat()) * dw
+                    py = top + (cursor.second / GestureMap.NORM.toFloat()) * dh
                 }
+                CursorMark(px, py)
             }
         }
-        if (session.displays.size > 1) {
-            Row(
-                Modifier
-                    .align(Alignment.TopStart)
-                    .padding(start = 48.dp, top = 48.dp)
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                session.displays.forEach { display ->
-                    IconButton(
-                        onClick = {
-                            shownDisplay = display.index
-                            onDisplay(display.index)
-                        },
-                        modifier = Modifier.size(48.dp),
-                    ) {
-                        Surface(
-                            shape = RoundedCornerShape(8.dp),
+        Box(
+            Modifier
+                .fillMaxSize()
+                .zIndex(2f)
+                .windowInsetsPadding(bars),
+        ) {
+            if (remote.showKeyBar) {
+                ModifierBar(
+                    modifier = Modifier.align(Alignment.BottomCenter).reportPad(space, "keys"),
+                    onText = { if (!remote.viewOnly) onText(it) },
+                    onKey = { scan, down -> if (!remote.viewOnly) onKey(scan, down) },
+                    onClose = { onRemote(remote.copy(showKeyBar = false)) },
+                )
+            }
+            if (idleWarn) {
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 8.dp)
+                        .reportPad(space, "idle"),
+                    shape = RoundedCornerShape(20.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+                ) {
+                    TextButton(onClick = onStay, modifier = Modifier.padding(horizontal = 8.dp)) {
+                        Text("Disconnecting in 10s, tap to stay")
+                    }
+                }
+            }
+            if (remote.showStats && (session.fps > 0 || session.latencyMs >= 0)) {
+                val latency = if (session.latencyMs >= 0) "${session.latencyMs} ms" else "—"
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 8.dp)
+                        .reportPad(space, "stats"),
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f),
+                ) {
+                    Text(
+                        "${session.fps} fps · ${session.bitrateKbps} kbps · $latency",
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
+            }
+            if (session.displays.size > 1) {
+                Row(
+                    Modifier
+                        .align(Alignment.TopStart)
+                        .padding(start = 8.dp, top = 8.dp)
+                        .horizontalScroll(rememberScrollState())
+                        .reportPad(space, "displays"),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    session.displays.forEach { display ->
+                        HitButton(
+                            description = "Display ${display.index + 1}",
+                            space = space,
+                            padId = "display-${display.index}",
                             color = if (display.index == shownDisplay) {
                                 MaterialTheme.colorScheme.primary
                             } else {
                                 MaterialTheme.colorScheme.surface.copy(alpha = 0.92f)
                             },
+                            pressedColor = MaterialTheme.colorScheme.primary,
+                            onClick = {
+                                shownDisplay = display.index
+                                onDisplay(display.index)
+                            },
                         ) {
-                            Box(Modifier.size(36.dp), contentAlignment = Alignment.Center) {
-                                Text("${display.index + 1}", style = MaterialTheme.typography.titleMedium)
-                            }
+                            Text("${display.index + 1}", style = MaterialTheme.typography.titleMedium)
                         }
                     }
                 }
             }
-        }
-        Surface(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(top = 48.dp, end = 48.dp)
-                .size(48.dp)
-                .combinedClickable(onClick = { confirmEnd = true }, onLongClick = onEnd),
-            shape = CircleShape,
-            color = Color(0xFFC62828),
-        ) {
-            Box(contentAlignment = Alignment.Center) { EndMark() }
+            Row(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 8.dp, end = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                HitButton(
+                    description = "Session settings",
+                    space = space,
+                    padId = "gear",
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
+                    pressedColor = MaterialTheme.colorScheme.primary,
+                    onClick = { sheet = true },
+                ) { GearMark() }
+                HitButton(
+                    description = "End session",
+                    space = space,
+                    padId = "end",
+                    color = Color(0xFFC62828),
+                    pressedColor = Color(0xFF8E0000),
+                    onClick = { confirmEnd = true },
+                    onLongClick = onEnd,
+                ) { EndMark() }
+            }
+            HitButton(
+                description = "Session menu",
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp),
+                space = space,
+                padId = "menu",
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
+                pressedColor = MaterialTheme.colorScheme.primary,
+                onClick = { sheet = true },
+            ) { Mark("tools") }
+            if (sheet) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.45f))
+                        .reportPad(space, "scrim")
+                        .clickable { sheet = false },
+                )
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .fillMaxHeight(0.88f)
+                        .reportPad(space, "sheet"),
+                    shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 8.dp,
+                ) {
+                    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(peerName, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                            TextButton(
+                                onClick = { sheet = false },
+                                modifier = Modifier.semantics { contentDescription = "Close session settings" },
+                            ) { Text("Close") }
+                        }
+                        RemoteOptionsForm(
+                            options = remote,
+                            onChange = onRemote,
+                            permissions = session.permissions,
+                            peerName = peerName,
+                            forThisComputer = forThisComputer,
+                            onForThisComputer = onForThisComputer,
+                            showActions = true,
+                            fileNames = fileNames,
+                            onClipboardNow = onClipboard,
+                            onFileList = onFileList,
+                            onSendFile = onSendFile,
+                            onRestart = onRestart,
+                            onLock = { onSpecial(1) },
+                            onCtrlAltDel = { onSpecial(0) },
+                            onDisconnect = {
+                                sheet = false
+                                confirmEnd = true
+                            },
+                        )
+                    }
+                }
+            }
         }
         if (confirmEnd) {
             AlertDialog(
@@ -443,49 +631,94 @@ fun SessionScreen(
                 },
             )
         }
-        SessionChrome(
-            session = session,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 48.dp),
-            trackpad = trackpad,
-            fitted = picture.scale <= 1.05f,
-            dragLock = dragLock,
-            onDragLock = onDragLock,
-            pointerSpeed = pointerSpeed,
-            onPointerSpeed = onPointerSpeed,
-            pointerAccel = pointerAccel,
-            onPointerAccel = onPointerAccel,
-            onTrackpad = { trackpad = it },
-            onFit = { fit ->
-                picture = if (fit) {
-                    PictureView.fit()
-                } else {
-                    val placed = GestureMap.letterbox(
-                        session.frameW.coerceAtLeast(16),
-                        session.frameH.coerceAtLeast(9),
-                        viewW,
-                        viewH,
-                    )
-                    PictureView.Frame(PictureView.oneToOne(session.frameW, placed.width), 0f, 0f)
-                }
-            },
-            onText = { _ -> keyboard = !keyboard },
-            onSpecial = onSpecial,
-            onKey = onKey,
-            onQuality = onQuality,
-            onDisplay = onDisplay,
-            onClipboard = onClipboard,
-            onEnd = onEnd,
-        )
     }
 }
+
+@Composable
+private fun HitButton(
+    description: String,
+    modifier: Modifier = Modifier,
+    space: OverlaySpace? = null,
+    padId: String? = null,
+    color: Color,
+    pressedColor: Color,
+    onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
+    icon: @Composable () -> Unit,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val located = if (space != null && padId != null) Modifier.reportPad(space, padId) else Modifier
+    val gesture = if (onLongClick == null) {
+        Modifier.clickable(
+            interactionSource = interaction,
+            indication = ripple(bounded = false),
+            onClick = onClick,
+        )
+    } else {
+        Modifier.combinedClickable(
+            interactionSource = interaction,
+            indication = ripple(bounded = false),
+            onClick = onClick,
+            onLongClick = onLongClick,
+        )
+    }
+    Surface(
+        modifier = modifier
+            .size(56.dp)
+            .then(located)
+            .semantics { contentDescription = description }
+            .then(gesture),
+        shape = CircleShape,
+        color = if (pressed) pressedColor else color,
+        border = if (pressed) BorderStroke(3.dp, Color.White) else null,
+        tonalElevation = 6.dp,
+    ) {
+        Box(contentAlignment = Alignment.Center) { icon() }
+    }
+}
+
+@Composable
+private fun Modifier.reportPad(space: OverlaySpace, id: String): Modifier {
+    DisposableEffect(id) {
+        onDispose { space.pads.remove(id) }
+    }
+    return this.onGloballyPositioned { coords ->
+        val b = coords.boundsInRoot()
+        val o = space.origin
+        space.pads[id] = ControlPad(b.left - o.x, b.top - o.y, b.right - o.x, b.bottom - o.y)
+    }
+}
+
+private fun Modifier.onSizeChangedSafe(block: (androidx.compose.ui.unit.IntSize) -> Unit): Modifier =
+    onGloballyPositioned { block(it.size) }
 
 @Composable
 private fun EndMark() {
     Canvas(Modifier.size(22.dp)) {
         drawLine(Color.White, Offset(5f, 5f), Offset(size.width - 5f, size.height - 5f), strokeWidth = 2.4.dp.toPx())
         drawLine(Color.White, Offset(size.width - 5f, 5f), Offset(5f, size.height - 5f), strokeWidth = 2.4.dp.toPx())
+    }
+}
+
+@Composable
+private fun GearMark() {
+    val color = MaterialTheme.colorScheme.onSurface
+    Canvas(Modifier.size(22.dp)) {
+        drawCircle(color, radius = size.minDimension * 0.22f, style = Stroke(width = 1.8.dp.toPx()))
+        drawCircle(color, radius = size.minDimension * 0.08f)
+        val arm = size.minDimension * 0.42f
+        for (i in 0 until 8) {
+            val angle = (Math.PI * i / 4.0)
+            val c = kotlin.math.cos(angle).toFloat()
+            val s = kotlin.math.sin(angle).toFloat()
+            drawLine(
+                color,
+                Offset(center.x + c * size.minDimension * 0.28f, center.y + s * size.minDimension * 0.28f),
+                Offset(center.x + c * arm, center.y + s * arm),
+                strokeWidth = 1.8.dp.toPx(),
+            )
+        }
     }
 }
 
@@ -509,135 +742,6 @@ private fun dispatch(
 }
 
 @Composable
-fun SessionChrome(
-    session: SessionInfo,
-    modifier: Modifier = Modifier,
-    onText: (String) -> Unit,
-    onSpecial: (Int) -> Unit,
-    onKey: (Int, Boolean) -> Unit,
-    onQuality: (String) -> Unit,
-    onDisplay: (Int) -> Unit,
-    onEnd: () -> Unit,
-    onClipboard: () -> Unit = {},
-    trackpad: Boolean = false,
-    fitted: Boolean = true,
-    onTrackpad: (Boolean) -> Unit = {},
-    onFit: (Boolean) -> Unit = {},
-    dragLock: Boolean = false,
-    onDragLock: (Boolean) -> Unit = {},
-    pointerSpeed: Float = 0.6f,
-    onPointerSpeed: (Float) -> Unit = {},
-    pointerAccel: Boolean = false,
-    onPointerAccel: (Boolean) -> Unit = {},
-) {
-    var open by remember { mutableStateOf(false) }
-    var ox by remember { mutableFloatStateOf(0f) }
-    var oy by remember { mutableFloatStateOf(0f) }
-    var quality by remember { mutableStateOf(false) }
-    var displays by remember { mutableStateOf(false) }
-    var speedMenu by remember { mutableStateOf(false) }
-    var dragged by remember { mutableFloatStateOf(0f) }
-    Surface(
-        modifier = modifier
-            .offset { IntOffset(ox.roundToInt(), oy.roundToInt()) }
-            .pointerInput(Unit) {
-                detectDragGestures(
-                    onDragStart = { dragged = 0f },
-                    onDragEnd = {
-                        if (dragged < 12f) open = !open
-                    },
-                ) { change, delta ->
-                    change.consume()
-                    dragged += hypot(delta.x.toDouble(), delta.y.toDouble()).toFloat()
-                    ox += delta.x
-                    oy += delta.y
-                }
-            },
-        shape = if (open) RoundedCornerShape(20.dp) else CircleShape,
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
-        tonalElevation = 6.dp,
-    ) {
-        if (!open) {
-            Box(Modifier.size(56.dp), contentAlignment = Alignment.Center) {
-                Mark("tools")
-            }
-        } else {
-            Column(Modifier.padding(6.dp).widthIn(max = 280.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(
-                    session.peer.ifBlank { session.id }.take(28),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = pjMuted(),
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                )
-                Row {
-                    Tool("keyboard", "Keyboard") { onText("") }
-                    Tool("keys", "Ctrl+Alt+Del") { onSpecial(0) }
-                    Tool(if (trackpad) "touch" else "pad", if (trackpad) "Touch" else "Trackpad") {
-                        onTrackpad(!trackpad)
-                    }
-                    Tool(if (fitted) "actual" else "fit", if (fitted) "1:1" else "Fit") { onFit(!fitted) }
-                }
-                Row {
-                    Box {
-                        Tool("display", "Display") { displays = true }
-                        DropdownMenu(expanded = displays, onDismissRequest = { displays = false }) {
-                            val list = session.displays.ifEmpty {
-                                listOf(us.spader.pjdesk.core.DisplayInfo(0, "This display", session.frameW, session.frameH, true))
-                            }
-                            list.forEach { display ->
-                                DropdownMenuItem(
-                                    text = { Text(display.name.ifBlank { "Display ${display.index}" }) },
-                                    onClick = { displays = false; onDisplay(display.index) },
-                                )
-                            }
-                        }
-                    }
-                    Box {
-                        Tool("quality", "Quality") { quality = true }
-                        DropdownMenu(expanded = quality, onDismissRequest = { quality = false }) {
-                            listOf("smooth", "balanced", "sharp", "high").forEach { name ->
-                                DropdownMenuItem(
-                                    text = { Text(name) },
-                                    onClick = { quality = false; onQuality(name) },
-                                )
-                            }
-                        }
-                    }
-                    Tool("clip", "Clipboard") { onClipboard() }
-                    Tool(if (dragLock) "dragOn" else "drag", if (dragLock) "Drag on" else "Drag") {
-                        onDragLock(!dragLock)
-                    }
-                }
-                Row {
-                    Box {
-                        Tool("speed", "Speed") { speedMenu = true }
-                        DropdownMenu(expanded = speedMenu, onDismissRequest = { speedMenu = false }) {
-                            listOf(0.25f, 0.6f, 1f, 1.5f, 2f).forEach { value ->
-                                val label = if (value == 0.6f) "0.6×" else if (value % 1f == 0f) "${value.toInt()}×" else "${value}×"
-                                DropdownMenuItem(
-                                    text = { Text(if (pointerSpeed == value) "$label  ✓" else label) },
-                                    onClick = { speedMenu = false; onPointerSpeed(value) },
-                                )
-                            }
-                            DropdownMenuItem(
-                                text = { Text(if (pointerAccel) "Acceleration on  ✓" else "Acceleration") },
-                                onClick = { speedMenu = false; onPointerAccel(!pointerAccel) },
-                            )
-                        }
-                    }
-                    Tool("end", "End") { onEnd() }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun Tool(kind: String, label: String, onClick: () -> Unit) {
-    IconButton(onClick = onClick) { Mark(kind) }
-}
-
-@Composable
 private fun ModifierBar(
     modifier: Modifier,
     onText: (String) -> Unit,
@@ -657,7 +761,7 @@ private fun ModifierBar(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 listOf("Ctrl" to 0x1D, "Alt" to 0x38, "Win" to 0xE05B, "Shift" to 0x2A).forEach { (label, scan) ->
-                    FilterChip(
+                    androidx.compose.material3.FilterChip(
                         selected = held.contains(scan),
                         onClick = {
                             if (held.contains(scan)) {
@@ -672,7 +776,7 @@ private fun ModifierBar(
                     )
                 }
                 WinKeys.forEach { (label, scan) ->
-                    FilterChip(
+                    androidx.compose.material3.FilterChip(
                         selected = false,
                         onClick = {
                             onKey(scan, true)
@@ -683,7 +787,7 @@ private fun ModifierBar(
                 }
             }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
+                androidx.compose.material3.OutlinedTextField(
                     value = typed,
                     onValueChange = { next ->
                         val added = if (next.length >= typed.length && next.startsWith(typed)) {
@@ -698,8 +802,8 @@ private fun ModifierBar(
                     singleLine = true,
                     label = { Text("Type") },
                 )
-                IconButton(onClick = { onText("\n"); typed = "" }) { Mark("enter") }
-                IconButton(onClick = onClose) { Mark("end") }
+                androidx.compose.material3.IconButton(onClick = { onText("\n"); typed = "" }) { Mark("enter") }
+                androidx.compose.material3.IconButton(onClick = onClose) { Mark("end") }
             }
         }
     }
@@ -725,14 +829,6 @@ private fun Mark(kind: String) {
                 drawLine(color, Offset(4f, 4f), Offset(4f, size.height * 0.42f), strokeWidth = 1.6.dp.toPx())
                 drawLine(color, Offset(size.width - 4f, size.height - 4f), Offset(size.width * 0.58f, size.height - 4f), strokeWidth = 1.6.dp.toPx())
                 drawLine(color, Offset(size.width - 4f, size.height - 4f), Offset(size.width - 4f, size.height * 0.58f), strokeWidth = 1.6.dp.toPx())
-            }
-            "drag", "dragOn" -> {
-                drawCircle(color, radius = 3.dp.toPx(), center = Offset(size.width * 0.35f, size.height * 0.62f))
-                drawLine(color, Offset(size.width * 0.42f, size.height * 0.55f), Offset(size.width * 0.78f, size.height * 0.28f), strokeWidth = 1.7.dp.toPx())
-            }
-            "speed" -> {
-                drawLine(color, Offset(size.width * 0.2f, size.height * 0.72f), Offset(size.width * 0.8f, size.height * 0.72f), strokeWidth = 1.6.dp.toPx())
-                drawCircle(color, radius = 3.dp.toPx(), center = Offset(size.width * 0.42f, size.height * 0.72f))
             }
             "tools" -> {
                 drawCircle(color, radius = 2.2.dp.toPx(), center = Offset(size.width * 0.3f, size.height / 2f))

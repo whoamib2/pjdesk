@@ -28,6 +28,10 @@ class PointerSession(
     var accelerate: Boolean = false,
     /** When on, a one-finger trackpad drag holds the mouse button. */
     var dragLock: Boolean = false,
+    /** Multiplier for a two-finger wheel notch. 1 matches the previous wheel. */
+    var scrollSpeed: Float = 1f,
+    /** Flips the wheel direction. */
+    var invertScroll: Boolean = false,
 ) {
     private val relative = trackpad ?: !android
     private val stroke = StrokeTracker()
@@ -106,10 +110,15 @@ class PointerSession(
             if (points.size >= 2) {
                 val originY = scrollY ?: points[0].second.also { scrollY = it }
                 val dy = points[0].second - originY
-                if (kotlin.math.abs(dy) < 1200) return emptyList()
+                val speed = scrollSpeed.coerceIn(0.25f, 4f)
+                val threshold = (1200f / speed).toInt().coerceIn(200, 4800)
+                if (kotlin.math.abs(dy) < threshold) return emptyList()
                 scrollY = points[0].second
-                val notches = if (dy > 0) -1 else 1
-                return listOf(Out.Mouse("wheel", cursor.first, cursor.second, notches * 120))
+                var notches = if (dy > 0) -1 else 1
+                if (invertScroll) notches = -notches
+                val scaled = kotlin.math.round(kotlin.math.abs(notches) * speed).toInt().coerceAtLeast(1)
+                val signed = scaled * if (notches < 0) -1 else 1
+                return listOf(Out.Mouse("wheel", cursor.first, cursor.second, signed * 120))
             }
             val from = last ?: points[0]
             val dx = points[0].first - from.first
