@@ -11,6 +11,12 @@ Android is 0.6.16 (versionCode 61600). Windows is 0.6.16 as well: the session wi
 * Disconnect ends sharing on both sides. When the PC disconnects, the phone stops MediaProjection, drops the sharing notification, and leaves the phone registered. When the phone stops sharing, the PC session closes with "The phone stopped sharing".
 * View phone started the viewer with `PJDESK_ASK_VIEW=1`, no password, and no `PJDESK_ASK`. The viewer then called `rpassword::prompt_password`, which needs a console. That failed with "The handle is invalid. (os error 6)" and the log never reached "Connecting to". `PJDESK_ASK_VIEW=1` is now an empty password, the same as `PJDESK_ASK`. The password prompt runs only when stdin is a terminal. Otherwise the viewer stops with "No password for {label}, and there is no console to ask for one." All three viewer launches from the window use null stdin, stdout, and stderr. A failed session opens a dialog on the PC.
 
+## 0.6.15
+
+Windows and Android are 0.6.15 (versionCode 61500). cloud/ did not change, so no deploy. Protocol stays 3. No tag, no release, and no GitHub Actions. The Windows client needs 0.6.15 for View phone. The phone build only carries the version bump.
+
+* View phone failed on Windows with "The handle is invalid. (os error 6)" and only an "Opening" toast. The window starts the viewer hidden, with no password and no console, and the viewer then tried to prompt for a password on the console. A view request now sends no password and never prompts, a viewer without a console stops with a clear message instead, and the window starts every viewer with null standard handles.
+
 ## 0.6.14
 
 Android is 0.6.14 (versionCode 61400). Windows and cloud/ did not change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The phone needs 0.6.14. The Windows client does not.

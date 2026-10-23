@@ -54,8 +54,8 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
     let label = direct.clone().unwrap_or_else(|| format_id(&target));
     let ask = std::env::var("PJDESK_ASK").ok().map(std::path::PathBuf::from).filter(|p| !p.as_os_str().is_empty());
     // View phone sets PJDESK_ASK_VIEW and no password, and it does not set
-    // PJDESK_ASK. That is an empty password. rpassword opens CONIN$ and
-    // fails with "The handle is invalid. (os error 6)" when there is no console.
+    // PJDESK_ASK. That is an empty password, the same as the 0.6.15 hotfix.
+    // rpassword opens CONIN$ and fails with os error 6 when there is no console.
     let ask_view = std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1");
     let ask_person = std::env::var("PJDESK_ASK_PERSON").ok().as_deref() == Some("1");
     let stdin_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
