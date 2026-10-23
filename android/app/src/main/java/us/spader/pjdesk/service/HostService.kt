@@ -15,12 +15,15 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.DisplayMetrics
+import android.view.Display
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import us.spader.pjdesk.AppLog
 import us.spader.pjdesk.MainActivity
 import us.spader.pjdesk.PjApp
 import us.spader.pjdesk.R
+import us.spader.pjdesk.a11y.PjAccessibilityService
+import us.spader.pjdesk.a11y.ProjectionConsent
 import us.spader.pjdesk.media.ScreenEncoder
 
 /**
@@ -128,6 +131,40 @@ class HostService : Service() {
             fail("Screen capture permission denied")
             return
         }
+        var rejected = false
+        var fullConfirmed = false
+        var readyToReport = false
+        val (displayW, displayH) = displayPixels()
+        fun rejectPartial(why: String) {
+            if (rejected || generation != mine) return
+            rejected = true
+            val announced = reported
+            generation++
+            AppLog.i("single-app capture stopped ($why); asking for the entire screen")
+            val restart = onConsentRestart
+            onConsentRestart = null
+            onCapture = null
+            restart?.invoke()
+            val tokenToStop = projection
+            forgetProjection()
+            runCatching { tokenToStop?.stop() }
+            if (announced) (application as PjApp).engine.screenWait()
+            val auto = preferAutoClick
+            if (partialRetries >= PARTIAL_LIMIT) {
+                partialRetries = 0
+                AppLog.i("single-app capture persisted; showing the screen share prompt")
+                main.postDelayed({ CapturePrompt.show(this) }, REASK_DELAY_MS)
+                return
+            }
+            partialRetries += 1
+            main.postDelayed({
+                if (auto && PjAccessibilityService.ready(this)) {
+                    ProjectionConsent.request(this)
+                } else {
+                    CapturePrompt.systemDialog(this)
+                }
+            }, REASK_DELAY_MS)
+        }
         token.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 if (generation != mine) return
@@ -140,6 +177,30 @@ class HostService : Service() {
                     engine.stop("The phone stopped sharing")
                 } else {
                     fail("Screen capture stopped")
+                }
+            }
+
+            override fun onCapturedContentResize(width: Int, height: Int) {
+                if (generation != mine || rejected) return
+                val (dw, dh) = displayPixels()
+                if (EntireDisplay.isSingleApp(width, height, dw, dh)) {
+                    AppLog.i("capture region ${width}x$height is not the display ${dw}x$dh")
+                    rejectPartial("${width}x$height against ${dw}x$dh")
+                } else {
+                    fullConfirmed = true
+                    partialRetries = 0
+                    AppLog.i("capture region ${width}x$height covers the display ${dw}x$dh")
+                    if (readyToReport) report(true, "")
+                }
+            }
+
+            override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
+                if (generation != mine || rejected || isVisible) return
+                // Entire-display capture reports hidden only when the display is off.
+                // A single app reports hidden while the display stays on.
+                if (displayIsOn()) {
+                    AppLog.i("captured region is hidden while the display is on")
+                    rejectPartial("captured region hidden")
                 }
             }
         }, main)
@@ -161,15 +222,28 @@ class HostService : Service() {
             onBeforeDisplay = { promoteToProjection() },
             onReady = {
                 main.post {
-                    if (generation != mine) return@post
-                    syncCapture(true)
-                    AppLog.i("screen capture started ${w}x$h")
-                    report(true, "")
+                    if (generation != mine || rejected) return@post
+                    readyToReport = true
+                    AppLog.i("screen capture started ${w}x$h display ${displayW}x$displayH")
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        partialRetries = 0
+                        report(true, "")
+                    } else if (fullConfirmed) {
+                        report(true, "")
+                    } else {
+                        main.postDelayed({
+                            if (generation == mine && !rejected && !fullConfirmed) {
+                                AppLog.i("capture region size was not reported; keeping this display capture")
+                                partialRetries = 0
+                                report(true, "")
+                            }
+                        }, REGION_WAIT_MS)
+                    }
                 }
             },
             onFailed = { error ->
                 main.post {
-                    if (generation != mine) return@post
+                    if (generation != mine || rejected) return@post
                     val message = error.ifBlank { "Screen capture failed" }
                     AppLog.e("encoder: $message")
                     val live = reported
@@ -184,6 +258,18 @@ class HostService : Service() {
                 }
             },
         )
+    }
+
+    @Suppress("DEPRECATION")
+    private fun displayPixels(): Pair<Int, Int> {
+        val metrics = DisplayMetrics()
+        getSystemService(WindowManager::class.java).defaultDisplay.getRealMetrics(metrics)
+        return metrics.widthPixels to metrics.heightPixels
+    }
+
+    @Suppress("DEPRECATION")
+    private fun displayIsOn(): Boolean {
+        return getSystemService(WindowManager::class.java).defaultDisplay.state == Display.STATE_ON
     }
 
     private fun promoteToProjection(): Boolean {
@@ -210,8 +296,9 @@ class HostService : Service() {
     private fun report(ok: Boolean, reason: String) {
         if (reported) return
         reported = true
+        onConsentRestart = null
         val engine = (application as PjApp).engine
-        if (ok) engine.setCapturing(true) else engine.captureDenied(reason.ifBlank { "Screen capture permission denied" })
+        if (ok) syncCapture(true) else engine.captureDenied(reason.ifBlank { "Screen capture permission denied" })
         val callback = onCapture
         if (callback == null) {
             AppLog.i("capture result with no listener: ok=$ok $reason")
@@ -294,6 +381,8 @@ class HostService : Service() {
     }
 
     private fun releaseCapture() {
+        partialRetries = 0
+        acceptOnSuccess = false
         generation++
         val token = projection
         forgetProjection()
@@ -341,6 +430,33 @@ class HostService : Service() {
         /** Called on the main thread after a capture attempt. One result per consent. */
         @Volatile
         var onCapture: ((Boolean, String) -> Unit)? = null
+
+        /**
+         * Finish the consent activity without accepting or denying, because this
+         * capture was a single app and a new entire-screen consent is opening.
+         */
+        @Volatile
+        var onConsentRestart: (() -> Unit)? = null
+
+        /** The consent that is opening was started by unattended access. */
+        @Volatile
+        var preferAutoClick: Boolean = false
+
+        /**
+         * A view or an in-app Allow is waiting on this capture. A single-app
+         * result closes that activity and opens a new one, so the next success
+         * still has to accept the connection.
+         */
+        @Volatile
+        var acceptOnSuccess: Boolean = false
+
+        /** How many single-app captures this session has already thrown away. */
+        @Volatile
+        var partialRetries: Int = 0
+
+        private const val PARTIAL_LIMIT = 2
+        private const val REGION_WAIT_MS = 1500L
+        private const val REASK_DELAY_MS = 400L
 
         fun arm(context: Context) {
             val intent = Intent(context, HostService::class.java)

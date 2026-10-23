@@ -9,7 +9,6 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -31,16 +30,28 @@ class ViewRequestActivity : ComponentActivity() {
         val data = result.data
         val engine = (application as PjApp).engine
         if (result.resultCode == RESULT_OK && data != null) {
+            HostService.onConsentRestart = {
+                runOnUiThread {
+                    HostService.onConsentRestart = null
+                    HostService.onCapture = null
+                    ViewPrompt.cancel(this)
+                    finish()
+                }
+            }
             HostService.onCapture = { ok, reason ->
                 runOnUiThread {
                     HostService.onCapture = null
+                    HostService.onConsentRestart = null
+                    HostService.acceptOnSuccess = false
                     if (ok) engine.accept() else engine.decline(reason.ifBlank { "Screen capture permission denied" })
                     ViewPrompt.cancel(this)
                     finish()
                 }
             }
+            HostService.acceptOnSuccess = true
             HostService.capture(this, result.resultCode, data)
         } else {
+            HostService.acceptOnSuccess = false
             engine.decline("Screen capture permission denied")
             ViewPrompt.cancel(this)
             finish()
@@ -63,7 +74,7 @@ class ViewRequestActivity : ComponentActivity() {
         val engine = (application as PjApp).engine
         AlertDialog.Builder(this)
             .setTitle("$who wants to view your screen")
-            .setMessage("Allow starts the session. Android then asks to share the screen, unless this phone is already sharing. That system prompt cannot be skipped.")
+            .setMessage("Allow starts the session. Android then asks to share the entire screen, not one app, unless this phone is already sharing.")
             .setPositiveButton("Allow") { _, _ ->
                 if (HostService.capturing) {
                     engine.accept()
@@ -101,8 +112,8 @@ class ViewRequestActivity : ComponentActivity() {
     }
 
     private fun launchProjection() {
-        val manager = getSystemService(MediaProjectionManager::class.java)
-        projection.launch(manager.createScreenCaptureIntent())
+        HostService.preferAutoClick = false
+        projection.launch(EntireScreen.captureIntent(this))
     }
 
     companion object {
@@ -200,17 +211,29 @@ class CaptureConsentActivity : ComponentActivity() {
         val data = result.data
         val engine = (application as PjApp).engine
         if (result.resultCode == RESULT_OK && data != null) {
+            HostService.onConsentRestart = {
+                runOnUiThread {
+                    HostService.onConsentRestart = null
+                    HostService.onCapture = null
+                    finish()
+                }
+            }
             HostService.onCapture = { ok, reason ->
                 runOnUiThread {
                     HostService.onCapture = null
-                    if (!ok) engine.captureDenied(reason.ifBlank { "Screen capture permission denied" })
+                    HostService.onConsentRestart = null
+                    if (ok && HostService.acceptOnSuccess) {
+                        HostService.acceptOnSuccess = false
+                        engine.accept()
+                    }
+                    if (!ok) refuseCapture(engine, reason.ifBlank { "Screen capture permission denied" })
                     CapturePrompt.cancel(this)
                     finish()
                 }
             }
             HostService.capture(this, result.resultCode, data)
         } else {
-            engine.captureDenied("Screen capture permission denied")
+            refuseCapture(engine, "Screen capture permission denied")
             CapturePrompt.cancel(this)
             finish()
         }
@@ -239,16 +262,26 @@ class CaptureConsentActivity : ComponentActivity() {
             .setMessage(getString(R.string.allow_screen_share_body))
             .setPositiveButton(getString(R.string.allow_screen_share)) { _, _ -> launchProjection() }
             .setNegativeButton("Deny") { _, _ ->
-                (application as PjApp).engine.captureDenied("Screen capture permission denied")
+                refuseCapture((application as PjApp).engine, "Screen capture permission denied")
                 CapturePrompt.cancel(this)
                 finish()
             }
             .setOnCancelListener {
-                (application as PjApp).engine.captureDenied("Screen capture permission denied")
+                refuseCapture((application as PjApp).engine, "Screen capture permission denied")
                 CapturePrompt.cancel(this)
                 finish()
             }
             .show()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (isFinishing || HostService.capturing) return
+        if (intent.getBooleanExtra(EXTRA_ALLOW, false)) {
+            launchNow = false
+            launchProjection()
+        }
     }
 
     override fun onStart() {
@@ -266,13 +299,19 @@ class CaptureConsentActivity : ComponentActivity() {
 
     private fun launchProjection() {
         HostService.consentInProgress = true
-        val manager = getSystemService(MediaProjectionManager::class.java)
-        projection.launch(manager.createScreenCaptureIntent())
+        projection.launch(EntireScreen.captureIntent(this))
     }
 
     companion object {
         const val EXTRA_ALLOW = "allow"
     }
+}
+
+/** A view that has not been accepted yet must decline. A granted session reports the capture. */
+private fun refuseCapture(engine: us.spader.pjdesk.core.Engine, reason: String) {
+    val waiting = HostService.acceptOnSuccess
+    HostService.acceptOnSuccess = false
+    if (waiting) engine.decline(reason) else engine.captureDenied(reason)
 }
 
 object CapturePrompt {
@@ -281,6 +320,7 @@ object CapturePrompt {
 
     fun show(context: Context, launch: Boolean = true) {
         val app = context.applicationContext
+        HostService.preferAutoClick = false
         if (HostService.capturing) {
             (app as PjApp).engine.setCapturing(true)
             return
@@ -335,6 +375,21 @@ object CapturePrompt {
         val app = context.applicationContext
         if (HostService.capturing) return
         show(app, launch = false)
+    }
+
+    /**
+     * The system dialog again, limited to the whole display. The PJDesk
+     * notification stays so the share is visible while Android asks.
+     */
+    fun systemDialog(context: Context) {
+        val app = context.applicationContext
+        HostService.arm(app)
+        show(app, launch = false)
+        val open = Intent(app, CaptureConsentActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            putExtra(CaptureConsentActivity.EXTRA_ALLOW, true)
+        }
+        runCatching { app.startActivity(open) }
     }
 
     fun cancel(context: Context) {

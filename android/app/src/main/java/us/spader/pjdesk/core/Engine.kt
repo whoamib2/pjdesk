@@ -138,6 +138,20 @@ class Engine(context: Context) : EngineListener {
         command(JSONObject().put("cmd", "capturing").put("on", on).toString())
     }
 
+    /**
+     * A capture was a single app and was stopped. The PC is told to keep
+     * waiting, and this phone is not left on "Accepted automatically".
+     */
+    fun screenWait() {
+        command("""{"cmd":"screenWait"}""")
+        update {
+            it.copy(
+                status = "Waiting for the phone to allow screen sharing",
+                acceptedAutomatically = false,
+            )
+        }
+    }
+
     /** The person denied screen sharing, or Android refused the consent. */
     fun captureDenied(reason: String) {
         val text = reason.ifBlank { "Screen capture permission denied" }

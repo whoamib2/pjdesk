@@ -377,6 +377,13 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 state.session_wake.notify_waiters();
             }
         }
+        "screenWait" => {
+            // A single-app capture was thrown away. The picture is not up yet,
+            // or it has to wait again. Same sentence the PC already knows.
+            state.capturing.store(false, Ordering::SeqCst);
+            *state.control_note.lock().unwrap() = Some(SCREEN_WAIT.to_string());
+            state.session_wake.notify_waiters();
+        }
         "setApproval" => {
             let mode = cmd.get("mode").and_then(|v| v.as_str()).unwrap_or("prompt");
             let want = mode == "unattended";
@@ -2310,6 +2317,23 @@ mod tests {
             assert!(host_accepts_typed(&passwords, saved));
             assert!(host_accepts_typed(&passwords, &passwords[0]));
             assert!(!host_accepts_typed(&passwords, "wrong horse battery"));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_single_app_capture_tells_the_pc_to_keep_waiting() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-screen-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let cb: Arc<dyn Callbacks> = Arc::new(Silent);
+            let state = test_state(&dir);
+            state.capturing.store(true, Ordering::SeqCst);
+            apply(&state, &cb, json!({"cmd":"screenWait"})).await;
+            assert!(!state.capturing.load(Ordering::SeqCst));
+            assert_eq!(state.control_note.lock().unwrap().as_deref(), Some(SCREEN_WAIT));
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

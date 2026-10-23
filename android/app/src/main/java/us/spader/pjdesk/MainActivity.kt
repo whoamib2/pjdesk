@@ -10,7 +10,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.media.projection.MediaProjectionManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Build
@@ -115,10 +114,18 @@ class MainActivity : FragmentActivity() {
         if (result.resultCode == RESULT_OK && data != null) {
             if (acceptAfter) {
                 AppLog.i("screen-share consent granted for an incoming connection")
+                HostService.onConsentRestart = {
+                    runOnUiThread {
+                        HostService.onConsentRestart = null
+                        HostService.onCapture = null
+                    }
+                }
                 HostService.onCapture = { ok, reason ->
                     runOnUiThread {
                         HostService.onCapture = null
+                        HostService.onConsentRestart = null
                         pendingAccept = false
+                        HostService.acceptOnSuccess = false
                         if (ok) {
                             captureReady.value = true
                             app.engine.accept()
@@ -130,6 +137,7 @@ class MainActivity : FragmentActivity() {
                         }
                     }
                 }
+                HostService.acceptOnSuccess = true
                 HostService.capture(this, result.resultCode, data)
             } else {
                 // The consent token is single-use on Android 14+. Remember that the
@@ -141,6 +149,7 @@ class MainActivity : FragmentActivity() {
             }
         } else if (acceptAfter) {
             pendingAccept = false
+            HostService.acceptOnSuccess = false
             val text = "Screen capture permission denied"
             AppLog.e(text)
             app.engine.showError(text)
@@ -1955,11 +1964,11 @@ class MainActivity : FragmentActivity() {
         // Android 14 and later consume each consent on one virtual display.
         // Always ask again for a real session, including when setup already did.
         pendingAccept = acceptAfter
+        HostService.preferAutoClick = false
         HostService.consentInProgress = true
         if (acceptAfter) app.engine.showStatus("Waiting for screen sharing")
-        AppLog.i(if (acceptAfter) "asking to share the screen for an incoming connection" else "asking to share the screen during setup")
-        val manager = getSystemService(MediaProjectionManager::class.java)
-        projection.launch(manager.createScreenCaptureIntent())
+        AppLog.i(if (acceptAfter) "asking to share the entire screen for an incoming connection" else "asking to share the entire screen during setup")
+        projection.launch(us.spader.pjdesk.service.EntireScreen.captureIntent(this))
     }
 
     private fun copy(text: String) {

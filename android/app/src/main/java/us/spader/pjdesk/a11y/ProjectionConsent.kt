@@ -33,6 +33,8 @@ sealed class ConsentStep {
  * Resource ids come first. Text is the fallback, including the labels Pixel
  * uses ("Share entire screen", "Share screen", "Start now") and a few other
  * locales. A two-row list that has one "single app" row taps the other row.
+ * Start is not tapped while the spinner still shows a single app. The
+ * spinner's own text is the selected mode; descendant text can mention both.
  */
 object ProjectionConsent {
     const val NOTICE = "Accepted automatically"
@@ -55,6 +57,7 @@ object ProjectionConsent {
             return
         }
         HostService.arm(app)
+        HostService.preferAutoClick = true
         armed = true
         automatic = false
         PjAccessibilityService.watchConsent {
@@ -104,17 +107,27 @@ object ProjectionConsent {
         if (!looksLikeConsent(nodes)) return ConsentStep.Wait
         val entire = nodes.indexOfFirst { isEntireChoice(it) }
         val mode = nodes.indexOfFirst { isModeControl(it) }
-        if (mode >= 0 && !isEntireLabel(nodes[mode].subtree)) {
+        val modeEntire = mode >= 0 && modeIsEntire(nodes[mode])
+        if (mode >= 0 && !modeEntire) {
             if (entire >= 0) return ConsentStep.Click(entire, "entire screen")
             val other = otherShareRow(nodes)
             if (other >= 0) return ConsentStep.Click(other, "entire screen")
             if (nodes[mode].enabled) return ConsentStep.Click(mode, "open share mode")
+            return ConsentStep.Wait
         } else if (mode < 0 && entire >= 0 && !nodes[entire].checked) {
             return ConsentStep.Click(entire, "entire screen")
         }
         val positive = nodes.indexOfFirst { isPositive(it) }
-        if (positive >= 0) return ConsentStep.Click(positive, "share")
+        if (positive >= 0 && (mode < 0 || modeEntire)) return ConsentStep.Click(positive, "share")
         return ConsentStep.Wait
+    }
+
+    /** The spinner's own text is the selection. Child text can name both choices. */
+    fun modeIsEntire(node: ConsentNode): Boolean {
+        if (isSingleApp(node.text)) return false
+        val shown = node.text.ifBlank { node.subtree }
+        if (isSingleApp(shown)) return false
+        return isEntireLabel(shown)
     }
 
     private fun otherShareRow(nodes: List<ConsentNode>): Int {

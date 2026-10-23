@@ -102,13 +102,27 @@ class ProjectionConsentTest {
         assertEquals(ConsentStep.Wait, ProjectionConsent.decide(emptyList()))
     }
 
-    private fun mode(selected: String) = ConsentNode(
+    @Test
+    fun aSingleAppSpinnerDoesNotStartWhenTheSubtreeAlsoSaysEntireScreen() {
+        val step = ProjectionConsent.decide(
+            listOf(
+                mode("A single app", subtree = "A single app Entire screen"),
+                button("android:id/button1", "Start now"),
+                button("android:id/button2", "Cancel"),
+            ),
+        )
+        assertEquals(ConsentStep.Click(0, "open share mode"), step)
+        assertFalse(ProjectionConsent.modeIsEntire(mode("A single app", subtree = "Entire screen")))
+        assertTrue(ProjectionConsent.modeIsEntire(mode("Entire screen", subtree = "Entire screen A single app")))
+    }
+
+    private fun mode(selected: String, subtree: String = selected) = ConsentNode(
         packageName = ProjectionConsent.SYSTEM_UI,
         className = "android.widget.Spinner",
         windowClass = "com.android.systemui.mediaprojection.permission.MediaProjectionPermissionActivity",
         viewId = "com.android.systemui:id/screen_share_mode_options",
         text = selected,
-        subtree = selected,
+        subtree = subtree,
         clickable = true,
         enabled = true,
     )
