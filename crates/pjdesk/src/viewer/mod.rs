@@ -53,15 +53,19 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
     }
     let label = direct.clone().unwrap_or_else(|| format_id(&target));
     let ask = std::env::var("PJDESK_ASK").ok().map(std::path::PathBuf::from).filter(|p| !p.as_os_str().is_empty());
+    // View phone sets PJDESK_ASK_VIEW and no password, and it does not set
+    // PJDESK_ASK. That is an empty password. rpassword opens CONIN$ and
+    // fails with "The handle is invalid. (os error 6)" when there is no console.
     let ask_view = std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1");
     let ask_person = std::env::var("PJDESK_ASK_PERSON").ok().as_deref() == Some("1");
-    let password = match password_source(args.password.as_deref(), ask.is_some(), ask_view, ask_person, console_available())
+    let stdin_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let password = match password_source(args.password.as_deref(), ask.is_some(), ask_view, ask_person, stdin_is_terminal)
     {
         PasswordSource::Given(password) => password,
         PasswordSource::Empty => String::new(),
         PasswordSource::Prompt => rpassword::prompt_password(format!("Password for {label}: "))?,
         PasswordSource::NoConsole => {
-            bail!("Enter the password in the PJDesk window.");
+            bail!("No password for {label}, and there is no console to ask for one.");
         }
     };
 
@@ -125,10 +129,12 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
     Ok(())
 }
 
-/// How the viewer gets the computer password. The PJDesk window passes it in
-/// the environment, or asks after the other computer answers. A console prompt
-/// is only for `pjdesk connect` typed in a terminal. View phone and "ask the
-/// person" send no password. Opening CONIN$ with no console is os error 6.
+/// How the viewer gets the computer password.
+///
+/// `PJDESK_ASK` and `PJDESK_ASK_VIEW` send no password. The window asks later,
+/// or the phone shows its share prompt. A console prompt is only for
+/// `pjdesk connect` when stdin is a terminal. Otherwise `rpassword` opens
+/// CONIN$ and fails with os error 6.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PasswordSource {
     Given(String),
@@ -142,26 +148,16 @@ pub(crate) fn password_source(
     ask: bool,
     ask_view: bool,
     ask_person: bool,
-    console: bool,
+    stdin_is_terminal: bool,
 ) -> PasswordSource {
     if ask || ask_view || ask_person {
         return PasswordSource::Empty;
     }
     match supplied {
         Some(password) => PasswordSource::Given(password.to_string()),
-        None if console => PasswordSource::Prompt,
+        None if stdin_is_terminal => PasswordSource::Prompt,
         None => PasswordSource::NoConsole,
     }
-}
-
-#[cfg(windows)]
-fn console_available() -> bool {
-    unsafe { !windows::Win32::System::Console::GetConsoleWindow().0.is_null() }
-}
-
-#[cfg(not(windows))]
-fn console_available() -> bool {
-    std::io::IsTerminal::is_terminal(&std::io::stdin())
 }
 
 /// Signaling → UDP binding → hole punching / relay → QUIC → password check.

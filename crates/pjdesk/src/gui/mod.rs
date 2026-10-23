@@ -2095,11 +2095,10 @@ fn write_service_consent(accept: bool) {
     let _ = std::fs::write(path, body.to_string());
 }
 
-/// The viewer does not inherit this process's std handles.
+/// Every viewer this window starts has null stdin, stdout, and stderr.
 ///
-/// After an update the service starts the window with `CreateProcessAsUser`.
-/// Those handles are null. Inheriting them, with `CREATE_NO_WINDOW`, makes the
-/// viewer fail with "The handle is invalid. (os error 6)" before it connects.
+/// View phone is hidden and has no console. Inheriting this process's
+/// handles would let the child treat a dead console as its terminal.
 fn prepare_viewer(cmd: &mut std::process::Command) {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
