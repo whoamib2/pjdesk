@@ -447,7 +447,8 @@ impl Session {
             | SpecialCommand::Recents
             | SpecialCommand::VolumeUp
             | SpecialCommand::VolumeDown
-            | SpecialCommand::Power => {
+            | SpecialCommand::Power
+            | SpecialCommand::Notifications => {
                 self.deny(send, "android", "this computer is not running Android").await?;
             }
         }

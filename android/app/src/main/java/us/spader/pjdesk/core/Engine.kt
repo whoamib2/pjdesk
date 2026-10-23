@@ -87,6 +87,7 @@ class Engine(context: Context) : EngineListener {
                 command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
                 pushTrusted()
                 setCapturing(us.spader.pjdesk.service.HostService.capturing)
+                setControl(us.spader.pjdesk.a11y.PjAccessibilityService.ready(app))
                 flushCommands()
                 _ready.value = EngineReadiness(EnginePhase.Ready, "Ready")
                 AppLog.i("engine ready")
@@ -122,6 +123,11 @@ class Engine(context: Context) : EngineListener {
         AppLog.e(text)
         _ready.value = EngineReadiness(EnginePhase.Failed, text)
         update { it.copy(status = text, error = text) }
+    }
+
+    /** The accessibility service can turn PC input into taps and typing. */
+    fun setControl(on: Boolean) {
+        command(JSONObject().put("cmd", "setControl").put("on", on).toString())
     }
 
     /** MediaProjection is producing frames, or it stopped. */
@@ -381,7 +387,7 @@ class Engine(context: Context) : EngineListener {
      * An empty password removes it. Returns false when it could not be stored.
      * The password itself is never written to the log.
      */
-    fun setPermanent(password: String): Boolean {
+    fun setPermanent(password: String, quiet: Boolean = false): Boolean {
         val trimmed = password.trim()
         if (trimmed.isNotEmpty() && !permanentOk(trimmed)) {
             update { it.copy(error = "Use at least 8 characters.") }
@@ -396,7 +402,11 @@ class Engine(context: Context) : EngineListener {
             it.copy(
                 hasPermanent = trimmed.isNotEmpty(),
                 approval = store.approval,
-                notice = if (trimmed.isEmpty()) "Permanent password removed." else "Permanent password saved.",
+                notice = when {
+                    quiet -> it.notice
+                    trimmed.isEmpty() -> "Permanent password removed."
+                    else -> "Permanent password saved."
+                },
             )
         }
         pushPermanent()
@@ -665,13 +675,18 @@ class Engine(context: Context) : EngineListener {
                 onFiles?.invoke(list)
             }
             "keyframe" -> onKeyframe?.invoke()
-            "input" -> RemoteControl.handle(event)
+            "input" -> {
+                if (!RemoteControl.handle(event)) setControl(false)
+            }
             "disconnected" -> {
                 us.spader.pjdesk.service.ViewPrompt.cancel(app)
                 us.spader.pjdesk.service.CapturePrompt.cancel(app)
                 val role = event.optString("role")
                 if (role == "controller" || role == "session") {
                     us.spader.pjdesk.service.SessionNotice.hide(app)
+                }
+                if (role == "host" || role == "session") {
+                    runCatching { us.spader.pjdesk.service.HostService.release(app) }
                 }
                 val reason = event.optString("reason").ifBlank { "the session ended" }
                 update {

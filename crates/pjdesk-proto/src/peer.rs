@@ -164,6 +164,8 @@ pub enum SpecialCommand {
     VolumeDown,
     /// Android power dialog, or the lock screen when the device offers it.
     Power,
+    /// Open the notification shade. Sent only to an Android host.
+    Notifications,
 }
 
 /// How keystrokes are delivered. Map sends hardware scan codes (the layout of
@@ -622,6 +624,7 @@ mod tests {
         assert_eq!(postcard::to_stdvec(&SpecialCommand::TaskManager).unwrap()[0], 2);
         assert_eq!(postcard::to_stdvec(&SpecialCommand::Back).unwrap()[0], 3);
         assert_eq!(postcard::to_stdvec(&SpecialCommand::Power).unwrap()[0], 8);
+        assert_eq!(postcard::to_stdvec(&SpecialCommand::Notifications).unwrap()[0], 9);
         let hello = ControlMsg::Hello { permissions: 1, monitor: 0, quality: crate::quality::StreamQuality::default() };
         assert!(postcard::to_stdvec(&hello).unwrap()[0] > 4);
     }

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.15
+
+Android is 0.6.15 (versionCode 61500). Windows is 0.6.15 as well: the session window for an Android peer has the control bar, keyboard typing, and the "Control not enabled on phone" and "The phone stopped sharing" messages. cloud/ did not change. Protocol stays 3. `SpecialCommand::Notifications` is appended at index 9. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The server binary did not change, so do not run `cloud\deploy.cmd`. The phone needs 0.6.15. The Windows client needs this build for the bar, the keyboard, and those two messages.
+
+* A computer could see the phone and not control it. Taps are delivered by the accessibility service, and when that service is not turned on the phone dropped the input and said nothing. Settings → Control and the home screen say whether it is off, listed but not running, or on, and open Accessibility. While someone is viewing and control is off, the phone asks once per session. The PC shows "Control not enabled on phone" instead of failing silently, and "Control is on" when the service connects. A click is a tap, a drag is a swipe, the wheel scrolls, and a right-click is a long-press.
+* An Android session on the PC keeps Back, Home, Recents, Notify, Lock, Vol+, and Vol− on screen. They use the accessibility global actions, including notifications and the lock screen, so they work when the phone is using gesture navigation. Volume still changes the media stream.
+* Typing on the PC keyboard goes into the focused field. Enter, Backspace, arrows, and Tab work. Ctrl+V pastes the PC clipboard as text. Backspace deletes the selection or the character before the cursor.
+* Settings → Security → Permanent password shows whether one is set, then Set or Change. The dialog has the password, confirm, Show on each, a length hint, Save, and Remove. The rule is still at least 8 characters, the same as Windows, and it is not the account password. It is stored in the account password vault under this phone's own 9-digit id, so a signed-in computer receives it as the saved password for the phone. A newer vault copy can update the phone.
+* Disconnect ends sharing on both sides. When the PC disconnects, the phone stops MediaProjection, drops the sharing notification, and leaves the phone registered. When the phone stops sharing, the PC session closes with "The phone stopped sharing".
+
 ## 0.6.14
 
 Android is 0.6.14 (versionCode 61400). Windows and cloud/ did not change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The phone needs 0.6.14. The Windows client does not.

@@ -37,7 +37,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.14";
+pub const APP_VERSION: &str = "0.6.15";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -100,6 +100,12 @@ struct State {
     capture: Mutex<(u16, u16)>,
     /// True while MediaProjection is producing frames.
     capturing: AtomicBool,
+    /// The accessibility service is connected and can turn input into taps.
+    control_ready: AtomicBool,
+    /// A notice the open host session should send, such as control being off.
+    control_note: Mutex<Option<String>>,
+    /// Wakes the host session so a local stop is not stuck behind the idle read.
+    session_wake: Notify,
     /// Set when the person denies screen sharing, or the consent fails.
     capture_deny: Mutex<String>,
     /// Bumped to end the current session. The host registration keeps running.
@@ -196,6 +202,9 @@ impl Engine {
             policy: Mutex::new(pjdesk_proto::signal::Policy::default()),
             capture: Mutex::new((1080, 2400)),
             capturing: AtomicBool::new(false),
+            control_ready: AtomicBool::new(false),
+            control_note: Mutex::new(None),
+            session_wake: Notify::new(),
             capture_deny: Mutex::new(String::new()),
             gen: AtomicU64::new(1),
             view_gen: AtomicU64::new(1),
@@ -352,6 +361,15 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 publish(state, cb);
             } else {
                 emit(cb, &json!({"event":"error","text":"Use at least 8 characters for a permanent password."}));
+            }
+        }
+        "setControl" => {
+            let on = cmd.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+            let was = state.control_ready.swap(on, Ordering::SeqCst);
+            if on != was {
+                let text = if on { CONTROL_ON } else { CONTROL_OFF };
+                *state.control_note.lock().unwrap() = Some(text.to_string());
+                state.session_wake.notify_waiters();
             }
         }
         "setApproval" => {
@@ -579,6 +597,7 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             state.gen.fetch_add(1, Ordering::SeqCst);
             *state.control.lock().unwrap() = None;
             *state.video.lock().unwrap() = None;
+            state.session_wake.notify_waiters();
             emit(cb, &json!({"event":"disconnected","role":"session","reason": reason}));
         }
         "text" => {
@@ -714,6 +733,7 @@ fn special_from(which: u64) -> Option<SpecialCommand> {
         6 => SpecialCommand::VolumeUp,
         7 => SpecialCommand::VolumeDown,
         8 => SpecialCommand::Power,
+        9 => SpecialCommand::Notifications,
         _ => return None,
     })
 }
@@ -1273,6 +1293,8 @@ async fn host_session(
 
     let (mut control_send, mut control_recv) = (auth.send, auth.recv);
     let mut adapter = PointerAdapter::default();
+    let mut control_warned = false;
+    let _ = deliver_control(&state, &mut control_send, &mut control_warned).await;
     let mut greeted = auth.peer_proto < 3;
     if greeted {
         let _ = send_welcome(&state, &mut control_send, perms::CLASSIC, ceiling, false).await;
@@ -1283,6 +1305,16 @@ async fn host_session(
             let saved = state.end_reason.lock().unwrap().clone();
             let saved = if saved.is_empty() { "stopped".to_string() } else { saved };
             break Err(anyhow!("{saved}"));
+        }
+        let control_text = state.control_note.lock().unwrap().take();
+        if let Some(text) = control_text {
+            if text == CONTROL_ON {
+                control_warned = false;
+            }
+            if text == CONTROL_OFF {
+                control_warned = true;
+            }
+            let _ = write_msg(&mut control_send, &HostMsg::Notice(text)).await;
         }
         if let Some(deadline) = share_deadline {
             if state.capturing.load(Ordering::SeqCst) {
@@ -1307,11 +1339,13 @@ async fn host_session(
             }
         }
         let idle = if share_deadline.is_some() { Duration::from_millis(250) } else { Duration::from_secs(20) };
-        let msg = tokio::time::timeout(
-            idle,
-            read_msg::<_, ControlMsg>(&mut control_recv, MAX_CONTROL_FRAME),
-        )
-        .await;
+        let msg = tokio::select! {
+            _ = state.session_wake.notified() => continue,
+            msg = tokio::time::timeout(
+                idle,
+                read_msg::<_, ControlMsg>(&mut control_recv, MAX_CONTROL_FRAME),
+            ) => msg,
+        };
         let msg = match msg {
             Ok(Ok(msg)) => msg,
             Ok(Err(e)) => {
@@ -1332,10 +1366,28 @@ async fn host_session(
             }
         };
         match msg {
-            ControlMsg::Input(event) => forward_input(&cb, &mut adapter, event),
-            ControlMsg::Text { chars } => emit(&cb, &json!({"event":"input","kind":"text","chars": chars})),
+            ControlMsg::Input(event) => {
+                if deliver_control(&state, &mut control_send, &mut control_warned).await {
+                    forward_input(&cb, &mut adapter, event);
+                }
+            }
+            ControlMsg::Text { chars } => {
+                if deliver_control(&state, &mut control_send, &mut control_warned).await {
+                    emit(&cb, &json!({"event":"input","kind":"text","chars": chars}));
+                }
+            }
             ControlMsg::Special(cmd) => {
-                emit(&cb, &json!({"event":"input","kind":"special","which": special_index(cmd)}))
+                if deliver_control(&state, &mut control_send, &mut control_warned).await {
+                    emit(&cb, &json!({"event":"input","kind":"special","which": special_index(cmd)}));
+                }
+            }
+            ControlMsg::Clipboard(clip) => {
+                if matches!(clip.kind, ClipKind::Text) {
+                    let text = String::from_utf8_lossy(&clip.bytes).into_owned();
+                    if !text.is_empty() && deliver_control(&state, &mut control_send, &mut control_warned).await {
+                        emit(&cb, &json!({"event":"input","kind":"text","chars": text}));
+                    }
+                }
             }
             ControlMsg::FrameAck { seq } => {
                 video_out.acked.store(seq, Ordering::SeqCst);
@@ -1387,11 +1439,44 @@ async fn host_session(
             }
         }
     };
+    let stopped_sharing = result.as_ref().err().is_some_and(|e| {
+        let text = e.to_string().to_ascii_lowercase();
+        text.contains("stopped sharing") || text.contains("screen capture stopped")
+    });
+    if stopped_sharing {
+        let _ = write_msg(&mut control_send, &HostMsg::Notice(PHONE_STOPPED.into())).await;
+    }
     video_task.abort();
     *state.video.lock().unwrap() = None;
     let sharing = result.as_ref().err().is_some_and(|e| e.to_string().contains("screen sharing"));
-    connection.close(0u32.into(), if sharing { b"screen sharing not allowed" } else { b"session ended" });
+    let close_reason: &[u8] = if stopped_sharing {
+        PHONE_STOPPED.as_bytes()
+    } else if sharing {
+        b"screen sharing not allowed"
+    } else {
+        b"session ended"
+    };
+    connection.close(0u32.into(), close_reason);
     result
+}
+
+/// Shown on the PC when this phone cannot turn mouse and keyboard into taps.
+const CONTROL_OFF: &str = "Control not enabled on phone";
+/// The accessibility service connected during the session.
+const CONTROL_ON: &str = "Control is on";
+/// The phone ended MediaProjection. The PC session closes on this sentence.
+const PHONE_STOPPED: &str = "The phone stopped sharing";
+
+/// False when the accessibility service is not connected. The PC is told once.
+async fn deliver_control(state: &State, send: &mut quinn::SendStream, warned: &mut bool) -> bool {
+    if state.control_ready.load(Ordering::SeqCst) {
+        return true;
+    }
+    if !*warned {
+        *warned = true;
+        let _ = write_msg(send, &HostMsg::Notice(CONTROL_OFF.into())).await;
+    }
+    false
 }
 
 /// Shown to the controller until MediaProjection is producing frames.
@@ -1605,6 +1690,7 @@ fn special_index(cmd: SpecialCommand) -> u8 {
         SpecialCommand::VolumeUp => 6,
         SpecialCommand::VolumeDown => 7,
         SpecialCommand::Power => 8,
+        SpecialCommand::Notifications => 9,
     }
 }
 
@@ -2154,7 +2240,9 @@ mod tests {
         assert_eq!(special_index(SpecialCommand::CtrlAltDel), 0);
         assert_eq!(special_index(SpecialCommand::Back), 3);
         assert_eq!(special_index(SpecialCommand::Power), 8);
+        assert_eq!(special_index(SpecialCommand::Notifications), 9);
         assert!(matches!(special_from(4), Some(SpecialCommand::Home)));
+        assert!(matches!(special_from(9), Some(SpecialCommand::Notifications)));
     }
 
     /// Save, drop the in-memory host (a process restart), hand the stored secret
@@ -2298,6 +2386,9 @@ mod tests {
             policy: Mutex::new(pjdesk_proto::signal::Policy::default()),
             capture: Mutex::new((1080, 2400)),
             capturing: AtomicBool::new(false),
+            control_ready: AtomicBool::new(false),
+            control_note: Mutex::new(None),
+            session_wake: Notify::new(),
             capture_deny: Mutex::new(String::new()),
             gen: AtomicU64::new(1),
             view_gen: AtomicU64::new(1),

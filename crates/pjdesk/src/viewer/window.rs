@@ -507,13 +507,15 @@ impl App {
             return;
         }
         let (win_w, win_h) = (size.width as usize, size.height as usize);
+        let android_bar = if snap.platform_family == "android" { toolbar::ANDROID_BAR_H as usize } else { 0 };
+        let paint_h = win_h.saturating_sub(android_bar).max(1);
         let Ok(mut buffer) = surface.buffer_mut() else { return };
         let shown = if separate { cropped.as_ref() } else { self.current.as_ref() };
         let origin = self.toolbar.tab_height() as usize;
         let layout = Self::paint_picture(
             &mut buffer,
             win_w,
-            win_h,
+            paint_h,
             shown,
             self.zoom,
             self.pan,
@@ -542,6 +544,18 @@ impl App {
             toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, origin as f32 + 48.0, &waiting, 0xFF_e7_ec_f5);
         }
         Self::paint_overlay(&self.toolbar, &self.toast, &mut buffer, win_w, win_h, display, separate, true);
+        if android_bar > 0 {
+            toolbar::draw_android_bar(&mut buffer, win_w, win_h);
+        }
+        if snap.control_off {
+            toolbar::draw_banner(
+                &mut buffer,
+                win_w,
+                win_h,
+                origin as f32,
+                super::controls::CONTROL_OFF,
+            );
+        }
         self.panel.draw(&mut buffer, win_w, win_h, &snap);
         if snap.restart {
             self.restarting = true;
@@ -1072,6 +1086,7 @@ impl App {
             2 => SpecialCommand::Recents,
             3 => SpecialCommand::VolumeUp,
             4 => SpecialCommand::VolumeDown,
+            6 => SpecialCommand::Notifications,
             _ => SpecialCommand::Power,
         };
         let _ = self.control.send(ControlMsg::Special(cmd));
@@ -1097,12 +1112,25 @@ impl App {
         if !down {
             return;
         }
-        if code == KeyCode::Backspace {
-            let _ = self.control.send(ControlMsg::Text { chars: "\u{8}".into() });
+        if self.modifiers.control_key() && code == KeyCode::KeyV {
+            self.paste_android_clipboard();
             return;
         }
-        if code == KeyCode::Enter {
-            let _ = self.control.send(ControlMsg::Text { chars: "\n".into() });
+        if self.modifiers.control_key() || self.modifiers.alt_key() {
+            return;
+        }
+        let chars = match code {
+            KeyCode::Backspace => "\u{8}",
+            KeyCode::Enter => "\n",
+            KeyCode::Tab => "\t",
+            KeyCode::ArrowLeft => "\u{E000}",
+            KeyCode::ArrowRight => "\u{E001}",
+            KeyCode::ArrowUp => "\u{E002}",
+            KeyCode::ArrowDown => "\u{E003}",
+            _ => "",
+        };
+        if !chars.is_empty() {
+            let _ = self.control.send(ControlMsg::Text { chars: chars.into() });
             return;
         }
         if let Some(text) = &event.text {
@@ -1111,6 +1139,14 @@ impl App {
                 let _ = self.control.send(ControlMsg::Text { chars: text });
             }
         }
+    }
+
+    fn paste_android_clipboard(&mut self) {
+        let Some(text) = crate::clip::get_text() else { return };
+        if text.is_empty() || text.len() > pjdesk_proto::peer::MAX_CLIP_TEXT {
+            return;
+        }
+        let _ = self.control.send(ControlMsg::Text { chars: text });
     }
 }
 
@@ -1762,6 +1798,19 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => self.on_cursor(position),
             WindowEvent::MouseInput { state, button, .. } => {
+                let win_w = self.window.as_ref().map(|w| w.inner_size().width as usize).unwrap_or(0);
+                let win_h = self.window.as_ref().map(|w| w.inner_size().height as usize).unwrap_or(0);
+                if self.remote_is_android() {
+                    if let Some(which) = toolbar::android_bar_hit(self.cursor_px.0, self.cursor_px.1, win_w, win_h) {
+                        if state == ElementState::Pressed {
+                            self.send_android(which);
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                        return;
+                    }
+                }
                 // Clicks on the toolbar (or its open menu) are handled locally.
                 if button == winit::event::MouseButton::Left {
                     let win_w = self.window.as_ref().map(|w| w.inner_size().width as usize).unwrap_or(0);
@@ -1826,6 +1875,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.remote_is_android() {
                     if button == MouseButton::Left {
                         self.on_android_button(state == ElementState::Pressed);
+                    } else if button == MouseButton::Right && state == ElementState::Pressed {
+                        if let Some(point) = self.pointer_norm() {
+                            self.send(pjdesk_proto::gesture::Gesture::long_press(point.0, point.1, 500).to_event());
+                        }
                     }
                 } else {
                     self.send(InputEvent::MouseButton { button, down: state == ElementState::Pressed });

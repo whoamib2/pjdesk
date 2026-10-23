@@ -62,6 +62,20 @@ class PermanentPasswordPersistenceTest {
     }
 
     @Test
+    fun thisPhonesPasswordIsAVaultEntry() {
+        val store = Store(context)
+        assertEquals(0L, store.permanentPublished)
+        assertTrue(store.stampPassword("482636105", "correct horse"))
+        store.permanentPublished = 50
+        val entry = store.vaultEntries().single { it.id == "482636105" }
+        assertEquals("correct horse", entry.password)
+        assertTrue(entry.updated > 0)
+        val again = Store(context)
+        assertEquals(50L, again.permanentPublished)
+        assertEquals("correct horse", again.computerPassword("482636105"))
+    }
+
+    @Test
     fun clearingSurvivesANewEngine() {
         val engine = Engine(context)
         assertTrue(engine.setPermanent("correct horse"))

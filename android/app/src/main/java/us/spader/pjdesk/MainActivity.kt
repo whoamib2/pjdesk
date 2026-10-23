@@ -81,13 +81,14 @@ import us.spader.pjdesk.ui.SetPinScreen
 import us.spader.pjdesk.ui.SignInScreen
 import us.spader.pjdesk.ui.UnlockScreen
 import java.util.UUID
-import us.spader.pjdesk.a11y.PjAccessibilityService
 import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.SavedFilter
 import us.spader.pjdesk.core.SavedSort
 import us.spader.pjdesk.data.SavedListPrefs
 import us.spader.pjdesk.core.nickname
+import us.spader.pjdesk.a11y.PjAccessibilityService
 import us.spader.pjdesk.core.permanentIssue
+import us.spader.pjdesk.service.RemoteControl
 import us.spader.pjdesk.media.ScreenDecoder
 import us.spader.pjdesk.service.HostService
 import us.spader.pjdesk.ui.HomeScreen
@@ -252,6 +253,22 @@ class MainActivity : FragmentActivity() {
                 enrolledFor = ""
                 accountComputers = emptyList()
             }
+            fun publishPermanent(id: String) {
+                val digits = id.filter { it.isDigit() }
+                if (digits.length != 9) return
+                if (!app.store.stampPassword(digits, app.store.permanent)) return
+                app.store.permanentPublished = System.currentTimeMillis() / 1000
+            }
+            fun adoptVaultPermanent(id: String) {
+                val digits = id.filter { it.isDigit() }
+                if (digits.length != 9) return
+                val entry = app.store.vaultEntries().find { it.id == digits } ?: return
+                if (entry.updated <= app.store.permanentPublished) return
+                if (entry.password != app.store.permanent) {
+                    if (!engine.setPermanent(entry.password, quiet = true)) return
+                }
+                app.store.permanentPublished = maxOf(app.store.permanentPublished, entry.updated)
+            }
             fun syncPasswords(upload: Boolean) {
                 val key = app.vaultKey ?: return
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
@@ -267,7 +284,25 @@ class MainActivity : FragmentActivity() {
                         false
                     }
                     if (changed) saved = app.store.saved()
+                    adoptVaultPermanent(state.id)
                 }
+            }
+            fun savePermanent(password: String, confirm: String): Boolean {
+                val issue = permanentIssue(password, confirm)
+                if (issue != null) {
+                    engine.showError(issue)
+                    return false
+                }
+                if (!engine.setPermanent(password.trim())) return false
+                publishPermanent(state.id)
+                syncPasswords(true)
+                return true
+            }
+            fun removePermanent() {
+                if (!engine.setPermanent("")) return
+                engine.setApproval("prompt")
+                publishPermanent(state.id)
+                syncPasswords(true)
             }
             fun rememberAccountServer(address: String, fingerprint: String, lan: List<String>, publicIp: String) {
                 if (address.isBlank()) return
@@ -620,6 +655,44 @@ class MainActivity : FragmentActivity() {
                 }
             }
             var showPermanent by remember { mutableStateOf(false) }
+            var controlEnabled by remember { mutableStateOf(PjAccessibilityService.enabled(this@MainActivity)) }
+            var controlBound by remember { mutableStateOf(RemoteControl.service != null) }
+            var controlDismissed by remember { mutableStateOf(false) }
+            LaunchedEffect(Unit) {
+                while (true) {
+                    val enabled = PjAccessibilityService.enabled(this@MainActivity)
+                    val bound = RemoteControl.service != null
+                    controlEnabled = enabled
+                    controlBound = bound
+                    engine.setControl(enabled && bound)
+                    kotlinx.coroutines.delay(1_500)
+                }
+            }
+            LaunchedEffect(state.hosting) {
+                if (!state.hosting) controlDismissed = false
+            }
+            LaunchedEffect(state.id, account, uiUnlocked) {
+                val digits = state.id.filter { it.isDigit() }
+                if (digits.length != 9 || app.store.permanentPublished != 0L) return@LaunchedEffect
+                if (app.store.permanent.isEmpty()) return@LaunchedEffect
+                if (temporarySession) return@LaunchedEffect
+                val key = app.vaultKey
+                if (account.isNotBlank() && key == null) return@LaunchedEffect
+                val refresh = app.store.networkRefresh()
+                val device = app.store.networkDeviceId
+                if (key != null && refresh.isNotBlank() && device.isNotBlank()) {
+                    val changed = withContext(Dispatchers.IO) {
+                        runCatching { PasswordSync.pull(app.store, key, refresh, device, false) }.getOrDefault(false)
+                    }
+                    if (changed) saved = app.store.saved()
+                    adoptVaultPermanent(digits)
+                    if (app.store.permanentPublished != 0L) return@LaunchedEffect
+                }
+                if (app.store.computerPassword(digits).isNotEmpty()) return@LaunchedEffect
+                if (app.store.permanent.isEmpty()) return@LaunchedEffect
+                publishPermanent(digits)
+                syncPasswords(true)
+            }
             DisposableEffect(Unit) {
                 val cm = getSystemService(ConnectivityManager::class.java)
                 val callback = object : ConnectivityManager.NetworkCallback() {
@@ -1345,19 +1418,11 @@ class MainActivity : FragmentActivity() {
                                     onStop = { HostService.stop(this@MainActivity) },
                                     showPermanent = showPermanent,
                                     onShowPermanent = { showPermanent = it },
-                                    onSavePermanent = { password, confirm ->
-                                        val issue = permanentIssue(password, confirm)
-                                        if (issue != null) {
-                                            engine.showError(issue)
-                                            false
-                                        } else {
-                                            engine.setPermanent(password.trim())
-                                        }
-                                    },
-                                    onClearPermanent = {
-                                        engine.setPermanent("")
-                                        engine.setApproval("prompt")
-                                    },
+                                    onSavePermanent = { password, confirm -> savePermanent(password, confirm) },
+                                    onClearPermanent = { removePermanent() },
+                                    controlEnabled = controlEnabled,
+                                    controlBound = controlBound,
+                                    onOpenControl = { PjAccessibilityService.openSettings(this@MainActivity) },
                                     onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
                                     onSignIn = if (account.isEmpty() && state.server.isNotEmpty()) {
                                         { signingIn = true }
@@ -1433,19 +1498,11 @@ class MainActivity : FragmentActivity() {
                                     },
                                     onServer = engine::setServer,
                                     onResetFingerprint = engine::resetFingerprint,
-                                    onSavePermanent = { password, confirm ->
-                                        val issue = permanentIssue(password, confirm)
-                                        if (issue != null) {
-                                            engine.showError(issue)
-                                            false
-                                        } else {
-                                            engine.setPermanent(password.trim())
-                                        }
-                                    },
-                                    onClearPermanent = {
-                                        engine.setPermanent("")
-                                        engine.setApproval("prompt")
-                                    },
+                                    onSavePermanent = { password, confirm -> savePermanent(password, confirm) },
+                                    onClearPermanent = { removePermanent() },
+                                    controlEnabled = controlEnabled,
+                                    controlBound = controlBound,
+                                    onOpenControl = { PjAccessibilityService.openSettings(this@MainActivity) },
                                     onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
                                     trustedAccounts = trustedAccounts,
                                     trustedComputers = trustedComputers,
@@ -1559,6 +1616,26 @@ class MainActivity : FragmentActivity() {
                             }
                         }
                     }
+                }
+                if (state.hosting && !(controlEnabled && controlBound) && !controlDismissed) {
+                    AlertDialog(
+                        onDismissRequest = { controlDismissed = true },
+                        title = { Text("Control not enabled on phone") },
+                        text = {
+                            Text(
+                                "A computer can see this phone, but it cannot tap, type, or use Back, Home, and the other buttons until PJDesk is turned on in Accessibility. ${us.spader.pjdesk.core.controlStatus(controlEnabled, controlBound)}",
+                            )
+                        },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                controlDismissed = true
+                                PjAccessibilityService.openSettings(this@MainActivity)
+                            }) { Text("Open Accessibility") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { controlDismissed = true }) { Text("Not now") }
+                        },
+                    )
                 }
                 if (tempWarn && temporarySession) {
                     AlertDialog(

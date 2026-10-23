@@ -78,6 +78,8 @@ pub struct Live {
     pub recording: bool,
     pub restart: bool,
     pub closed: Option<String>,
+    /// The phone's accessibility service is off, so clicks do not land.
+    pub control_off: bool,
     paths: HashMap<u64, PathBuf>,
     wanted: HashSet<String>,
     next_id: u64,
@@ -108,6 +110,7 @@ impl Live {
             recording: false,
             restart: false,
             closed: None,
+            control_off: false,
             paths: HashMap::new(),
             wanted: HashSet::new(),
             next_id: 1,
@@ -148,6 +151,7 @@ impl Live {
             recording: self.recording,
             restart: self.restart,
             closed: self.closed.clone(),
+            control_off: self.control_off,
             paths: HashMap::new(),
             wanted: HashSet::new(),
             next_id: 0,
@@ -286,7 +290,7 @@ async fn run_loop(
                         .close_reason()
                         .map(|e| e.to_string())
                         .unwrap_or_else(|| "the connection ended".into());
-                    let text = format!("Session stopped: {why}");
+                    let text = session_end_message(&why);
                     tracing::error!("{text}");
                     crate::note_failure(&text);
                     g.closed = Some(text);
@@ -354,7 +358,15 @@ fn on_host(
         }
         HostMsg::Notice(text) => {
             tracing::info!("Host says: {text}");
-            if screen_share_failure_text(&text) {
+            if text == CONTROL_OFF {
+                g.control_off = true;
+                crate::note_status(&text);
+                g.note(text);
+            } else if text == CONTROL_ON {
+                g.control_off = false;
+                crate::note_status(&text);
+                g.note(text);
+            } else if screen_share_failure_text(&text) || phone_stopped_sharing(&text) {
                 crate::note_failure(&text);
                 g.closed = Some(text);
             } else if screen_share_waiting(&text) {
@@ -737,6 +749,27 @@ async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &
     Ok(())
 }
 
+/// The phone's accessibility service is not connected.
+pub(crate) const CONTROL_OFF: &str = "Control not enabled on phone";
+/// The accessibility service connected while the session was open.
+pub(crate) const CONTROL_ON: &str = "Control is on";
+
+/// The phone ended screen sharing. The session closes on this sentence.
+pub(crate) fn phone_stopped_sharing(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("stopped sharing")
+}
+
+/// A connection close from the phone, as a sentence on the PC.
+pub(crate) fn session_end_message(why: &str) -> String {
+    if phone_stopped_sharing(why) {
+        "The phone stopped sharing".into()
+    } else if screen_share_failure_text(why) {
+        why.to_string()
+    } else {
+        format!("Session stopped: {why}")
+    }
+}
+
 /// The phone asked the person to allow screen sharing. Keep waiting.
 pub(crate) fn screen_share_waiting(text: &str) -> bool {
     text.to_ascii_lowercase().contains("allow screen sharing")
@@ -998,6 +1031,9 @@ mod tests {
         let denied = "screen sharing not allowed on the phone: Screen capture permission denied".to_string();
         assert_eq!(picture_gave_up("Pixel", &[denied.clone()]), denied);
         assert!(picture_gave_up("Pixel", &[]).contains("No picture arrived from Pixel"));
+        assert!(phone_stopped_sharing("The phone stopped sharing"));
+        assert_eq!(session_end_message("The phone stopped sharing"), "The phone stopped sharing");
+        assert_eq!(CONTROL_OFF, "Control not enabled on phone");
     }
 
     /// The window thread calls `start` after `block_on` has returned, so there

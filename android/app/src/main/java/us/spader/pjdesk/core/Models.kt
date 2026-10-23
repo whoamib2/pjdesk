@@ -96,6 +96,24 @@ fun SavedComputer.nickname(): String {
 fun permanentOk(password: String): Boolean =
     password.trim().codePointCount(0, password.trim().length) >= 8
 
+/** Length hint for the permanent-password dialog. The rule is still 8 characters. */
+fun permanentHint(password: String): String {
+    val count = password.trim().codePointCount(0, password.trim().length)
+    return when {
+        count == 0 -> "At least 8 characters. This is not your PJDesk account password."
+        count < 8 -> "Use at least 8 characters."
+        count < 12 -> "Long enough. A longer password is harder to guess."
+        else -> "That is a strong length."
+    }
+}
+
+/** What Settings and the home banner say about remote control. */
+fun controlStatus(enabled: Boolean, bound: Boolean): String = when {
+    enabled && bound -> "On. A computer can tap, type, and use the buttons."
+    enabled -> "Listed in Accessibility, but not running. Turn PJDesk off and on again."
+    else -> "Off. Open Accessibility and turn PJDesk on."
+}
+
 /** Empty when the password can be saved. Same 8-character rule as Windows. */
 fun permanentIssue(password: String, confirm: String): String? {
     val pw = password.trim()

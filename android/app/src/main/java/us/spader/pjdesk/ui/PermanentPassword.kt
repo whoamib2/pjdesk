@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -24,49 +25,115 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import us.spader.pjdesk.core.permanentHint
 import us.spader.pjdesk.core.permanentIssue
 
 /**
- * Permanent password, with a confirm field and Show/Hide on both.
+ * Status, Set or Change, and Remove. The password itself is typed in a dialog.
  * The one-time password on the home screen keeps working either way.
  */
 @Composable
-fun PermanentPasswordForm(
+fun PermanentPasswordSection(
     hasPermanent: Boolean,
     onSave: (password: String, confirm: String) -> Boolean,
-    onClear: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    var open by rememberSaveable { mutableStateOf(false) }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Permanent password", style = MaterialTheme.typography.titleMedium)
+        Text(
+            if (hasPermanent) "A permanent password is set." else "No permanent password is set.",
+            color = pjMuted(),
+        )
+        Text(
+            "At least 8 characters, the same rule as Windows. It is not your PJDesk account password. Saved computers on your account can use it to connect.",
+            color = pjMuted(),
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { open = true }) {
+                Text(if (hasPermanent) "Change" else "Set")
+            }
+            if (hasPermanent) {
+                TextButton(onClick = onRemove) { Text("Remove") }
+            }
+        }
+    }
+    if (open) {
+        PermanentPasswordDialog(
+            hasPermanent = hasPermanent,
+            onDismiss = { open = false },
+            onSave = { password, confirm ->
+                if (onSave(password, confirm)) {
+                    open = false
+                    true
+                } else {
+                    false
+                }
+            },
+            onRemove = {
+                onRemove()
+                open = false
+            },
+        )
+    }
+}
+
+@Composable
+internal fun PermanentPasswordFields(
+    password: String,
+    onPassword: (String) -> Unit,
+    confirm: String,
+    onConfirm: (String) -> Unit,
+    issue: String?,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SecretField(value = password, onValueChange = onPassword, label = "Password")
+        Text(permanentHint(password), color = pjMuted(), style = MaterialTheme.typography.bodySmall)
+        SecretField(value = confirm, onValueChange = onConfirm, label = "Confirm password")
+        if (issue != null) {
+            Text(issue, color = MaterialTheme.colorScheme.error)
+        }
+    }
+}
+
+@Composable
+private fun PermanentPasswordDialog(
+    hasPermanent: Boolean,
+    onDismiss: () -> Unit,
+    onSave: (password: String, confirm: String) -> Boolean,
+    onRemove: () -> Unit,
 ) {
     var password by rememberSaveable { mutableStateOf("") }
     var confirm by rememberSaveable { mutableStateOf("") }
     val issue = if (password.isEmpty() && confirm.isEmpty()) null else permanentIssue(password, confirm)
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-            "A permanent password lets you leave this phone unattended. It has to be at least 8 characters, the same rule as Windows.",
-            color = pjMuted(),
-        )
-        SecretField(value = password, onValueChange = { password = it }, label = "Permanent password")
-        SecretField(value = confirm, onValueChange = { confirm = it }, label = "Confirm password")
-        if (issue != null) {
-            Text(issue, color = MaterialTheme.colorScheme.error)
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(
-                onClick = {
-                    if (onSave(password, confirm)) {
-                        password = ""
-                        confirm = ""
-                    }
-                },
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (hasPermanent) "Change permanent password" else "Set permanent password") },
+        text = {
+            PermanentPasswordFields(
+                password = password,
+                onPassword = { password = it },
+                confirm = confirm,
+                onConfirm = { confirm = it },
+                issue = issue,
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onSave(password, confirm) },
                 enabled = issue == null && password.isNotEmpty(),
             ) { Text("Save") }
-            TextButton(onClick = {
-                password = ""
-                confirm = ""
-                onClear()
-            }) { Text("Clear") }
-        }
-        Text(if (hasPermanent) "A permanent password is set." else "No permanent password.", color = pjMuted())
-    }
+        },
+        dismissButton = {
+            Row {
+                if (hasPermanent) {
+                    TextButton(onClick = onRemove) { Text("Remove") }
+                }
+                TextButton(onClick = onDismiss) { Text("Cancel") }
+            }
+        },
+    )
 }
 
 /**

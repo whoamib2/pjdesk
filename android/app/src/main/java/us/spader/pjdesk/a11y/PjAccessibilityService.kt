@@ -2,13 +2,16 @@ package us.spader.pjdesk.a11y
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.accessibilityservice.GestureDescription
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.media.AudioManager
 import android.provider.Settings
 import android.view.accessibility.AccessibilityEvent
 import org.json.JSONObject
 import us.spader.pjdesk.AppLog
+import us.spader.pjdesk.PjApp
 import us.spader.pjdesk.service.RemoteControl
 import us.spader.pjdesk.service.gestureDescription
 import us.spader.pjdesk.service.screenSize
@@ -22,10 +25,12 @@ class PjAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         RemoteControl.service = this
         dropAccessibilityButton()
+        (application as? PjApp)?.engine?.setControl(true)
     }
 
     override fun onDestroy() {
         if (RemoteControl.service === this) RemoteControl.service = null
+        (application as? PjApp)?.engine?.setControl(false)
         super.onDestroy()
     }
 
@@ -35,8 +40,20 @@ class PjAccessibilityService : AccessibilityService() {
 
     fun gesture(event: JSONObject) {
         val (w, h) = screenSize(this)
-        val description = gestureDescription(event, w, h) ?: return
-        dispatchGesture(description, null, null)
+        val description = gestureDescription(event, w, h) ?: run {
+            AppLog.i("gesture ignored")
+            return
+        }
+        val sent = dispatchGesture(
+            description,
+            object : GestureResultCallback() {
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    AppLog.i("gesture cancelled")
+                }
+            },
+            null,
+        )
+        if (!sent) AppLog.i("gesture was not dispatched")
     }
 
     fun injectText(chars: String) {
@@ -55,6 +72,7 @@ class PjAccessibilityService : AccessibilityService() {
             } else {
                 performGlobalAction(GLOBAL_ACTION_POWER_DIALOG)
             }
+            9 -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
         }
     }
 
@@ -96,6 +114,14 @@ class PjAccessibilityService : AccessibilityService() {
             val raw = Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
                 ?: return false
             return raw.split(':').any { ComponentName.unflattenFromString(it) == expected }
+        }
+
+        /** Enabled in Settings and connected, so taps and typing can be delivered. */
+        fun ready(context: Context): Boolean = enabled(context) && RemoteControl.service != null
+
+        fun openSettings(context: Context) {
+            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            runCatching { context.startActivity(intent) }
         }
     }
 }

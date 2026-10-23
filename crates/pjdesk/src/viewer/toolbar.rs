@@ -171,7 +171,56 @@ const ANDROID_ITEMS: &[(&str, Action)] = &[
     ("Volume up", Action::Android(3)),
     ("Volume down", Action::Android(4)),
     ("Power", Action::Android(5)),
+    ("Notifications", Action::Android(6)),
 ];
+
+/// Always-visible controls along the bottom of an Android session.
+/// The number is the index [`crate::viewer::window`] sends as a special key.
+pub const ANDROID_BAR_H: f32 = 56.0;
+
+const ANDROID_BAR: &[(&str, u8)] = &[
+    ("Back", 0),
+    ("Home", 1),
+    ("Recents", 2),
+    ("Notify", 6),
+    ("Lock", 5),
+    ("Vol+", 3),
+    ("Vol-", 4),
+];
+
+/// Which Android button a click landed on. `None` when the point is above the bar.
+pub fn android_bar_hit(x: f64, y: f64, win_w: usize, win_h: usize) -> Option<u8> {
+    if win_w == 0 || win_h == 0 || y < win_h as f64 - ANDROID_BAR_H as f64 || y > win_h as f64 || x < 0.0 {
+        return None;
+    }
+    let slot = win_w as f64 / ANDROID_BAR.len() as f64;
+    if slot < 1.0 {
+        return None;
+    }
+    let index = (x / slot).floor() as usize;
+    ANDROID_BAR.get(index).map(|(_, which)| *which)
+}
+
+pub(crate) fn draw_android_bar(buf: &mut [u32], win_w: usize, win_h: usize) {
+    if win_w == 0 || win_h == 0 {
+        return;
+    }
+    let top = win_h as f32 - ANDROID_BAR_H;
+    fill_rect(buf, win_w, win_h, 0.0, top, win_w as f32, ANDROID_BAR_H, 0xF0_10_13_18);
+    fill_rect(buf, win_w, win_h, 0.0, top, win_w as f32, 1.0, 0xFF_2e_36_44);
+    let slot = win_w as f32 / ANDROID_BAR.len() as f32;
+    for (i, (label, _)) in ANDROID_BAR.iter().enumerate() {
+        let x = i as f32 * slot;
+        fill_rect(buf, win_w, win_h, x + 4.0, top + 8.0, (slot - 8.0).max(4.0), ANDROID_BAR_H - 16.0, 0xFF_22_28_33);
+        let tw = text_width(label);
+        draw_text(buf, win_w, win_h, x + (slot - tw) / 2.0, top + 20.0, label, 0xFF_e9_ed_f3);
+    }
+}
+
+pub(crate) fn draw_banner(buf: &mut [u32], win_w: usize, win_h: usize, y: f32, text: &str) {
+    fill_rect(buf, win_w, win_h, 0.0, y, win_w as f32, 36.0, 0xF0_3a_18_18);
+    draw_text(buf, win_w, win_h, 16.0, y + 10.0, text, 0xFF_ff_d0_c8);
+}
 
 pub struct Toolbar {
     buttons: Vec<Button>,
@@ -1370,5 +1419,18 @@ mod tests {
         bar.draw_tabs(&mut buf, w, h);
         assert!(buf.contains(&0xFF_2f_6f_ed), "light accent underline");
         assert!(buf.contains(&0xFF_f3_f5_f8), "light strip");
+    }
+
+    #[test]
+    fn android_bar_hits_the_bottom_buttons() {
+        assert_eq!(android_bar_hit(10.0, 343.0, 700, 400), None);
+        assert_eq!(android_bar_hit(10.0, 344.0, 700, 400), Some(0));
+        assert_eq!(android_bar_hit(150.0, 360.0, 700, 400), Some(1));
+        assert_eq!(android_bar_hit(250.0, 360.0, 700, 400), Some(2));
+        assert_eq!(android_bar_hit(350.0, 360.0, 700, 400), Some(6));
+        assert_eq!(android_bar_hit(450.0, 360.0, 700, 400), Some(5));
+        assert_eq!(android_bar_hit(550.0, 360.0, 700, 400), Some(3));
+        assert_eq!(android_bar_hit(650.0, 360.0, 700, 400), Some(4));
+        assert_eq!(android_bar_hit(-1.0, 360.0, 700, 400), None);
     }
 }

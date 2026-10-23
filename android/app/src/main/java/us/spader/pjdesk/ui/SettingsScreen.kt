@@ -26,6 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.DeskState
+import us.spader.pjdesk.core.controlStatus
 
 @Composable
 fun SettingsScreen(
@@ -36,6 +37,9 @@ fun SettingsScreen(
     onResetFingerprint: () -> Unit,
     onSavePermanent: (String, String) -> Boolean = { _, _ -> false },
     onClearPermanent: () -> Unit = {},
+    controlEnabled: Boolean = false,
+    controlBound: Boolean = false,
+    onOpenControl: () -> Unit = {},
     onUnattended: (Boolean) -> Unit = {},
     trustedAccounts: List<String> = emptyList(),
     trustedComputers: List<String> = emptyList(),
@@ -147,12 +151,15 @@ fun SettingsScreen(
             )
             TextButton(onClick = onResetFingerprint) { Text("Forget pinned key") }
         }
+        Section("Control") {
+            Text(controlStatus(controlEnabled, controlBound))
+            Button(onClick = onOpenControl, modifier = Modifier.fillMaxWidth()) { Text("Open Accessibility") }
+        }
         Section("Security") {
-            Text("Set permanent password", style = MaterialTheme.typography.titleMedium)
-            PermanentPasswordForm(
+            PermanentPasswordSection(
                 hasPermanent = state.hasPermanent,
                 onSave = onSavePermanent,
-                onClear = onClearPermanent,
+                onRemove = onClearPermanent,
             )
             WhenSomeoneConnects(
                 hasPermanent = state.hasPermanent,
@@ -231,7 +238,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.14", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.15", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }

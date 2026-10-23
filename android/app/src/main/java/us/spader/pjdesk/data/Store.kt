@@ -123,6 +123,14 @@ class Store(context: Context) {
      */
     fun savePermanent(password: String): Boolean = secret.write(password)
 
+    /**
+     * Seconds when this phone last published its permanent password into the account vault.
+     * A newer vault entry for this phone's own id can replace the local password.
+     */
+    var permanentPublished: Long
+        get() = prefs.getLong("permanentPublished", 0L)
+        set(value) { prefs.edit().putLong("permanentPublished", value).commit() }
+
     var approval: String
         get() = prefs.getString("approval", "prompt") ?: "prompt"
         set(value) { prefs.edit().putString("approval", value).commit() }

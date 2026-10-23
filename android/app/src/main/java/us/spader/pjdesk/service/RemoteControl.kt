@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityNodeInfo
 import org.json.JSONObject
+import us.spader.pjdesk.a11y.FieldEdit
 import us.spader.pjdesk.a11y.PjAccessibilityService
 import us.spader.pjdesk.input.GestureMap
 
@@ -21,13 +22,15 @@ object RemoteControl {
     @Volatile
     var service: PjAccessibilityService? = null
 
-    fun handle(event: JSONObject) {
-        val svc = service ?: return
+    /** False when the accessibility service is not bound, so the PC can be told. */
+    fun handle(event: JSONObject): Boolean {
+        val svc = service ?: return false
         when (event.optString("kind")) {
             "text" -> svc.injectText(event.optString("chars"))
             "special" -> svc.special(event.optInt("which"))
             "gesture" -> svc.gesture(event)
         }
+        return true
     }
 }
 
@@ -93,23 +96,63 @@ fun gestureDescription(event: JSONObject, width: Int, height: Int): GestureDescr
 }
 
 fun setFocusedText(root: AccessibilityNodeInfo?, chars: String): Boolean {
-    val node = root?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
-    val current = node.text?.toString() ?: ""
-    val next = when {
-        chars == "\u0008" -> current.dropLast(1)
-        chars == "\n" -> {
-            // ACTION_IME_ENTER is 0x00200002. A field that does not handle it
-            // gets a newline instead.
-            if (!node.performAction(0x00200002)) {
-                val args = Bundle()
-                args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, current + "\n")
-                node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-            }
-            return true
-        }
-        else -> current + chars
+    if (root == null || chars.isEmpty()) return false
+    if (chars == FieldEdit.TAB) return focusNextEditable(root)
+    val node = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        ?: firstEditable(root)?.also { it.performAction(AccessibilityNodeInfo.ACTION_FOCUS) }
+        ?: return false
+    // ACTION_IME_ENTER is 0x00200002. A field that does not handle it gets a newline.
+    if (chars == FieldEdit.ENTER && node.performAction(0x00200002)) return true
+    val text = node.text?.toString().orEmpty()
+    val start = node.textSelectionStart.takeIf { it >= 0 } ?: text.length
+    val end = node.textSelectionEnd.takeIf { it >= 0 } ?: text.length
+    val outcome = if (chars == FieldEdit.ENTER) {
+        FieldEdit.insert(text, start, end, "\n")
+    } else {
+        FieldEdit.apply(text, start, end, chars)
     }
+    return when (outcome) {
+        FieldEdit.Outcome.Tab -> focusNextEditable(root)
+        FieldEdit.Outcome.Enter -> false
+        is FieldEdit.Outcome.Replace -> writeText(node, outcome)
+    }
+}
+
+private fun writeText(node: AccessibilityNodeInfo, outcome: FieldEdit.Outcome.Replace): Boolean {
     val args = Bundle()
-    args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, next)
-    return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, outcome.text)
+    val wrote = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    val cursor = outcome.cursor.coerceIn(0, outcome.text.length)
+    val sel = Bundle()
+    sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, cursor)
+    sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, cursor)
+    node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, sel)
+    return wrote
+}
+
+private fun firstEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? =
+    editableNodes(root).firstOrNull()
+
+private fun focusNextEditable(root: AccessibilityNodeInfo): Boolean {
+    val nodes = editableNodes(root)
+    if (nodes.isEmpty()) return false
+    val current = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+    val index = if (current == null) -1 else nodes.indexOfFirst { it == current }
+    val next = if (index < 0) nodes.first() else nodes[(index + 1) % nodes.size]
+    return next.performAction(AccessibilityNodeInfo.ACTION_FOCUS) ||
+        next.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+}
+
+private fun editableNodes(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
+    val out = ArrayList<AccessibilityNodeInfo>()
+    val stack = ArrayDeque<AccessibilityNodeInfo>()
+    stack.add(root)
+    while (stack.isNotEmpty()) {
+        val node = stack.removeFirst()
+        if (node.isVisibleToUser && node.isEditable) out.add(node)
+        for (i in 0 until node.childCount) {
+            node.getChild(i)?.let { stack.add(it) }
+        }
+    }
+    return out
 }

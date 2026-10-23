@@ -45,7 +45,7 @@ class HostService : Service() {
         when (intent?.action) {
             ACTION_STOP -> {
                 AppLog.i("host service stop")
-                (application as PjApp).engine.stop()
+                (application as PjApp).engine.stop("The phone stopped sharing")
                 releaseCapture()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -61,7 +61,12 @@ class HostService : Service() {
                 controlledBy = ""
                 show(controlled = false, projection != null)
             }
-            ACTION_RELEASE -> releaseCapture()
+            ACTION_RELEASE -> {
+                controlled = false
+                controlledBy = ""
+                releaseCapture()
+                show(controlled = false, capturing = false)
+            }
             ACTION_CAPTURE -> {
                 val code = intent.getIntExtra(EXTRA_CODE, 0)
                 val data = intent.dataExtra()
@@ -125,11 +130,11 @@ class HostService : Service() {
                 if (generation != mine) return
                 generation++
                 AppLog.i("MediaProjection stopped")
-                releaseCapture()
+                forgetProjection()
                 if (reported) {
                     val engine = (application as PjApp).engine
-                    engine.showError("Screen capture stopped")
-                    engine.stop("Screen capture stopped")
+                    engine.showStatus("The phone stopped sharing")
+                    engine.stop("The phone stopped sharing")
                 } else {
                     fail("Screen capture stopped")
                 }
@@ -282,13 +287,19 @@ class HostService : Service() {
     }
 
     private fun releaseCapture() {
-        val enc = encoder
+        generation++
         val token = projection
+        forgetProjection()
+        runCatching { token?.stop() }
+    }
+
+    /** Drops the encoder without stopping the token. onStop is already running in that case. */
+    private fun forgetProjection() {
+        val enc = encoder
         encoder = null
         projection = null
         syncCapture(false)
         runCatching { enc?.stop() }
-        runCatching { token?.stop() }
     }
 
     private fun Intent.dataExtra(): Intent? {

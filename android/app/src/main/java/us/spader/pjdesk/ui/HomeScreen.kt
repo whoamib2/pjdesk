@@ -34,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.DeskState
 import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.computerTitle
+import us.spader.pjdesk.core.controlStatus
 
 @Composable
 fun HomeScreen(
@@ -57,6 +58,9 @@ fun HomeScreen(
     temporary: Boolean = false,
     recent: List<SavedComputer> = emptyList(),
     onRecent: (String) -> Unit = {},
+    controlEnabled: Boolean = true,
+    controlBound: Boolean = true,
+    onOpenControl: () -> Unit = {},
 ) {
     var showPassword by rememberSaveable { mutableStateOf(false) }
     val starting = state.status.startsWith("Starting PJDesk") ||
@@ -93,6 +97,10 @@ fun HomeScreen(
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Someone is viewing this phone.", Modifier.weight(1f), color = pjMuted())
                 OutlinedButton(onClick = onStop) { Text("Stop") }
+            }
+            if (!(controlEnabled && controlBound)) {
+                Text(controlStatus(controlEnabled, controlBound), color = MaterialTheme.colorScheme.error)
+                OutlinedButton(onClick = onOpenControl) { Text("Open Accessibility") }
             }
         }
         Card(Modifier.fillMaxWidth()) {

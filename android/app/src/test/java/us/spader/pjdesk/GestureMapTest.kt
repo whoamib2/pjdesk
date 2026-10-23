@@ -189,5 +189,24 @@ class GestureMapTest {
         assertEquals("Use at least 8 characters.", us.spader.pjdesk.core.permanentIssue("short", "short"))
         assertEquals("Those passwords do not match.", us.spader.pjdesk.core.permanentIssue("12345678", "12345679"))
         assertNull(us.spader.pjdesk.core.permanentIssue("12345678", "12345678"))
+        assertEquals(
+            "At least 8 characters. This is not your PJDesk account password.",
+            us.spader.pjdesk.core.permanentHint(""),
+        )
+        assertEquals("Use at least 8 characters.", us.spader.pjdesk.core.permanentHint("short"))
+        assertEquals("Long enough. A longer password is harder to guess.", us.spader.pjdesk.core.permanentHint("12345678"))
+        assertEquals("That is a strong length.", us.spader.pjdesk.core.permanentHint("123456789012"))
+        assertEquals(
+            "Off. Open Accessibility and turn PJDesk on.",
+            us.spader.pjdesk.core.controlStatus(false, false),
+        )
+        assertEquals(
+            "Listed in Accessibility, but not running. Turn PJDesk off and on again.",
+            us.spader.pjdesk.core.controlStatus(true, false),
+        )
+        assertEquals(
+            "On. A computer can tap, type, and use the buttons.",
+            us.spader.pjdesk.core.controlStatus(true, true),
+        )
     }
 }
