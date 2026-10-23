@@ -2052,7 +2052,7 @@ fn raise_consent(ctx: &egui::Context, id: u64) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     #[cfg(windows)]
     unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::MessageBeep(windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK);
+        let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK);
     }
 }
 

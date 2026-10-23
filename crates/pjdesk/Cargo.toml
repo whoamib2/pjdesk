@@ -53,6 +53,7 @@ ui-shots = ["dep:egui_kittest"]
 version = "0.62"
 features = [
     "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
