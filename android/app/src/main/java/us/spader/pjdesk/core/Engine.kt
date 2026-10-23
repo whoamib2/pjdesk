@@ -29,7 +29,11 @@ data class EngineReadiness(val phase: EnginePhase, val detail: String)
 
 class Engine(context: Context) : EngineListener {
     private val app = context.applicationContext
-    private val store = Store(app)
+    private val store = Store(app).also { saved ->
+        if (saved.migrateUnattendedAccess()) {
+            AppLog.i("migrated When someone connects to unattended access")
+        }
+    }
     private val main = Handler(Looper.getMainLooper())
     private val handle = AtomicLong(0)
     private val startOnce = AtomicBoolean(false)
@@ -43,7 +47,7 @@ class Engine(context: Context) : EngineListener {
         DeskState(
             approval = store.approval,
             hasPermanent = store.permanent.isNotEmpty(),
-            unattendedAccess = store.unattendedAccess && store.permanent.isNotEmpty(),
+            unattendedAccess = store.unattendedAccess,
         ),
     )
     val state: StateFlow<DeskState> = _state.asStateFlow()
@@ -87,7 +91,7 @@ class Engine(context: Context) : EngineListener {
                 )
                 pushPermanent()
                 command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
-                setUnattendedAccess(store.unattendedAccess)
+                syncUnattendedAccess()
                 pushTrusted()
                 setCapturing(us.spader.pjdesk.service.HostService.capturing)
                 setControl(us.spader.pjdesk.a11y.PjAccessibilityService.ready(app))
@@ -440,14 +444,26 @@ class Engine(context: Context) : EngineListener {
 
     /**
      * Unattended access accepts a permanent-password or trusted session and then
-     * the system screen-share dialog. It stays off without a permanent password
-     * and without the accessibility service.
+     * the system screen-share dialog. Turning it on still requires a permanent
+     * password and the accessibility service. That check is not repeated at
+     * startup: a process start must not write the saved choice back to off.
      */
     fun setUnattendedAccess(on: Boolean) {
         val allowed = on && store.permanent.isNotEmpty() && PjAccessibilityService.enabled(app)
         store.unattendedAccess = allowed
         update { it.copy(unattendedAccess = allowed) }
         command(org.json.JSONObject().put("cmd", "setUnattendedAccess").put("on", allowed).toString())
+    }
+
+    /**
+     * Tells the running host the saved switch. Does not write the preference.
+     * A session start decides whether auto-accept can run.
+     */
+    internal fun syncUnattendedAccess() {
+        val saved = store.unattendedAccess
+        update { it.copy(unattendedAccess = saved) }
+        command(JSONObject().put("cmd", "setUnattendedAccess").put("on", saved).put("sync", true).toString())
+        AppLog.i("unattended access saved=$saved; startup did not rewrite it")
     }
 
     fun setApproval(mode: String) {
@@ -617,7 +633,18 @@ class Engine(context: Context) : EngineListener {
                 }
             }
             "needCapture" -> {
-                val auto = event.optBoolean("auto") && store.unattendedAccess
+                val saved = store.unattendedAccess
+                val passwordReady = store.permanent.isNotEmpty()
+                val accessibilityReady = PjAccessibilityService.ready(app)
+                val requested = event.optBoolean("auto") && saved
+                val auto = requested && passwordReady && accessibilityReady
+                if (requested && !auto) {
+                    AppLog.i(
+                        "unattended access is saved but not ready (password=$passwordReady accessibility=$accessibilityReady); showing the screen share prompt",
+                    )
+                } else if (auto) {
+                    AppLog.i("unattended access will accept the screen share dialog")
+                }
                 if (us.spader.pjdesk.service.HostService.capturing) {
                     if (auto) us.spader.pjdesk.a11y.ProjectionConsent.markAlreadySharing()
                     setCapturing(true)

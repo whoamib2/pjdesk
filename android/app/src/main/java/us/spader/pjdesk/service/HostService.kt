@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.WindowManager
@@ -42,6 +43,7 @@ class HostService : Service() {
     private var generation = 0
     private var reported = false
     private val main = Handler(Looper.getMainLooper())
+    private var wake: PowerManager.WakeLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -51,6 +53,7 @@ class HostService : Service() {
                 AppLog.i("host service stop")
                 (application as PjApp).engine.stop("The phone stopped sharing")
                 releaseCapture()
+                dropWake("stop")
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
@@ -59,18 +62,21 @@ class HostService : Service() {
                 controlled = true
                 controlledBy = intent.getStringExtra(EXTRA_WHO).orEmpty()
                 automatic = intent.getBooleanExtra(EXTRA_AUTOMATIC, false)
+                holdWake("session")
                 show(controlled = true, projection != null)
             }
             ACTION_IDLE -> {
                 controlled = false
                 controlledBy = ""
                 automatic = false
+                if (projection == null) dropWake("idle")
                 show(controlled = false, projection != null)
             }
             ACTION_RELEASE -> {
                 controlled = false
                 controlledBy = ""
                 releaseCapture()
+                dropWake("release")
                 show(controlled = false, capturing = false)
             }
             ACTION_CAPTURE -> {
@@ -85,6 +91,7 @@ class HostService : Service() {
 
     override fun onDestroy() {
         releaseCapture()
+        dropWake("destroy")
         super.onDestroy()
     }
 
@@ -106,6 +113,7 @@ class HostService : Service() {
      * the service back to special-use before the new token is taken.
      */
     private fun startCapture(code: Int, data: Intent) {
+        holdWake("capture")
         val mine = ++generation
         reported = false
         val previousEncoder = encoder
@@ -280,6 +288,7 @@ class HostService : Service() {
             } else {
                 startForeground(NOTIF_ID, notification)
             }
+            AppLog.i("host foreground service mediaProjection")
             true
         } catch (e: Exception) {
             AppLog.e("foreground service type mediaProjection was refused", e)
@@ -291,6 +300,7 @@ class HostService : Service() {
         AppLog.e(reason)
         show(controlled, capturing = false)
         report(false, reason)
+        if (!controlled) dropWake("capture failed")
     }
 
     private fun report(ok: Boolean, reason: String) {
@@ -387,6 +397,26 @@ class HostService : Service() {
         val token = projection
         forgetProjection()
         runCatching { token?.stop() }
+        if (!controlled) dropWake("capture ended")
+    }
+
+    /** Keeps the CPU awake while a session is sharing. The screen can turn off. */
+    private fun holdWake(why: String) {
+        if (wake?.isHeld == true) return
+        val pm = getSystemService(PowerManager::class.java) ?: return
+        val lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pjdesk:host")
+        lock.setReferenceCounted(false)
+        lock.acquire(6 * 60 * 60 * 1000L)
+        wake = lock
+        AppLog.i("host wake lock held ($why)")
+    }
+
+    private fun dropWake(why: String) {
+        val lock = wake ?: return
+        wake = null
+        val held = runCatching { lock.isHeld }.getOrDefault(false)
+        if (held) runCatching { lock.release() }
+        AppLog.i("host wake lock released ($why)")
     }
 
     /** Drops the encoder without stopping the token. onStop is already running in that case. */

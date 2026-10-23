@@ -29,6 +29,7 @@ class PjAccessibilityService : AccessibilityService() {
     private val main = Handler(Looper.getMainLooper())
     private var polls = 0
     private var onGiveUp: (() -> Unit)? = null
+    private var lastDialog = ""
     private val held = ArrayList<AccessibilityNodeInfo>()
 
     override fun onServiceConnected() {
@@ -52,6 +53,7 @@ class PjAccessibilityService : AccessibilityService() {
 
     fun beginConsentWatch(giveUp: () -> Unit) {
         polls = 0
+        lastDialog = ""
         onGiveUp = giveUp
         main.removeCallbacks(poll)
         main.post(poll)
@@ -63,7 +65,17 @@ class PjAccessibilityService : AccessibilityService() {
         if (!ProjectionConsent.armed) return
         polls += 1
         val nodes = snapshot()
-        when (val step = ProjectionConsent.decide(nodes)) {
+        val step = ProjectionConsent.decide(nodes)
+        if (ProjectionConsent.looksLikeConsent(nodes)) {
+            val mode = nodes.firstOrNull { ProjectionConsent.isModeControl(it) }
+            val button = nodes.firstOrNull { it.viewId == "android:id/button1" }
+            val line = "screen share dialog mode='${mode?.text.orEmpty()}' child='${mode?.subtree.orEmpty()}' button='${button?.text.orEmpty()}' step=$step"
+            if (line != lastDialog) {
+                lastDialog = line
+                AppLog.i(line)
+            }
+        }
+        when (step) {
             is ConsentStep.Click -> {
                 val info = held.getOrNull(step.index)
                 val fired = info?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true

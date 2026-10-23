@@ -23,7 +23,8 @@ object AppLog {
     }
 
     fun i(message: String) {
-        Log.i(TAG, message)
+        // Release builds keep info lines. Minify is off, and Share logs sends the file.
+        Log.println(Log.INFO, TAG, message)
         write("I", message)
     }
 

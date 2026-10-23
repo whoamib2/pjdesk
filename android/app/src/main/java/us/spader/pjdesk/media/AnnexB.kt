@@ -7,6 +7,8 @@ package us.spader.pjdesk.media
  */
 object AnnexB {
     private val START = byteArrayOf(0, 0, 0, 1)
+    const val IDR = 5
+    const val SPS = 7
 
     fun isAnnexB(data: ByteArray): Boolean {
         if (data.size >= 4 && data[0] == 0.toByte() && data[1] == 0.toByte() && data[2] == 0.toByte() && data[3] == 1.toByte()) {
@@ -99,13 +101,21 @@ object AnnexB {
 
         fun frame(data: ByteArray, keyframe: Boolean): ByteArray {
             val body = if (isAnnexB(data)) data else avccToAnnexB(data)
-            if (!keyframe || sets.isEmpty()) return body
-            if (nalType(body) == 7) return body
+            // An IDR is a sync point even when the codec forgot BUFFER_FLAG_KEY_FRAME.
+            // Repeat SPS/PPS unless this access unit already carries them.
+            val sync = keyframe || containsNal(body, IDR)
+            if (!sync || sets.isEmpty() || containsNal(body, SPS)) return body
             val out = ByteArray(sets.size + body.size)
             sets.copyInto(out)
             body.copyInto(out, sets.size)
             return out
         }
+    }
+
+    /** True when [data] is Annex-B and contains a NAL of [type] (5 = IDR, 7 = SPS). */
+    fun containsNal(data: ByteArray, type: Int): Boolean {
+        if (!isAnnexB(data)) return false
+        return split(data).any { it.isNotEmpty() && (it[0].toInt() and 0x1F) == type }
     }
 
     private fun split(data: ByteArray): List<ByteArray> {

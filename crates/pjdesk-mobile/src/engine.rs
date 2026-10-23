@@ -37,7 +37,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.17";
+pub const APP_VERSION: &str = "0.6.18";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -251,9 +251,22 @@ impl Engine {
         if data.is_empty() || width == 0 || height == 0 {
             return;
         }
-        *video.latest.lock().unwrap() = Some(Outgoing { data, width, height, keyframe, encode_us });
-        video.notify.notify_one();
+        let mut slot = video.latest.lock().unwrap();
+        let replace = slot.as_ref().map(|pending| should_replace_frame(pending.keyframe, keyframe)).unwrap_or(true);
+        if replace {
+            *slot = Some(Outgoing { data, width, height, keyframe, encode_us });
+        }
+        drop(slot);
+        if replace {
+            video.notify.notify_one();
+        }
     }
+}
+
+/// A delta must not replace an IDR that has not been sent yet. The viewer
+/// asked for that IDR because the previous picture would not decode.
+pub(crate) fn should_replace_frame(pending_keyframe: bool, next_keyframe: bool) -> bool {
+    !pending_keyframe || next_keyframe
 }
 
 fn device_secret(android_id: &str, disk: &Disk) -> [u8; 32] {
@@ -399,10 +412,17 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         }
         "setUnattendedAccess" => {
             let on = cmd.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
-            let allowed = on && state.permanent.lock().unwrap().as_deref().is_some_and(|p| !p.trim().is_empty());
-            state.unattended_access.store(allowed, Ordering::SeqCst);
-            if on && !allowed {
-                emit(cb, &json!({"event":"error","text":"Save a permanent password first."}));
+            // A process start reports the saved switch. It must not be cleared
+            // here because the password or accessibility service is not ready yet.
+            let sync = cmd.get("sync").and_then(|v| v.as_bool()).unwrap_or(false);
+            if sync {
+                state.unattended_access.store(on, Ordering::SeqCst);
+            } else {
+                let allowed = on && state.permanent.lock().unwrap().as_deref().is_some_and(|p| !p.trim().is_empty());
+                state.unattended_access.store(allowed, Ordering::SeqCst);
+                if on && !allowed {
+                    emit(cb, &json!({"event":"error","text":"Save a permanent password first."}));
+                }
             }
         }
         "regenerate" => {
@@ -1107,20 +1127,28 @@ fn trusted_list(value: Option<&serde_json::Value>) -> Vec<String> {
 
 /// True when this session may accept Android's screen-share dialog by itself.
 /// The permanent password has to be the one that matched, or the view request
-/// has to be from a trusted account or computer. The one-time password does not.
+/// has to be preapproved. The one-time password does not.
 pub(crate) fn should_auto_share(unattended_access: bool, matched_permanent: bool, trusted_view: bool) -> bool {
     unattended_access && (matched_permanent || trusted_view)
 }
 
-/// A view request skips the PJDesk prompt when this account or computer is
-/// trusted, or when unattended mode is using the permanent password.
+/// A view request skips the PJDesk prompt only when unattended access is on.
+/// That is also what makes the phone tap Android's screen-share dialog.
+/// Eligible viewers are a trusted account, a trusted computer, or another
+/// device signed into this phone's own pjdesk.com account.
 fn view_is_preapproved(state: &State, ask: &ViewAsk) -> bool {
-    let approval = state.approval.lock().unwrap().clone();
+    if !state.unattended_access.load(Ordering::SeqCst) {
+        return false;
+    }
     let permanent = state.permanent.lock().unwrap().clone().unwrap_or_default();
-    if approval == "unattended" && !permanent.trim().is_empty() {
+    if permanent.trim().is_empty() {
+        return false;
+    }
+    let mine = state.account.lock().unwrap().clone();
+    let account = ask.account.trim();
+    if !account.is_empty() && !mine.trim().is_empty() && account.eq_ignore_ascii_case(mine.trim()) {
         return true;
     }
-    let account = ask.account.trim();
     if !account.is_empty() && state.trusted_accounts.lock().unwrap().iter().any(|saved| saved.eq_ignore_ascii_case(account)) {
         return true;
     }
@@ -2388,25 +2416,58 @@ mod tests {
     }
 
     #[test]
-    fn a_trusted_account_or_computer_or_permanent_password_skips_the_view_prompt() {
+    fn a_view_is_preapproved_only_when_unattended_access_is_on() {
         let dir = std::env::temp_dir().join(format!("pjdesk-trust-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let state = test_state(&dir);
         let ben = ViewAsk { view: true, account: "ben@spader.us".into(), computer: "BENLENOVODESK".into(), id: "692996394".into() };
+        *state.permanent.lock().unwrap() = Some("long-enough-password".into());
+        *state.approval.lock().unwrap() = "unattended".into();
+        assert!(!view_is_preapproved(&state, &ben), "the old approval mode does not skip Allow");
+        state.unattended_access.store(true, Ordering::SeqCst);
+        *state.account.lock().unwrap() = "Ben@Spader.us".into();
+        assert!(view_is_preapproved(&state, &ben), "the same signed-in account is eligible");
+        *state.account.lock().unwrap() = String::new();
         assert!(!view_is_preapproved(&state, &ben));
         *state.trusted_accounts.lock().unwrap() = vec!["Ben@Spader.us".into()];
         assert!(view_is_preapproved(&state, &ben));
+        state.unattended_access.store(false, Ordering::SeqCst);
+        assert!(!view_is_preapproved(&state, &ben), "a trusted account still needs the switch");
+        state.unattended_access.store(true, Ordering::SeqCst);
         *state.trusted_accounts.lock().unwrap() = vec![];
         *state.trusted_computers.lock().unwrap() = vec!["386 626 882".into()];
         let pixel = ViewAsk { view: true, account: String::new(), computer: "Pixel".into(), id: "386626882".into() };
         assert!(view_is_preapproved(&state, &pixel));
         assert!(!view_is_preapproved(&state, &ben));
-        *state.trusted_computers.lock().unwrap() = vec![];
-        *state.approval.lock().unwrap() = "unattended".into();
-        *state.permanent.lock().unwrap() = Some("long-enough-password".into());
-        assert!(view_is_preapproved(&state, &ben));
+        *state.permanent.lock().unwrap() = None;
+        assert!(!view_is_preapproved(&state, &pixel), "no permanent password falls back to the prompt");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_sync_remembers_the_switch_without_a_password() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let cb: Arc<dyn Callbacks> = Arc::new(Silent);
+            let state = test_state(&dir);
+            apply(&state, &cb, json!({"cmd":"setUnattendedAccess","on":true,"sync":true})).await;
+            assert!(state.unattended_access.load(Ordering::SeqCst));
+            apply(&state, &cb, json!({"cmd":"setUnattendedAccess","on":true})).await;
+            assert!(!state.unattended_access.load(Ordering::SeqCst));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unsent_idr_is_not_replaced_by_a_delta() {
+        assert!(!should_replace_frame(true, false));
+        assert!(should_replace_frame(true, true));
+        assert!(should_replace_frame(false, false));
+        assert!(should_replace_frame(false, true));
     }
 
     #[test]

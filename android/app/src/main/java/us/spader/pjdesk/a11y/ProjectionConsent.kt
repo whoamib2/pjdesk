@@ -59,6 +59,7 @@ object ProjectionConsent {
         HostService.arm(app)
         HostService.preferAutoClick = true
         armed = true
+        AppLog.i("unattended access opening the screen share dialog")
         automatic = false
         PjAccessibilityService.watchConsent {
             armed = false

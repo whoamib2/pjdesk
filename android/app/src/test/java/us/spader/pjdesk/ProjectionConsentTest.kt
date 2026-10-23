@@ -103,6 +103,23 @@ class ProjectionConsentTest {
     }
 
     @Test
+    fun pixelAndroid17ShareEntireScreenChildThenShareScreen() {
+        val spinner = ConsentNode(
+            packageName = ProjectionConsent.SYSTEM_UI,
+            className = "android.widget.Spinner",
+            windowClass = "com.android.systemui.mediaprojection.permission.MediaProjectionPermissionActivity",
+            viewId = "com.android.systemui:id/screen_share_mode_options",
+            text = "",
+            subtree = "Share entire screen",
+            clickable = true,
+            enabled = true,
+        )
+        val step = ProjectionConsent.decide(listOf(spinner, button("android:id/button1", "Share screen")))
+        assertEquals(ConsentStep.Click(1, "share"), step)
+        assertTrue(ProjectionConsent.modeIsEntire(spinner))
+    }
+
+    @Test
     fun aSingleAppSpinnerDoesNotStartWhenTheSubtreeAlsoSaysEntireScreen() {
         val step = ProjectionConsent.decide(
             listOf(

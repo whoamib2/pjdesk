@@ -140,6 +140,20 @@ class Store(context: Context) {
         get() = prefs.getBoolean("unattendedAccess", false)
         set(value) { prefs.edit().putBoolean("unattendedAccess", value).commit() }
 
+    /**
+     * 0.6.17 stored "Use the permanent password" separately from the switch.
+     * Copy that choice onto the switch once. Later launches leave the switch
+     * alone, including when the person turns it off.
+     * Returns true when this call turned the switch on.
+     */
+    fun migrateUnattendedAccess(): Boolean {
+        if (prefs.getBoolean("unattendedMigrated", false)) return false
+        val turnOn = approval == "unattended" && !unattendedAccess
+        if (turnOn) unattendedAccess = true
+        prefs.edit().putBoolean("unattendedMigrated", true).commit()
+        return turnOn
+    }
+
     fun trustedAccounts(): List<String> = readTrusted("trustedAccounts")
 
     fun trustedComputers(): List<String> = readTrusted("trustedComputers")
