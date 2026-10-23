@@ -39,8 +39,10 @@ pub enum Action {
     ViewSeparate,
     /// Close the screen window this bar belongs to.
     CloseScreen,
-    /// Android host: 0 Back, 1 Home, 2 Recents, 3 Volume up, 4 Volume down, 5 Power.
+    /// Android host: 0 Back, 1 Home, 2 Recents, 3 Volume up, 4 Volume down, 5 Power, 6 Notifications.
     Android(u8),
+    /// Show or hide the Android navigation bar under the phone picture.
+    ToggleAndroidBar,
 }
 
 /// Key combinations the "Send keys" menu can send to the host.
@@ -174,46 +176,219 @@ const ANDROID_ITEMS: &[(&str, Action)] = &[
     ("Notifications", Action::Android(6)),
 ];
 
-/// Always-visible controls along the bottom of an Android session.
-/// The number is the index [`crate::viewer::window`] sends as a special key.
-pub const ANDROID_BAR_H: f32 = 56.0;
+/// Height of the navigation bar docked under an Android picture.
+pub const ANDROID_BAR_H: f32 = 96.0;
 
-const ANDROID_BAR: &[(&str, u8)] = &[
-    ("Back", 0),
-    ("Home", 1),
-    ("Recents", 2),
-    ("Notify", 6),
-    ("Lock", 5),
-    ("Vol+", 3),
-    ("Vol-", 4),
-];
+/// Shown on the bar when the phone's accessibility service is not running.
+pub const ANDROID_CONTROL_HINT: &str = "Turn on control on the phone";
 
-/// Which Android button a click landed on. `None` when the point is above the bar.
-pub fn android_bar_hit(x: f64, y: f64, win_w: usize, win_h: usize) -> Option<u8> {
-    if win_w == 0 || win_h == 0 || y < win_h as f64 - ANDROID_BAR_H as f64 || y > win_h as f64 || x < 0.0 {
-        return None;
-    }
-    let slot = win_w as f64 / ANDROID_BAR.len() as f64;
-    if slot < 1.0 {
-        return None;
-    }
-    let index = (x / slot).floor() as usize;
-    ANDROID_BAR.get(index).map(|(_, which)| *which)
+/// One control on the Android navigation bar. `which` is the viewer index
+/// [`crate::viewer::window`] sends: 0 Back, 1 Home, 2 Recents, 3 Vol+, 4 Vol−, 5 Power, 6 Notify.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AndroidButton {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub which: u8,
 }
 
-pub(crate) fn draw_android_bar(buf: &mut [u32], win_w: usize, win_h: usize) {
+/// Where the bar sits in the window. It matches the phone picture when there is one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AndroidBarBox {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// A click on the bar. `Chrome` is the padding, so it is not a phone gesture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AndroidHit {
+    Button(u8),
+    Chrome,
+}
+
+/// The bar under `picture`, or a centered bar when the picture has not arrived.
+pub fn android_bar_box(pic_x: i32, pic_y: i32, pic_w: usize, pic_h: usize, win_w: usize, win_h: usize) -> AndroidBarBox {
+    let h = ANDROID_BAR_H;
     if win_w == 0 || win_h == 0 {
+        return AndroidBarBox { x: 0.0, y: 0.0, w: 0.0, h };
+    }
+    if pic_w < 8 || pic_h < 8 {
+        let max_w = win_w as f32;
+        let w = (max_w * 0.72).clamp(320.0_f32.min(max_w), 520.0_f32.min(max_w));
+        let x = ((max_w - w) / 2.0).max(0.0);
+        return AndroidBarBox { x, y: (win_h as f32 - h).max(0.0), w, h };
+    }
+    let left = pic_x.max(0) as f32;
+    let right = (pic_x.saturating_add(pic_w as i32)).clamp(0, win_w as i32) as f32;
+    let bottom = pic_y.saturating_add(pic_h as i32).clamp(0, win_h as i32);
+    let y = if bottom as f32 + h <= win_h as f32 + 0.5 {
+        bottom as f32
+    } else {
+        (win_h as f32 - h).max(0.0)
+    };
+    AndroidBarBox { x: left, y, w: (right - left).max(1.0), h }
+}
+
+/// Back, Home, and Recents centered and large. Notify and Vol− on the left, Vol+ and Power on the right.
+pub fn android_bar_buttons(bar: AndroidBarBox, disabled: bool) -> Vec<AndroidButton> {
+    if bar.w < 8.0 || bar.h < 8.0 {
+        return Vec::new();
+    }
+    let hint_band = if disabled { 20.0 } else { 0.0 };
+    let region_top = bar.y + 8.0;
+    let region_h = (bar.h - 16.0 - hint_band).max(20.0);
+    let mut nav = 52.0_f32.min(region_h);
+    let mut end_h = 32.0_f32.min(nav);
+    let mut nav_gap = 14.0_f32;
+    let mut end_gap = 6.0_f32;
+    let mut pad = 8.0_f32;
+    let side = 10.0_f32;
+    let labels = ["Notify", "Vol-", "Vol+", "Power"];
+    let mut end_ws: Vec<f32> = labels.iter().map(|label| text_width(label) + 18.0).collect();
+    let left_w = end_ws[0] + end_gap + end_ws[1];
+    let right_w = end_ws[2] + end_gap + end_ws[3];
+    let cluster = nav * 3.0 + nav_gap * 2.0;
+    let flank = (pad + left_w + side).max(pad + right_w + side);
+    let needed = cluster + flank * 2.0;
+    if needed > bar.w && needed > 0.0 {
+        let scale = bar.w / needed;
+        nav *= scale;
+        end_h *= scale;
+        nav_gap *= scale;
+        end_gap *= scale;
+        pad *= scale;
+        for w in &mut end_ws {
+            *w *= scale;
+        }
+    }
+    let cluster = nav * 3.0 + nav_gap * 2.0;
+    let cluster_x = bar.x + (bar.w - cluster) / 2.0;
+    let nav_y = region_top + (region_h - nav) / 2.0;
+    let end_y = nav_y + (nav - end_h) / 2.0;
+    let mut buttons = Vec::with_capacity(7);
+    let mut x = bar.x + pad;
+    let left_which = [6u8, 4];
+    for i in 0..2 {
+        buttons.push(AndroidButton { x, y: end_y, w: end_ws[i], h: end_h, which: left_which[i] });
+        x += end_ws[i] + end_gap;
+    }
+    for i in 0..3 {
+        buttons.push(AndroidButton {
+            x: cluster_x + i as f32 * (nav + nav_gap),
+            y: nav_y,
+            w: nav,
+            h: nav,
+            which: i as u8,
+        });
+    }
+    x = bar.x + bar.w - pad - end_ws[2] - end_gap - end_ws[3];
+    buttons.push(AndroidButton { x, y: end_y, w: end_ws[2], h: end_h, which: 3 });
+    x += end_ws[2] + end_gap;
+    buttons.push(AndroidButton { x, y: end_y, w: end_ws[3], h: end_h, which: 5 });
+    buttons
+}
+
+/// Which part of the navigation bar the point is on.
+pub fn android_bar_hit(
+    x: f64,
+    y: f64,
+    pic_x: i32,
+    pic_y: i32,
+    pic_w: usize,
+    pic_h: usize,
+    win_w: usize,
+    win_h: usize,
+    disabled: bool,
+) -> Option<AndroidHit> {
+    let bar = android_bar_box(pic_x, pic_y, pic_w, pic_h, win_w, win_h);
+    if bar.w < 1.0 || x < bar.x as f64 || y < bar.y as f64 || x > (bar.x + bar.w) as f64 || y > (bar.y + bar.h) as f64 {
+        return None;
+    }
+    let buttons = android_bar_buttons(bar, disabled);
+    if let Some(button) = buttons.iter().find(|b| b.which <= 2 && inside_button(b, x, y)) {
+        return Some(AndroidHit::Button(button.which));
+    }
+    if let Some(button) = buttons.iter().find(|b| inside_button(b, x, y)) {
+        return Some(AndroidHit::Button(button.which));
+    }
+    Some(AndroidHit::Chrome)
+}
+
+fn inside_button(button: &AndroidButton, x: f64, y: f64) -> bool {
+    x >= button.x as f64 && y >= button.y as f64 && x <= (button.x + button.w) as f64 && y <= (button.y + button.h) as f64
+}
+
+pub(crate) fn draw_android_bar(
+    buf: &mut [u32],
+    win_w: usize,
+    win_h: usize,
+    pic_x: i32,
+    pic_y: i32,
+    pic_w: usize,
+    pic_h: usize,
+    disabled: bool,
+) {
+    let bar = android_bar_box(pic_x, pic_y, pic_w, pic_h, win_w, win_h);
+    if bar.w < 1.0 || win_w == 0 || win_h == 0 {
         return;
     }
-    let top = win_h as f32 - ANDROID_BAR_H;
-    fill_rect(buf, win_w, win_h, 0.0, top, win_w as f32, ANDROID_BAR_H, 0xF0_10_13_18);
-    fill_rect(buf, win_w, win_h, 0.0, top, win_w as f32, 1.0, 0xFF_2e_36_44);
-    let slot = win_w as f32 / ANDROID_BAR.len() as f32;
-    for (i, (label, _)) in ANDROID_BAR.iter().enumerate() {
-        let x = i as f32 * slot;
-        fill_rect(buf, win_w, win_h, x + 4.0, top + 8.0, (slot - 8.0).max(4.0), ANDROID_BAR_H - 16.0, 0xFF_22_28_33);
-        let tw = text_width(label);
-        draw_text(buf, win_w, win_h, x + (slot - tw) / 2.0, top + 20.0, label, 0xFF_e9_ed_f3);
+    let bg = if disabled { 0xF0_18_1a_20 } else { 0xF0_10_13_18 };
+    let glyph = if disabled { 0xFF_6e_76_84 } else { 0xFF_f2_f4_f8 };
+    let well = if disabled { 0xFF_28_2c_34 } else { 0xFF_2a_33_42 };
+    let end_well = if disabled { 0xFF_24_28_30 } else { 0xFF_22_28_33 };
+    fill_rect(buf, win_w, win_h, bar.x, bar.y, bar.w, bar.h, bg);
+    fill_rect(buf, win_w, win_h, bar.x, bar.y, bar.w, 1.0, 0xFF_2e_36_44);
+    for button in android_bar_buttons(bar, disabled) {
+        if button.which <= 2 {
+            draw_nav_glyph(buf, win_w, win_h, &button, glyph, well);
+        } else {
+            fill_round(buf, win_w, win_h, button.x, button.y, button.w, button.h, 8.0, end_well);
+            let label = match button.which {
+                6 => "Notify",
+                4 => "Vol-",
+                3 => "Vol+",
+                _ => "Power",
+            };
+            let tw = text_width(label);
+            if tw <= button.w - 4.0 {
+                draw_text(buf, win_w, win_h, button.x + (button.w - tw) / 2.0, button.y + button.h * 0.68, label, glyph);
+            }
+        }
+    }
+    if disabled {
+        let tw = text_width(ANDROID_CONTROL_HINT);
+        draw_text(
+            buf,
+            win_w,
+            win_h,
+            bar.x + (bar.w - tw) / 2.0,
+            bar.y + bar.h - 8.0,
+            ANDROID_CONTROL_HINT,
+            0xFF_e7_c2_b6,
+        );
+    }
+}
+
+fn draw_nav_glyph(buf: &mut [u32], w: usize, h: usize, button: &AndroidButton, color: u32, well: u32) {
+    let cx = button.x + button.w / 2.0;
+    let cy = button.y + button.h / 2.0;
+    let r = button.w.min(button.h) / 2.0 - 1.0;
+    if r < 2.0 {
+        return;
+    }
+    fill_circle(buf, w, h, cx, cy, r, well);
+    let s = r * 0.62;
+    match button.which {
+        0 => fill_triangle(buf, w, h, cx - s * 0.95, cy, cx + s * 0.8, cy - s, cx + s * 0.8, cy + s, color),
+        1 => fill_circle(buf, w, h, cx, cy, s * 0.72, color),
+        2 => {
+            let side = s * 1.35;
+            fill_round(buf, w, h, cx - side / 2.0, cy - side / 2.0, side, side, (side * 0.18).max(2.0), color);
+        }
+        _ => {}
     }
 }
 
@@ -244,6 +419,8 @@ pub struct Toolbar {
     light: bool,
     hovered_slot: Option<usize>,
     android: bool,
+    /// The navigation bar under an Android picture. On until the Phone menu hides it.
+    android_nav: bool,
 }
 
 impl Default for Toolbar {
@@ -285,6 +462,7 @@ impl Default for Toolbar {
             light: false,
             hovered_slot: None,
             android: false,
+            android_nav: true,
         }
     }
 }
@@ -362,6 +540,10 @@ fn owned(items: &[(&str, Action)]) -> Menu {
     Menu { items, width }
 }
 
+fn nav_toggle_label(on: bool) -> &'static str {
+    if on { "Hide navigation bar" } else { "Show navigation bar" }
+}
+
 impl Toolbar {
     /// The displays the host last published, which one is current, and the view mode.
     pub fn sync(&mut self, displays: Vec<pjdesk_proto::layout::Screen>, current: u8, view_mode: u8) {
@@ -407,7 +589,14 @@ impl Toolbar {
         ];
         if on {
             menus.push(owned(ANDROID_ITEMS));
-            spec.push(("Phone", "Back, Home, Recents, volume, power", Kind::Menu(3), Mark::Session));
+            let label = nav_toggle_label(self.android_nav);
+            let item_w = text_width(label) + PAD * 3.0;
+            let menu = menus.last_mut().unwrap();
+            if item_w > menu.width {
+                menu.width = item_w;
+            }
+            menu.items.push((label.to_string(), Action::ToggleAndroidBar));
+            spec.push(("Phone", "Navigation bar, Back, Home, volume, power", Kind::Menu(3), Mark::Session));
         }
         spec.extend([
             ("Files", "Send and receive files", Kind::Act(Action::OpenPanel(0)), Mark::Files),
@@ -425,6 +614,33 @@ impl Toolbar {
         self.buttons = buttons;
         self.menus = menus;
         self.width = x + PAD;
+    }
+
+    /// The navigation bar is drawn for an Android peer until the viewer hides it.
+    pub fn shows_android_nav(&self) -> bool {
+        self.android && self.android_nav
+    }
+
+    pub fn android_nav_on(&self) -> bool {
+        self.android_nav
+    }
+
+    /// Phone menu: Hide navigation bar / Show navigation bar.
+    pub fn toggle_android_nav(&mut self) {
+        if !self.android {
+            return;
+        }
+        self.android_nav = !self.android_nav;
+        let label = nav_toggle_label(self.android_nav);
+        if let Some(menu) = self.menus.get_mut(3) {
+            if let Some(item) = menu.items.iter_mut().find(|(_, action)| *action == Action::ToggleAndroidBar) {
+                item.0 = label.to_string();
+            }
+            let w = text_width(label) + PAD * 3.0;
+            if w > menu.width {
+                menu.width = w;
+            }
+        }
     }
 
     fn bar_rect(&self, win_w: usize) -> (f32, f32, f32, f32) {
@@ -1099,6 +1315,29 @@ fn inside_round(px: f32, py: f32, left: f32, top: f32, right: f32, bottom: f32, 
     dx * dx + dy * dy <= rad * rad
 }
 
+fn fill_triangle(buf: &mut [u32], w: usize, h: usize, ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32, argb: u32) {
+    let area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+    if area.abs() < 0.5 {
+        return;
+    }
+    let min_x = ax.min(bx).min(cx).max(0.0) as usize;
+    let max_x = ((ax.max(bx).max(cx) as usize) + 1).min(w);
+    let min_y = ay.min(by).min(cy).max(0.0) as usize;
+    let max_y = ((ay.max(by).max(cy) as usize) + 1).min(h);
+    for yy in min_y..max_y {
+        for xx in min_x..max_x {
+            let px = xx as f32 + 0.5;
+            let py = yy as f32 + 0.5;
+            let w0 = (bx - px) * (cy - py) - (cx - px) * (by - py);
+            let w1 = (cx - px) * (ay - py) - (ax - px) * (cy - py);
+            let w2 = (ax - px) * (by - py) - (bx - px) * (ay - py);
+            if w0 * area >= 0.0 && w1 * area >= 0.0 && w2 * area >= 0.0 {
+                blend(&mut buf[yy * w + xx], argb, 1.0);
+            }
+        }
+    }
+}
+
 fn fill_circle(buf: &mut [u32], w: usize, h: usize, cx: f32, cy: f32, r: f32, argb: u32) {
     let r2 = r * r;
     let x0 = (cx - r).max(0.0) as usize;
@@ -1422,15 +1661,119 @@ mod tests {
     }
 
     #[test]
-    fn android_bar_hits_the_bottom_buttons() {
-        assert_eq!(android_bar_hit(10.0, 343.0, 700, 400), None);
-        assert_eq!(android_bar_hit(10.0, 344.0, 700, 400), Some(0));
-        assert_eq!(android_bar_hit(150.0, 360.0, 700, 400), Some(1));
-        assert_eq!(android_bar_hit(250.0, 360.0, 700, 400), Some(2));
-        assert_eq!(android_bar_hit(350.0, 360.0, 700, 400), Some(6));
-        assert_eq!(android_bar_hit(450.0, 360.0, 700, 400), Some(5));
-        assert_eq!(android_bar_hit(550.0, 360.0, 700, 400), Some(3));
-        assert_eq!(android_bar_hit(650.0, 360.0, 700, 400), Some(4));
-        assert_eq!(android_bar_hit(-1.0, 360.0, 700, 400), None);
+    fn android_nav_bar_is_docked_under_the_phone() {
+        let win_w = 800usize;
+        let win_h = 700usize;
+        let pic_w = 480usize;
+        let pic_h = 500usize;
+        let pic_x = 160i32;
+        let pic_y = win_h as i32 - ANDROID_BAR_H as i32 - pic_h as i32;
+        let bar = android_bar_box(pic_x, pic_y, pic_w, pic_h, win_w, win_h);
+        assert_eq!(bar.x, pic_x as f32);
+        assert_eq!(bar.w, pic_w as f32);
+        assert_eq!(bar.y, (pic_y + pic_h as i32) as f32);
+        assert_eq!(bar.h, ANDROID_BAR_H);
+        let buttons = android_bar_buttons(bar, false);
+        let back = button(&buttons, 0);
+        let home = button(&buttons, 1);
+        let recents = button(&buttons, 2);
+        let notify = button(&buttons, 6);
+        let vol_down = button(&buttons, 4);
+        let vol_up = button(&buttons, 3);
+        let power = button(&buttons, 5);
+        assert!(back.x < home.x && home.x < recents.x);
+        assert!(notify.x < back.x && vol_down.x < back.x);
+        assert!(vol_up.x > recents.x && power.x > recents.x);
+        assert!(back.h >= 48.0 && home.w >= 48.0 && recents.h >= 48.0);
+        assert!(notify.h < back.h && power.h < home.h);
+        let cluster_mid = (back.x + recents.x + recents.w) / 2.0;
+        assert!((cluster_mid - (bar.x + bar.w / 2.0)).abs() < 1.0);
+        assert!(!overlaps(&back, &home) && !overlaps(&home, &recents));
+        assert!(!overlaps(&notify, &back) && !overlaps(&power, &recents));
+        let hx = (home.x + home.w / 2.0) as f64;
+        let hy = (home.y + home.h / 2.0) as f64;
+        assert_eq!(
+            android_bar_hit(hx, hy, pic_x, pic_y, pic_w, pic_h, win_w, win_h, false),
+            Some(AndroidHit::Button(1))
+        );
+        assert_eq!(
+            android_bar_hit((back.x + 4.0) as f64, (back.y + 4.0) as f64, pic_x, pic_y, pic_w, pic_h, win_w, win_h, false),
+            Some(AndroidHit::Button(0))
+        );
+        assert_eq!(
+            android_bar_hit(hx, (bar.y - 2.0) as f64, pic_x, pic_y, pic_w, pic_h, win_w, win_h, false),
+            None
+        );
+        assert_eq!(
+            android_bar_hit((bar.x + 1.0) as f64, (bar.y + 2.0) as f64, pic_x, pic_y, pic_w, pic_h, win_w, win_h, false),
+            Some(AndroidHit::Chrome)
+        );
+        let narrow = android_bar_box(20, 40, 360, 400, 800, 600);
+        let fitted = android_bar_buttons(narrow, false);
+        assert!(fitted.iter().all(|b| b.x >= narrow.x - 0.5 && b.x + b.w <= narrow.x + narrow.w + 0.5));
+        for (i, a) in fitted.iter().enumerate() {
+            for b in fitted.iter().skip(i + 1) {
+                assert!(!overlaps(a, b), "{:?} overlaps {:?}", a.which, b.which);
+            }
+        }
+    }
+
+    #[test]
+    fn android_nav_bar_waits_centered_and_draws_grey_without_control() {
+        let waiting = android_bar_box(0, 0, 0, 0, 1000, 700);
+        assert!((320.0..=520.0).contains(&waiting.w));
+        assert!((waiting.x - (1000.0 - waiting.w) / 2.0).abs() < 1.0);
+        assert_eq!(waiting.y, 700.0 - ANDROID_BAR_H);
+        let slim = android_bar_box(0, 0, 0, 0, 200, 400);
+        assert!(slim.w <= 200.0 && slim.x >= 0.0);
+
+        let win_w = 800;
+        let win_h = 700;
+        let pic_w = 480usize;
+        let pic_h = 500i32;
+        let pic_x = 160;
+        let pic_y = win_h as i32 - ANDROID_BAR_H as i32 - pic_h;
+        let mut buf = vec![0u32; win_w * win_h];
+        draw_android_bar(&mut buf, win_w, win_h, pic_x, pic_y, pic_w, pic_h as usize, false);
+        let home = button(&android_bar_buttons(android_bar_box(pic_x, pic_y, pic_w, pic_h as usize, win_w, win_h), false), 1);
+        let px = (home.x + home.w / 2.0) as usize;
+        let py = (home.y + home.h / 2.0) as usize;
+        assert_eq!(buf[py * win_w + px], 0xFF_f2_f4_f8);
+        buf.fill(0);
+        draw_android_bar(&mut buf, win_w, win_h, pic_x, pic_y, pic_w, pic_h as usize, true);
+        let home = button(&android_bar_buttons(android_bar_box(pic_x, pic_y, pic_w, pic_h as usize, win_w, win_h), true), 1);
+        let px = (home.x + home.w / 2.0) as usize;
+        let py = (home.y + home.h / 2.0) as usize;
+        assert_eq!(buf[py * win_w + px], 0xFF_6e_76_84, "control off greys the Home button");
+    }
+
+    #[test]
+    fn phone_menu_hides_the_navigation_bar() {
+        let mut bar = Toolbar::default();
+        assert!(bar.android_nav_on());
+        assert!(!bar.shows_android_nav());
+        bar.set_android(true);
+        assert!(bar.shows_android_nav());
+        let phone = bar.buttons.iter().find(|b| b.label == "Phone").unwrap();
+        let (bx, by, _, _) = bar.bar_rect(1400);
+        assert_eq!(bar.click((bx + phone.x + 10.0) as f64, (by + 12.0) as f64, 1400), None);
+        let (mx, my, _, _) = bar.open_menu_rect(1400).unwrap();
+        let idx = bar.menus[3].items.iter().position(|(_, action)| *action == Action::ToggleAndroidBar).unwrap();
+        assert_eq!(bar.menus[3].items[idx].0, "Hide navigation bar");
+        let y = my + 4.0 + idx as f32 * ITEM_H + 8.0;
+        assert_eq!(bar.click((mx + 16.0) as f64, y as f64, 1400), Some(Action::ToggleAndroidBar));
+        bar.toggle_android_nav();
+        assert!(!bar.shows_android_nav());
+        assert!(bar.menus[3].items.iter().any(|(label, action)| label == "Show navigation bar" && *action == Action::ToggleAndroidBar));
+        bar.toggle_android_nav();
+        assert!(bar.shows_android_nav());
+    }
+
+    fn button(buttons: &[AndroidButton], which: u8) -> AndroidButton {
+        *buttons.iter().find(|b| b.which == which).unwrap()
+    }
+
+    fn overlaps(a: &AndroidButton, b: &AndroidButton) -> bool {
+        a.x < b.x + b.w - 0.5 && b.x < a.x + a.w - 0.5 && a.y < b.y + b.h - 0.5 && b.y < a.y + a.h - 0.5
     }
 }

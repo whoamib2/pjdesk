@@ -54,7 +54,7 @@ All four have to be set. A partial set leaves the APK unsigned.
 On Windows, sign an unsigned APK without saving the passwords:
 
 ```bat
-android\sign-release.cmd dist\PJDesk-Android-0.6.16-unsigned.apk
+android\sign-release.cmd dist\PJDesk-Android-0.6.17-unsigned.apk
 ```
 
 The script uses `apksigner` from `ANDROID_HOME`. The release key is `C:\Users\BenSpader\.pjdesk-android\pjdesk-release.jks`, alias `pjdesk`. Those are the defaults when `PJDESK_KEYSTORE` and `PJDESK_KEY_ALIAS` are unset. The script asks for the passwords and does not save them. A different key will not update the phone.

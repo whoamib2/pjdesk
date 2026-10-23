@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.17
+
+Windows is 0.6.17. Android is 0.6.17 (versionCode 61700). cloud/ did not change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The server binary did not change, so do not run `cloud\deploy.cmd`. The Windows client needs 0.6.17 for the navigation bar. The phone keeps the same Back, Home, and Recents actions; this build logs whether each one fired.
+
+* An Android session on Windows draws a navigation bar directly under the phone picture. Back, Home, and Recents are large and centered. Notifications, volume, and power stay smaller at the ends. The bar is on until Phone → Hide navigation bar. Esc is Back, Home is Home, the menu key is Recents, and the volume and power keys follow. Shortcuts still work when the bar is hidden. When control is off, the bar is grey and says "Turn on control on the phone".
+* Back, Home, and Recents still call the accessibility global actions, including when the phone uses gesture navigation. The phone writes whether `performGlobalAction` accepted the action.
+
 ## 0.6.16
 
 Android is 0.6.16 (versionCode 61600). Windows is 0.6.16 as well: the session window for an Android peer has the control bar, keyboard typing, and the "Control not enabled on phone" and "The phone stopped sharing" messages. cloud/ did not change. Protocol stays 3. `SpecialCommand::Notifications` is appended at index 9. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The server binary did not change, so do not run `cloud\deploy.cmd`. The phone needs 0.6.16. The Windows client needs this build for the bar, the keyboard, those two messages, and View phone. It includes the 0.6.15 View phone hotfix.

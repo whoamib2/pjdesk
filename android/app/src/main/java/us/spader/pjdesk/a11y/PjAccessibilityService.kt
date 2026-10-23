@@ -61,19 +61,25 @@ class PjAccessibilityService : AccessibilityService() {
     }
 
     fun special(which: Int) {
+        val nav = navAction(which)
+        if (nav != null) {
+            fire(which, nav)
+            return
+        }
         when (which) {
-            3 -> performGlobalAction(GLOBAL_ACTION_BACK)
-            4 -> performGlobalAction(GLOBAL_ACTION_HOME)
-            5 -> performGlobalAction(GLOBAL_ACTION_RECENTS)
             6 -> volume(AudioManager.ADJUST_RAISE)
             7 -> volume(AudioManager.ADJUST_LOWER)
-            8 -> if (android.os.Build.VERSION.SDK_INT >= 28) {
-                performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
-            } else {
-                performGlobalAction(GLOBAL_ACTION_POWER_DIALOG)
-            }
-            9 -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+            8 -> fire(
+                which,
+                if (android.os.Build.VERSION.SDK_INT >= 28) GLOBAL_ACTION_LOCK_SCREEN else GLOBAL_ACTION_POWER_DIALOG,
+            )
+            9 -> fire(which, GLOBAL_ACTION_NOTIFICATIONS)
         }
+    }
+
+    private fun fire(which: Int, action: Int) {
+        val fired = performGlobalAction(action)
+        AppLog.i("global action which=$which action=$action fired=$fired")
     }
 
     /**
@@ -118,6 +124,18 @@ class PjAccessibilityService : AccessibilityService() {
 
         /** Enabled in Settings and connected, so taps and typing can be delivered. */
         fun ready(context: Context): Boolean = enabled(context) && RemoteControl.service != null
+
+        /**
+         * Back, Home, and Recents. These are the platform global actions, so they
+         * run on gesture navigation as well as the three-button bar.
+         * 3, 4, and 5 are the indexes the Windows viewer sends.
+         */
+        fun navAction(which: Int): Int? = when (which) {
+            3 -> AccessibilityService.GLOBAL_ACTION_BACK
+            4 -> AccessibilityService.GLOBAL_ACTION_HOME
+            5 -> AccessibilityService.GLOBAL_ACTION_RECENTS
+            else -> null
+        }
 
         fun openSettings(context: Context) {
             val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

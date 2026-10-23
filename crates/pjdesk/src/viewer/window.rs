@@ -147,6 +147,7 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         follow_system_theme,
         noted_platform: String::new(),
         remote_size: None,
+        fitted_extra: None,
         android_stroke: pjdesk_proto::gesture::StrokeTracker::default(),
         pointer_down: false,
         saw_picture: Arc::new(AtomicBool::new(false)),
@@ -377,6 +378,8 @@ struct App {
     follow_system_theme: bool,
     noted_platform: String,
     remote_size: Option<(usize, usize)>,
+    /// Last extra height asked of the window (tabs plus the Android bar).
+    fitted_extra: Option<u32>,
     /// Press on an Android picture, turned into a tap or a swipe on release.
     android_stroke: pjdesk_proto::gesture::StrokeTracker,
     pointer_down: bool,
@@ -493,10 +496,12 @@ impl App {
         // selected display has a different size.
         if let Some(frame) = if separate { cropped.as_ref() } else { self.current.as_ref() } {
             let size = (frame.width, frame.height);
-            if self.remote_size != Some(size) {
+            let extra = self.toolbar.tab_height() as u32
+                + if self.toolbar.shows_android_nav() { toolbar::ANDROID_BAR_H as u32 } else { 0 };
+            if self.remote_size != Some(size) || self.fitted_extra != Some(extra) {
                 self.remote_size = Some(size);
+                self.fitted_extra = Some(extra);
                 self.sized_to_remote = true;
-                let extra = self.toolbar.tab_height() as u32;
                 Self::fit_remote(window, frame.width, frame.height, extra);
             }
         }
@@ -507,8 +512,9 @@ impl App {
             return;
         }
         let (win_w, win_h) = (size.width as usize, size.height as usize);
-        let android_bar = if snap.platform_family == "android" { toolbar::ANDROID_BAR_H as usize } else { 0 };
-        let paint_h = win_h.saturating_sub(android_bar).max(1);
+        let nav = self.toolbar.shows_android_nav();
+        let bar_h = if nav { toolbar::ANDROID_BAR_H as usize } else { 0 };
+        let paint_h = win_h.saturating_sub(bar_h).max(1);
         let Ok(mut buffer) = surface.buffer_mut() else { return };
         let shown = if separate { cropped.as_ref() } else { self.current.as_ref() };
         let origin = self.toolbar.tab_height() as usize;
@@ -521,6 +527,7 @@ impl App {
             self.pan,
             origin,
             self.toolbar.letterbox(),
+            nav,
         );
         self.layout = layout;
         if separate && cropped.is_none() {
@@ -544,8 +551,27 @@ impl App {
             toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, origin as f32 + 48.0, &waiting, 0xFF_e7_ec_f5);
         }
         Self::paint_overlay(&self.toolbar, &self.toast, &mut buffer, win_w, win_h, display, separate, true);
-        if android_bar > 0 {
-            toolbar::draw_android_bar(&mut buffer, win_w, win_h);
+        if nav {
+            toolbar::fill_rect(
+                &mut buffer,
+                win_w,
+                win_h,
+                0.0,
+                paint_h as f32,
+                win_w as f32,
+                bar_h as f32,
+                self.toolbar.letterbox(),
+            );
+            toolbar::draw_android_bar(
+                &mut buffer,
+                win_w,
+                win_h,
+                layout.x,
+                layout.y,
+                layout.width,
+                layout.height,
+                snap.control_off,
+            );
         }
         if snap.control_off {
             toolbar::draw_banner(
@@ -647,6 +673,7 @@ impl App {
             }
             Action::CloseScreen => return self.close_primary_screen(),
             Action::Android(which) => self.send_android(which),
+            Action::ToggleAndroidBar => self.toolbar.toggle_android_nav(),
         }
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -674,7 +701,8 @@ impl App {
         let Some(window) = &self.window else { return (1, 1, 0) };
         let size = window.inner_size();
         let origin = self.toolbar.tab_height() as i32;
-        (size.width as i32, (size.height as i32 - origin).max(1), origin)
+        let bar = if self.toolbar.shows_android_nav() { toolbar::ANDROID_BAR_H as i32 } else { 0 };
+        (size.width as i32, (size.height as i32 - origin - bar).max(1), origin)
     }
 
     fn set_scale(&mut self, scale: f32) {
@@ -1116,6 +1144,15 @@ impl App {
             self.paste_android_clipboard();
             return;
         }
+        if !self.modifiers.control_key() && !self.modifiers.alt_key() && !self.modifiers.super_key() {
+            if let Some(which) = android_nav_key(code).or_else(|| android_nav_named(&event.logical_key)) {
+                let volume = which == 3 || which == 4;
+                if !event.repeat || volume {
+                    self.send_android(which);
+                }
+                return;
+            }
+        }
         if self.modifiers.control_key() || self.modifiers.alt_key() {
             return;
         }
@@ -1246,6 +1283,7 @@ impl App {
         pan: (i32, i32),
         origin_y: usize,
         background: u32,
+        dock_bottom: bool,
     ) -> Layout {
         let content_h = win_h.saturating_sub(origin_y).max(1);
         match frame {
@@ -1254,6 +1292,9 @@ impl App {
                     Zoom::Fit => render::fit(frame.width, frame.height, win_w, content_h),
                     Zoom::Scale(scale) => render::placement(frame.width, frame.height, win_w, content_h, scale, pan),
                 };
+                if dock_bottom && layout.height > 0 && layout.height <= content_h {
+                    layout.y = (content_h - layout.height) as i32;
+                }
                 layout.y += origin_y as i32;
                 render::draw_on(frame, buffer, win_w, win_h, layout, background);
                 layout
@@ -1546,7 +1587,7 @@ impl App {
         let layout = {
             let Ok(mut buffer) = pane.surface.buffer_mut() else { return };
             let layout =
-                Self::paint_picture(&mut buffer, win_w, win_h, picture.as_ref(), Zoom::Fit, (0, 0), 0, background);
+                Self::paint_picture(&mut buffer, win_w, win_h, picture.as_ref(), Zoom::Fit, (0, 0), 0, background, false);
             if picture.is_none() {
                 toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, 48.0, "Waiting for this screen", 0xFF_9a_a3_b5);
             }
@@ -1800,13 +1841,31 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let win_w = self.window.as_ref().map(|w| w.inner_size().width as usize).unwrap_or(0);
                 let win_h = self.window.as_ref().map(|w| w.inner_size().height as usize).unwrap_or(0);
-                if self.remote_is_android() {
-                    if let Some(which) = toolbar::android_bar_hit(self.cursor_px.0, self.cursor_px.1, win_w, win_h) {
+                if self.toolbar.shows_android_nav() {
+                    let disabled = self.live.lock().unwrap().control_off;
+                    let lay = self.layout;
+                    if let Some(hit) = toolbar::android_bar_hit(
+                        self.cursor_px.0,
+                        self.cursor_px.1,
+                        lay.x,
+                        lay.y,
+                        lay.width,
+                        lay.height,
+                        win_w,
+                        win_h,
+                        disabled,
+                    ) {
                         if state == ElementState::Pressed {
-                            self.send_android(which);
+                            if let toolbar::AndroidHit::Button(which) = hit {
+                                if !disabled {
+                                    self.send_android(which);
+                                }
+                            }
                             if let Some(window) = &self.window {
                                 window.request_redraw();
                             }
+                        } else if self.pointer_down {
+                            self.on_android_button(false);
                         }
                         return;
                     }
@@ -1917,6 +1976,31 @@ fn screens_of(displays: &[pjdesk_proto::peer::DisplayLayout]) -> Vec<pjdesk_prot
         .collect()
 }
 
+/// Esc is Back, Home is Home, the menu key is Recents. Volume and power keys follow.
+pub(crate) fn android_nav_key(code: KeyCode) -> Option<u8> {
+    Some(match code {
+        KeyCode::Escape | KeyCode::BrowserBack => 0,
+        KeyCode::Home | KeyCode::BrowserHome => 1,
+        KeyCode::ContextMenu => 2,
+        KeyCode::AudioVolumeUp => 3,
+        KeyCode::AudioVolumeDown => 4,
+        KeyCode::Power => 5,
+        _ => return None,
+    })
+}
+
+/// Logical keys that do not have their own physical code: the Android app-switch
+/// and the phone Back/Home keys.
+pub(crate) fn android_nav_named(key: &Key) -> Option<u8> {
+    let Key::Named(named) = key else { return None };
+    Some(match named {
+        winit::keyboard::NamedKey::GoBack => 0,
+        winit::keyboard::NamedKey::GoHome => 1,
+        winit::keyboard::NamedKey::AppSwitch => 2,
+        _ => return None,
+    })
+}
+
 fn display_key(code: KeyCode) -> Option<usize> {
     Some(match code {
         KeyCode::Digit1 | KeyCode::Numpad1 => 0,
@@ -1954,5 +2038,29 @@ fn walk_drop(path: &std::path::Path, depth: u32, out: &mut Vec<std::path::PathBu
     let Ok(entries) = std::fs::read_dir(path) else { return };
     for entry in entries.flatten() {
         walk_drop(&entry.path(), depth + 1, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{android_nav_key, android_nav_named};
+    use winit::keyboard::{Key, KeyCode, NamedKey};
+
+    #[test]
+    fn android_keyboard_shortcuts_match_the_nav_bar() {
+        assert_eq!(android_nav_key(KeyCode::Escape), Some(0));
+        assert_eq!(android_nav_key(KeyCode::BrowserBack), Some(0));
+        assert_eq!(android_nav_key(KeyCode::Home), Some(1));
+        assert_eq!(android_nav_key(KeyCode::BrowserHome), Some(1));
+        assert_eq!(android_nav_key(KeyCode::ContextMenu), Some(2));
+        assert_eq!(android_nav_key(KeyCode::AudioVolumeUp), Some(3));
+        assert_eq!(android_nav_key(KeyCode::AudioVolumeDown), Some(4));
+        assert_eq!(android_nav_key(KeyCode::Power), Some(5));
+        assert_eq!(android_nav_key(KeyCode::KeyA), None);
+        assert_eq!(android_nav_key(KeyCode::Enter), None);
+        assert_eq!(android_nav_named(&Key::Named(NamedKey::AppSwitch)), Some(2));
+        assert_eq!(android_nav_named(&Key::Named(NamedKey::GoBack)), Some(0));
+        assert_eq!(android_nav_named(&Key::Named(NamedKey::GoHome)), Some(1));
+        assert_eq!(android_nav_named(&Key::Named(NamedKey::Home)), None);
     }
 }
