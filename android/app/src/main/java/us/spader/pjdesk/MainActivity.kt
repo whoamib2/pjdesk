@@ -729,6 +729,7 @@ class MainActivity : FragmentActivity() {
                         reported = on
                         engine.setControl(on)
                     }
+                    us.spader.pjdesk.service.ControlNotice.sync(this@MainActivity)
                     kotlinx.coroutines.delay(1_500)
                 }
             }

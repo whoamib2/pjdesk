@@ -60,7 +60,7 @@ object ProjectionConsent {
             CapturePrompt.show(app)
             return
         }
-        HostService.arm(app)
+        HostService.consentWait(app)
         HostService.preferAutoClick = true
         armed = true
         AppLog.i("unattended access opening the screen share dialog")
@@ -72,15 +72,12 @@ object ProjectionConsent {
             AppLog.i("auto-accept could not click the screen share dialog")
             if (HostService.consentInProgress) CapturePrompt.nudge(app) else CapturePrompt.show(app)
         }
+        CapturePrompt.show(app, launch = false)
         val open = Intent(app, us.spader.pjdesk.service.CaptureConsentActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             putExtra(us.spader.pjdesk.service.CaptureConsentActivity.EXTRA_ALLOW, true)
         }
-        runCatching { app.startActivity(open) }.onFailure {
-            AppLog.i("could not open the screen share dialog")
-            armed = false
-            CapturePrompt.show(app)
-        }
+        us.spader.pjdesk.service.ConsentLaunch.open(open)
     }
 
     /** The screen was already being shared, so nobody had to tap the dialog. */

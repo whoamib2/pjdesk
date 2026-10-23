@@ -1,12 +1,12 @@
 package us.spader.pjdesk.a11y
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
+import android.os.Build
 import android.provider.Settings
 import android.graphics.Path
 import android.graphics.Rect
@@ -35,7 +35,7 @@ class PjAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         AppLog.i("accessibility service connected service=${System.identityHashCode(this)}")
         RemoteControl.service = this
-        runCatching { dropAccessibilityButton() }.onFailure { AppLog.e("accessibility button cleanup failed", it) }
+        runCatching { us.spader.pjdesk.service.ControlNotice.sync(this) }
         runCatching { (application as? PjApp)?.engine?.setControl(true) }
             .onFailure { AppLog.e("could not report control on", it) }
     }
@@ -56,6 +56,7 @@ class PjAccessibilityService : AccessibilityService() {
         releaseNodes()
         if (RemoteControl.service !== this) return
         RemoteControl.service = null
+        runCatching { us.spader.pjdesk.service.ControlNotice.sync(this) }
         runCatching { (application as? PjApp)?.engine?.setControl(false) }
             .onFailure { AppLog.e("could not report control off", it) }
     }
@@ -221,47 +222,6 @@ class PjAccessibilityService : AccessibilityService() {
         AppLog.i("global action which=$which action=$action fired=$fired")
     }
 
-    /**
-     * The floating blue button is the system accessibility shortcut. PJDesk does
-     * not request it. Clear the flag if a previous build or the system set it,
-     * and drop this service from the shortcut target list when the platform allows.
-     */
-    private fun dropAccessibilityButton() {
-        // Writing serviceInfo or the shortcut settings restarts this service.
-        // Doing it on every connect turned into control off, control on, and a
-        // new activity about every few seconds. The choice is saved before the
-        // write, so a restart cannot try again.
-        val prefs = getSharedPreferences("pjdesk", Context.MODE_PRIVATE)
-        if (prefs.getBoolean(BUTTON_CLEANUP, false)) {
-            val flags = serviceInfo?.flags ?: 0
-            val button = AccessibilityServiceInfo.FLAG_REQUEST_ACCESSIBILITY_BUTTON
-            if ((flags and button) != 0) {
-                AppLog.i("accessibility button flag is still set; leaving it so the service is not restarted")
-            }
-            return
-        }
-        prefs.edit().putBoolean(BUTTON_CLEANUP, true).commit()
-        val info = serviceInfo ?: return
-        val without = info.flags and AccessibilityServiceInfo.FLAG_REQUEST_ACCESSIBILITY_BUTTON.inv()
-        if (without != info.flags) {
-            info.flags = without
-            serviceInfo = info
-            AppLog.i("cleared the accessibility button flag")
-        }
-        val resolver = contentResolver
-        for (key in listOf("accessibility_button_targets", "accessibility_shortcut_target_service")) {
-            val current = Settings.Secure.getString(resolver, key) ?: continue
-            if (!current.contains(packageName)) continue
-            val next = current.split(':').filter { it.isNotBlank() && !it.contains(packageName) }.joinToString(":")
-            try {
-                val wrote = Settings.Secure.putString(resolver, key, next)
-                AppLog.i(if (wrote) "removed this service from $key" else "could not change $key")
-            } catch (e: SecurityException) {
-                AppLog.i("this service is still listed in $key")
-            }
-        }
-    }
-
     private fun volume(direction: Int) {
         val audio = getSystemService(AudioManager::class.java)
         audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, AudioManager.FLAG_SHOW_UI)
@@ -290,11 +250,35 @@ class PjAccessibilityService : AccessibilityService() {
             else -> null
         }
 
-        fun openSettings(context: Context) {
-            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            runCatching { context.startActivity(intent) }
+        /**
+         * The PJDesk page in Accessibility settings. Android 13 and later open
+         * that service directly. Older releases open the Accessibility list.
+         * This never writes secure settings. An update turns the service off,
+         * and only the person at the phone can turn it back on.
+         */
+        fun detailsIntent(context: Context): Intent {
+            val component = ComponentName(context, PjAccessibilityService::class.java)
+            val action = accessibilitySettingsAction(Build.VERSION.SDK_INT)
+            return Intent(action).apply {
+                if (action == DETAILS_ACTION) putExtra(Intent.EXTRA_COMPONENT_NAME, component)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
         }
 
-        private const val BUTTON_CLEANUP = "a11yButtonCleanup"
+        fun openSettings(context: Context) {
+            val primary = detailsIntent(context)
+            val opened = runCatching { context.startActivity(primary) }
+            if (opened.isSuccess) return
+            AppLog.e("could not open the PJDesk accessibility page", opened.exceptionOrNull()!!)
+            if (primary.action == Settings.ACTION_ACCESSIBILITY_SETTINGS) return
+            runCatching {
+                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }
+        }
+
+        fun accessibilitySettingsAction(sdk: Int): String =
+            if (sdk >= 33) DETAILS_ACTION else Settings.ACTION_ACCESSIBILITY_SETTINGS
+
+        private const val DETAILS_ACTION = "android.settings.ACCESSIBILITY_DETAILS_SETTINGS"
     }
 }

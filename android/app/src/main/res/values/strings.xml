@@ -18,4 +18,6 @@
     <string name="allow_screen_share">Allow screen sharing</string>
     <string name="allow_screen_share_body">Tap to share the entire screen. Android may also ask. A single app is not shared.</string>
     <string name="channel_share">Screen sharing</string>
+    <string name="channel_control">Remote control</string>
+    <string name="allow_full_screen">Allow full-screen alerts</string>
 </resources>

@@ -37,7 +37,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.19";
+pub const APP_VERSION: &str = "0.6.20";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -1313,7 +1313,7 @@ async fn host_session(
         let _ = write_msg(&mut auth.send, &HostMsg::Notice(SCREEN_WAIT.into())).await;
         emit(&cb, &json!({"event":"needCapture","text": SCREEN_WAIT, "auto": auto_share}));
         log_line(&cb, SCREEN_WAIT.to_string());
-        share_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(60));
+        share_deadline = Some(tokio::time::Instant::now() + SHARE_WAIT);
     }
     if share_deadline.is_none() {
         // Already sharing, so there is no dialog. Tell the phone this session
@@ -1362,6 +1362,7 @@ async fn host_session(
     let (mut control_send, mut control_recv) = (auth.send, auth.recv);
     let mut adapter = PointerAdapter::default();
     let mut control_warned = false;
+    let mut consent_ticks = 0u32;
     let _ = deliver_control(&state, &mut control_send, &mut control_warned).await;
     let mut greeted = auth.peer_proto < 3;
     if greeted {
@@ -1385,6 +1386,13 @@ async fn host_session(
             let _ = write_msg(&mut control_send, &HostMsg::Notice(text)).await;
         }
         if let Some(deadline) = share_deadline {
+            consent_ticks = consent_ticks.saturating_add(1);
+            if consent_ticks % CONSENT_KEEPALIVE_TICKS == 0 {
+                // Pong is ignored by the viewer. The packet keeps a 15s idle
+                // timeout from closing the session during the minute we wait.
+                let _ = write_msg(&mut control_send, &HostMsg::Pong { t_us: 0 }).await;
+                log_line(&cb, "still waiting for screen sharing");
+            }
             if state.capturing.load(Ordering::SeqCst) {
                 share_deadline = None;
                 log_line(&cb, "screen sharing is on");
@@ -1549,6 +1557,10 @@ async fn deliver_control(state: &State, send: &mut quinn::SendStream, warned: &m
 
 /// Shown to the controller until MediaProjection is producing frames.
 const SCREEN_WAIT: &str = "Waiting for the phone to allow screen sharing";
+/// How long the host keeps the session while Android's share dialog is up.
+const SHARE_WAIT: Duration = Duration::from_secs(60);
+/// A write on the control stream inside the 15 second QUIC idle timeout.
+const CONSENT_KEEPALIVE_TICKS: u32 = 20;
 
 /// A replaced Connect (`stopped`) or a dismissed password (`cancelled`) is not a failure to show.
 fn surfaced_connect_error(raw: &str) -> Option<String> {
@@ -2347,6 +2359,12 @@ mod tests {
             assert!(!host_accepts_typed(&passwords, "wrong horse battery"));
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_consent_wait_sends_a_packet_inside_the_idle_timeout() {
+        assert_eq!(SHARE_WAIT, Duration::from_secs(60));
+        assert!(CONSENT_KEEPALIVE_TICKS * 250 < 15_000);
     }
 
     #[test]

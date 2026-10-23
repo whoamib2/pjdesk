@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.IconButton
@@ -34,7 +35,7 @@ import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.DeskState
 import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.computerTitle
-import us.spader.pjdesk.core.controlStatus
+import us.spader.pjdesk.service.ControlNotice
 
 @Composable
 fun HomeScreen(
@@ -98,9 +99,18 @@ fun HomeScreen(
                 Text("Someone is viewing this phone.", Modifier.weight(1f), color = pjMuted())
                 OutlinedButton(onClick = onStop) { Text("Stop") }
             }
-            if (!(controlEnabled && controlBound)) {
-                Text(controlStatus(controlEnabled, controlBound), color = MaterialTheme.colorScheme.error)
-                OutlinedButton(onClick = onOpenControl) { Text("Open Accessibility") }
+        }
+        if (!(controlEnabled && controlBound)) {
+            Card(
+                onClick = onOpenControl,
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+            ) {
+                Text(
+                    ControlNotice.TEXT,
+                    modifier = Modifier.padding(12.dp),
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                )
             }
         }
         Card(Modifier.fillMaxWidth()) {

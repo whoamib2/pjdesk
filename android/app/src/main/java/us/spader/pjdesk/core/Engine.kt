@@ -657,6 +657,7 @@ class Engine(context: Context) : EngineListener {
                 }
             }
             "needCapture" -> {
+                us.spader.pjdesk.service.HostService.consentWait(app)
                 val saved = store.unattendedAccess
                 val passwordReady = store.permanent.isNotEmpty()
                 val accessibilityReady = PjAccessibilityService.ready(app)
@@ -680,7 +681,11 @@ class Engine(context: Context) : EngineListener {
             }
             "hosting" -> {
                 us.spader.pjdesk.service.ViewPrompt.cancel(app)
-                us.spader.pjdesk.service.CapturePrompt.cancel(app)
+                // The visitor card arrives before the picture. The share
+                // notification stays until capture is actually running.
+                if (us.spader.pjdesk.service.HostService.capturing) {
+                    us.spader.pjdesk.service.CapturePrompt.cancel(app)
+                }
                 val auto = us.spader.pjdesk.a11y.ProjectionConsent.takeAutomatic() || event.optBoolean("auto")
                 if (auto) AppLog.i(us.spader.pjdesk.a11y.ProjectionConsent.NOTICE)
                 update {

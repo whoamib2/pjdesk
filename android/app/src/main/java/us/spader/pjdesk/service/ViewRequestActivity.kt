@@ -151,8 +151,8 @@ object ViewPrompt {
             putExtra(ViewRequestActivity.EXTRA_AUTO, bypass)
         }
         val allow = Intent(open).putExtra(ViewRequestActivity.EXTRA_ALLOW, true)
-        val content = pending(app, 0, open)
-        val allowIntent = pending(app, 2, allow)
+        val content = ConsentLaunch.pending(app, 0, open)
+        val allowIntent = ConsentLaunch.pending(app, 2, allow)
         val deny = PendingIntent.getBroadcast(
             app,
             1,
@@ -173,28 +173,19 @@ object ViewPrompt {
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setContentIntent(content)
-            .setFullScreenIntent(content, true)
             .setAutoCancel(false)
             .setOngoing(true)
         if (!bypass) {
             builder.addAction(0, "Allow", allowIntent)
             builder.addAction(0, "Deny", deny)
         }
+        attachFullScreen(app, builder, content)
         manager.notify(NOTIF, builder.build())
-        runCatching { app.startActivity(open) }
+        ConsentLaunch.open(open)
     }
 
     fun cancel(context: Context) {
         context.applicationContext.getSystemService(NotificationManager::class.java).cancel(NOTIF)
-    }
-
-    private fun pending(context: Context, request: Int, intent: Intent): PendingIntent {
-        return PendingIntent.getActivity(
-            context,
-            request,
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
     }
 }
 
@@ -309,6 +300,20 @@ class CaptureConsentActivity : ComponentActivity() {
     }
 }
 
+/**
+ * The share notification stays until the session ends. A full-screen intent
+ * brings the prompt up when Android allows it. On Android 14 and later that
+ * permission is a separate grant, and the notification offers it.
+ */
+private fun attachFullScreen(app: Context, builder: NotificationCompat.Builder, content: PendingIntent) {
+    val allowed = ConsentLaunch.fullScreenAllowed(app)
+    builder.setFullScreenIntent(content, allowed)
+    if (allowed) return
+    us.spader.pjdesk.AppLog.i("full-screen alerts are off; the share prompt stays in the notification until they are allowed")
+    val grant = ConsentLaunch.pending(app, 11, ConsentLaunch.fullScreenSettings(app))
+    builder.addAction(0, app.getString(R.string.allow_full_screen), grant)
+}
+
 /** A view that has not been accepted yet must decline. A granted session reports the capture. */
 private fun refuseCapture(engine: us.spader.pjdesk.core.Engine, reason: String) {
     val waiting = HostService.acceptOnSuccess
@@ -327,8 +332,8 @@ object CapturePrompt {
             (app as PjApp).engine.setCapturing(true)
             return
         }
-        if (launch && HostService.consentInProgress) return
-        HostService.arm(app)
+        val openDialog = launch && !HostService.consentInProgress
+        HostService.consentWait(app)
         val manager = app.getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) {
             val channel = NotificationChannel(CHANNEL, app.getString(R.string.channel_share), NotificationManager.IMPORTANCE_HIGH)
@@ -340,19 +345,9 @@ object CapturePrompt {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         }
         val allow = Intent(open).putExtra(CaptureConsentActivity.EXTRA_ALLOW, true)
-        val content = PendingIntent.getActivity(
-            app,
-            3,
-            open,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val allowIntent = PendingIntent.getActivity(
-            app,
-            4,
-            allow,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val notification = NotificationCompat.Builder(app, CHANNEL)
+        val content = ConsentLaunch.pending(app, 3, open)
+        val allowIntent = ConsentLaunch.pending(app, 4, allow)
+        val builder = NotificationCompat.Builder(app, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle(app.getString(R.string.allow_screen_share))
             .setContentText(app.getString(R.string.allow_screen_share_body))
@@ -360,13 +355,12 @@ object CapturePrompt {
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setContentIntent(content)
-            .setFullScreenIntent(content, true)
             .setAutoCancel(false)
             .setOngoing(true)
             .addAction(0, app.getString(R.string.allow_screen_share), allowIntent)
-            .build()
-        manager.notify(NOTIF, notification)
-        if (launch) runCatching { app.startActivity(open) }
+        attachFullScreen(app, builder, content)
+        manager.notify(NOTIF, builder.build())
+        if (openDialog) ConsentLaunch.open(open)
     }
 
     /**
@@ -385,13 +379,13 @@ object CapturePrompt {
      */
     fun systemDialog(context: Context) {
         val app = context.applicationContext
-        HostService.arm(app)
         show(app, launch = false)
         val open = Intent(app, CaptureConsentActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             putExtra(CaptureConsentActivity.EXTRA_ALLOW, true)
         }
-        runCatching { app.startActivity(open) }
+        HostService.consentWait(app)
+        ConsentLaunch.open(open)
     }
 
     fun cancel(context: Context) {

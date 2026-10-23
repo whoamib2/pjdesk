@@ -44,6 +44,9 @@ class HostService : Service() {
     private var reported = false
     private val main = Handler(Looper.getMainLooper())
     private var wake: PowerManager.WakeLock? = null
+    /** Screen-share consent is still open. The CPU stays awake until it ends. */
+    private var waitingConsent = false
+    private var consentDrop: Runnable? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -52,6 +55,7 @@ class HostService : Service() {
             ACTION_STOP -> {
                 AppLog.i("host service stop")
                 (application as PjApp).engine.stop("The phone stopped sharing")
+                clearConsentWait()
                 releaseCapture()
                 dropWake("stop")
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -69,12 +73,17 @@ class HostService : Service() {
                 controlled = false
                 controlledBy = ""
                 automatic = false
-                if (projection == null) dropWake("idle")
+                if (projection == null && !waitingConsent) dropWake("idle")
                 show(controlled = false, projection != null)
+            }
+            ACTION_CONSENT -> {
+                armConsentWake()
+                show(controlled, projection != null)
             }
             ACTION_RELEASE -> {
                 controlled = false
                 controlledBy = ""
+                clearConsentWait()
                 releaseCapture()
                 dropWake("release")
                 show(controlled = false, capturing = false)
@@ -90,6 +99,7 @@ class HostService : Service() {
     }
 
     override fun onDestroy() {
+        clearConsentWait()
         releaseCapture()
         dropWake("destroy")
         super.onDestroy()
@@ -113,6 +123,7 @@ class HostService : Service() {
      * the service back to special-use before the new token is taken.
      */
     private fun startCapture(code: Int, data: Intent) {
+        clearConsentWait()
         holdWake("capture")
         val mine = ++generation
         reported = false
@@ -346,6 +357,7 @@ class HostService : Service() {
             startForeground(NOTIF_ID, notification)
         }
         this.controlled = controlled
+        ControlNotice.sync(this)
     }
 
     private fun notification(controlled: Boolean): Notification {
@@ -401,6 +413,32 @@ class HostService : Service() {
         if (!controlled) dropWake("capture ended")
     }
 
+    /**
+     * The QUIC idle timeout is 15 seconds. A sleeping phone stops sending
+     * keepalives and the PC closes the session while the share dialog is still
+     * waiting. Hold the CPU for the minute that dialog is allowed to take.
+     */
+    private fun armConsentWake() {
+        waitingConsent = true
+        holdWake("waiting for screen share consent")
+        consentDrop?.let { main.removeCallbacks(it) }
+        val drop = Runnable {
+            consentDrop = null
+            if (!waitingConsent || projection != null || controlled) return@Runnable
+            waitingConsent = false
+            dropWake("consent wait ended")
+        }
+        consentDrop = drop
+        main.postDelayed(drop, CONSENT_WAKE_MS)
+        AppLog.i("host staying awake while waiting for screen share consent")
+    }
+
+    private fun clearConsentWait() {
+        waitingConsent = false
+        consentDrop?.let { main.removeCallbacks(it) }
+        consentDrop = null
+    }
+
     /** Keeps the CPU awake while a session is sharing. The screen can turn off. */
     private fun holdWake(why: String) {
         if (wake?.isHeld == true) return
@@ -444,6 +482,7 @@ class HostService : Service() {
         const val ACTION_CONTROLLED = "us.spader.pjdesk.CONTROLLED"
         const val ACTION_IDLE = "us.spader.pjdesk.IDLE"
         const val ACTION_RELEASE = "us.spader.pjdesk.RELEASE"
+        const val ACTION_CONSENT = "us.spader.pjdesk.CONSENT"
         private const val EXTRA_CODE = "code"
         private const val EXTRA_DATA = "data"
         private const val EXTRA_WHO = "who"
@@ -488,9 +527,16 @@ class HostService : Service() {
         private const val PARTIAL_LIMIT = 2
         private const val REGION_WAIT_MS = 1500L
         private const val REASK_DELAY_MS = 400L
+        private const val CONSENT_WAKE_MS = 70_000L
 
         fun arm(context: Context) {
             val intent = Intent(context, HostService::class.java)
+            androidx.core.content.ContextCompat.startForegroundService(context, intent)
+        }
+
+        /** Foreground service plus a partial wake lock for the consent minute. */
+        fun consentWait(context: Context) {
+            val intent = Intent(context, HostService::class.java).setAction(ACTION_CONSENT)
             androidx.core.content.ContextCompat.startForegroundService(context, intent)
         }
 

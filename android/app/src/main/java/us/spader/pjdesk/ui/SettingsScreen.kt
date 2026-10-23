@@ -154,7 +154,9 @@ fun SettingsScreen(
         }
         Section("Control") {
             Text(controlStatus(controlEnabled, controlBound))
-            Button(onClick = onOpenControl, modifier = Modifier.fillMaxWidth()) { Text("Open Accessibility") }
+            Button(onClick = onOpenControl, modifier = Modifier.fillMaxWidth()) {
+                Text(if (controlEnabled && controlBound) "Open Accessibility" else us.spader.pjdesk.service.ControlNotice.TEXT)
+            }
         }
         Section("Security") {
             PermanentPasswordSection(
@@ -240,7 +242,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.19", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.20", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }
