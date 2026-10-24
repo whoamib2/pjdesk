@@ -11,6 +11,9 @@
 //! Double-clicking `pjdesk.exe` does both: it hosts in the background and
 //! lets you type a partner ID to control another machine.
 
+#[cfg(test)]
+mod icon_asset;
+
 mod account;
 mod audio;
 mod client_update;

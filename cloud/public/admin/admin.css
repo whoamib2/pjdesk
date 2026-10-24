@@ -48,7 +48,7 @@ button, input, select { font: inherit; color: inherit; }
   gap: 18px;
 }
 .brand { color: var(--text); text-decoration: none; font-weight: 700; font-size: 18px; display: flex; align-items: center; gap: 8px; }
-.dot { width: 10px; height: 10px; border-radius: 99px; background: var(--accent); display: inline-block; }
+.brand .logo { width: 26px; height: 26px; display: block; }
 nav { display: flex; flex-direction: column; gap: 4px; }
 nav button {
   text-align: left;
