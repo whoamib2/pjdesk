@@ -6,6 +6,7 @@
 //! block (service control, scheduled tasks, the status file) runs on a
 //! background thread; the window only reads the latest snapshot.
 
+mod applock;
 mod icons;
 mod panels;
 mod probe;
@@ -327,6 +328,32 @@ pub struct App {
     join_busy: bool,
     join_error: String,
     join_rx: Option<Receiver<InviteMsg>>,
+    /// True after the first lock of this sign-in, so a later frame does not lock again.
+    lock_armed: bool,
+    lock_ui: bool,
+    lock_pin: String,
+    lock_show: bool,
+    lock_error: String,
+    lock_busy: bool,
+    lock_forgot: bool,
+    lock_password: String,
+    lock_pass_show: bool,
+    lock_rx: Option<Receiver<applock::LockMsg>>,
+    lock_pull_rx: Option<Receiver<Result<applock::LockRemote, String>>>,
+    next_lock_pull: Instant,
+    last_input: Instant,
+    minimized_at: Option<Instant>,
+    reauth_until: Instant,
+    pin_current: String,
+    pin_new: String,
+    pin_confirm: String,
+    pin_password: String,
+    pin_show_current: bool,
+    pin_show_new: bool,
+    pin_show_confirm: bool,
+    pin_show_password: bool,
+    pin_note: String,
+    pin_idle_minutes: u32,
 }
 
 enum InviteMsg {
@@ -475,7 +502,36 @@ impl App {
             join_busy: false,
             join_error: String::new(),
             join_rx: None,
+            lock_armed: false,
+            lock_ui: false,
+            lock_pin: String::new(),
+            lock_show: false,
+            lock_error: String::new(),
+            lock_busy: false,
+            lock_forgot: false,
+            lock_password: String::new(),
+            lock_pass_show: false,
+            lock_rx: None,
+            lock_pull_rx: None,
+            next_lock_pull: Instant::now(),
+            last_input: Instant::now(),
+            minimized_at: None,
+            reauth_until: Instant::now(),
+            pin_current: String::new(),
+            pin_new: String::new(),
+            pin_confirm: String::new(),
+            pin_password: String::new(),
+            pin_show_current: false,
+            pin_show_new: false,
+            pin_show_confirm: false,
+            pin_show_password: false,
+            pin_note: String::new(),
+            pin_idle_minutes: 5,
         };
+        let lock_email = app.account_email();
+        if let Some(verifier) = app.cfg.app_lock_for(&lock_email) {
+            app.pin_idle_minutes = (verifier.idle_sec / 60).clamp(1, 24 * 60) as u32;
+        }
         if app.cfg.account.is_some() {
             app.start_token_refresh();
         }
@@ -2509,11 +2565,14 @@ impl eframe::App for App {
         self.poll_support_offer();
         self.poll_support_connect();
         self.poll_invite();
+        self.poll_app_lock();
+        self.note_lock_visibility(&ctx);
         self.notice_sign_in_paste(&ctx);
 
         if ctx
             .input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma)))
             && !self.show_settings
+            && !self.lock_ui
         {
             self.open_settings();
         }
@@ -2523,6 +2582,7 @@ impl eframe::App for App {
         for action in tray_actions {
             match action {
                 tray::Action::Show => {
+                    self.lock_from_tray();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
@@ -2562,6 +2622,14 @@ impl eframe::App for App {
             || !self.viewer_rx.is_empty()
             || !self.engine.ready;
         ctx.request_repaint_after(Duration::from_millis(if pending { 50 } else { 400 }));
+
+        if self.lock_ui && self.pin_required() {
+            self.lock_screen(ui);
+            self.consent_prompt(&ctx);
+            poll_client_heartbeat();
+            adopt_service_notice();
+            return;
+        }
 
         let p = theme::paint_ctx(&ctx);
         egui::Panel::top("topbar")

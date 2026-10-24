@@ -65,6 +65,41 @@ object CloudAuth {
         )
     }
 
+    /** Sealed app-lock blob and the account's updated time. Empty when no PIN is set. */
+    fun fetchAppLock(refresh: String, deviceId: String): Pair<String, Long> {
+        val reply = post(
+            "$API/api/network/app-lock",
+            null,
+            JSONObject().put("refresh", refresh).put("device_id", deviceId),
+        )
+        return reply.optString("lock") to reply.optLong("updated_at")
+    }
+
+    fun putAppLock(refresh: String, deviceId: String, lock: String): Long {
+        val reply = post(
+            "$API/api/network/app-lock",
+            null,
+            JSONObject().put("refresh", refresh).put("device_id", deviceId).put("lock", lock),
+        )
+        return reply.optLong("updated_at")
+    }
+
+    /** Proves the account password. The short session this creates is dropped. */
+    fun confirmPassword(email: String, password: String) {
+        val login = post(
+            "$API/api/login",
+            null,
+            JSONObject()
+                .put("email", email.trim().lowercase())
+                .put("auth_key", authKeyHex(email, password))
+                .put("device", "PJDesk PIN check"),
+        )
+        val token = login.optString("token")
+        if (token.isNotBlank()) {
+            runCatching { post("$API/api/logout", token, JSONObject()) }
+        }
+    }
+
     private fun hmac(key: ByteArray, data: String): ByteArray {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(key, "HmacSHA256"))

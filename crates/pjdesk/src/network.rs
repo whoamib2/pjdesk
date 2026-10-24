@@ -299,6 +299,48 @@ pub fn fetch_password_vault(refresh: &str, device_id: &str) -> Result<String> {
     Ok(parsed.vault)
 }
 
+pub fn fetch_app_lock(refresh: &str, device_id: &str) -> Result<(String, u64)> {
+    let text = post_json(
+        &format!("{}/api/network/app-lock", api_base()),
+        None,
+        &serde_json::json!({ "refresh": refresh, "device_id": device_id }),
+    )?;
+    let parsed: LockReply = serde_json::from_str(&text).context("the account sent an unexpected app lock")?;
+    Ok((parsed.lock, parsed.updated_at))
+}
+
+pub fn put_app_lock(refresh: &str, device_id: &str, lock: &str) -> Result<u64> {
+    let text = post_json(
+        &format!("{}/api/network/app-lock", api_base()),
+        None,
+        &serde_json::json!({ "refresh": refresh, "device_id": device_id, "lock": lock }),
+    )?;
+    let parsed: LockReply = serde_json::from_str(&text).unwrap_or(LockReply { lock: String::new(), updated_at: 0 });
+    Ok(parsed.updated_at.max(1))
+}
+
+/// Checks the account password and drops the short session that check creates.
+/// The computer's saved sign-in is left as it was.
+pub fn confirm_account_password(email: &str, password: &str) -> Result<[u8; 32]> {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() || password.is_empty() {
+        bail!("Enter your account password.");
+    }
+    let (auth, _sync) = pjdesk_proto::access::derive_account_keys(&email, password);
+    let login: LoginReply = serde_json::from_str(&post_json(
+        &format!("{}/api/login", api_base()),
+        None,
+        &serde_json::json!({
+            "email": email,
+            "auth_key": hex::encode(auth),
+            "device": "PJDesk PIN check",
+        }),
+    )?)
+    .context("unexpected reply from PJDesk")?;
+    let _ = post_json(&format!("{}/api/logout", api_base()), Some(&login.token), &serde_json::json!({}));
+    Ok(pjdesk_proto::access::derive_password_vault_key(&email, password))
+}
+
 pub fn put_password_vault(refresh: &str, device_id: &str, vault: &str) -> Result<()> {
     post_json(
         &format!("{}/api/network/passwords", api_base()),
@@ -312,6 +354,14 @@ pub fn put_password_vault(refresh: &str, device_id: &str, vault: &str) -> Result
 struct VaultReply {
     #[serde(default)]
     vault: String,
+}
+
+#[derive(Deserialize)]
+struct LockReply {
+    #[serde(default)]
+    lock: String,
+    #[serde(default)]
+    updated_at: u64,
 }
 
 fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Session> {

@@ -388,13 +388,105 @@ class Store(context: Context) {
 
     var autoLockSeconds: Int
         get() {
-            val value = prefs.getInt("autoLockSeconds", 120)
-            return if (value == 60 || value == 120 || value == 300) value else 120
+            val value = prefs.getInt("autoLockSeconds", 300)
+            return if (value == 60 || value == 120 || value == 300 || value == 900 || value == 1800) value else 300
         }
         set(value) {
-            val kept = if (value == 60 || value == 120 || value == 300) value else 120
+            val kept = if (value == 60 || value == 120 || value == 300 || value == 900 || value == 1800) value else 300
             prefs.edit().putInt("autoLockSeconds", kept).apply()
         }
+
+    var accountPinSalt: String
+        get() = prefs.getString("accountPinSalt", "") ?: ""
+        set(value) { prefs.edit().putString("accountPinSalt", value).commit() }
+
+    var accountPinHash: String
+        get() = prefs.getString("accountPinHash", "") ?: ""
+        set(value) { prefs.edit().putString("accountPinHash", value).commit() }
+
+    var accountPinIters: Int
+        get() = prefs.getInt("accountPinIters", 0)
+        set(value) { prefs.edit().putInt("accountPinIters", value).commit() }
+
+    var accountPinUpdated: Long
+        get() = prefs.getLong("accountPinUpdated", 0L)
+        set(value) { prefs.edit().putLong("accountPinUpdated", value).commit() }
+
+    var accountPinIdle: Int
+        get() = prefs.getInt("accountPinIdle", 300)
+        set(value) { prefs.edit().putInt("accountPinIdle", value).commit() }
+
+    var appLockSealed: String
+        get() = prefs.getString("appLockSealed", "") ?: ""
+        set(value) { prefs.edit().putString("appLockSealed", value).commit() }
+
+    var appLockUpdated: Long
+        get() = prefs.getLong("appLockUpdated", 0L)
+        set(value) { prefs.edit().putLong("appLockUpdated", value).commit() }
+
+    var pinLockedUntil: Long
+        get() = prefs.getLong("pinLockedUntil", 0L)
+        set(value) { prefs.edit().putLong("pinLockedUntil", value).commit() }
+
+    var bioForUpdated: Long
+        get() = prefs.getLong("bioForUpdated", 0L)
+        set(value) { prefs.edit().putLong("bioForUpdated", value).commit() }
+
+    var accountPinEmail: String
+        get() = prefs.getString("accountPinEmail", "") ?: ""
+        set(value) { prefs.edit().putString("accountPinEmail", value).commit() }
+
+    fun hasAccountPin(): Boolean {
+        val email = networkEmail.trim().lowercase()
+        return email.isNotEmpty()
+            && email == accountPinEmail.trim().lowercase()
+            && accountPinHash.length == 64
+            && accountPinSalt.isNotBlank()
+            && accountPinIters > 0
+    }
+
+    fun saveAccountPin(email: String, verifier: us.spader.pjdesk.core.AccountPin.Verifier, sealed: String, updated: Long) {
+        val idle = when (verifier.idleSec) {
+            60, 900, 1800 -> verifier.idleSec
+            else -> 300
+        }
+        prefs.edit()
+            .putString("accountPinEmail", email.trim().lowercase())
+            .putString("accountPinSalt", verifier.salt)
+            .putString("accountPinHash", verifier.hash)
+            .putInt("accountPinIters", verifier.iterations)
+            .putLong("accountPinUpdated", verifier.updated)
+            .putInt("accountPinIdle", verifier.idleSec)
+            .putString("appLockSealed", sealed)
+            .putLong("appLockUpdated", updated)
+            .putInt("pinFails", 0)
+            .putLong("pinLockedUntil", 0L)
+            .putInt("autoLockSeconds", idle)
+            .commit()
+    }
+
+    /** A sealed PIN arrived before this phone could open it. The hash stays as it was. */
+    fun notePendingAppLock(sealed: String, updated: Long) {
+        prefs.edit()
+            .putString("appLockSealed", sealed)
+            .putLong("appLockUpdated", updated)
+            .commit()
+    }
+
+    fun clearAccountPin() {
+        prefs.edit()
+            .putString("accountPinEmail", "")
+            .putString("accountPinSalt", "")
+            .putString("accountPinHash", "")
+            .putInt("accountPinIters", 0)
+            .putLong("accountPinUpdated", 0L)
+            .putString("appLockSealed", "")
+            .putLong("appLockUpdated", 0L)
+            .putLong("bioForUpdated", 0L)
+            .putInt("pinFails", 0)
+            .putLong("pinLockedUntil", 0L)
+            .commit()
+    }
 
     fun hasPin(): Boolean = pinWrap.isNotEmpty() && pinSaltBytes()?.size == 16
 

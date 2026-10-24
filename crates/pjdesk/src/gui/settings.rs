@@ -55,6 +55,10 @@ impl SettingsDraft {
         self.tab = Tab::About;
     }
 
+    pub(super) fn show_security(&mut self) {
+        self.tab = Tab::Security;
+    }
+
     /// `update_task` is the cached probe result. `None` means "still checking"
     /// — this function does not ask Windows.
     pub fn from_config(cfg: &Config, update_task: Option<bool>) -> Self {
@@ -188,13 +192,16 @@ impl App {
                                             ui.set_min_width(ui.available_width());
                                             match self.settings.tab {
                                                 Tab::General => general_tab(ui, &mut self.settings),
-                                                Tab::Security => security_tab(
-                                                    ui,
-                                                    &mut self.settings,
-                                                    self.scm_installed,
-                                                    self.scm_running,
-                                                    self.scm_known,
-                                                ),
+                                                Tab::Security => {
+                                                    self.app_lock_settings(ui);
+                                                    security_tab(
+                                                        ui,
+                                                        &mut self.settings,
+                                                        self.scm_installed,
+                                                        self.scm_running,
+                                                        self.scm_known,
+                                                    );
+                                                }
                                                 Tab::Network => self.network_tab(ui),
                                                 Tab::Display => display_tab(ui, &mut self.settings),
                                                 Tab::Account => self.account_tab(ui),

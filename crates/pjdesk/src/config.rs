@@ -51,6 +51,22 @@ pub struct Config {
     /// Hex vault key, sealed with DPAPI. Empty for a temporary sign-in.
     #[serde(default)]
     pub password_vault_key: Option<String>,
+    /// Sealed PJLOCK01 blob for the account PIN. Empty when no PIN is set.
+    #[serde(default)]
+    pub app_lock_sealed: String,
+    #[serde(default)]
+    pub app_lock_updated: u64,
+    /// Account the cached verifier belongs to.
+    #[serde(default)]
+    pub app_lock_email: String,
+    /// Opened verifier (salt and slow hash), sealed with DPAPI. Not the PIN.
+    #[serde(default)]
+    pub app_lock_verifier: Option<String>,
+    #[serde(default)]
+    pub app_lock_fails: u32,
+    /// Unix time until which more PIN tries wait. 0 when there is no wait.
+    #[serde(default)]
+    pub app_lock_until: u64,
     /// PJDesk account that owns the private server this client uses.
     #[serde(default)]
     pub network_email: Option<String>,
@@ -670,6 +686,46 @@ impl Config {
 
     /// Drops the pjdesk.com sign-in. The saved list, nicknames, stars, order,
     /// and per-computer passwords stay on this computer. Syncing stops.
+    pub fn app_lock_for(&self, email: &str) -> Option<pjdesk_proto::applock::Verifier> {
+        let email = email.trim().to_lowercase();
+        if email.is_empty() || !self.app_lock_email.eq_ignore_ascii_case(&email) {
+            return None;
+        }
+        let stored = self.app_lock_verifier.as_deref()?;
+        let text = secure::reveal(stored)?;
+        serde_json::from_str(&text).ok()
+    }
+
+    pub fn write_app_lock(&mut self, email: &str, sealed: &str, updated: u64, verifier: Option<&pjdesk_proto::applock::Verifier>) {
+        self.app_lock_email = email.trim().to_lowercase();
+        self.app_lock_sealed = sealed.to_string();
+        self.app_lock_updated = updated;
+        self.app_lock_verifier = verifier.and_then(|v| serde_json::to_string(v).ok()).map(|text| secure::protect(&text));
+        if verifier.is_none() {
+            self.app_lock_fails = 0;
+            self.app_lock_until = 0;
+        }
+    }
+
+    pub fn clear_app_lock(&mut self) {
+        self.app_lock_email.clear();
+        self.app_lock_sealed.clear();
+        self.app_lock_updated = 0;
+        self.app_lock_verifier = None;
+        self.app_lock_fails = 0;
+        self.app_lock_until = 0;
+    }
+
+    pub fn note_app_lock_fail(&mut self, fails: u32, until: u64) {
+        self.app_lock_fails = fails;
+        self.app_lock_until = until;
+    }
+
+    pub fn clear_app_lock_fails(&mut self) {
+        self.app_lock_fails = 0;
+        self.app_lock_until = 0;
+    }
+
     pub fn leave_network_sign_in(&mut self) {
         self.network_email = None;
         self.network_refresh = None;

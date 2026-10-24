@@ -172,8 +172,10 @@ fun UnlockScreen(
     error: String,
     biometrics: Boolean,
     rejectCount: Int = 0,
+    lockedOut: Boolean = false,
     onSubmit: (String) -> Unit,
     onBiometric: () -> Unit,
+    onForgot: () -> Unit = {},
 ) {
     var pin by remember { mutableStateOf("") }
     LaunchedEffect(rejectCount) {
@@ -201,8 +203,8 @@ fun UnlockScreen(
         }
         Spacer(Modifier.size(28.dp))
         PinKeypad(
-            enabled = !busy,
-            showBiometric = biometrics,
+            enabled = !busy && !lockedOut,
+            showBiometric = biometrics && !lockedOut,
             onDigit = { digit ->
                 if (pin.length >= 8) return@PinKeypad
                 val next = pin + digit
@@ -215,9 +217,10 @@ fun UnlockScreen(
         Spacer(Modifier.size(20.dp))
         Button(
             onClick = { if (AppLockPolicy.pinAcceptable(pin)) onSubmit(pin) },
-            enabled = !busy && AppLockPolicy.pinAcceptable(pin),
+            enabled = !busy && !lockedOut && AppLockPolicy.pinAcceptable(pin),
             modifier = Modifier.fillMaxWidth(),
         ) { Text(if (busy) "Checking…" else "Unlock") }
+        TextButton(onClick = onForgot, enabled = !busy) { Text("Forgot PIN? Sign in again") }
     }
 }
 
@@ -228,6 +231,7 @@ fun ReauthScreen(
     busy: Boolean,
     error: String,
     onSubmit: (String) -> Unit,
+    onCancel: (() -> Unit)? = null,
 ) {
     var password by remember { mutableStateOf("") }
     Column(
@@ -237,7 +241,7 @@ fun ReauthScreen(
         LockMark()
         Text("Sign in with your password", style = MaterialTheme.typography.headlineMedium)
         Text(
-            "The PIN was not accepted too many times, or saved passwords need your account password again. You will set a new PIN after this.",
+            "Enter your pjdesk.com password. The PIN stays the same. You can change it in Settings after this.",
             color = pjMuted(),
         )
         AccountEmailField(value = email, onValueChange = onEmail, label = "Email")
@@ -248,6 +252,7 @@ fun ReauthScreen(
             enabled = !busy && password.isNotBlank(),
             modifier = Modifier.fillMaxWidth(),
         ) { Text(if (busy) "Signing in…" else "Sign in with your password") }
+        if (onCancel != null) TextButton(onClick = onCancel, enabled = !busy) { Text("Use PIN") }
     }
 }
 

@@ -66,6 +66,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.rememberCoroutineScope
 import org.json.JSONObject
+import us.spader.pjdesk.core.AccountPin
 import us.spader.pjdesk.core.AppLockPolicy
 import us.spader.pjdesk.core.BioVault
 import us.spader.pjdesk.core.CloudAuth
@@ -246,6 +247,14 @@ class MainActivity : FragmentActivity() {
             var savePassword by remember { mutableStateOf(false) }
             var signOutWhenDone by remember { mutableStateOf(false) }
             var changingPin by remember { mutableStateOf(false) }
+            var forgotPin by remember { mutableStateOf(false) }
+            var pinPending by remember {
+                mutableStateOf(
+                    app.store.appLockSealed.isNotBlank() && app.store.appLockUpdated > 0L
+                        && !app.store.hasAccountPin() && !app.store.hasPin(),
+                )
+            }
+            var pinFormError by remember { mutableStateOf("") }
             var confirmUnattended by remember { mutableStateOf(false) }
             var unattendedPin by remember { mutableStateOf("") }
             var pinRejects by remember { mutableIntStateOf(0) }
@@ -1058,6 +1067,7 @@ class MainActivity : FragmentActivity() {
                         app.bioPrompt = false
                         app.holdVaultKey(key)
                         app.store.pinFails = 0
+                        app.store.pinLockedUntil = 0L
                         lockError = ""
                         app.markUnlocked()
                         syncPasswords(!temporarySession)
@@ -1069,7 +1079,54 @@ class MainActivity : FragmentActivity() {
                     },
                 )
             }
+            fun notePinMiss() {
+                val fails = app.store.pinFails + 1
+                app.store.pinFails = fails
+                val wait = AppLockPolicy.lockoutSeconds(fails)
+                if (wait > 0) app.store.pinLockedUntil = System.currentTimeMillis() + wait * 1000L
+                pinRejects++
+                lockError = if (wait >= 60) {
+                    val minutes = (wait + 59) / 60
+                    "Too many tries. Try again in $minutes minute${if (minutes == 1) "" else "s"}."
+                } else if (wait > 0) {
+                    "Too many tries. Try again in $wait seconds."
+                } else {
+                    "Wrong PIN. ${AppLockPolicy.MAX_FAILS - fails} left before a wait."
+                }
+                AppLog.i("app pin rejected fails=$fails")
+            }
             fun submitPin(pin: String) {
+                if (app.store.pinLockedUntil > System.currentTimeMillis()) return
+                if (app.store.hasAccountPin()) {
+                    lockBusy = true
+                    lockError = ""
+                    scope.launch {
+                        val ok = withContext(Dispatchers.IO) {
+                            AccountPin.matches(pin, app.store.accountPinSalt, app.store.accountPinHash, app.store.accountPinIters)
+                        }
+                        if (!ok) {
+                            lockBusy = false
+                            notePinMiss()
+                            return@launch
+                        }
+                        val salt = app.store.pinSaltBytes()
+                        val wrapped = app.store.pinWrap
+                        val key = if (salt != null && wrapped.isNotBlank()) {
+                            withContext(Dispatchers.IO) { PinWrap.unwrap(wrapped, pin, salt) }
+                        } else {
+                            null
+                        }
+                        lockBusy = false
+                        app.store.pinFails = 0
+                        app.store.pinLockedUntil = 0L
+                        if (key != null) app.holdVaultKey(key)
+                        lockError = ""
+                        forgotPin = false
+                        app.markUnlocked()
+                        syncPasswords(!temporarySession)
+                    }
+                    return
+                }
                 val salt = app.store.pinSaltBytes()
                 val wrapped = app.store.pinWrap
                 if (salt == null || wrapped.isBlank()) return
@@ -1079,18 +1136,11 @@ class MainActivity : FragmentActivity() {
                     val key = withContext(Dispatchers.IO) { PinWrap.unwrap(wrapped, pin, salt) }
                     lockBusy = false
                     if (key == null) {
-                        val fails = app.store.pinFails + 1
-                        app.store.pinFails = fails
-                        pinRejects++
-                        lockError = if (fails >= AppLockPolicy.MAX_FAILS) {
-                            ""
-                        } else {
-                            "Wrong PIN. ${AppLockPolicy.MAX_FAILS - fails} left."
-                        }
-                        AppLog.i("app pin rejected fails=$fails")
+                        notePinMiss()
                         return@launch
                     }
                     app.store.pinFails = 0
+                    app.store.pinLockedUntil = 0L
                     app.holdVaultKey(key)
                     lockError = ""
                     app.markUnlocked()
@@ -1171,31 +1221,30 @@ class MainActivity : FragmentActivity() {
                 scope.launch {
                     val result = withContext(Dispatchers.IO) {
                         runCatching {
-                            val device = app.store.networkDeviceId.ifBlank {
-                                UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
-                            }
-                            val signed = CloudAuth.signIn(email, password, device, "Android")
-                            signed to CloudAuth.vaultKey(email, password)
+                            CloudAuth.confirmPassword(email, password)
+                            CloudAuth.vaultKey(email, password)
                         }
                     }
                     lockBusy = false
-                    result.onSuccess { (signed, key) ->
-                        commitAutofill()
-                        val who = signed.email.ifBlank { email }
-                        app.store.networkEmail = who
-                        account = who
-                        netEmail = who
-                        if (signed.refresh.isNotBlank()) app.store.saveNetworkRefresh(signed.refresh)
-                        rememberAccountServer(signed.address, signed.fingerprint, signed.lan, signed.publicIp)
-                        cloudAccess = signed.access
-                        engine.command(JSONObject().put("cmd", "accessToken").put("token", signed.access).toString())
-                        app.store.clearPinMaterial()
-                        BioVault.forget()
+                    result.onSuccess { key ->
                         app.holdVaultKey(key)
+                        val lock = app.store.appLockSealed
+                        if (lock.isNotBlank()) {
+                            val verifier = runCatching { AccountPin.open(key, lock) }.getOrNull()
+                            if (verifier != null) {
+                                app.store.saveAccountPin(email, verifier, lock, app.store.appLockUpdated)
+                            } else if (!app.store.hasAccountPin()) {
+                                lockError = "That PIN was sealed with a different account password."
+                                return@onSuccess
+                            }
+                        }
                         app.store.pinFails = 0
+                        app.store.pinLockedUntil = 0L
                         vaultRejected = false
                         lockError = ""
                         changingPin = false
+                        forgotPin = false
+                        pinPending = false
                         app.markUnlocked()
                     }.onFailure {
                         lockError = it.message ?: "Could not sign in."
@@ -1204,21 +1253,172 @@ class MainActivity : FragmentActivity() {
             }
             LaunchedEffect(account, temporarySession, uiUnlocked) {
                 val persistent = account.isNotEmpty() && !temporarySession
-                if (!persistent || uiUnlocked || vaultRejected || !app.store.hasPin()) return@LaunchedEffect
-                if (app.store.pinFails >= AppLockPolicy.MAX_FAILS) return@LaunchedEffect
-                if (!app.store.biometricsOn || app.store.bioWrap.isBlank()) return@LaunchedEffect
+                val bioMatches = !app.store.hasAccountPin() || app.store.bioForUpdated == app.store.accountPinUpdated
+                if (!persistent || uiUnlocked || !app.store.biometricsOn || app.store.bioWrap.isBlank() || !bioMatches) return@LaunchedEffect
+                if (app.store.pinLockedUntil > System.currentTimeMillis()) return@LaunchedEffect
                 tryBio()
+            }
+            fun pullAppLock() {
+                val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                val device = app.store.networkDeviceId
+                if (refresh.isBlank() || device.isBlank()) return
+                scope.launch {
+                    val remote = withContext(Dispatchers.IO) {
+                        runCatching { CloudAuth.fetchAppLock(refresh, device) }
+                    }.getOrNull() ?: return@launch
+                    val (lock, updated) = remote
+                    if (updated < app.store.appLockUpdated) return@launch
+                    if (updated == app.store.appLockUpdated && lock == app.store.appLockSealed) return@launch
+                    if (lock.isBlank()) {
+                        if (updated == 0L) return@launch
+                        app.store.clearAccountPin()
+                        app.store.clearPinMaterial()
+                        BioVault.forget()
+                        pinPending = false
+                        app.markUnlocked()
+                        return@launch
+                    }
+                    val key = app.vaultKey
+                    if (key == null) {
+                        if (!app.store.hasAccountPin() && !app.store.hasPin()) {
+                            app.store.notePendingAppLock(lock, updated)
+                            pinPending = true
+                        }
+                        return@launch
+                    }
+                    val verifier = runCatching { AccountPin.open(key, lock) }.getOrNull()
+                    if (verifier == null) {
+                        if (!app.store.hasAccountPin() && !app.store.hasPin()) {
+                            app.store.notePendingAppLock(lock, updated)
+                            pinPending = true
+                        }
+                        return@launch
+                    }
+                    val changed = app.store.hasAccountPin() && app.store.accountPinHash != verifier.hash
+                    app.store.saveAccountPin(account.ifBlank { netEmail }, verifier, lock, updated)
+                    pinPending = false
+                    if (changed) {
+                        app.store.bioWrap = ""
+                        app.store.bioForUpdated = 0L
+                        app.lockUi()
+                    }
+                }
+            }
+            LaunchedEffect(account, temporarySession) {
+                if (account.isBlank() || temporarySession) return@LaunchedEffect
+                while (true) {
+                    pullAppLock()
+                    delay(45_000)
+                }
+            }
+            LaunchedEffect(bumps, uiUnlocked, account) {
+                if (!uiUnlocked || account.isBlank() || temporarySession) return@LaunchedEffect
+                if (!app.store.hasAccountPin() && !app.store.hasPin()) return@LaunchedEffect
+                delay(app.store.autoLockSeconds * 1000L)
+                if (app.uiUnlocked.value && !app.bioPrompt) app.lockUi()
+            }
+            fun saveAccountPin(current: String, password: String, newPin: String, idleSec: Int, enableBio: Boolean) {
+                val email = netEmail.ifBlank { account }.trim()
+                lockBusy = true
+                pinFormError = ""
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching {
+                            val key = if (password.isNotBlank()) {
+                                CloudAuth.confirmPassword(email, password)
+                                CloudAuth.vaultKey(email, password)
+                            } else {
+                                app.vaultKey?.copyOf() ?: error("Enter your account password.")
+                            }
+                            if (app.store.hasAccountPin()) {
+                                if (current.isBlank() && password.isBlank()) error("Enter the current PIN or your account password.")
+                                if (password.isBlank() && !AccountPin.matches(current, app.store.accountPinSalt, app.store.accountPinHash, app.store.accountPinIters)) {
+                                    error("That PIN is wrong.")
+                                }
+                            } else if (password.isBlank()) {
+                                error("Enter your account password.")
+                            }
+                            val verifier = AccountPin.create(newPin, idleSec, System.currentTimeMillis() / 1000)
+                            val sealed = AccountPin.seal(key, verifier)
+                            val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                            val device = app.store.networkDeviceId
+                            if (refresh.isBlank() || device.isBlank()) error("Sign in again, then set the PIN.")
+                            val updated = CloudAuth.putAppLock(refresh, device, sealed)
+                            Triple(key, verifier, sealed to updated)
+                        }
+                    }
+                    lockBusy = false
+                    result.onSuccess { (key, verifier, stored) ->
+                        val (sealed, updated) = stored
+                        app.store.saveAccountPin(email, verifier, sealed, updated)
+                        val salt = PinWrap.newSalt()
+                        app.store.savePinSalt(salt)
+                        app.store.pinWrap = PinWrap.wrap(key, newPin, salt)
+                        app.holdVaultKey(key)
+                        pinFormError = ""
+                        if (enableBio && BioVault.available(this@MainActivity)) {
+                            app.bioPrompt = true
+                            BioVault.sealWithAuth(
+                                this@MainActivity,
+                                key,
+                                onSealed = { wrap ->
+                                    app.bioPrompt = false
+                                    app.store.bioWrap = wrap
+                                    app.store.biometricsOn = true
+                                    app.store.bioForUpdated = updated
+                                },
+                                onCancel = { app.bioPrompt = false },
+                                onError = {
+                                    app.bioPrompt = false
+                                    pinFormError = it
+                                },
+                            )
+                        }
+                    }.onFailure {
+                        pinFormError = it.message ?: "Could not save the PIN."
+                    }
+                }
+            }
+            fun removeAccountPin(current: String, password: String) {
+                val email = netEmail.ifBlank { account }.trim()
+                lockBusy = true
+                pinFormError = ""
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching {
+                            if (password.isNotBlank()) CloudAuth.confirmPassword(email, password)
+                            else if (!AccountPin.matches(current, app.store.accountPinSalt, app.store.accountPinHash, app.store.accountPinIters)) {
+                                error("That PIN is wrong.")
+                            }
+                            val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                            val device = app.store.networkDeviceId
+                            if (refresh.isBlank() || device.isBlank()) error("Sign in again, then remove the PIN.")
+                            CloudAuth.putAppLock(refresh, device, "")
+                        }
+                    }
+                    lockBusy = false
+                    result.onSuccess {
+                        app.store.clearAccountPin()
+                        app.store.clearPinMaterial()
+                        BioVault.forget()
+                        pinFormError = ""
+                        app.markUnlocked()
+                    }.onFailure {
+                        pinFormError = it.message ?: "Could not remove the PIN."
+                    }
+                }
             }
             PjTheme(theme.value) {
                 val session = state.session
                 val persistent = account.isNotEmpty() && !temporarySession
                 val bioAvailable = BioVault.available(this@MainActivity)
+                val pinWait = app.store.pinLockedUntil > System.currentTimeMillis()
                 val gate = when {
                     !persistent -> null
-                    vaultRejected || (app.store.hasPin() && app.store.pinFails >= AppLockPolicy.MAX_FAILS) -> "reauth"
-                    !app.store.hasPin() -> "pin"
-                    !uiUnlocked -> "unlock"
+                    forgotPin -> "reauth"
                     changingPin -> "change"
+                    (app.store.hasAccountPin() || app.store.hasPin()) && !uiUnlocked -> "unlock"
+                    pinPending && !uiUnlocked -> "reauth"
                     else -> null
                 }
                 if (gate == "pin" || gate == "change") {
@@ -1247,10 +1447,13 @@ class MainActivity : FragmentActivity() {
                     UnlockScreen(
                         busy = lockBusy,
                         error = lockError,
-                        biometrics = bioAvailable && app.store.biometricsOn && app.store.bioWrap.isNotBlank(),
+                        biometrics = bioAvailable && app.store.biometricsOn && app.store.bioWrap.isNotBlank()
+                            && (!app.store.hasAccountPin() || app.store.bioForUpdated == app.store.accountPinUpdated),
                         rejectCount = pinRejects,
+                        lockedOut = pinWait,
                         onSubmit = { submitPin(it) },
                         onBiometric = { tryBio() },
+                        onForgot = { forgotPin = true; lockError = "" },
                     )
                 } else if (gate == "reauth") {
                     ReauthScreen(
@@ -1259,6 +1462,11 @@ class MainActivity : FragmentActivity() {
                         busy = lockBusy,
                         error = lockError,
                         onSubmit = { reauth(it) },
+                        onCancel = if (forgotPin) {
+                            { forgotPin = false; lockError = "" }
+                        } else {
+                            null
+                        },
                     )
                 } else if (session != null) {
                     val sessionDecoder = remember {
@@ -1690,11 +1898,17 @@ class MainActivity : FragmentActivity() {
                                     onShareLogs = { AppLog.share(this@MainActivity) },
                                     onCheckUpdate = { engine.checkForUpdate() },
                                     signedIn = account.isNotEmpty() && !temporarySession,
-                                    hasPin = app.store.hasPin(),
+                                    hasPin = app.store.hasPin() || app.store.hasAccountPin(),
                                     biometricsOn = app.store.biometricsOn,
                                     biometricsAvailable = BioVault.available(this@MainActivity),
                                     autoLockSeconds = app.store.autoLockSeconds,
                                     onChangePin = { changingPin = true; lockError = "" },
+                                    onSaveAccountPin = { current, password, pin, idle, bio ->
+                                        saveAccountPin(current, password, pin, idle, bio)
+                                    },
+                                    onRemoveAccountPin = { current, password -> removeAccountPin(current, password) },
+                                    pinBusy = lockBusy,
+                                    pinError = pinFormError,
                                     onToggleBiometrics = { enabled ->
                                         if (!enabled) {
                                             app.store.biometricsOn = false
@@ -1723,7 +1937,29 @@ class MainActivity : FragmentActivity() {
                                             }
                                         }
                                     },
-                                    onAutoLock = { app.store.autoLockSeconds = it },
+                                    onAutoLock = { seconds ->
+                                        app.store.autoLockSeconds = seconds
+                                        val key = app.vaultKey
+                                        if (app.store.hasAccountPin() && key != null) {
+                                            val email = account.ifBlank { netEmail }
+                                            val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                                            val device = app.store.networkDeviceId
+                                            scope.launch(Dispatchers.IO) {
+                                                runCatching {
+                                                    val verifier = AccountPin.Verifier(
+                                                        app.store.accountPinSalt,
+                                                        app.store.accountPinHash,
+                                                        app.store.accountPinIters,
+                                                        seconds,
+                                                        System.currentTimeMillis() / 1000,
+                                                    )
+                                                    val sealed = AccountPin.seal(key, verifier)
+                                                    val updated = CloudAuth.putAppLock(refresh, device, sealed)
+                                                    app.store.saveAccountPin(email, verifier, sealed, updated)
+                                                }
+                                            }
+                                        }
+                                    },
                                     remote = remote,
                                     onRemote = {
                                         remote = it

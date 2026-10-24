@@ -375,6 +375,22 @@ function cleanComputer(row) {
 }
 
 /** Fields the account stores for one saved computer. Passwords are not among them. */
+/** Null when `text` is empty or a sealed PJLOCK01 blob. A string is the reason to reject it. */
+export function acceptLock(text) {
+  if (text == null || text === "") return null;
+  if (typeof text !== "string") return "That app lock is not valid.";
+  if (text.length > 8000) return "That app lock is too large.";
+  let raw;
+  try {
+    raw = atob(text);
+  } catch {
+    return "That app lock is not valid.";
+  }
+  if (raw.length < 8 + 12 + 16) return "That app lock is not valid.";
+  if (raw.slice(0, 8) !== "PJLOCK01") return "That app lock is not valid.";
+  return null;
+}
+
 /** Null when `text` is empty or a sealed PJVAULT1 blob. A string is the reason to reject it. */
 export function acceptVault(text) {
   if (text == null || text === "") return null;
@@ -989,6 +1005,7 @@ async function handle(request, env, url) {
   if (p === "/api/network/enroll" && m === "POST") return enroll(request, env);
   if (p === "/api/network/refresh" && m === "POST") return refresh(request, env);
   if (p === "/api/network/passwords" && m === "POST") return passwordVault(request, env);
+  if (p === "/api/network/app-lock" && m === "POST") return appLock(request, env);
   if (p === "/api/network/redeem" && m === "POST") return redeem(request, env);
   if (p === "/api/network/computers/delete" && m === "POST") return deleteComputer(request, env);
 
@@ -1312,6 +1329,44 @@ async function passwordVault(request, env) {
     return json({ vault: row?.ciphertext || "", updated_at: row?.updated_at || 0 });
   } catch (err) {
     if (/no such table/i.test(String(err?.message || err))) return json({ vault: "", updated_at: 0 });
+    throw err;
+  }
+}
+
+async function appLock(request, env) {
+  const body = await readJson(request);
+  const device = await openedDevice(env, body);
+  if (Object.prototype.hasOwnProperty.call(body, "lock")) {
+    const lock = String(body.lock ?? "");
+    const problem = acceptLock(lock);
+    if (problem) throw new HttpError(400, problem);
+    const updated = now();
+    try {
+      await env.DB.prepare(
+        `INSERT INTO network_app_lock (network_id, account_id, ciphertext, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(network_id, account_id) DO UPDATE SET
+           ciphertext = excluded.ciphertext, updated_at = excluded.updated_at`,
+      )
+        .bind(device.networkId, device.accountId, lock, updated)
+        .run();
+    } catch (err) {
+      if (/no such table/i.test(String(err?.message || err))) {
+        throw new HttpError(503, "App lock is not ready yet. Run cloud\\deploy.cmd.");
+      }
+      throw err;
+    }
+    return json({ ok: true, updated_at: updated });
+  }
+  try {
+    const row = await env.DB.prepare(
+      "SELECT ciphertext, updated_at FROM network_app_lock WHERE network_id = ? AND account_id = ?",
+    )
+      .bind(device.networkId, device.accountId)
+      .first();
+    return json({ lock: row?.ciphertext || "", updated_at: row?.updated_at || 0 });
+  } catch (err) {
+    if (/no such table/i.test(String(err?.message || err))) return json({ lock: "", updated_at: 0 });
     throw err;
   }
 }
