@@ -8,11 +8,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -38,7 +40,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.DeskState
 import us.spader.pjdesk.core.SavedComputer
-import us.spader.pjdesk.core.computerTitle
 import us.spader.pjdesk.service.ControlNotice
 
 @Composable
@@ -63,6 +64,7 @@ fun HomeScreen(
     temporary: Boolean = false,
     recent: List<SavedComputer> = emptyList(),
     onRecent: (String) -> Unit = {},
+    selfId: String = "",
     controlEnabled: Boolean = true,
     controlBound: Boolean = true,
     onOpenControl: () -> Unit = {},
@@ -92,9 +94,11 @@ fun HomeScreen(
     val starting = state.status.startsWith("Starting PJDesk") ||
         state.status.startsWith("Connecting") ||
         state.status.startsWith("Getting your PJDesk server")
+    val self = selfId.filter { it.isDigit() }
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 16.dp, vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -280,14 +284,16 @@ fun HomeScreen(
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Connect with code") }
         if (recent.isNotEmpty()) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Recent", style = MaterialTheme.typography.titleMedium)
+            Column(Modifier.fillMaxWidth()) {
                 recent.take(3).forEach { computer ->
-                    FilterChip(
-                        selected = false,
-                        onClick = { onRecent(computer.id.filter { it.isDigit() }.take(9)) },
-                        label = {
-                            Text(computerTitle(computer), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        },
+                    val mine = self.isNotBlank() && computer.id.filter { it.isDigit() } == self
+                    ComputerRow(
+                        computer = computer,
+                        mine = mine,
+                        showMenu = false,
+                        inset = 0.dp,
+                        onConnect = { onRecent(computer.id.filter { it.isDigit() }.take(9)) },
                     )
                 }
             }
@@ -306,27 +312,19 @@ private fun inviteLeft(expiresAt: Long, now: Long): String {
 
 @Composable
 private fun Glyph(kind: String) {
-    val c = MaterialTheme.colorScheme.onSurface
-    androidx.compose.foundation.Canvas(Modifier.size(22.dp)) {
-        val paint = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx())
-        when (kind) {
-            "copy" -> {
-                drawRoundRect(c, topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.28f, size.height * 0.18f), size = androidx.compose.ui.geometry.Size(size.width * 0.5f, size.height * 0.58f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(3f, 3f), style = paint)
-                drawRoundRect(c, topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.16f, size.height * 0.32f), size = androidx.compose.ui.geometry.Size(size.width * 0.5f, size.height * 0.5f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(3f, 3f), style = paint)
-            }
-            "show", "hide" -> {
-                drawOval(c, topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.1f, size.height * 0.32f), size = androidx.compose.ui.geometry.Size(size.width * 0.8f, size.height * 0.36f), style = paint)
-                drawCircle(c, radius = size.minDimension * 0.08f, center = center)
-                if (kind == "hide") {
-                    drawLine(c, androidx.compose.ui.geometry.Offset(size.width * 0.18f, size.height * 0.78f), androidx.compose.ui.geometry.Offset(size.width * 0.82f, size.height * 0.22f), strokeWidth = 2.dp.toPx())
-                }
-            }
-            else -> {
-                drawArc(c, startAngle = 40f, sweepAngle = 280f, useCenter = false, topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.2f, size.height * 0.2f), size = androidx.compose.ui.geometry.Size(size.width * 0.6f, size.height * 0.6f), style = paint)
-                drawLine(c, androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.12f), androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.32f), strokeWidth = 2.dp.toPx())
-            }
-        }
+    val icon = when (kind) {
+        "copy" -> PjIcons.Copy
+        "show" -> PjIcons.Show
+        "hide" -> PjIcons.Hide
+        else -> PjIcons.Refresh
     }
+    val description = when (kind) {
+        "copy" -> "Copy"
+        "show" -> "Show"
+        "hide" -> "Hide"
+        else -> "Refresh"
+    }
+    Icon(icon, contentDescription = description, tint = MaterialTheme.colorScheme.onSurface)
 }
 
 /** Groups of three digits. The field value stays raw digits, so the caret does not fight the spaces. */

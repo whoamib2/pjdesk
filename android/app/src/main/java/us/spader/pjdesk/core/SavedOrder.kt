@@ -22,6 +22,18 @@ enum class SavedFilter(val storage: String) {
     }
 }
 
+/** Big tiles, small tiles, or the compact list. List is the default. */
+enum class SavedView(val storage: String) {
+    List("list"),
+    Small("small"),
+    Big("big"),
+    ;
+
+    companion object {
+        fun fromStorage(value: String?): SavedView = entries.firstOrNull { it.storage == value } ?: List
+    }
+}
+
 fun computerTitle(computer: SavedComputer): String {
     val nick = computer.nickname()
     val host = computer.hostname.trim()
@@ -137,4 +149,40 @@ fun arrangeSaved(
     if (self.isEmpty()) return ordered
     val (mine, others) = ordered.partition { it.id.filter { ch -> ch.isDigit() } == self }
     return others + mine
+}
+
+/** `user@host` on a big tile. The host is the computer name when no hostname is known. */
+fun tileCaption(computer: SavedComputer): String {
+    val host = computer.hostname.trim().ifBlank {
+        computer.displayName.trim().ifBlank {
+            computer.nickname().ifBlank { formatSavedId(computer.id) }
+        }
+    }
+    val user = computer.consoleUser.trim()
+    return if (user.isEmpty()) host else "$user@$host"
+}
+
+/**
+ * Computers heard on the LAN, in beacon order. A saved record supplies the
+ * platform. This phone is left out. The same ID is kept once.
+ */
+fun discoveredComputers(
+    sights: List<LanSight>,
+    saved: List<SavedComputer>,
+    selfId: String,
+): List<SavedComputer> {
+    val self = selfId.filter { it.isDigit() }
+    val out = LinkedHashMap<String, SavedComputer>()
+    for (sight in sights) {
+        val id = sight.id.filter { it.isDigit() }
+        if (id.length != 9 || id == self) continue
+        val known = saved.find { it.id.filter { ch -> ch.isDigit() } == id }
+        val host = sight.name.trim()
+        out[id] = if (known == null) {
+            SavedComputer(id = id, hostname = host, online = true)
+        } else {
+            known.copy(online = true, hostname = known.hostname.ifBlank { host })
+        }
+    }
+    return out.values.toList()
 }

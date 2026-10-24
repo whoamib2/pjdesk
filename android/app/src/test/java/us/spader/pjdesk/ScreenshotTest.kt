@@ -7,11 +7,20 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -24,8 +33,11 @@ import us.spader.pjdesk.core.DeskState
 import us.spader.pjdesk.core.DisplayInfo
 import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.SessionInfo
+import us.spader.pjdesk.core.SavedView
+import us.spader.pjdesk.ui.ComputerRow
 import us.spader.pjdesk.ui.HomeScreen
 import us.spader.pjdesk.ui.OnboardingScreen
+import us.spader.pjdesk.ui.PjBottomBar
 import us.spader.pjdesk.ui.PjTheme
 import us.spader.pjdesk.ui.SavedScreen
 import us.spader.pjdesk.ui.SignInScreen
@@ -63,6 +75,41 @@ class ScreenshotTest {
 
     @Test
     fun savedLight() = shot("saved-light", "light") { savedList() }
+
+    @Test
+    fun savedBenDark() = shot("saved-ben-dark", "dark", check = ::tilesPresent) { shell { benSaved() } }
+
+    @Test
+    fun savedBenLight() = shot("saved-ben-light", "light", check = ::tilesPresent) { shell { benSaved() } }
+
+    @Test
+    fun savedSmallDark() = shot("saved-small-dark", "dark", check = ::tilesPresent) {
+        shell { benSaved(view = SavedView.Small) }
+    }
+
+    @Test
+    fun savedBigLight() = shot("saved-big-light", "light", check = ::tilesPresent) {
+        shell { benSaved(view = SavedView.Big) }
+    }
+
+    @Test
+    fun discoveredDark() = shot("discovered-dark", "dark", check = ::tilesPresent) {
+        shell {
+            benSaved(
+                discovered = listOf(
+                    SavedComputer("111555694", hostname = "Office PC", osFamily = "windows", osVersion = "11", online = true),
+                    SavedComputer("555000111", hostname = "Pixel-8", osFamily = "android", osVersion = "15", online = true),
+                ),
+                initialPage = 2,
+            )
+        }
+    }
+
+    @Test
+    fun homeRecentDark() = shot("home-recent-dark", "dark", check = ::tilesPresent) { recentBlock() }
+
+    @Test
+    fun homeRecentLight() = shot("home-recent-light", "light", check = ::tilesPresent) { recentBlock() }
 
     @Composable
     private fun savedList() {
@@ -230,7 +277,108 @@ class ScreenshotTest {
         )
     }
 
-    private fun shot(name: String, theme: String = "dark", content: @Composable () -> Unit) {
+    @OptIn(ExperimentalMaterial3Api::class)
+    @Composable
+    private fun shell(content: @Composable () -> Unit) {
+        Scaffold(
+            containerColor = MaterialTheme.colorScheme.background,
+            topBar = {
+                TopAppBar(
+                    title = { Text("Saved computers") },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.background,
+                        titleContentColor = MaterialTheme.colorScheme.onBackground,
+                    ),
+                )
+            },
+            bottomBar = { PjBottomBar(selected = 1, onSelect = {}) },
+        ) { padding ->
+            Box(Modifier.padding(padding)) { content() }
+        }
+    }
+
+    @Composable
+    private fun benSaved(
+        view: SavedView = SavedView.List,
+        discovered: List<SavedComputer> = emptyList(),
+        initialPage: Int = 0,
+    ) {
+        val now = System.currentTimeMillis() / 1000
+        SavedScreen(
+            computers = listOf(
+                SavedComputer("692996394", "Ben Lenovo Desk Home", "windows", "11", hostname = "BENLENOVODESK", online = true),
+                SavedComputer("902488771", "Cabin Desk", "windows", "11", hostname = "CABINDESK", online = false, lastSeen = now - 3600),
+                SavedComputer("622775091", hostname = "BEN-SURFACE-9", osFamily = "windows", osVersion = "11", online = false, lastSeen = now - 6 * 3600),
+                SavedComputer("610978221", hostname = "CHIP20", osFamily = "windows", osVersion = "11", online = true),
+                SavedComputer("386626882", "Pixel 11 Pro XL", "android", "14", hostname = "Pixel", online = false, lastSeen = now - 4 * 86400),
+                SavedComputer("482636105", "Ben Pixel 11", "android", "17", hostname = "Ben Pixel 11", online = true),
+            ),
+            query = "",
+            onQuery = {},
+            onForget = {},
+            selfId = "482636105",
+            view = view,
+            discovered = discovered,
+            initialPage = initialPage,
+        )
+    }
+
+    @Composable
+    private fun recentBlock() {
+        val rows = listOf(
+            SavedComputer("692996394", "Ben Lenovo Desk Home", "windows", "11", hostname = "BENLENOVODESK", online = true),
+            SavedComputer("902488771", "Cabin Desk", "windows", "11", hostname = "CABINDESK", online = false),
+            SavedComputer("482636105", "Ben Pixel 11", "android", "17", hostname = "Ben Pixel 11", online = true),
+        )
+        Column(
+            Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background),
+        ) {
+            Text("Recent", modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.titleMedium)
+            rows.forEach { computer ->
+                ComputerRow(
+                    computer = computer,
+                    mine = computer.id == "482636105",
+                    showMenu = false,
+                    onConnect = {},
+                )
+            }
+        }
+    }
+
+    private fun tilesPresent(bitmap: Bitmap) {
+        val palette = intArrayOf(
+            0x5C3A2E, 0x7A2E45, 0x5B3A78, 0x1F4D3A, 0x3D2F6B, 0x6B2D4A,
+            0x1E4A55, 0x3D454D, 0x8A5A1E, 0x2C4A6E, 0x2E4A32, 0x6E3A22,
+        )
+        assertTrue("colored tile", palette.any { hasColor(bitmap, it) })
+        assertTrue("accent connect", hasColor(bitmap, 0x4D9BFF) || hasColor(bitmap, 0x2F6FED))
+    }
+
+    private fun hasColor(bitmap: Bitmap, rgb: Int): Boolean {
+        val target = 0xFF000000.toInt() or rgb
+        var y = 0
+        while (y < bitmap.height) {
+            var x = 0
+            while (x < bitmap.width) {
+                val pixel = bitmap.getPixel(x, y)
+                if (near(pixel, target)) return true
+                x += 3
+            }
+            y += 3
+        }
+        return false
+    }
+
+    private fun near(pixel: Int, target: Int): Boolean {
+        fun ch(value: Int, shift: Int) = (value shr shift) and 0xFF
+        return kotlin.math.abs(ch(pixel, 16) - ch(target, 16)) < 12 &&
+            kotlin.math.abs(ch(pixel, 8) - ch(target, 8)) < 12 &&
+            kotlin.math.abs(ch(pixel, 0) - ch(target, 0)) < 12
+    }
+
+    private fun shot(name: String, theme: String = "dark", check: ((Bitmap) -> Unit)? = null, content: @Composable () -> Unit) {
         val activity = Robolectric.buildActivity(ComponentActivity::class.java).setup().get()
         activity.setContent { PjTheme(theme = theme) { content() } }
         ShadowLooper.idleMainLooper()
@@ -246,6 +394,7 @@ class ScreenshotTest {
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         view.draw(Canvas(bitmap))
         assertTrue("$name rendered a blank bitmap", hasInk(bitmap))
+        check?.invoke(bitmap)
         val dir = File("/opt/cursor/artifacts/screenshots")
         dir.mkdirs()
         File(dir, "pjdesk-android-$name.png").outputStream().use {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.26
+
+Windows is 0.6.26. Android is 0.6.26 (versionCode 62600). cloud/ did not change. No migration and no worker change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Do not run `cloud\deploy.cmd`. The phone needs 62600. The Windows version string moves with this build; the window layout did not change. This machine has no Pixel attached, so the phone screens were rendered headlessly in dark and light.
+
+* Saved computers use a rounded colored tile. The color is the same one the desktop picks from the ID. The mark on the tile is white: four panes for Windows, a phone for Android, a monitor when the system is unknown. A green dot with a ring means online. A grey dot means offline. The rows stay compact. This phone is a chip. Connect is a filled accent play button. The same tile is on the Home recent list and on Discovered. Discovered lists PJDesk computers heard on the local network. Big tiles, small tiles, and List are at the top and the choice is remembered. List is still the default. The bottom bar and the header icons are Material Symbols Rounded.
+
 ## 0.6.25
 
 Windows is 0.6.25. Android is 0.6.25 (versionCode 62500) for the corrected icon. cloud/ changed: the pjdesk.com favicon and header logo only. No migration and no worker change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Run `cloud\deploy.cmd` so the site shows the icon. The phone needs 62500. The Windows client and PJDesk Server need a rebuild for the exe, tray, and window icons. This machine has no Windows PC attached, so the window was not clicked through here.

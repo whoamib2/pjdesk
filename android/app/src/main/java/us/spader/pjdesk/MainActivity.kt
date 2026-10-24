@@ -30,13 +30,6 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.ui.Alignment
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.List
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.Icon
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -52,6 +45,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
@@ -84,9 +78,12 @@ import us.spader.pjdesk.ui.SetPinScreen
 import us.spader.pjdesk.ui.SignInScreen
 import us.spader.pjdesk.ui.UnlockScreen
 import java.util.UUID
+import us.spader.pjdesk.core.LanListen
 import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.SavedFilter
 import us.spader.pjdesk.core.SavedSort
+import us.spader.pjdesk.core.SavedView
+import us.spader.pjdesk.core.discoveredComputers
 import us.spader.pjdesk.data.SavedListPrefs
 import us.spader.pjdesk.core.nickname
 import us.spader.pjdesk.a11y.PjAccessibilityService
@@ -96,6 +93,7 @@ import us.spader.pjdesk.media.ScreenDecoder
 import us.spader.pjdesk.service.HostService
 import us.spader.pjdesk.ui.HomeScreen
 import us.spader.pjdesk.ui.OnboardingScreen
+import us.spader.pjdesk.ui.PjBottomBar
 import us.spader.pjdesk.ui.PjTheme
 import us.spader.pjdesk.ui.QrScan
 import us.spader.pjdesk.ui.SavedScreen
@@ -210,6 +208,7 @@ class MainActivity : FragmentActivity() {
             val listPrefs = remember { SavedListPrefs(applicationContext) }
             val savedSort by listPrefs.sort.collectAsStateWithLifecycle(SavedSort.Recent)
             val savedFilter by listPrefs.filter.collectAsStateWithLifecycle(SavedFilter.All)
+            val savedView by listPrefs.view.collectAsStateWithLifecycle(SavedView.List)
             val snackbar = remember { SnackbarHostState() }
             var tab by remember { mutableIntStateOf(0) }
             var connectId by remember { mutableStateOf("") }
@@ -217,6 +216,16 @@ class MainActivity : FragmentActivity() {
             var query by remember { mutableStateOf("") }
             var saved by remember { mutableStateOf(app.store.saved()) }
             var recentIds by remember { mutableStateOf(app.store.recentIds()) }
+            var discovered by remember { mutableStateOf<List<SavedComputer>>(emptyList()) }
+            val savedNow = rememberUpdatedState(saved)
+            val selfNow = rememberUpdatedState(state.id)
+            DisposableEffect(Unit) {
+                val listen = LanListen(applicationContext) { sights ->
+                    discovered = discoveredComputers(sights, savedNow.value, selfNow.value)
+                }
+                listen.start()
+                onDispose { listen.stop() }
+            }
             var trustedAccounts by remember { mutableStateOf(app.store.trustedAccounts()) }
             var trustedComputers by remember { mutableStateOf(app.store.trustedComputers()) }
             var showOnboarding by remember { mutableStateOf(!app.store.onboarded) }
@@ -1694,29 +1703,7 @@ class MainActivity : FragmentActivity() {
                             )
                         },
                         bottomBar = {
-                            NavigationBar(containerColor = androidx.compose.material3.MaterialTheme.colorScheme.surface) {
-                                NavigationBarItem(
-                                    selected = tab == 0,
-                                    onClick = { tab = 0 },
-                                    icon = { Icon(Icons.Filled.Home, contentDescription = null) },
-                                    label = { Text("Home") },
-                                    alwaysShowLabel = true,
-                                )
-                                NavigationBarItem(
-                                    selected = tab == 1,
-                                    onClick = { tab = 1 },
-                                    icon = { Icon(Icons.Filled.List, contentDescription = null) },
-                                    label = { Text("Saved") },
-                                    alwaysShowLabel = true,
-                                )
-                                NavigationBarItem(
-                                    selected = tab == 2,
-                                    onClick = { tab = 2 },
-                                    icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
-                                    label = { Text("Settings") },
-                                    alwaysShowLabel = true,
-                                )
-                            }
+                            PjBottomBar(selected = tab, onSelect = { tab = it })
                         },
                     ) { padding ->
                         androidx.compose.foundation.layout.Box(Modifier.padding(padding)) {
@@ -1748,6 +1735,7 @@ class MainActivity : FragmentActivity() {
                                     temporary = temporarySession,
                                     recent = saved.filter { recentIds.contains(it.id) }.take(3),
                                     onRecent = { beginConnect(it) },
+                                    selfId = state.id,
                                     onRefreshSupport = { engine.refreshSupport() },
                                     onSupportConnect = { code, password ->
                                         if (code.length != 8 || password.isBlank()) {
@@ -1831,6 +1819,9 @@ class MainActivity : FragmentActivity() {
                                     filter = savedFilter,
                                     onSort = { chosen -> scope.launch { listPrefs.setSort(chosen) } },
                                     onFilter = { chosen -> scope.launch { listPrefs.setFilter(chosen) } },
+                                    view = savedView,
+                                    onView = { chosen -> scope.launch { listPrefs.setView(chosen) } },
+                                    discovered = discovered,
                                     onConnect = { beginConnect(it.id) },
                                     onForget = {
                                         app.store.forget(it.id)
