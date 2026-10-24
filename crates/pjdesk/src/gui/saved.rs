@@ -15,6 +15,7 @@ pub enum SavedSort {
     Order,
 }
 
+#[derive(Clone)]
 pub struct SavedRow {
     pub id: String,
     /// User-typed name. Empty when they have not set one.
@@ -37,6 +38,105 @@ pub struct SavedRow {
     /// Name chosen on that computer. A nickname typed here replaces it on this row only.
     pub display_name: String,
     pub in_book: bool,
+    /// Direct LAN address (`host:port`). Set only for a computer found on this network.
+    pub direct: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SavedView {
+    List,
+    Small,
+    Big,
+}
+
+pub fn parse_saved_view(text: &str) -> SavedView {
+    match text.trim() {
+        "small" => SavedView::Small,
+        "big" => SavedView::Big,
+        _ => SavedView::List,
+    }
+}
+
+pub fn saved_view_key(view: SavedView) -> &'static str {
+    match view {
+        SavedView::List => "list",
+        SavedView::Small => "small",
+        SavedView::Big => "big",
+    }
+}
+
+/// Pleasant tile colors. The same id always picks the same one.
+const TILE_PALETTE: [egui::Color32; 12] = [
+    egui::Color32::from_rgb(0x5c, 0x3a, 0x2e),
+    egui::Color32::from_rgb(0x7a, 0x2e, 0x45),
+    egui::Color32::from_rgb(0x5b, 0x3a, 0x78),
+    egui::Color32::from_rgb(0x1f, 0x4d, 0x3a),
+    egui::Color32::from_rgb(0x3d, 0x2f, 0x6b),
+    egui::Color32::from_rgb(0x6b, 0x2d, 0x4a),
+    egui::Color32::from_rgb(0x1e, 0x4a, 0x55),
+    egui::Color32::from_rgb(0x3d, 0x45, 0x4d),
+    egui::Color32::from_rgb(0x8a, 0x5a, 0x1e),
+    egui::Color32::from_rgb(0x2c, 0x4a, 0x6e),
+    egui::Color32::from_rgb(0x2e, 0x4a, 0x32),
+    egui::Color32::from_rgb(0x6e, 0x3a, 0x22),
+];
+
+/// ID when there is one, otherwise the name. Spaces are ignored.
+pub fn tile_key(id: &str, name: &str) -> String {
+    let compact: String = id.chars().filter(|c| !c.is_whitespace()).collect();
+    if !compact.is_empty() {
+        compact.to_ascii_lowercase()
+    } else {
+        name.trim().to_ascii_lowercase()
+    }
+}
+
+pub fn tile_index(key: &str) -> usize {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in key.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash as usize % TILE_PALETTE.len()
+}
+
+pub fn tile_color(key: &str) -> egui::Color32 {
+    TILE_PALETTE[tile_index(key)]
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatusTone {
+    /// Online, or this computer.
+    Ok,
+    /// Offline.
+    Warn,
+}
+
+pub fn status_tone(online: bool, this_computer: bool) -> StatusTone {
+    if this_computer || online {
+        StatusTone::Ok
+    } else {
+        StatusTone::Warn
+    }
+}
+
+/// `user@host` shown on a colored tile. The host is the computer name when no hostname is known.
+pub fn tile_caption(user: &str, hostname: &str, display_name: &str, nickname: &str, id: &str) -> String {
+    let host = if !hostname.trim().is_empty() {
+        hostname.trim().to_string()
+    } else if !display_name.trim().is_empty() {
+        display_name.trim().to_string()
+    } else if !nickname.trim().is_empty() {
+        nickname.trim().to_string()
+    } else {
+        format_id(id)
+    };
+    let user = user.trim();
+    if user.is_empty() {
+        host
+    } else {
+        format!("{user}@{host}")
+    }
 }
 
 pub fn os_icon(family: &str) -> Icon {
@@ -104,24 +204,45 @@ impl App {
         let p = theme::paint(ui);
         let mut submitted = false;
         theme::card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                for (tab, label) in [
-                    (super::DeskTab::Saved, "Saved"),
-                    (super::DeskTab::Recent, "Recent"),
-                    (super::DeskTab::Lan, "On this network"),
-                ] {
-                    let selected = self.desk_tab == tab;
-                    let text = if selected {
-                        RichText::new(label).strong().color(p.text)
-                    } else {
-                        RichText::new(label).color(p.muted)
-                    };
-                    let fill = if selected { p.elev } else { egui::Color32::TRANSPARENT };
-                    if ui.add(egui::Button::new(text).fill(fill).frame(selected)).clicked() {
-                        self.desk_tab = tab;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (tab, label) in [
+                        (super::DeskTab::Saved, "Saved"),
+                        (super::DeskTab::Recent, "Recent"),
+                        (super::DeskTab::Lan, "Discovered"),
+                    ] {
+                        let selected = self.desk_tab == tab;
+                        if tab == super::DeskTab::Lan {
+                            let color = if selected { p.text } else { p.muted };
+                            let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                            super::icons::paint(ui.painter(), icon_rect, Icon::Compass, color);
+                        }
+                        let text = if selected {
+                            RichText::new(label).strong().color(p.text)
+                        } else {
+                            RichText::new(label).color(p.muted)
+                        };
+                        let fill = if selected { p.elev } else { egui::Color32::TRANSPARENT };
+                        if ui.add(egui::Button::new(text).fill(fill).frame(selected)).clicked() {
+                            self.desk_tab = tab;
+                        }
                     }
-                }
+                });
+                let current = parse_saved_view(&self.cfg.settings.saved_view);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (view, icon, tip) in [
+                        (SavedView::Big, Icon::ViewBig, "Big tiles"),
+                        (SavedView::Small, Icon::ViewSmall, "Small tiles"),
+                        (SavedView::List, Icon::ViewList, "List"),
+                    ] {
+                        if widgets::icon_button_active(ui, icon, tip, current == view).clicked() {
+                            self.set_saved_view(view);
+                        }
+                    }
+                });
             });
             ui.add_space(6.0);
             if self.desk_tab == super::DeskTab::Saved {
@@ -135,8 +256,13 @@ impl App {
                 }
             } else if self.desk_tab == super::DeskTab::Recent {
                 ui.label(widgets::muted(ui, "Computers you have connected to on this computer."));
+            } else if self.cfg.settings.discover_lan {
+                ui.label(widgets::muted(
+                    ui,
+                    "PJDesk computers on this network. Connecting asks for that computer's password and goes directly over the LAN. No account is required.",
+                ));
             } else {
-                ui.label(widgets::muted(ui, "PJDesk computers that answered on this network."));
+                ui.label(widgets::muted(ui, "LAN discovery is turned off in Settings."));
             }
             ui.add_space(6.0);
             let search = widgets::text_field(ui, &mut self.saved_query, "Search nickname, name, ID, or OS", false);
@@ -177,26 +303,47 @@ impl App {
         let query = self.saved_query.clone();
         rows.retain(|r| query_matches(&query, &r.nickname, &r.hostname, &r.id, &r.os_family, &r.console_user));
         sort_rows(&mut rows, self.saved_sort);
-        if submitted {
-            if let Some(first) = rows.iter().find(|r| !r.this_computer) {
-                let id = first.id.clone();
-                self.connect_to(&id, None, false);
-            }
+        let submitted_cmd = if submitted { rows.iter().find(|r| !r.this_computer).map(connect_cmd) } else { None };
+        if let Some(cmd) = submitted_cmd {
+            self.apply_saved(cmd);
         }
 
+        let view = parse_saved_view(&self.cfg.settings.saved_view);
         theme::card(ui, |ui| {
             if rows.is_empty() {
-                ui.label(widgets::muted(ui, "No saved computers match."));
+                let msg = if !query.trim().is_empty() {
+                    "No computers match."
+                } else if self.desk_tab == super::DeskTab::Lan {
+                    if self.cfg.settings.discover_lan {
+                        "No PJDesk computers have answered on this network yet."
+                    } else {
+                        "LAN discovery is turned off in Settings."
+                    }
+                } else {
+                    "No saved computers match."
+                };
+                ui.label(widgets::muted(ui, msg));
                 return;
             }
-            egui::ScrollArea::vertical().id_salt("saved-rows").auto_shrink([false, false]).show(ui, |ui| {
-                let available = ui.available_width();
-                let width = if available.is_finite() { (available - ROW_GUTTER).max(0.0) } else { 640.0 };
-                let layout = saved_layout(width);
+            let salt = match view {
+                SavedView::List => "saved-rows",
+                SavedView::Small => "saved-small",
+                SavedView::Big => "saved-big",
+            };
+            egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]).show(ui, |ui| {
                 let mut action: Option<RowCmd> = None;
-                saved_header(ui, width, &layout);
-                for row in &rows {
-                    self.saved_row(ui, row, width, &layout, &mut action);
+                match view {
+                    SavedView::List => {
+                        let available = ui.available_width();
+                        let width = if available.is_finite() { (available - ROW_GUTTER).max(0.0) } else { 640.0 };
+                        let layout = saved_layout(width);
+                        saved_header(ui, width, &layout);
+                        for row in &rows {
+                            self.saved_row(ui, row, width, &layout, &mut action);
+                        }
+                    }
+                    SavedView::Small => self.tile_grid(ui, &rows, false, &mut action),
+                    SavedView::Big => self.tile_grid(ui, &rows, true, &mut action),
                 }
                 if let Some(cmd) = action {
                     self.apply_saved(cmd);
@@ -250,6 +397,7 @@ impl App {
                 sort_order: note.map(|n| n.sort_order).unwrap_or(0),
                 display_name: note.map(|n| n.display_name.clone()).unwrap_or_default(),
                 in_book: entry.is_some(),
+                direct: None,
             });
         }
         rows
@@ -257,7 +405,7 @@ impl App {
 
     fn lan_rows(&self) -> Vec<SavedRow> {
         let mut rows = Vec::new();
-        for (name, id, _addr) in &self.lan {
+        for (name, id, addr) in &self.lan {
             let id = normalize_id(id);
             if !pjdesk_proto::is_valid_id(&id) {
                 continue;
@@ -285,9 +433,19 @@ impl App {
                 sort_order: note.map(|n| n.sort_order).unwrap_or(0),
                 display_name: note.map(|n| n.display_name.clone()).unwrap_or_default(),
                 in_book: entry.is_some() && !self.cfg.is_saved_hidden(&id),
+                direct: Some(addr.clone()),
             });
         }
         rows
+    }
+
+    fn set_saved_view(&mut self, view: SavedView) {
+        let key = saved_view_key(view);
+        if self.cfg.settings.saved_view == key {
+            return;
+        }
+        self.cfg.settings.saved_view = key.to_string();
+        self.save_cfg();
     }
 
     /// Adds a computer from Recent or On this network to the saved list.
@@ -326,16 +484,11 @@ impl App {
         }
         let id = row.id.clone();
         if row_resp.double_clicked() && self.renaming.as_deref() != Some(id.as_str()) {
-            if let Some(kind) = primary_action(row.this_computer, &row.os_family) {
-                *action = Some(match kind {
-                    PrimaryAction::Connect => RowCmd::Connect(id.clone()),
-                    PrimaryAction::View => RowCmd::View(id.clone()),
-                });
-            }
+            *action = primary_cmd(row);
         }
         let slots = column_slots(rect, layout);
         in_rect(ui, slots.icon, (&id, "icon"), |ui| {
-            paint_icon(ui, ui.max_rect(), Icon::Monitor, p.muted);
+            paint_list_avatar(ui, ui.max_rect(), row);
         });
         let renaming = self.renaming.as_deref() == Some(id.as_str());
         if renaming {
@@ -427,7 +580,7 @@ impl App {
                         let resp = widgets::icon_button(ui, Icon::Go, tip);
                         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip));
                         if resp.clicked() {
-                            *action = Some(if android { RowCmd::View(id.to_string()) } else { RowCmd::Connect(id.to_string()) });
+                            *action = Some(if android { RowCmd::View(id.to_string()) } else { connect_cmd(row) });
                         }
                     }
                 } else if row.this_computer {
@@ -437,7 +590,7 @@ impl App {
                         *action = Some(RowCmd::View(id.to_string()));
                     }
                 } else if ui.button("Connect").clicked() {
-                    *action = Some(RowCmd::Connect(id.to_string()));
+                    *action = Some(connect_cmd(row));
                 }
             });
         });
@@ -446,6 +599,13 @@ impl App {
             ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button("Menu", |ui| {
+                    self.menu_items(ui, row, id, action);
+                });
+            });
+        });
+    }
+
+    fn menu_items(&mut self, ui: &mut egui::Ui, row: &SavedRow, id: &str, action: &mut Option<RowCmd>) {
                     if !row.this_computer && ui.button("Request view access").clicked() {
                         *action = Some(RowCmd::View(id.to_string()));
                         ui.close();
@@ -490,14 +650,132 @@ impl App {
                         *action = Some(RowCmd::DeleteAccount(id.to_string()));
                         ui.close();
                     }
-                });
+    }
+
+    fn tile_grid(&mut self, ui: &mut egui::Ui, rows: &[SavedRow], big: bool, action: &mut Option<RowCmd>) {
+        let gap = 10.0;
+        let min_w = if big { 300.0 } else { 230.0 };
+        let avail = ui.available_width();
+        let avail = if avail.is_finite() { avail.max(min_w) } else { min_w * 2.0 + gap };
+        let cols = ((avail + gap) / (min_w + gap)).floor().max(1.0) as usize;
+        let card_w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).max(1.0);
+        let card_h = if big { 228.0 } else { 148.0 };
+        ui.horizontal_wrapped(|ui| {
+            ui.set_max_width(avail);
+            ui.spacing_mut().item_spacing = Vec2::splat(gap);
+            for row in rows {
+                self.tile_card(ui, row, card_w, card_h, big, action);
+            }
+        });
+    }
+
+    fn tile_card(&mut self, ui: &mut egui::Ui, row: &SavedRow, w: f32, h: f32, big: bool, action: &mut Option<RowCmd>) {
+        let p = theme::paint(ui);
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+        let id = row.id.clone();
+        if resp.double_clicked() && self.renaming.as_deref() != Some(id.as_str()) {
+            if let Some(cmd) = primary_cmd(row) {
+                *action = Some(cmd);
+            }
+        }
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, egui::CornerRadius::same(12), p.text.linear_multiply(0.04));
+        }
+        let color = tile_color(&tile_key(&row.id, &row.hostname));
+        let header_h = if big { h * 0.70 } else { h * 0.60 };
+        let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), header_h));
+        let footer = Rect::from_min_max(Pos2::new(rect.left(), header.bottom()), rect.right_bottom());
+        ui.painter().rect_filled(
+            header,
+            egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 },
+            color,
+        );
+        let foot = if resp.hovered() { p.elev } else { p.card };
+        ui.painter().rect_filled(footer, egui::CornerRadius { nw: 0, ne: 0, sw: 12, se: 12 }, foot);
+        ui.painter().rect_stroke(rect, egui::CornerRadius::same(12), egui::Stroke::new(1.0, p.line), egui::StrokeKind::Inside);
+
+        let caption = tile_caption(&row.console_user, &row.hostname, &row.display_name, &row.nickname, &row.id);
+        let icon_side = if big { 72.0 } else { 36.0 };
+        let icon_y = if big { header.center().y - 16.0 } else { header.top() + header_h * 0.38 };
+        let icon_rect = Rect::from_center_size(Pos2::new(header.center().x, icon_y), Vec2::splat(icon_side));
+        super::icons::paint(ui.painter(), icon_rect, os_icon(&row.os_family), egui::Color32::WHITE);
+        let text_rect = Rect::from_min_max(
+            Pos2::new(header.left() + 10.0, icon_rect.bottom() + 2.0),
+            Pos2::new(header.right() - 10.0, header.bottom() - 6.0),
+        );
+        in_rect(ui, text_rect, (&id, "cap"), |ui| {
+            ui.set_min_width(text_rect.width().max(0.0));
+            ui.set_max_width(text_rect.width().max(0.0));
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(caption).color(egui::Color32::WHITE).size(if big { 14.0 } else { 12.0 }))
+                        .truncate(),
+                );
             });
+        });
+
+        let dot = status_color(ui, row);
+        ui.painter().circle_filled(Pos2::new(footer.left() + 16.0, footer.center().y), 4.5, dot);
+        let menu_w = 32.0;
+        let connect_w = if big { 96.0 } else { 36.0 };
+        let right = footer.right() - 4.0;
+        let menu_rect = Rect::from_min_max(Pos2::new(right - menu_w, footer.top()), Pos2::new(right, footer.bottom()));
+        let connect_rect = Rect::from_min_max(Pos2::new(menu_rect.left() - connect_w - 2.0, footer.top()), menu_rect.left_bottom());
+        let name_rect = Rect::from_min_max(Pos2::new(footer.left() + 28.0, footer.top()), Pos2::new(connect_rect.left() - 4.0, footer.bottom()));
+        let renaming = self.renaming.as_deref() == Some(id.as_str());
+        if renaming {
+            if name_editor(ui, name_rect, &id, &mut self.rename_text) {
+                *action = Some(RowCmd::CommitRename(id.clone()));
+            }
+        } else {
+            let primary = row_primary_name(row);
+            let placeholder = primary == "No name yet";
+            in_rect(ui, name_rect, (&id, "tile-name"), |ui| {
+                ui.set_max_width(name_rect.width().max(0.0));
+                let color = if placeholder { p.muted } else { p.text };
+                ui.add(egui::Label::new(RichText::new(primary).color(color).size(13.0)).truncate());
+            });
+        }
+        let android = row.os_family.eq_ignore_ascii_case("android");
+        in_rect(ui, connect_rect, (&id, "tile-connect"), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if row.this_computer {
+                    if big {
+                        ui.add_enabled(false, egui::Button::new("Connect"));
+                    } else {
+                        let (r, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                        super::icons::paint(ui.painter(), r.shrink(6.0), Icon::Go, p.muted);
+                        resp.on_hover_text("This computer");
+                    }
+                } else if big {
+                    let label = if android { "View" } else { "Connect" };
+                    if ui.button(label).clicked() {
+                        *action = Some(if android { RowCmd::View(id.clone()) } else { connect_cmd(row) });
+                    }
+                } else {
+                    let tip = if android { "View phone" } else { "Connect" };
+                    let resp = widgets::icon_button(ui, Icon::Go, tip);
+                    if resp.clicked() {
+                        *action = Some(if android { RowCmd::View(id.clone()) } else { connect_cmd(row) });
+                    }
+                }
+            });
+        });
+        in_rect(ui, menu_rect, (&id, "tile-menu"), |ui| {
+            let button = egui::Button::new(" ").min_size(Vec2::splat(28.0)).frame(false);
+            let (resp, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+                self.menu_items(ui, row, &id, action);
+            });
+            let color = if resp.hovered() { p.text } else { p.muted };
+            super::icons::paint(ui.painter(), resp.rect.shrink(6.0), Icon::Dots, color);
+            resp.on_hover_text("Menu");
         });
     }
 
     fn apply_saved(&mut self, cmd: RowCmd) {
         match cmd {
             RowCmd::Connect(id) => self.connect_to(&id, None, false),
+            RowCmd::Direct(id, addr) => self.connect_discovered(&id, &addr),
             RowCmd::View(id) => self.request_view(&id),
             RowCmd::Files(id) => self.connect_to(&id, None, false),
             RowCmd::Save(id) => self.save_computer(&id),
@@ -656,7 +934,9 @@ impl App {
         let mut close = false;
         let mut go = false;
         let mut ask_person = false;
-        let name = if self.prompt_direct.is_some() {
+        let direct_addr = self.prompt_direct.clone();
+        let named_peer = direct_addr.is_some() && pjdesk_proto::is_valid_id(&self.prompt_id);
+        let name = if direct_addr.is_some() && !named_peer {
             self.prompt_id.clone()
         } else {
             self.row_title(&self.prompt_id)
@@ -667,7 +947,15 @@ impl App {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                let id_line = if self.prompt_direct.is_some() { self.prompt_id.clone() } else { format_id(&self.prompt_id) };
+                let id_line = if let Some(addr) = &direct_addr {
+                    if named_peer {
+                        format!("{} · {addr}", format_id(&self.prompt_id))
+                    } else {
+                        self.prompt_id.clone()
+                    }
+                } else {
+                    format_id(&self.prompt_id)
+                };
                 ui.label(RichText::new(id_line).monospace().color(theme::paint(ui).muted));
                 if self.prompt_rejected {
                     ui.add_space(4.0);
@@ -688,17 +976,24 @@ impl App {
                 let resp = widgets::password_field(ui, &mut self.prompt_password, "Computer password", &mut self.prompt_show);
                 ui.add_space(4.0);
                 widgets::checkbox(ui, &mut self.prompt_remember, "Save password for this computer");
-                ui.label(widgets::muted(
-                    ui,
-                    "The password on this computer, not your PJDesk account. Saved on this computer only, and not uploaded.",
-                ));
+                if direct_addr.is_some() {
+                    ui.label(widgets::muted(
+                        ui,
+                        "That computer's permanent password, or a one-time support code. No PJDesk account is required. The connection stays on this network, and discovery never includes the password.",
+                    ));
+                } else {
+                    ui.label(widgets::muted(
+                        ui,
+                        "The password on this computer, not your PJDesk account. Saved on this computer only, and not uploaded.",
+                    ));
+                }
                 ui.add_space(8.0);
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         close = true;
                     }
-                    if !self.prompt_checking && ui.button("Ask to connect instead").clicked() {
+                    if !self.prompt_checking && !named_peer && ui.button("Ask to connect instead").clicked() {
                         ask_person = true;
                     }
                     if !self.prompt_checking && (widgets::accent_button(ui, "Connect", Vec2::new(120.0, 36.0)) || enter) {
@@ -748,8 +1043,8 @@ impl App {
                 self.prompt_rejected = false;
                 self.ask_alive = false;
                 self.ask_path = None;
-                if self.prompt_direct.is_some() {
-                    self.spawn_direct_with_password(&id, &pw);
+                if let Some(addr) = self.prompt_direct.clone() {
+                    self.spawn_direct_with_password(&addr, &pw);
                 } else {
                     self.spawn_viewer(&id, &pw, files, remember, false);
                 }
@@ -758,8 +1053,11 @@ impl App {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum RowCmd {
     Connect(String),
+    /// Computer id and the direct LAN address. Asks for that computer's password.
+    Direct(String, String),
     View(String),
     Files(String),
     Save(String),
@@ -831,6 +1129,44 @@ fn system_label(family: &str, version: &str) -> String {
 enum PrimaryAction {
     Connect,
     View,
+}
+
+fn connect_cmd(row: &SavedRow) -> RowCmd {
+    match row.direct.as_deref().map(str::trim).filter(|addr| !addr.is_empty()) {
+        Some(addr) => RowCmd::Direct(row.id.clone(), addr.to_string()),
+        None => RowCmd::Connect(row.id.clone()),
+    }
+}
+
+fn primary_cmd(row: &SavedRow) -> Option<RowCmd> {
+    match primary_action(row.this_computer, &row.os_family) {
+        Some(PrimaryAction::Connect) => Some(connect_cmd(row)),
+        Some(PrimaryAction::View) => Some(RowCmd::View(row.id.clone())),
+        None => None,
+    }
+}
+
+fn row_primary_name(row: &SavedRow) -> String {
+    if !row.nickname.is_empty() {
+        row.nickname.clone()
+    } else if !row.display_name.is_empty() {
+        row.display_name.clone()
+    } else if !row.hostname.is_empty() {
+        row.hostname.clone()
+    } else {
+        "No name yet".into()
+    }
+}
+
+fn paint_list_avatar(ui: &egui::Ui, rect: Rect, row: &SavedRow) {
+    let color = tile_color(&tile_key(&row.id, &row.hostname));
+    let side = 26.0_f32.min((rect.height() - 8.0).max(8.0)).min(rect.width().max(8.0));
+    let avatar = Rect::from_center_size(rect.center(), Vec2::splat(side));
+    ui.painter().rect_filled(avatar, egui::CornerRadius::same(6), color);
+    super::icons::paint(ui.painter(), avatar.shrink(5.0), os_icon(&row.os_family), egui::Color32::WHITE);
+    let at = Pos2::new(avatar.right() - 1.0, avatar.bottom() - 1.0);
+    ui.painter().circle_filled(at, 4.2, theme::paint(ui).card);
+    ui.painter().circle_filled(at, 3.0, status_color(ui, row));
 }
 
 /// What a double-click on the row does. This computer does not connect to itself.
@@ -1120,12 +1456,9 @@ fn status_text(row: &SavedRow) -> String {
 
 fn status_color(ui: &egui::Ui, row: &SavedRow) -> egui::Color32 {
     let p = theme::paint(ui);
-    if row.this_computer {
-        p.accent
-    } else if row.online {
-        p.ok
-    } else {
-        p.muted
+    match status_tone(row.online, row.this_computer) {
+        StatusTone::Ok => p.ok,
+        StatusTone::Warn => p.warn,
     }
 }
 
@@ -1271,6 +1604,7 @@ mod tests {
                 sort_order: 0,
                 display_name: String::new(),
                 in_book: true,
+                direct: None,
             },
             SavedRow {
                 id: "111111111".into(),
@@ -1288,6 +1622,7 @@ mod tests {
                 sort_order: 0,
                 display_name: String::new(),
                 in_book: true,
+                direct: None,
             },
         ];
         sort_rows(&mut rows, SavedSort::Name);
@@ -1382,5 +1717,88 @@ mod tests {
         assert!(user > last && last > sys && sys > id && id > status, "hide order user {user} last {last} sys {sys} id {id} status {status}");
         assert!(!saved_layout(COMPACT_BELOW).compact_connect);
         assert!(saved_layout(COMPACT_BELOW - 1.0).compact_connect);
+    }
+
+    #[test]
+    fn tile_color_stays_with_the_id() {
+        assert_eq!(tile_index(&tile_key("692996394", "CABINDESK")), tile_index("692996394"));
+        assert_eq!(tile_index("692 996 394"), tile_index("692996394"));
+        let mut seen = std::collections::BTreeSet::new();
+        for id in ["692996394", "622775091", "902488771", "386626882", "482636105", "111111111", "222222222"] {
+            seen.insert(tile_index(id));
+        }
+        assert!(seen.len() > 1, "palette collapsed: {seen:?}");
+        assert_eq!(tile_key("", "Cabindesk"), "cabindesk");
+        assert_eq!(tile_index(&tile_key("", "Cabindesk")), tile_index("cabindesk"));
+        assert_eq!(tile_color("692996394"), tile_color("692996394"));
+    }
+
+    #[test]
+    fn offline_dot_is_the_warn_tone() {
+        assert_eq!(status_tone(true, false), StatusTone::Ok);
+        assert_eq!(status_tone(false, true), StatusTone::Ok);
+        assert_eq!(status_tone(false, false), StatusTone::Warn);
+    }
+
+    #[test]
+    fn saved_view_defaults_to_the_list() {
+        assert_eq!(parse_saved_view(""), SavedView::List);
+        assert_eq!(parse_saved_view("list"), SavedView::List);
+        assert_eq!(parse_saved_view("nope"), SavedView::List);
+        assert_eq!(parse_saved_view("small"), SavedView::Small);
+        assert_eq!(parse_saved_view("big"), SavedView::Big);
+        assert_eq!(saved_view_key(SavedView::List), "list");
+        assert_eq!(saved_view_key(SavedView::Small), "small");
+        assert_eq!(saved_view_key(SavedView::Big), "big");
+        let settings: crate::config::Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.discover_lan);
+        assert!(settings.allow_direct);
+        assert_eq!(parse_saved_view(&settings.saved_view), SavedView::List);
+        let mut off = settings;
+        off.discover_lan = false;
+        let args = crate::HostArgs::from_settings(&off);
+        assert!(!args.discover_lan);
+        assert!(args.allow_direct);
+    }
+
+    #[test]
+    fn discovered_connect_uses_the_lan_address() {
+        let saved = sample_row("692996394", None);
+        assert!(matches!(connect_cmd(&saved), RowCmd::Connect(id) if id == "692996394"));
+        let found = sample_row("692996394", Some("192.168.1.20:21201"));
+        match connect_cmd(&found) {
+            RowCmd::Direct(id, addr) => {
+                assert_eq!(id, "692996394");
+                assert_eq!(addr, "192.168.1.20:21201");
+            }
+            other => panic!("expected a direct connect, got {other:?}"),
+        }
+        assert!(matches!(primary_cmd(&found), Some(RowCmd::Direct(_, _))));
+        let mut here = found.clone();
+        here.this_computer = true;
+        assert_eq!(primary_cmd(&here), None);
+        assert_eq!(tile_caption("Ben", "CABINDESK", "", "", "692996394"), "Ben@CABINDESK");
+        assert_eq!(tile_caption("", "CABINDESK", "", "", "692996394"), "CABINDESK");
+    }
+
+    fn sample_row(id: &str, direct: Option<&str>) -> SavedRow {
+        SavedRow {
+            id: id.into(),
+            nickname: String::new(),
+            hostname: "CABINDESK".into(),
+            os_family: "windows".into(),
+            os_version: String::new(),
+            last_connected: 0,
+            favorite: false,
+            has_password: false,
+            online: true,
+            console_user: "Ben".into(),
+            last_seen: 0,
+            this_computer: false,
+            sort_order: 0,
+            display_name: String::new(),
+            in_book: false,
+            direct: direct.map(str::to_string),
+        }
     }
 }

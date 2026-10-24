@@ -32,6 +32,16 @@ pub enum Icon {
     OsUnknown,
     /// Right arrow used as the compact Connect button.
     Go,
+    /// Circle with a needle. Not a logo.
+    Compass,
+    /// Three horizontal lines.
+    ViewList,
+    /// Four small squares.
+    ViewSmall,
+    /// Four larger squares.
+    ViewBig,
+    /// Vertical ellipsis.
+    Dots,
 }
 
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -126,6 +136,41 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.line_segment([c + Vec2::new(-s * 0.28, 0.0), c + Vec2::new(s * 0.16, 0.0)], stroke);
             painter.line_segment([c + Vec2::new(-s * 0.02, -s * 0.22), c + Vec2::new(s * 0.28, 0.0)], stroke);
             painter.line_segment([c + Vec2::new(-s * 0.02, s * 0.22), c + Vec2::new(s * 0.28, 0.0)], stroke);
+        }
+        Icon::Compass => {
+            painter.circle_stroke(c, s * 0.34, stroke);
+            let north = c + Vec2::new(s * 0.05, -s * 0.26);
+            let south = c + Vec2::new(-s * 0.05, s * 0.26);
+            let left = c + Vec2::new(-s * 0.14, s * 0.02);
+            let right = c + Vec2::new(s * 0.14, -s * 0.02);
+            painter.add(egui::Shape::convex_polygon(vec![north, right, south, left], color, Stroke::NONE));
+            painter.circle_stroke(c, s * 0.05, stroke);
+        }
+        Icon::ViewList => {
+            for i in -1..=1 {
+                let y = c.y + i as f32 * s * 0.22;
+                painter.line_segment([Pos2::new(c.x - s * 0.28, y), Pos2::new(c.x + s * 0.28, y)], stroke);
+            }
+        }
+        Icon::ViewSmall => grid_squares(painter, c, s * 0.16, s * 0.08, color),
+        Icon::ViewBig => grid_squares(painter, c, s * 0.26, s * 0.08, color),
+        Icon::Dots => {
+            for i in -1..=1 {
+                painter.circle_filled(c + Vec2::new(0.0, i as f32 * s * 0.24), (s * 0.07).max(1.2), color);
+            }
+        }
+    }
+}
+
+fn grid_squares(painter: &egui::Painter, c: Pos2, pane: f32, gap: f32, color: Color32) {
+    let origin = c - Vec2::splat(pane + gap / 2.0);
+    for row in 0..2 {
+        for col in 0..2 {
+            let rect = Rect::from_min_size(
+                origin + Vec2::new(col as f32 * (pane + gap), row as f32 * (pane + gap)),
+                Vec2::splat(pane),
+            );
+            painter.rect_filled(rect, CornerRadius::same(2), color);
         }
     }
 }

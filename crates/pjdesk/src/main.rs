@@ -198,6 +198,9 @@ pub struct HostArgs {
     /// Listen for direct IP / LAN connections.
     #[arg(skip)]
     pub allow_direct: bool,
+    /// Answer LAN discovery. Off when the person opts out in Settings.
+    #[arg(skip)]
+    pub discover_lan: bool,
     /// Ports a tunnel may open on this computer (loopback).
     #[arg(skip)]
     pub tunnel_ports: Vec<u16>,
@@ -221,6 +224,7 @@ impl Default for HostArgs {
             approval: "prompt".into(),
             receive_dir: String::new(),
             allow_direct: true,
+            discover_lan: true,
             tunnel_ports: Vec::new(),
             service_host: false,
         }
@@ -264,6 +268,7 @@ impl HostArgs {
             approval: if settings.approval == "unattended" { "unattended".into() } else { "prompt".into() },
             receive_dir: resolve_receive_dir(&settings.receive_dir),
             allow_direct: settings.allow_direct,
+            discover_lan: settings.discover_lan,
             tunnel_ports: settings.tunnel_ports.clone(),
             service_host: false,
         }

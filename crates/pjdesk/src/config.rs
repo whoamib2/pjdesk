@@ -157,9 +157,16 @@ pub struct Settings {
     /// Folder received files are written into. Empty means file transfer is refused.
     #[serde(default)]
     pub receive_dir: String,
-    /// Listen for direct IP connections and announce this computer on the LAN.
+    /// Listen for direct IP connections.
     #[serde(default = "yes")]
     pub allow_direct: bool,
+    /// Look for PJDesk on the local network, and let others find this computer.
+    /// On unless the person turns it off. The announcement has no password.
+    #[serde(default = "yes")]
+    pub discover_lan: bool,
+    /// Saved-list layout on this computer: "list", "small", or "big".
+    #[serde(default = "default_saved_view")]
+    pub saved_view: String,
     /// Host ports a remote session may forward to (loopback only unless the server policy says otherwise).
     #[serde(default)]
     pub tunnel_ports: Vec<u16>,
@@ -183,6 +190,9 @@ fn default_theme() -> String {
 }
 fn default_approval() -> String {
     "prompt".into()
+}
+fn default_saved_view() -> String {
+    "list".into()
 }
 
 /// True when `text` is the same 9-digit ID, ignoring spaces.
@@ -291,6 +301,8 @@ impl Default for Settings {
             approval: default_approval(),
             receive_dir: String::new(),
             allow_direct: true,
+            discover_lan: true,
+            saved_view: default_saved_view(),
             tunnel_ports: Vec::new(),
             peers: BTreeMap::new(),
             direct_pins: BTreeMap::new(),

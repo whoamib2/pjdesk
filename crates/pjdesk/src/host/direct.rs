@@ -6,8 +6,9 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use pjdesk_proto::discover::{self, LanBeacon};
@@ -128,12 +129,39 @@ async fn one(state: Arc<HostState>, incoming: quinn::Incoming) -> Result<()> {
     result
 }
 
+/// File the window writes when LAN discovery is turned off.
+/// The service host reads it, so announcing stops without a service restart.
+pub fn lan_opt_out_path() -> std::path::PathBuf {
+    crate::syspaths::service_dir().join("lan-discovery.off")
+}
+
+/// Writes or removes the opt-out flag. `on` means this computer may be found.
+pub fn set_lan_discovery(on: bool) {
+    let path = lan_opt_out_path();
+    if on {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, b"off\n");
+}
+
+fn discovery_opted_out() -> bool {
+    lan_opt_out_path().is_file()
+}
+
 async fn announce(state: Arc<HostState>) {
     let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else { return };
     let _ = socket.set_broadcast(true);
     let dest = SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT));
     loop {
         tokio::time::sleep(Duration::from_secs(3)).await;
+        // Name, id, port, and certificate fingerprint only. Never a password.
+        if !discover::announce_now(discovery_opted_out(), state.args.discover_lan, &discover::private_ipv4s()) {
+            continue;
+        }
         let id = state.device_id.lock().unwrap().clone();
         if id.is_empty() {
             continue;
@@ -151,7 +179,9 @@ async fn announce(state: Arc<HostState>) {
     }
 }
 
-/// Listens for LAN beacons for a few seconds. Used by the connect screen.
+/// Listens for LAN beacons for a few seconds.
+/// The window uses [`listen_discovered`] instead, so this stays for a short scan.
+#[allow(dead_code)]
 pub fn discover_for(limit: Duration) -> Vec<(LanBeacon, SocketAddr)> {
     let socket = match std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], DISCOVERY_PORT))) {
         Ok(s) => s,
@@ -165,6 +195,9 @@ pub fn discover_for(limit: Duration) -> Vec<(LanBeacon, SocketAddr)> {
     while std::time::Instant::now() < deadline {
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => {
+                if !discover::accept_lan_ip(src.ip()) {
+                    continue;
+                }
                 if let Ok(beacon) = discover::decode(&buf[..n]) {
                     if !found.iter().any(|(b, _): &(LanBeacon, SocketAddr)| b.id == beacon.id && b.fingerprint == beacon.fingerprint)
                     {
@@ -177,4 +210,83 @@ pub fn discover_for(limit: Duration) -> Vec<(LanBeacon, SocketAddr)> {
         }
     }
     found
+}
+
+struct SeenPeer {
+    name: String,
+    id: String,
+    addr: String,
+    seen: Instant,
+}
+
+/// Listens on the discovery port until `stop` is set.
+/// Sends the current list when it changes. Public senders are dropped.
+/// The packets are not logged.
+pub fn listen_discovered(stop: Arc<AtomicBool>, tx: Sender<Vec<(String, String, String)>>) {
+    while !stop.load(Ordering::Relaxed) {
+        let socket = match std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], DISCOVERY_PORT))) {
+            Ok(socket) => socket,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+        if !collect_beacons(&socket, &stop, &tx) && stop.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+}
+
+fn collect_beacons(socket: &std::net::UdpSocket, stop: &AtomicBool, tx: &Sender<Vec<(String, String, String)>>) -> bool {
+    let mut peers: Vec<SeenPeer> = Vec::new();
+    let mut buf = [0u8; 512];
+    while !stop.load(Ordering::Relaxed) {
+        let mut changed = false;
+        match socket.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                if !discover::accept_lan_ip(src.ip()) {
+                    continue;
+                }
+                if n >= 8 && &buf[..8] == pjdesk_proto::discover::SERVER_MAGIC {
+                    if let Ok(server) = discover::decode_server(&buf[..n]) {
+                        if let std::net::IpAddr::V4(ip) = src.ip() {
+                            discover::note_server_beacon(std::net::SocketAddr::from((ip, server.port)), server.fingerprint);
+                        }
+                    }
+                    continue;
+                }
+                let Ok(beacon) = discover::decode(&buf[..n]) else { continue };
+                let mut addr = src;
+                addr.set_port(beacon.port);
+                let name = if beacon.name.is_empty() { "Computer".to_string() } else { beacon.name };
+                let addr = addr.to_string();
+                if let Some(have) = peers.iter_mut().find(|peer| peer.id == beacon.id) {
+                    have.seen = Instant::now();
+                    if have.name != name || have.addr != addr {
+                        have.name = name;
+                        have.addr = addr;
+                        changed = true;
+                    }
+                } else {
+                    peers.push(SeenPeer { name, id: beacon.id, addr, seen: Instant::now() });
+                    changed = true;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return true,
+        }
+        let before = peers.len();
+        peers.retain(|peer| peer.seen.elapsed() < Duration::from_secs(12));
+        if peers.len() != before {
+            changed = true;
+        }
+        if changed {
+            let rows = peers.iter().map(|peer| (peer.name.clone(), peer.id.clone(), peer.addr.clone())).collect();
+            if tx.send(rows).is_err() {
+                return false;
+            }
+        }
+    }
+    false
 }

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.24
+
+Windows is 0.6.24. Android stays 0.6.23 (versionCode 62300). cloud/ did not change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The Rust server binary did not change, so do not run `cloud\deploy.cmd`. The phone does not need this build. The Windows client does: a 0.6.23 window does not have colored tiles, the view toggle, or the Discovered tab. This machine has no Windows PC attached, so the window was not clicked through here.
+
+* Each saved computer has a colored tile. The color comes from its ID (or its name, when there is no ID) and stays the same. Online is a green dot. Offline is orange. Dark and light both remain, under Settings → General → Appearance.
+* The Saved list has a toggle at the top right: Big tiles, Small tiles, or List. The choice is remembered on this computer. List is still the default, with Connect and Menu always visible. Double-click still connects. Each card has the same menu.
+* Discovered shows PJDesk computers on the local network, with a compass. Each one shows its name and ID. Connecting asks for that computer's permanent password or one-time support code, needs no account, and connects directly over the LAN. Discovery is on unless it is turned off under Settings → Network. This computer only answers on a private network, and the announcement does not include a password.
+
 ## 0.6.23
 
 Windows is 0.6.23. Android is 0.6.23 (versionCode 62300). cloud/ changed: migrations `0015_join_support.sql` and `0016_app_lock.sql`, and the worker. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The Rust server binary did not change. Run `cloud\deploy.cmd` before using the codes or the app-lock PIN, so both migrations and the worker are live. The phone needs 62300. The Windows client needs this build. A 0.6.22 window does not have Invite, Let someone connect, or the app-lock PIN.

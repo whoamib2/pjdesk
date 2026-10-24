@@ -688,12 +688,8 @@ impl App {
                     let addr = self.direct_addr.clone();
                     self.connect_direct(&addr);
                 }
-                if self.lan_rx.is_some() {
-                    widgets::spinner(ui, p.muted);
-                    ui.label(widgets::muted(ui, "Looking on this network…"));
-                } else if ui.button("Find on this network").clicked() {
+                if ui.button("Find on this network").clicked() {
                     self.find_on_lan();
-                    self.desk_tab = super::DeskTab::Lan;
                 }
             });
         });

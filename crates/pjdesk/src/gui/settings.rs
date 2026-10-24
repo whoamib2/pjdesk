@@ -47,6 +47,7 @@ pub struct SettingsDraft {
     receive_dir: String,
     computer_name: String,
     allow_direct: bool,
+    discover_lan: bool,
     tunnel_ports: String,
 }
 
@@ -88,6 +89,7 @@ impl SettingsDraft {
             receive_dir: s.receive_dir.clone(),
             computer_name: crate::hostfacts::read_computer_name(),
             allow_direct: s.allow_direct,
+            discover_lan: s.discover_lan,
             tunnel_ports: s.tunnel_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
         }
     }
@@ -310,6 +312,7 @@ impl App {
         s.approval = if d.approval == "unattended" { "unattended".into() } else { "prompt".into() };
         s.receive_dir = d.receive_dir.trim().to_string();
         s.allow_direct = d.allow_direct;
+        s.discover_lan = d.discover_lan;
         s.tunnel_ports = ports;
         if d.use_permanent {
             s.set_permanent_password(Some(d.permanent_password.trim()));
@@ -327,6 +330,7 @@ impl App {
             || old.approval != s.approval
             || old.receive_dir != s.receive_dir
             || old.allow_direct != s.allow_direct
+            || old.discover_lan != s.discover_lan
             || old.tunnel_ports != s.tunnel_ports;
         theme::apply(&self.egui_ctx(), &theme_name);
 
@@ -360,6 +364,8 @@ impl App {
             }
         }
 
+        crate::host::direct::set_lan_discovery(self.cfg.settings.discover_lan);
+        self.ensure_lan_watch();
         if server_changed || host_changed {
             let running = if self.scm_known { self.scm_running } else { self.engine.service_running };
             let cfg = self.cfg.clone();
@@ -627,11 +633,17 @@ impl App {
 
         ui.add_space(12.0);
         widgets::heading(ui, "DIRECT CONNECTIONS");
+        widgets::checkbox(ui, &mut self.settings.allow_direct, "Allow direct IP connections");
+        ui.add_space(6.0);
         widgets::checkbox(
             ui,
-            &mut self.settings.allow_direct,
-            "Allow direct IP connections and announce this computer on the local network",
+            &mut self.settings.discover_lan,
+            "Let other computers on this network find this one",
         );
+        ui.label(widgets::muted(
+            ui,
+            "On unless you uncheck it. PJDesk only answers on a private network. The announcement is the name and ID, never a password. Direct connections must also be allowed for someone to connect.",
+        ));
         ui.add_space(8.0);
         widgets::field_label(ui, "Ports a remote session may forward");
         widgets::text_field(ui, &mut self.settings.tunnel_ports, "22, 3389", false);

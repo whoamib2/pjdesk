@@ -19,6 +19,7 @@ mod widgets;
 #[cfg(feature = "ui-shots")]
 mod shots;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -197,6 +198,8 @@ pub struct App {
     direct_addr: String,
     lan: Vec<(String, String, String)>,
     lan_rx: Option<Receiver<Vec<(String, String, String)>>>,
+    /// Stops the background LAN listener. None when discovery is off.
+    lan_stop: Option<Arc<AtomicBool>>,
     password_notice: String,
     show_change: bool,
     change_pass: String,
@@ -390,6 +393,7 @@ impl App {
             direct_addr: String::new(),
             lan: Vec::new(),
             lan_rx: None,
+            lan_stop: None,
             password_notice: String::new(),
             show_change: false,
             change_pass: String::new(),
@@ -534,6 +538,10 @@ impl App {
         }
         if app.cfg.account.is_some() {
             app.start_token_refresh();
+        }
+        if !preview {
+            crate::host::direct::set_lan_discovery(app.cfg.settings.discover_lan);
+            app.ensure_lan_watch();
         }
         app
     }
@@ -1956,6 +1964,18 @@ impl App {
         let _ = std::fs::write(reply, body);
     }
 
+    /// A computer found on the LAN. Always asks for its password and connects
+    /// with `--direct`. No account, and the password is not in the beacon.
+    fn connect_discovered(&mut self, id: &str, addr: &str) {
+        let id = normalize_id(id);
+        let addr = addr.trim();
+        if addr.is_empty() {
+            self.status = "That computer did not give a network address.".into();
+            return;
+        }
+        self.spawn_ask(&id, false, Some(addr.to_string()));
+    }
+
     fn connect_direct(&mut self, addr: &str) {
         let addr = addr.trim().to_string();
         if addr.is_empty() {
@@ -2029,36 +2049,92 @@ impl App {
     }
 
     fn find_on_lan(&mut self) {
+        if !self.cfg.settings.discover_lan {
+            self.status = "LAN discovery is turned off in Settings.".into();
+            return;
+        }
+        self.ensure_lan_watch();
+        self.desk_tab = DeskTab::Lan;
+        if self.lan.is_empty() {
+            self.status = "Looking for computers on this network…".into();
+        } else {
+            self.status = format!("Found {} computer(s) on this network.", self.lan.len());
+        }
+    }
+
+    /// One listener while the window is open and discovery is on.
+    /// A later result updates the list in place and does not change the tab.
+    fn ensure_lan_watch(&mut self) {
+        if !self.cfg.settings.discover_lan {
+            self.stop_lan_watch();
+            return;
+        }
+        if self.lan_stop.is_some() && self.lan_rx.is_some() {
+            return;
+        }
+        self.stop_lan_watch();
         let (tx, rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        if std::thread::Builder::new()
+            .name("lan-discover".into())
+            .spawn(move || crate::host::direct::listen_discovered(stop_thread, tx))
+            .is_err()
+        {
+            return;
+        }
+        self.lan_stop = Some(stop);
         self.lan_rx = Some(rx);
-        self.status = "Looking for computers on this network…".into();
-        std::thread::spawn(move || {
-            let found = crate::host::direct::discover_for(std::time::Duration::from_secs(4));
-            let rows = found
-                .into_iter()
-                .map(|(b, src)| {
-                    let mut addr = src;
-                    addr.set_port(b.port);
-                    (if b.name.is_empty() { "Computer".into() } else { b.name }, b.id, addr.to_string())
-                })
-                .collect::<Vec<_>>();
-            let _ = tx.send(rows);
-        });
+    }
+
+    fn stop_lan_watch(&mut self) {
+        if let Some(stop) = self.lan_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.lan_rx = None;
+        self.lan.clear();
     }
 
     fn poll_lan(&mut self) {
-        let Some(rx) = &self.lan_rx else { return };
-        if let Ok(rows) = rx.try_recv() {
-            self.lan_rx = None;
-            self.status = if rows.is_empty() {
-                "No PJDesk computers answered on this network.".into()
+        enum Heard {
+            None,
+            Rows(Vec<(String, String, String)>),
+            Dead,
+        }
+        let heard = {
+            let Some(rx) = &self.lan_rx else { return };
+            let mut latest = None;
+            let mut dead = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(rows) => latest = Some(rows),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+            if dead {
+                Heard::Dead
+            } else if let Some(rows) = latest {
+                Heard::Rows(rows)
             } else {
-                format!("Found {} computer(s) on this network.", rows.len())
-            };
-            self.lan = rows;
-            self.note_lan_names();
-            if !self.lan.is_empty() {
-                self.desk_tab = DeskTab::Lan;
+                Heard::None
+            }
+        };
+        match heard {
+            Heard::None => {}
+            Heard::Dead => {
+                self.lan_rx = None;
+                if let Some(stop) = self.lan_stop.take() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                self.ensure_lan_watch();
+            }
+            Heard::Rows(rows) => {
+                self.lan = rows;
+                self.note_lan_names();
             }
         }
     }
@@ -2628,6 +2704,7 @@ impl eframe::App for App {
             self.consent_prompt(&ctx);
             poll_client_heartbeat();
             adopt_service_notice();
+            self.poll_lan();
             return;
         }
 
