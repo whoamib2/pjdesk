@@ -11,12 +11,13 @@ use std::sync::Mutex;
 
 use eframe::egui;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::w;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
 };
+use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
 const MUTEX_NAME: windows::core::PCWSTR = w!("Local\\PJDeskServerTray");
 const EVENT_NAME: windows::core::PCWSTR = w!("Local\\PJDeskServerTrayShow");
@@ -65,6 +66,8 @@ pub fn acquire_or_signal() -> bool {
         };
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = CloseHandle(mutex);
+            // The new process is in front. Let the open window take the foreground.
+            let _ = AllowSetForegroundWindow(0xFFFF_FFFF);
             for _ in 0..20 {
                 if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, EVENT_NAME) {
                     let _ = SetEvent(event);
@@ -73,6 +76,7 @@ pub fn acquire_or_signal() -> bool {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            tracing::info!("PJDesk Server is already open. Asked that window to come forward.");
             return false;
         }
         let event = match CreateEventW(None, false, false, EVENT_NAME) {
@@ -82,6 +86,11 @@ pub fn acquire_or_signal() -> bool {
         *HELD.lock().unwrap() = Some(Singleton { _mutex: raw(mutex), event: raw(event) });
         true
     }
+}
+
+/// True when this process owns the single window.
+pub fn holds_window() -> bool {
+    HELD.lock().unwrap().is_some()
 }
 
 /// True when another launch asked this process to open the window.
@@ -169,23 +178,39 @@ impl Tray {
         let sync_id = sync.id().0.clone();
         let quit_id = quit.id().0.clone();
 
+        let show_now = show_id.clone();
         let c1 = ctx.clone();
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+            if e.id.0 == show_now {
+                crate::winshow::activate("Open", "PJDesk Server", holds_window());
+            }
             MENU_IDS.lock().unwrap().push(e.id.0.clone());
             c1.request_repaint();
         }));
         let c2 = ctx.clone();
         TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-            if matches!(e, TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. }) {
-                ICON_CLICKED.store(true, Ordering::SeqCst);
-                c2.request_repaint();
+            let click = match e {
+                TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } => {
+                    Some(pjdesk_proto::trayshow::Click::Left)
+                }
+                TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => Some(pjdesk_proto::trayshow::Click::LeftDouble),
+                _ => None,
+            };
+            let Some(click) = click else { return };
+            if !pjdesk_proto::trayshow::opens_window(click) {
+                return;
             }
+            let reason = if click == pjdesk_proto::trayshow::Click::LeftDouble { "double-click" } else { "left click" };
+            crate::winshow::activate(reason, "PJDesk Server", holds_window());
+            ICON_CLICKED.store(true, Ordering::SeqCst);
+            c2.request_repaint();
         }));
 
         let icon = TrayIconBuilder::new()
             .with_tooltip("PJDesk Server")
             .with_icon(icon)
             .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
             .build()
             .ok()?;
         Some(Self {
@@ -209,7 +234,12 @@ impl Tray {
 
     pub fn poll(&self) -> Vec<Action> {
         let mut out = Vec::new();
-        if ICON_CLICKED.swap(false, Ordering::SeqCst) || show_requested() {
+        let clicked = ICON_CLICKED.swap(false, Ordering::SeqCst);
+        let second = show_requested();
+        if second {
+            crate::winshow::activate("second launch", "PJDesk Server", holds_window());
+        }
+        if clicked || second {
             out.push(Action::Show);
         }
         for id in MENU_IDS.lock().unwrap().drain(..) {

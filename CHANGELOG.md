@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.30
+
+Windows is 0.6.30. Android is 0.6.30 (versionCode 63000). cloud/ did not change. No migration and no worker change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Do not run `cloud\deploy.cmd`. The phone needs 63000. The PJDesk client and PJDesk Server both need this build. This machine has no Windows PC attached, so the tray was not clicked through here.
+
+* A left click or a double-click on the tray icon, and Open on its menu, bring the PJDesk window and the PJDesk Server window forward. A minimized or hidden window is restored with ShowWindow(SW_RESTORE) and SetForegroundWindow, including when Windows would otherwise keep that click from taking the foreground. The window is looked up by its title, so a handle left over after the window was closed is not reused. If that window is not running, the tray starts it. A window left on a disconnected monitor is moved onto a screen that is connected. The PIN lock still shows, and it does not hide the window again. The client writes this to %APPDATA%\PJDesk\pjdesk.log. PJDesk Server writes it to %APPDATA%\PJDesk\pjdesk-server.log.
+
 ## 0.6.29
 
 Windows is 0.6.29. Android stays 0.6.28 (versionCode 62800). cloud/ changed: the worker accepts the PJDesk Server window's pjdesk.com sign-in on the existing app-lock route. No new migration. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Run `cloud\deploy.cmd` so the server window can save the PIN. The phone does not need this build. The PJDesk client and PJDesk Server both need this build. This machine has no Pixel and no Windows PC attached, so Windows Hello was not clicked through here.

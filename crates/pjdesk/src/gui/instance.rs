@@ -16,6 +16,18 @@ pub fn acquire_or_signal() -> bool {
     }
 }
 
+/// True when this process owns the single window.
+pub fn holds_window() -> bool {
+    #[cfg(windows)]
+    {
+        imp::holds_window()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// True when another launch asked this process to open the window.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn show_requested() -> bool {
@@ -38,6 +50,7 @@ mod imp {
     use windows::Win32::System::Threading::{
         CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
     };
+    use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
     const MUTEX_NAME: windows::core::PCWSTR = w!("Local\\PJDeskClientWindow");
     const EVENT_NAME: windows::core::PCWSTR = w!("Local\\PJDeskClientWindowShow");
@@ -65,6 +78,8 @@ mod imp {
             };
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let _ = CloseHandle(mutex);
+                // The new process is in front. Let the open window take the foreground.
+                let _ = AllowSetForegroundWindow(0xFFFF_FFFF);
                 for _ in 0..20 {
                     if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, EVENT_NAME) {
                         let _ = SetEvent(event);
@@ -73,7 +88,7 @@ mod imp {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                tracing::info!("PJDesk is already open. Asked that window to show itself.");
+                tracing::info!("PJDesk is already open. Asked that window to come forward.");
                 return false;
             }
             let event = match CreateEventW(None, false, false, EVENT_NAME) {
@@ -83,6 +98,10 @@ mod imp {
             *HELD.lock().unwrap() = Some(Held { _mutex: raw(mutex), event: raw(event) });
             true
         }
+    }
+
+    pub fn holds_window() -> bool {
+        HELD.lock().unwrap().is_some()
     }
 
     pub fn show_requested() -> bool {

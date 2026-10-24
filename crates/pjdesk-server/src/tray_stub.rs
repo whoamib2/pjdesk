@@ -23,6 +23,10 @@ pub fn acquire_or_signal() -> bool {
     true
 }
 
+pub fn holds_window() -> bool {
+    false
+}
+
 pub fn ensure_login_default() {}
 
 pub fn login_enabled() -> bool {

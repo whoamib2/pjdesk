@@ -31,6 +31,7 @@ pub mod quality;
 pub mod record;
 pub mod signal;
 pub mod tls;
+pub mod trayshow;
 pub mod udp;
 pub mod update;
 

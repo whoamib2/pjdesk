@@ -36,6 +36,19 @@ fn p(ui: &egui::Ui) -> Paint {
     ui_theme::paint(ui)
 }
 
+/// Show the window from the tray. A click restores it immediately. This
+/// also clears minimize and asks for focus, so hide-to-tray does not undo
+/// the open. The PIN lock, when there is one, is drawn inside the window.
+fn reveal_window(ctx: &egui::Context, reason: &str) {
+    if !crate::winshow::user_just_opened() {
+        crate::winshow::activate(reason, "PJDesk Server", crate::tray::holds_window());
+    }
+    crate::winshow::note_user_open();
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
 pub fn run(data_dir: PathBuf, port: u16, start_hidden: bool) -> Result<()> {
     // One icon per user. A second launch asks the first window to show itself.
     if !crate::tray::acquire_or_signal() {
@@ -423,9 +436,8 @@ impl eframe::App for App {
             match action {
                 crate::tray::Action::Show => {
                     tracing::info!("Opening PJDesk Server from the tray or a second launch");
+                    reveal_window(&ctx, "Open");
                     self.gate.engage();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 crate::tray::Action::ServiceStart => self.elevate_service(&["service", "start"]),
                 crate::tray::Action::ServiceStop => self.elevate_service(&["service", "stop"]),
@@ -438,8 +450,8 @@ impl eframe::App for App {
                 }
                 crate::tray::Action::OpenLog => crate::tray::open_log_folder(&self.data_dir),
                 crate::tray::Action::CheckUpdates => {
+                    reveal_window(&ctx, "Check for updates");
                     self.gate.engage();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     if self.via_service() {
                         self.status = "Checking for updates…".into();
                         self.spawn_cloud_job(|| {
@@ -454,14 +466,14 @@ impl eframe::App for App {
                     }
                 }
                 crate::tray::Action::Promote => {
+                    reveal_window(&ctx, "Make this the primary");
                     self.gate.engage();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     self.cloud_form.confirm_promote = true;
                     self.cloud_form.confirm_demote = false;
                 }
                 crate::tray::Action::Demote => {
+                    reveal_window(&ctx, "Step down to standby");
                     self.gate.engage();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     self.cloud_form.confirm_demote = true;
                     self.cloud_form.confirm_promote = false;
                 }
@@ -481,7 +493,10 @@ impl eframe::App for App {
                 }
             }
         }
-        if has_tray && ctx.input(|i| i.viewport().minimized == Some(true)) {
+        if has_tray
+            && ctx.input(|i| i.viewport().minimized == Some(true))
+            && pjdesk_proto::trayshow::hide_because_minimized(true, crate::winshow::user_just_opened())
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }

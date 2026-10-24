@@ -23,6 +23,7 @@ mod color;
 mod config;
 mod gui;
 mod winhello;
+mod winshow;
 mod handoff;
 mod host;
 mod hostfacts;

@@ -20,7 +20,7 @@ mod imp {
 
     use eframe::egui;
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-    use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+    use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
     use super::Action;
 
@@ -53,23 +53,39 @@ mod imp {
 
             // Wake the UI whenever a tray event arrives, so Show/Quit work even
             // while the window is hidden.
+            let show_now = show_id.clone();
             let c1 = ctx.clone();
             MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+                if e.id.0 == show_now {
+                    crate::winshow::activate("Open", "PJDesk", super::super::instance::holds_window());
+                }
                 MENU_IDS.lock().unwrap().push(e.id.0.clone());
                 c1.request_repaint();
             }));
             let c2 = ctx.clone();
             TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-                if matches!(e, TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. }) {
-                    ICON_CLICKED.store(true, Ordering::SeqCst);
-                    c2.request_repaint();
+                let click = match e {
+                    TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } => {
+                        Some(pjdesk_proto::trayshow::Click::Left)
+                    }
+                    TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => Some(pjdesk_proto::trayshow::Click::LeftDouble),
+                    _ => None,
+                };
+                let Some(click) = click else { return };
+                if !pjdesk_proto::trayshow::opens_window(click) {
+                    return;
                 }
+                let reason = if click == pjdesk_proto::trayshow::Click::LeftDouble { "double-click" } else { "left click" };
+                crate::winshow::activate(reason, "PJDesk", super::super::instance::holds_window());
+                ICON_CLICKED.store(true, Ordering::SeqCst);
+                c2.request_repaint();
             }));
 
             let icon = TrayIconBuilder::new()
                 .with_tooltip("PJDesk")
                 .with_icon(icon)
                 .with_menu(Box::new(menu))
+                .with_menu_on_left_click(false)
                 .build()
                 .ok()?;
             Some(Self { _icon: icon, show_id, update_id, quit_id })
@@ -78,7 +94,12 @@ mod imp {
         /// Drains any pending tray actions.
         pub fn poll(&self) -> Vec<Action> {
             let mut out = Vec::new();
-            if ICON_CLICKED.swap(false, Ordering::SeqCst) || super::super::instance::show_requested() {
+            let clicked = ICON_CLICKED.swap(false, Ordering::SeqCst);
+            let second = super::super::instance::show_requested();
+            if second {
+                crate::winshow::activate("second launch", "PJDesk", super::super::instance::holds_window());
+            }
+            if clicked || second {
                 out.push(Action::Show);
             }
             for id in MENU_IDS.lock().unwrap().drain(..) {

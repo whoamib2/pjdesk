@@ -2370,6 +2370,19 @@ impl App {
     }
 }
 
+/// Show the window from the tray. A click restores it immediately. This
+/// also clears minimize and asks for focus, so a later frame does not leave
+/// the window hidden. The PIN lock, when there is one, is drawn inside it.
+fn reveal_window(ctx: &egui::Context, reason: &str) {
+    if !crate::winshow::user_just_opened() {
+        crate::winshow::activate(reason, "PJDesk", instance::holds_window());
+    }
+    crate::winshow::note_user_open();
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
 /// Lets the viewer process bring its window in front of this one.
 #[cfg(windows)]
 fn allow_viewer_foreground() {
@@ -2703,13 +2716,11 @@ impl eframe::App for App {
             match action {
                 tray::Action::Show => {
                     tracing::info!("Opening the window from the tray or a second launch");
+                    reveal_window(&ctx, "Open");
                     self.lock_from_tray();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 tray::Action::Update => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    reveal_window(&ctx, "Check for updates");
                     if self.signed_in() {
                         self.lock_from_tray();
                     } else {

@@ -23,6 +23,7 @@ mod public_addr;
 mod gui;
 mod winhello;
 mod window_lock;
+mod winshow;
 mod registry;
 mod relay;
 mod requests;
@@ -257,6 +258,7 @@ fn main() -> Result<()> {
             // window hidden, so the icon is there after sign-in.
             #[cfg(windows)]
             {
+                init_window_logging();
                 if let Err(e) = gui::run(data_dir, cli.opts.port, cli.tray) {
                     fatal(&format!("PJDesk Server could not start: {e:#}"));
                 }
@@ -605,6 +607,30 @@ mod cli_lock {
         assert!(!help.contains("skip-lock"), "{help}");
         assert!(!help.contains("--unlocked"), "{help}");
     }
+}
+
+/// The tray has no console. Activation is written next to the client log.
+#[cfg(windows)]
+fn init_window_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,wgpu=warn,naga=warn,eframe=warn,egui_wgpu=warn"));
+    let dir = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = dir.join("PJDesk");
+    let _ = std::fs::create_dir_all(&dir);
+    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).with_ansi(false);
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("pjdesk-server.log")) {
+        let _ = builder.with_writer(std::sync::Mutex::new(file)).try_init();
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .try_init();
 }
 
 fn init_console_logging() {
