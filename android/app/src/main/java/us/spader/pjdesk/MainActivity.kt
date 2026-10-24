@@ -731,6 +731,7 @@ class MainActivity : FragmentActivity() {
             var controlBound by remember { mutableStateOf(RemoteControl.service != null) }
             var controlDismissed by remember { mutableStateOf(false) }
             LaunchedEffect(state.supportCode, state.id) {
+                if (isFinishing) return@LaunchedEffect
                 val code = state.supportCode
                 val id = state.id
                 if (code.length != 8 || id.length != 9) return@LaunchedEffect
@@ -2049,6 +2050,10 @@ class MainActivity : FragmentActivity() {
         }
         if (isFinishing && !isChangingConfigurations) {
             val desk = app.engine.state.value
+            // Rotate first so the password on screen stops working, then drop
+            // the hash that was published for that pair. The snapshot is the
+            // old code; refresh replaces it.
+            app.engine.refreshSupport()
             Thread {
                 us.spader.pjdesk.core.CloudAuth.revokeSupport(desk.supportCode, desk.id)
             }.start()
