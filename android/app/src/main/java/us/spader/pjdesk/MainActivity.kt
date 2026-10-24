@@ -73,6 +73,7 @@ import us.spader.pjdesk.core.PinWrap
 import us.spader.pjdesk.core.VaultKeyRejected
 import us.spader.pjdesk.core.connectFailureText
 import us.spader.pjdesk.core.connectStatusLabel
+import us.spader.pjdesk.core.shouldRetryNotOnline
 import us.spader.pjdesk.ui.ReauthScreen
 import us.spader.pjdesk.ui.SecretField
 import us.spader.pjdesk.ui.SetPinScreen
@@ -215,6 +216,8 @@ class MainActivity : FragmentActivity() {
             var tab by remember { mutableIntStateOf(0) }
             var connectId by remember { mutableStateOf("") }
             var connectPassword by remember { mutableStateOf("") }
+            var connectAsk by remember { mutableStateOf(false) }
+            var notOnlineTries by remember { mutableIntStateOf(0) }
             var query by remember { mutableStateOf("") }
             var saved by remember { mutableStateOf(app.store.saved()) }
             var recentIds by remember { mutableStateOf(app.store.recentIds()) }
@@ -586,12 +589,21 @@ class MainActivity : FragmentActivity() {
             var sessionIdleWarn by remember { mutableStateOf(false) }
             var screenOff by remember { mutableStateOf(false) }
             var sessionBackground by remember { mutableStateOf(false) }
-            fun launchConnect(id: String, name: String, password: String, askPerson: Boolean = false) {
+            fun launchConnect(
+                id: String,
+                name: String,
+                password: String,
+                askPerson: Boolean = false,
+                resetNotOnline: Boolean = true,
+            ) {
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (connecting && now - lastConnectMs < 700) {
                     AppLog.i("Connect ignored, already starting $id")
                     return
                 }
+                connectPassword = password
+                connectAsk = askPerson
+                if (resetNotOnline) notOnlineTries = 0
                 lastConnectMs = now
                 promptBeforeConnect = false
                 connecting = true
@@ -945,6 +957,28 @@ class MainActivity : FragmentActivity() {
             }
             LaunchedEffect(state.error) {
                 val text = state.error ?: return@LaunchedEffect
+                val digits = connectId.filter { it.isDigit() }
+                val seen = liveSaved.firstOrNull { it.id == digits }?.lastSeen ?: 0L
+                if (connecting && shouldRetryNotOnline(text, seen, System.currentTimeMillis(), notOnlineTries)) {
+                    val retryId = digits
+                    val retryName = connectComputerName(saved, digits)
+                    val retryPassword = connectPassword
+                    val retryAsk = connectAsk
+                    val retryGen = connectGen
+                    val retryAttempt = notOnlineTries + 1
+                    AppLog.i("connect: $retryId is not online, retry $retryAttempt in 2s")
+                    scope.launch {
+                        delay(2_000)
+                        if (!connecting || retryGen != connectGen) {
+                            AppLog.i("connect retry $retryAttempt for $retryId skipped")
+                            return@launch
+                        }
+                        notOnlineTries = retryAttempt
+                        launchConnect(retryId, retryName, retryPassword, retryAsk, resetNotOnline = false)
+                    }
+                    engine.dismissError()
+                    return@LaunchedEffect
+                }
                 val friendly = connectFailureText(text, connectComputerName(saved, connectId))
                 if (friendly == null) {
                     AppLog.i("connect attempt ended quietly: $text")

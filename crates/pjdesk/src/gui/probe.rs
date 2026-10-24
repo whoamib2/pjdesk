@@ -77,6 +77,40 @@ fn sample(update_task: Option<bool>) -> ProbeSnap {
     ProbeSnap { installed, running, update_task, svc }
 }
 
+/// Missed service checks required before the window registers, after the
+/// service has been seen running. One miss must not start a second registrar.
+pub const SERVICE_DOWN_POLLS: u32 = 2;
+
+/// Who should register this computer after one service-status sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostDuty {
+    pub service_running: bool,
+    pub down_polls: u32,
+    /// The window should have its own host after this sample.
+    pub window_hosts: bool,
+}
+
+/// The first sample starts the window immediately when the service is down.
+/// After the service has been seen running, [`SERVICE_DOWN_POLLS`] consecutive
+/// down samples are required.
+pub fn host_duty(ready: bool, service_running: bool, down_polls: u32, sample_running: bool) -> HostDuty {
+    if !ready {
+        return HostDuty { service_running: sample_running, down_polls: 0, window_hosts: !sample_running };
+    }
+    if sample_running {
+        return HostDuty { service_running: true, down_polls: 0, window_hosts: false };
+    }
+    if !service_running {
+        return HostDuty { service_running: false, down_polls: 0, window_hosts: true };
+    }
+    let polls = down_polls.saturating_add(1);
+    if polls >= SERVICE_DOWN_POLLS {
+        HostDuty { service_running: false, down_polls: polls, window_hosts: true }
+    } else {
+        HostDuty { service_running: true, down_polls: polls, window_hosts: false }
+    }
+}
+
 fn probe_loop(cmd: Receiver<ProbeCmd>, tx: Sender<ProbeSnap>, ctx: egui::Context) {
     let mut update_task = None;
     loop {
@@ -100,5 +134,36 @@ fn probe_loop(cmd: Receiver<ProbeCmd>, tx: Sender<ProbeSnap>, ctx: egui::Context
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_down_starts_window() {
+        let first_down = host_duty(false, false, 0, false);
+        assert!(first_down.window_hosts, "the first sample starts the window when the service is down");
+        assert!(!first_down.service_running);
+
+        let first_up = host_duty(false, false, 0, true);
+        assert!(!first_up.window_hosts);
+        assert!(first_up.service_running);
+
+        let one_miss = host_duty(true, true, 0, false);
+        assert_eq!(one_miss.down_polls, 1);
+        assert!(one_miss.service_running);
+        assert!(!one_miss.window_hosts, "one missed check must not start a second registrar");
+
+        let two_miss = host_duty(true, true, one_miss.down_polls, false);
+        assert_eq!(two_miss.down_polls, SERVICE_DOWN_POLLS);
+        assert!(!two_miss.service_running);
+        assert!(two_miss.window_hosts);
+
+        let back = host_duty(true, false, two_miss.down_polls, true);
+        assert!(back.service_running);
+        assert_eq!(back.down_polls, 0);
+        assert!(!back.window_hosts);
     }
 }

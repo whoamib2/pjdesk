@@ -577,6 +577,8 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
     let has_permanent = state.permanent.lock().unwrap().is_some();
     print_banner(&device_id, &state.password.lock().unwrap(), has_permanent, &server);
     crate::HOST_ONLINE.store(true, Ordering::SeqCst);
+    let role = if state.args.service_host { "service" } else { "window" };
+    info!("Registered {} as the {role}", format_id(&device_id));
     if let Some(shared) = &state.shared {
         *shared.id.lock().unwrap() = Some(device_id.clone());
         *shared.last_error.lock().unwrap() = None;
@@ -586,7 +588,7 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
     state.publish_password();
 
     let server_ip = signal.server_addr.ip();
-    let mut ping = tokio::time::interval(Duration::from_secs(25));
+    let mut ping = tokio::time::interval(Duration::from_secs(10));
     ping.tick().await;
     let mut ui_tick = tokio::time::interval(Duration::from_millis(300));
     let mut report_host = false;
@@ -606,8 +608,8 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                 state.apply_ui_requests();
             }
             _ = ping.tick() => {
-                if last_heard.elapsed() > Duration::from_secs(70) {
-                    warn!("No reply from the server for over a minute; reconnecting");
+                if last_heard.elapsed() >= Duration::from_secs(30) {
+                    warn!("No reply from the server for 30 s ({role}); reconnecting");
                     return Ok(());
                 }
                 signal.send(ClientMsg::Ping)?;
@@ -623,7 +625,7 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
             }
             msg = signal.recv() => {
                 let Some(msg) = msg else {
-                    warn!("Lost the connection to the server");
+                    warn!("Lost the connection to the server ({role}); reconnecting");
                     return Ok(());
                 };
                 last_heard = std::time::Instant::now();

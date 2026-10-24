@@ -30,6 +30,26 @@ fun connectFailureText(raw: String, name: String): String? {
     }
 }
 
+/** Extra Connect attempts after "not online" when the computer was seen recently. */
+const val NOT_ONLINE_RETRIES = 2
+
+/** A last-seen time inside this window is recent enough to retry. */
+const val NOT_ONLINE_RECENT_MS = 120_000L
+
+/**
+ * True when Connect should wait and try again.
+ * [attempt] is how many extra tries have already been started. [lastSeen] is unix seconds or milliseconds.
+ */
+fun shouldRetryNotOnline(message: String, lastSeen: Long, nowMs: Long, attempt: Int): Boolean {
+    if (attempt >= NOT_ONLINE_RETRIES) return false
+    val head = message.lineSequence().firstOrNull()?.trim().orEmpty()
+    if (!head.lowercase().contains("not online")) return false
+    val seenMs = seenSeconds(lastSeen) * 1000
+    if (seenMs <= 0L) return false
+    val age = nowMs - seenMs
+    return age in 0..NOT_ONLINE_RECENT_MS
+}
+
 /** Status line shown the moment Connect starts. */
 fun connectStatusLabel(name: String, id: String): String {
     val who = name.trim().ifBlank {

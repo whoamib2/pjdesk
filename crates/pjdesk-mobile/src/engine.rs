@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use pjdesk_link::admit::{self, Admit};
@@ -37,7 +37,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.27";
+pub const APP_VERSION: &str = "0.6.28";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -993,8 +993,9 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
         app_version: APP_VERSION.into(),
     })?;
     let server_ip = signal.server_addr.ip();
-    let mut ping = tokio::time::interval(Duration::from_secs(25));
+    let mut ping = tokio::time::interval(Duration::from_secs(10));
     ping.tick().await;
+    let mut last_heard = Instant::now();
     let mut routes: HashMap<u64, mpsc::UnboundedSender<ServerMsg>> = HashMap::new();
     let mut saw_registered = false;
     let mut report_host = false;
@@ -1005,6 +1006,10 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
         }
         tokio::select! {
             _ = ping.tick() => {
+                if last_heard.elapsed() >= Duration::from_secs(30) {
+                    warn!("No reply from the server for 30 s (phone); reconnecting");
+                    return Ok(());
+                }
                 if state.host_live.load(Ordering::SeqCst) == 0 {
                     let born = state.support_born.load(Ordering::SeqCst);
                     if born > 0 && unix_now().saturating_sub(born) >= 10 * 60 {
@@ -1024,18 +1029,20 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
             }
             msg = signal.recv() => {
                 let Some(msg) = msg else {
+                    warn!("Lost the connection to the server (phone); reconnecting");
                     if presented && !saw_registered {
                         state.suppress_token.store(true, Ordering::SeqCst);
                     }
                     return Ok(());
                 };
+                last_heard = Instant::now();
                 match msg {
                     ServerMsg::Registered { device_id } => {
                         saw_registered = true;
                         *state.device_id.lock().unwrap() = Some(device_id.clone());
                         persist(&state);
                         publish(&state, &cb);
-                        log_line(&cb, format!("registered as {}", format_id(&device_id)));
+                        log_line(&cb, format!("registered as {} (phone)", format_id(&device_id)));
                         emit(&cb, &json!({"event":"status","text":"Ready"}));
                     }
                     ServerMsg::Policy(policy) => {

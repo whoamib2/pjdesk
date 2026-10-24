@@ -101,6 +101,11 @@ impl std::fmt::Display for RegisterError {
 impl std::error::Error for RegisterError {}
 
 fn now() -> u64 {
+    unix_now()
+}
+
+/// Unix seconds. Used by the signaling server as well as the registry.
+pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
@@ -382,6 +387,11 @@ impl Registry {
         if let Err(e) = self.save() {
             tracing::warn!("could not save a display name: {e}");
         }
+    }
+
+    /// Last time this id registered or was touched, or 0 when it is unknown.
+    pub fn last_seen_of(&self, id: &str) -> u64 {
+        self.data.devices.get(id).map(|d| d.last_seen).unwrap_or(0)
     }
 
     /// Every registered computer, for the account list. Online is decided by the caller.

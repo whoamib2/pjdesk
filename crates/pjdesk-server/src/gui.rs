@@ -2871,7 +2871,7 @@ fn heading(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Reads the server's live online snapshot (id → reported version). Ignores a
-/// stale file (older than ~15 s), which means the server isn't running.
+/// stale file, which means the server isn't running.
 fn read_online(data_dir: &std::path::Path) -> HashMap<String, String> {
     #[derive(serde::Deserialize)]
     struct OnlineInfo {
@@ -2880,11 +2880,7 @@ fn read_online(data_dir: &std::path::Path) -> HashMap<String, String> {
         version: String,
     }
     let path = data_dir.join("online.json");
-    let fresh = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map(|e| e.as_secs() <= 15).unwrap_or(false))
-        .unwrap_or(false);
-    if !fresh {
+    if !crate::cloud::online_file_is_fresh(&path) {
         return HashMap::new();
     }
     std::fs::read(&path)

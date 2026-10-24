@@ -23,8 +23,21 @@ use tracing::{debug, info, warn};
 use crate::registry::Registry;
 use crate::ServerOpts;
 
-/// Clients must send something (hosts ping every 25 s) within this time.
+/// Clients must send something within this time. Current hosts ping every 10 s
+/// and reconnect after 30 s of silence. 0.6.26 hosts still ping every 25 s, so
+/// this stays at 90 s and does not drop them.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long Connect waits when the computer was registered recently but is
+/// missing from the live table. It is usually reconnecting.
+const CONNECT_WAIT: Duration = Duration::from_secs(6);
+const CONNECT_POLL: Duration = Duration::from_millis(250);
+/// A last-seen time inside this window is recent enough to wait.
+const CONNECT_RECENT_SECS: u64 = 120;
+
+/// True when `last_seen` is non-zero and no older than [`CONNECT_RECENT_SECS`].
+fn host_was_seen_recently(last_seen: u64, now: u64) -> bool {
+    last_seen > 0 && now.saturating_sub(last_seen) <= CONNECT_RECENT_SECS
+}
 /// Sessions that never complete are forgotten after this long.
 const SESSION_TTL: Duration = Duration::from_secs(600);
 /// Open sessions one address may have at once. Past this, further connection
@@ -72,6 +85,8 @@ pub struct OnlineHost {
     pub addr: SocketAddr,
     /// Protocol the host registered with. New server messages go only to version 3.
     pub proto: u16,
+    /// When this connection became the active registration.
+    pub since: Instant,
 }
 
 /// A connection attempt between a controller and a host.
@@ -421,6 +436,7 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
         let mut guard = state.lock().unwrap();
         let st = &mut *guard;
         if st.online.get(id).map(|h| h.conn_id) == Some(conn.id) {
+            let held = st.online.get(id).map(|h| h.since.elapsed().as_secs()).unwrap_or(0);
             st.online.remove(id);
             let mut replacement = None;
             if let Some(list) = st.standby.get_mut(id) {
@@ -433,11 +449,18 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
             }
             match replacement {
                 Some(h) => {
+                    info!(
+                        "Host {} dropped its connection after {held}s; another PJDesk process on this computer took over",
+                        format_id(id)
+                    );
                     st.online.insert(id.clone(), h);
                 }
-                None => info!("Host {} is offline", format_id(id)),
+                None => info!("Host {} is offline after {held}s", format_id(id)),
             }
         } else if let Some(list) = st.standby.get_mut(id) {
+            if list.iter().any(|h| h.conn_id == conn.id) {
+                info!("Host {} closed a standby connection from {}", format_id(id), conn.addr.ip());
+            }
             list.retain(|h| h.conn_id != conn.id);
         }
         if st.standby.get(id).is_some_and(|l| l.is_empty()) {
@@ -555,6 +578,75 @@ fn gate(st: &State, conn: &Conn) -> Result<Option<pjdesk_proto::access::Claims>,
     }
 }
 
+struct ControllerSide {
+    conn_id: u64,
+    addr: SocketAddr,
+    tx: mpsc::UnboundedSender<ServerMsg>,
+}
+
+fn offline_message(target: &str) -> String {
+    format!("device {} is not online", format_id(target))
+}
+
+fn send_error(tx: &mpsc::UnboundedSender<ServerMsg>, code: ErrorCode, message: impl Into<String>) {
+    let _ = tx.send(ServerMsg::Error { code, message: message.into() });
+}
+
+/// Opens a session when `target` is in the live table. The caller has already
+/// checked the network-access gate and the connect rate limit.
+fn start_session(st: &mut State, ctrl: &ControllerSide, target: &str, controller_name: &str) {
+    let Some(host) = st.online.get(target) else {
+        send_error(&ctrl.tx, ErrorCode::HostOffline, offline_message(target));
+        return;
+    };
+    if host.conn_id == ctrl.conn_id {
+        send_error(&ctrl.tx, ErrorCode::BadRequest, "a device cannot connect to itself on the same connection");
+        return;
+    }
+    let from_here = st.sessions.values().filter(|s| s.controller_ip == ctrl.addr.ip()).count();
+    if from_here >= MAX_SESSIONS_PER_IP || st.sessions.len() >= MAX_SESSIONS {
+        send_error(&ctrl.tx, ErrorCode::RateLimited, "too many connection attempts, wait a minute");
+        return;
+    }
+    let session_id = pjdesk_proto::random_u64();
+    let host_token = pjdesk_proto::random_bytes::<16>();
+    let controller_token = pjdesk_proto::random_bytes::<16>();
+    let _ = host.tx.send(ServerMsg::IncomingSession {
+        session_id,
+        token: host_token,
+        udp_port: st.udp_port,
+        controller_name: controller_name.to_string(),
+        controller_ip: ctrl.addr.ip().to_string(),
+    });
+    let session = Session {
+        host_token,
+        controller_token,
+        host_id: target.to_string(),
+        host_name: host.hostname.clone(),
+        host_conn: host.conn_id,
+        host_tx: host.tx.clone(),
+        controller_conn: ctrl.conn_id,
+        controller_ip: ctrl.addr.ip(),
+        controller_tx: ctrl.tx.clone(),
+        accepted: false,
+        host: PeerSlot::default(),
+        controller: PeerSlot::default(),
+        info_sent: false,
+        created: Instant::now(),
+    };
+    st.sessions.insert(session_id, session);
+    crate::audit::AuditLog::open(&st.data_dir).record(
+        "connect",
+        controller_name,
+        &format!("to {} from {}", format_id(target), ctrl.addr.ip()),
+    );
+    info!(
+        "Session {session_id:016x}: \"{controller_name}\" ({}) → host {}",
+        ctrl.addr.ip(),
+        format_id(target)
+    );
+}
+
 fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
     // Password checks are slow (Argon2). Do them off the process-wide lock so
     // one sign-in attempt cannot stall every other connection.
@@ -600,18 +692,29 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                         app_version: app_version.clone(),
                         addr: conn.addr,
                         proto: conn.proto,
+                        since: Instant::now(),
                     };
                     if let Some(prev) = st.online.insert(id.clone(), host) {
-                        if prev.conn_id != conn.id && prev.addr.ip() != conn.addr.ip() {
-                            warn!(
-                                "Host {} is now registered from {} (it was {}). The device secret is known to both.",
-                                format_id(&id),
-                                conn.addr.ip(),
-                                prev.addr.ip()
-                            );
-                        }
-                        if prev.conn_id != conn.id && !prev.tx.is_closed() {
-                            st.standby.entry(id.clone()).or_default().push(prev);
+                        if prev.conn_id != conn.id {
+                            let held = prev.since.elapsed().as_secs();
+                            if prev.addr.ip() != conn.addr.ip() {
+                                warn!(
+                                    "Host {} is now registered from {} (it was {}, held {held}s). The device secret is known to both.",
+                                    format_id(&id),
+                                    conn.addr.ip(),
+                                    prev.addr.ip()
+                                );
+                            } else {
+                                info!(
+                                    "Host {} registered again from {} (another PJDesk process on this computer, previous connection held {held}s)",
+                                    format_id(&id),
+                                    conn.addr.ip()
+                                );
+                            }
+                            if !prev.tx.is_closed() {
+                                info!("Host {} kept the previous connection on standby", format_id(&id));
+                                st.standby.entry(id.clone()).or_default().push(prev);
+                            }
                         }
                     }
                     conn.host_id = Some(id.clone());
@@ -659,57 +762,59 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 return;
             }
             let target = normalize_id(&target_id);
-            let Some(host) = st.online.get(&target) else {
+            let controller_name: String = controller_name.chars().take(64).collect();
+            let side = ControllerSide { conn_id: conn.id, addr: conn.addr, tx: conn.tx.clone() };
+            if st.online.contains_key(&target) {
+                start_session(st, &side, &target, &controller_name);
+                return;
+            }
+            let seen = st.registry.last_seen_of(&target);
+            let now = crate::registry::unix_now();
+            if !host_was_seen_recently(seen, now) {
+                let when = if seen == 0 {
+                    "never".to_string()
+                } else {
+                    format!("{}s ago", now.saturating_sub(seen))
+                };
+                info!("Connect to {} refused; it is not online (last seen {when})", format_id(&target));
                 conn.error(ErrorCode::HostOffline, format!("device {} is not online", format_id(&target)));
                 return;
-            };
-            if host.conn_id == conn.id {
-                conn.error(ErrorCode::BadRequest, "a device cannot connect to itself on the same connection");
-                return;
             }
-            let from_here = st.sessions.values().filter(|s| s.controller_ip == conn.addr.ip()).count();
-            if from_here >= MAX_SESSIONS_PER_IP || st.sessions.len() >= MAX_SESSIONS {
-                conn.error(ErrorCode::RateLimited, "too many connection attempts, wait a minute");
-                return;
-            }
-            let session_id = pjdesk_proto::random_u64();
-            let host_token = pjdesk_proto::random_bytes::<16>();
-            let controller_token = pjdesk_proto::random_bytes::<16>();
-            let controller_name: String = controller_name.chars().take(64).collect();
-            let _ = host.tx.send(ServerMsg::IncomingSession {
-                session_id,
-                token: host_token,
-                udp_port: st.udp_port,
-                controller_name: controller_name.clone(),
-                controller_ip: conn.addr.ip().to_string(),
-            });
-            let session = Session {
-                host_token,
-                controller_token,
-                host_id: target.clone(),
-                host_name: host.hostname.clone(),
-                host_conn: host.conn_id,
-                host_tx: host.tx.clone(),
-                controller_conn: conn.id,
-                controller_ip: conn.addr.ip(),
-                controller_tx: conn.tx.clone(),
-                accepted: false,
-                host: PeerSlot::default(),
-                controller: PeerSlot::default(),
-                info_sent: false,
-                created: Instant::now(),
-            };
-            st.sessions.insert(session_id, session);
-            crate::audit::AuditLog::open(&st.data_dir).record(
-                "connect",
-                &controller_name,
-                &format!("to {} from {}", format_id(&target), conn.addr.ip()),
-            );
+            let age = now.saturating_sub(seen);
             info!(
-                "Session {session_id:016x}: \"{controller_name}\" ({}) → host {}",
-                conn.addr.ip(),
-                format_id(&target)
+                "Connect to {} is waiting up to {}s; it was seen {age}s ago and is not registered right now",
+                format_id(&target),
+                CONNECT_WAIT.as_secs()
             );
+            let state = Arc::clone(state);
+            let target_for_wait = target.clone();
+            let name_for_wait = controller_name.clone();
+            tokio::spawn(async move {
+                let deadline = Instant::now() + CONNECT_WAIT;
+                loop {
+                    {
+                        let mut guard = state.lock().unwrap();
+                        if guard.online.contains_key(&target_for_wait) {
+                            info!("Connect to {} is going ahead; it registered during the wait", format_id(&target_for_wait));
+                            start_session(&mut guard, &side, &target_for_wait, &name_for_wait);
+                            return;
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        info!(
+                            "Connect to {} gave up after {}s; it did not register",
+                            format_id(&target_for_wait),
+                            CONNECT_WAIT.as_secs()
+                        );
+                        let _ = side.tx.send(ServerMsg::Error {
+                            code: ErrorCode::HostOffline,
+                            message: format!("device {} is not online", format_id(&target_for_wait)),
+                        });
+                        return;
+                    }
+                    tokio::time::sleep(CONNECT_POLL).await;
+                }
+            });
         }
 
         ClientMsg::SessionResponse { session_id, accept, reason } => {
@@ -956,11 +1061,13 @@ async fn janitor(state: Shared) {
 }
 
 /// One online device, published to `online.json` for the management window.
+/// `at` is unix seconds. Readers use it when the file's modification time stalls.
 #[derive(serde::Serialize)]
 struct OnlineInfo {
     id: String,
     hostname: String,
     version: String,
+    at: u64,
 }
 
 /// Publishes the live set of online devices to `online.json`, carries out the
@@ -982,6 +1089,7 @@ async fn fleet_sync(state: Shared) {
                 let ids: Vec<String> = st.online.keys().cloned().collect();
                 st.registry.touch(&ids);
             }
+            let at = crate::registry::unix_now();
             let snapshot: Vec<OnlineInfo> = st
                 .online
                 .iter()
@@ -989,6 +1097,7 @@ async fn fleet_sync(state: Shared) {
                     id: id.clone(),
                     hostname: h.hostname.clone(),
                     version: h.app_version.clone(),
+                    at,
                 })
                 .collect();
             (st.data_dir.clone(), snapshot)
@@ -996,8 +1105,23 @@ async fn fleet_sync(state: Shared) {
         let online_path = data_dir.join("online.json");
         if let Ok(bytes) = serde_json::to_vec(&snapshot) {
             let tmp = online_path.with_extension("json.tmp");
-            if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &online_path).is_ok() {
-                crate::cloud::protect(&online_path);
+            let created = !online_path.exists();
+            let replaced = std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &online_path).is_ok();
+            if replaced {
+                if created {
+                    crate::cloud::protect(&online_path);
+                }
+            } else {
+                warn!("could not replace online.json; writing it in place");
+                match std::fs::write(&online_path, &bytes) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        if created {
+                            crate::cloud::protect(&online_path);
+                        }
+                    }
+                    Err(e) => warn!("could not write online.json: {e}"),
+                }
             }
         }
 
@@ -1158,6 +1282,15 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_host_was_seen_recently() {
+        assert!(!host_was_seen_recently(0, 1_000));
+        assert!(host_was_seen_recently(1_000, 1_000));
+        assert!(host_was_seen_recently(1_000, 1_120));
+        assert!(!host_was_seen_recently(1_000, 1_121));
+        assert!(host_was_seen_recently(2_000, 1_000), "a clock ahead of the server is still recent");
+    }
 
     #[test]
     fn rate_limiter_blocks_after_limit() {

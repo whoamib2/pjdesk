@@ -106,6 +106,8 @@ struct Engine {
     /// False until the first probe snapshot. We do not start a host before that,
     /// or we would register the same computer twice when the service is up.
     ready: bool,
+    /// Consecutive "service not running" samples after it has been seen running.
+    service_down_polls: u32,
 }
 
 impl Engine {
@@ -115,21 +117,43 @@ impl Engine {
             server: ServerAddr::parse(&config.effective_server()).ok(),
             service_running: false,
             ready: false,
+            service_down_polls: 0,
         }
     }
 
     fn on_service(&mut self, config: &Config, running: bool) {
-        if !self.ready {
-            self.ready = true;
-            self.service_running = running;
-            if !running {
+        let was_ready = self.ready;
+        let window_was_hosting = self.ready && !self.service_running;
+        let duty = probe::host_duty(self.ready, self.service_running, self.service_down_polls, running);
+        self.ready = true;
+        self.service_down_polls = duty.down_polls;
+        if !was_ready {
+            self.service_running = duty.service_running;
+            if duty.window_hosts {
+                tracing::info!("The background service is not running; this window will register this computer");
                 self.spawn(config);
             }
             return;
         }
-        if running != self.service_running {
-            self.restart(config, running);
+        if duty.window_hosts == window_was_hosting && duty.service_running == self.service_running {
+            if !running && self.service_running {
+                tracing::info!(
+                    "The background service missed a status check ({}/{})",
+                    duty.down_polls,
+                    probe::SERVICE_DOWN_POLLS
+                );
+            }
+            return;
         }
+        if duty.window_hosts && !window_was_hosting {
+            tracing::info!(
+                "The background service missed {} status checks; this window will register this computer",
+                probe::SERVICE_DOWN_POLLS
+            );
+        } else if !duty.window_hosts && window_was_hosting {
+            tracing::info!("The background service is running; this window stopped registering this computer");
+        }
+        self.restart(config, duty.service_running);
     }
 
     fn restart(&mut self, config: &Config, service_running: bool) {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.28
+
+Windows is 0.6.28. Android is 0.6.28 (versionCode 62800). cloud/ did not change. No migration and no worker change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Do not run `cloud\deploy.cmd`. The phone needs 62800. Cabin Desk and CHIP20 need this Windows client. PJDesk Server needs this build. A 0.6.26 client still pings every 25 seconds, and the server still allows 90 seconds of silence, so that client stays registered. This machine has no Pixel and no Windows PC attached.
+
+* A Windows computer pings the server every 10 seconds and registers again after 30 seconds without a reply. The log says whether that registration is the background service or the window. The window waits for two missed service checks before it registers, so one flicker does not start a second registration of the same ID.
+* PJDesk Server waits up to 6 seconds before saying a computer is not online, when that computer was seen in the last 2 minutes. A registration that replaces another connection on the same computer is logged, including how long the previous connection was held and whether a standby connection took over.
+* `online.json` stays fresh for 45 seconds. Each row includes the time it was written, so a stalled file time does not mark every computer offline. The file's permission reset runs when the file is created, not on every write. A file that cannot be read does not publish an empty list. The presence log names each computer that flips between online and offline.
+* The phone retries Connect twice, 2 seconds apart, when the server says the computer is not online and that computer was seen in the last 2 minutes. Each retry is in the phone log.
+
 ## 0.6.27
 
 Windows is 0.6.27. Android is 0.6.27 (versionCode 62700). cloud/ did not change. No migration and no worker change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Do not run `cloud\deploy.cmd`. The phone needs 62700. The Windows client and PJDesk Server need this build so a computer is marked online from the live connection list. A last-connected time does not count. This machine has no Pixel attached, so the phone screens were rendered headlessly.

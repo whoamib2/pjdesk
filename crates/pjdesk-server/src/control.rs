@@ -432,11 +432,7 @@ fn online_count(data_dir: &Path) -> usize {
         id: String,
     }
     let path = data_dir.join("online.json");
-    let fresh = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map(|e| e.as_secs() <= 15).unwrap_or(false))
-        .unwrap_or(false);
-    if !fresh {
+    if !crate::cloud::online_file_is_fresh(&path) {
         return 0;
     }
     std::fs::read(&path)

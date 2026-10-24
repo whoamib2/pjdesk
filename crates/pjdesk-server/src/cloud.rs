@@ -675,11 +675,7 @@ pub fn discard_sign_in(cfg: &CloudConfig) {
 /// How many computers are connected to the running server (0 if it isn't running).
 pub fn computers_online(data_dir: &Path) -> usize {
     let path = data_dir.join("online.json");
-    let fresh = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map(|e| e.as_secs() <= 15).unwrap_or(false))
-        .unwrap_or(false);
-    if !fresh {
+    if !online_file_is_fresh(&path) {
         return 0;
     }
     std::fs::read(&path)
@@ -1644,7 +1640,9 @@ fn publish_presence(data_dir: &Path) {
         return;
     }
     let Ok(reg) = crate::registry::Registry::load(data_dir.join("devices.json")) else { return };
-    let online = online_ids(data_dir);
+    let Some(online) = online_ids(data_dir) else { return };
+    let online_path = data_dir.join("online.json");
+    let snapshot_stale = online_path.exists() && !online_file_is_fresh(&online_path);
     let now = now();
     let mut devices = Vec::new();
     for row in reg.presence() {
@@ -1668,10 +1666,17 @@ fn publish_presence(data_dir: &Path) {
     }
     let body = serde_json::json!({ "devices": devices });
     let stamp = data_dir.join("presence-publish.json");
-    if let Ok(prev) = std::fs::read(&stamp) {
-        if serde_json::from_slice::<serde_json::Value>(&prev).ok().as_ref() == Some(&body) {
-            return;
-        }
+    let previous = std::fs::read(&stamp).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    if previous.as_ref() == Some(&body) {
+        return;
+    }
+    if snapshot_stale {
+        tracing::warn!(
+            "online.json is older than {ONLINE_FRESH_SECS}s; publishing every computer offline"
+        );
+    }
+    if let Some(prev) = previous.as_ref() {
+        log_presence_changes(prev, &body);
     }
     let result = agent()
         .post(&format!("{}/api/network/presence", cfg.api.trim_end_matches('/')))
@@ -1692,25 +1697,98 @@ fn publish_presence(data_dir: &Path) {
     }
 }
 
-/// Ids in a fresh `online.json`. The server rewrites that file from the live
-/// connection table every couple of seconds. A file older than 15 seconds means
-/// the process is not running, so nothing is online. `last_seen` is not read.
-fn online_ids(data_dir: &Path) -> std::collections::HashSet<String> {
+/// How long `online.json` may sit before it no longer counts as the live set.
+/// The server rewrites it about every 2 seconds. 45 seconds still rejects a
+/// dead process, and it leaves room for a slow rename or a stalled permission
+/// update on Windows.
+pub const ONLINE_FRESH_SECS: u64 = 45;
+
+/// Ids in a fresh `online.json`. `None` means the file was there but could not
+/// be read, so the caller must leave the published list alone. An empty set
+/// means nothing is online. `last_seen` in the registry is not read.
+fn online_ids(data_dir: &Path) -> Option<std::collections::HashSet<String>> {
     let path = data_dir.join("online.json");
-    if !online_file_fresh(&path) {
-        return std::collections::HashSet::new();
-    }
-    let Ok(bytes) = std::fs::read(&path) else {
-        return std::collections::HashSet::new();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(std::collections::HashSet::new()),
+        Err(e) => {
+            tracing::warn!("online.json could not be read ({e}); presence was not changed");
+            return None;
+        }
     };
-    online_ids_from(&bytes)
+    if !online_file_is_fresh(&path) {
+        return Some(std::collections::HashSet::new());
+    }
+    match serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+        Ok(rows) => Some(
+            rows.into_iter().filter_map(|row| row.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())).collect(),
+        ),
+        Err(e) => {
+            tracing::warn!("online.json could not be read ({e}); presence was not changed");
+            None
+        }
+    }
 }
 
-fn online_file_fresh(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map(|e| e.as_secs() <= 15).unwrap_or(false))
-        .unwrap_or(false)
+/// True when `online.json` was written recently. The file time counts, and so
+/// does the newest `at` stamp inside the file, so a stalled modification time
+/// does not mark every computer offline.
+pub fn online_file_is_fresh(path: &Path) -> bool {
+    if online_mtime_age(path).is_some_and(|age| age <= ONLINE_FRESH_SECS) {
+        return true;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    embedded_at_is_fresh(&bytes)
+}
+
+fn online_mtime_age(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(modified.elapsed().map(|e| e.as_secs()).unwrap_or(u64::MAX))
+}
+
+fn embedded_at_is_fresh(bytes: &[u8]) -> bool {
+    let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) else {
+        return false;
+    };
+    let Some(at) = rows.iter().filter_map(|row| row.get("at").and_then(|v| v.as_u64())).max() else {
+        return false;
+    };
+    now().saturating_sub(at) <= ONLINE_FRESH_SECS
+}
+
+fn presence_flags(body: &serde_json::Value) -> std::collections::BTreeMap<String, bool> {
+    let mut flags = std::collections::BTreeMap::new();
+    let Some(devices) = body.get("devices").and_then(|d| d.as_array()) else {
+        return flags;
+    };
+    for row in devices {
+        let Some(id) = row.get("id").and_then(|v| v.as_str()) else { continue };
+        flags.insert(id.to_string(), row.get("online").and_then(|v| v.as_bool()).unwrap_or(false));
+    }
+    flags
+}
+
+fn log_presence_changes(previous: &serde_json::Value, next: &serde_json::Value) {
+    let before = presence_flags(previous);
+    let after = presence_flags(next);
+    let mut ids: Vec<String> = before.keys().chain(after.keys()).cloned().collect();
+    ids.sort();
+    ids.dedup();
+    for id in ids {
+        let was = before.get(&id).copied();
+        let now_online = after.get(&id).copied();
+        if was == now_online {
+            continue;
+        }
+        let label = pjdesk_proto::format_id(&id);
+        match now_online {
+            Some(true) => tracing::info!("presence: {label} is online"),
+            Some(false) => tracing::info!("presence: {label} is offline"),
+            None => tracing::info!("presence: {label} left the list"),
+        }
+    }
 }
 
 fn online_ids_from(bytes: &[u8]) -> std::collections::HashSet<String> {
@@ -2395,13 +2473,13 @@ mod tests {
             br#"{"devices":{"902488771":{"hostname":"CABINDESK","last_seen":1700000000}}}"#,
         )
         .unwrap();
-        assert!(online_ids(&dir).is_empty(), "a last_seen time is not presence");
+        assert!(online_ids(&dir).unwrap().is_empty(), "a last_seen time is not presence");
         std::fs::write(
             dir.join("online.json"),
             br#"[{"id":"610978221","hostname":"CHIP20","version":"0.6.27"}]"#,
         )
         .unwrap();
-        let live = online_ids(&dir);
+        let live = online_ids(&dir).unwrap();
         assert!(live.contains("610978221"));
         assert!(!live.contains("902488771"));
         #[cfg(unix)]
@@ -2410,9 +2488,45 @@ mod tests {
             assert!(
                 std::process::Command::new("touch").arg("-d").arg("1 hour ago").arg(&path).status().unwrap().success()
             );
-            assert!(online_ids(&dir).is_empty(), "a stale online.json is not live presence");
+            assert!(online_ids(&dir).unwrap().is_empty(), "a stale online.json is not live presence");
         }
         assert!(online_ids_from(br#"[{"id":"902488771"}]"#).contains("902488771"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn presence_online_at_stamp_counts_when_mtime_is_old() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-online-at-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let at = now();
+        let path = dir.join("online.json");
+        std::fs::write(
+            &path,
+            format!(r#"[{{"id":"902488771","hostname":"CABINDESK","version":"0.6.28","at":{at}}}]"#),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            assert!(
+                std::process::Command::new("touch").arg("-d").arg("1 hour ago").arg(&path).status().unwrap().success()
+            );
+            assert!(!online_mtime_age(&path).is_some_and(|age| age <= ONLINE_FRESH_SECS));
+        }
+        let live = online_ids(&dir).unwrap();
+        assert!(live.contains("902488771"), "a recent at stamp keeps the computer online");
+        std::fs::write(
+            &path,
+            format!(r#"[{{"id":"902488771","hostname":"CABINDESK","version":"0.6.28","at":{}}}]"#, at.saturating_sub(3600)),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            assert!(
+                std::process::Command::new("touch").arg("-d").arg("1 hour ago").arg(&path).status().unwrap().success()
+            );
+            assert!(online_ids(&dir).unwrap().is_empty(), "an old at stamp is not live presence");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

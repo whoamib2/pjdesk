@@ -225,10 +225,7 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
     let Ok(file) = serde_json::from_slice::<File>(&bytes) else {
         return Vec::new();
     };
-    let online_fresh = std::fs::metadata(dir.join("online.json"))
-        .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map(|e| e.as_secs() <= 15).unwrap_or(false))
-        .unwrap_or(false);
+    let online_fresh = crate::cloud::online_file_is_fresh(&dir.join("online.json"));
     let online: std::collections::BTreeMap<String, String> = if online_fresh {
         std::fs::read(dir.join("online.json"))
             .ok()
