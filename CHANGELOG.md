@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.22
+
+Windows is 0.6.22. Android stays 0.6.21 (versionCode 62100). cloud/ did not change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The server binary did not change, so do not run `cloud\deploy.cmd`. The phone does not need this build. The Windows client does: a 0.6.21 window still clips Connect, View phone, and Menu until the window is widened. This machine has no Windows PC attached. The six widths were rendered headlessly.
+
+* The Saved list pins Connect (or View phone) and Menu to the right edge at a fixed width. Name, ID, user, last connected, and system text shrink or drop first. As the list gets narrower, User goes, then Last connected, then the system name (the OS icon stays), then the ID moves under the computer name, then the status dot sits in the name. Below a narrow list, Connect is an arrow icon with the same tooltip. The narrowest window, 720 points (900 px at 125% DPI), still shows the name, the status, and the actions.
+* Double-click a row to connect. A phone row views the phone. This computer does nothing. The buttons still work with one click.
+
 ## 0.6.21
 
 Windows is 0.6.21. Android is 0.6.21 (versionCode 62100). cloud/ did not change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The server binary did not change, so do not run `cloud\deploy.cmd`. The phone needs 62100. The Windows viewer needs this build for the 60 second screen-share wait. This machine has no Pixel attached, so 0.6.21 was not run on the device.

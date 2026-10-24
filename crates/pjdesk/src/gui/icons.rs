@@ -30,6 +30,8 @@ pub enum Icon {
     OsAndroid,
     /// A monitor with a question mark.
     OsUnknown,
+    /// Right arrow used as the compact Connect button.
+    Go,
 }
 
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -120,6 +122,11 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::OsLinux => terminal(painter, c, s, stroke, color),
         Icon::OsAndroid => phone(painter, c, s, stroke, color),
         Icon::OsUnknown => unknown_monitor(painter, c, s, stroke, color),
+        Icon::Go => {
+            painter.line_segment([c + Vec2::new(-s * 0.28, 0.0), c + Vec2::new(s * 0.16, 0.0)], stroke);
+            painter.line_segment([c + Vec2::new(-s * 0.02, -s * 0.22), c + Vec2::new(s * 0.28, 0.0)], stroke);
+            painter.line_segment([c + Vec2::new(-s * 0.02, s * 0.22), c + Vec2::new(s * 0.28, 0.0)], stroke);
+        }
     }
 }
 

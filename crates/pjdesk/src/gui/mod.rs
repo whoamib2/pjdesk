@@ -61,7 +61,7 @@ pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 840.0])
-            .with_min_inner_size([920.0, 680.0])
+            .with_min_inner_size([saved::MIN_INNER_WIDTH, 680.0])
             .with_title("PJDesk")
             .with_app_id("pjdesk")
             .with_icon(std::sync::Arc::new(app_icon())),
@@ -541,8 +541,12 @@ impl App {
             },
         );
         self.cfg.remember_password("123456789", Some("saved-secret"));
+        if let Some(note) = self.cfg.settings.peers.get_mut("123456789") {
+            note.console_user = "SPADER\\Ben".into();
+        }
         self.lan = vec![("OFFICE-PC".into(), "123456789".into(), "192.168.1.20:21201".into())];
         self.page = MainPage::Saved;
+        self.desk_tab = DeskTab::Saved;
         self.saved_query.clear();
     }
 

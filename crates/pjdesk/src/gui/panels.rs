@@ -7,6 +7,24 @@ use pjdesk_proto::{format_id, normalize_id};
 use super::icons::Icon;
 use super::{theme, widgets, App};
 
+/// How the main window divides the area under the top bar.
+pub(crate) struct DeskSplit {
+    pub stacked: bool,
+    pub left: f32,
+    pub list: f32,
+}
+
+/// `body_width` is the width of the main area, after the window margin.
+pub(crate) fn desk_split(body_width: f32) -> DeskSplit {
+    if body_width < 960.0 {
+        DeskSplit { stacked: true, left: body_width, list: body_width }
+    } else {
+        let left = 400.0_f32.min((body_width * 0.34).max(340.0));
+        let list = (body_width - left - 12.0).max(320.0);
+        DeskSplit { stacked: false, left, list }
+    }
+}
+
 impl App {
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
@@ -66,10 +84,10 @@ impl App {
             return;
         }
         let width = ui.available_width();
-        let height = ui.available_height();
-        // Narrow windows stack. The computer list then gets the full width so
-        // Connect and Menu are not clipped off the right edge.
-        if width < 960.0 {
+        // Narrow windows stack the connect form above the list. The list pins
+        // Connect and Menu to its own right edge at every width.
+        let split = desk_split(width);
+        if split.stacked {
             ScrollArea::vertical().id_salt("stacked").auto_shrink([false, false]).show(ui, |ui| {
                 self.remote(ui);
                 ui.add_space(12.0);
@@ -79,23 +97,38 @@ impl App {
             });
             return;
         }
+        // Place the two columns in the space the window actually has. A horizontal
+        // layout would let the left column's minimum width push Connect and Menu
+        // past the right edge.
+        let rect = ui.available_rect_before_wrap();
         let gap = 12.0;
-        let left = 400.0_f32.min((width * 0.34).max(340.0));
-        let right = (width - left - gap).max(320.0);
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(Vec2::new(left, height), egui::Layout::top_down(egui::Align::Min), |ui| {
-                ScrollArea::vertical().id_salt("connect-col").auto_shrink([false, false]).show(ui, |ui| {
-                    ui.set_min_width(left - 8.0);
-                    self.remote(ui);
-                    ui.add_space(12.0);
-                    self.rail(ui);
-                });
-            });
-            ui.add_space(gap);
-            ui.allocate_ui_with_layout(Vec2::new(right, height), egui::Layout::top_down(egui::Align::Min), |ui| {
-                self.computer_list(ui);
-            });
+        let left_w = split.left.min((rect.width() - gap - 280.0).max(0.0));
+        let right_x = rect.left() + left_w + gap;
+        let left_rect = egui::Rect::from_min_max(rect.left_top(), egui::pos2(right_x - gap, rect.bottom()));
+        let right_rect = egui::Rect::from_min_max(egui::pos2(right_x.min(rect.right()), rect.top()), rect.right_bottom());
+        let mut left_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("connect-col-wrap")
+                .max_rect(left_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        left_ui.set_clip_rect(left_rect);
+        ScrollArea::vertical().id_salt("connect-col").auto_shrink([false, false]).show(&mut left_ui, |ui| {
+            ui.set_max_width(left_rect.width());
+            self.remote(ui);
+            ui.add_space(12.0);
+            self.rail(ui);
         });
+        let mut right_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("saved-col-wrap")
+                .max_rect(right_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        right_ui.set_clip_rect(right_rect);
+        right_ui.set_max_width(right_rect.width());
+        self.computer_list(&mut right_ui);
+        ui.advance_cursor_after_rect(rect);
     }
 
     fn rail(&mut self, ui: &mut egui::Ui) {

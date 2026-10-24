@@ -1,7 +1,7 @@
 //! Saved computers: one list for everything this app has connected to or been
 //! given an ID for, with search, sort, and a favorites filter.
 
-use eframe::egui::{self, RichText, Vec2};
+use eframe::egui::{self, Pos2, Rect, RichText, Sense, Vec2};
 use pjdesk_proto::{format_id, normalize_id};
 
 use super::icons::Icon;
@@ -189,19 +189,15 @@ impl App {
                 ui.label(widgets::muted(ui, "No saved computers match."));
                 return;
             }
-            egui::ScrollArea::both().id_salt("saved-rows").auto_shrink([false, false]).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("saved-rows").auto_shrink([false, false]).show(ui, |ui| {
+                let available = ui.available_width();
+                let width = if available.is_finite() { (available - ROW_GUTTER).max(0.0) } else { 640.0 };
+                let layout = saved_layout(width);
                 let mut action: Option<RowCmd> = None;
-                egui::Grid::new("saved-table").num_columns(11).spacing(egui::vec2(6.0, 4.0)).min_col_width(0.0).show(
-                    ui,
-                    |ui| {
-                        header(ui);
-                        ui.end_row();
-                        for row in &rows {
-                            self.row_line(ui, row, &mut action);
-                            ui.end_row();
-                        }
-                    },
-                );
+                saved_header(ui, width, &layout);
+                for row in &rows {
+                    self.saved_row(ui, row, width, &layout, &mut action);
+                }
                 if let Some(cmd) = action {
                     self.apply_saved(cmd);
                 }
@@ -322,110 +318,179 @@ impl App {
         self.engine.shared.id.lock().unwrap().as_deref().is_some_and(same)
     }
 
-    fn row_line(&mut self, ui: &mut egui::Ui, row: &SavedRow, action: &mut Option<RowCmd>) {
+    fn saved_row(&mut self, ui: &mut egui::Ui, row: &SavedRow, width: f32, layout: &SavedLayout, action: &mut Option<RowCmd>) {
         let p = theme::paint(ui);
+        let (rect, row_resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
+        if row_resp.hovered() {
+            ui.painter().rect_filled(rect, egui::CornerRadius::same(8), p.text.linear_multiply(0.06));
+        }
         let id = row.id.clone();
-        icon_cell(ui, Icon::Monitor, p.muted);
-        if self.renaming.as_deref() == Some(id.as_str()) {
-            let commit = name_editor(ui, &mut self.rename_text);
+        if row_resp.double_clicked() && self.renaming.as_deref() != Some(id.as_str()) {
+            if let Some(kind) = primary_action(row.this_computer, &row.os_family) {
+                *action = Some(match kind {
+                    PrimaryAction::Connect => RowCmd::Connect(id.clone()),
+                    PrimaryAction::View => RowCmd::View(id.clone()),
+                });
+            }
+        }
+        let slots = column_slots(rect, layout);
+        in_rect(ui, slots.icon, (&id, "icon"), |ui| {
+            paint_icon(ui, ui.max_rect(), Icon::Monitor, p.muted);
+        });
+        let renaming = self.renaming.as_deref() == Some(id.as_str());
+        if renaming {
+            let commit = name_editor(ui, slots.name, &id, &mut self.rename_text);
             if commit {
                 *action = Some(RowCmd::CommitRename(id.clone()));
             }
         } else {
-            name_cell(ui, &row.nickname, &row.display_name, &row.hostname, p.text, p.muted);
-        }
-        fixed(ui, W_ID, |ui| {
-            ui.add(egui::Label::new(RichText::new(format_id(&id)).monospace().color(p.muted)).truncate());
-        });
-        fixed(ui, W_COPY, |ui| {
-            if widgets::icon_button(ui, Icon::Copy, "Copy ID").clicked() {
+            let copied = name_block(ui, slots.name, row, layout, p.text, p.muted);
+            if copied {
                 ui.ctx().copy_text(format_id(&id));
                 self.toast.show("Copied");
             }
+        }
+        if let Some(r) = slots.id {
+            in_rect(ui, r, (&id, "id"), |ui| {
+                ui.add(egui::Label::new(RichText::new(format_id(&id)).monospace().color(p.muted).size(13.0)).truncate());
+            });
+        }
+        if let Some(r) = slots.copy {
+            in_rect(ui, r, (&id, "copy"), |ui| {
+                if widgets::icon_button(ui, Icon::Copy, "Copy ID").clicked() {
+                    ui.ctx().copy_text(format_id(&id));
+                    self.toast.show("Copied");
+                }
+            });
+        }
+        if let Some(r) = slots.user {
+            let user = if row.console_user.trim().is_empty() { "—".to_string() } else { row.console_user.clone() };
+            in_rect(ui, r, (&id, "user"), |ui| {
+                ui.add(egui::Label::new(RichText::new(user).color(p.text).size(12.5)).truncate());
+            });
+        }
+        if let Some(r) = slots.last {
+            let when = if row.last_connected == 0 { "Never".to_string() } else { ago(row.last_connected) };
+            in_rect(ui, r, (&id, "last"), |ui| {
+                ui.add(egui::Label::new(RichText::new(when).color(p.muted).size(12.5)).truncate());
+            });
+        }
+        in_rect(ui, slots.os, (&id, "os"), |ui| {
+            paint_icon(ui, ui.max_rect(), os_icon(&row.os_family), p.text);
         });
-        let user = if row.console_user.trim().is_empty() { "—".to_string() } else { row.console_user.clone() };
-        fixed(ui, W_USER, |ui| {
-            ui.add(egui::Label::new(RichText::new(user).color(p.text).size(12.0)).truncate());
-        });
-        let when = if row.last_connected == 0 { "Never".to_string() } else { ago(row.last_connected) };
-        fixed(ui, W_LAST, |ui| {
-            ui.add(egui::Label::new(RichText::new(when).color(p.muted).size(12.0)).truncate());
-        });
-        system_cell(ui, &row.os_family, &row.os_version);
-        fixed(ui, W_LOCK, |ui| {
+        if let Some(r) = slots.system_text {
+            let os = system_label(&row.os_family, &row.os_version);
+            in_rect(ui, r, (&id, "sys"), |ui| {
+                ui.add(egui::Label::new(RichText::new(os).color(p.muted).size(12.5)).truncate());
+            });
+        }
+        in_rect(ui, slots.lock, (&id, "lock"), |ui| {
             if row.has_password {
-                theme::icon_in(ui, Icon::Lock, 14.0, p.muted);
+                paint_icon(ui, ui.max_rect(), Icon::Lock, p.muted);
             }
         });
-        fixed(ui, W_STATUS, |ui| {
-            if row.this_computer {
-                ui.add(egui::Label::new(RichText::new("This computer").color(p.accent).size(12.0)).truncate());
-            } else if row.online {
-                widgets::status_dot(ui, p.ok, "Online");
-            } else if row.last_seen == 0 {
-                ui.add(egui::Label::new(RichText::new("Offline").color(p.muted).size(12.0)).truncate());
-            } else {
-                let text = format!("Offline · {}", ago(row.last_seen));
-                ui.add(egui::Label::new(RichText::new(text).color(p.muted).size(12.0)).truncate());
-            }
+        if let Some(r) = slots.status {
+            let text = status_text(row);
+            let color = status_color(ui, row);
+            in_rect(ui, r, (&id, "status"), |ui| {
+                let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.0, color);
+                ui.add(egui::Label::new(RichText::new(text).color(p.text).size(12.5)).truncate());
+            });
+        }
+        self.row_actions(ui, row, &id, slots.connect, slots.menu, layout.compact_connect, action);
+    }
+
+    fn row_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        row: &SavedRow,
+        id: &str,
+        connect: Rect,
+        menu: Rect,
+        compact: bool,
+        action: &mut Option<RowCmd>,
+    ) {
+        let p = theme::paint(ui);
+        let android = row.os_family.eq_ignore_ascii_case("android");
+        in_rect(ui, connect, (id, "connect"), |ui| {
+            ui.set_width(connect.width());
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if compact {
+                    if row.this_computer {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(W_CONNECT_ICON), Sense::hover());
+                        super::icons::paint(ui.painter(), rect.shrink(6.0), Icon::Go, p.muted);
+                        resp.on_hover_text("This computer");
+                    } else {
+                        let tip = if android { "View phone" } else { "Connect" };
+                        let resp = widgets::icon_button(ui, Icon::Go, tip);
+                        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip));
+                        if resp.clicked() {
+                            *action = Some(if android { RowCmd::View(id.to_string()) } else { RowCmd::Connect(id.to_string()) });
+                        }
+                    }
+                } else if row.this_computer {
+                    ui.add_enabled(false, egui::Button::new("Connect"));
+                } else if android {
+                    if ui.button("View phone").clicked() {
+                        *action = Some(RowCmd::View(id.to_string()));
+                    }
+                } else if ui.button("Connect").clicked() {
+                    *action = Some(RowCmd::Connect(id.to_string()));
+                }
+            });
         });
-        fixed(ui, W_CONNECT, |ui| {
-            if row.this_computer {
-                ui.add_enabled(false, egui::Button::new("Connect"));
-            } else if row.os_family.eq_ignore_ascii_case("android") {
-                if ui.button("View phone").clicked() {
-                    *action = Some(RowCmd::View(id.clone()));
-                }
-            } else if ui.button("Connect").clicked() {
-                *action = Some(RowCmd::Connect(id.clone()));
-            }
-        });
-        fixed(ui, W_MENU, |ui| {
-            ui.menu_button("Menu", |ui| {
-                if !row.this_computer && ui.button("Request view access").clicked() {
-                    *action = Some(RowCmd::View(id.clone()));
-                    ui.close();
-                }
-                if ui.button("Rename").clicked() {
-                    *action = Some(RowCmd::Rename(id.clone()));
-                    ui.close();
-                }
-                if !row.in_book && ui.button("Save").clicked() {
-                    *action = Some(RowCmd::Save(id.clone()));
-                    ui.close();
-                }
-                let fav = if row.favorite { "Unfavorite" } else { "Favorite" };
-                if ui.button(fav).clicked() {
-                    *action = Some(RowCmd::Favorite(id.clone()));
-                    ui.close();
-                }
-                if ui.button("Move up").clicked() {
-                    *action = Some(RowCmd::Move(id.clone(), true));
-                    ui.close();
-                }
-                if ui.button("Move down").clicked() {
-                    *action = Some(RowCmd::Move(id.clone(), false));
-                    ui.close();
-                }
-                if row.has_password && ui.button("Forget saved password").clicked() {
-                    *action = Some(RowCmd::ForgetPassword(id.clone()));
-                    ui.close();
-                }
-                if ui.button("Remove from Saved").clicked() {
-                    *action = Some(RowCmd::Remove(id.clone()));
-                    ui.close();
-                }
-                if row.this_computer {
-                    ui.add_enabled(false, egui::Button::new("Delete from my account")).on_disabled_hover_text(
-                        "This computer stays on your account while PJDesk is signed in here.",
-                    );
-                } else if self.cfg.network_refresh_token().is_empty() {
-                    ui.add_enabled(false, egui::Button::new("Delete from my account"))
-                        .on_disabled_hover_text("Sign in to delete a computer from your account.");
-                } else if ui.button("Delete from my account").clicked() {
-                    *action = Some(RowCmd::DeleteAccount(id.clone()));
-                    ui.close();
-                }
+        in_rect(ui, menu, (id, "menu"), |ui| {
+            ui.set_width(menu.width());
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button("Menu", |ui| {
+                    if !row.this_computer && ui.button("Request view access").clicked() {
+                        *action = Some(RowCmd::View(id.to_string()));
+                        ui.close();
+                    }
+                    if ui.button("Rename").clicked() {
+                        *action = Some(RowCmd::Rename(id.to_string()));
+                        ui.close();
+                    }
+                    if !row.in_book && ui.button("Save").clicked() {
+                        *action = Some(RowCmd::Save(id.to_string()));
+                        ui.close();
+                    }
+                    let fav = if row.favorite { "Unfavorite" } else { "Favorite" };
+                    if ui.button(fav).clicked() {
+                        *action = Some(RowCmd::Favorite(id.to_string()));
+                        ui.close();
+                    }
+                    if ui.button("Move up").clicked() {
+                        *action = Some(RowCmd::Move(id.to_string(), true));
+                        ui.close();
+                    }
+                    if ui.button("Move down").clicked() {
+                        *action = Some(RowCmd::Move(id.to_string(), false));
+                        ui.close();
+                    }
+                    if row.has_password && ui.button("Forget saved password").clicked() {
+                        *action = Some(RowCmd::ForgetPassword(id.to_string()));
+                        ui.close();
+                    }
+                    if ui.button("Remove from Saved").clicked() {
+                        *action = Some(RowCmd::Remove(id.to_string()));
+                        ui.close();
+                    }
+                    if row.this_computer {
+                        ui.add_enabled(false, egui::Button::new("Delete from my account")).on_disabled_hover_text(
+                            "This computer stays on your account while PJDesk is signed in here.",
+                        );
+                    } else if self.cfg.network_refresh_token().is_empty() {
+                        ui.add_enabled(false, egui::Button::new("Delete from my account"))
+                            .on_disabled_hover_text("Sign in to delete a computer from your account.");
+                    } else if ui.button("Delete from my account").clicked() {
+                        *action = Some(RowCmd::DeleteAccount(id.to_string()));
+                        ui.close();
+                    }
+                });
             });
         });
     }
@@ -721,18 +786,35 @@ fn ago(unix: u64) -> String {
     }
 }
 
+/// Narrowest window inner width. 720 points is 900 physical pixels at 125% DPI,
+/// and that width still shows the name, the status, and Connect / Menu.
+pub(crate) const MIN_INNER_WIDTH: f32 = 720.0;
+
 const ROW_H: f32 = 46.0;
+const GAP: f32 = 6.0;
+/// Room so the floating scrollbar does not cover Menu.
+const ROW_GUTTER: f32 = 10.0;
 const W_ICON: f32 = 28.0;
-const W_NAME: f32 = 168.0;
-const W_ID: f32 = 118.0;
-const W_COPY: f32 = 32.0;
-const W_USER: f32 = 128.0;
-const W_LAST: f32 = 100.0;
-const W_SYS: f32 = 132.0;
+const W_OS: f32 = 22.0;
 const W_LOCK: f32 = 18.0;
-const W_STATUS: f32 = 132.0;
-const W_CONNECT: f32 = 88.0;
+const W_COPY: f32 = 32.0;
+const W_CONNECT: f32 = 118.0;
+const W_CONNECT_ICON: f32 = 32.0;
 const W_MENU: f32 = 76.0;
+const NAME_MIN: f32 = 120.0;
+const NAME_PREF: f32 = 200.0;
+const USER_PREF: f32 = 120.0;
+const USER_MIN: f32 = 72.0;
+const LAST_PREF: f32 = 104.0;
+const LAST_MIN: f32 = 80.0;
+const SYS_PREF: f32 = 96.0;
+const SYS_MIN: f32 = 72.0;
+const ID_PREF: f32 = 118.0;
+const ID_MIN: f32 = 108.0;
+const STATUS_PREF: f32 = 128.0;
+const STATUS_MIN: f32 = 110.0;
+/// Below this list width, Connect becomes an icon so the other columns can stay.
+const COMPACT_BELOW: f32 = 640.0;
 
 fn system_label(family: &str, version: &str) -> String {
     if family.is_empty() {
@@ -745,62 +827,403 @@ fn system_label(family: &str, version: &str) -> String {
     }
 }
 
-/// One grid cell. The width is fixed so a badge on one row cannot move the buttons on the others.
-fn fixed(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
-    ui.allocate_ui_with_layout(Vec2::new(width, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        ui.set_min_width(width);
-        ui.set_max_width(width);
-        add(ui);
-    });
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimaryAction {
+    Connect,
+    View,
 }
 
-fn icon_cell(ui: &mut egui::Ui, icon: Icon, color: egui::Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(W_ICON, ROW_H), egui::Sense::hover());
-    let icon_rect = egui::Rect::from_center_size(rect.center(), Vec2::splat(22.0));
+/// What a double-click on the row does. This computer does not connect to itself.
+fn primary_action(this_computer: bool, os_family: &str) -> Option<PrimaryAction> {
+    if this_computer {
+        None
+    } else if os_family.eq_ignore_ascii_case("android") {
+        Some(PrimaryAction::View)
+    } else {
+        Some(PrimaryAction::Connect)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SavedLayout {
+    show_user: bool,
+    show_last: bool,
+    show_system_text: bool,
+    show_id: bool,
+    status_in_name: bool,
+    compact_connect: bool,
+    name: f32,
+    user: f32,
+    last: f32,
+    system_text: f32,
+    id: f32,
+    status: f32,
+    actions: f32,
+}
+
+impl SavedLayout {
+    fn actions_width(compact: bool) -> f32 {
+        let connect = if compact { W_CONNECT_ICON } else { W_CONNECT };
+        connect + GAP + W_MENU
+    }
+
+    fn used(&self) -> f32 {
+        let mut parts = 0.0;
+        let mut n = 0.0;
+        let mut add = |w: f32| {
+            parts += w;
+            n += 1.0;
+        };
+        add(W_ICON);
+        add(self.name);
+        if self.show_id {
+            add(self.id);
+            add(W_COPY);
+        }
+        if self.show_user {
+            add(self.user);
+        }
+        if self.show_last {
+            add(self.last);
+        }
+        add(W_OS);
+        if self.show_system_text {
+            add(self.system_text);
+        }
+        add(W_LOCK);
+        if !self.status_in_name {
+            add(self.status);
+        }
+        add(self.actions);
+        parts + GAP * (n - 1.0)
+    }
+
+    fn fits(&self, available: f32) -> bool {
+        self.used() <= available + 0.5 && self.name + 0.5 >= NAME_MIN
+    }
+}
+
+struct Flex {
+    pref: f32,
+    min: f32,
+}
+
+/// Columns for one list width. Actions stay a fixed width on the right.
+/// User, Last connected, the system text, then the ID column drop in that
+/// order. The ID then sits under the name. The status dot folds into the
+/// name after that. Connect becomes an icon below [`COMPACT_BELOW`].
+fn saved_layout(available: f32) -> SavedLayout {
+    let available = if available.is_finite() { available.max(0.0) } else { 800.0 };
+    let compact = available < COMPACT_BELOW;
+    let stages = [
+        (true, true, true, true, true),
+        (false, true, true, true, true),
+        (false, false, true, true, true),
+        (false, false, false, true, true),
+        (false, false, false, false, true),
+        (false, false, false, false, false),
+    ];
+    for (user, last, sys, id, status_beside) in stages {
+        if let Some(layout) = fit(available, user, last, sys, id, status_beside, compact) {
+            return layout;
+        }
+    }
+    fit(available, false, false, false, false, false, true).unwrap_or(SavedLayout {
+        show_user: false,
+        show_last: false,
+        show_system_text: false,
+        show_id: false,
+        status_in_name: true,
+        compact_connect: true,
+        name: 0.0,
+        user: 0.0,
+        last: 0.0,
+        system_text: 0.0,
+        id: 0.0,
+        status: 0.0,
+        actions: SavedLayout::actions_width(true),
+    })
+}
+
+fn fit(
+    available: f32,
+    user: bool,
+    last: bool,
+    sys: bool,
+    id: bool,
+    status_beside: bool,
+    compact: bool,
+) -> Option<SavedLayout> {
+    let actions = SavedLayout::actions_width(compact);
+    let mut fixed = W_ICON + W_OS + W_LOCK + actions;
+    let mut n = 5.0;
+    if id {
+        fixed += W_COPY;
+        n += 2.0;
+    }
+    if user {
+        n += 1.0;
+    }
+    if last {
+        n += 1.0;
+    }
+    if sys {
+        n += 1.0;
+    }
+    if status_beside {
+        n += 1.0;
+    }
+    let budget = available - fixed - GAP * (n - 1.0);
+    let mut cols = Vec::new();
+    if user {
+        cols.push(Flex { pref: USER_PREF, min: USER_MIN });
+    }
+    if last {
+        cols.push(Flex { pref: LAST_PREF, min: LAST_MIN });
+    }
+    if sys {
+        cols.push(Flex { pref: SYS_PREF, min: SYS_MIN });
+    }
+    if id {
+        cols.push(Flex { pref: ID_PREF, min: ID_MIN });
+    }
+    if status_beside {
+        cols.push(Flex { pref: STATUS_PREF, min: STATUS_MIN });
+    }
+    cols.push(Flex { pref: NAME_PREF, min: NAME_MIN });
+    let min_sum: f32 = cols.iter().map(|c| c.min).sum();
+    if budget + 0.5 < min_sum {
+        return None;
+    }
+    let mut widths: Vec<f32> = cols.iter().map(|c| c.pref).collect();
+    let sum: f32 = widths.iter().sum();
+    if sum > budget {
+        let mut over = sum - budget;
+        for (w, col) in widths.iter_mut().zip(cols.iter()) {
+            let cut = (*w - col.min).max(0.0).min(over);
+            *w -= cut;
+            over -= cut;
+        }
+    } else {
+        let extra = budget - sum;
+        if let Some(name) = widths.last_mut() {
+            *name += extra;
+        }
+    }
+    let mut next = widths.into_iter();
+    let user_w = user.then(|| next.next().unwrap_or(0.0)).unwrap_or(0.0);
+    let last_w = last.then(|| next.next().unwrap_or(0.0)).unwrap_or(0.0);
+    let sys_w = sys.then(|| next.next().unwrap_or(0.0)).unwrap_or(0.0);
+    let id_w = id.then(|| next.next().unwrap_or(0.0)).unwrap_or(0.0);
+    let status_w = status_beside.then(|| next.next().unwrap_or(0.0)).unwrap_or(0.0);
+    let name = next.next().unwrap_or(NAME_MIN);
+    Some(SavedLayout {
+        show_user: user,
+        show_last: last,
+        show_system_text: sys,
+        show_id: id,
+        status_in_name: !status_beside,
+        compact_connect: compact,
+        name,
+        user: user_w,
+        last: last_w,
+        system_text: sys_w,
+        id: id_w,
+        status: status_w,
+        actions,
+    })
+}
+
+/// List row width for a window inner size, in points. The card margin and the
+/// scrollbar gutter are already removed, which is the width [`saved_layout`] sees.
+fn row_width_for_window(window_inner: f32) -> f32 {
+    let body = (window_inner - 32.0).max(0.0);
+    let list = super::panels::desk_split(body).list;
+    (list - 32.0 - ROW_GUTTER).max(0.0)
+}
+
+struct Slots {
+    icon: Rect,
+    name: Rect,
+    id: Option<Rect>,
+    copy: Option<Rect>,
+    user: Option<Rect>,
+    last: Option<Rect>,
+    os: Rect,
+    system_text: Option<Rect>,
+    lock: Rect,
+    status: Option<Rect>,
+    connect: Rect,
+    menu: Rect,
+}
+
+fn column_slots(row: Rect, layout: &SavedLayout) -> Slots {
+    let actions = Rect::from_min_max(Pos2::new((row.right() - layout.actions).max(row.left()), row.top()), row.right_bottom());
+    let menu = Rect::from_min_max(Pos2::new(actions.right() - W_MENU, actions.top()), actions.right_bottom());
+    let connect = Rect::from_min_max(actions.left_top(), Pos2::new((menu.left() - GAP).max(actions.left()), actions.bottom()));
+    let content_right = (actions.left() - GAP).max(row.left());
+    let content = Rect::from_min_max(row.left_top(), Pos2::new(content_right, row.bottom()));
+    let mut edge = content.right();
+    let mut take = |w: f32| -> Rect {
+        let rect = Rect::from_min_max(Pos2::new(edge - w, content.top()), Pos2::new(edge, content.bottom()));
+        edge -= w + GAP;
+        rect
+    };
+    let status = if layout.status_in_name { None } else { Some(take(layout.status)) };
+    let lock = take(W_LOCK);
+    let system_text = if layout.show_system_text { Some(take(layout.system_text)) } else { None };
+    let os = take(W_OS);
+    let last = if layout.show_last { Some(take(layout.last)) } else { None };
+    let user = if layout.show_user { Some(take(layout.user)) } else { None };
+    let copy = if layout.show_id { Some(take(W_COPY)) } else { None };
+    let id = if layout.show_id { Some(take(layout.id)) } else { None };
+    let icon = Rect::from_min_size(content.left_top(), Vec2::new(W_ICON, content.height()));
+    let name_left = icon.right() + GAP;
+    let name = Rect::from_min_max(Pos2::new(name_left, content.top()), Pos2::new(edge.max(name_left), content.bottom()));
+    Slots { icon, name, id, copy, user, last, os, system_text, lock, status, connect, menu }
+}
+
+fn in_rect(ui: &mut egui::Ui, rect: Rect, salt: impl std::hash::Hash + std::fmt::Debug, add: impl FnOnce(&mut egui::Ui)) {
+    if rect.width() < 1.0 || rect.height() < 1.0 {
+        return;
+    }
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(salt)
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.set_clip_rect(rect);
+    add(&mut child);
+}
+
+fn paint_icon(ui: &egui::Ui, rect: Rect, icon: Icon, color: egui::Color32) {
+    let size = 18.0_f32.min(rect.width()).min(rect.height());
+    if size < 1.0 {
+        return;
+    }
+    let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(size));
     super::icons::paint(ui.painter(), icon_rect, icon, color);
 }
 
-fn name_cell(
-    ui: &mut egui::Ui,
-    nickname: &str,
-    display_name: &str,
-    hostname: &str,
-    text: egui::Color32,
-    muted: egui::Color32,
-) {
-    let primary = if !nickname.is_empty() {
-        nickname.to_string()
-    } else if !display_name.is_empty() {
-        display_name.to_string()
-    } else if !hostname.is_empty() {
-        hostname.to_string()
+fn status_text(row: &SavedRow) -> String {
+    if row.this_computer {
+        "This computer".into()
+    } else if row.online {
+        "Online".into()
+    } else if row.last_seen == 0 {
+        "Offline".into()
+    } else {
+        format!("Offline · {}", ago(row.last_seen))
+    }
+}
+
+fn status_color(ui: &egui::Ui, row: &SavedRow) -> egui::Color32 {
+    let p = theme::paint(ui);
+    if row.this_computer {
+        p.accent
+    } else if row.online {
+        p.ok
+    } else {
+        p.muted
+    }
+}
+
+fn saved_header(ui: &mut egui::Ui, width: f32, layout: &SavedLayout) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::hover());
+    let slots = column_slots(rect, layout);
+    let p = theme::paint(ui);
+    let label = |ui: &mut egui::Ui, rect: Rect, salt: &str, text: &str| {
+        if text.is_empty() {
+            return;
+        }
+        in_rect(ui, rect, ("hdr", salt), |ui| {
+            ui.add(egui::Label::new(RichText::new(text).size(12.0).color(p.muted).strong()).truncate());
+        });
+    };
+    label(ui, slots.name, "name", "Name");
+    if let Some(r) = slots.id {
+        label(ui, r, "id", "ID");
+    }
+    if let Some(r) = slots.user {
+        label(ui, r, "user", "User");
+    }
+    if let Some(r) = slots.last {
+        label(ui, r, "last", "Last connected");
+    }
+    if layout.show_system_text {
+        let system = Rect::from_min_max(slots.os.left_top(), slots.system_text.unwrap_or(slots.os).right_bottom());
+        label(ui, system, "sys", "System");
+    }
+    if let Some(r) = slots.status {
+        label(ui, r, "status", "Status");
+    }
+    ui.painter().hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, p.line));
+    ui.add_space(4.0);
+}
+
+fn name_block(ui: &mut egui::Ui, mut rect: Rect, row: &SavedRow, layout: &SavedLayout, text: egui::Color32, muted: egui::Color32) -> bool {
+    let mut copied = false;
+    if layout.status_in_name {
+        let color = status_color(ui, row);
+        let center = Pos2::new(rect.left() + 8.0, rect.center().y);
+        let dot = Rect::from_center_size(center, Vec2::splat(12.0));
+        ui.painter().circle_filled(center, 4.0, color);
+        let hover = ui.interact(dot, ui.id().with((&row.id, "status-dot")), Sense::hover());
+        hover.on_hover_text(status_text(row));
+        rect = rect.with_min_x(rect.left() + 18.0);
+    }
+    let show_copy = !layout.show_id && rect.width() >= 150.0;
+    if show_copy {
+        let copy = Rect::from_min_max(Pos2::new(rect.right() - W_COPY, rect.top()), rect.right_bottom());
+        in_rect(ui, copy, (&row.id, "copy-name"), |ui| {
+            if widgets::icon_button(ui, Icon::Copy, "Copy ID").clicked() {
+                copied = true;
+            }
+        });
+        rect = rect.with_max_x(copy.left());
+    }
+    let primary = if !row.nickname.is_empty() {
+        row.nickname.clone()
+    } else if !row.display_name.is_empty() {
+        row.display_name.clone()
+    } else if !row.hostname.is_empty() {
+        row.hostname.clone()
     } else {
         "No name yet".into()
     };
-    let secondary = if !hostname.is_empty() && hostname != primary { hostname.to_string() } else { String::new() };
+    let mut secondary = if !row.hostname.is_empty() && row.hostname != primary { row.hostname.clone() } else { String::new() };
+    if !layout.show_id {
+        let id_text = format_id(&row.id);
+        secondary = if secondary.is_empty() { id_text } else { format!("{secondary} · {id_text}") };
+    }
     let placeholder = primary == "No name yet";
-    let layout = if secondary.is_empty() {
-        egui::Layout::left_to_right(egui::Align::Center)
-    } else {
-        egui::Layout::top_down(egui::Align::Min)
-    };
-    ui.allocate_ui_with_layout(Vec2::new(W_NAME, ROW_H), layout, |ui| {
-        ui.set_min_width(W_NAME);
-        ui.set_max_width(W_NAME);
-        let color = if placeholder { muted } else { text };
-        ui.add(egui::Label::new(RichText::new(primary).color(color)).truncate());
-        if !secondary.is_empty() {
-            ui.add(egui::Label::new(RichText::new(secondary).color(muted).size(11.0)).truncate());
+    let stacked = !secondary.is_empty();
+    in_rect(ui, rect, (&row.id, "name"), |ui| {
+        ui.set_min_width(rect.width().max(0.0));
+        ui.set_max_width(rect.width().max(0.0));
+        if stacked {
+            ui.set_height(rect.height());
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let color = if placeholder { muted } else { text };
+                ui.add(egui::Label::new(RichText::new(primary).color(color)).truncate());
+                ui.add(egui::Label::new(RichText::new(secondary).color(muted).size(11.0)).truncate());
+            });
+        } else {
+            let color = if placeholder { muted } else { text };
+            ui.add(egui::Label::new(RichText::new(primary).color(color)).truncate());
         }
     });
+    copied
 }
 
-fn name_editor(ui: &mut egui::Ui, text: &mut String) -> bool {
+fn name_editor(ui: &mut egui::Ui, rect: Rect, id: &str, text: &mut String) -> bool {
     let mut commit = false;
-    ui.allocate_ui_with_layout(Vec2::new(W_NAME, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        ui.set_min_width(W_NAME);
-        ui.set_max_width(W_NAME);
-        let edit = ui.add(egui::TextEdit::singleline(text).desired_width(W_NAME - 4.0).hint_text("Nickname"));
+    in_rect(ui, rect, (id, "rename"), |ui| {
+        ui.set_min_width(rect.width().max(0.0));
+        ui.set_max_width(rect.width().max(0.0));
+        let edit = ui.add(egui::TextEdit::singleline(text).desired_width((rect.width() - 4.0).max(40.0)).hint_text("Nickname"));
         if !edit.has_focus() {
             edit.request_focus();
         }
@@ -809,40 +1232,6 @@ fn name_editor(ui: &mut egui::Ui, text: &mut String) -> bool {
         }
     });
     commit
-}
-
-fn header_label(ui: &mut egui::Ui, width: f32, text: &str) {
-    let p = theme::paint(ui);
-    fixed(ui, width, |ui| {
-        if !text.is_empty() {
-            ui.add(egui::Label::new(RichText::new(text).size(12.0).color(p.muted).strong()).truncate());
-        }
-    });
-}
-
-fn system_cell(ui: &mut egui::Ui, family: &str, version: &str) {
-    let p = theme::paint(ui);
-    let os = system_label(family, version);
-    fixed(ui, W_SYS, |ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
-        let icon_rect = egui::Rect::from_center_size(rect.center(), Vec2::splat(16.0));
-        super::icons::paint(ui.painter(), icon_rect, os_icon(family), p.text);
-        ui.add(egui::Label::new(RichText::new(os).color(p.muted).size(12.0)).truncate());
-    });
-}
-
-fn header(ui: &mut egui::Ui) {
-    let _ = ui.allocate_exact_size(Vec2::new(W_ICON, 16.0), egui::Sense::hover());
-    header_label(ui, W_NAME, "Name");
-    header_label(ui, W_ID, "ID");
-    header_label(ui, W_COPY, "");
-    header_label(ui, W_USER, "User");
-    header_label(ui, W_LAST, "Last connected");
-    header_label(ui, W_SYS, "System");
-    header_label(ui, W_LOCK, "");
-    header_label(ui, W_STATUS, "");
-    header_label(ui, W_CONNECT, "");
-    header_label(ui, W_MENU, "");
 }
 
 #[cfg(test)]
@@ -907,5 +1296,91 @@ mod tests {
         assert_eq!(rows[0].id, "111111111");
         sort_rows(&mut rows, SavedSort::Os);
         assert_eq!(rows[0].os_family, "linux");
+    }
+
+    #[test]
+    fn double_click_connects_except_on_this_computer() {
+        assert_eq!(primary_action(false, "windows"), Some(PrimaryAction::Connect));
+        assert_eq!(primary_action(false, "linux"), Some(PrimaryAction::Connect));
+        assert_eq!(primary_action(false, "Android"), Some(PrimaryAction::View));
+        assert_eq!(primary_action(true, "android"), None);
+        assert_eq!(primary_action(true, "windows"), None);
+    }
+
+    #[test]
+    fn saved_columns_keep_actions_at_the_tested_widths() {
+        // Physical pixels at 100% and 125% DPI. 125% is the same layout with
+        // fewer points, which is the width the window actually lays out in.
+        let cases = [(900.0, 1.0), (900.0, 1.25), (1024.0, 1.0), (1024.0, 1.25), (1280.0, 1.0), (1280.0, 1.25)];
+        for (px, dpi) in cases {
+            let points = px / dpi;
+            assert!(points + 0.1 >= MIN_INNER_WIDTH, "{px}px at {dpi} is below the window minimum");
+            let row = row_width_for_window(points);
+            let layout = saved_layout(row);
+            assert!(
+                layout.fits(row),
+                "{px}px at {dpi} (row {row:.1}) does not fit: {layout:?} used {:.1}",
+                layout.used()
+            );
+            assert!(layout.name + 0.5 >= NAME_MIN, "name {:.1} at {px}px/{dpi}", layout.name);
+            assert!(layout.status_in_name || layout.status + 0.5 >= STATUS_MIN, "status missing at {px}px/{dpi}: {layout:?}");
+            assert_eq!(layout.compact_connect, row < COMPACT_BELOW, "compact at {px}px/{dpi} row {row:.1}");
+            let connect = if layout.compact_connect { W_CONNECT_ICON } else { W_CONNECT };
+            assert!((layout.actions - (connect + GAP + W_MENU)).abs() < 0.1);
+        }
+    }
+
+    #[test]
+    fn lower_priority_columns_hide_first_and_stay_hidden() {
+        let mut prev = saved_layout(1400.0);
+        assert!(prev.show_user && prev.show_last && prev.show_system_text && prev.show_id);
+        assert!(!prev.status_in_name && !prev.compact_connect);
+        let mut dropped_user = None;
+        let mut dropped_last = None;
+        let mut dropped_sys = None;
+        let mut dropped_id = None;
+        let mut merged_status = None;
+        let mut w = 1400.0;
+        while w >= 280.0 {
+            let layout = saved_layout(w);
+            if layout.fits(w) {
+                assert!(layout.name + 0.5 >= NAME_MIN, "name collapsed at {w}: {layout:?}");
+            }
+            if layout.compact_connect == prev.compact_connect {
+                assert!(prev.show_user || !layout.show_user, "user came back at {w}");
+                assert!(prev.show_last || !layout.show_last, "last came back at {w}");
+                assert!(prev.show_system_text || !layout.show_system_text, "system text came back at {w}");
+                assert!(prev.show_id || !layout.show_id, "id column came back at {w}");
+                assert!(!prev.status_in_name || layout.status_in_name, "status left the name at {w}");
+            }
+            if dropped_user.is_none() && !layout.show_user {
+                dropped_user = Some(w);
+            }
+            if dropped_last.is_none() && !layout.show_last {
+                dropped_last = Some(w);
+            }
+            if dropped_sys.is_none() && !layout.show_system_text {
+                dropped_sys = Some(w);
+            }
+            if dropped_id.is_none() && !layout.show_id {
+                dropped_id = Some(w);
+            }
+            if merged_status.is_none() && layout.status_in_name {
+                merged_status = Some(w);
+            }
+            if !layout.show_id {
+                assert!(layout.status_in_name || layout.status > 0.0);
+            }
+            prev = layout;
+            w -= 5.0;
+        }
+        let user = dropped_user.expect("user hides");
+        let last = dropped_last.expect("last hides");
+        let sys = dropped_sys.expect("system text hides");
+        let id = dropped_id.expect("id column hides");
+        let status = merged_status.expect("status merges into the name");
+        assert!(user > last && last > sys && sys > id && id > status, "hide order user {user} last {last} sys {sys} id {id} status {status}");
+        assert!(!saved_layout(COMPACT_BELOW).compact_connect);
+        assert!(saved_layout(COMPACT_BELOW - 1.0).compact_connect);
     }
 }
