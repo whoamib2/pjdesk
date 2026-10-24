@@ -215,16 +215,22 @@ object CloudAuth {
         JSONObject(text).optString("ip").trim()
     }.getOrDefault("")
 
-    fun createJoinCode(token: String): JoinCode {
-        val reply = post("$API/api/network/join-code", token, JSONObject())
+    fun createJoinCode(refresh: String, deviceId: String): JoinCode {
+        if (refresh.isBlank() || deviceId.isBlank()) throw CloudAuthException("Sign in again.")
+        val reply = post(
+            "$API/api/network/join-code",
+            null,
+            JSONObject().put("refresh", refresh).put("device_id", deviceId),
+        )
         val code = reply.optString("code").filter { it.isDigit() }
         val id = reply.optString("id")
         if (!id.startsWith("jnc_") || code.length != 8) throw CloudAuthException("PJDesk did not return a code.")
         return JoinCode(id, code, reply.optLong("expires_at"))
     }
 
-    fun listJoinCodes(token: String): List<JoinCode> {
-        val reply = get("$API/api/network/join-code", token)
+    fun listJoinCodes(refresh: String, deviceId: String): List<JoinCode> {
+        if (refresh.isBlank() || deviceId.isBlank()) throw CloudAuthException("Sign in again.")
+        val reply = get("$API/api/network/join-code", refresh, deviceId)
         val array = reply.optJSONArray("codes") ?: return emptyList()
         val out = ArrayList<JoinCode>(array.length())
         for (i in 0 until array.length()) {
@@ -234,8 +240,13 @@ object CloudAuth {
         return out
     }
 
-    fun revokeJoinCode(token: String, id: String) {
-        post("$API/api/network/join-code/revoke", token, JSONObject().put("id", id))
+    fun revokeJoinCode(refresh: String, deviceId: String, id: String) {
+        if (refresh.isBlank() || deviceId.isBlank()) throw CloudAuthException("Sign in again.")
+        post(
+            "$API/api/network/join-code/revoke",
+            null,
+            JSONObject().put("refresh", refresh).put("device_id", deviceId).put("id", id),
+        )
     }
 
     fun offerSupport(code: String, pjdeskId: String) {
@@ -433,18 +444,20 @@ object CloudAuth {
         )
     }
 
-    private fun get(url: String, bearer: String): JSONObject {
+    private fun get(url: String, bearer: String, deviceId: String): JSONObject {
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 25_000
             readTimeout = 25_000
             setRequestProperty("Authorization", "Bearer $bearer")
+            if (deviceId.isNotBlank()) setRequestProperty("X-PJDesk-Device", deviceId)
         }
         val code = conn.responseCode
         val text = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText().orEmpty()
         if (code !in 200..299) {
             val parsed = runCatching { JSONObject(text) }.getOrNull()
-            throw CloudAuthException(parsed?.optString("error").orEmpty().ifBlank { "Could not sign in ($code)." })
+            val message = parsed?.optString("error").orEmpty()
+            throw CloudAuthException(message.ifBlank { if (text.isBlank()) "PJDesk replied $code." else "PJDesk replied $code: ${text.take(160)}" })
         }
         return JSONObject(text)
     }

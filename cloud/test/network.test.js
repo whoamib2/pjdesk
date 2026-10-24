@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyPresence, canonical, decide, inviteError, isPrivateAddress, normalizeFingerprint, planRegistration, presenceView, requireAccountsOn, savedShape } from "../src/network.js";
+import { applyPresence, canonical, decide, inviteError, isPrivateAddress, joinAuthMode, normalizeFingerprint, planRegistration, presenceView, relayAccessParts, requireAccountsOn, savedShape } from "../src/network.js";
 
 test("canonical matches the shared fixture", () => {
   const text = canonical({
@@ -269,6 +269,51 @@ test("a saved computer has no password field in the canonical record", () => {
     exp: 1,
   });
   assert.equal(text.includes("password"), false);
+});
+
+test("an invite uses the saved sign-in, and a relay token is not a website session", async () => {
+  const refresh = "ab".repeat(32);
+  const device = "device-1";
+  assert.equal(joinAuthMode("", "", { refresh, device_id: device }), "device");
+  assert.equal(joinAuthMode(`Bearer ${"a".repeat(40)}`, "", { refresh, device_id: device }), "device");
+  assert.equal(joinAuthMode(`Bearer ${"a".repeat(40)}`, "", {}), "bearer");
+  assert.equal(joinAuthMode(`Bearer ${refresh}`, device, {}), "device");
+  assert.equal(joinAuthMode("", "", {}), "missing");
+  assert.equal(joinAuthMode("Bearer short", "", {}), "missing");
+
+  const body = canonical({
+    email: "Ben@Spader.us",
+    networkId: "net_1",
+    fingerprints: ["aa"],
+    deviceId: device,
+    exp: 2_000_000_000,
+  });
+  const bodyHex = Buffer.from(body, "utf8").toString("hex");
+  const token = `${bodyHex}.${"cd".repeat(64)}`;
+  assert.equal(/^[A-Za-z0-9_-]{20,128}$/.test(token), false);
+  assert.equal(joinAuthMode(`Bearer ${token}`, "", {}), "relay");
+  const parts = relayAccessParts(token);
+  assert.equal(parts.email, "ben@spader.us");
+  assert.equal(parts.networkId, "net_1");
+  assert.equal(parts.deviceId, device);
+  assert.equal(parts.exp, 2_000_000_000);
+  assert.equal(relayAccessParts("not-a-token"), null);
+  assert.equal(relayAccessParts(`${bodyHex}.abcd`), null);
+
+  const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", pair.privateKey, Buffer.from(body, "utf8")));
+  const signed = `${bodyHex}.${Buffer.from(sig).toString("hex")}`;
+  const signedParts = relayAccessParts(signed);
+  assert.equal(signedParts.email, "ben@spader.us");
+  assert.equal(
+    await crypto.subtle.verify(
+      "Ed25519",
+      pair.publicKey,
+      Buffer.from(signedParts.sigHex, "hex"),
+      Buffer.from(signedParts.bodyHex, "hex"),
+    ),
+    true,
+  );
 });
 
 test("an empty display name clears, and a missing one does not", () => {

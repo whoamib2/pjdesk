@@ -2595,20 +2595,21 @@ impl App {
             .name("invite-code".into())
             .spawn(move || {
                 crate::network::refresh_config(&mut cfg);
-                let token = cfg.network_access_token();
+                let refresh = cfg.network_refresh_token();
+                let device = cfg.network_device_id.clone().unwrap_or_default();
                 let msg = match kind {
-                    InviteKind::Create => match crate::network::create_join_code(&token) {
+                    InviteKind::Create => match crate::network::create_join_code(&refresh, &device) {
                         Ok(code) => InviteMsg::Ready(code),
                         Err(e) => InviteMsg::Failed(e.to_string()),
                     },
-                    InviteKind::List => match crate::network::list_join_codes(&token) {
+                    InviteKind::List => match crate::network::list_join_codes(&refresh, &device) {
                         Ok(codes) => match codes.into_iter().next() {
                             Some(code) => InviteMsg::Active(code),
                             None => InviteMsg::Clear,
                         },
                         Err(e) => InviteMsg::Failed(e.to_string()),
                     },
-                    InviteKind::Revoke => match crate::network::revoke_join_code(&token, &id) {
+                    InviteKind::Revoke => match crate::network::revoke_join_code(&refresh, &device, &id) {
                         Ok(()) => InviteMsg::Clear,
                         Err(e) => InviteMsg::Failed(e.to_string()),
                     },
@@ -2644,6 +2645,7 @@ impl App {
                 self.join_expires = 0;
             }
             Ok(InviteMsg::Failed(message)) => {
+                tracing::warn!("Invite code failed: {message}");
                 self.join_rx = None;
                 self.join_busy = false;
                 self.join_error = message;

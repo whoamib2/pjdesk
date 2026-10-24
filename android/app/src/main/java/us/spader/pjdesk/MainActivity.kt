@@ -811,17 +811,21 @@ class MainActivity : FragmentActivity() {
                     delay(4 * 60 * 1000L)
                 }
             }
-            LaunchedEffect(account, cloudAccess) {
-                if (inviteListed || account.isBlank() || cloudAccess.isBlank()) return@LaunchedEffect
+            LaunchedEffect(account) {
+                val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                val device = app.store.networkDeviceId
+                if (inviteListed || account.isBlank() || refresh.isBlank() || device.isBlank()) return@LaunchedEffect
                 inviteListed = true
                 val listed = withContext(Dispatchers.IO) {
-                    runCatching { us.spader.pjdesk.core.CloudAuth.listJoinCodes(cloudAccess) }.getOrNull()
+                    runCatching { us.spader.pjdesk.core.CloudAuth.listJoinCodes(refresh, device) }
                 }
-                val first = listed?.firstOrNull() ?: return@LaunchedEffect
-                if (inviteCode.isEmpty()) {
-                    inviteId = first.id
-                    inviteExpires = first.expiresAt
-                }
+                listed.onSuccess { codes ->
+                    val first = codes.firstOrNull() ?: return@onSuccess
+                    if (inviteCode.isEmpty()) {
+                        inviteId = first.id
+                        inviteExpires = first.expiresAt
+                    }
+                }.onFailure { inviteError = it.message ?: "Could not list codes." }
             }
             LaunchedEffect(Unit) {
                 // The service connection is what changes control. This only refreshes
@@ -1829,15 +1833,16 @@ class MainActivity : FragmentActivity() {
                                     inviteBusy = inviteBusy,
                                     inviteError = inviteError,
                                     onCreateInvite = {
-                                        val token = cloudAccess
-                                        if (token.isBlank()) {
+                                        val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                                        val device = app.store.networkDeviceId
+                                        if (refresh.isBlank() || device.isBlank()) {
                                             inviteError = "Sign in again."
                                         } else {
                                             inviteBusy = true
                                             inviteError = ""
                                             scope.launch {
                                                 val result = withContext(Dispatchers.IO) {
-                                                    runCatching { us.spader.pjdesk.core.CloudAuth.createJoinCode(token) }
+                                                    runCatching { us.spader.pjdesk.core.CloudAuth.createJoinCode(refresh, device) }
                                                 }
                                                 inviteBusy = false
                                                 result.onSuccess {
@@ -1849,16 +1854,17 @@ class MainActivity : FragmentActivity() {
                                         }
                                     },
                                     onRevokeInvite = {
-                                        val token = cloudAccess
+                                        val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                                        val device = app.store.networkDeviceId
                                         val id = inviteId
-                                        if (token.isBlank() || id.isBlank()) {
+                                        if (refresh.isBlank() || device.isBlank() || id.isBlank()) {
                                             inviteError = "Sign in again."
                                         } else {
                                             inviteBusy = true
                                             inviteError = ""
                                             scope.launch {
                                                 val result = withContext(Dispatchers.IO) {
-                                                    runCatching { us.spader.pjdesk.core.CloudAuth.revokeJoinCode(token, id) }
+                                                    runCatching { us.spader.pjdesk.core.CloudAuth.revokeJoinCode(refresh, device, id) }
                                                 }
                                                 inviteBusy = false
                                                 result.onSuccess {

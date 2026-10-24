@@ -986,22 +986,51 @@ pub struct JoinCode {
     pub expires_at: u64,
 }
 
-/// Creates a single-use 8-digit code for this account's network. Older unused
-/// codes for that network are revoked. The digits are returned once.
-pub fn create_join_code(token: &str) -> Result<JoinCode> {
-    if token.trim().is_empty() {
+/// Body for create and revoke. This is the network refresh token and device id,
+/// the same pair the saved list sends. The relay access token is not included.
+pub fn join_code_body(refresh: &str, device_id: &str, id: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({ "refresh": refresh, "device_id": device_id });
+    if let Some(id) = id {
+        body["id"] = serde_json::Value::String(id.to_string());
+    }
+    body
+}
+
+fn require_saved_sign_in(refresh: &str, device_id: &str) -> Result<()> {
+    if refresh.trim().is_empty() || device_id.trim().is_empty() {
         bail!("Sign in again.");
     }
-    let text = post_json(&format!("{}/api/network/join-code", api_base()), Some(token), &serde_json::json!({}))?;
+    Ok(())
+}
+
+/// The message pjdesk.com returned. A body that is not JSON keeps the status
+/// and the text.
+pub fn invite_failure_message(status: u16, body: &str) -> String {
+    let parsed: ErrorBody = serde_json::from_str(body).unwrap_or(ErrorBody { error: String::new(), code: String::new(), role: String::new() });
+    if !parsed.error.is_empty() {
+        return parsed.error;
+    }
+    let snippet: String = body.chars().filter(|c| !c.is_control()).take(160).collect();
+    let snippet = snippet.trim();
+    if snippet.is_empty() {
+        format!("PJDesk replied {status}.")
+    } else {
+        format!("PJDesk replied {status}: {snippet}")
+    }
+}
+
+/// Creates a single-use 8-digit code for this account's network. Older unused
+/// codes for that network are revoked. The digits are returned once.
+pub fn create_join_code(refresh: &str, device_id: &str) -> Result<JoinCode> {
+    require_saved_sign_in(refresh, device_id)?;
+    let text = post_join(&format!("{}/api/network/join-code", api_base()), &join_code_body(refresh, device_id, None))?;
     parse_join(&text, true)
 }
 
 /// Active invite codes this account can revoke. Digits are not included.
-pub fn list_join_codes(token: &str) -> Result<Vec<JoinCode>> {
-    if token.trim().is_empty() {
-        bail!("Sign in again.");
-    }
-    let text = get_json(&format!("{}/api/network/join-code", api_base()), Some(token))?;
+pub fn list_join_codes(refresh: &str, device_id: &str) -> Result<Vec<JoinCode>> {
+    require_saved_sign_in(refresh, device_id)?;
+    let text = get_join(&format!("{}/api/network/join-code", api_base()), refresh, device_id)?;
     let parsed: serde_json::Value = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
     let mut out = Vec::new();
     for item in parsed.get("codes").and_then(|v| v.as_array()).into_iter().flatten() {
@@ -1014,15 +1043,9 @@ pub fn list_join_codes(token: &str) -> Result<Vec<JoinCode>> {
     Ok(out)
 }
 
-pub fn revoke_join_code(token: &str, id: &str) -> Result<()> {
-    if token.trim().is_empty() {
-        bail!("Sign in again.");
-    }
-    post_json(
-        &format!("{}/api/network/join-code/revoke", api_base()),
-        Some(token),
-        &serde_json::json!({ "id": id }),
-    )?;
+pub fn revoke_join_code(refresh: &str, device_id: &str, id: &str) -> Result<()> {
+    require_saved_sign_in(refresh, device_id)?;
+    post_join(&format!("{}/api/network/join-code/revoke", api_base()), &join_code_body(refresh, device_id, Some(id)))?;
     Ok(())
 }
 
@@ -1127,19 +1150,20 @@ pub fn group_digits(code: &str) -> String {
     }
 }
 
-fn get_json(url: &str, bearer: Option<&str>) -> Result<String> {
-    let mut req = agent().get(url);
-    if let Some(token) = bearer {
-        req = req.set("Authorization", &format!("Bearer {token}"));
+fn post_join(url: &str, body: &serde_json::Value) -> Result<String> {
+    let req = agent().post(url).set("content-type", "application/json");
+    match req.send_string(&body.to_string()) {
+        Ok(resp) => Ok(resp.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(code, resp)) => bail!(invite_failure_message(code, &resp.into_string().unwrap_or_default())),
+        Err(ureq::Error::Transport(_)) => bail!("Could not reach pjdesk.com."),
     }
+}
+
+fn get_join(url: &str, refresh: &str, device_id: &str) -> Result<String> {
+    let req = agent().get(url).set("Authorization", &format!("Bearer {refresh}")).set("X-PJDesk-Device", device_id);
     match req.call() {
         Ok(resp) => Ok(resp.into_string().unwrap_or_default()),
-        Err(ureq::Error::Status(code, resp)) => {
-            let text = resp.into_string().unwrap_or_default();
-            let parsed: ErrorBody = serde_json::from_str(&text).unwrap_or(ErrorBody { error: String::new(), code: String::new(), role: String::new() });
-            let message = if !parsed.error.is_empty() { parsed.error } else { format!("PJDesk could not sign in ({code}).") };
-            bail!(message)
-        }
+        Err(ureq::Error::Status(code, resp)) => bail!(invite_failure_message(code, &resp.into_string().unwrap_or_default())),
         Err(ureq::Error::Transport(_)) => bail!("Could not reach pjdesk.com."),
     }
 }
@@ -1308,5 +1332,26 @@ mod tests {
         assert_eq!(remaining_label(0, 50), "Expired");
         assert_eq!(group_digits("12 345 678"), "1234 5678");
         assert_eq!(group_digits("abcd"), "");
+    }
+
+    #[test]
+    fn an_invite_sends_the_saved_sign_in_and_shows_the_server_error() {
+        let access = format!("{}.{}", "aa".repeat(80), "bb".repeat(64));
+        let refresh = "cd".repeat(32);
+        let body = join_code_body(&refresh, "device-1", None);
+        assert_eq!(body["refresh"].as_str(), Some(refresh.as_str()));
+        assert_eq!(body["device_id"].as_str(), Some("device-1"));
+        assert!(body.get("access").is_none());
+        assert!(!body.to_string().contains(&access));
+        let revoke = join_code_body(&refresh, "device-1", Some("jnc_abc"));
+        assert_eq!(revoke["id"].as_str(), Some("jnc_abc"));
+        assert_eq!(invite_failure_message(401, r#"{"error":"Please sign in."}"#), "Please sign in.");
+        assert_eq!(
+            invite_failure_message(404, r#"{"error":"Set your network before creating a code."}"#),
+            "Set your network before creating a code."
+        );
+        assert_eq!(invite_failure_message(401, ""), "PJDesk replied 401.");
+        assert!(!invite_failure_message(401, "upstream down").contains("Wrong email"));
+        assert!(invite_failure_message(502, "upstream down").contains("502"));
     }
 }

@@ -265,8 +265,12 @@ async function sha256Hex(text) {
   return toHex(await crypto.subtle.digest("SHA-256", encoder.encode(text)));
 }
 
-// Any signed-in account. Site admin is not required and is not checked.
-// Mutations call owned() and apply only to the network this account owns.
+// A pjdesk.com website session. Site admin is not required and is not checked.
+// The Windows and Android clients do not have one of these. They are signed
+// in with a network refresh token. Invite codes use joinAuthMode instead:
+// a relay access token contains a dot and is longer than this pattern, and
+// matching it here answered 401 "Please sign in." for an account that was
+// already signed in.
 async function session(request, env) {
   const m = (request.headers.get("authorization") || "").match(/^Bearer\s+([A-Za-z0-9_-]{20,128})$/);
   if (!m) throw new HttpError(401, "Please sign in.");
@@ -384,6 +388,59 @@ export function appLockAuthMode(header, body) {
   const bearer = /^Bearer\s+\S+/.test(String(header || ""));
   if (bearer && !body?.refresh) return "bearer";
   return "device";
+}
+
+function bearerToken(header) {
+  const match = String(header || "").trim().match(/^Bearer\s+(\S+)$/);
+  return match ? match[1] : "";
+}
+
+/**
+ * How an invite-code call is signed in.
+ * `device` is the network refresh token plus device id, the same pair the
+ * saved list uses. `bearer` is a pjdesk.com website session. `relay` is the
+ * short-lived access token (hex, a dot, and a 64-byte signature). That token
+ * is not a row in the website session table.
+ */
+export function joinAuthMode(header, deviceHeader, body) {
+  const refresh = String(body?.refresh || "").trim();
+  const deviceId = String(body?.device_id || "").trim();
+  if (/^[0-9a-f]{64}$/.test(refresh) && validDevice(deviceId)) return "device";
+  const token = bearerToken(header);
+  const headerDevice = String(deviceHeader || "").trim();
+  if (/^[0-9a-f]{64}$/.test(token) && validDevice(headerDevice)) return "device";
+  if (/^[A-Za-z0-9_-]{20,128}$/.test(token)) return "bearer";
+  if (token && (token.includes(".") || token.length > 128)) return "relay";
+  return "missing";
+}
+
+/** The account, network, device, and expiry inside a relay access token. Null when it is not one. */
+export function relayAccessParts(token) {
+  const raw = String(token || "").trim();
+  const dot = raw.indexOf(".");
+  if (dot < 10 || dot !== raw.lastIndexOf(".")) return null;
+  const bodyHex = raw.slice(0, dot);
+  const sigHex = raw.slice(dot + 1);
+  if (!/^[0-9a-f]+$/i.test(bodyHex) || bodyHex.length % 2 !== 0) return null;
+  if (!/^[0-9a-f]{128}$/i.test(sigHex)) return null;
+  let text;
+  try {
+    text = new TextDecoder().decode(fromHex(bodyHex));
+  } catch {
+    return null;
+  }
+  const lines = text.split("\n");
+  if (lines[0] !== "PJN1" || lines.length < 7) return null;
+  const exp = Number(lines[5]);
+  if (!Number.isFinite(exp)) return null;
+  return {
+    email: lines[1],
+    networkId: lines[2],
+    deviceId: lines[4],
+    exp,
+    bodyHex,
+    sigHex,
+  };
 }
 
 /** Null when `text` is empty or a sealed PJLOCK01 blob. A string is the reason to reject it. */
@@ -1020,6 +1077,16 @@ async function handle(request, env, url) {
   if (p === "/api/network/redeem" && m === "POST") return redeem(request, env);
   if (p === "/api/network/computers/delete" && m === "POST") return deleteComputer(request, env);
 
+  if (
+    (p === "/api/network/join-code" && (m === "GET" || m === "POST")) ||
+    (p === "/api/network/join-code/revoke" && m === "POST")
+  ) {
+    const opened = await openJoin(request, env);
+    if (m === "GET") return listJoinCodes(env, opened.account);
+    if (p.endsWith("/revoke")) return revokeJoinCode(opened.body, env, opened.account);
+    return createJoinCode(env, opened.account);
+  }
+
   const account = await session(request, env);
 
   if (p === "/api/network" && m === "GET") return getNetwork(env, account);
@@ -1033,9 +1100,6 @@ async function handle(request, env, url) {
   if (p === "/api/network/computers" && m === "PUT") return putComputers(request, env, account);
   if (p === "/api/network/presence" && m === "POST") return postPresence(request, env, account);
   if (p === "/api/network/enroll-code" && m === "POST") return enrollCode(env, account);
-  if (p === "/api/network/join-code" && m === "GET") return listJoinCodes(env, account);
-  if (p === "/api/network/join-code" && m === "POST") return createJoinCode(env, account);
-  if (p === "/api/network/join-code/revoke" && m === "POST") return revokeJoinCode(request, env, account);
   if (p === "/api/network/invites" && m === "POST") return createInvite(request, env, account);
   if (p === "/api/network/invites/revoke" && m === "POST") return revokeInvite(request, env, account);
   if (p === "/api/network/policy" && m === "GET") return policy(env, account);
@@ -1696,6 +1760,61 @@ async function redeemJoinCode(env, request, hash, deviceId, deviceName) {
   return json(await issue(env, { accountId: owner.id, email: owner.email }, row, deviceId, deviceName, null));
 }
 
+async function openJoin(request, env) {
+  const header = request.headers.get("authorization") || "";
+  const deviceHeader = request.headers.get("x-pjdesk-device") || "";
+  let body = {};
+  if (request.method === "POST" || request.method === "PUT") body = await readJson(request);
+  const mode = joinAuthMode(header, deviceHeader, body);
+  if (mode === "device") {
+    const device = await openedDevice(env, {
+      refresh: String(body?.refresh || "").trim() || bearerToken(header),
+      device_id: String(body?.device_id || "").trim() || String(deviceHeader || "").trim(),
+    });
+    return { account: { accountId: device.accountId, email: device.email }, body };
+  }
+  if (mode === "bearer") return { account: await session(request, env), body };
+  if (mode === "relay") return { account: await accountFromRelay(env, bearerToken(header)), body };
+  throw new HttpError(401, "Sign in required.");
+}
+
+async function accountFromRelay(env, token) {
+  const parts = relayAccessParts(token);
+  if (!parts) throw new HttpError(401, "That sign-in was not accepted.");
+  if (now() >= parts.exp) throw new HttpError(401, "That sign-in expired. Sign in again.");
+  const key = await env.DB.prepare("SELECT public_key FROM network_keys WHERE id = 1").first();
+  if (!key?.public_key) throw new HttpError(401, "That sign-in was not accepted.");
+  let ok = false;
+  try {
+    const publicKey = await crypto.subtle.importKey("raw", fromHex(key.public_key), { name: "Ed25519" }, false, ["verify"]);
+    ok = await crypto.subtle.verify("Ed25519", publicKey, fromHex(parts.sigHex), fromHex(parts.bodyHex));
+  } catch {
+    ok = false;
+  }
+  if (!ok) throw new HttpError(401, "That sign-in was not accepted.");
+  if (!validDevice(parts.deviceId)) throw new HttpError(401, "That sign-in was not accepted.");
+  const device = await env.DB.prepare(
+    `SELECT account_id, email, revoked_at, enrolled_at, network_id
+       FROM network_devices WHERE device_id = ? AND network_id = ?`,
+  )
+    .bind(parts.deviceId, parts.networkId)
+    .first();
+  if (!device || device.revoked_at) throw new HttpError(401, "Sign in required.");
+  if (now() - device.enrolled_at > REFRESH_TTL) throw new HttpError(401, "Sign in required.");
+  if (normEmail(device.email) !== normEmail(parts.email)) throw new HttpError(401, "That sign-in was not accepted.");
+  const network = await env.DB.prepare("SELECT owner_id FROM networks WHERE id = ?").bind(device.network_id).first();
+  if (!network) throw new HttpError(401, "Sign in required.");
+  const owner = await env.DB.prepare("SELECT email FROM accounts WHERE id = ?").bind(network.owner_id).first();
+  const member = await env.DB.prepare(
+    "SELECT revoked_at FROM network_members WHERE network_id = ? AND email = ?",
+  )
+    .bind(device.network_id, device.email)
+    .first();
+  if (member?.revoked_at) throw new HttpError(401, "Sign in required.");
+  if (owner?.email !== device.email && !member) throw new HttpError(401, "Sign in required.");
+  return { accountId: device.account_id, email: device.email };
+}
+
 async function listJoinCodes(env, account) {
   const row = await owned(env, account.accountId);
   if (!row) throw new HttpError(404, "Set your network before creating a code.");
@@ -1737,10 +1856,9 @@ async function createJoinCode(env, account) {
   return json({ id, code, expires_at: expires });
 }
 
-async function revokeJoinCode(request, env, account) {
+async function revokeJoinCode(body, env, account) {
   const row = await owned(env, account.accountId);
   if (!row) throw new HttpError(404, "No network.");
-  const body = await readJson(request);
   const id = String(body.id || "");
   if (!id.startsWith("jnc_")) throw new HttpError(400, "Unknown code.");
   const t = now();
