@@ -1692,11 +1692,29 @@ fn publish_presence(data_dir: &Path) {
     }
 }
 
+/// Ids in a fresh `online.json`. The server rewrites that file from the live
+/// connection table every couple of seconds. A file older than 15 seconds means
+/// the process is not running, so nothing is online. `last_seen` is not read.
 fn online_ids(data_dir: &Path) -> std::collections::HashSet<String> {
-    let Ok(bytes) = std::fs::read(data_dir.join("online.json")) else {
+    let path = data_dir.join("online.json");
+    if !online_file_fresh(&path) {
+        return std::collections::HashSet::new();
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
         return std::collections::HashSet::new();
     };
-    let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) else {
+    online_ids_from(&bytes)
+}
+
+fn online_file_fresh(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().map(|e| e.as_secs() <= 15).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+fn online_ids_from(bytes: &[u8]) -> std::collections::HashSet<String> {
+    let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) else {
         return std::collections::HashSet::new();
     };
     rows.into_iter().filter_map(|row| row.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())).collect()
@@ -2365,5 +2383,36 @@ mod tests {
         );
         assert!(with_match.contains("SignedHeaders=host;if-match;x-amz-content-sha256;x-amz-date"));
         assert_ne!(with_match, without);
+    }
+
+    #[test]
+    fn presence_online_is_the_live_set_not_last_seen() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-online-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("devices.json"),
+            br#"{"devices":{"902488771":{"hostname":"CABINDESK","last_seen":1700000000}}}"#,
+        )
+        .unwrap();
+        assert!(online_ids(&dir).is_empty(), "a last_seen time is not presence");
+        std::fs::write(
+            dir.join("online.json"),
+            br#"[{"id":"610978221","hostname":"CHIP20","version":"0.6.27"}]"#,
+        )
+        .unwrap();
+        let live = online_ids(&dir);
+        assert!(live.contains("610978221"));
+        assert!(!live.contains("902488771"));
+        #[cfg(unix)]
+        {
+            let path = dir.join("online.json");
+            assert!(
+                std::process::Command::new("touch").arg("-d").arg("1 hour ago").arg(&path).status().unwrap().success()
+            );
+            assert!(online_ids(&dir).is_empty(), "a stale online.json is not live presence");
+        }
+        assert!(online_ids_from(br#"[{"id":"902488771"}]"#).contains("902488771"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

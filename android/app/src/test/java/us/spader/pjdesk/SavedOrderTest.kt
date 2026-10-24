@@ -7,9 +7,14 @@ import us.spader.pjdesk.core.Native
 import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.SavedFilter
 import us.spader.pjdesk.core.SavedSort
+import us.spader.pjdesk.core.applyLan
+import us.spader.pjdesk.core.applyPresence
 import us.spader.pjdesk.core.arrangeSaved
 import us.spader.pjdesk.core.connectFailureText
+import us.spader.pjdesk.core.liveOnline
 import us.spader.pjdesk.core.osDetail
+import us.spader.pjdesk.core.PresenceReport
+import us.spader.pjdesk.core.presenceOnlineFlag
 import us.spader.pjdesk.core.savedSubtitle
 
 class SavedOrderTest {
@@ -110,6 +115,37 @@ class SavedOrderTest {
             selfId = "482 636 105",
         )
         assertEquals(listOf("902488771", "622775091", "482636105"), shown.map { it.id })
+    }
+
+    @Test
+    fun presenceReplacesAStaleOfflineDot() {
+        val cached = listOf(
+            SavedComputer(id = "902488771", name = "Cabin Desk", hostname = "CABINDESK", osFamily = "windows", osVersion = "11", online = false, lastSeen = 1_700_000_000),
+            SavedComputer(id = "610978221", hostname = "CHIP20", osFamily = "windows", osVersion = "11", online = false, lastSeen = 1_700_000_000),
+            SavedComputer(id = "622775091", hostname = "BEN-SURFACE-9", osFamily = "windows", osVersion = "11", online = true, lastSeen = 1_700_010_000),
+        )
+        val live = applyPresence(
+            cached,
+            listOf(
+                PresenceReport(id = "902 488 771", hostname = "CABINDESK", lastSeen = 1_700_014_400, online = true),
+                PresenceReport(id = "610978221", hostname = "CHIP20", lastSeen = 1_700_014_400_000, online = true),
+                PresenceReport(id = "622775091", hostname = "BEN-SURFACE-9", lastSeen = 1_700_010_000, online = false),
+            ),
+        )
+        assertEquals(true, live[0].online)
+        assertEquals(1_700_014_400L, live[0].lastSeen)
+        assertEquals(true, live[1].online)
+        assertEquals(1_700_014_400L, live[1].lastSeen)
+        assertEquals(false, live[2].online)
+        assertEquals(1_700_010_000L, live[2].lastSeen)
+        assertEquals(false, liveOnline(false, false))
+        assertEquals(true, liveOnline(false, true))
+        assertEquals(true, presenceOnlineFlag(true))
+        assertEquals(true, presenceOnlineFlag(1))
+        assertEquals(false, presenceOnlineFlag(0))
+        val onLan = applyLan(live, setOf("622775091"))
+        assertEquals(true, onLan[2].online)
+        assertEquals(false, applyLan(listOf(cached[0]), emptySet())[0].online)
     }
 
     @Test

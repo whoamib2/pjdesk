@@ -1293,6 +1293,47 @@ mod tests {
     }
 
     #[test]
+    fn presence_online_follows_the_live_flag_not_last_connected() {
+        let mut c = Config::default();
+        c.settings.peers.insert(
+            "902488771".into(),
+            PeerNote {
+                last_connected: 1_700_000_000,
+                last_seen: 100,
+                reported_online: true,
+                ..Default::default()
+            },
+        );
+        c.merge_presence(&[crate::network::HostPresence {
+            id: "902488771".into(),
+            hostname: "CABINDESK".into(),
+            os_family: "windows".into(),
+            os_version: "11".into(),
+            console_user: String::new(),
+            display_name: None,
+            last_seen: 100,
+            online: false,
+        }]);
+        let note = c.settings.peers.get("902488771").unwrap();
+        assert!(!note.reported_online);
+        assert_eq!(note.last_seen, 100);
+        assert_eq!(note.last_connected, 1_700_000_000);
+        c.merge_presence(&[crate::network::HostPresence {
+            id: "610978221".into(),
+            hostname: "CHIP20".into(),
+            os_family: "windows".into(),
+            os_version: "11".into(),
+            console_user: String::new(),
+            display_name: None,
+            last_seen: 40,
+            online: true,
+        }]);
+        let chip = c.settings.peers.get("610978221").unwrap();
+        assert!(chip.reported_online);
+        assert_eq!(chip.last_connected, 0);
+    }
+
+    #[test]
     fn a_temporary_sign_in_does_not_write_the_account() {
         let dir = std::env::temp_dir().join(format!("pjdesk-temp-sign-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

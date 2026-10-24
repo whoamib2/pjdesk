@@ -112,6 +112,12 @@ pub enum StatusTone {
     Warn,
 }
 
+/// Online from the account's live presence flag, or from a computer heard on
+/// this LAN. Last-connected time is a separate column and does not count.
+pub fn presence_online(reported_online: bool, on_lan: bool) -> bool {
+    on_lan || reported_online
+}
+
 pub fn status_tone(online: bool, this_computer: bool) -> StatusTone {
     if this_computer || online {
         StatusTone::Ok
@@ -379,8 +385,8 @@ impl App {
             let hostname = note.map(|n| n.hostname.trim().to_string()).unwrap_or_default();
             let alias = entry.map(|e| e.alias.clone()).unwrap_or_default();
             let nickname = crate::config::nickname_text(&alias, &id, &hostname);
-            let online = self.lan.iter().any(|(_, lan_id, _)| normalize_id(lan_id) == id)
-                || note.is_some_and(|n| n.reported_online);
+            let on_lan = self.lan.iter().any(|(_, lan_id, _)| normalize_id(lan_id) == id);
+            let online = presence_online(note.is_some_and(|n| n.reported_online), on_lan);
             rows.push(SavedRow {
                 id: id.clone(),
                 nickname,
@@ -1631,6 +1637,34 @@ mod tests {
         assert_eq!(rows[0].id, "111111111");
         sort_rows(&mut rows, SavedSort::Os);
         assert_eq!(rows[0].os_family, "linux");
+    }
+
+    #[test]
+    fn status_uses_live_presence_not_last_connected() {
+        let mut row = SavedRow {
+            id: "902488771".into(),
+            nickname: "Cabin Desk".into(),
+            hostname: "CABINDESK".into(),
+            os_family: "windows".into(),
+            os_version: "11".into(),
+            last_connected: u64::MAX,
+            favorite: false,
+            has_password: false,
+            online: false,
+            console_user: String::new(),
+            last_seen: 0,
+            this_computer: false,
+            sort_order: 0,
+            display_name: String::new(),
+            in_book: true,
+            direct: None,
+        };
+        assert_eq!(status_text(&row), "Offline");
+        assert!(!presence_online(false, false));
+        row.online = presence_online(true, false);
+        row.last_connected = 0;
+        assert_eq!(status_text(&row), "Online");
+        assert!(presence_online(false, true));
     }
 
     #[test]

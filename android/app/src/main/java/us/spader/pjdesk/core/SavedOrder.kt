@@ -69,10 +69,96 @@ fun osShort(computer: SavedComputer): String {
     }
 }
 
+/**
+ * Unix seconds. The account stores seconds. A millisecond stamp is converted
+ * so a later second-based report can still win the comparison.
+ */
+fun seenSeconds(stamp: Long): Long {
+    if (stamp <= 0L) return 0L
+    return if (stamp >= 10_000_000_000L) stamp / 1000 else stamp
+}
+
+/** The account's online flag, or a 1/0 that some JSON readers leave as a number. */
+fun presenceOnlineFlag(value: Any?): Boolean = when (value) {
+    is Boolean -> value
+    is Number -> value.toLong() != 0L
+    is String -> value.equals("true", ignoreCase = true) || value == "1"
+    else -> false
+}
+
+/**
+ * Same rule as the Windows Saved list. Online when the account's live presence
+ * says so, or when this phone just heard the computer on the local network.
+ * The last time this phone connected is not presence.
+ */
+fun liveOnline(reportedOnline: Boolean, seenOnLan: Boolean): Boolean = reportedOnline || seenOnLan
+
+/** One row from the account presence list. `lastSeen` is unix seconds or milliseconds. */
+data class PresenceReport(
+    val id: String,
+    val hostname: String = "",
+    val osFamily: String = "",
+    val osVersion: String = "",
+    val consoleUser: String = "",
+    val displayName: String = "",
+    val lastSeen: Long = 0,
+    val online: Boolean = false,
+)
+
+/**
+ * Applies a presence pull. The online flag always comes from this report.
+ * A newer last-seen time replaces an older one. A missing computer is left as it was.
+ */
+fun applyPresence(computers: List<SavedComputer>, presence: List<PresenceReport>): List<SavedComputer> {
+    if (presence.isEmpty()) return computers
+    val merged = computers.toMutableList()
+    for (row in presence) {
+        val id = row.id.filter { it.isDigit() }
+        if (id.length != 9) continue
+        val seen = seenSeconds(row.lastSeen)
+        val index = merged.indexOfFirst { it.id.filter { ch -> ch.isDigit() } == id }
+        if (index < 0) {
+            merged.add(
+                SavedComputer(
+                    id = id,
+                    hostname = row.hostname,
+                    osFamily = row.osFamily,
+                    osVersion = row.osVersion,
+                    consoleUser = row.consoleUser,
+                    displayName = row.displayName,
+                    lastSeen = seen,
+                    online = row.online,
+                ),
+            )
+            continue
+        }
+        val cur = merged[index]
+        merged[index] = cur.copy(
+            hostname = row.hostname.ifBlank { cur.hostname },
+            osFamily = row.osFamily.ifBlank { cur.osFamily },
+            osVersion = row.osVersion.ifBlank { cur.osVersion },
+            consoleUser = row.consoleUser.ifBlank { cur.consoleUser },
+            displayName = row.displayName.ifBlank { cur.displayName },
+            lastSeen = maxOf(seenSeconds(cur.lastSeen), seen),
+            online = row.online,
+        )
+    }
+    return merged
+}
+
+/** Marks computers heard on the LAN online, without writing that into the saved file. */
+fun applyLan(computers: List<SavedComputer>, lanIds: Set<String>): List<SavedComputer> {
+    if (lanIds.isEmpty()) return computers
+    return computers.map { computer ->
+        val id = computer.id.filter { it.isDigit() }
+        if (liveOnline(computer.online, id in lanIds) && !computer.online) computer.copy(online = true) else computer
+    }
+}
+
 /** "3d ago" from a unix-second or unix-millis stamp. Empty when the time is unknown. */
 fun agoShort(lastSeen: Long, nowMs: Long): String {
     if (lastSeen <= 0L) return ""
-    val seenMs = if (lastSeen < 10_000_000_000L) lastSeen * 1000 else lastSeen
+    val seenMs = seenSeconds(lastSeen) * 1000
     val mins = ((nowMs - seenMs).coerceAtLeast(0L)) / 60_000L
     return when {
         mins < 1 -> "now"

@@ -378,13 +378,30 @@ class ScreenshotTest {
             kotlin.math.abs(ch(pixel, 0) - ch(target, 0)) < 12
     }
 
-    private fun shot(name: String, theme: String = "dark", check: ((Bitmap) -> Unit)? = null, content: @Composable () -> Unit) {
+    @Test
+    fun discoveredLabelNarrow() = shot("discovered-narrow", "dark", width = 960, height = 1600, check = ::tilesPresent) {
+        shell {
+            benSaved(
+                discovered = listOf(
+                    SavedComputer("111555694", hostname = "Office PC", osFamily = "windows", osVersion = "11", online = true),
+                ),
+                initialPage = 2,
+            )
+        }
+    }
+
+    private fun shot(
+        name: String,
+        theme: String = "dark",
+        width: Int = 1080,
+        height: Int = 1920,
+        check: ((Bitmap) -> Unit)? = null,
+        content: @Composable () -> Unit,
+    ) {
         val activity = Robolectric.buildActivity(ComponentActivity::class.java).setup().get()
         activity.setContent { PjTheme(theme = theme) { content() } }
         ShadowLooper.idleMainLooper()
         val view = activity.window.decorView
-        val width = 1080
-        val height = 1920
         view.measure(
             View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
             View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY),

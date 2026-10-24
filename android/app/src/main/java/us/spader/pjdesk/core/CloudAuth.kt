@@ -393,7 +393,7 @@ object CloudAuth {
                         osVersion = o.optString("os_version"),
                         consoleUser = o.optString("console_user"),
                         lastSeen = o.optLong("last_seen"),
-                        online = o.optBoolean("online"),
+                        online = presenceOnlineFlag(if (o.has("online") && !o.isNull("online")) o.get("online") else null),
                     ),
                 )
             }
@@ -416,26 +416,21 @@ object CloudAuth {
 
     /** Presence fills a saved row and adds computers that were never saved by hand. */
     private fun mergePresence(computers: List<SavedComputer>, presence: List<SavedComputer>): List<SavedComputer> {
-        val merged = computers.toMutableList()
-        for (incoming in presence) {
-            if (incoming.id.length != 9) continue
-            val index = merged.indexOfFirst { it.id == incoming.id }
-            if (index < 0) {
-                merged.add(incoming)
-                continue
-            }
-            val cur = merged[index]
-            merged[index] = cur.copy(
-                hostname = incoming.hostname.ifBlank { cur.hostname },
-                osFamily = incoming.osFamily.ifBlank { cur.osFamily },
-                osVersion = incoming.osVersion.ifBlank { cur.osVersion },
-                consoleUser = incoming.consoleUser.ifBlank { cur.consoleUser },
-                displayName = incoming.displayName.ifBlank { cur.displayName },
-                lastSeen = maxOf(cur.lastSeen, incoming.lastSeen),
-                online = incoming.online,
-            )
-        }
-        return merged
+        return applyPresence(
+            computers,
+            presence.map {
+                PresenceReport(
+                    id = it.id,
+                    hostname = it.hostname,
+                    osFamily = it.osFamily,
+                    osVersion = it.osVersion,
+                    consoleUser = it.consoleUser,
+                    displayName = it.displayName,
+                    lastSeen = it.lastSeen,
+                    online = it.online,
+                )
+            },
+        )
     }
 
     private fun get(url: String, bearer: String): JSONObject {

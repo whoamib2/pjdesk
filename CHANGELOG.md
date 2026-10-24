@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.27
+
+Windows is 0.6.27. Android is 0.6.27 (versionCode 62700). cloud/ did not change. No migration and no worker change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Do not run `cloud\deploy.cmd`. The phone needs 62700. The Windows client and PJDesk Server need this build so a computer is marked online from the live connection list. A last-connected time does not count. This machine has no Pixel attached, so the phone screens were rendered headlessly.
+
+* The phone Saved list was keeping the online dot from the last account pull. Cabin Desk, CHIP20, and BEN-SURFACE-9 stayed grey while the Windows client, which asks again every 20 seconds, showed them from the same presence list. The phone now uses that same `online` flag, and a computer heard on the local network is online too. It refreshes when Home or Saved is open, when the list is pulled down, and every 20 seconds while that screen stays visible.
+* PJDesk Server publishes online from `online.json` only while that file is fresh. A stale file, or a last-seen time in the registry, does not mark a computer online.
+* The Discovered tab keeps its full label. On a narrow phone the tabs sit on their own row so the word is not cut off.
+
 ## 0.6.26
 
 Windows is 0.6.26. Android is 0.6.26 (versionCode 62600). cloud/ did not change. No migration and no worker change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Do not run `cloud\deploy.cmd`. The phone needs 62600. The Windows version string moves with this build; the window layout did not change. This machine has no Pixel attached, so the phone screens were rendered headlessly in dark and light.

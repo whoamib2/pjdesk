@@ -224,7 +224,7 @@ class Store(context: Context) {
                             passwordSaved = computerPassword(id).isNotEmpty(),
                             hostname = hostname,
                             consoleUser = o.optString("consoleUser"),
-                            lastSeen = o.optLong("lastSeen"),
+                            lastSeen = us.spader.pjdesk.core.seenSeconds(o.optLong("lastSeen")),
                             online = o.optBoolean("online"),
                             displayName = o.optString("displayName"),
                         ),
@@ -261,8 +261,15 @@ class Store(context: Context) {
                 osFamily = incoming.osFamily.ifBlank { cur.osFamily },
                 osVersion = incoming.osVersion.ifBlank { cur.osVersion },
                 consoleUser = incoming.consoleUser.ifBlank { cur.consoleUser },
-                lastSeen = maxOf(cur.lastSeen, incoming.lastSeen),
-                online = if (incoming.lastSeen > 0 || incoming.online) incoming.online else cur.online,
+                lastSeen = maxOf(
+                    us.spader.pjdesk.core.seenSeconds(cur.lastSeen),
+                    us.spader.pjdesk.core.seenSeconds(incoming.lastSeen),
+                ),
+                online = if (us.spader.pjdesk.core.seenSeconds(incoming.lastSeen) > 0L || incoming.online) {
+                    incoming.online
+                } else {
+                    cur.online
+                },
                 displayName = incoming.displayName.ifBlank { cur.displayName },
             )
         }

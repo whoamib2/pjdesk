@@ -53,6 +53,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -83,6 +84,7 @@ import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.SavedFilter
 import us.spader.pjdesk.core.SavedSort
 import us.spader.pjdesk.core.SavedView
+import us.spader.pjdesk.core.applyLan
 import us.spader.pjdesk.core.discoveredComputers
 import us.spader.pjdesk.data.SavedListPrefs
 import us.spader.pjdesk.core.nickname
@@ -616,9 +618,46 @@ class MainActivity : FragmentActivity() {
                     engine.connect(digits, if (askPerson) "" else password, askPerson, name)
                 }
             }
+            val liveSaved = applyLan(saved, discovered.map { it.id.filter { ch -> ch.isDigit() } }.toSet())
+            var presenceJob by remember { mutableStateOf<Job?>(null) }
+            var presenceBusy by remember { mutableStateOf(false) }
+            fun pullPresence() {
+                if (presenceJob?.isActive == true) return
+                val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                val device = app.store.networkDeviceId
+                val signed = account.isNotBlank() && refresh.isNotBlank() && device.isNotBlank() && !temporarySession
+                presenceJob = scope.launch {
+                    presenceBusy = true
+                    try {
+                        if (!signed) return@launch
+                        val session = withContext(Dispatchers.IO) {
+                            runCatching { refreshAccount(refresh, device, null) }
+                                .onFailure { AppLog.e("presence refresh failed: ${it.message}") }
+                                .getOrNull()
+                        } ?: return@launch
+                        if (session.access.isNotBlank()) {
+                            cloudAccess = session.access
+                            engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
+                        }
+                        rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp)
+                        app.store.mergeCloud(session.computers)
+                        saved = app.store.saved()
+                    } finally {
+                        presenceBusy = false
+                    }
+                }
+            }
+            LaunchedEffect(tab, account, temporarySession) {
+                if (account.isBlank() || temporarySession) return@LaunchedEffect
+                if (tab != 0 && tab != 1) return@LaunchedEffect
+                while (true) {
+                    pullPresence()
+                    delay(20_000)
+                }
+            }
             fun beginConnect(rawId: String, ignoreOffline: Boolean = false) {
                 val digits = rawId.filter { it.isDigit() }
-                val computer = saved.firstOrNull { it.id == digits }
+                val computer = liveSaved.firstOrNull { it.id == digits }
                 val name = connectComputerName(saved, digits)
                 val savedPassword = app.store.computerPassword(digits)
                 val knownOffline = computer != null && !computer.online && (
@@ -1733,7 +1772,7 @@ class MainActivity : FragmentActivity() {
                                     },
                                     accountEmail = account,
                                     temporary = temporarySession,
-                                    recent = saved.filter { recentIds.contains(it.id) }.take(3),
+                                    recent = liveSaved.filter { recentIds.contains(it.id) }.take(3),
                                     onRecent = { beginConnect(it) },
                                     selfId = state.id,
                                     onRefreshSupport = { engine.refreshSupport() },
@@ -1799,7 +1838,9 @@ class MainActivity : FragmentActivity() {
                                 )
                                 1 -> SavedScreen(
                                     signedIn = account.isNotEmpty(),
-                                    computers = saved,
+                                    computers = liveSaved,
+                                    refreshing = presenceBusy,
+                                    onRefresh = { pullPresence() },
                                     recentIds = recentIds,
                                     query = query,
                                     onQuery = { query = it },
