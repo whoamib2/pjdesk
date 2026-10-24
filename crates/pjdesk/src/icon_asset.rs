@@ -26,10 +26,10 @@ mod tests {
             .filter(|p| p[3] > 200 && p[0] < 30 && p[1] < 30 && p[2] < 40)
             .count();
         assert!(dark > 2_000, "the monitor glass should still be in the icon");
-        // The white bezel, stand, and server are the outer edge. A cutout that
-        // deletes them leaves the black glass touching the transparent margin.
+        // A thin dark outline is the outer pixel. The white bezel is just inside it.
+        // A cutout that deletes the white leaves the black glass there instead.
         let mut light_rows = 0;
-        let mut dark_rows = 0;
+        let mut rows = 0;
         for y in 0..256 {
             let mut first = None;
             for x in 0..256 {
@@ -40,32 +40,19 @@ mod tests {
                 }
             }
             let Some(x0) = first else { continue };
-            let mut sum = 0u32;
-            let mut n = 0u32;
-            for x in x0..(x0 + 3).min(256) {
-                let i = (y * 256 + x) * 4;
-                if bytes[i + 3] > 180 {
-                    sum += u32::from(bytes[i]) + u32::from(bytes[i + 1]) + u32::from(bytes[i + 2]);
-                    n += 3;
+            rows += 1;
+            let x = (x0 + 4).min(255);
+            let i = (y * 256 + x) * 4;
+            if bytes[i + 3] > 160 {
+                let mean = (u32::from(bytes[i]) + u32::from(bytes[i + 1]) + u32::from(bytes[i + 2])) / 3;
+                if mean > 170 {
+                    light_rows += 1;
                 }
-            }
-            if n == 0 {
-                continue;
-            }
-            let mean = sum / n;
-            if mean > 180 {
-                light_rows += 1;
-            } else if mean < 80 {
-                dark_rows += 1;
             }
         }
         assert!(
-            light_rows > 150,
-            "the white bezel should be the outer edge ({light_rows} light rows)"
-        );
-        assert!(
-            dark_rows < 40,
-            "the glass should sit inside the bezel ({dark_rows} dark edge rows)"
+            light_rows > 80,
+            "the white bezel should sit inside the outline ({light_rows} of {rows} rows)"
         );
     }
 
@@ -104,18 +91,31 @@ mod tests {
     }
 
     #[test]
-    fn server_uses_the_same_icon() {
-        assert_eq!(
+    fn server_icon_is_its_own_mark() {
+        let client = include_bytes!("../assets/icon_256.rgba");
+        let server = include_bytes!("../../pjdesk-server/assets/icon_server_256.rgba");
+        assert_ne!(client as &[u8], server as &[u8]);
+        corners_clear(server, 256);
+        let white = server
+            .chunks(4)
+            .filter(|p| p[3] > 200 && p[0] > 210 && p[1] > 210 && p[2] > 210)
+            .count();
+        let blue = server
+            .chunks(4)
+            .filter(|p| p[3] > 200 && p[2] > 160 && p[2] > p[0].saturating_add(40))
+            .count();
+        assert!(white > 4_000, "the server box should be the large white shape");
+        assert!(blue > 400, "the server bars should be blue");
+        assert_ne!(
             include_bytes!("../assets/pjdesk.ico") as &[u8],
-            include_bytes!("../../pjdesk-server/assets/pjdesk-server.ico")
+            include_bytes!("../../pjdesk-server/assets/pjdesk-server.ico") as &[u8]
         );
-        assert_eq!(
-            include_bytes!("../assets/icon_256.rgba") as &[u8],
-            include_bytes!("../../pjdesk-server/assets/icon_server_256.rgba")
-        );
-        assert_eq!(
-            include_bytes!("../assets/icon_32.rgba") as &[u8],
-            include_bytes!("../../pjdesk-server/assets/icon_server_32.rgba")
-        );
+        let tray = include_bytes!("../../pjdesk-server/assets/icon_server_32.rgba");
+        corners_clear(tray, 32);
+        let tray_blue = tray
+            .chunks(4)
+            .filter(|p| p[3] > 180 && p[2] > 140 && p[2] > p[0].saturating_add(30))
+            .count();
+        assert!(tray_blue > 20, "the server tray mark should keep the blue bars");
     }
 }

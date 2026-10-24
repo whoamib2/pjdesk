@@ -1,6 +1,7 @@
 # PJDesk
 
 <img src="docs/pjdesk-icon.png" width="96" height="96" alt="PJDesk">
+<img src="docs/pjdesk-server-icon.png" width="96" height="96" alt="PJDesk Server">
 
 A self-hosted, open-source remote desktop in the spirit of RustDesk, written in Rust. Your computers connect only through a server you run — no cloud, no accounts with anyone but you. [pjdesk.com](https://pjdesk.com)
 
