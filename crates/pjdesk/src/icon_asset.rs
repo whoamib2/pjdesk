@@ -26,6 +26,47 @@ mod tests {
             .filter(|p| p[3] > 200 && p[0] < 30 && p[1] < 30 && p[2] < 40)
             .count();
         assert!(dark > 2_000, "the monitor glass should still be in the icon");
+        // The white bezel, stand, and server are the outer edge. A cutout that
+        // deletes them leaves the black glass touching the transparent margin.
+        let mut light_rows = 0;
+        let mut dark_rows = 0;
+        for y in 0..256 {
+            let mut first = None;
+            for x in 0..256 {
+                let i = (y * 256 + x) * 4;
+                if bytes[i + 3] > 180 {
+                    first = Some(x);
+                    break;
+                }
+            }
+            let Some(x0) = first else { continue };
+            let mut sum = 0u32;
+            let mut n = 0u32;
+            for x in x0..(x0 + 3).min(256) {
+                let i = (y * 256 + x) * 4;
+                if bytes[i + 3] > 180 {
+                    sum += u32::from(bytes[i]) + u32::from(bytes[i + 1]) + u32::from(bytes[i + 2]);
+                    n += 3;
+                }
+            }
+            if n == 0 {
+                continue;
+            }
+            let mean = sum / n;
+            if mean > 180 {
+                light_rows += 1;
+            } else if mean < 80 {
+                dark_rows += 1;
+            }
+        }
+        assert!(
+            light_rows > 150,
+            "the white bezel should be the outer edge ({light_rows} light rows)"
+        );
+        assert!(
+            dark_rows < 40,
+            "the glass should sit inside the bezel ({dark_rows} dark edge rows)"
+        );
     }
 
     #[test]

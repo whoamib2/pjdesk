@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.25
+
+Windows is 0.6.25. Android is 0.6.25 (versionCode 62500) for the corrected icon. cloud/ changed: the pjdesk.com favicon and header logo only. No migration and no worker change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Run `cloud\deploy.cmd` so the site shows the icon. The phone needs 62500. The Windows client and PJDesk Server need a rebuild for the exe, tray, and window icons. This machine has no Windows PC attached, so the window was not clicked through here.
+
+* The 0.6.24 icon dropped the white monitor bezel, the stand, and the server box along with the checkerboard, so a dark title bar showed only the black screen and the cursor. The cutout now flood-fills the checkerboard that touches the image edge and keeps every white part of the artwork. A soft dark edge keeps that white readable on a dark title bar. The same picture is the Windows icon (16 through 256) for the client, the server, and both installers, the tray, the window logo, the Android launcher (light background and monochrome), the pjdesk.com favicon and header logo, and the README.
+
 ## 0.6.24
 
 Windows is 0.6.24. Android is 0.6.24 (versionCode 62400) for the new icon. cloud/ changed: the pjdesk.com favicon and header logo only. No migration and no worker change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Run `cloud\deploy.cmd` so the site shows the new icon. The phone needs 62400 for the launcher icon. The Windows client and PJDesk Server need a rebuild for the exe, tray, and window icons. A 0.6.23 window does not have colored tiles, the view toggle, or the Discovered tab. This machine has no Windows PC attached, so the window was not clicked through here.
