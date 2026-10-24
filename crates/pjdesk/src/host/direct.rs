@@ -120,6 +120,7 @@ async fn one(state: Arc<HostState>, incoming: quinn::Incoming) -> Result<()> {
     }
     let result = stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
     state.streaming.store(false, Ordering::SeqCst);
+    state.fresh_support();
     if let Some(shared) = &state.shared {
         *shared.connected.lock().unwrap() = None;
     }

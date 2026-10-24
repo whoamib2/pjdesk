@@ -112,6 +112,17 @@ pub fn random_u64() -> u64 {
     u64::from_le_bytes(random_bytes::<8>())
 }
 
+/// `count` decimal digits from the operating system's secure RNG.
+pub fn random_digits(count: usize) -> String {
+    (0..count).map(|_| char::from(b'0' + random_below(10) as u8)).collect()
+}
+
+/// Lowercase hex SHA-256. Invite and support codes are stored as this, never as digits.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
 /// A random integer in `0..bound` (rejection sampling, no modulo bias).
 pub fn random_below(bound: u32) -> u32 {
     assert!(bound > 0);
@@ -155,6 +166,17 @@ pub fn generate_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn support_codes_are_eight_digits() {
+        let code = random_digits(8);
+        assert_eq!(code.len(), 8);
+        assert!(code.bytes().all(|b| b.is_ascii_digit()));
+        assert_eq!(
+            sha256_hex(b"12345678"),
+            "ef797c8118f02dfb649607dd5d3f8c7623048c9c063d532cc95c5ed7a898a64f"
+        );
+    }
 
     #[test]
     fn ids_format_and_validate() {

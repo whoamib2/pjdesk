@@ -37,6 +37,12 @@ data class DeskState(
     val id: String = "",
     val idFormatted: String = "",
     val password: String = "",
+    /** Temporary 8-digit code for Let someone connect. Empty until the engine has one. */
+    val supportCode: String = "",
+    /** Temporary password that matches [supportCode]. Not the permanent password. */
+    val supportPassword: String = "",
+    /** Unix seconds when the support pair was created. 0 until the first pair. */
+    val supportBorn: Long = 0,
     val hasPermanent: Boolean = false,
     val fingerprint: String = "",
     val server: String = "",

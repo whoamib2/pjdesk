@@ -74,6 +74,7 @@ fun SignInScreen(
         Text("Sign in to your network", style = MaterialTheme.typography.headlineMedium)
         Text(
             if (useKey) "Paste a network key, or scan its QR code. This phone enrolls and stays signed in after a restart."
+            else if (useCode) "Enter an 8-digit code from someone on this network. It works once, lasts one hour, and you do not need a PJDesk account. An older enrollment code still works in this box."
             else "Your PJDesk account sets the servers for this network. It does not connect you to a computer, and it is not that computer's password.",
             color = pjMuted(),
         )
@@ -109,9 +110,13 @@ fun SignInScreen(
                         onValueChange = onCode,
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
-                        label = { Text("Enrollment code") },
+                        label = { Text("8-digit code") },
+                        placeholder = { Text("1234 5678") },
                     )
-                    Text("From pjdesk.com → Account → My network. One device, one hour.", color = pjMuted())
+                    Text(
+                        "From Invite on a signed-in PJDesk. One use, one hour. An older enrollment code from pjdesk.com still works here.",
+                        color = pjMuted(),
+                    )
                 }
                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                     Checkbox(checked = temporary, onCheckedChange = onTemporary, enabled = !busy)
@@ -128,7 +133,12 @@ fun SignInScreen(
                     }
                 }
                 Button(onClick = onSubmit, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
-                    Text(if (busy) "Signing in…" else if (useKey) "Use network key" else "Sign in")
+                    Text(
+                        if (busy) "Signing in…"
+                        else if (useKey) "Use network key"
+                        else if (useCode) "Join"
+                        else "Sign in",
+                    )
                 }
                 if (!useCode && !useKey) {
                     TextButton(onClick = onEnrollOnly, enabled = !busy) {
@@ -142,7 +152,7 @@ fun SignInScreen(
                 }
                 if (!useCode) {
                     TextButton(onClick = { onUseKey(false); onUseCode(true) }, enabled = !busy) {
-                        Text("I have an enrollment code")
+                        Text("Join with an 8-digit code")
                     }
                 }
                 if (!useKey) {

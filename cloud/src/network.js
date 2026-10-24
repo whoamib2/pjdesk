@@ -9,6 +9,8 @@
 // Android client:
 //   PJN1\n{email}\n{network id}\n{sorted fingerprints}\n{device id}\n{exp}\n
 
+import { JOIN_TTL_SEC, SUPPORT_TTL_SEC, joinRedeemable, nextGuess, randomDigits } from "./codes.js";
+
 const TOKEN_TTL = 15 * 60;
 const REFRESH_TTL = 365 * 24 * 3600;
 const ENROLL_TTL = 60 * 60;
@@ -975,6 +977,9 @@ export async function route(request, env, url) {
 async function handle(request, env, url) {
   const p = url.pathname;
   const m = request.method;
+  if (p === "/api/support/offer" && m === "POST") return supportOffer(request, env);
+  if (p === "/api/support/revoke" && m === "POST") return supportRevoke(request, env);
+  if (p === "/api/support/lookup" && m === "POST") return supportLookup(request, env);
   if (p === "/api/network/key" && m === "GET") {
     const { publicKey } = await signingKey(env);
     return json({ public_key: publicKey });
@@ -1000,6 +1005,9 @@ async function handle(request, env, url) {
   if (p === "/api/network/computers" && m === "PUT") return putComputers(request, env, account);
   if (p === "/api/network/presence" && m === "POST") return postPresence(request, env, account);
   if (p === "/api/network/enroll-code" && m === "POST") return enrollCode(env, account);
+  if (p === "/api/network/join-code" && m === "GET") return listJoinCodes(env, account);
+  if (p === "/api/network/join-code" && m === "POST") return createJoinCode(env, account);
+  if (p === "/api/network/join-code/revoke" && m === "POST") return revokeJoinCode(request, env, account);
   if (p === "/api/network/invites" && m === "POST") return createInvite(request, env, account);
   if (p === "/api/network/invites/revoke" && m === "POST") return revokeInvite(request, env, account);
   if (p === "/api/network/policy" && m === "GET") return policy(env, account);
@@ -1506,17 +1514,230 @@ async function enroll(request, env) {
   const code = String(body.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   const deviceId = String(body.device_id || "");
   if (code.length !== 8) throw new HttpError(400, "That enrollment code is not valid.");
+  await assertGuessOpen(env, request, "join");
   const hash = await sha256Hex(code);
+  if (/^\d{8}$/.test(code)) {
+    const joined = await redeemJoinCode(env, request, hash, deviceId, body.device_name || "Joined computer");
+    if (joined) return joined;
+  }
   const row = await env.DB.prepare(
     `SELECT c.expires_at, c.used_at, n.* FROM enroll_codes c JOIN networks n ON n.id = c.network_id WHERE c.code_hash = ?`,
   )
     .bind(hash)
     .first();
-  if (!row || row.used_at || row.expires_at < now()) throw new HttpError(400, "That enrollment code is not valid.");
+  if (!row || row.used_at || row.expires_at < now()) {
+    await recordGuess(env, request, "join", false);
+    throw new HttpError(400, "That enrollment code is not valid.");
+  }
   const owner = await env.DB.prepare("SELECT id, email FROM accounts WHERE id = ?").bind(row.owner_id).first();
-  if (!owner) throw new HttpError(400, "That enrollment code is not valid.");
+  if (!owner) {
+    await recordGuess(env, request, "join", false);
+    throw new HttpError(400, "That enrollment code is not valid.");
+  }
   await env.DB.prepare("UPDATE enroll_codes SET used_at = ? WHERE code_hash = ?").bind(now(), hash).run();
+  await recordGuess(env, request, "join", true);
   return json(await issue(env, { accountId: owner.id, email: owner.email }, row, deviceId, body.device_name || "Enrolled device", null));
+}
+
+function callerSubject(request) {
+  const raw = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
+  return raw.split(",")[0].trim().slice(0, 80);
+}
+
+async function guessRow(env, request, kind) {
+  const subject = await sha256Hex(`${kind}\n${callerSubject(request)}`);
+  const row = await env.DB.prepare(
+    "SELECT failures, window_start, locked_until FROM code_attempts WHERE subject = ? AND kind = ?",
+  )
+    .bind(subject, kind)
+    .first();
+  return { subject, row };
+}
+
+async function assertGuessOpen(env, request, kind) {
+  const { row } = await guessRow(env, request, kind);
+  const decision = nextGuess({
+    failures: row?.failures,
+    windowStart: row?.window_start,
+    lockedUntil: row?.locked_until,
+    now: now(),
+  });
+  if (decision.locked) throw new HttpError(429, decision.message);
+}
+
+async function recordGuess(env, request, kind, success, opts) {
+  const { subject, row } = await guessRow(env, request, kind);
+  const decision = nextGuess(
+    {
+      failures: row?.failures,
+      windowStart: row?.window_start,
+      lockedUntil: row?.locked_until,
+      now: now(),
+      success,
+      record: !success,
+    },
+    opts,
+  );
+  await env.DB.prepare(
+    `INSERT INTO code_attempts (subject, kind, failures, window_start, locked_until)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(subject, kind) DO UPDATE SET
+       failures = excluded.failures,
+       window_start = excluded.window_start,
+       locked_until = excluded.locked_until`,
+  )
+    .bind(subject, kind, decision.failures, decision.windowStart, decision.lockedUntil)
+    .run();
+  return decision;
+}
+
+async function redeemJoinCode(env, request, hash, deviceId, deviceName) {
+  const row = await env.DB.prepare(
+    `SELECT c.used_at, c.revoked_at, c.expires_at, c.id AS code_id, n.*
+       FROM join_codes c JOIN networks n ON n.id = c.network_id
+      WHERE c.code_hash = ?`,
+  )
+    .bind(hash)
+    .first();
+  if (!row) return null;
+  const t = now();
+  if (!joinRedeemable({ usedAt: row.used_at, revokedAt: row.revoked_at, expiresAt: row.expires_at, now: t })) {
+    await recordGuess(env, request, "join", false);
+    throw new HttpError(400, "That code is not valid.");
+  }
+  const claimed = await env.DB.prepare(
+    `UPDATE join_codes SET used_at = ?
+      WHERE code_hash = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?`,
+  )
+    .bind(t, hash, t)
+    .run();
+  if (!claimed.meta || !claimed.meta.changes) {
+    await recordGuess(env, request, "join", false);
+    throw new HttpError(400, "That code is not valid.");
+  }
+  const owner = await env.DB.prepare("SELECT id, email FROM accounts WHERE id = ?").bind(row.owner_id).first();
+  if (!owner) throw new HttpError(400, "That code is not valid.");
+  await recordGuess(env, request, "join", true);
+  return json(await issue(env, { accountId: owner.id, email: owner.email }, row, deviceId, deviceName, null));
+}
+
+async function listJoinCodes(env, account) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "Set your network before creating a code.");
+  const t = now();
+  const { results } = await env.DB.prepare(
+    `SELECT id, created_at, expires_at FROM join_codes
+      WHERE network_id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+      ORDER BY created_at DESC`,
+  )
+    .bind(row.id, t)
+    .all();
+  return json({
+    codes: (results || []).map((item) => ({
+      id: item.id,
+      created_at: item.created_at,
+      expires_at: item.expires_at,
+    })),
+  });
+}
+
+async function createJoinCode(env, account) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "Set your network before creating a code.");
+  const t = now();
+  await env.DB.prepare(
+    `UPDATE join_codes SET revoked_at = ?
+      WHERE network_id = ? AND used_at IS NULL AND revoked_at IS NULL`,
+  )
+    .bind(t, row.id)
+    .run();
+  const code = randomDigits(8);
+  const id = `jnc_${randomHex(8)}`;
+  const expires = t + JOIN_TTL_SEC;
+  await env.DB.prepare(
+    "INSERT INTO join_codes (id, code_hash, network_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+  )
+    .bind(id, await sha256Hex(code), row.id, t, expires)
+    .run();
+  return json({ id, code, expires_at: expires });
+}
+
+async function revokeJoinCode(request, env, account) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "No network.");
+  const body = await readJson(request);
+  const id = String(body.id || "");
+  if (!id.startsWith("jnc_")) throw new HttpError(400, "Unknown code.");
+  const t = now();
+  await env.DB.prepare(
+    `UPDATE join_codes SET revoked_at = ?
+      WHERE id = ? AND network_id = ? AND used_at IS NULL AND revoked_at IS NULL`,
+  )
+    .bind(t, id, row.id)
+    .run();
+  return json({ ok: true, id });
+}
+
+function pjdeskIdOk(id) {
+  return /^\d{9}$/.test(String(id || ""));
+}
+
+async function supportOffer(request, env) {
+  await assertGuessOpen(env, request, "support-publish");
+  const body = await readJson(request);
+  const codeHash = String(body.code_hash || "").trim().toLowerCase();
+  const pjdeskId = String(body.pjdesk_id || "").replace(/\D/g, "");
+  if (!/^[0-9a-f]{64}$/.test(codeHash) || !pjdeskIdOk(pjdeskId)) {
+    throw new HttpError(400, "That support code is not valid.");
+  }
+  const decision = await recordGuess(env, request, "support-publish", false, {
+    limit: 240,
+    windowSec: 60 * 60,
+    lockSec: 60,
+  });
+  if (decision.locked) throw new HttpError(429, decision.message);
+  const t = now();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM support_offers WHERE pjdesk_id = ? OR expires_at <= ?").bind(pjdeskId, t),
+    env.DB.prepare(
+      "INSERT INTO support_offers (code_hash, pjdesk_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+    ).bind(codeHash, pjdeskId, t, t + SUPPORT_TTL_SEC),
+  ]);
+  return json({ ok: true, expires_at: t + SUPPORT_TTL_SEC });
+}
+
+async function supportRevoke(request, env) {
+  const body = await readJson(request);
+  const codeHash = String(body.code_hash || "").trim().toLowerCase();
+  const pjdeskId = String(body.pjdesk_id || "").replace(/\D/g, "");
+  if (!/^[0-9a-f]{64}$/.test(codeHash) || !pjdeskIdOk(pjdeskId)) {
+    throw new HttpError(400, "That support code is not valid.");
+  }
+  await env.DB.prepare("DELETE FROM support_offers WHERE code_hash = ? AND pjdesk_id = ?")
+    .bind(codeHash, pjdeskId)
+    .run();
+  return json({ ok: true });
+}
+
+async function supportLookup(request, env) {
+  await assertGuessOpen(env, request, "support");
+  const body = await readJson(request);
+  const code = String(body.code || "").replace(/\D/g, "");
+  if (code.length !== 8) {
+    await recordGuess(env, request, "support", false);
+    throw new HttpError(400, "That code is not valid.");
+  }
+  const hash = await sha256Hex(code);
+  const row = await env.DB.prepare("SELECT pjdesk_id, expires_at FROM support_offers WHERE code_hash = ?")
+    .bind(hash)
+    .first();
+  const t = now();
+  if (!row || row.expires_at <= t || !pjdeskIdOk(row.pjdesk_id)) {
+    await recordGuess(env, request, "support", false);
+    throw new HttpError(400, "That code is not valid.");
+  }
+  await recordGuess(env, request, "support", true);
+  return json({ id: row.pjdesk_id });
 }
 
 async function policy(env, account) {

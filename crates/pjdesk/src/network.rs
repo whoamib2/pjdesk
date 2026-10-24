@@ -927,6 +927,189 @@ pub fn installer_network_key(explicit: Option<&str>) -> Option<String> {
     pjdesk_proto::netkey::blob_from_text(&text)
 }
 
+/// An 8-digit invite. `code` is empty when the server listed a code this
+/// process did not create (the digits are not stored).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinCode {
+    pub id: String,
+    pub code: String,
+    pub expires_at: u64,
+}
+
+/// Creates a single-use 8-digit code for this account's network. Older unused
+/// codes for that network are revoked. The digits are returned once.
+pub fn create_join_code(token: &str) -> Result<JoinCode> {
+    if token.trim().is_empty() {
+        bail!("Sign in again.");
+    }
+    let text = post_json(&format!("{}/api/network/join-code", api_base()), Some(token), &serde_json::json!({}))?;
+    parse_join(&text, true)
+}
+
+/// Active invite codes this account can revoke. Digits are not included.
+pub fn list_join_codes(token: &str) -> Result<Vec<JoinCode>> {
+    if token.trim().is_empty() {
+        bail!("Sign in again.");
+    }
+    let text = get_json(&format!("{}/api/network/join-code", api_base()), Some(token))?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
+    let mut out = Vec::new();
+    for item in parsed.get("codes").and_then(|v| v.as_array()).into_iter().flatten() {
+        out.push(JoinCode {
+            id: item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            code: String::new(),
+            expires_at: item.get("expires_at").and_then(|v| v.as_u64()).unwrap_or(0),
+        });
+    }
+    Ok(out)
+}
+
+pub fn revoke_join_code(token: &str, id: &str) -> Result<()> {
+    if token.trim().is_empty() {
+        bail!("Sign in again.");
+    }
+    post_json(
+        &format!("{}/api/network/join-code/revoke", api_base()),
+        Some(token),
+        &serde_json::json!({ "id": id }),
+    )?;
+    Ok(())
+}
+
+/// Publishes the hash of an 8-digit support code for this computer. The
+/// temporary password is not sent.
+pub fn offer_support(code: &str, pjdesk_id: &str) -> Result<u64> {
+    let digits = digits_only(code);
+    let id = pjdesk_proto::normalize_id(pjdesk_id);
+    if digits.len() != 8 || !pjdesk_proto::is_valid_id(&id) {
+        bail!("This computer is not online yet, so a support code cannot be used.");
+    }
+    let text = post_json(
+        &format!("{}/api/support/offer", api_base()),
+        None,
+        &serde_json::json!({
+            "code_hash": pjdesk_proto::sha256_hex(digits.as_bytes()),
+            "pjdesk_id": id,
+        }),
+    )?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    Ok(parsed.get("expires_at").and_then(|v| v.as_u64()).unwrap_or(0))
+}
+
+/// Drops a published support code. A failure still expires after about 10 minutes.
+pub fn revoke_support(code: &str, pjdesk_id: &str) -> Result<()> {
+    let digits = digits_only(code);
+    let id = pjdesk_proto::normalize_id(pjdesk_id);
+    if digits.len() != 8 || !pjdesk_proto::is_valid_id(&id) {
+        return Ok(());
+    }
+    post_json_timeout(
+        &format!("{}/api/support/revoke", api_base()),
+        None,
+        &serde_json::json!({
+            "code_hash": pjdesk_proto::sha256_hex(digits.as_bytes()),
+            "pjdesk_id": id,
+        }),
+        3,
+    )?;
+    Ok(())
+}
+
+/// The 9-digit ID behind an 8-digit support code. The password is checked by
+/// that computer, not by pjdesk.com.
+pub fn lookup_support(code: &str) -> Result<String> {
+    let digits = digits_only(code);
+    if digits.len() != 8 {
+        bail!("Enter the 8-digit code.");
+    }
+    let text = post_json(
+        &format!("{}/api/support/lookup", api_base()),
+        None,
+        &serde_json::json!({ "code": digits }),
+    )?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
+    let id = parsed.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !pjdesk_proto::is_valid_id(&id) {
+        bail!("That code is not valid.");
+    }
+    Ok(id)
+}
+
+fn digits_only(text: &str) -> String {
+    text.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+fn parse_join(text: &str, with_code: bool) -> Result<JoinCode> {
+    let parsed: serde_json::Value = serde_json::from_str(text).context("unexpected reply from PJDesk")?;
+    let code = if with_code { parsed.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string() } else { String::new() };
+    let id = parsed.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !id.starts_with("jnc_") || (with_code && digits_only(&code).len() != 8) {
+        bail!("PJDesk did not return a code.");
+    }
+    Ok(JoinCode { id, code: digits_only(&code), expires_at: parsed.get("expires_at").and_then(|v| v.as_u64()).unwrap_or(0) })
+}
+
+/// How long an invite code has left, for the countdown Ben sees.
+pub fn remaining_label(expires_unix: u64, now_unix: u64) -> String {
+    if expires_unix == 0 || expires_unix <= now_unix {
+        return "Expired".into();
+    }
+    let left = expires_unix - now_unix;
+    let hours = left / 3600;
+    let mins = (left % 3600) / 60;
+    let secs = left % 60;
+    if hours > 0 {
+        format!("{hours} h {mins} min")
+    } else if mins > 0 {
+        format!("{mins} min {secs} s")
+    } else {
+        format!("{secs} s")
+    }
+}
+
+/// "12345678" → "1234 5678".
+pub fn group_digits(code: &str) -> String {
+    let digits = digits_only(code);
+    if digits.len() == 8 {
+        format!("{} {}", &digits[..4], &digits[4..])
+    } else {
+        digits
+    }
+}
+
+fn get_json(url: &str, bearer: Option<&str>) -> Result<String> {
+    let mut req = agent().get(url);
+    if let Some(token) = bearer {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    match req.call() {
+        Ok(resp) => Ok(resp.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let parsed: ErrorBody = serde_json::from_str(&text).unwrap_or(ErrorBody { error: String::new(), code: String::new(), role: String::new() });
+            let message = if !parsed.error.is_empty() { parsed.error } else { format!("PJDesk could not sign in ({code}).") };
+            bail!(message)
+        }
+        Err(ureq::Error::Transport(_)) => bail!("Could not reach pjdesk.com."),
+    }
+}
+
+fn post_json_timeout(url: &str, bearer: Option<&str>, body: &serde_json::Value, secs: u64) -> Result<String> {
+    let mut req = ureq::AgentBuilder::new().timeout(Duration::from_secs(secs)).build().post(url).set("content-type", "application/json");
+    if let Some(token) = bearer {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    match req.send_string(&body.to_string()) {
+        Ok(resp) => Ok(resp.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(_, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let parsed: ErrorBody = serde_json::from_str(&text).unwrap_or(ErrorBody { error: String::new(), code: String::new(), role: String::new() });
+            bail!(if parsed.error.is_empty() { "Could not reach pjdesk.com.".to_string() } else { parsed.error })
+        }
+        Err(ureq::Error::Transport(_)) => bail!("Could not reach pjdesk.com."),
+    }
+}
+
 /// Removes the installer's pending file after the key has been applied.
 pub fn clear_installer_network_key() {
     let Ok(exe) = std::env::current_exe() else { return };
@@ -1065,5 +1248,15 @@ mod tests {
         assert_eq!(keep_hostname("pjdesk.spader.us:21200", ""), "pjdesk.spader.us:21200");
         assert!(is_old_no_server("Set the server address in My network first."));
         assert!(!is_old_no_server(NO_SERVER));
+    }
+
+    #[test]
+    fn an_invite_countdown_and_grouped_code() {
+        assert_eq!(remaining_label(3_700, 100), "1 h 0 min");
+        assert_eq!(remaining_label(190, 100), "1 min 30 s");
+        assert_eq!(remaining_label(100, 100), "Expired");
+        assert_eq!(remaining_label(0, 50), "Expired");
+        assert_eq!(group_digits("12 345 678"), "1234 5678");
+        assert_eq!(group_digits("abcd"), "");
     }
 }

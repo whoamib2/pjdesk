@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use pjdesk_link::admit::{self, Admit};
@@ -37,7 +37,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.21";
+pub const APP_VERSION: &str = "0.6.23";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -94,6 +94,14 @@ struct State {
     my_public_ip: Mutex<String>,
     fingerprint: Mutex<Option<String>>,
     otp: Mutex<String>,
+    /// Temporary 8-digit code for Let someone connect.
+    support_code: Mutex<String>,
+    /// Temporary password that matches the support code. Not the permanent one.
+    support_password: Mutex<String>,
+    /// Unix time the current support pair was created.
+    support_born: AtomicU64,
+    /// Set once a session has started, so it gets a new support pair when it ends.
+    support_hold: AtomicBool,
     permanent: Mutex<Option<String>>,
     approval: Mutex<String>,
     policy: Mutex<pjdesk_proto::signal::Policy>,
@@ -238,6 +246,10 @@ impl Engine {
             my_public_ip: Mutex::new(stored.my_public_ip),
             fingerprint: Mutex::new((!stored.fingerprint.is_empty()).then_some(stored.fingerprint)),
             otp: Mutex::new(generate_password()),
+            support_code: Mutex::new(pjdesk_proto::random_digits(8)),
+            support_password: Mutex::new(generate_password()),
+            support_born: AtomicU64::new(unix_now()),
+            support_hold: AtomicBool::new(false),
             permanent: Mutex::new(None),
             approval: Mutex::new("prompt".into()),
             policy: Mutex::new(pjdesk_proto::signal::Policy::default()),
@@ -386,6 +398,9 @@ fn publish(state: &State, cb: &Arc<dyn Callbacks>) {
             "id": id,
             "idFormatted": if id.is_empty() { String::new() } else { format_id(&id) },
             "password": password,
+            "supportCode": state.support_code.lock().unwrap().clone(),
+            "supportPassword": state.support_password.lock().unwrap().clone(),
+            "supportBorn": state.support_born.load(Ordering::SeqCst),
             "permanent": permanent,
             "fingerprint": fp,
             "server": server,
@@ -467,6 +482,10 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         }
         "regenerate" => {
             *state.otp.lock().unwrap() = generate_password();
+            publish(state, cb);
+        }
+        "refreshSupport" => {
+            refresh_support(state);
             publish(state, cb);
         }
         "hostFacts" => {
@@ -986,6 +1005,13 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
         }
         tokio::select! {
             _ = ping.tick() => {
+                if state.host_live.load(Ordering::SeqCst) == 0 {
+                    let born = state.support_born.load(Ordering::SeqCst);
+                    if born > 0 && unix_now().saturating_sub(born) >= 10 * 60 {
+                        refresh_support(&state);
+                        publish(&state, &cb);
+                    }
+                }
                 signal.send(ClientMsg::Ping)?;
                 if report_host {
                     since_report += 1;
@@ -1049,6 +1075,10 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
                             };
                             log_line(&cb, format!("host session ended: {reason}"));
                             emit(&cb, &json!({"event":"disconnected","role":"host","reason": reason}));
+                            if state.support_hold.swap(false, Ordering::SeqCst) {
+                                refresh_support(&state);
+                                publish(&state, &cb);
+                            }
                         });
                     }
                     ServerMsg::PeerInfo { session_id, public_addr, local_addrs, cert_fingerprint } => {
@@ -1314,6 +1344,13 @@ async fn host_session(
         }
     } else {
         state.lockout.lock().unwrap().succeed(&source);
+        let support = state.support_password.lock().unwrap().clone();
+        if admit::matched_support(&passwords, auth.password_slot, Some(support.as_str())) {
+            log_line(&cb, "accepting with the support password, without asking");
+            grant_auth(&mut auth.send, &state.hostname).await?;
+            let policy = state.policy.lock().unwrap().clone();
+            admit::support_open(&policy, false)
+        } else {
         let matched = admit::matched_permanent(&passwords, auth.password_slot, permanent.as_deref());
         let permanent_set = permanent.as_deref().map(str::trim).is_some_and(|p| !p.is_empty());
         let approval = state.approval.lock().unwrap().clone();
@@ -1336,6 +1373,7 @@ async fn host_session(
                 }
             },
         }
+        }
     };
     if auth.password_slot != ASK_SLOT {
         log_line(&cb, format!("password accepted for {}", auth.peer_name));
@@ -1348,6 +1386,7 @@ async fn host_session(
     // Tell the controller before the video stream opens, and keep this session
     // up while the phone shows the consent notification. The viewer is attached
     // from here until this function ends, so a late consent cannot start a capture.
+    state.support_hold.store(true, Ordering::SeqCst);
     let host_live = HostLive::enter(&state);
     let mut share_deadline = None;
     if !state.capturing.load(Ordering::SeqCst) {
@@ -1669,9 +1708,25 @@ fn screen_share_failure(reason: &str) -> String {
 fn auth_passwords(state: &State) -> Vec<String> {
     let mut pws = vec![state.otp.lock().unwrap().clone()];
     if let Some(pw) = state.permanent.lock().unwrap().clone() {
-        pws.push(pw);
+        if !pw.trim().is_empty() && !pws.contains(&pw) {
+            pws.push(pw);
+        }
+    }
+    let support = state.support_password.lock().unwrap().clone();
+    if !support.trim().is_empty() && !pws.contains(&support) {
+        pws.push(support);
     }
     pws
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn refresh_support(state: &State) {
+    *state.support_code.lock().unwrap() = pjdesk_proto::random_digits(8);
+    *state.support_password.lock().unwrap() = generate_password();
+    state.support_born.store(unix_now(), Ordering::SeqCst);
 }
 
 async fn send_welcome(
@@ -2400,8 +2455,10 @@ mod tests {
             assert!(restarted.permanent.lock().unwrap().is_none());
             apply(&restarted, &cb, json!({"cmd":"setPermanent","password": saved})).await;
             let passwords = auth_passwords(&restarted);
-            assert_eq!(passwords.len(), 2);
+            assert_eq!(passwords.len(), 3);
             assert_eq!(passwords[1], saved);
+            assert_ne!(passwords[2], saved);
+            assert!(!passwords[2].is_empty());
             assert!(host_accepts_typed(&passwords, saved));
             assert!(host_accepts_typed(&passwords, &passwords[0]));
             assert!(!host_accepts_typed(&passwords, "wrong horse battery"));
@@ -2593,6 +2650,10 @@ mod tests {
             my_public_ip: Mutex::new(String::new()),
             fingerprint: Mutex::new(None),
             otp: Mutex::new(generate_password()),
+            support_code: Mutex::new(pjdesk_proto::random_digits(8)),
+            support_password: Mutex::new(generate_password()),
+            support_born: AtomicU64::new(unix_now()),
+            support_hold: AtomicBool::new(false),
             permanent: Mutex::new(None),
             approval: Mutex::new("prompt".into()),
             policy: Mutex::new(pjdesk_proto::signal::Policy::default()),

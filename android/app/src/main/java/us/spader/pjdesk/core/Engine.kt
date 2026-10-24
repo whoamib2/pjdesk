@@ -520,6 +520,8 @@ class Engine(context: Context) : EngineListener {
     }
 
     fun regenerate() = command("""{"cmd":"regenerate"}""")
+
+    fun refreshSupport() = command("""{"cmd":"refreshSupport"}""")
     fun setServer(address: String) = applyAccountServer(address, "", quiet = false)
     fun resetFingerprint() = command("""{"cmd":"resetFingerprint"}""")
     fun captureSize(width: Int, height: Int) =
@@ -578,6 +580,9 @@ class Engine(context: Context) : EngineListener {
                         id = event.optString("id"),
                         idFormatted = event.optString("idFormatted"),
                         password = event.optString("password"),
+                        supportCode = event.optString("supportCode"),
+                        supportPassword = event.optString("supportPassword"),
+                        supportBorn = event.optLong("supportBorn"),
                         hasPermanent = store.permanent.isNotEmpty(),
                         fingerprint = event.optString("fingerprint"),
                         server = event.optString("server", it.server),

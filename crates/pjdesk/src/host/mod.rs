@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
 use pjdesk_proto::auth::generate_password;
@@ -54,6 +54,12 @@ pub struct HostShared {
     pub id: Mutex<Option<String>>,
     /// The password a controller must enter right now.
     pub password: Mutex<String>,
+    /// Temporary 8-digit support code. Shown with [`Self::support_password`].
+    pub support_code: Mutex<String>,
+    /// Temporary password that matches the support code. Not the permanent one.
+    pub support_password: Mutex<String>,
+    /// Unix time the current support pair was created. 0 until the first pair.
+    pub support_born: AtomicU64,
     /// Name of the controller currently connected, if any.
     pub connected: Mutex<Option<String>>,
     /// Last error worth showing the user (e.g. can't reach the server).
@@ -64,6 +70,8 @@ pub struct HostShared {
     set_password: Mutex<Option<String>>,
     /// UI → host: pick a fresh random password.
     regenerate: AtomicBool,
+    /// UI → host: replace the support code and its temporary password.
+    refresh_support: AtomicBool,
     /// UI → host: stop hosting and return (e.g. the server changed).
     stop: AtomicBool,
     /// A connection waiting for the person at this computer to accept it.
@@ -129,6 +137,18 @@ impl HostShared {
     /// Request a fresh random password.
     pub fn request_regenerate(&self) {
         self.regenerate.store(true, Ordering::SeqCst);
+    }
+    pub fn request_support_refresh(&self) {
+        self.refresh_support.store(true, Ordering::SeqCst);
+    }
+    pub fn support_code(&self) -> String {
+        self.support_code.lock().unwrap().clone()
+    }
+    pub fn support_password(&self) -> String {
+        self.support_password.lock().unwrap().clone()
+    }
+    pub fn support_born(&self) -> u64 {
+        self.support_born.load(Ordering::SeqCst)
     }
     /// Ask the host loop to stop (used before restarting with new settings).
     pub fn request_stop(&self) {
@@ -236,6 +256,12 @@ pub(crate) struct HostState {
     /// An optional permanent password that also authenticates, when the user
     /// has set one. Both this and the one-time password let a controller in.
     permanent: Mutex<Option<String>>,
+    /// Temporary 8-digit code shown as "Let someone connect".
+    support_code: Mutex<String>,
+    /// Temporary password that matches the support code. Not the permanent one.
+    support_password: Mutex<String>,
+    /// When the current support pair was created.
+    support_born: Mutex<Instant>,
     /// An authenticated controller is connected.
     streaming: AtomicBool,
     /// Sessions being set up (not yet authenticated).
@@ -268,8 +294,8 @@ impl HostState {
         }
     }
 
-    /// The passwords a controller may authenticate with: the one-time password
-    /// and, if set, the permanent one (either grants access).
+    /// The passwords a controller may authenticate with: the one-time password,
+    /// the permanent one when set, and the temporary support password.
     fn auth_passwords(&self) -> Vec<String> {
         let mut pws = vec![self.password.lock().unwrap().clone()];
         if let Some(p) = self.permanent.lock().unwrap().clone() {
@@ -277,7 +303,40 @@ impl HostState {
                 pws.push(p);
             }
         }
+        let support = self.support_password.lock().unwrap().clone();
+        if !support.trim().is_empty() && !pws.contains(&support) {
+            pws.push(support);
+        }
         pws
+    }
+
+    /// A new support code and a new temporary password. The permanent password
+    /// is left alone. The digits and the password stay in memory.
+    fn fresh_support(&self) {
+        *self.support_code.lock().unwrap() = pjdesk_proto::random_digits(8);
+        *self.support_password.lock().unwrap() = generate_password();
+        *self.support_born.lock().unwrap() = Instant::now();
+        self.publish_support();
+    }
+
+    fn publish_support(&self) {
+        let Some(shared) = &self.shared else { return };
+        *shared.support_code.lock().unwrap() = self.support_code.lock().unwrap().clone();
+        *shared.support_password.lock().unwrap() = self.support_password.lock().unwrap().clone();
+        let unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        shared.support_born.store(unix, Ordering::SeqCst);
+    }
+
+    /// Replaces a support pair that sat unused for 10 minutes. A live session
+    /// keeps the pair that opened it.
+    fn maybe_expire_support(&self) {
+        if self.streaming.load(Ordering::SeqCst) {
+            return;
+        }
+        let born = *self.support_born.lock().unwrap();
+        if born.elapsed() >= Duration::from_secs(10 * 60) {
+            self.fresh_support();
+        }
     }
 
     /// Applies any password change the UI asked for (regenerate or set).
@@ -296,6 +355,11 @@ impl HostState {
         }
         if changed {
             self.publish_password();
+        }
+        if shared.refresh_support.swap(false, Ordering::SeqCst) {
+            self.fresh_support();
+        } else {
+            self.maybe_expire_support();
         }
     }
 }
@@ -369,6 +433,9 @@ async fn host_main(
         identity: TlsIdentity::generate(PEER_SERVER_NAME)?,
         password: Mutex::new(generate_password()),
         permanent: Mutex::new(args.permanent_password.clone().filter(|p| !p.trim().is_empty())),
+        support_code: Mutex::new(String::new()),
+        support_password: Mutex::new(String::new()),
+        support_born: Mutex::new(Instant::now()),
         streaming: AtomicBool::new(false),
         pending: AtomicUsize::new(0),
         peer_info_routes: Mutex::new(HashMap::new()),
@@ -391,6 +458,7 @@ async fn host_main(
         });
     }
     state.publish_password();
+    state.fresh_support();
 
     let mut delay = Duration::from_secs(2);
     let mut force_refresh = false;
@@ -779,6 +847,7 @@ async fn session_inner(
     };
     let result = stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
     state.streaming.store(false, Ordering::SeqCst);
+    state.fresh_support();
     if let Some(shared) = &state.shared {
         *shared.connected.lock().unwrap() = None;
     }
@@ -901,6 +970,15 @@ async fn open_session(
     controller_ip: &str,
 ) -> Result<(u32, String)> {
     if auth.password_slot != ASK_SLOT {
+        let support = state.support_password.lock().unwrap().clone();
+        if admit::matched_support(passwords, auth.password_slot, Some(support.as_str())) {
+            let policy = state.policy.lock().unwrap().clone();
+            grant_auth(&mut auth.send, &state.name).await?;
+            return Ok((
+                admit::support_open(&policy, state.args.view_only),
+                crate::resolve_receive_dir(&state.args.receive_dir),
+            ));
+        }
         let matched = admit::matched_permanent(passwords, auth.password_slot, permanent);
         let permanent_set = permanent.map(str::trim).is_some_and(|p| !p.is_empty());
         let policy = state.policy.lock().unwrap().clone();

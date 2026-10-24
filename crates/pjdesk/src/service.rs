@@ -559,6 +559,14 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
         );
         status.rtt_ms = shared.rtt_ms();
         status.reach = shared.reach();
+        status.support_code = shared.support_code();
+        status.support_password = shared.support_password();
+        status.support_born_unix = shared.support_born();
+        let refresh = crate::syspaths::service_dir().join("support.refresh");
+        if refresh.is_file() {
+            let _ = std::fs::remove_file(&refresh);
+            shared.request_support_refresh();
+        }
         status.write();
         std::thread::sleep(Duration::from_secs(2));
     }

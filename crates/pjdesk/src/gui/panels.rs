@@ -44,6 +44,11 @@ impl App {
                 }
                 ui.separator();
                 let email = self.cfg.network_email.clone().unwrap_or_default();
+                let signed_in = self.temp.is_some() || !email.trim().is_empty();
+                if signed_in && ui.button("Invite").on_hover_text("Make an 8-digit code someone can use to join your network.").clicked()
+                {
+                    self.open_invite();
+                }
                 if self.temp.is_some() {
                     ui.label(RichText::new("Signed in until you close PJDesk").color(p.warn).size(13.0));
                     if ui.button("Sign out").clicked() {
@@ -89,6 +94,8 @@ impl App {
         let split = desk_split(width);
         if split.stacked {
             ScrollArea::vertical().id_salt("stacked").auto_shrink([false, false]).show(ui, |ui| {
+                self.support_card(ui);
+                ui.add_space(12.0);
                 self.remote(ui);
                 ui.add_space(12.0);
                 self.rail(ui);
@@ -115,6 +122,8 @@ impl App {
         left_ui.set_clip_rect(left_rect);
         ScrollArea::vertical().id_salt("connect-col").auto_shrink([false, false]).show(&mut left_ui, |ui| {
             ui.set_max_width(left_rect.width());
+            self.support_card(ui);
+            ui.add_space(12.0);
             self.remote(ui);
             ui.add_space(12.0);
             self.rail(ui);
@@ -129,6 +138,58 @@ impl App {
         right_ui.set_max_width(right_rect.width());
         self.computer_list(&mut right_ui);
         ui.advance_cursor_after_rect(rect);
+    }
+
+    fn support_card(&mut self, ui: &mut egui::Ui) {
+        let p = theme::paint(ui);
+        let (code, password, id, _) = self.support_view();
+        let online = pjdesk_proto::is_valid_id(&id) && !self.cfg.effective_server().trim().is_empty();
+        theme::card(ui, |ui| {
+            widgets::heading(ui, "LET SOMEONE CONNECT");
+            ui.add_space(4.0);
+            if !online {
+                ui.label(widgets::muted(
+                    ui,
+                    "This computer is not on a network yet, so a support code cannot be used.",
+                ));
+            } else {
+            ui.label(widgets::muted(
+                ui,
+                "Give them this code and the temporary password. They connect without an Allow prompt. This is not the permanent password. This computer still shows who connected. A code lasts about 10 minutes if it is not used, and a new one is made when the session ends.",
+            ));
+            ui.add_space(8.0);
+            match code {
+                Some(code) => {
+                    ui.label(RichText::new(crate::network::group_digits(&code)).size(28.0).strong().monospace().color(p.text));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let shown = match &password {
+                            Some(pw) if self.show_support_password => pw.clone(),
+                            Some(pw) => "•".repeat(pw.chars().count().max(6)),
+                            None => "—".into(),
+                        };
+                        ui.label(RichText::new(shown).size(18.0).monospace().color(p.text));
+                        if password.is_some() {
+                            let eye = if self.show_support_password { Icon::EyeOff } else { Icon::Eye };
+                            let tip = if self.show_support_password { "Hide password" } else { "Show password" };
+                            if widgets::icon_button(ui, eye, tip).clicked() {
+                                self.show_support_password = !self.show_support_password;
+                            }
+                        }
+                        if widgets::icon_button(ui, Icon::Refresh, "New code and password").clicked() {
+                            self.refresh_support_pair();
+                        }
+                    });
+                    ui.label(RichText::new("Temporary password").color(p.muted).size(12.5));
+                }
+                None => {
+                    widgets::spinner(ui, p.muted);
+                    ui.label(RichText::new("Preparing a code").color(p.muted));
+                }
+            }
+            }
+        });
     }
 
     fn rail(&mut self, ui: &mut egui::Ui) {
@@ -212,7 +273,7 @@ impl App {
                     "Paste a network key. This computer is added to your account. This sign-in ends when you close PJDesk."
                 }
                 2 => "Paste a network key from My network or the PJDesk Server window. This computer enrolls and stays signed in after a restart.",
-                1 => "An enrollment code is for one device and expires in an hour.",
+                1 => "Enter an 8-digit code from someone on this network. It works once, lasts one hour, and you do not need a PJDesk account. An older enrollment code still works in this box.",
                 _ => "Your PJDesk account sets the servers for this network. It does not connect you to a computer, and it is not that computer's password.",
             };
             ui.label(widgets::muted(ui, intro));
@@ -260,9 +321,12 @@ impl App {
                     widgets::field_label(ui, "PJDesk account password");
                     widgets::account_password_field(ui, &mut self.net_pass, &mut self.net_show);
                 } else {
-                    widgets::field_label(ui, "Enrollment code");
-                    widgets::text_field(ui, &mut self.net_code, "ABCD-EFGH", true);
-                    ui.label(widgets::muted(ui, "From pjdesk.com → Account → My network. One device, one hour."));
+                    widgets::field_label(ui, "8-digit code");
+                    widgets::text_field(ui, &mut self.net_code, "1234 5678", true);
+                    ui.label(widgets::muted(
+                        ui,
+                        "From Invite on a signed-in PJDesk. One use, one hour. An older enrollment code from pjdesk.com still works here.",
+                    ));
                 }
                 ui.add_space(8.0);
                 widgets::checkbox(
@@ -289,6 +353,8 @@ impl App {
                     "Signing in…"
                 } else if self.net_mode == 2 {
                     "Use network key"
+                } else if self.net_mode == 1 {
+                    "Join"
                 } else {
                     "Sign in"
                 };
@@ -315,7 +381,7 @@ impl App {
                         self.net_offer = false;
                         self.net_login.clear();
                     }
-                    if self.net_mode != 1 && ui.button("I have an enrollment code").clicked() && !self.net_busy {
+                    if self.net_mode != 1 && ui.button("Join with an 8-digit code").clicked() && !self.net_busy {
                         self.net_mode = 1;
                         self.net_error.clear();
                         self.net_offer = false;
@@ -598,6 +664,23 @@ impl App {
             ));
 
             ui.add_space(12.0);
+            widgets::field_label(ui, "Or use their support code");
+            widgets::text_field(ui, &mut self.support_code_in, "1234 5678", true);
+            ui.add_space(6.0);
+            widgets::password_field(ui, &mut self.support_pass_in, "Temporary password", &mut self.support_pass_show);
+            if !self.support_error.is_empty() {
+                ui.colored_label(p.warn, &self.support_error);
+            }
+            let support_label = if self.support_busy { "Connecting…" } else { "Connect with code" };
+            if widgets::accent_button(ui, support_label, Vec2::new(ui.available_width(), 36.0)) && !self.support_busy {
+                self.start_support_connect();
+            }
+            ui.label(widgets::muted(
+                ui,
+                "From Let someone connect on their computer. The code and the temporary password are both required.",
+            ));
+
+            ui.add_space(12.0);
             widgets::field_label(ui, "Or connect directly");
             widgets::text_field(ui, &mut self.direct_addr, "192.168.1.20", false);
             ui.horizontal(|ui| {
@@ -614,6 +697,67 @@ impl App {
                 }
             });
         });
+    }
+
+    pub(super) fn invite_window(&mut self, ctx: &egui::Context) {
+        if !self.show_invite {
+            return;
+        }
+        let mut open = true;
+        let mut create = false;
+        let mut revoke = false;
+        let code = self.join_code.clone();
+        let expires = self.join_expires;
+        let busy = self.join_busy;
+        let error = self.join_error.clone();
+        let has_id = !self.join_id.is_empty();
+        egui::Window::new("Invite someone")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                let p = theme::paint(ui);
+                if !code.is_empty() {
+                    ui.label(RichText::new(crate::network::group_digits(&code)).size(32.0).strong().monospace().color(p.text));
+                    ui.add_space(6.0);
+                    ui.label(format!(
+                        "Expires in {}. One use. They do not need a PJDesk account. They choose Join with an 8-digit code.",
+                        crate::network::remaining_label(expires, super::unix_now())
+                    ));
+                } else if has_id {
+                    ui.label(format!(
+                        "A code is already active and expires in {}. The digits were shown once. Revoke it, or create a new one (that replaces it).",
+                        crate::network::remaining_label(expires, super::unix_now())
+                    ));
+                } else {
+                    ui.label("Create an 8-digit code. It works once, lasts one hour, and the other person does not need a PJDesk account.");
+                }
+                if !error.is_empty() {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.warn, &error);
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let create_label = if busy { "Working…" } else if code.is_empty() && !has_id { "Create code" } else { "Create a new code" };
+                    if ui.add_enabled(!busy, egui::Button::new(create_label)).clicked() {
+                        create = true;
+                    }
+                    if has_id && ui.add_enabled(!busy, egui::Button::new("Revoke")).clicked() {
+                        revoke = true;
+                    }
+                });
+            });
+        if !open {
+            self.show_invite = false;
+        }
+        if create {
+            self.start_invite(super::InviteKind::Create);
+        }
+        if revoke {
+            self.start_invite(super::InviteKind::Revoke);
+        }
     }
 
     pub(super) fn add_book_window(&mut self, ctx: &egui::Context) {

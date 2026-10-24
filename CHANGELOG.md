@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.23
+
+Windows is 0.6.23. Android is 0.6.23 (versionCode 62300). cloud/ changed: migration `0015_join_support.sql` and the worker. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The Rust server binary did not change. Run `cloud\deploy.cmd` before using the codes so the migration and the worker are live. The phone needs 62300. The Windows client needs this build. A 0.6.22 window does not have Invite or Let someone connect.
+
+* Invite: a signed-in PJDesk can create an 8-digit code. It works once, lasts one hour, and can be revoked. The other person chooses Join with an 8-digit code on the sign-in screen and does not need a PJDesk account. Their computer is added to the account. An older enrollment code still works in that same box.
+* Let someone connect: the computer being helped shows an 8-digit code and a temporary password, with Show and Refresh. The helper enters both and connects with no Allow prompt. The code lasts about 10 minutes if it is unused, stays valid during the session, and a new pair is made when the session ends. It is not the permanent password. The computer still shows who connected. On Android, PJDesk does not ask Allow; Android may still ask to share the screen.
+
 ## 0.6.22
 
 Windows is 0.6.22. Android stays 0.6.21 (versionCode 62100). cloud/ did not change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The server binary did not change, so do not run `cloud\deploy.cmd`. The phone does not need this build. The Windows client does: a 0.6.21 window still clips Connect, View phone, and Menu until the window is widened. This machine has no Windows PC attached. The six widths were rendered headlessly.

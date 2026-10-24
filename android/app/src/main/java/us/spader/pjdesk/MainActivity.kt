@@ -59,6 +59,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -219,6 +220,13 @@ class MainActivity : FragmentActivity() {
             var trustedComputers by remember { mutableStateOf(app.store.trustedComputers()) }
             var showOnboarding by remember { mutableStateOf(!app.store.onboarded) }
             var account by remember { mutableStateOf(app.store.networkEmail) }
+            var cloudAccess by remember { mutableStateOf("") }
+            var inviteCode by remember { mutableStateOf("") }
+            var inviteId by remember { mutableStateOf("") }
+            var inviteExpires by remember { mutableLongStateOf(0L) }
+            var inviteBusy by remember { mutableStateOf(false) }
+            var inviteError by remember { mutableStateOf("") }
+            var inviteListed by remember { mutableStateOf(false) }
             var netEmail by remember { mutableStateOf(app.store.networkEmail) }
             var netPass by remember { mutableStateOf("") }
             var netCode by remember { mutableStateOf("") }
@@ -260,6 +268,11 @@ class MainActivity : FragmentActivity() {
                 memoryRefresh = ""
                 app.store.endTemporaryVisit()
                 app.clearVaultKey()
+                cloudAccess = ""
+                inviteCode = ""
+                inviteId = ""
+                inviteExpires = 0
+                inviteListed = false
                 engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", "").toString())
                 account = ""
                 saved = app.store.saved()
@@ -467,6 +480,7 @@ class MainActivity : FragmentActivity() {
                         accountComputers = enrolled.computers
                         enrolledFor = if (pjdeskId.length == 9) pjdeskId else ""
                         rememberAccountServer(enrolled.address, enrolled.fingerprint, enrolled.lan, enrolled.publicIp)
+                        cloudAccess = enrolled.access
                         engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", enrolled.access).toString())
                         account = who
                         signingIn = false
@@ -633,6 +647,7 @@ class MainActivity : FragmentActivity() {
                                 return@launch
                             }
                             rememberAccountServer(fetched.address, fetched.fingerprint, fetched.lan, fetched.publicIp)
+                            cloudAccess = fetched.access
                             engine.command(JSONObject().put("cmd", "accessToken").put("token", fetched.access).toString())
                             beginConnect(rawId, ignoreOffline)
                         }
@@ -715,6 +730,29 @@ class MainActivity : FragmentActivity() {
             var controlEnabled by remember { mutableStateOf(PjAccessibilityService.enabled(this@MainActivity)) }
             var controlBound by remember { mutableStateOf(RemoteControl.service != null) }
             var controlDismissed by remember { mutableStateOf(false) }
+            LaunchedEffect(state.supportCode, state.id) {
+                val code = state.supportCode
+                val id = state.id
+                if (code.length != 8 || id.length != 9) return@LaunchedEffect
+                while (true) {
+                    withContext(Dispatchers.IO) {
+                        runCatching { us.spader.pjdesk.core.CloudAuth.offerSupport(code, id) }
+                    }
+                    delay(4 * 60 * 1000L)
+                }
+            }
+            LaunchedEffect(account, cloudAccess) {
+                if (inviteListed || account.isBlank() || cloudAccess.isBlank()) return@LaunchedEffect
+                inviteListed = true
+                val listed = withContext(Dispatchers.IO) {
+                    runCatching { us.spader.pjdesk.core.CloudAuth.listJoinCodes(cloudAccess) }.getOrNull()
+                }
+                val first = listed?.firstOrNull() ?: return@LaunchedEffect
+                if (inviteCode.isEmpty()) {
+                    inviteId = first.id
+                    inviteExpires = first.expiresAt
+                }
+            }
             LaunchedEffect(Unit) {
                 // The service connection is what changes control. This only refreshes
                 // the screen, and tells the engine when that value actually changes.
@@ -796,6 +834,7 @@ class MainActivity : FragmentActivity() {
                     }
                     return@LaunchedEffect
                 }
+                cloudAccess = session.access
                 engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
                 if (!temporarySession) {
                     rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp)
@@ -1085,6 +1124,7 @@ class MainActivity : FragmentActivity() {
                             netEmail = who
                             if (signed.refresh.isNotBlank()) app.store.saveNetworkRefresh(signed.refresh)
                             rememberAccountServer(signed.address, signed.fingerprint, signed.lan, signed.publicIp)
+                            cloudAccess = signed.access
                             engine.command(JSONObject().put("cmd", "accessToken").put("token", signed.access).toString())
                             commitAutofill()
                         }
@@ -1146,6 +1186,7 @@ class MainActivity : FragmentActivity() {
                         netEmail = who
                         if (signed.refresh.isNotBlank()) app.store.saveNetworkRefresh(signed.refresh)
                         rememberAccountServer(signed.address, signed.fingerprint, signed.lan, signed.publicIp)
+                        cloudAccess = signed.access
                         engine.command(JSONObject().put("cmd", "accessToken").put("token", signed.access).toString())
                         app.store.clearPinMaterial()
                         BioVault.forget()
@@ -1498,6 +1539,66 @@ class MainActivity : FragmentActivity() {
                                     temporary = temporarySession,
                                     recent = saved.filter { recentIds.contains(it.id) }.take(3),
                                     onRecent = { beginConnect(it) },
+                                    onRefreshSupport = { engine.refreshSupport() },
+                                    onSupportConnect = { code, password ->
+                                        if (code.length != 8 || password.isBlank()) {
+                                            scope.launch { snackbar.showSnackbar("Enter the 8-digit code and the temporary password.") }
+                                        } else {
+                                            scope.launch {
+                                                val found = withContext(Dispatchers.IO) {
+                                                    runCatching { us.spader.pjdesk.core.CloudAuth.lookupSupport(code) }
+                                                }
+                                                found.onSuccess { id -> launchConnect(id, "", password) }
+                                                    .onFailure { snackbar.showSnackbar(it.message ?: "That code is not valid.") }
+                                            }
+                                        }
+                                    },
+                                    inviteCode = inviteCode,
+                                    inviteExpiresAt = inviteExpires,
+                                    inviteId = inviteId,
+                                    inviteBusy = inviteBusy,
+                                    inviteError = inviteError,
+                                    onCreateInvite = {
+                                        val token = cloudAccess
+                                        if (token.isBlank()) {
+                                            inviteError = "Sign in again."
+                                        } else {
+                                            inviteBusy = true
+                                            inviteError = ""
+                                            scope.launch {
+                                                val result = withContext(Dispatchers.IO) {
+                                                    runCatching { us.spader.pjdesk.core.CloudAuth.createJoinCode(token) }
+                                                }
+                                                inviteBusy = false
+                                                result.onSuccess {
+                                                    inviteCode = it.code
+                                                    inviteId = it.id
+                                                    inviteExpires = it.expiresAt
+                                                }.onFailure { inviteError = it.message ?: "Could not create a code." }
+                                            }
+                                        }
+                                    },
+                                    onRevokeInvite = {
+                                        val token = cloudAccess
+                                        val id = inviteId
+                                        if (token.isBlank() || id.isBlank()) {
+                                            inviteError = "Sign in again."
+                                        } else {
+                                            inviteBusy = true
+                                            inviteError = ""
+                                            scope.launch {
+                                                val result = withContext(Dispatchers.IO) {
+                                                    runCatching { us.spader.pjdesk.core.CloudAuth.revokeJoinCode(token, id) }
+                                                }
+                                                inviteBusy = false
+                                                result.onSuccess {
+                                                    inviteCode = ""
+                                                    inviteId = ""
+                                                    inviteExpires = 0
+                                                }.onFailure { inviteError = it.message ?: "Could not revoke the code." }
+                                            }
+                                        }
+                                    },
                                 )
                                 1 -> SavedScreen(
                                     signedIn = account.isNotEmpty(),
@@ -1640,6 +1741,11 @@ class MainActivity : FragmentActivity() {
                                                 app.store.networkEmail = ""
                                                 app.store.saveNetworkRefresh("")
                                                 app.lockUi()
+                                                cloudAccess = ""
+                                                inviteCode = ""
+                                                inviteId = ""
+                                                inviteExpires = 0
+                                                inviteListed = false
                                                 engine.command(JSONObject().put("cmd", "accessToken").put("token", "").toString())
                                                 account = ""
                                             }
@@ -1940,6 +2046,12 @@ class MainActivity : FragmentActivity() {
         AppLog.i("main activity destroyed finishing=$isFinishing task=$taskId")
         if (isFinishing && !isChangingConfigurations && app.engine.state.value.session != null) {
             app.engine.stopView("closed")
+        }
+        if (isFinishing && !isChangingConfigurations) {
+            val desk = app.engine.state.value
+            Thread {
+                us.spader.pjdesk.core.CloudAuth.revokeSupport(desk.supportCode, desk.id)
+            }.start()
         }
         if (isFinishing) {
             decoder?.stop()

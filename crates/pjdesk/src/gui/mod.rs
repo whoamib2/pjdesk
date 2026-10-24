@@ -306,6 +306,34 @@ pub struct App {
     logo: Option<egui::TextureHandle>,
     really_quit: bool,
     told_tray: bool,
+    /// Show toggle for the support password. Separate from the one-time password.
+    show_support_password: bool,
+    support_code_in: String,
+    support_pass_in: String,
+    support_pass_show: bool,
+    support_busy: bool,
+    support_error: String,
+    support_rx: Option<Receiver<Result<(String, String), String>>>,
+    /// Last support code pjdesk.com accepted. Empty until that succeeds.
+    published_code: String,
+    published_id: String,
+    published_at: Instant,
+    offer_retry: Instant,
+    offer_rx: Option<Receiver<Result<(String, String), String>>>,
+    show_invite: bool,
+    join_id: String,
+    join_code: String,
+    join_expires: u64,
+    join_busy: bool,
+    join_error: String,
+    join_rx: Option<Receiver<InviteMsg>>,
+}
+
+enum InviteMsg {
+    Ready(crate::network::JoinCode),
+    Active(crate::network::JoinCode),
+    Clear,
+    Failed(String),
 }
 
 impl App {
@@ -428,6 +456,25 @@ impl App {
             )),
             really_quit: false,
             told_tray: false,
+            show_support_password: false,
+            support_code_in: String::new(),
+            support_pass_in: String::new(),
+            support_pass_show: false,
+            support_busy: false,
+            support_error: String::new(),
+            support_rx: None,
+            published_code: String::new(),
+            published_id: String::new(),
+            published_at: Instant::now(),
+            offer_retry: Instant::now(),
+            offer_rx: None,
+            show_invite: false,
+            join_id: String::new(),
+            join_code: String::new(),
+            join_expires: 0,
+            join_busy: false,
+            join_error: String::new(),
+            join_rx: None,
         };
         if app.cfg.account.is_some() {
             app.start_token_refresh();
@@ -451,6 +498,9 @@ impl App {
             rtt_ms: 18,
             reach: "Internet".into(),
             updated_unix: unix_now(),
+            support_code: "12345678".into(),
+            support_password: "temp-pass".into(),
+            support_born_unix: unix_now(),
         };
         self.connect_id = "123 456 789".into();
         self.cfg.server = Some("office.example:21200".into());
@@ -2174,8 +2224,268 @@ fn last_session_reason() -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+impl App {
+    /// Code, temporary password, this computer's ID, and whether this process
+    /// is hosting (the service hosts otherwise).
+    fn support_view(&self) -> (Option<String>, Option<String>, String, bool) {
+        let id = self.visible_id();
+        if self.engine.service_running {
+            let code = self.svc_status.support_code.clone();
+            let password = self.svc_status.support_password.clone();
+            (
+                (!code.is_empty()).then_some(code),
+                (!password.is_empty()).then_some(password),
+                id,
+                false,
+            )
+        } else {
+            let code = self.engine.shared.support_code();
+            let password = self.engine.shared.support_password();
+            (
+                (!code.is_empty()).then_some(code),
+                (!password.is_empty()).then_some(password),
+                id,
+                true,
+            )
+        }
+    }
+
+    fn refresh_support_pair(&mut self) {
+        if self.engine.service_running {
+            let path = crate::syspaths::service_dir().join("support.refresh");
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, b"1\n");
+        } else {
+            self.engine.shared.request_support_refresh();
+        }
+        self.toast.show("New support code");
+    }
+
+    fn poll_support_offer(&mut self) {
+        if let Some(rx) = &self.offer_rx {
+            match rx.try_recv() {
+                Ok(Ok((code, id))) => {
+                    self.offer_rx = None;
+                    self.published_code = code;
+                    self.published_id = id;
+                    self.published_at = Instant::now();
+                }
+                Ok(Err(_)) => {
+                    self.offer_rx = None;
+                    self.offer_retry = Instant::now() + Duration::from_secs(30);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.offer_rx = None;
+                    self.offer_retry = Instant::now() + Duration::from_secs(30);
+                }
+            }
+        }
+        if Instant::now() < self.offer_retry || self.offer_rx.is_some() {
+            return;
+        }
+        let (code, _, id, _) = self.support_view();
+        let Some(code) = code.filter(|code| code.len() == 8) else { return };
+        if !pjdesk_proto::is_valid_id(&id) {
+            return;
+        }
+        let stale = self.published_at.elapsed() >= Duration::from_secs(4 * 60);
+        if self.published_code == code && self.published_id == id && !stale {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.offer_rx = Some(rx);
+        let send_code = code.clone();
+        let send_id = id.clone();
+        let spawned = std::thread::Builder::new()
+            .name("support-offer".into())
+            .spawn(move || {
+                let result = crate::network::offer_support(&send_code, &send_id)
+                    .map(|_| (send_code, send_id))
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            });
+        if spawned.is_err() {
+            self.offer_rx = None;
+            self.offer_retry = Instant::now() + Duration::from_secs(30);
+        }
+    }
+
+    fn revoke_published_support(&mut self) {
+        let code = if self.published_code.len() == 8 {
+            self.published_code.clone()
+        } else {
+            return;
+        };
+        let id = self.published_id.clone();
+        self.published_code.clear();
+        self.published_id.clear();
+        let _ = crate::network::revoke_support(&code, &id);
+    }
+
+    fn start_support_connect(&mut self) {
+        if self.support_busy {
+            return;
+        }
+        let code = self.support_code_in.clone();
+        let password = self.support_pass_in.trim().to_string();
+        let digits: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() != 8 || password.is_empty() {
+            self.support_error = "Enter the 8-digit code and the temporary password.".into();
+            return;
+        }
+        self.support_busy = true;
+        self.support_error.clear();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.support_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("support-lookup".into())
+            .spawn(move || {
+                let result = crate::network::lookup_support(&digits)
+                    .map(|id| (id, password))
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            })
+            .ok();
+    }
+
+    fn poll_support_connect(&mut self) {
+        let Some(rx) = &self.support_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((id, password))) => {
+                self.support_rx = None;
+                self.support_busy = false;
+                self.connect_with_typed(&id, &password);
+            }
+            Ok(Err(message)) => {
+                self.support_rx = None;
+                self.support_busy = false;
+                self.support_error = message;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.support_rx = None;
+                self.support_busy = false;
+                self.support_error = "Could not reach pjdesk.com.".into();
+            }
+        }
+    }
+
+    /// Connects with a password typed for this attempt. It is not saved.
+    fn connect_with_typed(&mut self, id: &str, password: &str) {
+        let id = normalize_id(id);
+        if !pjdesk_proto::is_valid_id(&id) {
+            self.status = "That isn't a 9-digit PJDesk ID.".into();
+            return;
+        }
+        self.status = format!("Connecting to {}", format_id(&id));
+        self.spawn_viewer(&id, password, false, false, false);
+    }
+
+    fn open_invite(&mut self) {
+        self.show_invite = true;
+        self.join_error.clear();
+        if self.join_code.is_empty() && self.join_rx.is_none() {
+            self.start_invite(InviteKind::List);
+        }
+    }
+
+    fn start_invite(&mut self, kind: InviteKind) {
+        if self.join_busy {
+            return;
+        }
+        let id = self.join_id.clone();
+        let mut cfg = self.cfg.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.join_rx = Some(rx);
+        self.join_busy = true;
+        self.join_error.clear();
+        std::thread::Builder::new()
+            .name("invite-code".into())
+            .spawn(move || {
+                crate::network::refresh_config(&mut cfg);
+                let token = cfg.network_access_token();
+                let msg = match kind {
+                    InviteKind::Create => match crate::network::create_join_code(&token) {
+                        Ok(code) => InviteMsg::Ready(code),
+                        Err(e) => InviteMsg::Failed(e.to_string()),
+                    },
+                    InviteKind::List => match crate::network::list_join_codes(&token) {
+                        Ok(codes) => match codes.into_iter().next() {
+                            Some(code) => InviteMsg::Active(code),
+                            None => InviteMsg::Clear,
+                        },
+                        Err(e) => InviteMsg::Failed(e.to_string()),
+                    },
+                    InviteKind::Revoke => match crate::network::revoke_join_code(&token, &id) {
+                        Ok(()) => InviteMsg::Clear,
+                        Err(e) => InviteMsg::Failed(e.to_string()),
+                    },
+                };
+                let _ = tx.send(msg);
+            })
+            .ok();
+    }
+
+    fn poll_invite(&mut self) {
+        let Some(rx) = &self.join_rx else { return };
+        match rx.try_recv() {
+            Ok(InviteMsg::Ready(code)) => {
+                self.join_rx = None;
+                self.join_busy = false;
+                self.join_id = code.id;
+                self.join_code = code.code;
+                self.join_expires = code.expires_at;
+            }
+            Ok(InviteMsg::Active(code)) => {
+                self.join_rx = None;
+                self.join_busy = false;
+                if self.join_code.is_empty() {
+                    self.join_id = code.id;
+                    self.join_expires = code.expires_at;
+                }
+            }
+            Ok(InviteMsg::Clear) => {
+                self.join_rx = None;
+                self.join_busy = false;
+                self.join_id.clear();
+                self.join_code.clear();
+                self.join_expires = 0;
+            }
+            Ok(InviteMsg::Failed(message)) => {
+                self.join_rx = None;
+                self.join_busy = false;
+                self.join_error = message;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.join_rx = None;
+                self.join_busy = false;
+            }
+        }
+    }
+}
+
+enum InviteKind {
+    Create,
+    List,
+    Revoke,
+}
+
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
+        if self.engine.service_running {
+            let path = crate::syspaths::service_dir().join("support.refresh");
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, b"1\n");
+        } else {
+            self.engine.shared.request_support_refresh();
+        }
+        self.revoke_published_support();
         self.end_temporary_sign_in();
     }
 
@@ -2196,6 +2506,9 @@ impl eframe::App for App {
         self.poll_session_status();
         self.poll_viewers();
         self.poll_client_update();
+        self.poll_support_offer();
+        self.poll_support_connect();
+        self.poll_invite();
         self.notice_sign_in_paste(&ctx);
 
         if ctx
@@ -2264,6 +2577,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.body(ui));
 
         self.settings_window(&ctx);
+        self.invite_window(&ctx);
         self.session_error_dialog(&ctx);
         self.temporary_warning(&ctx);
         self.import_prompt(&ctx);

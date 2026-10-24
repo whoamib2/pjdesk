@@ -180,6 +180,67 @@ object CloudAuth {
         JSONObject(text).optString("ip").trim()
     }.getOrDefault("")
 
+    fun createJoinCode(token: String): JoinCode {
+        val reply = post("$API/api/network/join-code", token, JSONObject())
+        val code = reply.optString("code").filter { it.isDigit() }
+        val id = reply.optString("id")
+        if (!id.startsWith("jnc_") || code.length != 8) throw CloudAuthException("PJDesk did not return a code.")
+        return JoinCode(id, code, reply.optLong("expires_at"))
+    }
+
+    fun listJoinCodes(token: String): List<JoinCode> {
+        val reply = get("$API/api/network/join-code", token)
+        val array = reply.optJSONArray("codes") ?: return emptyList()
+        val out = ArrayList<JoinCode>(array.length())
+        for (i in 0 until array.length()) {
+            val item = array.optJSONObject(i) ?: continue
+            out.add(JoinCode(item.optString("id"), "", item.optLong("expires_at")))
+        }
+        return out
+    }
+
+    fun revokeJoinCode(token: String, id: String) {
+        post("$API/api/network/join-code/revoke", token, JSONObject().put("id", id))
+    }
+
+    fun offerSupport(code: String, pjdeskId: String) {
+        val digits = code.filter { it.isDigit() }
+        val id = pjdeskId.filter { it.isDigit() }
+        if (digits.length != 8 || id.length != 9) throw CloudAuthException("This phone is not online yet, so a support code cannot be used.")
+        post(
+            "$API/api/support/offer",
+            null,
+            JSONObject().put("code_hash", sha256Hex(digits)).put("pjdesk_id", id),
+        )
+    }
+
+    fun revokeSupport(code: String, pjdeskId: String) {
+        val digits = code.filter { it.isDigit() }
+        val id = pjdeskId.filter { it.isDigit() }
+        if (digits.length != 8 || id.length != 9) return
+        runCatching {
+            post(
+                "$API/api/support/revoke",
+                null,
+                JSONObject().put("code_hash", sha256Hex(digits)).put("pjdesk_id", id),
+            )
+        }
+    }
+
+    fun lookupSupport(code: String): String {
+        val digits = code.filter { it.isDigit() }
+        if (digits.length != 8) throw CloudAuthException("Enter the 8-digit code.")
+        val reply = post("$API/api/support/lookup", null, JSONObject().put("code", digits))
+        val id = reply.optString("id").filter { it.isDigit() }
+        if (id.length != 9) throw CloudAuthException("That code is not valid.")
+        return id
+    }
+
+    fun sha256Hex(text: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
     fun enroll(code: String, deviceId: String, deviceName: String): Session {
         val reply = post(
             "$API/api/network/enroll",
@@ -342,6 +403,22 @@ object CloudAuth {
         return merged
     }
 
+    private fun get(url: String, bearer: String): JSONObject {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 25_000
+            readTimeout = 25_000
+            setRequestProperty("Authorization", "Bearer $bearer")
+        }
+        val code = conn.responseCode
+        val text = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText().orEmpty()
+        if (code !in 200..299) {
+            val parsed = runCatching { JSONObject(text) }.getOrNull()
+            throw CloudAuthException(parsed?.optString("error").orEmpty().ifBlank { "Could not sign in ($code)." })
+        }
+        return JSONObject(text)
+    }
+
     private fun post(url: String, bearer: String?, body: JSONObject): JSONObject {
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
@@ -373,6 +450,12 @@ class CloudAuthException(
     val role: String = "",
     val loginToken: String = "",
 ) : Exception(message)
+
+data class JoinCode(
+    val id: String,
+    val code: String,
+    val expiresAt: Long,
+)
 
 data class Session(
     val email: String,

@@ -19,10 +19,14 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.AnnotatedString
@@ -62,8 +66,29 @@ fun HomeScreen(
     controlEnabled: Boolean = true,
     controlBound: Boolean = true,
     onOpenControl: () -> Unit = {},
+    onRefreshSupport: () -> Unit = {},
+    onSupportConnect: (String, String) -> Unit = { _, _ -> },
+    inviteCode: String = "",
+    inviteExpiresAt: Long = 0,
+    inviteId: String = "",
+    inviteBusy: Boolean = false,
+    inviteError: String = "",
+    onCreateInvite: () -> Unit = {},
+    onRevokeInvite: () -> Unit = {},
 ) {
     var showPassword by rememberSaveable { mutableStateOf(false) }
+    var showSupport by rememberSaveable { mutableStateOf(false) }
+    var helpCode by rememberSaveable { mutableStateOf("") }
+    var helpPass by rememberSaveable { mutableStateOf("") }
+    var helpShow by rememberSaveable { mutableStateOf(false) }
+    var inviteOpen by rememberSaveable { mutableStateOf(false) }
+    var tick by remember { mutableLongStateOf(System.currentTimeMillis() / 1000) }
+    LaunchedEffect(inviteOpen) {
+        while (inviteOpen) {
+            tick = System.currentTimeMillis() / 1000
+            delay(1000)
+        }
+    }
     val starting = state.status.startsWith("Starting PJDesk") ||
         state.status.startsWith("Connecting") ||
         state.status.startsWith("Getting your PJDesk server")
@@ -114,6 +139,82 @@ fun HomeScreen(
             }
         }
         Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Let someone connect", style = MaterialTheme.typography.titleMedium)
+                if (state.server.isBlank() || state.id.length != 9) {
+                    Text("This phone is not on a network yet, so a support code cannot be used.", color = pjMuted())
+                } else if (state.supportCode.length == 8) {
+                    Text(
+                        state.supportCode.chunked(4).joinToString(" "),
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (showSupport) state.supportPassword.ifBlank { "—" }
+                            else "•".repeat(state.supportPassword.length.coerceAtLeast(8)),
+                            modifier = Modifier.weight(1f),
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 1,
+                        )
+                        IconButton(onClick = { showSupport = !showSupport }, enabled = state.supportPassword.isNotEmpty()) {
+                            Glyph(if (showSupport) "hide" else "show")
+                        }
+                        IconButton(onClick = onRefreshSupport) { Glyph("refresh") }
+                    }
+                    Text("Temporary password", color = pjMuted(), style = MaterialTheme.typography.labelMedium)
+                    Text(
+                        "About 10 minutes if unused, then a new code. This is not the permanent password. PJDesk will not ask Allow. Android may still ask to share the screen. This phone still shows who connected.",
+                        color = pjMuted(),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                } else {
+                    Text("Preparing a code", color = pjMuted())
+                }
+            }
+        }
+        if (accountEmail.isNotBlank()) {
+            OutlinedButton(onClick = { inviteOpen = !inviteOpen }, modifier = Modifier.fillMaxWidth()) {
+                Text(if (inviteOpen) "Hide invite" else "Invite someone")
+            }
+            if (inviteOpen) {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (inviteCode.length == 8) {
+                            Text(
+                                inviteCode.chunked(4).joinToString(" "),
+                                style = MaterialTheme.typography.headlineMedium,
+                                fontFamily = FontFamily.Monospace,
+                            )
+                            Text(
+                                "Expires in ${inviteLeft(inviteExpiresAt, tick)}. One use. They do not need a PJDesk account.",
+                                color = pjMuted(),
+                            )
+                        } else if (inviteId.isNotBlank()) {
+                            Text(
+                                "A code is already active and expires in ${inviteLeft(inviteExpiresAt, tick)}. The digits were shown once.",
+                                color = pjMuted(),
+                            )
+                        } else {
+                            Text(
+                                "Create an 8-digit code. It works once, lasts one hour, and the other person does not need a PJDesk account.",
+                                color = pjMuted(),
+                            )
+                        }
+                        if (inviteError.isNotBlank()) Text(inviteError, color = MaterialTheme.colorScheme.error)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = onCreateInvite, enabled = !inviteBusy) {
+                                Text(if (inviteCode.isEmpty() && inviteId.isEmpty()) "Create code" else "Create a new code")
+                            }
+                            if (inviteId.isNotBlank()) {
+                                OutlinedButton(onClick = onRevokeInvite, enabled = !inviteBusy) { Text("Revoke") }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Your ID", color = pjMuted(), style = MaterialTheme.typography.labelMedium, modifier = Modifier.weight(1f))
@@ -154,6 +255,30 @@ fun HomeScreen(
             )
             Button(onClick = onConnect, modifier = Modifier.widthIn(min = 108.dp)) { Text("Connect") }
         }
+        OutlinedTextField(
+            value = helpCode.filter { it.isDigit() }.take(8),
+            onValueChange = { helpCode = it.filter { ch -> ch.isDigit() }.take(8) },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Their support code") },
+            placeholder = { Text("1234 5678") },
+            textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace),
+        )
+        OutlinedTextField(
+            value = helpPass,
+            onValueChange = { helpPass = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Temporary password") },
+            visualTransformation = if (helpShow) VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
+            trailingIcon = {
+                IconButton(onClick = { helpShow = !helpShow }) { Glyph(if (helpShow) "hide" else "show") }
+            },
+        )
+        OutlinedButton(
+            onClick = { onSupportConnect(helpCode.filter { it.isDigit() }.take(8), helpPass) },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Connect with code") }
         if (recent.isNotEmpty()) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 recent.take(3).forEach { computer ->
@@ -168,6 +293,15 @@ fun HomeScreen(
             }
         }
     }
+}
+
+private fun inviteLeft(expiresAt: Long, now: Long): String {
+    if (expiresAt <= now) return "0 s"
+    val left = expiresAt - now
+    val hours = left / 3600
+    val mins = (left % 3600) / 60
+    val secs = left % 60
+    return if (hours > 0) "$hours h $mins min" else if (mins > 0) "$mins min $secs s" else "$secs s"
 }
 
 @Composable

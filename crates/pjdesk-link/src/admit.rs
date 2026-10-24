@@ -44,6 +44,19 @@ pub fn matched_permanent(passwords: &[String], slot: u8, permanent: Option<&str>
     passwords.get(slot as usize).is_some_and(|pw| pw == permanent)
 }
 
+/// The quick-support password is a third slot. It is not the permanent password.
+pub fn matched_support(passwords: &[String], slot: u8, support: Option<&str>) -> bool {
+    let Some(support) = support.map(str::trim).filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    passwords.get(slot as usize).is_some_and(|pw| pw == support)
+}
+
+/// Permission bits for a support-code session. The person is not asked.
+pub fn support_open(policy: &Policy, view_only: bool) -> u32 {
+    grant(perms::UNATTENDED_DEFAULT | perms::FILE, policy.max_permissions, view_only)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +86,19 @@ mod tests {
         let mut forced = policy.clone();
         forced.force_prompt = true;
         assert!(matches!(after_password("unattended", true, true, &forced, false), Admit::Ask));
+    }
+
+    #[test]
+    fn a_support_password_opens_without_asking_and_is_not_the_permanent_password() {
+        let passwords = vec!["once".into(), "permanent-secret".into(), "support-temp".into()];
+        assert!(matched_support(&passwords, 2, Some("support-temp")));
+        assert!(!matched_support(&passwords, 0, Some("support-temp")));
+        assert!(!matched_support(&passwords, 1, Some("support-temp")));
+        assert!(!matched_permanent(&passwords, 2, Some("permanent-secret")));
+        let policy = Policy::default();
+        assert!(perms::has(support_open(&policy, false), perms::FILE));
+        assert!(!perms::has(support_open(&policy, true), perms::FILE));
+        assert!(matches!(after_password("prompt", false, true, &policy, false), Admit::Ask));
     }
 
     #[test]
