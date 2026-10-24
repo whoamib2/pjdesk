@@ -69,8 +69,15 @@ class PjAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // The consent watch polls on its own. Driving it from these events made
-        // the deadline depend on how chatty the dialog was.
+        if (event == null || !ProjectionConsent.armed) return
+        val type = event.eventType
+        val stateChanged = type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        val windowsChanged = type == AccessibilityEvent.TYPE_WINDOWS_CHANGED
+        if (!stateChanged && !windowsChanged) return
+        val pkg = event.packageName?.toString().orEmpty()
+        if (stateChanged && pkg != ProjectionConsent.SYSTEM_UI) return
+        if (stateChanged) AppLog.i("consent watch saw $pkg")
+        ConsentWatcher.nudge()
     }
 
     fun collectConsent(): List<ConsentNode> {
@@ -121,14 +128,22 @@ class PjAccessibilityService : AccessibilityService() {
         }.getOrDefault(false)
     }
 
+    /**
+     * Every window from [getWindows], with the active window's root first.
+     * [rootInActiveWindow] is null for the system share dialog, so it is not read.
+     */
     private fun snapshot(): List<ConsentNode> {
         releaseNodes()
         val nodes = ArrayList<ConsentNode>()
-        val open = this.windows ?: return nodes
-        for (window in open) {
+        val open = windows ?: return nodes
+        val activeId = open.firstOrNull { it.isActive }?.id
+        val ordered = open.sortedByDescending { it.id == activeId }
+        val seen = HashSet<Int>()
+        for (window in ordered) {
             heldWindows.add(window)
-            val root = window.root
-            if (root != null) append(root, windowClass(window), nodes)
+            if (!seen.add(window.id)) continue
+            val root = window.root ?: continue
+            append(root, windowLabel(window, root), nodes)
         }
         return nodes
     }
@@ -172,8 +187,11 @@ class PjAccessibilityService : AccessibilityService() {
         children.forEach { append(it, windowClass, nodes) }
     }
 
-    private fun windowClass(window: AccessibilityWindowInfo): String {
-        return window.title?.toString().orEmpty()
+    private fun windowLabel(window: AccessibilityWindowInfo, root: AccessibilityNodeInfo): String {
+        val pkg = root.packageName?.toString().orEmpty()
+        val cls = root.className?.toString().orEmpty()
+        val title = window.title?.toString().orEmpty()
+        return listOf(pkg, cls, title).filter { it.isNotBlank() }.distinct().joinToString(" ")
     }
 
     override fun onInterrupt() {}

@@ -1732,7 +1732,20 @@ impl ApplicationHandler<UserEvent> for App {
         };
         info!("Viewer window is open");
         self.hook_drops(&window);
-        crate::note_status("Viewer window is open. Waiting for the picture.");
+        let waiting = self
+            .live
+            .lock()
+            .unwrap()
+            .notices
+            .iter()
+            .rev()
+            .find(|note| super::controls::screen_share_waiting(note))
+            .cloned();
+        if let Some(text) = waiting {
+            crate::note_status(&text);
+        } else {
+            crate::note_status("Viewer window is open. Waiting for the picture.");
+        }
         self.window_shown.store(true, Ordering::SeqCst);
         window.focus_window();
         window.request_user_attention(Some(UserAttentionType::Critical));

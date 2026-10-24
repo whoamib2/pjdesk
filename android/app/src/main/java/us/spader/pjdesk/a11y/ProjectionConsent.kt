@@ -98,13 +98,15 @@ object ProjectionConsent {
     fun takeAutomatic(): Boolean {
         val on = automatic
         automatic = false
-        armed = false
+        // The visitor card arrives before the system dialog. Clearing the watch
+        // here is what stopped the poll 50 ms before that dialog existed.
         return on
     }
 
     fun reset() {
         armed = false
         automatic = false
+        HostService.preferAutoClick = false
         ConsentWatcher.stop()
     }
 

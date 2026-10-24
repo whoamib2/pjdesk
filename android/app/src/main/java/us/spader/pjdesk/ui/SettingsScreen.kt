@@ -242,7 +242,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.20", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.21", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }

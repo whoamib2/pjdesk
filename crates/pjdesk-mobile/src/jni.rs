@@ -124,6 +124,18 @@ pub extern "system" fn Java_us_spader_pjdesk_core_Native_nativeCommand(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_us_spader_pjdesk_core_Native_nativeHostAttached(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jboolean {
+    if handle == 0 {
+        return 0;
+    }
+    if engine(handle).host_attached() { 1 } else { 0 }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_us_spader_pjdesk_core_Native_nativeSubmitVideo(
     env: JNIEnv,
     _class: JClass,

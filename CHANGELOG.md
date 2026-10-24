@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.21
+
+Windows is 0.6.21. Android is 0.6.21 (versionCode 62100). cloud/ did not change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The server binary did not change, so do not run `cloud\deploy.cmd`. The phone needs 62100. The Windows viewer needs this build for the 60 second screen-share wait. This machine has no Pixel attached, so 0.6.21 was not run on the device.
+
+* The 0.6.20 Pixel test (accessibility on, keyguard off) showed the share prompt and kept the host up for 60 seconds. The consent watch logged one poll about 50 ms before MediaProjectionPermissionActivity launched and then stopped, so nothing tapped Share screen. The visitor card had cleared the watch. The watch now stays up until the dialog is tapped or 50 seconds pass. A system-window change from SystemUI polls immediately. The deadline is the clock, so those events do not use it up. The dialog is read from getWindows(), active window first. rootInActiveWindow is not used, because it is null for that dialog. The service XML now asks for windows-changed events, so this update turns the accessibility service off again. The "Control is off, tap to turn on" notice is still how it is turned back on. PJDesk still does not write accessibility secure settings.
+* The PC viewer gave up after about 20 seconds with "No picture from the host: the host never opened the video stream" while the phone was still waiting. QUIC does not announce a stream until the phone writes a frame, and the frame waits for consent. The viewer now waits the full minute and shows "Waiting for the phone to allow screen sharing".
+* After the viewer was killed, Back dismissed the prompt and capture still started, leaving a MediaProjection with nobody watching. A consent result after the session has ended is stopped immediately and is not encoded. The projection also stops when the last viewer disconnects.
+
 ## 0.6.20
 
 Windows is 0.6.20. Android is 0.6.20 (versionCode 62000). cloud/ did not change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. The server binary did not change, so do not run `cloud\deploy.cmd`. The phone needs 62000. The Windows viewer code did not change; a build from this tree reports 0.6.20.

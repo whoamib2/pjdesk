@@ -793,6 +793,18 @@ pub(crate) fn picture_limit_secs(notices: &[String]) -> u64 {
     }
 }
 
+/// How long to wait for the host to open the video stream. QUIC does not tell
+/// the viewer the stream exists until the host writes a frame, and the phone
+/// writes that frame only after screen-share consent. A phone that is still
+/// asking gets the same minute. Anything else stays at 20 seconds.
+pub(crate) fn video_open_limit_secs(notices: &[String]) -> u64 {
+    if notices.iter().any(|note| screen_share_waiting(note)) {
+        60
+    } else {
+        20
+    }
+}
+
 /// The line the main window shows when no frame arrived.
 pub(crate) fn picture_gave_up(host: &str, notices: &[String]) -> String {
     if let Some(reason) = notices.iter().rev().find(|note| screen_share_failure_text(note)) {
@@ -807,27 +819,47 @@ pub(crate) fn picture_gave_up(host: &str, notices: &[String]) -> String {
     )
 }
 
+/// Wait until the host writes on a uni stream, or until the consent minute ends.
+/// The limit is re-read so "Waiting for the phone to allow screen sharing"
+/// extends a wait that started at 20 seconds.
+async fn await_video_stream(connection: &Connection, live: &Arc<Mutex<Live>>) -> Result<quinn::RecvStream, String> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let notices = live.lock().unwrap().notices.clone();
+        let limit = Duration::from_secs(video_open_limit_secs(&notices));
+        let elapsed = started.elapsed();
+        if elapsed >= limit {
+            if notices.iter().any(|note| screen_share_waiting(note)) {
+                return Err(picture_gave_up("the phone", &notices));
+            }
+            let why = connection
+                .close_reason()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "the host never opened the video stream".into());
+            return Err(format!("No picture from the host: {why}"));
+        }
+        let slice = (limit - elapsed).min(Duration::from_millis(250));
+        match tokio::time::timeout(slice, connection.accept_uni()).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => return Err(format!("The host did not open the video stream: {e}")),
+            Err(_) => {
+                if let Some(reason) = connection.close_reason() {
+                    return Err(format!("No picture from the host: {reason}"));
+                }
+            }
+        }
+    }
+}
+
 async fn dispatch_uni(
     connection: Connection,
     frames: std::sync::mpsc::Sender<(VideoHeader, Vec<u8>)>,
     live: Arc<Mutex<Live>>,
     player: Arc<Mutex<Option<Player>>>,
 ) {
-    let video = match tokio::time::timeout(Duration::from_secs(20), connection.accept_uni()).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            let text = format!("The host did not open the video stream: {e}");
-            tracing::error!("{text}");
-            crate::note_failure(&text);
-            live.lock().unwrap().closed = Some(text);
-            return;
-        }
-        Err(_) => {
-            let why = connection
-                .close_reason()
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "the host never opened the video stream".into());
-            let text = format!("No picture from the host: {why}");
+    let video = match await_video_stream(&connection, &live).await {
+        Ok(stream) => stream,
+        Err(text) => {
             tracing::error!("{text}");
             crate::note_failure(&text);
             live.lock().unwrap().closed = Some(text);
@@ -1024,6 +1056,8 @@ mod tests {
         assert_eq!(picture_limit_secs(&[]), 15);
         let waiting = "Waiting for the phone to allow screen sharing".to_string();
         assert_eq!(picture_limit_secs(&[waiting.clone()]), 60);
+        assert_eq!(video_open_limit_secs(&[]), 20);
+        assert_eq!(video_open_limit_secs(&[waiting.clone()]), 60);
         assert_eq!(
             picture_gave_up("Pixel", &[waiting]),
             "Timed out. No one at that phone allowed screen sharing."

@@ -139,6 +139,13 @@ class Engine(context: Context) : EngineListener {
         update { it.copy(status = text, error = text) }
     }
 
+    /** A controller is still connected. False once that session has ended. */
+    fun hostAttached(): Boolean {
+        val h = handle.get()
+        if (h == 0L || !Native.loaded) return false
+        return runCatching { Native.nativeHostAttached(h) }.getOrDefault(false)
+    }
+
     /** The accessibility service can turn PC input into taps and typing. */
     fun setControl(on: Boolean) {
         val now = android.os.SystemClock.elapsedRealtime()
@@ -676,6 +683,7 @@ class Engine(context: Context) : EngineListener {
                 } else if (auto) {
                     us.spader.pjdesk.a11y.ProjectionConsent.request(app)
                 } else {
+                    us.spader.pjdesk.service.HostService.preferAutoClick = false
                     us.spader.pjdesk.service.CapturePrompt.show(app)
                 }
             }
@@ -685,6 +693,7 @@ class Engine(context: Context) : EngineListener {
                 // notification stays until capture is actually running.
                 if (us.spader.pjdesk.service.HostService.capturing) {
                     us.spader.pjdesk.service.CapturePrompt.cancel(app)
+                    us.spader.pjdesk.a11y.ProjectionConsent.stopWatching()
                 }
                 val auto = us.spader.pjdesk.a11y.ProjectionConsent.takeAutomatic() || event.optBoolean("auto")
                 if (auto) AppLog.i(us.spader.pjdesk.a11y.ProjectionConsent.NOTICE)

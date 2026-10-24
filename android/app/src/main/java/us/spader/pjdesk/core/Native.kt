@@ -35,6 +35,7 @@ object Native {
     external fun nativeCreate(dir: String, androidId: String, hostname: String, listener: EngineListener): Long
     external fun nativeDestroy(handle: Long)
     external fun nativeCommand(handle: Long, json: String)
+    external fun nativeHostAttached(handle: Long): Boolean
     external fun nativeSubmitVideo(handle: Long, data: ByteArray, width: Int, height: Int, keyframe: Boolean, encodeUs: Int)
     external fun nativeViewToNorm(frameW: Int, frameH: Int, viewW: Int, viewH: Int, x: Float, y: Float): Long
     external fun nativeLetterbox(frameW: Int, frameH: Int, viewW: Int, viewH: Int): IntArray?

@@ -30,6 +30,13 @@ class ViewRequestActivity : ComponentActivity() {
         val data = result.data
         val engine = (application as PjApp).engine
         if (result.resultCode == RESULT_OK && data != null) {
+            if (!engine.hostAttached()) {
+                us.spader.pjdesk.AppLog.i("consent arrived after the session ended; stopping the projection")
+                HostService.discard(this, result.resultCode, data)
+                ViewPrompt.cancel(this)
+                finish()
+                return@registerForActivityResult
+            }
             HostService.onConsentRestart = {
                 runOnUiThread {
                     HostService.onConsentRestart = null
@@ -203,6 +210,13 @@ class CaptureConsentActivity : ComponentActivity() {
         val data = result.data
         val engine = (application as PjApp).engine
         if (result.resultCode == RESULT_OK && data != null) {
+            if (!engine.hostAttached()) {
+                us.spader.pjdesk.AppLog.i("consent arrived after the session ended; stopping the projection")
+                HostService.discard(this, result.resultCode, data)
+                CapturePrompt.cancel(this)
+                finish()
+                return@registerForActivityResult
+            }
             HostService.onConsentRestart = {
                 runOnUiThread {
                     HostService.onConsentRestart = null
@@ -327,7 +341,6 @@ object CapturePrompt {
 
     fun show(context: Context, launch: Boolean = true) {
         val app = context.applicationContext
-        HostService.preferAutoClick = false
         if (HostService.capturing) {
             (app as PjApp).engine.setCapturing(true)
             return

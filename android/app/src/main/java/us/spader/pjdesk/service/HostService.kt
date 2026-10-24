@@ -84,6 +84,7 @@ class HostService : Service() {
                 controlled = false
                 controlledBy = ""
                 clearConsentWait()
+                AppLog.i("viewer left; stopping the projection")
                 releaseCapture()
                 dropWake("release")
                 show(controlled = false, capturing = false)
@@ -92,6 +93,16 @@ class HostService : Service() {
                 val code = intent.getIntExtra(EXTRA_CODE, 0)
                 val data = intent.dataExtra()
                 if (data != null) startCapture(code, data) else fail("Screen capture permission denied")
+            }
+            ACTION_DISCARD -> {
+                val code = intent.getIntExtra(EXTRA_CODE, 0)
+                val data = intent.dataExtra()
+                AppLog.i("consent arrived after the session ended; stopping the projection")
+                clearConsentWait()
+                if (data != null) stopGrantedToken(code, data)
+                releaseCapture()
+                if (!controlled) dropWake("consent discarded")
+                show(controlled, capturing = false)
             }
             else -> show(controlled, projection != null)
         }
@@ -123,6 +134,15 @@ class HostService : Service() {
      * the service back to special-use before the new token is taken.
      */
     private fun startCapture(code: Int, data: Intent) {
+        if (!viewerPresent()) {
+            AppLog.i("consent arrived after the session ended; stopping the projection")
+            clearConsentWait()
+            stopGrantedToken(code, data)
+            releaseCapture()
+            if (!controlled) dropWake("consent discarded")
+            show(controlled, capturing = false)
+            return
+        }
         clearConsentWait()
         holdWake("capture")
         val mine = ++generation
@@ -148,6 +168,13 @@ class HostService : Service() {
         }
         if (token == null || generation != mine) {
             fail("Screen capture permission denied")
+            return
+        }
+        if (!viewerPresent()) {
+            AppLog.i("consent arrived after the session ended; stopping the projection")
+            generation++
+            runCatching { token.stop() }
+            clearConsentWait()
             return
         }
         var rejected = false
@@ -242,6 +269,11 @@ class HostService : Service() {
             onReady = {
                 main.post {
                     if (generation != mine || rejected) return@post
+                    if (!viewerPresent()) {
+                        AppLog.i("viewer left before the picture was up; stopping the projection")
+                        releaseCapture()
+                        return@post
+                    }
                     readyToReport = true
                     AppLog.i("screen capture started ${w}x$h display ${displayW}x$displayH")
                     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -403,6 +435,17 @@ class HostService : Service() {
         manager.createNotificationChannel(live)
     }
 
+    /** A consent grant arrived after the viewer left. Take the token and stop it. */
+    private fun stopGrantedToken(code: Int, data: Intent) {
+        if (promoteToProjection()) {
+            val manager = getSystemService(MediaProjectionManager::class.java)
+            val token = runCatching { manager.getMediaProjection(code, data) }.getOrNull()
+            runCatching { token?.stop() }
+        }
+    }
+
+    private fun viewerPresent(): Boolean = (application as PjApp).engine.hostAttached()
+
     private fun releaseCapture() {
         partialRetries = 0
         acceptOnSuccess = false
@@ -478,6 +521,7 @@ class HostService : Service() {
 
     companion object {
         const val ACTION_CAPTURE = "us.spader.pjdesk.CAPTURE"
+        const val ACTION_DISCARD = "us.spader.pjdesk.DISCARD"
         const val ACTION_STOP = "us.spader.pjdesk.STOP"
         const val ACTION_CONTROLLED = "us.spader.pjdesk.CONTROLLED"
         const val ACTION_IDLE = "us.spader.pjdesk.IDLE"
@@ -541,9 +585,23 @@ class HostService : Service() {
         }
 
         fun capture(context: Context, code: Int, data: Intent) {
+            if (!(context.applicationContext as PjApp).engine.hostAttached()) {
+                AppLog.i("consent arrived after the session ended; stopping the projection")
+                discard(context, code, data)
+                return
+            }
             AppLog.i("starting screen capture")
             val intent = Intent(context, HostService::class.java).apply {
                 action = ACTION_CAPTURE
+                putExtra(EXTRA_CODE, code)
+                putExtra(EXTRA_DATA, data)
+            }
+            androidx.core.content.ContextCompat.startForegroundService(context, intent)
+        }
+
+        fun discard(context: Context, code: Int, data: Intent) {
+            val intent = Intent(context, HostService::class.java).apply {
+                action = ACTION_DISCARD
                 putExtra(EXTRA_CODE, code)
                 putExtra(EXTRA_DATA, data)
             }

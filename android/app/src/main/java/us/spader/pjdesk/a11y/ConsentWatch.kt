@@ -2,6 +2,7 @@ package us.spader.pjdesk.a11y
 
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import us.spader.pjdesk.AppLog
 import us.spader.pjdesk.service.RemoteControl
 
@@ -24,8 +25,16 @@ object ConsentWatch {
         val note: String?,
     )
 
-    fun decide(bound: Boolean, locked: Boolean, polls: Int, limit: Int = POLL_LIMIT): Decision {
-        if (polls >= limit) {
+    fun decide(
+        bound: Boolean,
+        locked: Boolean,
+        polls: Int,
+        limit: Int = POLL_LIMIT,
+        elapsedMs: Long = polls.toLong() * POLL_MS,
+    ): Decision {
+        // The deadline is wall time. A system-window event can poll early, and
+        // that must not burn the 50 seconds.
+        if (elapsedMs >= limit.toLong() * POLL_MS) {
             val note = when {
                 locked -> "keyguard is locked; the screen share dialog cannot be tapped"
                 !bound -> "accessibility service is not bound; the screen share dialog was not tapped"
@@ -66,6 +75,10 @@ object ConsentWatcher {
     private var awaiting = false
     private var awaitingWhy = ""
     private var awaitingPolls = 0
+    private var startedAt = 0L
+    private var ticking = false
+    private var pendingNudge = false
+    private var lastNudge = 0L
     private val poll = Runnable { tick() }
 
     fun start(giveUp: () -> Unit) {
@@ -75,6 +88,9 @@ object ConsentWatcher {
         awaiting = false
         awaitingWhy = ""
         awaitingPolls = 0
+        startedAt = SystemClock.elapsedRealtime()
+        pendingNudge = false
+        lastNudge = 0L
         onGiveUp = giveUp
         main.removeCallbacks(poll)
         main.post(poll)
@@ -82,8 +98,24 @@ object ConsentWatcher {
 
     fun stop() {
         main.removeCallbacks(poll)
+        ticking = false
+        pendingNudge = false
         awaiting = false
         onGiveUp = null
+    }
+
+    /** A system window changed. Poll now, without resetting the 50 second deadline. */
+    fun nudge() {
+        if (!ProjectionConsent.armed) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastNudge < 200L) return
+        lastNudge = now
+        if (ticking) {
+            pendingNudge = true
+            return
+        }
+        main.removeCallbacks(poll)
+        main.post(poll)
     }
 
     fun gestureFinished(completed: Boolean, why: String) {
@@ -99,13 +131,16 @@ object ConsentWatcher {
 
     private fun tick() {
         if (!ProjectionConsent.armed) return
+        ticking = true
         polls += 1
+        var again = true
         try {
             val service = RemoteControl.service
             val locked = service?.let { ScreenAlert.locked(it) } ?: false
+            val elapsed = (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L)
             if (polls == 1 || polls % 12 == 0) {
                 val id = service?.let { System.identityHashCode(it) } ?: 0
-                AppLog.i("consent watch poll=$polls bound=${service != null} keyguard=$locked service=$id")
+                AppLog.i("consent watch poll=$polls elapsed=${elapsed}ms bound=${service != null} keyguard=$locked service=$id")
             }
             if (awaiting) {
                 awaitingPolls += 1
@@ -116,7 +151,8 @@ object ConsentWatcher {
                     AppLog.i("screen share tap was not confirmed")
                 }
             }
-            val decision = ConsentWatch.decide(service != null, locked, polls)
+            val decision = ConsentWatch.decide(service != null, locked, polls, elapsedMs = elapsed)
+            again = decision.again && !decision.giveUp
             val note = decision.note
             if (note != null && note != lastNote) {
                 lastNote = note
@@ -124,6 +160,10 @@ object ConsentWatcher {
             }
             if (service != null) {
                 val nodes = service.collectConsent()
+                if (polls == 1 || polls % 12 == 0) {
+                    val system = nodes.count { it.packageName == ProjectionConsent.SYSTEM_UI }
+                    AppLog.i("consent watch read nodes=${nodes.size} systemui=$system")
+                }
                 val step = ProjectionConsent.decide(nodes)
                 logDialog(nodes, step)
                 if (decision.click && !awaiting && step is ConsentStep.Click) {
@@ -132,9 +172,8 @@ object ConsentWatcher {
                     if (result.action && step.why == "share") {
                         ProjectionConsent.markClicked()
                         ProjectionConsent.stopWatching()
-                        return
-                    }
-                    if (result.gesture) {
+                        again = false
+                    } else if (result.gesture) {
                         awaiting = true
                         awaitingWhy = step.why
                         awaitingPolls = 0
@@ -142,15 +181,24 @@ object ConsentWatcher {
                 }
             }
             if (decision.giveUp || !decision.again) {
+                again = false
                 val giveUp = onGiveUp
                 onGiveUp = null
                 giveUp?.invoke()
-                return
             }
         } catch (error: Throwable) {
             AppLog.e("consent watch failed", error)
+        } finally {
+            ticking = false
         }
-        if (ProjectionConsent.armed) main.postDelayed(poll, ConsentWatch.POLL_MS)
+        if (again && ProjectionConsent.armed) {
+            if (pendingNudge) {
+                pendingNudge = false
+                main.post(poll)
+            } else {
+                main.postDelayed(poll, ConsentWatch.POLL_MS)
+            }
+        }
     }
 
     private fun logDialog(nodes: List<ConsentNode>, step: ConsentStep) {

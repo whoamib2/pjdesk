@@ -37,7 +37,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.20";
+pub const APP_VERSION: &str = "0.6.21";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -134,6 +134,10 @@ struct State {
     viewer: Mutex<Option<quinn::Connection>>,
     files: Mutex<HashMap<u64, FileOffer>>,
     file_seq: AtomicU64,
+    /// Non-zero while a controller is connected to this phone. A later session
+    /// uses a new value, so an older session ending cannot clear it.
+    host_live: AtomicU64,
+    host_live_seq: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -168,7 +172,41 @@ pub struct Engine {
     cmds: mpsc::UnboundedSender<Value>,
 }
 
+/// One controller session. Dropping it, or [`HostLive::end`], clears the flag
+/// only when no newer session has replaced it.
+struct HostLive {
+    state: Arc<State>,
+    gen: u64,
+}
+
+impl HostLive {
+    fn enter(state: &Arc<State>) -> Self {
+        let gen = state.host_live_seq.fetch_add(1, Ordering::SeqCst).wrapping_add(1).max(1);
+        state.host_live.store(gen, Ordering::SeqCst);
+        Self { state: state.clone(), gen }
+    }
+
+    fn end(&self) {
+        let _ = self.state.host_live.compare_exchange(self.gen, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+impl Drop for HostLive {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+fn host_attached(state: &State) -> bool {
+    state.host_live.load(Ordering::SeqCst) != 0
+}
+
 impl Engine {
+    /// True while a controller is still connected. Capture must not start after this is false.
+    pub fn host_attached(&self) -> bool {
+        host_attached(&self.state)
+    }
+
     pub fn start(dir: PathBuf, android_id: String, hostname: String, callbacks: Arc<dyn Callbacks>) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
         let disk = load_disk(&dir);
@@ -228,6 +266,8 @@ impl Engine {
             viewer: Mutex::new(None),
             files: Mutex::new(HashMap::new()),
             file_seq: AtomicU64::new(1),
+            host_live: AtomicU64::new(0),
+            host_live_seq: AtomicU64::new(0),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let engine = Self { state: state.clone(), cmds: tx };
@@ -1306,7 +1346,9 @@ async fn host_session(
     }
     // The password (or Allow) is done. The picture still needs MediaProjection.
     // Tell the controller before the video stream opens, and keep this session
-    // up while the phone shows the consent notification.
+    // up while the phone shows the consent notification. The viewer is attached
+    // from here until this function ends, so a late consent cannot start a capture.
+    let host_live = HostLive::enter(&state);
     let mut share_deadline = None;
     if !state.capturing.load(Ordering::SeqCst) {
         *state.capture_deny.lock().unwrap() = String::new();
@@ -1370,6 +1412,9 @@ async fn host_session(
         emit(&cb, &json!({"event":"keyframe"}));
     }
     let result = loop {
+        if connection.close_reason().is_some() {
+            break Err(anyhow!("the other computer closed the session"));
+        }
         if state.gen.load(Ordering::SeqCst) != gen || state.app_stop.load(Ordering::SeqCst) {
             let saved = state.end_reason.lock().unwrap().clone();
             let saved = if saved.is_empty() { "stopped".to_string() } else { saved };
@@ -1515,6 +1560,9 @@ async fn host_session(
             }
         }
     };
+    // Clear this before the cleanup awaits. A consent result on the main thread
+    // must already see that the viewer is gone.
+    host_live.end();
     let stopped_sharing = result.as_ref().err().is_some_and(|e| {
         let text = e.to_string().to_ascii_lowercase();
         text.contains("stopped sharing") || text.contains("screen capture stopped")
@@ -2362,6 +2410,25 @@ mod tests {
     }
 
     #[test]
+    fn an_ended_viewer_does_not_clear_the_next_session() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-host-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir);
+        assert!(!host_attached(&state));
+        let first = HostLive::enter(&state);
+        assert!(host_attached(&state));
+        let second = HostLive::enter(&state);
+        drop(first);
+        assert!(host_attached(&state), "the older session must not clear the newer one");
+        second.end();
+        assert!(!host_attached(&state));
+        drop(second);
+        assert!(!host_attached(&state));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_consent_wait_sends_a_packet_inside_the_idle_timeout() {
         assert_eq!(SHARE_WAIT, Duration::from_secs(60));
         assert!(CONSENT_KEEPALIVE_TICKS * 250 < 15_000);
@@ -2554,6 +2621,8 @@ mod tests {
             viewer: Mutex::new(None),
             files: Mutex::new(HashMap::new()),
             file_seq: AtomicU64::new(1),
+            host_live: AtomicU64::new(0),
+            host_live_seq: AtomicU64::new(0),
         })
     }
 

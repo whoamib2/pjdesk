@@ -47,4 +47,24 @@ class ConsentWatchTest {
         assertEquals(true, decision.giveUp)
         assertTrue(decision.note!!.contains("could not click"))
     }
+
+    @Test
+    fun aPollBeforeTheDialogKeepsWaiting() {
+        val decision = ConsentWatch.decide(bound = true, locked = false, polls = 1, elapsedMs = 50)
+        assertTrue(decision.click)
+        assertTrue(decision.again)
+        assertFalse(decision.giveUp)
+    }
+
+    @Test
+    fun theWatchGivesUpOnTheClockEvenWhenFewPollsRan() {
+        val decision = ConsentWatch.decide(
+            bound = true,
+            locked = false,
+            polls = 1,
+            elapsedMs = ConsentWatch.POLL_LIMIT * ConsentWatch.POLL_MS,
+        )
+        assertTrue(decision.giveUp)
+        assertFalse(decision.again)
+    }
 }
