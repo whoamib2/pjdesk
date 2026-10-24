@@ -21,6 +21,8 @@ mod handoff;
 mod password_policy;
 mod public_addr;
 mod gui;
+mod winhello;
+mod window_lock;
 mod registry;
 mod relay;
 mod requests;
@@ -588,6 +590,21 @@ fn confirm(yes: bool, prompt: &str) -> Result<bool> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+#[cfg(test)]
+mod cli_lock {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    #[test]
+    fn no_flag_skips_the_window_lock() {
+        let help = Cli::command().render_long_help().to_string().to_lowercase();
+        assert!(!help.contains("no-pin"), "{help}");
+        assert!(!help.contains("skip-lock"), "{help}");
+        assert!(!help.contains("--unlocked"), "{help}");
+    }
 }
 
 fn init_console_logging() {

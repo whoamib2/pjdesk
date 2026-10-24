@@ -78,7 +78,7 @@ mod imp {
         /// Drains any pending tray actions.
         pub fn poll(&self) -> Vec<Action> {
             let mut out = Vec::new();
-            if ICON_CLICKED.swap(false, Ordering::SeqCst) {
+            if ICON_CLICKED.swap(false, Ordering::SeqCst) || super::super::instance::show_requested() {
                 out.push(Action::Show);
             }
             for id in MENU_IDS.lock().unwrap().drain(..) {

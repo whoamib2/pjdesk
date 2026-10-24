@@ -8,6 +8,7 @@
 
 mod applock;
 mod icons;
+mod instance;
 mod panels;
 mod probe;
 mod saved;
@@ -51,6 +52,10 @@ enum DeskTab {
 
 /// Launches the app and blocks until the window is closed.
 pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result<()> {
+    // No flag skips the lock. A second launch wakes the window that is already open.
+    if pjdesk_proto::applock::second_window_should_exit(instance::acquire_or_signal()) {
+        return Ok(());
+    }
     crate::temp_sign::scrub_abandoned();
     let mut config = Config::load().unwrap_or_default();
     if let Some(flag) = &server_flag {
@@ -381,6 +386,14 @@ pub struct App {
     pin_show_password: bool,
     pin_note: String,
     pin_idle_minutes: u32,
+    /// Account password was accepted. The window stays locked until a new PIN is saved.
+    lock_resetting: bool,
+    hello_choice: Option<bool>,
+    hello_available: Option<bool>,
+    hello_prompted: bool,
+    hello_busy: bool,
+    hello_rx: Option<Receiver<bool>>,
+    hello_check_rx: Option<Receiver<bool>>,
 }
 
 enum InviteMsg {
@@ -555,6 +568,13 @@ impl App {
             pin_show_password: false,
             pin_note: String::new(),
             pin_idle_minutes: 5,
+            lock_resetting: false,
+            hello_choice: pjdesk_proto::applock::read_window_lock(&pjdesk_proto::applock::window_lock_path()).hello,
+            hello_available: None,
+            hello_prompted: false,
+            hello_busy: false,
+            hello_rx: None,
+            hello_check_rx: if preview { None } else { Some(crate::winhello::spawn_check()) },
         };
         let lock_email = app.account_email();
         if let Some(verifier) = app.cfg.app_lock_for(&lock_email) {
@@ -2682,6 +2702,7 @@ impl eframe::App for App {
         for action in tray_actions {
             match action {
                 tray::Action::Show => {
+                    tracing::info!("Opening the window from the tray or a second launch");
                     self.lock_from_tray();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -2689,8 +2710,12 @@ impl eframe::App for App {
                 tray::Action::Update => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.show_settings = true;
-                    self.settings.show_about();
+                    if self.signed_in() {
+                        self.lock_from_tray();
+                    } else {
+                        self.show_settings = true;
+                        self.settings.show_about();
+                    }
                     crate::client_update::start();
                 }
                 tray::Action::Quit => {
@@ -2720,11 +2745,18 @@ impl eframe::App for App {
             || self.delete_rx.is_some()
             || self.lan_rx.is_some()
             || !self.viewer_rx.is_empty()
-            || !self.engine.ready;
+            || !self.engine.ready
+            || self.hello_busy
+            || self.hello_check_rx.is_some()
+            || self.lock_busy;
         ctx.request_repaint_after(Duration::from_millis(if pending { 50 } else { 400 }));
 
-        if self.lock_ui && self.pin_required() {
-            self.lock_screen(ui);
+        if self.lock_ui && self.signed_in() {
+            if self.lock_resetting || self.cfg.app_lock_for(&self.account_email()).is_none() {
+                self.setup_screen(ui);
+            } else {
+                self.lock_screen(ui);
+            }
             self.consent_prompt(&ctx);
             poll_client_heartbeat();
             adopt_service_notice();

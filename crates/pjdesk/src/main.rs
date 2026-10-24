@@ -22,6 +22,7 @@ mod clip;
 mod color;
 mod config;
 mod gui;
+mod winhello;
 mod handoff;
 mod host;
 mod hostfacts;
@@ -853,4 +854,19 @@ pub fn hostname() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "pjdesk".into())
+}
+
+#[cfg(test)]
+mod cli_lock {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    #[test]
+    fn no_flag_skips_the_window_lock() {
+        let help = Cli::command().render_long_help().to_string().to_lowercase();
+        assert!(!help.contains("no-pin"), "{help}");
+        assert!(!help.contains("skip-lock"), "{help}");
+        assert!(!help.contains("--unlocked"), "{help}");
+    }
 }

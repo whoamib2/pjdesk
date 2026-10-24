@@ -25,7 +25,7 @@ pub(super) struct LockRemote {
 }
 
 impl App {
-    fn signed_in(&self) -> bool {
+    pub(super) fn signed_in(&self) -> bool {
         self.temp.is_some() || !self.cfg.network_refresh_token().is_empty()
     }
 
@@ -43,8 +43,9 @@ impl App {
     }
 
     pub(super) fn note_lock_visibility(&mut self, ctx: &egui::Context) {
-        if !self.pin_required() {
+        if !self.signed_in() {
             self.lock_armed = false;
+            self.lock_ui = false;
             return;
         }
         if !self.lock_armed {
@@ -65,7 +66,10 @@ impl App {
                 self.engage_lock();
             }
         }
-        if self.lock_ui {
+        if self.lock_ui || self.cfg.app_lock_for(&self.account_email()).is_none() {
+            if self.cfg.app_lock_for(&self.account_email()).is_none() {
+                self.lock_ui = true;
+            }
             return;
         }
         if user_activity(ctx) {
@@ -76,7 +80,8 @@ impl App {
     }
 
     pub(super) fn lock_from_tray(&mut self) {
-        if self.pin_required() {
+        if self.signed_in() {
+            tracing::info!("The window is locked. A tray open or a second launch does not skip the PIN.");
             self.engage_lock();
         }
     }
@@ -86,12 +91,15 @@ impl App {
         self.lock_pin.clear();
         self.lock_forgot = false;
         self.lock_password.clear();
+        self.hello_prompted = false;
         self.show_settings = false;
         self.show_invite = false;
         self.show_login = false;
     }
 
     pub(super) fn poll_app_lock(&mut self) {
+        self.absorb_shared_lock();
+        self.poll_hello();
         if self.lock_rx.is_some() {
             let msg = self.lock_rx.as_ref().and_then(|rx| match rx.try_recv() {
                 Ok(msg) => Some(msg),
@@ -159,9 +167,12 @@ impl App {
                 return;
             }
             self.cfg.clear_app_lock();
-            self.lock_ui = false;
-            self.lock_armed = false;
+            self.lock_ui = self.signed_in();
+            self.lock_armed = self.signed_in();
+            self.lock_resetting = false;
             self.save_cfg();
+            self.publish_shared();
+            tracing::info!("The account PIN was cleared. This window is asking for a new one.");
             return;
         }
         let Some(key) = crate::vault::key_from(&self.cfg) else {
@@ -181,6 +192,7 @@ impl App {
                     self.lock_armed = true;
                 }
                 self.save_cfg();
+                self.publish_shared();
             }
             Err(err) => {
                 if self.lock_ui {
@@ -195,7 +207,9 @@ impl App {
             LockMsg::Unlocked => {
                 self.cfg.clear_app_lock_fails();
                 self.save_cfg();
+                self.publish_shared();
                 self.lock_ui = false;
+                self.lock_resetting = false;
                 self.lock_error.clear();
                 self.lock_pin.clear();
                 self.last_input = Instant::now();
@@ -205,6 +219,8 @@ impl App {
                 let (fails, until) = pjdesk_proto::applock::note_miss(self.cfg.app_lock_fails, now);
                 self.cfg.note_app_lock_fail(fails, until);
                 self.save_cfg();
+                self.publish_shared();
+                tracing::info!("Wrong PIN ({fails} misses)");
                 self.lock_pin.clear();
                 self.lock_error = if until > now {
                     wait_label(until - now)
@@ -232,16 +248,19 @@ impl App {
                 }
                 self.cfg.clear_app_lock_fails();
                 self.save_cfg();
-                self.lock_ui = false;
+                self.publish_shared();
+                self.lock_ui = true;
                 self.lock_armed = true;
+                self.lock_resetting = true;
                 self.lock_forgot = false;
                 self.lock_password.clear();
+                self.lock_pin.clear();
+                self.pin_new.clear();
+                self.pin_confirm.clear();
                 self.lock_error.clear();
-                self.last_input = Instant::now();
                 self.reauth_until = Instant::now() + Duration::from_secs(10 * 60);
-                self.pin_note = "Signed in again. The PIN still works. Change it here if you want a new one.".into();
-                self.open_settings();
-                self.settings.show_security();
+                self.pin_note = "Signed in. Choose a new PIN.".into();
+                tracing::info!("Account password accepted. Waiting for a new PIN.");
             }
             LockMsg::Stored { sealed, updated, verifier, key } => {
                 crate::vault::set_session_key(key);
@@ -253,19 +272,26 @@ impl App {
                 self.cfg.write_app_lock(&email, &sealed, updated, Some(&verifier));
                 self.cfg.clear_app_lock_fails();
                 self.save_cfg();
+                self.publish_shared();
                 self.clear_pin_form();
-                self.pin_note = "PIN saved. Every signed-in computer will ask for it.".into();
+                self.lock_resetting = false;
+                self.lock_ui = false;
                 self.lock_armed = true;
+                self.last_input = Instant::now();
+                self.pin_note = "PIN saved. This window will ask for it.".into();
                 self.next_lock_pull = Instant::now() + Duration::from_secs(45);
+                tracing::info!("Saved the account PIN");
             }
             LockMsg::Cleared { updated } => {
                 self.cfg.clear_app_lock();
                 self.cfg.app_lock_updated = updated;
                 self.save_cfg();
-                self.lock_ui = false;
-                self.lock_armed = false;
+                self.publish_shared();
+                self.lock_ui = self.signed_in();
+                self.lock_armed = self.signed_in();
+                self.lock_resetting = false;
                 self.clear_pin_form();
-                self.pin_note = "PIN removed. This window no longer asks for one.".into();
+                self.pin_note = "Set a new PIN to open this window.".into();
             }
             LockMsg::Failed(err) => {
                 self.lock_error = err.clone();
@@ -274,6 +300,78 @@ impl App {
                     self.pin_idle_minutes = (v.idle_sec / 60).clamp(1, 24 * 60) as u32;
                 }
             }
+        }
+    }
+
+    fn hello_toggle(&mut self, ui: &mut egui::Ui) {
+        let available = self.hello_available.unwrap_or(false);
+        let mut on = pjdesk_proto::applock::hello_enabled(self.hello_choice, available);
+        if ui.checkbox(&mut on, "Unlock with Windows Hello").changed() {
+            self.store_hello(on);
+        }
+        let hint = if self.hello_available == Some(false) {
+            "Windows Hello is not set up on this computer. The PIN is used instead."
+        } else {
+            "Fingerprint, face, or the Windows Hello PIN. On by default when Windows Hello is available. The PJDesk PIN still works."
+        };
+        ui.label(widgets::muted(ui, hint));
+    }
+
+    fn store_hello(&mut self, on: bool) {
+        self.hello_choice = Some(on);
+        let path = pjdesk_proto::applock::window_lock_path();
+        let mut file = pjdesk_proto::applock::read_window_lock(&path);
+        file.hello = Some(on);
+        if let Err(err) = pjdesk_proto::applock::write_window_lock(&path, &file) {
+            self.pin_note = err;
+        } else {
+            tracing::info!("Unlock with Windows Hello is {}", if on { "on" } else { "off" });
+        }
+    }
+
+    fn publish_shared(&self) {
+        let path = pjdesk_proto::applock::window_lock_path();
+        let mut file = pjdesk_proto::applock::read_window_lock(&path);
+        file.email = self.account_email();
+        file.sealed = self.cfg.app_lock_sealed.clone();
+        file.updated = self.cfg.app_lock_updated;
+        file.verifier = self.cfg.app_lock_verifier.clone().unwrap_or_default();
+        file.fails = self.cfg.app_lock_fails;
+        file.until = self.cfg.app_lock_until;
+        if let Err(err) = pjdesk_proto::applock::write_window_lock(&path, &file) {
+            tracing::info!("Could not share the window lock: {err}");
+        }
+    }
+
+    fn absorb_shared_lock(&mut self) {
+        let email = self.account_email();
+        if email.is_empty() {
+            return;
+        }
+        let file = pjdesk_proto::applock::read_window_lock(&pjdesk_proto::applock::window_lock_path());
+        if !file.email.eq_ignore_ascii_case(&email) {
+            return;
+        }
+        let (fails, until) = pjdesk_proto::applock::lockout_for(&file, &email);
+        if until > self.cfg.app_lock_until {
+            self.cfg.note_app_lock_fail(fails, until);
+            self.save_cfg();
+        }
+        if file.updated <= self.cfg.app_lock_updated || file.verifier.is_empty() {
+            return;
+        }
+        let Some(text) = crate::secure::reveal(&file.verifier) else {
+            return;
+        };
+        let Ok(verifier) = serde_json::from_str::<pjdesk_proto::applock::Verifier>(&text) else {
+            return;
+        };
+        self.pin_idle_minutes = (verifier.idle_sec / 60).clamp(1, 24 * 60) as u32;
+        self.cfg.write_app_lock(&email, file.sealed.trim(), file.updated, Some(&verifier));
+        self.save_cfg();
+        if self.signed_in() {
+            self.engage_lock();
+            self.lock_armed = true;
         }
     }
 
@@ -310,6 +408,16 @@ impl App {
                         "Your account stays signed in. This computer stays online for incoming connections and updates.",
                     ));
                     ui.add_space(16.0);
+                    let hello = pjdesk_proto::applock::hello_enabled(self.hello_choice, self.hello_available.unwrap_or(false))
+                        && self.hello_available == Some(true);
+                    if hello {
+                        let label = if self.hello_busy { "Waiting for Windows Hello…" } else { "Use Windows Hello" };
+                        if widgets::accent_button(ui, label, egui::Vec2::new(420.0, 40.0)) && !self.hello_busy && !self.lock_busy {
+                            self.hello_prompted = true;
+                            self.start_hello();
+                        }
+                        ui.add_space(8.0);
+                    }
                     let mut pin = self.lock_pin.clone();
                     widgets::password_field(ui, &mut pin, "4 to 8 digits", &mut self.lock_show);
                     self.lock_pin = digits_only(&pin);
@@ -329,7 +437,7 @@ impl App {
                     }
                     if self.lock_forgot {
                         ui.add_space(8.0);
-                        ui.label(widgets::muted(ui, "This is your pjdesk.com password."));
+                        ui.label(widgets::muted(ui, "This is your pjdesk.com password. After it is accepted you choose a new PIN."));
                         let mut pass = self.lock_password.clone();
                         widgets::password_field(ui, &mut pass, "Account password", &mut self.lock_pass_show);
                         self.lock_password = pass;
@@ -343,6 +451,102 @@ impl App {
                     }
                 });
             });
+        self.maybe_auto_hello(ui.ctx());
+    }
+
+    pub(super) fn setup_screen(&mut self, ui: &mut egui::Ui) {
+        let p = theme::paint(ui);
+        let title = if self.lock_resetting { "Choose a new PIN" } else { "Set a PIN" };
+        let need_password = crate::vault::key_from(&self.cfg).is_none() && !self.password_recently_ok();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::same(24)))
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.set_max_width(420.0);
+                    ui.add_space(72.0);
+                    ui.label(RichText::new(title).strong().size(22.0));
+                    ui.add_space(6.0);
+                    ui.label(widgets::muted(
+                        ui,
+                        "This window stays here until the PIN is saved to the PJDesk account. Incoming connections and updates keep running.",
+                    ));
+                    ui.add_space(16.0);
+                    if need_password {
+                        ui.label("Account password");
+                        let mut pass = self.pin_password.clone();
+                        widgets::password_field(ui, &mut pass, "pjdesk.com password", &mut self.pin_show_password);
+                        self.pin_password = pass;
+                        ui.add_space(8.0);
+                    }
+                    ui.label("PIN");
+                    let mut pin = self.pin_new.clone();
+                    widgets::password_field(ui, &mut pin, "4 to 8 digits", &mut self.pin_show_new);
+                    self.pin_new = digits_only(&pin);
+                    ui.label("Confirm PIN");
+                    let mut confirm = self.pin_confirm.clone();
+                    widgets::password_field(ui, &mut confirm, "Repeat the PIN", &mut self.pin_show_confirm);
+                    self.pin_confirm = digits_only(&confirm);
+                    if !self.pin_note.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(&self.pin_note).color(p.warn));
+                    }
+                    ui.add_space(12.0);
+                    let can = !self.lock_busy
+                        && pjdesk_proto::applock::pin_acceptable(&self.pin_new)
+                        && self.pin_new == self.pin_confirm;
+                    if widgets::accent_button(ui, if self.lock_busy { "Saving…" } else { "Save PIN" }, egui::Vec2::new(420.0, 40.0)) && can {
+                        self.start_save(false);
+                    }
+                });
+            });
+    }
+
+    fn maybe_auto_hello(&mut self, ctx: &egui::Context) {
+        let visible = ctx.input(|i| i.viewport().visible().unwrap_or(true) && i.viewport().minimized != Some(true));
+        let enabled = pjdesk_proto::applock::hello_enabled(self.hello_choice, self.hello_available.unwrap_or(false));
+        if pjdesk_proto::applock::hello_auto_prompt(
+            enabled,
+            self.hello_available.unwrap_or(false),
+            self.hello_prompted,
+            self.hello_busy || self.lock_busy,
+            visible,
+        ) {
+            self.hello_prompted = true;
+            self.start_hello();
+        }
+    }
+
+    fn start_hello(&mut self) {
+        if self.hello_busy {
+            return;
+        }
+        self.hello_busy = true;
+        let (tx, rx) = mpsc::channel();
+        self.hello_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("winhello".into())
+            .spawn(move || {
+                let _ = tx.send(crate::winhello::prompt("Unlock PJDesk"));
+            })
+            .ok();
+    }
+
+    fn poll_hello(&mut self) {
+        if let Some(rx) = &self.hello_check_rx {
+            if let Ok(ok) = rx.try_recv() {
+                self.hello_available = Some(ok);
+                self.hello_check_rx = None;
+            }
+        }
+        if let Some(rx) = &self.hello_rx {
+            if let Ok(ok) = rx.try_recv() {
+                self.hello_rx = None;
+                self.hello_busy = false;
+                if ok {
+                    self.apply_lock_msg(LockMsg::Unlocked);
+                }
+            }
+        }
     }
 
     fn start_unlock(&mut self) {
@@ -388,8 +592,10 @@ impl App {
         let have = self.pin_required();
         ui.label(widgets::muted(
             ui,
-            "A PIN for this PJDesk account. Opening this window asks for it, and so does showing it from the tray. Restoring a minimized window, or leaving it idle, asks again after the time below. The background service, incoming connections, and updates keep running.",
+            "A PIN is required for this PJDesk account. Opening this window asks for it, and so does PJDesk Server, the tray, and starting the program again. Restoring a minimized window, or leaving it idle, asks again after the time below. The background service, incoming connections, and updates keep running.",
         ));
+        ui.add_space(6.0);
+        self.hello_toggle(ui);
         ui.add_space(6.0);
         if !self.signed_in() {
             ui.label(widgets::muted(ui, "Sign in to set a PIN for this account."));
@@ -439,9 +645,6 @@ impl App {
             if ui.button(label).clicked() && !self.lock_busy {
                 self.start_save(false);
             }
-            if have && ui.button("Remove PIN").clicked() && !self.lock_busy {
-                self.start_save(true);
-            }
         });
         if !self.pin_note.is_empty() {
             ui.add_space(4.0);
@@ -462,11 +665,12 @@ impl App {
         let confirm = self.pin_confirm.clone();
         let have = self.cfg.app_lock_for(&email);
         let recent = self.password_recently_ok();
+        let existing_key = crate::vault::key_from(&self.cfg);
         if have.is_some() && current.is_empty() && password.is_empty() && !recent {
             self.pin_note = "Enter the current PIN or your account password.".into();
             return;
         }
-        if have.is_none() && password.is_empty() && !recent {
+        if have.is_none() && password.is_empty() && !recent && existing_key.is_none() {
             self.pin_note = "Enter your account password.".into();
             return;
         }
@@ -487,7 +691,6 @@ impl App {
             self.pin_note = "Sign in again, then set the PIN.".into();
             return;
         }
-        let existing_key = crate::vault::key_from(&self.cfg);
         self.spawn_save(SaveJob {
             email,
             current,
@@ -596,6 +799,8 @@ fn save_lock(job: SaveJob) -> LockMsg {
             Some(key) => key,
             None => return LockMsg::Failed("Enter your account password to save this on the account.".into()),
         }
+    } else if let Some(key) = job.existing_key {
+        key
     } else {
         return LockMsg::Failed("Enter your account password.".into());
     };

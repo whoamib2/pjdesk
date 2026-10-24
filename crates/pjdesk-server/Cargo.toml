@@ -42,11 +42,13 @@ eframe = { version = "0.36", default-features = false, features = ["default_font
 
 [target.'cfg(windows)'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
+windows-future = "0.3"
 windows-service = "0.8"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Environment",
@@ -57,6 +59,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Com",
+    "Win32_System_WinRT",
+    "Security_Credentials_UI",
 ] }
 # System-tray icon + menu for the management window.
 tray-icon = "0.26"

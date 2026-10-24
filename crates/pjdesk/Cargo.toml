@@ -77,6 +77,8 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
+    "Win32_System_WinRT",
+    "Security_Credentials_UI",
     "Win32_System_Shutdown",
     "Win32_System_SystemInformation",
     "Wdk_System_SystemServices",
@@ -88,6 +90,7 @@ features = [
 ]
 
 [target.'cfg(windows)'.dependencies]
+windows-future = "0.3"
 windows-service = "0.8"
 # System-tray icon + menu (minimize-to-tray, Show/Quit).
 tray-icon = "0.26"

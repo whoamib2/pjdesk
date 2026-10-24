@@ -63,6 +63,109 @@ pub fn clamp_idle(secs: u64) -> u64 {
     }
 }
 
+/// What a signed-in Windows window shows before its contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowGate {
+    /// No signed-in account, so there is no account PIN to require.
+    Open,
+    /// Signed in, and a PIN is already stored.
+    Unlock,
+    /// Signed in, and this account does not have a PIN yet.
+    SetPin,
+}
+
+/// The management window asks for the account PIN whenever an account is signed in.
+pub fn window_gate(signed_in: bool, has_pin: bool) -> WindowGate {
+    if !signed_in {
+        WindowGate::Open
+    } else if has_pin {
+        WindowGate::Unlock
+    } else {
+        WindowGate::SetPin
+    }
+}
+
+/// A second launch must leave. The first window is the one that opens.
+pub fn second_window_should_exit(acquired: bool) -> bool {
+    !acquired
+}
+
+/// `stored` is the Settings choice. None means it has not been chosen, which
+/// is on when Windows Hello can run on this computer.
+pub fn hello_enabled(stored: Option<bool>, available: bool) -> bool {
+    stored.unwrap_or(available)
+}
+
+/// Prompt once, when the lock screen is actually on screen.
+pub fn hello_auto_prompt(enabled: bool, available: bool, prompted: bool, busy: bool, visible: bool) -> bool {
+    enabled && available && visible && !prompted && !busy
+}
+
+/// Local window-lock file shared by the PJDesk client and PJDesk Server.
+/// The PIN is not in here. `verifier` is the opened salt and hash, already
+/// sealed for this Windows user.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowLockFile {
+    #[serde(default)]
+    pub hello: Option<bool>,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub fails: u32,
+    #[serde(default)]
+    pub until: u64,
+    #[serde(default)]
+    pub sealed: String,
+    #[serde(default)]
+    pub updated: u64,
+    #[serde(default)]
+    pub verifier: String,
+}
+
+pub fn window_lock_path() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("PJDESK_WINDOW_LOCK") {
+        return std::path::PathBuf::from(path);
+    }
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(std::path::PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+    };
+    base.unwrap_or_else(|| std::path::PathBuf::from(".")).join("PJDesk").join("window-lock.json")
+}
+
+pub fn read_window_lock(path: &std::path::Path) -> WindowLockFile {
+    let Ok(bytes) = std::fs::read(path) else {
+        return WindowLockFile::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+pub fn write_window_lock(path: &std::path::Path, file: &WindowLockFile) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(file).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    if std::fs::rename(&tmp, path).is_err() {
+        std::fs::write(path, &bytes).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(())
+}
+
+/// Lockout for this account. A file for a different account does not count.
+pub fn lockout_for(file: &WindowLockFile, email: &str) -> (u32, u64) {
+    if email.is_empty() || !file.email.eq_ignore_ascii_case(email) {
+        (0, 0)
+    } else {
+        (file.fails, file.until)
+    }
+}
+
 pub fn hash_pin(pin: &str, salt: &[u8], iterations: u32) -> Result<[u8; 32], String> {
     let iterations = std::num::NonZeroU32::new(iterations).filter(|n| n.get() <= MAX_ITERATIONS).ok_or("bad pin hash")?;
     let mut out = [0u8; 32];
@@ -199,5 +302,42 @@ mod tests {
         assert_eq!(made.idle_sec, IDLE_DEFAULT);
         assert_eq!(made.iterations, ITERATIONS);
         assert!(matches(&made, "1234"));
+    }
+
+    #[test]
+    fn a_signed_in_window_requires_a_pin_and_hello_defaults_on() {
+        assert_eq!(window_gate(false, false), WindowGate::Open);
+        assert_eq!(window_gate(false, true), WindowGate::Open);
+        assert_eq!(window_gate(true, false), WindowGate::SetPin);
+        assert_eq!(window_gate(true, true), WindowGate::Unlock);
+        assert!(second_window_should_exit(false));
+        assert!(!second_window_should_exit(true));
+        assert!(hello_enabled(None, true));
+        assert!(!hello_enabled(None, false));
+        assert!(!hello_enabled(Some(false), true));
+        assert!(hello_enabled(Some(true), false));
+        assert!(hello_auto_prompt(true, true, false, false, true));
+        assert!(!hello_auto_prompt(true, true, false, false, false));
+        assert!(!hello_auto_prompt(true, true, true, false, true));
+        assert!(!hello_auto_prompt(false, true, false, false, true));
+    }
+
+    #[test]
+    fn the_shared_lock_file_keeps_hello_and_lockout_per_account() {
+        let path = std::env::temp_dir().join(format!("pjdesk-window-lock-{}-{}.json", std::process::id(), line!()));
+        let _ = std::fs::remove_file(&path);
+        let mut file = WindowLockFile { hello: Some(false), email: "Ben@Spader.us".into(), fails: 5, until: 9_000, ..WindowLockFile::default() };
+        write_window_lock(&path, &file).unwrap();
+        let loaded = read_window_lock(&path);
+        assert_eq!(loaded.hello, Some(false));
+        assert_eq!(lockout_for(&loaded, "ben@spader.us"), (5, 9_000));
+        assert_eq!(lockout_for(&loaded, "other@spader.us"), (0, 0));
+        file.hello = Some(true);
+        file.fails = 0;
+        file.until = 0;
+        write_window_lock(&path, &file).unwrap();
+        assert_eq!(read_window_lock(&path).hello, Some(true));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(read_window_lock(&path), WindowLockFile::default());
     }
 }

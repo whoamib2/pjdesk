@@ -134,6 +134,7 @@ struct App {
     release_at: Option<Instant>,
     release_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
     check_release: bool,
+    gate: crate::window_lock::Gate,
 }
 
 /// How a cloud job (network calls on a worker thread) ended.
@@ -267,6 +268,7 @@ impl App {
             release_at: None,
             release_rx: None,
             check_release: spawn_probe,
+            gate: crate::window_lock::Gate::new(),
         };
         if let crate::self_update::Loaded::Present(update) = crate::self_update::Settings::read(&app.data_dir) {
             app.update_start = update.window_start;
@@ -274,6 +276,9 @@ impl App {
         }
         crate::public_addr::remember_port(&app.data_dir, port);
         app.refresh();
+        let email = app.signed_in_email();
+        let (token, api) = app.cloud_session();
+        app.gate.arm(&email, &token, &api);
         if spawn_probe {
             app.probe = spawn_status_probe(&cc.egui_ctx);
             app.start_address_guess();
@@ -417,6 +422,8 @@ impl eframe::App for App {
         for action in tray_actions {
             match action {
                 crate::tray::Action::Show => {
+                    tracing::info!("Opening PJDesk Server from the tray or a second launch");
+                    self.gate.engage();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
@@ -431,6 +438,7 @@ impl eframe::App for App {
                 }
                 crate::tray::Action::OpenLog => crate::tray::open_log_folder(&self.data_dir),
                 crate::tray::Action::CheckUpdates => {
+                    self.gate.engage();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     if self.via_service() {
                         self.status = "Checking for updates…".into();
@@ -446,11 +454,13 @@ impl eframe::App for App {
                     }
                 }
                 crate::tray::Action::Promote => {
+                    self.gate.engage();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     self.cloud_form.confirm_promote = true;
                     self.cloud_form.confirm_demote = false;
                 }
                 crate::tray::Action::Demote => {
+                    self.gate.engage();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     self.cloud_form.confirm_demote = true;
                     self.cloud_form.confirm_promote = false;
@@ -522,6 +532,17 @@ impl eframe::App for App {
             }));
         }
 
+        let email = self.signed_in_email();
+        let (token, api) = self.cloud_session();
+        self.gate.poll(&ctx, &email, &token, &api);
+        let hidden = ctx.input(|i| i.viewport().minimized == Some(true) || i.viewport().visible() == Some(false));
+        self.gate.note_visibility(&ctx, hidden);
+        if self.gate.blocking() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+            self.gate.draw(ui);
+            return;
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(4.0);
@@ -574,6 +595,8 @@ impl eframe::App for App {
                 if self.preview_account {
                     return;
                 }
+                ui.add_space(8.0);
+                self.gate.security_card(ui);
                 ui.add_space(8.0);
                 self.service_card(ui);
                 ui.add_space(8.0);
@@ -1050,6 +1073,20 @@ impl App {
         } else {
             ui.label("Locked — open as administrator to view.");
         }
+    }
+
+    /// Bearer token for the signed-in PJDesk account, when this window can read it.
+    fn cloud_session(&self) -> (String, String) {
+        let api_fallback = crate::cloud::default_api();
+        if self.access == Access::Readable {
+            if let Some(cfg) = crate::cloud::CloudConfig::load(&self.data_dir) {
+                if cfg.is_account() && !cfg.token.is_empty() {
+                    let api = if cfg.api.trim().is_empty() { api_fallback } else { cfg.api.trim_end_matches('/').to_string() };
+                    return (cfg.token, api);
+                }
+            }
+        }
+        (String::new(), api_fallback)
     }
 
     /// Email of the PJDesk account this server is signed in as.

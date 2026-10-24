@@ -3641,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "pjdesk"
-version = "0.6.28"
+version = "0.6.29"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -3670,6 +3670,7 @@ dependencies = [
  "tray-icon",
  "ureq",
  "windows",
+ "windows-future",
  "windows-service",
  "winit",
  "winresource",
@@ -3677,7 +3678,7 @@ dependencies = [
 
 [[package]]
 name = "pjdesk-link"
-version = "0.6.28"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "pjdesk-proto",
@@ -3690,7 +3691,7 @@ dependencies = [
 
 [[package]]
 name = "pjdesk-mobile"
-version = "0.6.28"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "hex",
@@ -3708,7 +3709,7 @@ dependencies = [
 
 [[package]]
 name = "pjdesk-proto"
-version = "0.6.28"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3731,7 +3732,7 @@ dependencies = [
 
 [[package]]
 name = "pjdesk-server"
-version = "0.6.28"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3756,6 +3757,7 @@ dependencies = [
  "tray-icon",
  "ureq",
  "windows",
+ "windows-future",
  "windows-service",
  "winresource",
 ]

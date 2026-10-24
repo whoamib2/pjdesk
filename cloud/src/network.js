@@ -375,6 +375,17 @@ function cleanComputer(row) {
 }
 
 /** Fields the account stores for one saved computer. Passwords are not among them. */
+/**
+ * The PJDesk client sends a network refresh token. The PJDesk Server window
+ * sends its pjdesk.com sign-in (Bearer) and no refresh token. Both read and
+ * write the same sealed PIN.
+ */
+export function appLockAuthMode(header, body) {
+  const bearer = /^Bearer\s+\S+/.test(String(header || ""));
+  if (bearer && !body?.refresh) return "bearer";
+  return "device";
+}
+
 /** Null when `text` is empty or a sealed PJLOCK01 blob. A string is the reason to reject it. */
 export function acceptLock(text) {
   if (text == null || text === "") return null;
@@ -1335,7 +1346,16 @@ async function passwordVault(request, env) {
 
 async function appLock(request, env) {
   const body = await readJson(request);
-  const device = await openedDevice(env, body);
+  const header = request.headers.get("authorization") || "";
+  let device;
+  if (appLockAuthMode(header, body) === "bearer") {
+    const account = await session(request, env);
+    const found = await networkFor(env, account);
+    if (!found.network) throw new HttpError(403, "This account is not on a network.");
+    device = { networkId: found.network.id, accountId: account.accountId, email: account.email };
+  } else {
+    device = await openedDevice(env, body);
+  }
   if (Object.prototype.hasOwnProperty.call(body, "lock")) {
     const lock = String(body.lock ?? "");
     const problem = acceptLock(lock);

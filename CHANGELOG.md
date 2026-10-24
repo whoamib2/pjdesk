@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.29
+
+Windows is 0.6.29. Android stays 0.6.28 (versionCode 62800). cloud/ changed: the worker accepts the PJDesk Server window's pjdesk.com sign-in on the existing app-lock route. No new migration. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Run `cloud\deploy.cmd` so the server window can save the PIN. The phone does not need this build. The PJDesk client and PJDesk Server both need this build. This machine has no Pixel and no Windows PC attached, so Windows Hello was not clicked through here.
+
+* A signed-in Windows window asks for the account PIN before it shows anything. That is the PJDesk client and PJDesk Server, including Open from the tray and a second launch of the same program. A second launch wakes the window that is already open. No command-line flag skips the lock. The service, incoming connections, and updates keep running.
+* If the account has no PIN yet, the window shows Set a PIN (PIN, confirm, and Show) and saves it to the account before the rest of the window opens. Forgot PIN signs in to pjdesk.com again, then asks for a new PIN. Wrong PINs still wait: the first four misses do not, then 1, 2, 5, 10, and 30 minutes.
+* Windows Hello (fingerprint, face, or the Windows Hello PIN) can unlock either window. The lock screen shows Use Windows Hello and asks automatically when Hello is available. Settings, Security, Unlock with Windows Hello is on by default when Hello is available. If Hello is not set up or is not accepted, the window asks for the PJDesk PIN.
+
 ## 0.6.28
 
 Windows is 0.6.28. Android is 0.6.28 (versionCode 62800). cloud/ did not change. No migration and no worker change. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off. Do not delete cloud-sync.json or cloud-state.json. The PJDesk Server account sign-in stays persistent. Do not run `cloud\deploy.cmd`. The phone needs 62800. Cabin Desk and CHIP20 need this Windows client. PJDesk Server needs this build. A 0.6.26 client still pings every 25 seconds, and the server still allows 90 seconds of silence, so that client stays registered. This machine has no Pixel and no Windows PC attached.

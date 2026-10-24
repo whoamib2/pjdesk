@@ -56,6 +56,7 @@ impl SettingsDraft {
         self.tab = Tab::About;
     }
 
+    #[allow(dead_code)]
     pub(super) fn show_security(&mut self) {
         self.tab = Tab::Security;
     }
