@@ -480,10 +480,21 @@ class Engine(context: Context) : EngineListener {
      * startup: a process start must not write the saved choice back to off.
      */
     fun setUnattendedAccess(on: Boolean) {
-        val allowed = on && store.permanent.isNotEmpty() && PjAccessibilityService.enabled(app)
-        store.unattendedAccess = allowed
-        update { it.copy(unattendedAccess = allowed) }
-        command(org.json.JSONObject().put("cmd", "setUnattendedAccess").put("on", allowed).toString())
+        if (!on) {
+            store.unattendedAccess = false
+            update { it.copy(unattendedAccess = false) }
+            command(org.json.JSONObject().put("cmd", "setUnattendedAccess").put("on", false).toString())
+            return
+        }
+        val ready = store.permanent.isNotEmpty() && PjAccessibilityService.enabled(app)
+        if (!ready) {
+            AppLog.i("unattended access stays ${store.unattendedAccess}; the password or accessibility service is not ready")
+            update { it.copy(unattendedAccess = store.unattendedAccess) }
+            return
+        }
+        store.unattendedAccess = true
+        update { it.copy(unattendedAccess = true) }
+        command(org.json.JSONObject().put("cmd", "setUnattendedAccess").put("on", true).toString())
     }
 
     /**
@@ -672,20 +683,14 @@ class Engine(context: Context) : EngineListener {
                 us.spader.pjdesk.service.HostService.consentWait(app)
                 val saved = store.unattendedAccess
                 val passwordReady = store.permanent.isNotEmpty()
-                val accessibilityReady = PjAccessibilityService.ready(app)
-                val requested = event.optBoolean("auto") && saved
-                val auto = requested && passwordReady && accessibilityReady
-                if (requested && !auto) {
-                    AppLog.i(
-                        "unattended access is saved but not ready (password=$passwordReady accessibility=$accessibilityReady); showing the screen share prompt",
-                    )
-                } else if (auto) {
+                val requested = event.optBoolean("auto") && saved && passwordReady
+                if (requested) {
                     AppLog.i("unattended access will accept the screen share dialog")
                 }
                 if (us.spader.pjdesk.service.HostService.capturing) {
-                    if (auto) us.spader.pjdesk.a11y.ProjectionConsent.markAlreadySharing()
+                    if (requested) us.spader.pjdesk.a11y.ProjectionConsent.markAlreadySharing()
                     setCapturing(true)
-                } else if (auto) {
+                } else if (requested) {
                     us.spader.pjdesk.a11y.ProjectionConsent.request(app)
                 } else {
                     us.spader.pjdesk.service.HostService.preferAutoClick = false

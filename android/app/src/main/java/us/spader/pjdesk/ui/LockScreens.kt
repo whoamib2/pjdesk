@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -36,6 +37,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -71,8 +79,40 @@ fun SetPinScreen(
     var shakeToken by remember { mutableIntStateOf(0) }
     val entered = if (confirming) confirm else pin
     val shown = localError.ifBlank { error }
+    val focus = remember { FocusRequester() }
+    fun advance() {
+        localError = when {
+            needPassword && password.isBlank() -> "Enter your account password."
+            !confirming && !AppLockPolicy.pinAcceptable(pin) -> "Use 4 to 8 digits."
+            confirming && confirm != pin -> "Those PINs do not match."
+            confirming && !AppLockPolicy.pinAcceptable(confirm) -> "Use 4 to 8 digits."
+            else -> ""
+        }
+        if (localError == "Those PINs do not match.") {
+            shakeToken++
+            confirm = ""
+        } else if (localError.isEmpty() && !confirming) {
+            confirming = true
+        } else if (localError.isEmpty()) {
+            onSave(pin, password, enableBio && biometricsAvailable)
+        }
+    }
+    LaunchedEffect(needPassword) {
+        if (!needPassword) runCatching { focus.requestFocus() }
+    }
     Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 32.dp),
+        Modifier
+            .fillMaxSize()
+            .focusRequester(focus)
+            .focusable()
+            .onPreviewKeyEvent { event ->
+                val enter = event.key == Key.Enter || event.key == Key.NumPadEnter
+                if (!enter || busy) return@onPreviewKeyEvent false
+                if (event.type == KeyEventType.KeyUp) advance()
+                true
+            }
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp, vertical = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
@@ -86,6 +126,8 @@ fun SetPinScreen(
                 onValueChange = { password = it },
                 label = "Account password",
                 modifier = Modifier.fillMaxWidth(),
+                autofocus = true,
+                onSubmit = { if (!busy) advance() },
             )
             Text(
                 "This is your pjdesk.com password, used once to unlock saved computer passwords.",
@@ -129,23 +171,7 @@ fun SetPinScreen(
             }
         }
         Button(
-            onClick = {
-                localError = when {
-                    needPassword && password.isBlank() -> "Enter your account password."
-                    !confirming && !AppLockPolicy.pinAcceptable(pin) -> "Use 4 to 8 digits."
-                    confirming && confirm != pin -> "Those PINs do not match."
-                    confirming && !AppLockPolicy.pinAcceptable(confirm) -> "Use 4 to 8 digits."
-                    else -> ""
-                }
-                if (localError == "Those PINs do not match.") {
-                    shakeToken++
-                    confirm = ""
-                } else if (localError.isEmpty() && !confirming) {
-                    confirming = true
-                } else if (localError.isEmpty()) {
-                    onSave(pin, password, enableBio && biometricsAvailable)
-                }
-            },
+            onClick = { advance() },
             enabled = !busy && AppLockPolicy.pinAcceptable(entered),
             modifier = Modifier.fillMaxWidth(),
         ) {
@@ -178,11 +204,28 @@ fun UnlockScreen(
     onForgot: () -> Unit = {},
 ) {
     var pin by remember { mutableStateOf("") }
+    val focus = remember { FocusRequester() }
+    fun submit() {
+        if (!busy && !lockedOut && AppLockPolicy.pinAcceptable(pin)) onSubmit(pin)
+    }
     LaunchedEffect(rejectCount) {
         if (rejectCount > 0) pin = ""
     }
+    LaunchedEffect(biometrics) {
+        if (!biometrics) runCatching { focus.requestFocus() }
+    }
     Column(
-        Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 32.dp),
+        Modifier
+            .fillMaxSize()
+            .focusRequester(focus)
+            .focusable()
+            .onPreviewKeyEvent { event ->
+                val enter = event.key == Key.Enter || event.key == Key.NumPadEnter
+                if (!enter) return@onPreviewKeyEvent false
+                if (event.type == KeyEventType.KeyUp) submit()
+                true
+            }
+            .padding(horizontal = 24.dp, vertical = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
@@ -216,7 +259,7 @@ fun UnlockScreen(
         )
         Spacer(Modifier.size(20.dp))
         Button(
-            onClick = { if (AppLockPolicy.pinAcceptable(pin)) onSubmit(pin) },
+            onClick = { submit() },
             enabled = !busy && !lockedOut && AppLockPolicy.pinAcceptable(pin),
             modifier = Modifier.fillMaxWidth(),
         ) { Text(if (busy) "Checking…" else "Unlock") }
@@ -245,7 +288,13 @@ fun ReauthScreen(
             color = pjMuted(),
         )
         AccountEmailField(value = email, onValueChange = onEmail, label = "Email")
-        AccountPasswordField(value = password, onValueChange = { password = it }, label = "Account password")
+        AccountPasswordField(
+            value = password,
+            onValueChange = { password = it },
+            label = "Account password",
+            autofocus = true,
+            onSubmit = { if (!busy && password.isNotBlank()) onSubmit(password) },
+        )
         if (error.isNotEmpty()) Text(error, color = MaterialTheme.colorScheme.error)
         Button(
             onClick = { if (password.isNotBlank()) onSubmit(password) },

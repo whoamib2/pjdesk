@@ -14,6 +14,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -28,7 +30,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.AppLockPolicy
 import us.spader.pjdesk.core.DeskState
@@ -290,7 +296,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.30", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.31", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }
@@ -323,8 +329,26 @@ private fun AccountPinDialog(
     var enableBio by remember { mutableStateOf(biometricsOn) }
     var localError by remember { mutableStateOf("") }
     var submitted by remember { mutableStateOf(false) }
+    val pinFocus = remember { FocusRequester() }
+    val confirmFocus = remember { FocusRequester() }
+    fun save() {
+        localError = when {
+            hasPin && current.isBlank() && password.isBlank() -> "Enter the current PIN or your account password."
+            !hasPin && password.isBlank() -> "Enter your account password."
+            !remove && !AppLockPolicy.pinAcceptable(pin) -> "Use 4 to 8 digits."
+            !remove && pin != confirm -> "Those PINs do not match."
+            else -> ""
+        }
+        if (localError.isEmpty()) {
+            submitted = true
+            onSave(current, password, pin, enableBio && biometrics)
+        }
+    }
     LaunchedEffect(busy, error, submitted) {
         if (submitted && !busy && error.isEmpty()) onDismiss()
+    }
+    LaunchedEffect(Unit) {
+        if (!hasPin && !remove) runCatching { pinFocus.requestFocus() }
     }
     val shown = localError.ifBlank { error }
     AlertDialog(
@@ -337,12 +361,36 @@ private fun AccountPinDialog(
                     color = pjMuted(),
                 )
                 if (hasPin) {
-                    PinEntry(current, { current = it }, "Current PIN", showPin) { showPin = !showPin }
+                    PinEntry(current, { current = it }, "Current PIN", showPin, { showPin = !showPin }, ImeAction.Next) {
+                        if (!remove) runCatching { pinFocus.requestFocus() } else save()
+                    }
                 }
-                AccountPasswordField(value = password, onValueChange = { password = it }, label = "Account password")
+                AccountPasswordField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = "Account password",
+                    autofocus = !hasPin,
+                    onSubmit = { if (remove) save() else runCatching { pinFocus.requestFocus() } },
+                )
                 if (!remove) {
-                    PinEntry(pin, { pin = it }, "New PIN", showPin) { showPin = !showPin }
-                    PinEntry(confirm, { confirm = it }, "Confirm PIN", showPin) { showPin = !showPin }
+                    PinEntry(
+                        pin,
+                        { pin = it },
+                        "New PIN",
+                        showPin,
+                        { showPin = !showPin },
+                        ImeAction.Next,
+                        Modifier.focusRequester(pinFocus),
+                    ) { runCatching { confirmFocus.requestFocus() } }
+                    PinEntry(
+                        confirm,
+                        { confirm = it },
+                        "Confirm PIN",
+                        showPin,
+                        { showPin = !showPin },
+                        ImeAction.Done,
+                        Modifier.focusRequester(confirmFocus),
+                    ) { save() }
                     if (biometrics) {
                         Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                             androidx.compose.material3.Checkbox(checked = enableBio, onCheckedChange = { enableBio = it })
@@ -354,37 +402,35 @@ private fun AccountPinDialog(
             }
         },
         confirmButton = {
-            TextButton(
-                enabled = !busy,
-                onClick = {
-                    localError = when {
-                        hasPin && current.isBlank() && password.isBlank() -> "Enter the current PIN or your account password."
-                        !hasPin && password.isBlank() -> "Enter your account password."
-                        !remove && !AppLockPolicy.pinAcceptable(pin) -> "Use 4 to 8 digits."
-                        !remove && pin != confirm -> "Those PINs do not match."
-                        else -> ""
-                    }
-                    if (localError.isEmpty()) {
-                        submitted = true
-                        onSave(current, password, pin, enableBio && biometrics)
-                    }
-                },
-            ) { Text(if (busy) "Saving…" else if (remove) "Remove" else "Save") }
+            TextButton(enabled = !busy, onClick = { save() }) {
+                Text(if (busy) "Saving…" else if (remove) "Remove" else "Save")
+            }
         },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") } },
     )
 }
 
 @Composable
-private fun PinEntry(value: String, onValue: (String) -> Unit, label: String, shown: Boolean, onToggle: () -> Unit) {
+private fun PinEntry(
+    value: String,
+    onValue: (String) -> Unit,
+    label: String,
+    shown: Boolean,
+    onToggle: () -> Unit,
+    ime: ImeAction = ImeAction.Next,
+    modifier: Modifier = Modifier,
+    onIme: () -> Unit = {},
+) {
     OutlinedTextField(
         value = value,
         onValueChange = { onValue(it.filter { ch -> ch.isDigit() }.take(8)) },
         label = { Text(label) },
         singleLine = true,
         visualTransformation = if (shown) VisualTransformation.None else PasswordVisualTransformation(),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword, imeAction = ime),
+        keyboardActions = KeyboardActions(onNext = { onIme() }, onDone = { onIme() }),
         trailingIcon = { TextButton(onClick = onToggle) { Text(if (shown) "Hide" else "Show") } },
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
     )
 }
 

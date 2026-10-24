@@ -120,7 +120,6 @@ class ViewRequestActivity : ComponentActivity() {
     }
 
     private fun launchProjection() {
-        HostService.preferAutoClick = false
         projection.launch(EntireScreen.captureIntent(this))
     }
 

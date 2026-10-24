@@ -28,6 +28,7 @@ class PjApp : Application() {
         store = Store(this)
         engine = Engine(this)
         engine.start()
+        runCatching { us.spader.pjdesk.service.HostService.arm(this) }
     }
 
     fun holdVaultKey(key: ByteArray) {

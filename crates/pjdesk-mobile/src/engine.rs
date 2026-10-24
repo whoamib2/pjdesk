@@ -13,23 +13,27 @@ use anyhow::{anyhow, bail, Context, Result};
 use pjdesk_link::admit::{self, Admit};
 use pjdesk_link::lockout::{self, Lockout};
 use pjdesk_link::p2p::{self, LinkPath};
-use pjdesk_link::session::{self, grant_auth, refuse_auth, refuse_before_password, LockedOut, NeedsApproval, WrongPassword};
+use pjdesk_link::session::{
+    self, grant_auth, refuse_auth, refuse_before_password, LockedOut, NeedsApproval, WrongPassword,
+};
 use pjdesk_link::signal::{ServerAddr, SignalClient};
 use pjdesk_proto::auth::generate_password;
+use pjdesk_proto::filesafe::{self, MAX_TRANSFER_BYTES};
 use pjdesk_proto::framing::{read_msg, write_msg, MAX_CONTROL_FRAME};
 use pjdesk_proto::gesture::{Gesture, PointerAdapter, GESTURE_LONG_PRESS, GESTURE_PINCH, GESTURE_SWIPE, GESTURE_TAP};
-use pjdesk_proto::filesafe::{self, MAX_TRANSFER_BYTES};
 use pjdesk_proto::peer::{
-    read_video_frame, write_side_chunk, write_side_header, write_video_frame, ClipKind, Clipboard, ControlMsg, DisplayLayout,
-    FileMsg, HostMsg, InputEvent, KeyboardMode, MonitorInfo, SideHeader, SpecialCommand, VideoHeader, FILE_MAGIC, MAX_CLIP_TEXT,
-    VIEW_SINGLE,
+    read_video_frame, write_side_chunk, write_side_header, write_video_frame, ClipKind, Clipboard, ControlMsg,
+    DisplayLayout, FileMsg, HostMsg, InputEvent, KeyboardMode, MonitorInfo, SideHeader, SpecialCommand, VideoHeader,
+    FILE_MAGIC, MAX_CLIP_TEXT, VIEW_SINGLE,
 };
 use pjdesk_proto::perms::{self, grant};
 use pjdesk_proto::quality::{self, StreamQuality};
 use pjdesk_proto::signal::{ClientMsg, ServerMsg};
 use pjdesk_proto::tls::TlsIdentity;
 use pjdesk_proto::udp::Role;
-use pjdesk_proto::{derive_device_secret, format_id, is_valid_id, normalize_id, LEGACY_REGISTERED_SERVER, PROTOCOL_VERSION};
+use pjdesk_proto::{
+    derive_device_secret, format_id, is_valid_id, normalize_id, LEGACY_REGISTERED_SERVER, PROTOCOL_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -37,7 +41,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.30";
+pub const APP_VERSION: &str = "0.6.31";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -493,7 +497,8 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             if let Some(host) = cmd.get("hostname").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
                 facts.hostname = host.chars().take(64).collect();
             }
-            if let Some(family) = cmd.get("os_family").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(family) = cmd.get("os_family").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+            {
                 facts.os_family = family.chars().take(32).collect();
             }
             if let Some(version) = cmd.get("os_version").and_then(|v| v.as_str()).map(str::trim) {
@@ -528,14 +533,21 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 emit(cb, &json!({"event":"error","text":"That server address is not host or host:port."}));
                 log_line(cb, format!("server rejected address len={}", address.len()));
             } else {
-                if let Some(fp) = cmd.get("fingerprint").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(fp) =
+                    cmd.get("fingerprint").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+                {
                     if let Ok(parsed) = pjdesk_proto::tls::parse_fingerprint(fp) {
                         *state.fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&parsed));
                     }
                 }
                 *state.server.lock().unwrap() = address.clone();
                 if let Some(list) = cmd.get("lan").and_then(|v| v.as_array()) {
-                    *state.lan.lock().unwrap() = list.iter().filter_map(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                    *state.lan.lock().unwrap() = list
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                 }
                 if let Some(ip) = cmd.get("publicIp").and_then(|v| v.as_str()) {
                     *state.public_ip.lock().unwrap() = ip.trim().to_string();
@@ -626,7 +638,9 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             let view_mark = state.view_gen.load(Ordering::SeqCst);
             let (state, cb) = (state.clone(), cb.clone());
             tokio::spawn(async move {
-                if let Err(e) = controller_session(state.clone(), cb.clone(), &id, &password, gen, view_mark, ask_now).await {
+                if let Err(e) =
+                    controller_session(state.clone(), cb.clone(), &id, &password, gen, view_mark, ask_now).await
+                {
                     let raw = format!("{e:#}");
                     let head = raw.lines().next().unwrap_or("").trim().to_string();
                     log_line(&cb, format!("connect ended: {head}"));
@@ -785,10 +799,7 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             let bytes = clip_text(text);
             if !bytes.is_empty() {
                 let len = bytes.len() as u32;
-                send_control(
-                    state,
-                    ControlMsg::Clipboard(Clipboard { kind: ClipKind::Text, bytes, byte_len: len }),
-                );
+                send_control(state, ControlMsg::Clipboard(Clipboard { kind: ClipKind::Text, bytes, byte_len: len }));
             }
         }
         "shutdown" => state.app_stop.store(true, Ordering::SeqCst),
@@ -897,15 +908,17 @@ async fn open_signal(
     cb: &Arc<dyn Callbacks>,
     server: &ServerAddr,
     pinned: Option<pjdesk_proto::tls::Fingerprint>,
+    public_only: bool,
 ) -> Result<SignalClient> {
     let lan = state.lan.lock().unwrap().clone();
     let published = state.public_ip.lock().unwrap().clone();
     let mine = state.my_public_ip.lock().unwrap().clone();
     let public = server.to_string();
-    if !lan.is_empty() {
+    log_line(cb, format!("looking up {public}"));
+    if !public_only && !lan.is_empty() {
         log_line(cb, format!("trying the server on LAN ({}) and {public}", lan.join(", ")));
     }
-    match SignalClient::connect_reaching(server, pinned, &lan, &published, &mine).await {
+    match SignalClient::connect_reaching(server, pinned, &lan, &published, &mine, public_only).await {
         Ok(signal) => {
             log_line(cb, format!("signaling via {} {} (TCP 21200)", signal.via, signal.server_addr));
             emit(
@@ -942,22 +955,38 @@ async fn open_signal(
 
 async fn host_loop(state: Arc<State>, cb: Arc<dyn Callbacks>) {
     let mut wait = Duration::from_secs(1);
+    let mut public_only = false;
     while !state.app_stop.load(Ordering::SeqCst) {
-        match host_once(state.clone(), cb.clone()).await {
-            Ok(()) => wait = Duration::from_secs(1),
+        let mut advance = false;
+        match host_once(state.clone(), cb.clone(), public_only).await {
+            Ok(()) => {
+                public_only = false;
+                wait = Duration::from_secs(1);
+            }
             Err(e) => {
                 let full = format!("{e:#}");
                 let head = full.lines().next().unwrap_or("could not reach the PJDesk server").trim();
                 warn!("host signaling: {full}");
                 emit(&cb, &json!({"event":"status","text": head}));
-                wait = (wait * 2).min(Duration::from_secs(20));
+                if pjdesk_proto::signal::is_standby_refusal(&full) {
+                    public_only = true;
+                    wait = Duration::from_secs(1);
+                } else {
+                    advance = true;
+                }
             }
         }
-        tokio::time::sleep(wait).await;
+        if state.app_stop.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(pjdesk_proto::signal::jitter_reconnect(wait)).await;
+        if advance {
+            wait = pjdesk_proto::signal::next_reconnect_delay(wait);
+        }
     }
 }
 
-async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
+async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool) -> Result<()> {
     let server_text = state.server.lock().unwrap().clone();
     if server_text.trim().is_empty() {
         emit(&cb, &json!({"event":"status","text":"Sign in required"}));
@@ -965,7 +994,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
     }
     let server = ServerAddr::parse(&server_text)?;
     let pinned = state.fingerprint.lock().unwrap().clone().and_then(|s| pjdesk_proto::tls::parse_fingerprint(&s).ok());
-    let mut signal = open_signal(&state, &cb, &server, pinned).await?;
+    let mut signal = open_signal(&state, &cb, &server, pinned, public_only).await?;
     if let Some(fp) = signal.observed {
         let text = pjdesk_proto::tls::format_fingerprint(&fp);
         *state.fingerprint.lock().unwrap() = Some(text);
@@ -988,7 +1017,11 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
         device_secret: state.secret,
         hostname: {
             let reported = state.facts.lock().unwrap().hostname.clone();
-            if reported.trim().is_empty() { state.hostname.clone() } else { reported }
+            if reported.trim().is_empty() {
+                state.hostname.clone()
+            } else {
+                reported
+            }
         },
         app_version: APP_VERSION.into(),
     })?;
@@ -1042,7 +1075,18 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
                         *state.device_id.lock().unwrap() = Some(device_id.clone());
                         persist(&state);
                         publish(&state, &cb);
-                        log_line(&cb, format!("registered as {} (phone)", format_id(&device_id)));
+                        let key = state.fingerprint.lock().unwrap().clone().unwrap_or_default();
+                        let key = pjdesk_proto::discover::fingerprint_prefix(&key);
+                        log_line(
+                            &cb,
+                            format!(
+                                "registered {} (phone) with {} via {} ({}), key {key}, role primary",
+                                format_id(&device_id),
+                                server,
+                                signal.via,
+                                signal.server_addr
+                            ),
+                        );
                         emit(&cb, &json!({"event":"status","text":"Ready"}));
                     }
                     ServerMsg::Policy(policy) => {
@@ -1096,6 +1140,18 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>) -> Result<()> {
                         }
                     }
                     ServerMsg::Error { message, .. } => {
+                        if pjdesk_proto::signal::is_standby_refusal(&message) {
+                            let key = state.fingerprint.lock().unwrap().clone().unwrap_or_default();
+                            let key = pjdesk_proto::discover::fingerprint_prefix(&key);
+                            log_line(
+                                &cb,
+                                format!(
+                                    "registration refused by the standby at {} via {} ({}), key {key}; connecting to the primary",
+                                    server, signal.via, signal.server_addr
+                                ),
+                            );
+                            bail!("{message}");
+                        }
                         emit(&cb, &json!({"event":"status","text": message}));
                     }
                     ServerMsg::WantHostReport => {
@@ -1125,7 +1181,9 @@ async fn offer_android_update(cb: &Arc<dyn Callbacks>, from_server: bool) {
     } else {
         emit(cb, &json!({"event":"status","text":"Checking for updates…"}));
     }
-    let found = tokio::task::spawn_blocking(|| pjdesk_proto::update::check_android(pjdesk_proto::UPDATE_REPO, APP_VERSION)).await;
+    let found =
+        tokio::task::spawn_blocking(|| pjdesk_proto::update::check_android(pjdesk_proto::UPDATE_REPO, APP_VERSION))
+            .await;
     match found {
         Ok(Ok(Some(update))) => {
             emit(
@@ -1226,7 +1284,9 @@ fn view_is_preapproved(state: &State, ask: &ViewAsk) -> bool {
     if !account.is_empty() && !mine.trim().is_empty() && account.eq_ignore_ascii_case(mine.trim()) {
         return true;
     }
-    if !account.is_empty() && state.trusted_accounts.lock().unwrap().iter().any(|saved| saved.eq_ignore_ascii_case(account)) {
+    if !account.is_empty()
+        && state.trusted_accounts.lock().unwrap().iter().any(|saved| saved.eq_ignore_ascii_case(account))
+    {
         return true;
     }
     let computer = ask.computer.trim();
@@ -1236,7 +1296,8 @@ fn view_is_preapproved(state: &State, ask: &ViewAsk) -> bool {
         if saved.is_empty() {
             return false;
         }
-        (!computer.is_empty() && saved.eq_ignore_ascii_case(computer)) || (!id.is_empty() && saved.chars().filter(|c| c.is_ascii_digit()).eq(id.chars()))
+        (!computer.is_empty() && saved.eq_ignore_ascii_case(computer))
+            || (!id.is_empty() && saved.chars().filter(|c| c.is_ascii_digit()).eq(id.chars()))
     })
 }
 
@@ -1271,7 +1332,9 @@ async fn approve(state: &State, cb: &Arc<dyn Callbacks>, name: &str, ip: &str, v
         Ok(Ok(Ok(()))) => Approval::Yes(grant(perms::KEYBOARD | perms::MOUSE, policy.max_permissions, false)),
         Ok(Ok(Err(reason))) => Approval::No(reason),
         Ok(Err(_)) => Approval::No("the approval prompt closed".into()),
-        Err(_) if view => Approval::No(format!("Timed out. No one at {} answered the request to view the screen", state.hostname)),
+        Err(_) if view => {
+            Approval::No(format!("Timed out. No one at {} answered the request to view the screen", state.hostname))
+        }
         Err(_) => Approval::No(format!("No one at {} answered the request", state.hostname)),
     }
 }
@@ -1308,7 +1371,18 @@ async fn host_session(
         &cb,
         format!("checking the password ({} slot{})", passwords.len(), if passwords.len() == 1 { "" } else { "s" }),
     );
-    let accepted = accept_authenticated(&state, &cb, &endpoint, &passwords, &state.hostname, server_udp.ip(), peer_public, &controller_ip, &controller_name).await;
+    let accepted = accept_authenticated(
+        &state,
+        &cb,
+        &endpoint,
+        &passwords,
+        &state.hostname,
+        server_udp.ip(),
+        peer_public,
+        &controller_ip,
+        &controller_name,
+    )
+    .await;
     punching.abort();
     let (connection, mut auth, ask) = match accepted {
         Ok(done) => done,
@@ -1325,7 +1399,11 @@ async fn host_session(
     *state.view_ask.lock().unwrap() = ask.clone();
     let mut auto_share = false;
     let ceiling = if auth.password_slot == ASK_SLOT {
-        let who = if ask.view && !auth.peer_name.trim().is_empty() { auth.peer_name.clone() } else { controller_name.clone() };
+        let who = if ask.view && !auth.peer_name.trim().is_empty() {
+            auth.peer_name.clone()
+        } else {
+            controller_name.clone()
+        };
         let bypass = ask.view && view_is_preapproved(&state, &ask);
         let auto = should_auto_share(state.unattended_access.load(Ordering::SeqCst), false, bypass);
         if auto {
@@ -1358,28 +1436,28 @@ async fn host_session(
             let policy = state.policy.lock().unwrap().clone();
             admit::support_open(&policy, false)
         } else {
-        let matched = admit::matched_permanent(&passwords, auth.password_slot, permanent.as_deref());
-        let permanent_set = permanent.as_deref().map(str::trim).is_some_and(|p| !p.is_empty());
-        let approval = state.approval.lock().unwrap().clone();
-        let policy = state.policy.lock().unwrap().clone();
-        match admit::after_password(&approval, matched, permanent_set, &policy, false) {
-            Admit::Open(bits) => {
-                auto_share = should_auto_share(state.unattended_access.load(Ordering::SeqCst), matched, false);
-                log_line(&cb, "accepting with the permanent password, without asking");
-                grant_auth(&mut auth.send, &state.hostname).await?;
-                bits
-            }
-            Admit::Ask => match approve(&state, &cb, &controller_name, &controller_ip, false, false).await {
-                Approval::Yes(bits) => {
+            let matched = admit::matched_permanent(&passwords, auth.password_slot, permanent.as_deref());
+            let permanent_set = permanent.as_deref().map(str::trim).is_some_and(|p| !p.is_empty());
+            let approval = state.approval.lock().unwrap().clone();
+            let policy = state.policy.lock().unwrap().clone();
+            match admit::after_password(&approval, matched, permanent_set, &policy, false) {
+                Admit::Open(bits) => {
+                    auto_share = should_auto_share(state.unattended_access.load(Ordering::SeqCst), matched, false);
+                    log_line(&cb, "accepting with the permanent password, without asking");
                     grant_auth(&mut auth.send, &state.hostname).await?;
                     bits
                 }
-                Approval::No(reason) => {
-                    let _ = refuse_auth(&mut auth.send, &reason).await;
-                    bail!(reason);
-                }
-            },
-        }
+                Admit::Ask => match approve(&state, &cb, &controller_name, &controller_ip, false, false).await {
+                    Approval::Yes(bits) => {
+                        grant_auth(&mut auth.send, &state.hostname).await?;
+                        bits
+                    }
+                    Approval::No(reason) => {
+                        let _ = refuse_auth(&mut auth.send, &reason).await;
+                        bail!(reason);
+                    }
+                },
+            }
         }
     };
     if auth.password_slot != ASK_SLOT {
@@ -1675,7 +1753,10 @@ fn explain_connect_error(target: &str, host_name: &str, err: &anyhow::Error) -> 
     let who = if host_name.trim().is_empty() { format_id(target) } else { host_name.trim().to_string() };
     if lower.contains("even through the relay") {
         format!("Could not reach {who}, even through the relay.")
-    } else if lower.contains("did not respond") || lower.contains("did not finish setting up") || lower.contains("is offline") {
+    } else if lower.contains("did not respond")
+        || lower.contains("did not finish setting up")
+        || lower.contains("is offline")
+    {
         if head.contains(&who) {
             head.to_string()
         } else {
@@ -2006,7 +2087,7 @@ async fn controller_session(
     }
     let server = ServerAddr::parse(&server_text)?;
     let pinned = state.fingerprint.lock().unwrap().clone().and_then(|s| pjdesk_proto::tls::parse_fingerprint(&s).ok());
-    let mut signal = open_signal(&state, &cb, &server, pinned).await?;
+    let mut signal = open_signal(&state, &cb, &server, pinned, false).await?;
     if let Some(fp) = signal.observed {
         *state.fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         persist(&state);
@@ -2080,13 +2161,12 @@ async fn controller_session(
                 TypedAuth::Cancel => bail!("cancelled"),
             }
         }
-        let punching = binding.punch_socket.try_clone().ok().map(|sock| {
-            p2p::spawn_punching(sock, candidates.clone(), session_id, Duration::from_secs(8))
-        });
-        log_line(
-            &cb,
-            "Trying a direct connection on this network first (UDP 21201), then the relay",
-        );
+        let punching = binding
+            .punch_socket
+            .try_clone()
+            .ok()
+            .map(|sock| p2p::spawn_punching(sock, candidates.clone(), session_id, Duration::from_secs(8)));
+        log_line(&cb, "Trying a direct connection on this network first (UDP 21201), then the relay");
         let connected = p2p::connect_to_host(&endpoint, &candidates, server_udp, false).await;
         if let Some(punching) = punching {
             punching.abort();
@@ -2132,10 +2212,7 @@ async fn controller_session(
             }
             Err(e) if e.is::<WrongPassword>() => {
                 connection.close(1u32.into(), b"authentication failed");
-                log_line(
-                    &cb,
-                    format!("incorrect password for {} (saved cleared: {from_store})", format_id(target)),
-                );
+                log_line(&cb, format!("incorrect password for {} (saved cleared: {from_store})", format_id(target)));
                 let mut text = format!("Incorrect password for {}", format_id(target));
                 if from_store {
                     emit(&cb, &json!({"event":"clearSaved","id": target}));
@@ -2288,9 +2365,7 @@ async fn controller_session(
             }
             Ok(HostMsg::Pong { t_us }) => emit(&cb, &json!({"event":"pong","t_us": t_us})),
             Ok(HostMsg::Privacy { enabled }) => emit(&cb, &json!({"event":"privacy","enabled": enabled})),
-            Ok(HostMsg::Restarting) => {
-                emit(&cb, &json!({"event":"status","text": "The other computer is restarting"}))
-            }
+            Ok(HostMsg::Restarting) => emit(&cb, &json!({"event":"status","text": "The other computer is restarting"})),
             Ok(HostMsg::Clipboard(clip)) => {
                 if matches!(clip.kind, ClipKind::Text) {
                     if let Ok(text) = String::from_utf8(clip.bytes) {
@@ -2307,8 +2382,13 @@ async fn controller_session(
                         let cb_file = cb.clone();
                         tokio::spawn(async move {
                             match send_file_bytes(conn, id, &job.path, resume_from).await {
-                                Ok(()) => emit(&cb_file, &json!({"event":"status","text": format!("Sent {}", job.name)})),
-                                Err(e) => emit(&cb_file, &json!({"event":"status","text": format!("Could not send the file: {e}")})),
+                                Ok(()) => {
+                                    emit(&cb_file, &json!({"event":"status","text": format!("Sent {}", job.name)}))
+                                }
+                                Err(e) => emit(
+                                    &cb_file,
+                                    &json!({"event":"status","text": format!("Could not send the file: {e}")}),
+                                ),
                             }
                         });
                     }
@@ -2419,7 +2499,10 @@ mod tests {
     #[test]
     fn mouse_buttons_follow_the_command() {
         let right = mouse_from(&json!({"kind":"down","button":"right","x":1,"y":2})).unwrap();
-        assert!(matches!(right, InputEvent::MouseButton { button: pjdesk_proto::peer::MouseButton::Right, down: true }));
+        assert!(matches!(
+            right,
+            InputEvent::MouseButton { button: pjdesk_proto::peer::MouseButton::Right, down: true }
+        ));
         let left = mouse_from(&json!({"kind":"up","x":1,"y":2})).unwrap();
         assert!(matches!(left, InputEvent::MouseButton { button: pjdesk_proto::peer::MouseButton::Left, down: false }));
         assert_eq!(clip_text("héllo").len(), "héllo".len());
@@ -2526,10 +2609,7 @@ mod tests {
             "Could not reach Cabin Desk, even through the relay."
         );
         let offline = anyhow::anyhow!("the host did not respond");
-        assert_eq!(
-            explain_connect_error("902488771", "", &offline),
-            "902 488 771 is offline, or it did not answer."
-        );
+        assert_eq!(explain_connect_error("902488771", "", &offline), "902 488 771 is offline, or it did not answer.");
         let locked = anyhow::anyhow!("locked out, try again in 20 minutes");
         assert_eq!(explain_connect_error("902488771", "Cabin Desk", &locked), "locked out, try again in 20 minutes");
         let empty = anyhow::anyhow!("the server address is empty");
@@ -2570,7 +2650,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let state = test_state(&dir);
-        let ben = ViewAsk { view: true, account: "ben@spader.us".into(), computer: "BENLENOVODESK".into(), id: "692996394".into() };
+        let ben = ViewAsk {
+            view: true,
+            account: "ben@spader.us".into(),
+            computer: "BENLENOVODESK".into(),
+            id: "692996394".into(),
+        };
         *state.permanent.lock().unwrap() = Some("long-enough-password".into());
         *state.approval.lock().unwrap() = "unattended".into();
         assert!(!view_is_preapproved(&state, &ben), "the old approval mode does not skip Allow");
@@ -2643,7 +2728,8 @@ mod tests {
     }
 
     fn test_state(dir: &std::path::Path) -> Arc<State> {
-        let identity = TlsIdentity::load_or_create(&dir.join("host.crt"), &dir.join("host.key"), "pjdesk-host").unwrap();
+        let identity =
+            TlsIdentity::load_or_create(&dir.join("host.crt"), &dir.join("host.key"), "pjdesk-host").unwrap();
         Arc::new(State {
             dir: dir.to_path_buf(),
             hostname: "Pixel".into(),

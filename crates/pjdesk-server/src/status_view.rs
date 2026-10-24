@@ -104,6 +104,10 @@ pub struct Snapshot {
     pub public_watch: bool,
     #[serde(default)]
     pub public_ip_line: String,
+    /// Last lines of server.log, with passwords and tokens removed.
+    /// An unelevated window can copy this. The data folder stays locked.
+    #[serde(default)]
+    pub log_tail: String,
 }
 
 /// One computer, safe to put on the status pipe. No password, secret, or key.
@@ -124,12 +128,7 @@ pub struct ListedDevice {
 impl Snapshot {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn from_disk(dir: &Path, port: u16, service_running: bool) -> Self {
-        let mut snap = Self {
-            version: env!("CARGO_PKG_VERSION").into(),
-            port,
-            service_running,
-            ..Self::default()
-        };
+        let mut snap = Self { version: env!("CARGO_PKG_VERSION").into(), port, service_running, ..Self::default() };
         if access(dir) != Access::Readable {
             return snap;
         }
@@ -193,8 +192,66 @@ impl Snapshot {
         snap.public_watch_known = true;
         snap.public_watch = watch.enabled(&snap.public_address);
         snap.public_ip_line = watch.line();
+        snap.log_tail = redacted_log_tail(&dir.join("server.log"));
         snap
     }
+}
+
+/// Last lines of a log, safe to put on the clipboard or the status pipe.
+pub(crate) fn redacted_log_tail(path: &Path) -> String {
+    let Ok(bytes) = std::fs::read(path) else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(80);
+    let joined = lines[start..].join("\n");
+    let redacted = redact_secrets(&joined);
+    let max = 16_000;
+    if redacted.chars().count() <= max {
+        redacted
+    } else {
+        let skip = redacted.chars().count() - max;
+        redacted.chars().skip(skip).collect()
+    }
+}
+
+/// Drops passwords, tokens, and key material. Host names, IDs, and addresses stay.
+pub(crate) fn redact_secrets(text: &str) -> String {
+    text.lines().map(redact_line).collect::<Vec<_>>().join("\n")
+}
+
+fn redact_line(line: &str) -> String {
+    let upper = line.to_ascii_uppercase();
+    if upper.contains("PRIVATE KEY") || upper.contains("BEGIN CERTIFICATE") || upper.contains("BEGIN RSA") {
+        return "[redacted]".into();
+    }
+    line.split_inclusive(char::is_whitespace).map(redact_word).collect()
+}
+
+fn redact_word(word: &str) -> String {
+    let lower = word.to_ascii_lowercase();
+    for key in ["password=", "token=", "secret=", "refresh_token=", "authorization=", "pin="] {
+        if let Some(at) = lower.find(key) {
+            let end = at + key.len();
+            let value = word[end..].trim_end_matches(|c: char| c.is_whitespace());
+            let ws = &word[end + value.len()..];
+            if value.is_empty() {
+                return word.to_string();
+            }
+            return format!("{}[redacted]{ws}", &word[..end]);
+        }
+    }
+    let trimmed = word.trim_end_matches(|c: char| c.is_whitespace());
+    let ws = &word[trimmed.len()..];
+    if trimmed.starts_with("eyJ") && trimmed.len() >= 20 {
+        return format!("[redacted]{ws}");
+    }
+    let alnum = trimmed.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+    if alnum >= 40 && !trimmed.contains('.') && !trimmed.contains(':') {
+        return format!("[redacted]{ws}");
+    }
+    word.to_string()
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -314,6 +371,17 @@ mod tests {
         assert_eq!(snap.devices.len(), 1);
         assert_eq!(snap.devices[0].version, "0.5.1");
         assert_eq!(snap.devices[0].hostname, "office");
+        std::fs::write(
+            dir.join("server.log"),
+            "host 902488771 registered via LAN (10.0.0.20:21200)\npassword=hunter2 token=SUPERSECRETTOKENVALUE1234567890ABCDEF\n-----BEGIN PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let snap = Snapshot::from_disk(&dir, 21200, true);
+        assert!(snap.log_tail.contains("902488771"), "{}", snap.log_tail);
+        assert!(snap.log_tail.contains("10.0.0.20"), "{}", snap.log_tail);
+        assert!(!snap.log_tail.contains("hunter2"), "{}", snap.log_tail);
+        assert!(!snap.log_tail.contains("SUPERSECRETTOKENVALUE"), "{}", snap.log_tail);
+        assert!(!snap.log_tail.contains("PRIVATE KEY"), "{}", snap.log_tail);
 
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("DEVICESECRETSHA"));

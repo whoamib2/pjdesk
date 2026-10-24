@@ -73,7 +73,8 @@ pub fn ensure(data_dir: &Path, port: u16) -> PublicAddress {
             if restored != existing.address.trim() {
                 existing.address = restored;
                 existing.source = "legacy".into();
-                existing.note = "Kept the hostname computers already use. A public IP change does not replace it.".into();
+                existing.note =
+                    "Kept the hostname computers already use. A public IP change does not replace it.".into();
                 save(data_dir, &existing);
             }
             return existing;
@@ -155,36 +156,28 @@ fn local_ips() -> Vec<IpAddr> {
 /// Picks the address to show. A name that resolves to this server's public
 /// address wins. A public IP is next. A LAN address is kept for the window
 /// and is not publishable until someone confirms it.
-pub fn choose_address(port: u16, legacy_host: &str, legacy_ips: &[IpAddr], public_ip: Option<IpAddr>, local_ips: &[IpAddr]) -> Guess {
+pub fn choose_address(
+    port: u16,
+    legacy_host: &str,
+    legacy_ips: &[IpAddr],
+    public_ip: Option<IpAddr>,
+    local_ips: &[IpAddr],
+) -> Guess {
     let port = if port == 0 { pjdesk_proto::DEFAULT_PORT } else { port };
     let on_public = public_ip.is_some_and(|ip| !is_private_ip(ip) && legacy_ips.contains(&ip));
     let on_local_public = legacy_ips.iter().any(|ip| !is_private_ip(*ip) && local_ips.contains(ip));
     if !legacy_host.is_empty() && (on_public || on_local_public) {
-        return Guess {
-            address: format!("{legacy_host}:{port}"),
-            source: "legacy",
-            needs_confirmation: false,
-        };
+        return Guess { address: format!("{legacy_host}:{port}"), source: "legacy", needs_confirmation: false };
     }
     if let Some(ip) = public_ip.filter(|ip| !is_private_ip(*ip)) {
-        return Guess {
-            address: format_endpoint(ip, port),
-            source: "public-ip",
-            needs_confirmation: false,
-        };
+        return Guess { address: format_endpoint(ip, port), source: "public-ip", needs_confirmation: false };
     }
-    if let Some(ip) = local_ips.iter().copied().find(|ip| is_private_ip(*ip) && !ip.is_unspecified() && !ip.is_loopback()) {
-        return Guess {
-            address: format_endpoint(ip, port),
-            source: "lan",
-            needs_confirmation: true,
-        };
+    if let Some(ip) =
+        local_ips.iter().copied().find(|ip| is_private_ip(*ip) && !ip.is_unspecified() && !ip.is_loopback())
+    {
+        return Guess { address: format_endpoint(ip, port), source: "lan", needs_confirmation: true };
     }
-    Guess {
-        address: String::new(),
-        source: "none",
-        needs_confirmation: true,
-    }
+    Guess { address: String::new(), source: "none", needs_confirmation: true }
 }
 
 fn format_endpoint(ip: IpAddr, port: u16) -> String {
@@ -340,15 +333,22 @@ impl IpWatch {
     }
 }
 
-/// Broadcasts this server's signaling port and key on UDP 21202 until the process ends.
-/// Clients on the same LAN learn the private address without waiting for the account.
-pub fn announce_lan(port: u16, fingerprint: [u8; 32]) {
+/// Broadcasts this server's signaling port, key, and role on UDP 21202 until
+/// the process ends. The role is read again every announcement, so a promote
+/// or demote shows up without a restart. Clients ignore a standby.
+pub fn announce_lan(port: u16, fingerprint: [u8; 32], data_dir: std::path::PathBuf) {
     let port = if port == 0 { pjdesk_proto::DEFAULT_PORT } else { port };
     let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else { return };
     let _ = socket.set_broadcast(true);
     let dest = std::net::SocketAddr::from(([255, 255, 255, 255], pjdesk_proto::DISCOVERY_PORT));
-    let packet = pjdesk_proto::discover::encode_server(&pjdesk_proto::discover::ServerBeacon { port, fingerprint });
     loop {
+        let role = if crate::cloud::accepts_host_registrations(&data_dir) {
+            pjdesk_proto::discover::BeaconRole::Primary
+        } else {
+            pjdesk_proto::discover::BeaconRole::Standby
+        };
+        let packet =
+            pjdesk_proto::discover::encode_server(&pjdesk_proto::discover::ServerBeacon { port, fingerprint, role });
         let _ = socket.send_to(&packet, dest);
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
@@ -383,7 +383,8 @@ pub fn poll_public_ip(data_dir: &Path, now: u64) -> bool {
         return false;
     }
     let Some(ip) = fetch_public_ip() else { return false };
-    let (observed, pending, hits, changed) = note_ip_reading(&watch.observed, &watch.pending, watch.hits, &ip.to_string());
+    let (observed, pending, hits, changed) =
+        note_ip_reading(&watch.observed, &watch.pending, watch.hits, &ip.to_string());
     let previous = watch.observed.clone();
     watch.observed = observed;
     watch.pending = pending;
@@ -419,9 +420,7 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
                 || a == 0
                 || (a == 100 && (64..128).contains(&b))
         }
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unspecified() || is_unique_local(v6) || is_v6_link_local(v6)
-        }
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || is_unique_local(v6) || is_v6_link_local(v6),
     }
 }
 
@@ -444,7 +443,13 @@ mod tests {
 
     #[test]
     fn a_legacy_name_wins_when_it_points_at_this_server() {
-        let guess = choose_address(21200, "pjdesk.spader.us", &[v4(203, 0, 113, 10)], Some(v4(203, 0, 113, 10)), &[v4(192, 168, 1, 20)]);
+        let guess = choose_address(
+            21200,
+            "pjdesk.spader.us",
+            &[v4(203, 0, 113, 10)],
+            Some(v4(203, 0, 113, 10)),
+            &[v4(192, 168, 1, 20)],
+        );
         assert_eq!(guess.address, "pjdesk.spader.us:21200");
         assert_eq!(guess.source, "legacy");
         assert!(!guess.needs_confirmation);
@@ -453,7 +458,13 @@ mod tests {
 
     #[test]
     fn a_public_ip_is_used_when_the_legacy_name_points_elsewhere() {
-        let guess = choose_address(21200, "pjdesk.spader.us", &[v4(203, 0, 113, 10)], Some(v4(198, 51, 100, 8)), &[v4(192, 168, 1, 20)]);
+        let guess = choose_address(
+            21200,
+            "pjdesk.spader.us",
+            &[v4(203, 0, 113, 10)],
+            Some(v4(198, 51, 100, 8)),
+            &[v4(192, 168, 1, 20)],
+        );
         assert_eq!(guess.address, "198.51.100.8:21200");
         assert_eq!(guess.source, "public-ip");
         assert!(!guess.needs_confirmation);
@@ -481,12 +492,7 @@ mod tests {
         assert!(auto_update_default(""));
         let kept = prefer_hostname("pjdesk.spader.us:21200", "other.example", 21200, &[v4(204, 248, 122, 44)]);
         assert_eq!(kept, "pjdesk.spader.us:21200");
-        let restored = prefer_hostname(
-            "204.248.122.44:21200",
-            "pjdesk.spader.us",
-            21200,
-            &[v4(204, 248, 122, 44)],
-        );
+        let restored = prefer_hostname("204.248.122.44:21200", "pjdesk.spader.us", 21200, &[v4(204, 248, 122, 44)]);
         assert_eq!(restored, "pjdesk.spader.us:21200");
         let foreign = prefer_hostname("198.51.100.8:21200", "pjdesk.spader.us", 21200, &[v4(204, 248, 122, 44)]);
         assert_eq!(foreign, "198.51.100.8:21200");
@@ -495,7 +501,10 @@ mod tests {
             "pjdesk.spader.us:21200"
         );
         assert_eq!(address_after_ip_change("204.248.122.44:21200", "203.0.113.9", 21200, true), "203.0.113.9:21200");
-        assert_eq!(address_after_ip_change("204.248.122.44:21200", "203.0.113.9", 21200, false), "204.248.122.44:21200");
+        assert_eq!(
+            address_after_ip_change("204.248.122.44:21200", "203.0.113.9", 21200, false),
+            "204.248.122.44:21200"
+        );
     }
 
     #[test]

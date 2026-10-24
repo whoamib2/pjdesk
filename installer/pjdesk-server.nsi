@@ -81,7 +81,7 @@ Section "PJDesk Server (required)" SecCore
   ; Upgrade in place: stop the service and close the window so files unlock.
   nsExec::Exec 'net stop PJDeskServer'
   nsExec::Exec 'taskkill /F /IM ${EXE}'
-  Sleep 800
+  Sleep 200
 
   SetOutPath "$INSTDIR"
   File "${EXE}"

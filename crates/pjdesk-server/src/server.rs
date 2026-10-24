@@ -11,10 +11,12 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use pjdesk_proto::framing::{read_msg, write_msg, MAX_SIGNAL_FRAME};
 use pjdesk_proto::signal::{ClientMsg, ErrorCode, ServerMsg, SessionId};
+use pjdesk_proto::signal::{DeviceBrief, Role as AccountRole};
 use pjdesk_proto::tls::{self, TlsIdentity};
 use pjdesk_proto::udp::Role;
-use pjdesk_proto::signal::{DeviceBrief, Role as AccountRole};
-use pjdesk_proto::{format_id, normalize_id, protocol_ok, ALPN_SIGNAL, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SIGNAL_SERVER_NAME};
+use pjdesk_proto::{
+    format_id, normalize_id, protocol_ok, ALPN_SIGNAL, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SIGNAL_SERVER_NAME,
+};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
@@ -29,7 +31,7 @@ use crate::ServerOpts;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// How long Connect waits when the computer was registered recently but is
 /// missing from the live table. It is usually reconnecting.
-const CONNECT_WAIT: Duration = Duration::from_secs(6);
+const CONNECT_WAIT: Duration = Duration::from_secs(12);
 const CONNECT_POLL: Duration = Duration::from_millis(250);
 /// A last-seen time inside this window is recent enough to wait.
 const CONNECT_RECENT_SECS: u64 = 120;
@@ -253,8 +255,9 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
 
     let beacon_port = opts.port;
     let beacon_fp = identity.fingerprint();
+    let beacon_dir = data_dir.clone();
     let _ = std::thread::Builder::new().name("lan-beacon".into()).spawn(move || {
-        crate::public_addr::announce_lan(beacon_port, beacon_fp);
+        crate::public_addr::announce_lan(beacon_port, beacon_fp, beacon_dir);
     });
 
     let relay = tokio::spawn(crate::relay::run(Arc::new(udp), state.clone()));
@@ -520,7 +523,11 @@ fn handle_login(
                     });
                     let user = session.as_ref().map(|s| s.username.clone()).unwrap_or_else(|_| username.clone());
                     drop(guard);
-                    crate::audit::AuditLog::open(&data_dir).record("login", &user, "password accepted; weaker than the current policy");
+                    crate::audit::AuditLog::open(&data_dir).record(
+                        "login",
+                        &user,
+                        "password accepted; weaker than the current policy",
+                    );
                     info!("Account \"{user}\" signed in with a password that no longer meets policy");
                     return;
                 }
@@ -640,11 +647,7 @@ fn start_session(st: &mut State, ctrl: &ControllerSide, target: &str, controller
         controller_name,
         &format!("to {} from {}", format_id(target), ctrl.addr.ip()),
     );
-    info!(
-        "Session {session_id:016x}: \"{controller_name}\" ({}) → host {}",
-        ctrl.addr.ip(),
-        format_id(target)
-    );
+    info!("Session {session_id:016x}: \"{controller_name}\" ({}) → host {}", ctrl.addr.ip(), format_id(target));
 }
 
 fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
@@ -667,6 +670,14 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::Register { proto, device_id, device_secret, hostname, app_version } => {
+            if !crate::cloud::accepts_host_registrations(&st.data_dir) {
+                info!(
+                    "Refused host registration from {}: this server is the standby and is not the live table",
+                    conn.addr
+                );
+                conn.error(ErrorCode::Unauthorized, pjdesk_proto::signal::STANDBY_REGISTRATION);
+                return;
+            }
             let signed = match gate(st, conn) {
                 Ok(claims) => claims,
                 Err(()) => {
@@ -732,7 +743,11 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                         &hostname,
                         &format!("{} from {}", format_id(&id), conn.addr.ip()),
                     );
-                    info!("Host {} \"{hostname}\" online from {} (v{app_version})", format_id(&id), conn.addr.ip());
+                    info!(
+                        "Host {} \"{hostname}\" online from {} (v{app_version}); this server is the primary",
+                        format_id(&id),
+                        conn.addr.ip()
+                    );
                     // One record per computer: drop its old, offline records.
                     let online: HashSet<String> = st.online.keys().cloned().collect();
                     let removed = st.registry.remove_stale_duplicates(&id, &online);
@@ -748,6 +763,11 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::Connect { proto, target_id, controller_name } => {
+            if !crate::cloud::accepts_host_registrations(&st.data_dir) {
+                info!("Refused a connection from {}: this server is the standby and is not the live table", conn.addr);
+                conn.error(ErrorCode::Unauthorized, pjdesk_proto::signal::STANDBY_REGISTRATION);
+                return;
+            }
             // Before any ID lookup, so a refused peer learns nothing about the target.
             if gate(st, conn).is_err() {
                 conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
@@ -771,11 +791,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             let seen = st.registry.last_seen_of(&target);
             let now = crate::registry::unix_now();
             if !host_was_seen_recently(seen, now) {
-                let when = if seen == 0 {
-                    "never".to_string()
-                } else {
-                    format!("{}s ago", now.saturating_sub(seen))
-                };
+                let when = if seen == 0 { "never".to_string() } else { format!("{}s ago", now.saturating_sub(seen)) };
                 info!("Connect to {} refused; it is not online (last seen {when})", format_id(&target));
                 conn.error(ErrorCode::HostOffline, format!("device {} is not online", format_id(&target)));
                 return;
@@ -795,7 +811,10 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                     {
                         let mut guard = state.lock().unwrap();
                         if guard.online.contains_key(&target_for_wait) {
-                            info!("Connect to {} is going ahead; it registered during the wait", format_id(&target_for_wait));
+                            info!(
+                                "Connect to {} is going ahead; it registered during the wait",
+                                format_id(&target_for_wait)
+                            );
                             start_session(&mut guard, &side, &target_for_wait, &name_for_wait);
                             return;
                         }
@@ -987,7 +1006,11 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                     host.hostname = hostname.clone();
                 }
             }
-            info!("Host {} reported {}", format_id(&id), if hostname.is_empty() { "its system".into() } else { hostname });
+            info!(
+                "Host {} reported {}",
+                format_id(&id),
+                if hostname.is_empty() { "its system".into() } else { hostname }
+            );
         }
 
         ClientMsg::ChangePassword { token, new_password } => match st.accounts.user_for_token(&token) {
@@ -1016,7 +1039,9 @@ fn note_proto(conn: &mut Conn, proto: u16) -> bool {
     if !protocol_ok(proto) {
         conn.error(
             ErrorCode::VersionMismatch,
-            format!("version mismatch (server speaks protocol {MIN_PROTOCOL_VERSION}-{PROTOCOL_VERSION}, client {proto})"),
+            format!(
+                "version mismatch (server speaks protocol {MIN_PROTOCOL_VERSION}-{PROTOCOL_VERSION}, client {proto})"
+            ),
         );
         return false;
     }
@@ -1134,14 +1159,12 @@ async fn fleet_sync(state: Shared) {
         let mut st = state.lock().unwrap();
         for req in &updates {
             if req == "*" {
-                info!("Update all online computers: asking {} client(s) to install the latest release", st.online.len());
+                info!(
+                    "Update all online computers: asking {} client(s) to install the latest release",
+                    st.online.len()
+                );
                 for (id, h) in &st.online {
-                    info!(
-                        "Asking {} \"{}\" (v{}) to update now",
-                        format_id(id),
-                        h.hostname,
-                        h.app_version
-                    );
+                    info!("Asking {} \"{}\" (v{}) to update now", format_id(id), h.hostname, h.app_version);
                     let _ = h.tx.send(ServerMsg::UpdateNow);
                 }
             } else if let Some(h) = st.online.get(req) {
@@ -1164,7 +1187,11 @@ async fn fleet_sync(state: Shared) {
                 match st.registry.set_group(&id, &group) {
                     Ok(()) => {
                         info!("Device {} is now in group \"{group}\"", format_id(&id));
-                        crate::audit::AuditLog::open(&st.data_dir).record("group", "server", &format!("{} -> {group}", format_id(&id)));
+                        crate::audit::AuditLog::open(&st.data_dir).record(
+                            "group",
+                            "server",
+                            &format!("{} -> {group}", format_id(&id)),
+                        );
                     }
                     Err(e) => warn!("could not set a group on {}: {e}", format_id(&id)),
                 }
@@ -1335,12 +1362,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pjdesk-gate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        crate::access::Policy {
-            require_accounts: true,
-            ..crate::access::Policy::default()
-        }
-        .save(&dir)
-        .unwrap();
+        crate::access::Policy { require_accounts: true, ..crate::access::Policy::default() }.save(&dir).unwrap();
         let state = state_in(&dir);
         let (mut conn, mut rx) = conn_pair();
         handle_message(

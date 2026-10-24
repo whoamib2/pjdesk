@@ -42,25 +42,65 @@ pub fn encode(beacon: &LanBeacon) -> Result<Vec<u8>> {
 /// Separate from [`BEACON_MAGIC`], so a computer beacon is never read as a server.
 pub const SERVER_MAGIC: &[u8; 8] = b"PJDESKSV";
 
+/// Whether the server that sent a beacon is the live primary.
+/// A 42-byte beacon from 0.6.30 and earlier has [`BeaconRole::Unknown`].
+/// That is not proof of the primary: a standby shares the server key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BeaconRole {
+    #[default]
+    Unknown,
+    Primary,
+    Standby,
+}
+
+impl BeaconRole {
+    pub fn from_byte(byte: u8) -> Self {
+        match byte {
+            1 => Self::Primary,
+            2 => Self::Standby,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Self::Primary => 1,
+            Self::Standby => 2,
+            Self::Unknown => 0,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Standby => "standby",
+            Self::Unknown => "unspecified",
+        }
+    }
+}
+
 /// The PJDesk server's LAN signaling endpoint. The packet's source address is
 /// the LAN IP. `port` is the TCP/UDP server port (21200). The fingerprint is
 /// the server key, so a client with a pinned key can ignore a different server.
+/// `role` is an optional trailing byte. Older servers omit it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerBeacon {
     pub port: u16,
     pub fingerprint: [u8; 32],
+    pub role: BeaconRole,
 }
 
 pub fn encode_server(beacon: &ServerBeacon) -> Vec<u8> {
-    let mut out = Vec::with_capacity(42);
+    let mut out = Vec::with_capacity(43);
     out.extend_from_slice(SERVER_MAGIC);
     out.extend_from_slice(&beacon.port.to_be_bytes());
     out.extend_from_slice(&beacon.fingerprint);
+    out.push(beacon.role.to_byte());
     out
 }
 
 pub fn decode_server(packet: &[u8]) -> Result<ServerBeacon> {
-    if packet.len() != 42 || &packet[..8] != SERVER_MAGIC {
+    if (packet.len() != 42 && packet.len() != 43) || &packet[..8] != SERVER_MAGIC {
         bail!("not a PJDesk server beacon");
     }
     let port = u16::from_be_bytes([packet[8], packet[9]]);
@@ -69,12 +109,14 @@ pub fn decode_server(packet: &[u8]) -> Result<ServerBeacon> {
     }
     let mut fingerprint = [0u8; 32];
     fingerprint.copy_from_slice(&packet[10..42]);
-    Ok(ServerBeacon { port, fingerprint })
+    let role = if packet.len() == 43 { BeaconRole::from_byte(packet[42]) } else { BeaconRole::Unknown };
+    Ok(ServerBeacon { port, fingerprint, role })
 }
 
 struct HeardServer {
     addr: SocketAddr,
     fingerprint: [u8; 32],
+    role: BeaconRole,
     at: Instant,
 }
 
@@ -85,28 +127,33 @@ fn server_slot() -> &'static Mutex<Vec<HeardServer>> {
 
 /// Records a server beacon already received on the shared discovery socket.
 /// [`listen_servers`] returns these when that socket is already open.
-pub fn note_server_beacon(addr: SocketAddr, fingerprint: [u8; 32]) {
+pub fn note_server_beacon(addr: SocketAddr, fingerprint: [u8; 32], role: BeaconRole) {
     let mut slot = server_slot().lock().unwrap_or_else(|err| err.into_inner());
     let now = Instant::now();
     slot.retain(|heard| now.saturating_duration_since(heard.at) < Duration::from_secs(8));
     if let Some(have) = slot.iter_mut().find(|heard| heard.addr == addr && heard.fingerprint == fingerprint) {
+        have.role = role;
         have.at = now;
         return;
     }
-    slot.push(HeardServer { addr, fingerprint, at: now });
+    slot.push(HeardServer { addr, fingerprint, role, at: now });
 }
 
-fn cached_servers() -> Vec<(SocketAddr, [u8; 32])> {
+fn cached_servers() -> Vec<(SocketAddr, ServerBeacon)> {
     let mut slot = server_slot().lock().unwrap_or_else(|err| err.into_inner());
     let now = Instant::now();
     slot.retain(|heard| now.saturating_duration_since(heard.at) < Duration::from_secs(8));
-    slot.iter().map(|heard| (heard.addr, heard.fingerprint)).collect()
+    slot.iter()
+        .map(|heard| {
+            (heard.addr, ServerBeacon { port: heard.addr.port(), fingerprint: heard.fingerprint, role: heard.role })
+        })
+        .collect()
 }
 
 /// Listens on UDP 21202 for [ServerBeacon]s. The returned address uses the
 /// sender's IP and the port inside the packet. A busy port returns a beacon
 /// the window already heard, or nothing.
-pub fn listen_servers(limit: std::time::Duration) -> Vec<(std::net::SocketAddr, [u8; 32])> {
+pub fn listen_servers(limit: std::time::Duration) -> Vec<(std::net::SocketAddr, ServerBeacon)> {
     let cached = cached_servers();
     if !cached.is_empty() {
         return cached;
@@ -117,7 +164,7 @@ pub fn listen_servers(limit: std::time::Duration) -> Vec<(std::net::SocketAddr, 
     };
     let _ = socket.set_read_timeout(Some(std::time::Duration::from_millis(80)));
     let deadline = std::time::Instant::now() + limit;
-    let mut found = Vec::new();
+    let mut found: Vec<(std::net::SocketAddr, ServerBeacon)> = Vec::new();
     let mut buf = [0u8; 128];
     while std::time::Instant::now() < deadline {
         match socket.recv_from(&mut buf) {
@@ -126,8 +173,11 @@ pub fn listen_servers(limit: std::time::Duration) -> Vec<(std::net::SocketAddr, 
                     if let std::net::IpAddr::V4(ip) = src.ip() {
                         if ip.is_private() || ip.is_link_local() {
                             let addr = std::net::SocketAddr::from((ip, beacon.port));
-                            if !found.iter().any(|(have, fp)| *have == addr && *fp == beacon.fingerprint) {
-                                found.push((addr, beacon.fingerprint));
+                            if !found
+                                .iter()
+                                .any(|(have, heard)| *have == addr && heard.fingerprint == beacon.fingerprint)
+                            {
+                                found.push((addr, beacon));
                             }
                         }
                     }
@@ -214,6 +264,134 @@ pub fn private_ipv4s() -> Vec<Ipv4Addr> {
     ips
 }
 
+/// Addresses to dial. `public` is the primary's reachable address. `lan` is
+/// only a current primary on this same network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachPlan {
+    pub public: SocketAddr,
+    pub lan: Vec<SocketAddr>,
+}
+
+/// Chooses signaling addresses.
+///
+/// A LAN address, including this computer's own addresses and localhost, is
+/// used only when it is the current primary. A standby beacon is never a
+/// candidate, and neither is a role-less beacon: 0.6.30 standbys share the
+/// server key and still send those. Account LAN addresses are used only when
+/// `same_site` (this computer's public IP is the primary's). DNS that returns
+/// this computer, or a private address on a different network, is replaced
+/// with `published_public` when that is a public IPv4 address.
+pub fn reach_plan(
+    resolved: SocketAddr,
+    published_public: &str,
+    port: u16,
+    same_site: bool,
+    account_lan: &[SocketAddr],
+    beacons: &[(SocketAddr, [u8; 32], BeaconRole)],
+    pinned: Option<[u8; 32]>,
+    own: &[Ipv4Addr],
+) -> ReachPlan {
+    let published = published_public_addr(published_public, if port == 0 { resolved.port() } else { port });
+    let primary_here =
+        |addr: SocketAddr| beacon_is_primary(addr, beacons, pinned) || (same_site && account_lan.contains(&addr));
+    let public = if dns_is_local_or_foreign(resolved, same_site, own) {
+        if primary_here(resolved) {
+            resolved
+        } else {
+            published.unwrap_or(resolved)
+        }
+    } else {
+        resolved
+    };
+    let mut lan = Vec::new();
+    let mut push = |addr: SocketAddr| {
+        if addr == public || lan.contains(&addr) {
+            return;
+        }
+        let local = is_own_addr(addr, own);
+        if local && !beacon_is_primary(addr, beacons, pinned) && !(same_site && account_lan.contains(&addr)) {
+            return;
+        }
+        lan.push(addr);
+    };
+    if same_site {
+        for addr in account_lan {
+            push(*addr);
+        }
+    }
+    for (addr, fingerprint, role) in beacons {
+        if *role == BeaconRole::Primary && fingerprint_matches(*fingerprint, pinned) {
+            push(*addr);
+        }
+    }
+    ReachPlan { public, lan }
+}
+
+fn beacon_is_primary(
+    addr: SocketAddr,
+    beacons: &[(SocketAddr, [u8; 32], BeaconRole)],
+    pinned: Option<[u8; 32]>,
+) -> bool {
+    beacons.iter().any(|(heard, fingerprint, role)| {
+        *heard == addr && *role == BeaconRole::Primary && fingerprint_matches(*fingerprint, pinned)
+    })
+}
+
+fn fingerprint_matches(fingerprint: [u8; 32], pinned: Option<[u8; 32]>) -> bool {
+    pinned.is_none_or(|expected| expected == fingerprint)
+}
+
+fn dns_is_local_or_foreign(resolved: SocketAddr, same_site: bool, own: &[Ipv4Addr]) -> bool {
+    if is_own_addr(resolved, own) {
+        return true;
+    }
+    is_private_socket(resolved) && !same_site
+}
+
+fn is_own_addr(addr: SocketAddr, own: &[Ipv4Addr]) -> bool {
+    match addr.ip() {
+        IpAddr::V4(ip) => ip.is_loopback() || own.contains(&ip),
+        IpAddr::V6(ip) => ip.is_loopback(),
+    }
+}
+
+fn is_private_socket(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local() || ip.is_loopback(),
+        IpAddr::V6(_) => false,
+    }
+}
+
+fn published_public_addr(text: &str, port: u16) -> Option<SocketAddr> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let addr = if let Ok(addr) = text.parse::<SocketAddr>() {
+        addr
+    } else if let Ok(ip) = text.parse::<Ipv4Addr>() {
+        SocketAddr::new(IpAddr::V4(ip), port)
+    } else {
+        return None;
+    };
+    match addr.ip() {
+        IpAddr::V4(ip) if !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() => {
+            Some(addr)
+        }
+        _ => None,
+    }
+}
+
+/// The first two groups of a formatted fingerprint, such as `d2fd-3afd`.
+pub fn fingerprint_prefix(text: &str) -> String {
+    let groups: Vec<&str> = text.split('-').filter(|part| !part.is_empty()).take(2).collect();
+    if groups.len() >= 2 {
+        format!("{}-{}", groups[0], groups[1])
+    } else {
+        text.chars().take(9).collect()
+    }
+}
+
 /// True when `host` is a loopback name. Port forwards default to these only,
 /// so a session cannot turn the host into an open proxy.
 pub fn is_loopback_host(host: &str) -> bool {
@@ -249,27 +427,81 @@ mod tests {
         assert_eq!(
             bytes,
             [
-                0x50, 0x4a, 0x44, 0x45, 0x53, 0x4b, 0x4c, 0x42, 0x00, 0x38, 0x03, 0x09, 0x31, 0x32, 0x33, 0x34,
-                0x35, 0x36, 0x37, 0x38, 0x39, 0xd1, 0xa5, 0x01, 0x09, 0x63, 0x61, 0x62, 0x69, 0x6e, 0x64, 0x65,
-                0x73, 0x6b, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
-                0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
-                0x07, 0x07,
+                0x50, 0x4a, 0x44, 0x45, 0x53, 0x4b, 0x4c, 0x42, 0x00, 0x38, 0x03, 0x09, 0x31, 0x32, 0x33, 0x34, 0x35,
+                0x36, 0x37, 0x38, 0x39, 0xd1, 0xa5, 0x01, 0x09, 0x63, 0x61, 0x62, 0x69, 0x6e, 0x64, 0x65, 0x73, 0x6b,
+                0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+                0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
             ]
         );
         assert!(decode(b"nope").is_err());
         assert!(decode(&bytes[..9]).is_err());
-        let server = encode_server(&ServerBeacon { port: crate::DEFAULT_PORT, fingerprint: [9u8; 32] });
+        let server = encode_server(&ServerBeacon {
+            port: crate::DEFAULT_PORT,
+            fingerprint: [9u8; 32],
+            role: BeaconRole::Primary,
+        });
         assert!(decode(&server).is_err());
     }
 
     #[test]
-    fn server_beacon_is_a_fixed_packet() {
-        let beacon = ServerBeacon { port: crate::DEFAULT_PORT, fingerprint: [4u8; 32] };
+    fn server_beacon_keeps_a_role_byte_and_still_reads_the_old_packet() {
+        let beacon = ServerBeacon { port: crate::DEFAULT_PORT, fingerprint: [4u8; 32], role: BeaconRole::Primary };
         let bytes = encode_server(&beacon);
         assert_eq!(&bytes[..8], b"PJDESKSV");
+        assert_eq!(bytes.len(), 43);
+        assert_eq!(bytes[42], 1);
         assert_eq!(decode_server(&bytes).unwrap(), beacon);
+        let standby = ServerBeacon { role: BeaconRole::Standby, ..beacon.clone() };
+        assert_eq!(encode_server(&standby)[42], 2);
+        assert_eq!(decode_server(&encode_server(&standby)).unwrap().role, BeaconRole::Standby);
+        let mut legacy = bytes[..42].to_vec();
+        assert_eq!(decode_server(&legacy).unwrap().role, BeaconRole::Unknown);
+        legacy.push(9);
+        assert_eq!(decode_server(&legacy).unwrap().role, BeaconRole::Unknown);
         assert!(decode_server(b"PJDESKSV").is_err());
         assert!(decode_server(&[0u8; 42]).is_err());
+    }
+
+    #[test]
+    fn a_local_standby_is_not_the_signaling_address() {
+        let own = [Ipv4Addr::new(10, 0, 0, 20)];
+        let key = [7u8; 32];
+        let local: SocketAddr = "10.0.0.20:21200".parse().unwrap();
+        let primary_lan: SocketAddr = "192.168.0.231:21200".parse().unwrap();
+        let public: SocketAddr = "204.248.122.44:21200".parse().unwrap();
+        let standby = vec![(local, key, BeaconRole::Standby)];
+        let unspecified = vec![(local, key, BeaconRole::Unknown)];
+        let plan = reach_plan(local, "204.248.122.44", 21200, false, &[primary_lan], &standby, Some(key), &own);
+        assert_eq!(plan.public, public);
+        assert!(plan.lan.is_empty(), "{plan:?}");
+        let legacy = reach_plan(local, "204.248.122.44", 21200, false, &[primary_lan], &unspecified, Some(key), &own);
+        assert_eq!(legacy.public, public);
+        assert!(legacy.lan.is_empty());
+        let wrong_key = vec![(local, [1u8; 32], BeaconRole::Primary)];
+        let mismatched =
+            reach_plan(public, "204.248.122.44", 21200, false, &[primary_lan], &wrong_key, Some(key), &own);
+        assert_eq!(mismatched.public, public);
+        assert!(mismatched.lan.is_empty());
+    }
+
+    #[test]
+    fn the_primary_on_this_network_is_still_used() {
+        let own = [Ipv4Addr::new(192, 168, 0, 231)];
+        let key = [7u8; 32];
+        let local: SocketAddr = "192.168.0.231:21200".parse().unwrap();
+        let public: SocketAddr = "204.248.122.44:21200".parse().unwrap();
+        let beacons = vec![(local, key, BeaconRole::Primary)];
+        let plan = reach_plan(local, "204.248.122.44", 21200, true, &[local], &beacons, Some(key), &own);
+        assert_eq!(plan.public, local);
+        assert!(plan.lan.is_empty());
+        let other = [Ipv4Addr::new(192, 168, 0, 50)];
+        let client = reach_plan(public, "204.248.122.44", 21200, true, &[local], &beacons, Some(key), &other);
+        assert_eq!(client.public, public);
+        assert_eq!(client.lan, vec![local]);
+        let loopback: SocketAddr = "127.0.0.1:21200".parse().unwrap();
+        let cabin = reach_plan(loopback, "204.248.122.44", 21200, false, &[local], &[], Some(key), &[]);
+        assert_eq!(cabin.public, public);
+        assert!(cabin.lan.is_empty());
     }
 
     #[test]
@@ -317,11 +549,14 @@ mod tests {
         let lan = [Ipv4Addr::new(192, 168, 1, 20)];
         let public = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(127, 0, 0, 1)];
         let addr = "192.168.1.20:21200".parse().unwrap();
-        note_server_beacon(addr, [4u8; 32]);
+        note_server_beacon(addr, [4u8; 32], BeaconRole::Standby);
         let cached = cached_servers();
-        assert_eq!(cached, vec![(addr, [4u8; 32])]);
-        note_server_beacon(addr, [4u8; 32]);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].0, addr);
+        assert_eq!(cached[0].1.role, BeaconRole::Standby);
+        note_server_beacon(addr, [4u8; 32], BeaconRole::Primary);
         assert_eq!(cached_servers().len(), 1);
+        assert_eq!(cached_servers()[0].1.role, BeaconRole::Primary);
 
         assert!(announce_now(false, true, &lan));
         assert!(!announce_now(true, true, &lan));

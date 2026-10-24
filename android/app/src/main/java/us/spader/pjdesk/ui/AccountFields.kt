@@ -1,6 +1,7 @@
 package us.spader.pjdesk.ui
 
 import android.text.InputType
+import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
@@ -58,10 +59,14 @@ fun AccountPasswordField(
     onValueChange: (String) -> Unit,
     modifier: Modifier = Modifier,
     label: String = "Password",
+    autofocus: Boolean = false,
+    onSubmit: (() -> Unit)? = null,
 ) {
     var shown by remember { mutableStateOf(false) }
+    var focused by remember { mutableStateOf(false) }
     val current = rememberUpdatedState(value)
     val notify = rememberUpdatedState(onValueChange)
+    val submit = rememberUpdatedState(onSubmit)
     Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         AndroidView(
             modifier = Modifier.weight(1f),
@@ -69,6 +74,17 @@ fun AccountPasswordField(
                 accountEdit(context, label).apply {
                     setAutofillHints(View.AUTOFILL_HINT_PASSWORD)
                     imeOptions = EditorInfo.IME_ACTION_DONE
+                    setOnEditorActionListener { _, actionId, event ->
+                        val enter = actionId == EditorInfo.IME_ACTION_DONE ||
+                            actionId == EditorInfo.IME_ACTION_GO ||
+                            (event?.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_DOWN)
+                        if (enter) {
+                            submit.value?.invoke()
+                            true
+                        } else {
+                            false
+                        }
+                    }
                     doAfterTextChanged { text ->
                         val next = text?.toString().orEmpty()
                         if (next != current.value) notify.value(next)
@@ -88,6 +104,10 @@ fun AccountPasswordField(
                     edit.setSelection(edit.text.length)
                 }
                 edit.hint = label
+                if (autofocus && !focused) {
+                    edit.requestFocus()
+                    focused = true
+                }
             },
         )
         TextButton(onClick = { shown = !shown }) { Text(if (shown) "Hide" else "Show") }

@@ -239,7 +239,6 @@ impl HostShared {
             lines.drain(0..n);
         }
     }
-
 }
 
 /// Connection requests that may be in setup at once. Only an authenticated
@@ -460,13 +459,14 @@ async fn host_main(
     state.publish_password();
     state.fresh_support();
 
-    let mut delay = Duration::from_secs(2);
+    let mut delay = Duration::from_secs(1);
     let mut force_refresh = false;
+    let mut public_only = false;
     loop {
         if state.shared.as_ref().is_some_and(|s| s.stopping()) {
             return Ok(());
         }
-        let outcome = signaling_loop(&server, &mut config, &state, force_refresh).await;
+        let outcome = signaling_loop(&server, &mut config, &state, force_refresh, public_only).await;
         force_refresh = true;
         if let Some(shared) = &state.shared {
             shared.online.store(false, Ordering::SeqCst);
@@ -476,30 +476,52 @@ async fn host_main(
                 return Ok(());
             }
         }
+        let mut advance = false;
         match outcome {
-            Ok(()) => delay = Duration::from_secs(2),
+            Ok(()) => {
+                public_only = false;
+                delay = Duration::from_secs(1);
+            }
             Err(e) if format!("{e:#}").contains("SERVER KEY MISMATCH") => {
                 if let Some(shared) = &state.shared {
                     *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
                 }
                 return Err(e);
             }
+            Err(e) if pjdesk_proto::signal::is_standby_refusal(&format!("{e:#}")) => {
+                warn!("{e:#}");
+                public_only = true;
+                delay = Duration::from_secs(1);
+                if let Some(shared) = &state.shared {
+                    *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
+                }
+            }
             Err(e) => {
                 warn!("{e:#}");
+                advance = true;
                 if let Some(shared) = &state.shared {
                     *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
                 }
             }
         }
-        info!("Reconnecting to the server in {} s...", delay.as_secs());
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_secs(30));
+        let pause = pjdesk_proto::signal::jitter_reconnect(delay);
+        info!("Reconnecting to the server in {:.1} s...", pause.as_secs_f32());
+        tokio::time::sleep(pause).await;
+        if advance {
+            delay = pjdesk_proto::signal::next_reconnect_delay(delay);
+        }
     }
 }
 
 /// One signaling connection: register, then handle incoming sessions.
 /// Returns `Ok` if we were registered before the connection dropped.
-async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<HostState>, force_refresh: bool) -> Result<()> {
+async fn signaling_loop(
+    server: &ServerAddr,
+    config: &mut Config,
+    state: &Arc<HostState>,
+    force_refresh: bool,
+    public_only: bool,
+) -> Result<()> {
     tokio::task::spawn_blocking({
         let mut copy = config.clone();
         move || {
@@ -525,7 +547,7 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
     });
     let server = ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone());
     let token = config.network_access_token();
-    let mut signal = SignalClient::connect(&server, config).await?;
+    let mut signal = SignalClient::connect_mode(&server, config, public_only).await?;
     if !token.is_empty() {
         let _ = signal.send(ClientMsg::PresentAccess { token: token.clone() });
     }
@@ -545,7 +567,7 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
         Ok(None) if !token.is_empty() => {
             // A server from before 0.6.0 cannot decode PresentAccess and drops
             // the socket. Try once without the token so this computer stays online.
-            signal = SignalClient::connect(&server, config).await?;
+            signal = SignalClient::connect_mode(&server, config, public_only).await?;
             signal.send(register)?;
             timeout(Duration::from_secs(10), signal.recv()).await
         }
@@ -559,6 +581,18 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
             bail!("{message}; a new ID will be requested");
         }
         Ok(Some(ServerMsg::Error { message, .. })) => {
+            if pjdesk_proto::signal::is_standby_refusal(&message) {
+                let key = config
+                    .server_fingerprint
+                    .as_deref()
+                    .map(pjdesk_proto::discover::fingerprint_prefix)
+                    .unwrap_or_else(|| "unpinned".into());
+                warn!(
+                    "Registration refused by the standby at {server} via {} ({}), key {key}; connecting to the primary",
+                    signal.via, signal.server_addr
+                );
+                bail!("{message}");
+            }
             if pjdesk_proto::version_rejected(&message) && register_proto > pjdesk_proto::MIN_PROTOCOL_VERSION {
                 state.server_proto.store(pjdesk_proto::MIN_PROTOCOL_VERSION, Ordering::SeqCst);
                 bail!("the server speaks an older protocol; reconnecting");
@@ -578,7 +612,17 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
     print_banner(&device_id, &state.password.lock().unwrap(), has_permanent, &server);
     crate::HOST_ONLINE.store(true, Ordering::SeqCst);
     let role = if state.args.service_host { "service" } else { "window" };
-    info!("Registered {} as the {role}", format_id(&device_id));
+    let key = config
+        .server_fingerprint
+        .as_deref()
+        .map(pjdesk_proto::discover::fingerprint_prefix)
+        .unwrap_or_else(|| "unpinned".into());
+    info!(
+        "Registered {} ({role}) with {server} via {} ({}), key {key}, role primary",
+        format_id(&device_id),
+        signal.via,
+        signal.server_addr
+    );
     if let Some(shared) = &state.shared {
         *shared.id.lock().unwrap() = Some(device_id.clone());
         *shared.last_error.lock().unwrap() = None;
@@ -847,7 +891,8 @@ async fn session_inner(
         tunnel_ports: ports,
         receive_dir,
     };
-    let result = stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
+    let result =
+        stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
     state.streaming.store(false, Ordering::SeqCst);
     state.fresh_support();
     if let Some(shared) = &state.shared {
@@ -991,7 +1036,11 @@ async fn open_session(
             return Ok((bits, crate::resolve_receive_dir(&state.args.receive_dir)));
         }
     }
-    let who = if auth.password_slot == ASK_SLOT && !auth.peer_name.trim().is_empty() { auth.peer_name.as_str() } else { controller_name };
+    let who = if auth.password_slot == ASK_SLOT && !auth.peer_name.trim().is_empty() {
+        auth.peer_name.as_str()
+    } else {
+        controller_name
+    };
     match approve(state, who, controller_ip).await {
         Person::Yes(bits, dir) => {
             grant_auth(&mut auth.send, &state.name).await?;
@@ -1087,7 +1136,11 @@ fn consent_grant(policy: &Policy, reply: ConsentReply) -> Option<(u32, String)> 
     let mut bits = reply.permissions & policy.max_permissions;
     let dir = if bits & perms::FILE != 0 {
         let chosen = reply.receive_dir.trim();
-        if chosen.is_empty() { crate::resolve_receive_dir("") } else { chosen.to_string() }
+        if chosen.is_empty() {
+            crate::resolve_receive_dir("")
+        } else {
+            chosen.to_string()
+        }
     } else {
         String::new()
     };
@@ -1120,10 +1173,8 @@ async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) 
     let ask_path = dir.join("consent.json");
     let reply_path = dir.join("consent-reply.json");
     let _ = std::fs::remove_file(&reply_path);
-    let id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(1);
+    let id =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1);
     let ask = serde_json::json!({ "id": id, "from": name, "ip": ip, "offered": offered });
     if std::fs::write(&ask_path, ask.to_string()).is_err() {
         return Person::Unavailable;

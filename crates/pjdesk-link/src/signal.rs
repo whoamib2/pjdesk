@@ -78,7 +78,6 @@ const LAN_HANDSHAKE: Duration = Duration::from_millis(1500);
 /// The public path starts this long after the LAN path, so a working LAN wins.
 const PUBLIC_DELAY: Duration = Duration::from_millis(200);
 const PUBLIC_HANDSHAKE: Duration = Duration::from_secs(10);
-const LAN_PROBE: Duration = Duration::from_millis(400);
 
 struct Ready {
     stream: tokio_rustls::client::TlsStream<TcpStream>,
@@ -105,41 +104,55 @@ impl SignalClient {
     /// Connects and checks the server key. `pinned` of `None` trusts the key
     /// this connection presents and returns it in [`Self::observed`].
     pub async fn connect(server: &ServerAddr, pinned: Option<Fingerprint>) -> Result<Self> {
-        Self::connect_reaching(server, pinned, &[], "", "").await
+        Self::connect_reaching(server, pinned, &[], "", "", false).await
     }
 
-    /// Same handshake as [`Self::connect`]. When [lan] has private addresses and
-    /// this device is on that network (its public IP matches [published_public_ip],
-    /// or a short TCP probe answers), the LAN address and the public address run
-    /// together and the first finished handshake is kept.
+    /// Same handshake as [`Self::connect`]. A LAN address is dialed only when it
+    /// is the current primary and this device is on that server's public network.
+    /// A standby beacon, a role-less beacon, localhost, and this device's own
+    /// addresses are not used. `public_only` is the retry after a standby refusal.
+    /// DNS is resolved on every call.
     pub async fn connect_reaching(
         server: &ServerAddr,
         pinned: Option<Fingerprint>,
         lan: &[String],
         published_public_ip: &str,
         my_public_ip: &str,
+        public_only: bool,
     ) -> Result<Self> {
         let (resolved, heard) = tokio::join!(
             server.resolve(),
             tokio::task::spawn_blocking(|| pjdesk_proto::discover::listen_servers(Duration::from_millis(250))),
         );
-        let public_addr = resolved?;
-        let mut entries: Vec<String> = lan.to_vec();
-        if let Ok(found) = heard {
-            for (addr, fp) in found {
-                if pinned.is_none_or(|expected| expected == fp) {
-                    entries.push(addr.to_string());
-                }
-            }
-        }
-        let targets = lan_targets(&entries, server.port, public_addr);
-        let label = server.to_string();
-        let ready = if targets.is_empty() {
-            handshake(public_addr, "Internet", PUBLIC_HANDSHAKE, &label, pinned).await?
-        } else if prefer_lan(my_public_ip, published_public_ip, &targets).await {
-            race_paths(&targets, public_addr, &label, pinned).await?
+        let resolved = resolved?;
+        let same_site = !public_only && same_public_ip(my_public_ip, published_public_ip);
+        let own = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
+        let account = if same_site { lan_targets(lan, server.port, resolved) } else { Vec::new() };
+        let beacons = if public_only {
+            Vec::new()
         } else {
-            handshake(public_addr, "Internet", PUBLIC_HANDSHAKE, &label, pinned).await?
+            heard
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(addr, beacon)| (addr, beacon.fingerprint, beacon.role))
+                .collect()
+        };
+        let plan = pjdesk_proto::discover::reach_plan(
+            resolved,
+            published_public_ip,
+            server.port,
+            same_site,
+            &account,
+            &beacons,
+            pinned,
+            &own,
+        );
+        let label = server.to_string();
+        let ready = if plan.lan.is_empty() {
+            let via = if crate::p2p::is_lan_ip(plan.public.ip()) { "LAN" } else { "Internet" };
+            handshake(plan.public, via, PUBLIC_HANDSHAKE, &label, pinned).await?
+        } else {
+            race_paths(&plan.lan, plan.public, &label, pinned).await?
         };
         let observed = pinned.is_none().then(|| ready.verifier.observed()).flatten();
         let via = ready.via;
@@ -217,27 +230,6 @@ fn same_public_ip(mine: &str, published: &str) -> bool {
     !mine.is_empty() && mine == published
 }
 
-async fn prefer_lan(my_public: &str, published_public: &str, lan: &[SocketAddr]) -> bool {
-    if lan.is_empty() {
-        return false;
-    }
-    same_public_ip(my_public, published_public) || probe_lan(lan).await
-}
-
-async fn probe_lan(addrs: &[SocketAddr]) -> bool {
-    let mut set = JoinSet::new();
-    for &addr in addrs {
-        set.spawn(async move { timeout(LAN_PROBE, TcpStream::connect(addr)).await.ok().and_then(Result::ok).is_some() });
-    }
-    while let Some(result) = set.join_next().await {
-        if matches!(result, Ok(true)) {
-            set.abort_all();
-            return true;
-        }
-    }
-    false
-}
-
 async fn race_paths(
     lan: &[SocketAddr],
     public_addr: SocketAddr,
@@ -250,9 +242,10 @@ async fn race_paths(
         set.spawn(async move { handshake(addr, "LAN", LAN_HANDSHAKE, &label, pinned).await });
     }
     let label = server_label.to_string();
+    let public_via = if crate::p2p::is_lan_ip(public_addr.ip()) { "LAN" } else { "Internet" };
     set.spawn(async move {
         tokio::time::sleep(PUBLIC_DELAY).await;
-        handshake(public_addr, "Internet", PUBLIC_HANDSHAKE, &label, pinned).await
+        handshake(public_addr, public_via, PUBLIC_HANDSHAKE, &label, pinned).await
     });
     let mut mismatch = None;
     let mut other = Vec::new();

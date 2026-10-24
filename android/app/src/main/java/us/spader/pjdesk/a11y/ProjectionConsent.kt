@@ -56,9 +56,7 @@ object ProjectionConsent {
     fun request(context: Context) {
         val app = context.applicationContext
         if (!PjAccessibilityService.ready(app)) {
-            AppLog.i("unattended access needs the accessibility service; showing the screen share prompt")
-            CapturePrompt.show(app)
-            return
+            AppLog.i("unattended access waiting for the accessibility service to bind")
         }
         HostService.consentWait(app)
         HostService.preferAutoClick = true

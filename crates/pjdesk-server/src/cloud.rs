@@ -450,7 +450,13 @@ fn signed(cfg: &CloudConfig, method: &str, payload: &[u8]) -> (String, String, S
 /// Like [`signed`], for `object`, with extra signed headers (lower-case names).
 /// Conditional uploads sign `if-match` / `if-none-match`; leaving them out of
 /// the signature makes R2 reject the request.
-fn signed_for(cfg: &CloudConfig, object: &str, method: &str, payload: &[u8], extra: &[(&str, &str)]) -> (String, String, String) {
+fn signed_for(
+    cfg: &CloudConfig,
+    object: &str,
+    method: &str,
+    payload: &[u8],
+    extra: &[(&str, &str)],
+) -> (String, String, String) {
     let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let payload_sha256 = hex::encode(Sha256::digest(payload));
     let mut headers = vec![
@@ -1095,6 +1101,32 @@ fn effective_role(st: &SyncState, mine: &str, heuristic: Role) -> Role {
     }
 }
 
+/// True when this process may keep the live computer table.
+/// A server with no cloud sync is the only server. A cloud standby, including
+/// one whose desired role is standby or whose epoch belongs to another
+/// instance, must not accept host registrations as authoritative.
+pub fn accepts_host_registrations(data_dir: &Path) -> bool {
+    if CloudConfig::load(data_dir).is_none() {
+        return true;
+    }
+    let st = SyncState::load(data_dir);
+    if st.desired == "standby" {
+        return false;
+    }
+    let mine = instance_id(data_dir);
+    if !st.active_instance.is_empty() && st.active_instance != mine && st.desired != "active" {
+        return false;
+    }
+    if st.desired != "active" {
+        if let Some(status) = CloudStatus::load(data_dir) {
+            if status.role == "standby" {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// True when the running server wrote `cloud-status.json` recently.
 pub fn status_is_fresh(data_dir: &Path) -> bool {
     CloudStatus::load(data_dir).is_some_and(|s| s.updated_at + 90 >= now())
@@ -1322,7 +1354,8 @@ pub fn promote(data_dir: &Path) -> Result<()> {
     }
     let mut st = SyncState::load(data_dir);
     st.desired = "active".into();
-    st.notice = "This server is now the primary. The other server will switch to standby the next time it checks.".into();
+    st.notice =
+        "This server is now the primary. The other server will switch to standby the next time it checks.".into();
     st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Active);
     tracing::info!("{}", st.notice);
@@ -1666,14 +1699,13 @@ fn publish_presence(data_dir: &Path) {
     }
     let body = serde_json::json!({ "devices": devices });
     let stamp = data_dir.join("presence-publish.json");
-    let previous = std::fs::read(&stamp).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let previous =
+        std::fs::read(&stamp).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
     if previous.as_ref() == Some(&body) {
         return;
     }
     if snapshot_stale {
-        tracing::warn!(
-            "online.json is older than {ONLINE_FRESH_SECS}s; publishing every computer offline"
-        );
+        tracing::warn!("online.json is older than {ONLINE_FRESH_SECS}s; publishing every computer offline");
     }
     if let Some(prev) = previous.as_ref() {
         log_presence_changes(prev, &body);
@@ -1721,7 +1753,9 @@ fn online_ids(data_dir: &Path) -> Option<std::collections::HashSet<String>> {
     }
     match serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
         Ok(rows) => Some(
-            rows.into_iter().filter_map(|row| row.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())).collect(),
+            rows.into_iter()
+                .filter_map(|row| row.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+                .collect(),
         ),
         Err(e) => {
             tracing::warn!("online.json could not be read ({e}); presence was not changed");
@@ -1872,7 +1906,8 @@ fn register_network(data_dir: &Path, role: Role, replace: bool) {
     }
     if crate::public_addr::is_private_address(&record.address) && !record.confirmed {
         record.needs_confirm = false;
-        record.note = "This is a local network address. Confirm it before it is published. It is not sent until you do.".into();
+        record.note =
+            "This is a local network address. Confirm it before it is published. It is not sent until you do.".into();
         crate::public_addr::save(data_dir, &record);
         return;
     }
@@ -1943,11 +1978,8 @@ fn register_network(data_dir: &Path, role: Role, replace: bool) {
         Err(ureq::Error::Status(code, resp)) => {
             let text = resp.into_string().unwrap_or_default();
             let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-            let message = value
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Could not publish this server.")
-                .to_string();
+            let message =
+                value.get("error").and_then(|v| v.as_str()).unwrap_or("Could not publish this server.").to_string();
             record.needs_confirm = value.get("needs_confirm").and_then(|v| v.as_bool()).unwrap_or(code == 409);
             record.note = message;
             crate::public_addr::save(data_dir, &record);
@@ -2015,7 +2047,8 @@ pub struct CreatedKey {
 }
 
 fn account_cfg(data_dir: &Path) -> Result<CloudConfig> {
-    let cfg = CloudConfig::load(data_dir).context("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → Account → My network.")?;
+    let cfg = CloudConfig::load(data_dir)
+        .context("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → Account → My network.")?;
     if !cfg.is_account() || cfg.token.is_empty() {
         bail!("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → Account → My network.");
     }
@@ -2069,7 +2102,9 @@ pub fn create_network_key(
         .set("Authorization", &format!("Bearer {}", cfg.token))
         .call()
     {
-        Ok(resp) => serde_json::from_str(&resp.into_string().unwrap_or_default()).context("unexpected reply from PJDesk")?,
+        Ok(resp) => {
+            serde_json::from_str(&resp.into_string().unwrap_or_default()).context("unexpected reply from PJDesk")?
+        }
         Err(e) => return Err(cloud_api_error(e)),
     };
     let net = doc.network.context(
@@ -2084,7 +2119,8 @@ pub fn create_network_key(
     let secret_hex = hex::encode(secret);
     let hash = pjdesk_proto::netkey::secret_hash(&secret_hex);
     let expires_at = days.map(|d| {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_secs()).unwrap_or(0) + d.saturating_mul(86_400)
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_secs()).unwrap_or(0)
+            + d.saturating_mul(86_400)
     });
     let body = serde_json::json!({
         "secret_hash": hash,
@@ -2131,7 +2167,8 @@ pub fn list_network_keys(data_dir: &Path) -> Result<Vec<NetworkInvite>> {
         .call()
     {
         Ok(resp) => {
-            let doc: Doc = serde_json::from_str(&resp.into_string().unwrap_or_default()).context("unexpected reply from PJDesk")?;
+            let doc: Doc = serde_json::from_str(&resp.into_string().unwrap_or_default())
+                .context("unexpected reply from PJDesk")?;
             Ok(doc.invites)
         }
         Err(e) => Err(cloud_api_error(e)),
@@ -2242,6 +2279,28 @@ fn read_health_doc(cfg: &CloudConfig) -> Result<(HealthDoc, Option<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_standby_does_not_keep_the_live_table() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-role-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(accepts_host_registrations(&dir), "a server with no cloud sync is the primary");
+        std::fs::write(dir.join(CONFIG_FILE), r#"{"mode":"account","key":"abcd","email":"ben@spader.us"}"#).unwrap();
+        std::fs::write(
+            dir.join(STATE_FILE),
+            r#"{"desired":"standby","active_instance":"other","active_name":"BENLENOVODESK"}"#,
+        )
+        .unwrap();
+        assert!(!accepts_host_registrations(&dir));
+        std::fs::write(
+            dir.join(STATE_FILE),
+            r#"{"desired":"active","active_instance":"other","active_name":"BENLENOVODESK"}"#,
+        )
+        .unwrap();
+        assert!(accepts_host_registrations(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sigv4_matches_the_aws_example() {
@@ -2405,11 +2464,8 @@ mod tests {
     #[test]
     fn the_server_that_owns_the_cloud_copy_stays_active_with_no_computers_online() {
         let mine = "1b401af7870a921b0629820f04e82433";
-        let st = SyncState {
-            active_instance: mine.into(),
-            active_name: "BENLENOVODESK".into(),
-            ..SyncState::default()
-        };
+        let st =
+            SyncState { active_instance: mine.into(), active_name: "BENLENOVODESK".into(), ..SyncState::default() };
         assert_eq!(effective_role(&st, mine, Role::Standby), Role::Active);
         let other = SyncState { active_instance: mine.into(), ..SyncState::default() };
         assert_eq!(effective_role(&other, "someone-else", Role::Active), Role::Standby);
@@ -2474,20 +2530,21 @@ mod tests {
         )
         .unwrap();
         assert!(online_ids(&dir).unwrap().is_empty(), "a last_seen time is not presence");
-        std::fs::write(
-            dir.join("online.json"),
-            br#"[{"id":"610978221","hostname":"CHIP20","version":"0.6.27"}]"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("online.json"), br#"[{"id":"610978221","hostname":"CHIP20","version":"0.6.27"}]"#)
+            .unwrap();
         let live = online_ids(&dir).unwrap();
         assert!(live.contains("610978221"));
         assert!(!live.contains("902488771"));
         #[cfg(unix)]
         {
             let path = dir.join("online.json");
-            assert!(
-                std::process::Command::new("touch").arg("-d").arg("1 hour ago").arg(&path).status().unwrap().success()
-            );
+            assert!(std::process::Command::new("touch")
+                .arg("-d")
+                .arg("1 hour ago")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
             assert!(online_ids(&dir).unwrap().is_empty(), "a stale online.json is not live presence");
         }
         assert!(online_ids_from(br#"[{"id":"902488771"}]"#).contains("902488771"));
@@ -2501,30 +2558,38 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let at = now();
         let path = dir.join("online.json");
-        std::fs::write(
-            &path,
-            format!(r#"[{{"id":"902488771","hostname":"CABINDESK","version":"0.6.28","at":{at}}}]"#),
-        )
-        .unwrap();
+        std::fs::write(&path, format!(r#"[{{"id":"902488771","hostname":"CABINDESK","version":"0.6.28","at":{at}}}]"#))
+            .unwrap();
         #[cfg(unix)]
         {
-            assert!(
-                std::process::Command::new("touch").arg("-d").arg("1 hour ago").arg(&path).status().unwrap().success()
-            );
+            assert!(std::process::Command::new("touch")
+                .arg("-d")
+                .arg("1 hour ago")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
             assert!(!online_mtime_age(&path).is_some_and(|age| age <= ONLINE_FRESH_SECS));
         }
         let live = online_ids(&dir).unwrap();
         assert!(live.contains("902488771"), "a recent at stamp keeps the computer online");
         std::fs::write(
             &path,
-            format!(r#"[{{"id":"902488771","hostname":"CABINDESK","version":"0.6.28","at":{}}}]"#, at.saturating_sub(3600)),
+            format!(
+                r#"[{{"id":"902488771","hostname":"CABINDESK","version":"0.6.28","at":{}}}]"#,
+                at.saturating_sub(3600)
+            ),
         )
         .unwrap();
         #[cfg(unix)]
         {
-            assert!(
-                std::process::Command::new("touch").arg("-d").arg("1 hour ago").arg(&path).status().unwrap().success()
-            );
+            assert!(std::process::Command::new("touch")
+                .arg("-d")
+                .arg("1 hour ago")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
             assert!(online_ids(&dir).unwrap().is_empty(), "an old at stamp is not live presence");
         }
         let _ = std::fs::remove_dir_all(&dir);

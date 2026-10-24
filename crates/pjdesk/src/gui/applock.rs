@@ -38,7 +38,11 @@ impl App {
     }
 
     fn lock_idle(&self) -> Duration {
-        let secs = self.cfg.app_lock_for(&self.account_email()).map(|v| v.idle_sec).unwrap_or(pjdesk_proto::applock::IDLE_DEFAULT);
+        let secs = self
+            .cfg
+            .app_lock_for(&self.account_email())
+            .map(|v| v.idle_sec)
+            .unwrap_or(pjdesk_proto::applock::IDLE_DEFAULT);
         Duration::from_secs(pjdesk_proto::applock::clamp_idle(secs))
     }
 
@@ -58,7 +62,10 @@ impl App {
             if self.minimized_at.is_none() {
                 self.minimized_at = Some(now);
             }
-            if self.minimized_at.is_some_and(|at| pjdesk_proto::applock::relock(at.elapsed().as_secs(), self.lock_idle().as_secs())) {
+            if self
+                .minimized_at
+                .is_some_and(|at| pjdesk_proto::applock::relock(at.elapsed().as_secs(), self.lock_idle().as_secs()))
+            {
                 self.engage_lock();
             }
         } else if let Some(at) = self.minimized_at.take() {
@@ -91,7 +98,8 @@ impl App {
         self.lock_pin.clear();
         self.lock_forgot = false;
         self.lock_password.clear();
-        self.hello_prompted = false;
+        self.lock_pin_armed = false;
+        self.setup_pin_focused = false;
         self.show_settings = false;
         self.show_invite = false;
         self.show_login = false;
@@ -99,7 +107,6 @@ impl App {
 
     pub(super) fn poll_app_lock(&mut self) {
         self.absorb_shared_lock();
-        self.poll_hello();
         if self.lock_rx.is_some() {
             let msg = self.lock_rx.as_ref().and_then(|rx| match rx.try_recv() {
                 Ok(msg) => Some(msg),
@@ -252,6 +259,7 @@ impl App {
                 self.lock_ui = true;
                 self.lock_armed = true;
                 self.lock_resetting = true;
+                self.setup_pin_focused = false;
                 self.lock_forgot = false;
                 self.lock_password.clear();
                 self.lock_pin.clear();
@@ -300,32 +308,6 @@ impl App {
                     self.pin_idle_minutes = (v.idle_sec / 60).clamp(1, 24 * 60) as u32;
                 }
             }
-        }
-    }
-
-    fn hello_toggle(&mut self, ui: &mut egui::Ui) {
-        let available = self.hello_available.unwrap_or(false);
-        let mut on = pjdesk_proto::applock::hello_enabled(self.hello_choice, available);
-        if ui.checkbox(&mut on, "Unlock with Windows Hello").changed() {
-            self.store_hello(on);
-        }
-        let hint = if self.hello_available == Some(false) {
-            "Windows Hello is not set up on this computer. The PIN is used instead."
-        } else {
-            "Fingerprint, face, or the Windows Hello PIN. On by default when Windows Hello is available. The PJDesk PIN still works."
-        };
-        ui.label(widgets::muted(ui, hint));
-    }
-
-    fn store_hello(&mut self, on: bool) {
-        self.hello_choice = Some(on);
-        let path = pjdesk_proto::applock::window_lock_path();
-        let mut file = pjdesk_proto::applock::read_window_lock(&path);
-        file.hello = Some(on);
-        if let Err(err) = pjdesk_proto::applock::write_window_lock(&path, &file) {
-            self.pin_note = err;
-        } else {
-            tracing::info!("Unlock with Windows Hello is {}", if on { "on" } else { "off" });
         }
     }
 
@@ -408,25 +390,22 @@ impl App {
                         "Your account stays signed in. This computer stays online for incoming connections and updates.",
                     ));
                     ui.add_space(16.0);
-                    let hello = pjdesk_proto::applock::hello_enabled(self.hello_choice, self.hello_available.unwrap_or(false))
-                        && self.hello_available == Some(true);
-                    if hello {
-                        let label = if self.hello_busy { "Waiting for Windows Hello…" } else { "Use Windows Hello" };
-                        if widgets::accent_button(ui, label, egui::Vec2::new(420.0, 40.0)) && !self.hello_busy && !self.lock_busy {
-                            self.hello_prompted = true;
-                            self.start_hello();
-                        }
-                        ui.add_space(8.0);
-                    }
                     let mut pin = self.lock_pin.clone();
-                    widgets::password_field(ui, &mut pin, "4 to 8 digits", &mut self.lock_show);
+                    let pin_box = widgets::password_field(ui, &mut pin, "4 to 8 digits", &mut self.lock_show);
+                    if !self.lock_pin_armed {
+                        pin_box.request_focus();
+                        self.lock_pin_armed = true;
+                    }
                     self.lock_pin = digits_only(&pin);
+                    let can = !self.lock_busy && !waiting && pjdesk_proto::applock::pin_acceptable(&self.lock_pin);
+                    if widgets::submitted(ui, &pin_box) && can {
+                        self.start_unlock();
+                    }
                     if !self.lock_error.is_empty() {
                         ui.add_space(8.0);
                         ui.label(RichText::new(&self.lock_error).color(p.warn));
                     }
                     ui.add_space(12.0);
-                    let can = !self.lock_busy && !waiting && pjdesk_proto::applock::pin_acceptable(&self.lock_pin);
                     if widgets::accent_button(ui, if self.lock_busy { "Checking…" } else { "Unlock" }, egui::Vec2::new(420.0, 40.0)) && can {
                         self.start_unlock();
                     }
@@ -439,19 +418,19 @@ impl App {
                         ui.add_space(8.0);
                         ui.label(widgets::muted(ui, "This is your pjdesk.com password. After it is accepted you choose a new PIN."));
                         let mut pass = self.lock_password.clone();
-                        widgets::password_field(ui, &mut pass, "Account password", &mut self.lock_pass_show);
+                        let pass_box = widgets::password_field(ui, &mut pass, "Account password", &mut self.lock_pass_show);
                         self.lock_password = pass;
                         ui.add_space(8.0);
-                        if widgets::accent_button(ui, "Sign in", egui::Vec2::new(420.0, 36.0))
-                            && !self.lock_busy
-                            && !self.lock_password.is_empty()
-                        {
+                        let can_reset = !self.lock_busy && !self.lock_password.is_empty();
+                        if widgets::submitted(ui, &pass_box) && can_reset {
+                            self.start_reauth();
+                        }
+                        if widgets::accent_button(ui, "Sign in", egui::Vec2::new(420.0, 36.0)) && can_reset {
                             self.start_reauth();
                         }
                     }
                 });
             });
-        self.maybe_auto_hello(ui.ctx());
     }
 
     pub(super) fn setup_screen(&mut self, ui: &mut egui::Ui) {
@@ -474,18 +453,32 @@ impl App {
                     if need_password {
                         ui.label("Account password");
                         let mut pass = self.pin_password.clone();
-                        widgets::password_field(ui, &mut pass, "pjdesk.com password", &mut self.pin_show_password);
+                        let pass_box = widgets::password_field(ui, &mut pass, "pjdesk.com password", &mut self.pin_show_password);
                         self.pin_password = pass;
+                        if widgets::submitted(ui, &pass_box) {
+                            self.setup_pin_focused = false;
+                        }
                         ui.add_space(8.0);
                     }
                     ui.label("PIN");
                     let mut pin = self.pin_new.clone();
-                    widgets::password_field(ui, &mut pin, "4 to 8 digits", &mut self.pin_show_new);
+                    let pin_box = widgets::password_field(ui, &mut pin, "4 to 8 digits", &mut self.pin_show_new);
+                    if !self.setup_pin_focused {
+                        pin_box.request_focus();
+                        self.setup_pin_focused = true;
+                    }
                     self.pin_new = digits_only(&pin);
+                    let advance = widgets::submitted(ui, &pin_box);
                     ui.label("Confirm PIN");
                     let mut confirm = self.pin_confirm.clone();
-                    widgets::password_field(ui, &mut confirm, "Repeat the PIN", &mut self.pin_show_confirm);
+                    let confirm_box = widgets::password_field(ui, &mut confirm, "Repeat the PIN", &mut self.pin_show_confirm);
+                    if advance {
+                        confirm_box.request_focus();
+                    }
                     self.pin_confirm = digits_only(&confirm);
+                    if widgets::submitted(ui, &confirm_box) && !self.lock_busy {
+                        self.start_save(false);
+                    }
                     if !self.pin_note.is_empty() {
                         ui.add_space(8.0);
                         ui.label(RichText::new(&self.pin_note).color(p.warn));
@@ -501,54 +494,6 @@ impl App {
             });
     }
 
-    fn maybe_auto_hello(&mut self, ctx: &egui::Context) {
-        let visible = ctx.input(|i| i.viewport().visible().unwrap_or(true) && i.viewport().minimized != Some(true));
-        let enabled = pjdesk_proto::applock::hello_enabled(self.hello_choice, self.hello_available.unwrap_or(false));
-        if pjdesk_proto::applock::hello_auto_prompt(
-            enabled,
-            self.hello_available.unwrap_or(false),
-            self.hello_prompted,
-            self.hello_busy || self.lock_busy,
-            visible,
-        ) {
-            self.hello_prompted = true;
-            self.start_hello();
-        }
-    }
-
-    fn start_hello(&mut self) {
-        if self.hello_busy {
-            return;
-        }
-        self.hello_busy = true;
-        let (tx, rx) = mpsc::channel();
-        self.hello_rx = Some(rx);
-        std::thread::Builder::new()
-            .name("winhello".into())
-            .spawn(move || {
-                let _ = tx.send(crate::winhello::prompt("Unlock PJDesk"));
-            })
-            .ok();
-    }
-
-    fn poll_hello(&mut self) {
-        if let Some(rx) = &self.hello_check_rx {
-            if let Ok(ok) = rx.try_recv() {
-                self.hello_available = Some(ok);
-                self.hello_check_rx = None;
-            }
-        }
-        if let Some(rx) = &self.hello_rx {
-            if let Ok(ok) = rx.try_recv() {
-                self.hello_rx = None;
-                self.hello_busy = false;
-                if ok {
-                    self.apply_lock_msg(LockMsg::Unlocked);
-                }
-            }
-        }
-    }
-
     fn start_unlock(&mut self) {
         let Some(verifier) = self.cfg.app_lock_for(&self.account_email()) else {
             self.lock_error = "No PIN is set for this account.".into();
@@ -562,7 +507,8 @@ impl App {
         std::thread::Builder::new()
             .name("app-lock".into())
             .spawn(move || {
-                let msg = if pjdesk_proto::applock::matches(&verifier, &pin) { LockMsg::Unlocked } else { LockMsg::Rejected };
+                let msg =
+                    if pjdesk_proto::applock::matches(&verifier, &pin) { LockMsg::Unlocked } else { LockMsg::Rejected };
                 let _ = tx.send(msg);
             })
             .ok();
@@ -595,8 +541,6 @@ impl App {
             "A PIN is required for this PJDesk account. Opening this window asks for it, and so does PJDesk Server, the tray, and starting the program again. Restoring a minimized window, or leaving it idle, asks again after the time below. The background service, incoming connections, and updates keep running.",
         ));
         ui.add_space(6.0);
-        self.hello_toggle(ui);
-        ui.add_space(6.0);
         if !self.signed_in() {
             ui.label(widgets::muted(ui, "Sign in to set a PIN for this account."));
             ui.add_space(12.0);
@@ -620,12 +564,19 @@ impl App {
         ui.add_space(4.0);
         ui.label("New PIN");
         let mut new_pin = self.pin_new.clone();
-        widgets::password_field(ui, &mut new_pin, "4 to 8 digits", &mut self.pin_show_new);
+        let new_box = widgets::password_field(ui, &mut new_pin, "4 to 8 digits", &mut self.pin_show_new);
         self.pin_new = digits_only(&new_pin);
+        let advance = widgets::submitted(ui, &new_box);
         ui.label("Confirm PIN");
         let mut confirm = self.pin_confirm.clone();
-        widgets::password_field(ui, &mut confirm, "Repeat the PIN", &mut self.pin_show_confirm);
+        let confirm_box = widgets::password_field(ui, &mut confirm, "Repeat the PIN", &mut self.pin_show_confirm);
+        if advance {
+            confirm_box.request_focus();
+        }
         self.pin_confirm = digits_only(&confirm);
+        if widgets::submitted(ui, &confirm_box) && !self.lock_busy {
+            self.start_save(false);
+        }
         ui.add_space(4.0);
         ui.label("Ask again after");
         ui.horizontal(|ui| {

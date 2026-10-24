@@ -17,34 +17,33 @@ mod accounts;
 mod audit;
 mod cloud;
 mod control;
+mod gui;
 mod handoff;
 mod password_policy;
 mod public_addr;
-mod gui;
-mod winhello;
-mod window_lock;
-mod winshow;
 mod registry;
 mod relay;
 mod requests;
 mod self_update;
-mod status_pipe;
-mod status_view;
-mod tray_tip;
-mod ui_icons;
-mod ui_theme;
-mod ui_widgets;
-#[cfg(windows)]
-mod tray;
-#[cfg(not(windows))]
-#[path = "tray_stub.rs"]
-mod tray;
 mod server;
 #[cfg(windows)]
 mod service;
 #[cfg(not(windows))]
 #[path = "service_stub.rs"]
 mod service;
+mod status_pipe;
+mod status_view;
+#[cfg(windows)]
+mod tray;
+#[cfg(not(windows))]
+#[path = "tray_stub.rs"]
+mod tray;
+mod tray_tip;
+mod ui_icons;
+mod ui_theme;
+mod ui_widgets;
+mod window_lock;
+mod winshow;
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -373,7 +372,12 @@ fn account_command(cmd: AccountCommand, data_dir: &std::path::Path) -> Result<()
             };
             let existed = accounts.list().iter().any(|a| a.username == accounts::normalize_username(&username));
             accounts.create(&username, &password, admin, true)?;
-            println!("{} account \"{}\"{}.", if existed { "Updated" } else { "Created" }, accounts::normalize_username(&username), if admin { " (administrator)" } else { "" });
+            println!(
+                "{} account \"{}\"{}.",
+                if existed { "Updated" } else { "Created" },
+                accounts::normalize_username(&username),
+                if admin { " (administrator)" } else { "" }
+            );
         }
         AccountCommand::List => {
             let list = accounts.list();
@@ -454,7 +458,10 @@ fn cloud_command(cmd: CloudCommand, data_dir: &std::path::Path) -> Result<()> {
             match cloud::connect_account(data_dir, &cfg, online, choice)? {
                 cloud::Connected::Uploaded => {
                     let _ = requests::push(data_dir, requests::SYNC_FILE, "now");
-                    println!("Signed in as {}. This is the main server; its data is uploaded to PJDesk Cloud.", cfg.email);
+                    println!(
+                        "Signed in as {}. This is the main server; its data is uploaded to PJDesk Cloud.",
+                        cfg.email
+                    );
                 }
                 cloud::Connected::Resumed => println!("Signed in as {}; syncing as before.", cfg.email),
                 cloud::Connected::Joined { from } => {
@@ -627,7 +634,8 @@ fn init_window_logging() {
     }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
         .try_init();

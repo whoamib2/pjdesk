@@ -390,7 +390,7 @@ impl App {
         self.accounts = Accounts::load(&self.data_dir).map(|a| a.list()).unwrap_or_default();
         self.devices = Registry::load(self.data_dir.join("devices.json")).map(|r| r.list()).unwrap_or_default();
         self.online = read_online(&self.data_dir);
-        self.log_tail = tail(&self.data_dir.join("server.log"), 40);
+        self.log_tail = status_view::redacted_log_tail(&self.data_dir.join("server.log"));
         self.cloud_on = self.data_dir.join(crate::cloud::CONFIG_FILE).exists();
         self.cloud = crate::cloud::CloudStatus::load(&self.data_dir);
     }
@@ -941,7 +941,9 @@ impl App {
             let managed = self.control_ready;
             let mut auto = snap.update_auto;
             let changed = ui
-                .add_enabled_ui(managed, |ui| ui_widgets::checkbox(ui, &mut auto, "Install server updates automatically"))
+                .add_enabled_ui(managed, |ui| {
+                    ui_widgets::checkbox(ui, &mut auto, "Install server updates automatically")
+                })
                 .inner;
             if changed && managed {
                 self.ask_service(crate::control::Request {
@@ -991,7 +993,9 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     ui.label("Maintenance window");
-                    ui.add(egui::TextEdit::singleline(&mut self.update_start).hint_text("any time").desired_width(70.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.update_start).hint_text("any time").desired_width(70.0),
+                    );
                     ui.label("to");
                     ui.add(egui::TextEdit::singleline(&mut self.update_end).hint_text("HH:MM").desired_width(70.0));
                     if ui.button("Save").clicked() {
@@ -1096,7 +1100,11 @@ impl App {
         if self.access == Access::Readable {
             if let Some(cfg) = crate::cloud::CloudConfig::load(&self.data_dir) {
                 if cfg.is_account() && !cfg.token.is_empty() {
-                    let api = if cfg.api.trim().is_empty() { api_fallback } else { cfg.api.trim_end_matches('/').to_string() };
+                    let api = if cfg.api.trim().is_empty() {
+                        api_fallback
+                    } else {
+                        cfg.api.trim_end_matches('/').to_string()
+                    };
                     return (cfg.token, api);
                 }
             }
@@ -1173,11 +1181,8 @@ impl App {
         let busy = self.cloud_job.is_some();
         let can_act = self.can_write || self.control_ready;
         let readable = self.access == Access::Readable;
-        let cloud_on = if readable {
-            self.cloud_on
-        } else {
-            self.live.as_ref().is_some_and(|s| s.cloud_on) || !email.is_empty()
-        };
+        let cloud_on =
+            if readable { self.cloud_on } else { self.live.as_ref().is_some_and(|s| s.cloud_on) || !email.is_empty() };
         let choosing_bucket = self.cloud_form.own_bucket;
         card(ui, |ui| {
             heading(ui, "PJDESK ACCOUNT");
@@ -1715,12 +1720,14 @@ impl App {
                     return;
                 }
                 if self.via_service() {
-                    self.spawn_cloud_job(move || service_job(crate::control::Request {
-                        cmd: "sign_in".into(),
-                        email,
-                        password,
-                        ..Default::default()
-                    }));
+                    self.spawn_cloud_job(move || {
+                        service_job(crate::control::Request {
+                            cmd: "sign_in".into(),
+                            email,
+                            password,
+                            ..Default::default()
+                        })
+                    });
                     return;
                 }
                 self.spawn_cloud_job(move || {
@@ -2016,14 +2023,18 @@ impl App {
                     .desired_width(360.0)
                     .font(egui::TextStyle::Monospace),
             );
-            ui.label(RichText::new(crate::public_addr::IpWatch::load(&self.data_dir).line()).color(p(ui).muted).size(12.0));
+            ui.label(
+                RichText::new(crate::public_addr::IpWatch::load(&self.data_dir).line()).color(p(ui).muted).size(12.0),
+            );
             let hostname = crate::public_addr::is_hostname(self.pub_addr.trim());
             let mut watch = crate::public_addr::IpWatch::load(&self.data_dir);
             let mut auto = watch.enabled(self.pub_addr.trim());
             if hostname {
-                ui.label(RichText::new(
-                    "This address is a hostname, so a public IP change does not replace it.",
-                ).color(p(ui).muted).size(12.0));
+                ui.label(
+                    RichText::new("This address is a hostname, so a public IP change does not replace it.")
+                        .color(p(ui).muted)
+                        .size(12.0),
+                );
             }
             ui.add_enabled_ui(may_edit && !hostname, |ui| {
                 if ui.checkbox(&mut auto, "Update the address when my public IP changes").changed() {
@@ -2156,7 +2167,7 @@ impl App {
                 self.spawn_revoke_key(id);
             }
         });
-            if changed {
+        if changed {
             policy.require_accounts = require;
             policy.require_chosen = true;
             if let Err(e) = policy.save(&self.data_dir) {
@@ -2195,9 +2206,10 @@ impl App {
         let address = self.pub_addr.clone();
         card(ui, |ui| {
             heading(ui, "PUBLIC ADDRESS");
-            ui.label(RichText::new(
-                "Saved by the PJDesk service. The address computers use to reach this server.",
-            ).color(p(ui).muted));
+            ui.label(
+                RichText::new("Saved by the PJDesk service. The address computers use to reach this server.")
+                    .color(p(ui).muted),
+            );
             ui.add_space(6.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.pub_addr)
@@ -2209,9 +2221,11 @@ impl App {
                 ui.label(RichText::new(&ip_line).color(p(ui).muted).size(12.0));
             }
             if hostname {
-                ui.label(RichText::new(
-                    "This address is a hostname, so a public IP change does not replace it.",
-                ).color(p(ui).muted).size(12.0));
+                ui.label(
+                    RichText::new("This address is a hostname, so a public IP change does not replace it.")
+                        .color(p(ui).muted)
+                        .size(12.0),
+                );
             } else if watch_known && ui.checkbox(&mut watch, "Update the address when my public IP changes").changed() {
                 watch_changed = true;
             }
@@ -2221,7 +2235,9 @@ impl App {
             if self.pub_addr_needs_confirm && ui.button("Replace the server on My network").clicked() {
                 publish = true;
                 replace = true;
-            } else if !self.pub_addr.trim().is_empty() && self.pub_addr.trim() != address.trim() && ui.button("Update My network").clicked()
+            } else if !self.pub_addr.trim().is_empty()
+                && self.pub_addr.trim() != address.trim()
+                && ui.button("Update My network").clicked()
             {
                 publish = true;
             }
@@ -2566,7 +2582,9 @@ impl App {
                         && online > 0
                         && ui
                             .small_button("Update all online computers")
-                            .on_hover_text("Tell every online PJDesk client to download and install the latest release now")
+                            .on_hover_text(
+                                "Tell every online PJDesk client to download and install the latest release now",
+                            )
                             .clicked()
                     {
                         update_all = true;
@@ -2783,16 +2801,17 @@ impl App {
     }
 
     fn log_card(&mut self, ui: &mut egui::Ui) {
-        if self.access != Access::Readable {
-            card(ui, |ui| {
-                heading(ui, "LOG");
-                self.locked_line(ui);
-            });
-            return;
-        }
+        let from_service = self.access != Access::Readable;
+        let service_log = if from_service {
+            self.live.as_ref().map(|s| s.log_tail.clone()).unwrap_or_default()
+        } else {
+            self.log_tail.clone()
+        };
         card(ui, |ui| {
             heading(ui, "LOG");
-            if self.log_tail.is_empty() {
+            if from_service && service_log.is_empty() {
+                self.locked_line(ui);
+            } else if service_log.is_empty() {
                 ui.label(
                     RichText::new("No log yet (the server writes server.log in its data folder when it runs).")
                         .color(p(ui).muted)
@@ -2800,9 +2819,19 @@ impl App {
                 );
             } else {
                 egui::ScrollArea::vertical().max_height(160.0).id_salt("log").stick_to_bottom(true).show(ui, |ui| {
-                    ui.label(RichText::new(&self.log_tail).monospace().size(11.0).color(p(ui).muted));
+                    ui.label(RichText::new(&service_log).monospace().size(11.0).color(p(ui).muted));
                 });
             }
+            ui.add_space(8.0);
+            if ui.button("Copy diagnostics").clicked() {
+                copy(&diagnostics_text(&service_log));
+                self.status = "Copied diagnostics. Passwords and tokens are left out.".into();
+            }
+            ui.label(
+                RichText::new("This works without administrator rights. The copy leaves out passwords and tokens.")
+                    .color(p(ui).muted)
+                    .size(12.0),
+            );
         });
     }
 }
@@ -2981,11 +3010,30 @@ fn copy(text: &str) {
     }
 }
 
-fn tail(path: &std::path::Path, lines: usize) -> String {
-    let Ok(text) = std::fs::read_to_string(path) else { return String::new() };
-    let all: Vec<&str> = text.lines().collect();
-    let start = all.len().saturating_sub(lines);
-    all[start..].join("\n")
+fn diagnostics_text(service_log: &str) -> String {
+    let window = status_view::redacted_log_tail(&window_log_path());
+    let mut out = String::from("PJDesk Server diagnostics\n\n--- server.log ---\n");
+    if service_log.is_empty() {
+        out.push_str("(not available)\n");
+    } else {
+        out.push_str(service_log);
+        out.push('\n');
+    }
+    if !window.is_empty() {
+        out.push_str("\n--- pjdesk-server.log ---\n");
+        out.push_str(&window);
+        out.push('\n');
+    }
+    out
+}
+
+fn window_log_path() -> std::path::PathBuf {
+    std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("PJDesk")
+        .join("pjdesk-server.log")
 }
 
 fn ago(unix: u64) -> String {

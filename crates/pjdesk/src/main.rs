@@ -17,13 +17,10 @@ mod icon_asset;
 mod account;
 mod audio;
 mod client_update;
-mod update_pipe;
 mod clip;
 mod color;
 mod config;
 mod gui;
-mod winhello;
-mod winshow;
 mod handoff;
 mod host;
 mod hostfacts;
@@ -38,8 +35,10 @@ mod session;
 mod signaling;
 mod syspaths;
 mod temp_sign;
+mod update_pipe;
 mod vault;
 mod viewer;
+mod winshow;
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -494,9 +493,7 @@ fn repair_stdio_handles() {
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
-    use windows::Win32::System::Console::{
-        SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    };
+    use windows::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 
     unsafe {
         let nul = windows::core::HSTRING::from("NUL");
@@ -816,7 +813,8 @@ fn phone_view_failure(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     if lower.contains("declin") || lower.contains("not allowed to view") {
         "Phone declined".into()
-    } else if lower.contains("screen sharing") || lower.contains("screen capture") || lower.contains("mediaprojection") {
+    } else if lower.contains("screen sharing") || lower.contains("screen capture") || lower.contains("mediaprojection")
+    {
         "Screen sharing not allowed on the phone".into()
     } else if lower.contains("timed out")
         || lower.contains("did not answer")

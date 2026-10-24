@@ -52,12 +52,10 @@ pub struct Gate {
     next_pull: Instant,
     last_input: Instant,
     hidden_at: Option<Instant>,
-    hello_choice: Option<bool>,
-    hello_available: Option<bool>,
-    hello_prompted: bool,
-    hello_busy: bool,
-    hello_rx: Option<Receiver<bool>>,
-    hello_check: Option<Receiver<bool>>,
+    /// The unlock PIN box has been focused for this appearance.
+    pin_armed: bool,
+    /// The Set-a-PIN field has been focused for this appearance.
+    setup_focused: bool,
 }
 
 impl Gate {
@@ -92,12 +90,8 @@ impl Gate {
             next_pull: Instant::now(),
             last_input: Instant::now(),
             hidden_at: None,
-            hello_choice: file.hello,
-            hello_available: None,
-            hello_prompted: false,
-            hello_busy: false,
-            hello_rx: None,
-            hello_check: None,
+            pin_armed: false,
+            setup_focused: false,
         }
     }
 
@@ -126,7 +120,8 @@ impl Gate {
         self.pin.clear();
         self.forgot = false;
         self.password.clear();
-        self.hello_prompted = false;
+        self.pin_armed = false;
+        self.setup_focused = false;
         self.error.clear();
     }
 
@@ -171,7 +166,6 @@ impl Gate {
         self.note_account(email, token, api);
         self.refresh_lockout();
         self.poll_jobs();
-        self.poll_hello();
         if self.email.is_empty() || self.rx.is_some() || Instant::now() < self.next_pull || self.token.is_empty() {
             return;
         }
@@ -182,7 +176,9 @@ impl Gate {
         let spawned = std::thread::Builder::new()
             .name("app-lock-pull".into())
             .spawn(move || {
-                let msg = fetch_lock(&api, &token).map(|remote| Msg::Remote(Ok(remote))).unwrap_or_else(|e| Msg::Remote(Err(e)));
+                let msg = fetch_lock(&api, &token)
+                    .map(|remote| Msg::Remote(Ok(remote)))
+                    .unwrap_or_else(|e| Msg::Remote(Err(e)));
                 let _ = tx.send(msg);
             })
             .is_ok();
@@ -211,23 +207,7 @@ impl Gate {
             return;
         }
         ui.label("A PIN is required to open this window and the PJDesk client. The service keeps running while the window is locked.");
-        ui.add_space(6.0);
-        self.hello_toggle(ui);
         ui.add_space(8.0);
-    }
-
-    fn hello_toggle(&mut self, ui: &mut egui::Ui) {
-        let available = self.hello_available.unwrap_or(false);
-        let mut on = applock::hello_enabled(self.hello_choice, available);
-        if crate::ui_widgets::checkbox(ui, &mut on, "Unlock with Windows Hello") && Some(on) != self.hello_choice {
-            self.store_hello(on);
-        }
-        let hint = if self.hello_available == Some(false) {
-            "Windows Hello is not set up on this computer. The PIN is used instead."
-        } else {
-            "Fingerprint, face, or the Windows Hello PIN. On by default when Windows Hello is available. The PJDesk PIN still works."
-        };
-        ui.label(RichText::new(hint).color(crate::ui_theme::paint(ui).muted).size(12.0));
     }
 
     fn setup_screen(&mut self, ui: &mut egui::Ui) {
@@ -243,17 +223,31 @@ impl Gate {
                 ui.add_space(12.0);
                 if self.key.is_none() && Instant::now() >= self.reauth_until {
                     ui.label("Account password");
-                    secret_field(ui, &mut self.password, "pjdesk.com password", &mut self.pass_show);
+                    let pass_box = secret_field(ui, &mut self.password, "pjdesk.com password", &mut self.pass_show);
+                    if submitted(ui, &pass_box) {
+                        self.setup_focused = false;
+                    }
                     ui.add_space(8.0);
                 }
                 ui.label("PIN");
                 let mut pin = self.pin.clone();
-                secret_field(ui, &mut pin, "4 to 8 digits", &mut self.pin_show);
+                let pin_box = secret_field(ui, &mut pin, "4 to 8 digits", &mut self.pin_show);
+                if !self.setup_focused {
+                    pin_box.request_focus();
+                    self.setup_focused = true;
+                }
                 self.pin = digits(&pin);
+                let advance = submitted(ui, &pin_box);
                 ui.label("Confirm PIN");
                 let mut confirm = self.confirm.clone();
-                secret_field(ui, &mut confirm, "Repeat the PIN", &mut self.confirm_show);
+                let confirm_box = secret_field(ui, &mut confirm, "Repeat the PIN", &mut self.confirm_show);
+                if advance {
+                    confirm_box.request_focus();
+                }
                 self.confirm = digits(&confirm);
+                if submitted(ui, &confirm_box) && !self.busy {
+                    self.start_save();
+                }
                 self.footer(ui, "Save PIN", true);
             });
         });
@@ -267,26 +261,27 @@ impl Gate {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
         let p = crate::ui_theme::paint(ui);
-        let hello = applock::hello_enabled(self.hello_choice, self.hello_available.unwrap_or(false)) && self.hello_available == Some(true);
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.set_max_width(420.0);
                 ui.add_space(72.0);
                 ui.label(RichText::new("Enter your PIN").strong().size(22.0).color(p.text));
                 ui.add_space(6.0);
-                ui.label("Your account stays signed in. This server stays online for incoming connections and updates.");
+                ui.label(
+                    "Your account stays signed in. This server stays online for incoming connections and updates.",
+                );
                 ui.add_space(12.0);
-                if hello {
-                    let label = if self.hello_busy { "Waiting for Windows Hello…" } else { "Use Windows Hello" };
-                    if crate::ui_widgets::accent_button(ui, label) && !self.hello_busy && !self.busy {
-                        self.hello_prompted = true;
-                        self.start_hello();
-                    }
-                    ui.add_space(8.0);
-                }
                 let mut pin = self.pin.clone();
-                secret_field(ui, &mut pin, "4 to 8 digits", &mut self.pin_show);
+                let pin_box = secret_field(ui, &mut pin, "4 to 8 digits", &mut self.pin_show);
+                if !self.pin_armed {
+                    pin_box.request_focus();
+                    self.pin_armed = true;
+                }
                 self.pin = digits(&pin);
+                let can = !self.busy && !waiting && applock::pin_acceptable(&self.pin);
+                if submitted(ui, &pin_box) && can {
+                    self.start_unlock();
+                }
                 self.footer(ui, "Unlock", false);
                 ui.add_space(8.0);
                 if ui.link("Forgot PIN? Sign in again").clicked() && !self.busy {
@@ -296,15 +291,18 @@ impl Gate {
                 if self.forgot {
                     ui.add_space(8.0);
                     ui.label("This is your pjdesk.com password. After it is accepted you choose a new PIN.");
-                    secret_field(ui, &mut self.password, "Account password", &mut self.pass_show);
+                    let pass_box = secret_field(ui, &mut self.password, "Account password", &mut self.pass_show);
                     ui.add_space(8.0);
-                    if crate::ui_widgets::accent_button(ui, "Sign in") && !self.busy && !self.password.is_empty() {
+                    let can_reset = !self.busy && !self.password.is_empty();
+                    if submitted(ui, &pass_box) && can_reset {
+                        self.start_reauth();
+                    }
+                    if crate::ui_widgets::accent_button(ui, "Sign in") && can_reset {
                         self.start_reauth();
                     }
                 }
             });
         });
-        self.maybe_auto_hello(ui.ctx());
     }
 
     fn footer(&mut self, ui: &mut egui::Ui, label: &str, setup: bool) {
@@ -332,31 +330,6 @@ impl Gate {
                 self.start_unlock();
             }
         }
-    }
-
-    fn maybe_auto_hello(&mut self, ctx: &egui::Context) {
-        let visible = ctx.input(|i| i.viewport().visible().unwrap_or(true) && i.viewport().minimized != Some(true));
-        let enabled = applock::hello_enabled(self.hello_choice, self.hello_available.unwrap_or(false));
-        if applock::hello_auto_prompt(enabled, self.hello_available.unwrap_or(false), self.hello_prompted, self.hello_busy || self.busy, visible)
-        {
-            self.hello_prompted = true;
-            self.start_hello();
-        }
-    }
-
-    fn start_hello(&mut self) {
-        if self.hello_busy {
-            return;
-        }
-        self.hello_busy = true;
-        let (tx, rx) = mpsc::channel();
-        self.hello_rx = Some(rx);
-        std::thread::Builder::new()
-            .name("winhello".into())
-            .spawn(move || {
-                let _ = tx.send(crate::winhello::prompt("Unlock PJDesk Server"));
-            })
-            .ok();
     }
 
     fn start_unlock(&mut self) {
@@ -440,27 +413,6 @@ impl Gate {
         self.apply(msg);
     }
 
-    fn poll_hello(&mut self) {
-        if self.hello_check.is_none() && self.hello_available.is_none() {
-            self.hello_check = Some(crate::winhello::spawn_check());
-        }
-        if let Some(rx) = &self.hello_check {
-            if let Ok(ok) = rx.try_recv() {
-                self.hello_available = Some(ok);
-                self.hello_check = None;
-            }
-        }
-        if let Some(rx) = &self.hello_rx {
-            if let Ok(ok) = rx.try_recv() {
-                self.hello_rx = None;
-                self.hello_busy = false;
-                if ok {
-                    self.unlock();
-                }
-            }
-        }
-    }
-
     fn apply(&mut self, msg: Msg) {
         match msg {
             Msg::Unlocked => self.unlock(),
@@ -474,7 +426,11 @@ impl Gate {
                     wait_label(until - unix_now())
                 } else {
                     let left = 5u32.saturating_sub(fails);
-                    if left == 0 { "Wrong PIN.".into() } else { format!("Wrong PIN. {left} left before a wait.") }
+                    if left == 0 {
+                        "Wrong PIN.".into()
+                    } else {
+                        format!("Wrong PIN. {left} left before a wait.")
+                    }
                 };
                 tracing::info!("Wrong PIN on the PJDesk Server window ({fails} misses)");
             }
@@ -487,6 +443,7 @@ impl Gate {
                 self.ui = true;
                 self.pin.clear();
                 self.confirm.clear();
+                self.setup_focused = false;
                 self.error.clear();
                 self.note = "Signed in. Choose a new PIN.".into();
                 tracing::info!("Account password accepted. Waiting for a new PIN.");
@@ -592,7 +549,6 @@ impl Gate {
             self.updated = file.updated;
             self.fails = file.fails;
             self.until = file.until;
-            self.hello_choice = file.hello.or(self.hello_choice);
         } else {
             self.verifier = None;
             self.sealed.clear();
@@ -615,16 +571,9 @@ impl Gate {
         }
     }
 
-    fn store_hello(&mut self, on: bool) {
-        self.hello_choice = Some(on);
-        self.persist();
-        tracing::info!("Unlock with Windows Hello is {}", if on { "on" } else { "off" });
-    }
-
     fn persist(&self) {
         let path = applock::window_lock_path();
         let mut file = applock::read_window_lock(&path);
-        file.hello = self.hello_choice.or(file.hello);
         if !self.email.is_empty() {
             file.email = self.email.clone();
             file.fails = self.fails;
@@ -651,7 +600,16 @@ fn open_cached(file: &WindowLockFile) -> Option<Verifier> {
     serde_json::from_str(&text).ok()
 }
 
-fn save_pin(api: &str, token: &str, email: &str, password: &str, existing: Option<[u8; 32]>, recent: bool, pin: &str, idle: u64) -> Msg {
+fn save_pin(
+    api: &str,
+    token: &str,
+    email: &str,
+    password: &str,
+    existing: Option<[u8; 32]>,
+    recent: bool,
+    pin: &str,
+    idle: u64,
+) -> Msg {
     let key = if !password.is_empty() {
         match confirm_password(api, email, password) {
             Ok(key) => key,
@@ -682,7 +640,8 @@ fn save_pin(api: &str, token: &str, email: &str, password: &str, existing: Optio
 fn fetch_lock(api: &str, token: &str) -> Result<Remote, String> {
     let url = format!("{}/api/network/app-lock", api.trim_end_matches('/'));
     let text = post(&url, token, "{}")?;
-    let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|_| "the account sent an unexpected app lock".to_string())?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "the account sent an unexpected app lock".to_string())?;
     Ok(Remote {
         sealed: parsed.get("lock").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         updated: parsed.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -740,7 +699,8 @@ fn confirm_password(api: &str, email: &str, password: &str) -> Result<[u8; 32], 
         }
         Err(ureq::Error::Transport(err)) => return Err(format!("Could not reach pjdesk.com. {err}")),
     };
-    let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|_| "unexpected reply from PJDesk".to_string())?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "unexpected reply from PJDesk".to_string())?;
     let token = parsed.get("token").and_then(|v| v.as_str()).unwrap_or("");
     if !token.is_empty() {
         let _ = crate::cloud::agent()
@@ -751,11 +711,15 @@ fn confirm_password(api: &str, email: &str, password: &str) -> Result<[u8; 32], 
     Ok(pjdesk_proto::access::derive_password_vault_key(&email, password))
 }
 
-fn secret_field(ui: &mut egui::Ui, value: &mut String, hint: &str, shown: &mut bool) {
+fn submitted(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+}
+
+fn secret_field(ui: &mut egui::Ui, value: &mut String, hint: &str, shown: &mut bool) -> egui::Response {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         let width = (ui.available_width() - 72.0).max(48.0);
-        ui.add(
+        let response = ui.add(
             egui::TextEdit::singleline(value)
                 .hint_text(hint)
                 .password(!*shown)
@@ -763,7 +727,9 @@ fn secret_field(ui: &mut egui::Ui, value: &mut String, hint: &str, shown: &mut b
                 .margin(egui::Margin::symmetric(12, 10)),
         );
         crate::ui_widgets::reveal(ui, shown);
-    });
+        response
+    })
+    .inner
 }
 
 fn digits(text: &str) -> String {

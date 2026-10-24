@@ -89,7 +89,8 @@ async fn one(state: Arc<HostState>, incoming: quinn::Incoming) -> Result<()> {
     if state.streaming.swap(true, Ordering::SeqCst) {
         let message = "another controller is already connected";
         warn!("Password was accepted, then the direct session stopped: {message}");
-        let _ = pjdesk_proto::framing::write_msg(&mut auth.send, &pjdesk_proto::peer::HostMsg::Notice(message.into())).await;
+        let _ = pjdesk_proto::framing::write_msg(&mut auth.send, &pjdesk_proto::peer::HostMsg::Notice(message.into()))
+            .await;
         connection.close(2u32.into(), message.as_bytes());
         return Ok(());
     }
@@ -119,7 +120,8 @@ async fn one(state: Arc<HostState>, incoming: quinn::Incoming) -> Result<()> {
     } else {
         info!("Host log: %APPDATA%\\PJDesk\\pjdesk.log");
     }
-    let result = stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
+    let result =
+        stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
     state.streaming.store(false, Ordering::SeqCst);
     state.fresh_support();
     if let Some(shared) = &state.shared {
@@ -199,8 +201,9 @@ pub fn discover_for(limit: Duration) -> Vec<(LanBeacon, SocketAddr)> {
                     continue;
                 }
                 if let Ok(beacon) = discover::decode(&buf[..n]) {
-                    if !found.iter().any(|(b, _): &(LanBeacon, SocketAddr)| b.id == beacon.id && b.fingerprint == beacon.fingerprint)
-                    {
+                    if !found.iter().any(|(b, _): &(LanBeacon, SocketAddr)| {
+                        b.id == beacon.id && b.fingerprint == beacon.fingerprint
+                    }) {
                         found.push((beacon, src));
                     }
                 }
@@ -238,7 +241,11 @@ pub fn listen_discovered(stop: Arc<AtomicBool>, tx: Sender<Vec<(String, String, 
     }
 }
 
-fn collect_beacons(socket: &std::net::UdpSocket, stop: &AtomicBool, tx: &Sender<Vec<(String, String, String)>>) -> bool {
+fn collect_beacons(
+    socket: &std::net::UdpSocket,
+    stop: &AtomicBool,
+    tx: &Sender<Vec<(String, String, String)>>,
+) -> bool {
     let mut peers: Vec<SeenPeer> = Vec::new();
     let mut buf = [0u8; 512];
     while !stop.load(Ordering::Relaxed) {
@@ -251,7 +258,11 @@ fn collect_beacons(socket: &std::net::UdpSocket, stop: &AtomicBool, tx: &Sender<
                 if n >= 8 && &buf[..8] == pjdesk_proto::discover::SERVER_MAGIC {
                     if let Ok(server) = discover::decode_server(&buf[..n]) {
                         if let std::net::IpAddr::V4(ip) = src.ip() {
-                            discover::note_server_beacon(std::net::SocketAddr::from((ip, server.port)), server.fingerprint);
+                            discover::note_server_beacon(
+                                std::net::SocketAddr::from((ip, server.port)),
+                                server.fingerprint,
+                                server.role,
+                            );
                         }
                     }
                     continue;

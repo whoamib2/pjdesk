@@ -118,6 +118,11 @@ pub fn text_field(ui: &mut egui::Ui, value: &mut String, hint: &str, monospace: 
 
 /// Password field with a Show/Hide toggle. The toggle is a word, not an icon,
 /// so it stays readable in every font.
+/// True when Enter left this single-line field, the same as clicking its button.
+pub fn submitted(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+}
+
 pub fn password_field(ui: &mut egui::Ui, value: &mut String, hint: &str, shown: &mut bool) -> egui::Response {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;

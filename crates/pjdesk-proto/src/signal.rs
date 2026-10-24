@@ -19,6 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Identifies one connection attempt between a controller and a host.
 pub type SessionId = u64;
@@ -29,45 +30,98 @@ pub enum ClientMsg {
     /// Host: register this device (or reclaim its ID) and go online.
     ///
     /// The secret proves ownership of the ID; the server stores only its hash.
-    Register { proto: u16, device_id: Option<String>, device_secret: [u8; 32], hostname: String, app_version: String },
+    Register {
+        proto: u16,
+        device_id: Option<String>,
+        device_secret: [u8; 32],
+        hostname: String,
+        app_version: String,
+    },
     /// Controller: ask for a session with the device `target_id`.
-    Connect { proto: u16, target_id: String, controller_name: String },
+    Connect {
+        proto: u16,
+        target_id: String,
+        controller_name: String,
+    },
     /// Host: answer to [`ServerMsg::IncomingSession`].
-    SessionResponse { session_id: SessionId, accept: bool, reason: String },
+    SessionResponse {
+        session_id: SessionId,
+        accept: bool,
+        reason: String,
+    },
     /// Either peer: my UDP socket is bound (see [`crate::udp`]); here are my
     /// LAN candidate addresses. Hosts also send their QUIC certificate
     /// fingerprint so the controller can pin it.
-    UdpReady { session_id: SessionId, local_addrs: Vec<SocketAddr>, cert_fingerprint: Option<[u8; 32]> },
+    UdpReady {
+        session_id: SessionId,
+        local_addrs: Vec<SocketAddr>,
+        cert_fingerprint: Option<[u8; 32]>,
+    },
     /// Sign in to an account on the server, with a password or a saved token
     /// (see [`Credential`]). The reply is [`ServerMsg::LoginResult`].
-    Login { proto: u16, username: String, credential: Credential, device_name: String },
+    Login {
+        proto: u16,
+        username: String,
+        credential: Credential,
+        device_name: String,
+    },
     /// Invalidate the saved token in [`Credential::Token`] (sign out everywhere
     /// is a server setting; this just drops the current one).
-    Logout { token: String },
+    Logout {
+        token: String,
+    },
     /// Fetch the signed-in account's address book ([`ServerMsg::AddressBook`]).
-    GetAddressBook { token: String },
+    GetAddressBook {
+        token: String,
+    },
     /// Replace the signed-in account's address book.
-    SaveAddressBook { token: String, entries: Vec<AddressEntry> },
+    SaveAddressBook {
+        token: String,
+        entries: Vec<AddressEntry>,
+    },
     /// Keep-alive.
     Ping,
     /// Version 3. Operator or admin: the registered computers.
-    ListDevices { token: String },
+    ListDevices {
+        token: String,
+    },
     /// Version 3. Operator or admin: set or clear a computer's group.
-    SetDeviceGroup { token: String, device_id: String, group: String },
+    SetDeviceGroup {
+        token: String,
+        device_id: String,
+        group: String,
+    },
     /// Version 3. Any signed-in user may read the policy; only an admin may change it.
-    GetPolicy { token: String },
-    SetPolicy { token: String, policy: Policy },
+    GetPolicy {
+        token: String,
+    },
+    SetPolicy {
+        token: String,
+        policy: Policy,
+    },
     /// Version 3. Operator or admin: recent audit events.
-    GetAudit { token: String, limit: u32 },
+    GetAudit {
+        token: String,
+        limit: u32,
+    },
     /// Version 3. Admin: change an account's role.
-    SetRole { token: String, username: String, role: Role },
+    SetRole {
+        token: String,
+        username: String,
+        role: Role,
+    },
     /// Version 3. The signed-in user replaces their own password. The server
     /// drops saved tokens, so the client signs in again.
-    ChangePassword { token: String, new_password: String },
+    ChangePassword {
+        token: String,
+        new_password: String,
+    },
     /// Presents a pjdesk.com network access token. Sent only by 0.6.0+ clients
     /// that have one, before Register or Connect. Older servers cannot decode
     /// this variant and drop the connection; those clients retry once without it.
-    PresentAccess { token: String },
+    PresentAccess {
+        token: String,
+    },
     /// 0.6.2+. Hostname, operating system, and the last interactive user.
     /// Sent only after [`ServerMsg::WantHostReport`]. The user name is stored
     /// for the account owner. It is not forwarded to other peers.
@@ -80,7 +134,9 @@ pub enum ClientMsg {
     /// 0.6.2+. Friendly name for this computer. Sent only after
     /// [`ServerMsg::WantHostReport`]. An empty name clears the stored one
     /// so other computers show the hostname.
-    ReportDisplayName { name: String },
+    ReportDisplayName {
+        name: String,
+    },
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -279,6 +335,40 @@ pub enum ErrorCode {
     Internal,
 }
 
+/// Sent when a standby is asked to register a computer or start a session.
+/// The standby does not keep its own live table. A 0.6.31 client connects to
+/// the primary instead. The text stays on the existing error message so an
+/// older client can still decode it.
+pub const STANDBY_REGISTRATION: &str = "This server is the standby. Connect to the primary.";
+
+pub fn is_standby_refusal(message: &str) -> bool {
+    message.contains("This server is the standby")
+}
+
+/// Backoff after a refused signaling connection: 1s, 2s, 4s, 8s, then 10s.
+pub fn next_reconnect_delay(current: Duration) -> Duration {
+    let next = current.saturating_mul(2);
+    if next < Duration::from_secs(1) {
+        Duration::from_secs(1)
+    } else if next > Duration::from_secs(10) {
+        Duration::from_secs(10)
+    } else {
+        next
+    }
+}
+
+/// Spreads reconnects so every computer does not dial on the same second.
+pub fn jitter_reconnect(base: Duration) -> Duration {
+    let ms = base.as_millis() as u64;
+    let swing = ms / 5;
+    if swing == 0 {
+        return base;
+    }
+    let tick = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos() as u64).unwrap_or(0);
+    let delta = (tick % (swing * 2 + 1)) as i64 - swing as i64;
+    Duration::from_millis((ms as i64 + delta).clamp(200, 10_000) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +420,31 @@ mod tests {
         assert_eq!(p.max_permissions, crate::perms::ALL);
         assert!(!p.force_prompt);
         assert!(p.tunnel_ports.is_empty());
+    }
+
+    #[test]
+    fn reconnect_backoff_caps_at_ten_seconds() {
+        assert!(is_standby_refusal(STANDBY_REGISTRATION));
+        assert!(!is_standby_refusal("device 902 488 771 is not online"));
+        let mut delay = Duration::from_secs(1);
+        let mut seen = vec![delay];
+        for _ in 0..6 {
+            delay = next_reconnect_delay(delay);
+            seen.push(delay);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            ]
+        );
+        let paused = jitter_reconnect(Duration::from_secs(4));
+        assert!(paused >= Duration::from_millis(3200) && paused <= Duration::from_millis(4800), "{paused:?}");
     }
 }

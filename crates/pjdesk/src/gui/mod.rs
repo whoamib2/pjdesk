@@ -388,12 +388,10 @@ pub struct App {
     pin_idle_minutes: u32,
     /// Account password was accepted. The window stays locked until a new PIN is saved.
     lock_resetting: bool,
-    hello_choice: Option<bool>,
-    hello_available: Option<bool>,
-    hello_prompted: bool,
-    hello_busy: bool,
-    hello_rx: Option<Receiver<bool>>,
-    hello_check_rx: Option<Receiver<bool>>,
+    /// The unlock PIN box has been focused for this appearance.
+    lock_pin_armed: bool,
+    /// The Set-a-PIN field has been focused for this appearance.
+    setup_pin_focused: bool,
 }
 
 enum InviteMsg {
@@ -569,12 +567,8 @@ impl App {
             pin_note: String::new(),
             pin_idle_minutes: 5,
             lock_resetting: false,
-            hello_choice: pjdesk_proto::applock::read_window_lock(&pjdesk_proto::applock::window_lock_path()).hello,
-            hello_available: None,
-            hello_prompted: false,
-            hello_busy: false,
-            hello_rx: None,
-            hello_check_rx: if preview { None } else { Some(crate::winhello::spawn_check()) },
+            lock_pin_armed: false,
+            setup_pin_focused: false,
         };
         let lock_email = app.account_email();
         if let Some(verifier) = app.cfg.app_lock_for(&lock_email) {
@@ -1243,7 +1237,9 @@ impl App {
                 self.pending_temporary = false;
                 self.pending_enroll_only = false;
                 let who = if email.is_empty() { self.net_email.trim().to_string() } else { email };
-                self.toast.show(format!("Added this computer to {who}. Nothing from that sign-in was kept on this computer."));
+                self.toast.show(format!(
+                    "Added this computer to {who}. Nothing from that sign-in was kept on this computer."
+                ));
             }
             Ok(Ok(crate::network::SignIn::Ready(session))) => {
                 self.net_busy = false;
@@ -1364,7 +1360,8 @@ impl App {
         self.net_enroll_only = false;
         let pjdesk_id = self.visible_id();
         if enroll_only && !pjdesk_proto::is_valid_id(&pjdesk_id) {
-            self.net_error = "This computer does not have an ID yet. Wait until Your ID appears, then try again.".into();
+            self.net_error =
+                "This computer does not have an ID yet. Wait until Your ID appears, then try again.".into();
             return;
         }
         self.pending_temporary = self.net_temporary && !enroll_only;
@@ -1425,7 +1422,8 @@ impl App {
                 .spawn(move || {
                     let result = match crate::network::sign_in(&email, &password, &device, &name) {
                         Ok(crate::network::SignIn::Ready(session)) => {
-                            crate::network::finish_account_sign_in(session, &this, &local, enroll_only).map_err(|e| e.to_string())
+                            crate::network::finish_account_sign_in(session, &this, &local, enroll_only)
+                                .map_err(|e| e.to_string())
                         }
                         Ok(other) => Ok(other),
                         Err(e) => Err(e.to_string()),
@@ -1459,10 +1457,10 @@ impl App {
         std::thread::Builder::new()
             .name("network-claim".into())
             .spawn(move || {
-                let result = match crate::network::claim_current_server(&token, &address, &fingerprint, &device, &name) {
-                    Ok(session) => {
-                        crate::network::finish_account_sign_in(session, &this, &local, enroll_only).map_err(|e| e.to_string())
-                    }
+                let result = match crate::network::claim_current_server(&token, &address, &fingerprint, &device, &name)
+                {
+                    Ok(session) => crate::network::finish_account_sign_in(session, &this, &local, enroll_only)
+                        .map_err(|e| e.to_string()),
                     Err(e) => Err(e.to_string()),
                 };
                 let _ = tx.send(result);
@@ -2273,7 +2271,9 @@ fn raise_consent(ctx: &egui::Context, id: u64) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     #[cfg(windows)]
     unsafe {
-        let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK);
+        let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(
+            windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK,
+        );
     }
 }
 
@@ -2330,9 +2330,7 @@ fn write_service_consent(accept: bool) {
 /// View phone is hidden and has no console. Inheriting this process's
 /// handles would let the child treat a dead console as its terminal.
 fn prepare_viewer(cmd: &mut std::process::Command) {
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -2421,21 +2419,11 @@ impl App {
         if self.engine.service_running {
             let code = self.svc_status.support_code.clone();
             let password = self.svc_status.support_password.clone();
-            (
-                (!code.is_empty()).then_some(code),
-                (!password.is_empty()).then_some(password),
-                id,
-                false,
-            )
+            ((!code.is_empty()).then_some(code), (!password.is_empty()).then_some(password), id, false)
         } else {
             let code = self.engine.shared.support_code();
             let password = self.engine.shared.support_password();
-            (
-                (!code.is_empty()).then_some(code),
-                (!password.is_empty()).then_some(password),
-                id,
-                true,
-            )
+            ((!code.is_empty()).then_some(code), (!password.is_empty()).then_some(password), id, true)
         }
     }
 
@@ -2488,14 +2476,12 @@ impl App {
         self.offer_rx = Some(rx);
         let send_code = code.clone();
         let send_id = id.clone();
-        let spawned = std::thread::Builder::new()
-            .name("support-offer".into())
-            .spawn(move || {
-                let result = crate::network::offer_support(&send_code, &send_id)
-                    .map(|_| (send_code, send_id))
-                    .map_err(|e| e.to_string());
-                let _ = tx.send(result);
-            });
+        let spawned = std::thread::Builder::new().name("support-offer".into()).spawn(move || {
+            let result = crate::network::offer_support(&send_code, &send_id)
+                .map(|_| (send_code, send_id))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
         if spawned.is_err() {
             self.offer_rx = None;
             self.offer_retry = Instant::now() + Duration::from_secs(30);
@@ -2532,9 +2518,8 @@ impl App {
         std::thread::Builder::new()
             .name("support-lookup".into())
             .spawn(move || {
-                let result = crate::network::lookup_support(&digits)
-                    .map(|id| (id, password))
-                    .map_err(|e| e.to_string());
+                let result =
+                    crate::network::lookup_support(&digits).map(|id| (id, password)).map_err(|e| e.to_string());
                 let _ = tx.send(result);
             })
             .ok();
@@ -2759,8 +2744,6 @@ impl eframe::App for App {
             || self.lan_rx.is_some()
             || !self.viewer_rx.is_empty()
             || !self.engine.ready
-            || self.hello_busy
-            || self.hello_check_rx.is_some()
             || self.lock_busy;
         ctx.request_repaint_after(Duration::from_millis(if pending { 50 } else { 400 }));
 

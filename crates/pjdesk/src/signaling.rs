@@ -80,7 +80,6 @@ const LAN_HANDSHAKE: Duration = Duration::from_millis(1500);
 /// The public path starts this long after the LAN path, so a working LAN wins.
 const PUBLIC_DELAY: Duration = Duration::from_millis(200);
 const PUBLIC_HANDSHAKE: Duration = Duration::from_secs(10);
-const LAN_PROBE: Duration = Duration::from_millis(400);
 
 /// An open signaling connection. Messages are sent and received through
 /// channels so several tasks can use it.
@@ -103,36 +102,65 @@ struct Ready {
 
 impl SignalClient {
     /// Connects, verifies the server key on every path, and starts the
-    /// reader/writer tasks. A computer on the server's LAN tries the published
-    /// private address first and keeps the public address as a fallback.
+    /// reader/writer tasks. A LAN address is used only when it is the current
+    /// primary on this computer's network. A local standby is not used.
     pub async fn connect(server: &ServerAddr, config: &mut Config) -> Result<Self> {
+        Self::connect_mode(server, config, false).await
+    }
+
+    /// `public_only` skips LAN candidates after a standby refused registration.
+    /// DNS is resolved on every call.
+    pub async fn connect_mode(server: &ServerAddr, config: &mut Config, public_only: bool) -> Result<Self> {
+        info!("Looking up {server}");
         let (resolved, heard) = tokio::join!(
             server.resolve(),
             tokio::task::spawn_blocking(|| pjdesk_proto::discover::listen_servers(Duration::from_millis(250))),
         );
-        let public_addr = resolved?;
-        let mut entries = config.network_lan.clone();
-        let key = net_key(public_addr);
-        if let Some(cached) = config.lan_path_cache.get(&key) {
-            entries.push(cached.clone());
-        }
-        let pinned_now = config.pinned_fingerprint();
-        if let Ok(found) = heard {
-            for (addr, fp) in found {
-                if pinned_now.is_none_or(|expected| expected == fp) {
-                    entries.push(addr.to_string());
-                }
-            }
-        }
-        let lan = lan_targets(&entries, server.port, public_addr);
+        let resolved = resolved?;
+        let same_site = if public_only { false } else { same_site(&config.network_public_ip).await };
+        let own = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
         let pinned = config.pinned_fingerprint();
-        let expected = config.server_fingerprint.clone();
-        let ready = if lan.is_empty() {
-            handshake(public_addr, path_label(public_addr), PUBLIC_HANDSHAKE, &server.to_string(), pinned, expected.as_deref()).await?
-        } else if prefer_lan(&config.network_public_ip, &lan).await {
-            race_paths(&lan, public_addr, &server.to_string(), pinned, expected.as_deref()).await?
+        let account = if same_site && !public_only {
+            let mut entries = config.network_lan.clone();
+            if let Some(cached) = config.lan_path_cache.get(&net_key(resolved)) {
+                entries.push(cached.clone());
+            }
+            lan_targets(&entries, server.port, resolved)
         } else {
-            handshake(public_addr, path_label(public_addr), PUBLIC_HANDSHAKE, &server.to_string(), pinned, expected.as_deref()).await?
+            Vec::new()
+        };
+        let beacons = if public_only {
+            Vec::new()
+        } else {
+            heard
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(addr, beacon)| (addr, beacon.fingerprint, beacon.role))
+                .collect()
+        };
+        let plan = pjdesk_proto::discover::reach_plan(
+            resolved,
+            &config.network_public_ip,
+            server.port,
+            same_site,
+            &account,
+            &beacons,
+            pinned,
+            &own,
+        );
+        let expected = config.server_fingerprint.clone();
+        let ready = if plan.lan.is_empty() {
+            handshake(
+                plan.public,
+                path_label(plan.public),
+                PUBLIC_HANDSHAKE,
+                &server.to_string(),
+                pinned,
+                expected.as_deref(),
+            )
+            .await?
+        } else {
+            race_paths(&plan.lan, plan.public, &server.to_string(), pinned, expected.as_deref()).await?
         };
 
         if pinned.is_none() {
@@ -143,9 +171,14 @@ impl SignalClient {
                 config.save()?;
             }
         }
-        info!("Connected to {server} via {} ({})", ready.via, ready.addr);
-        if ready.via == "LAN" {
-            let key = net_key(public_addr);
+        let key = config
+            .server_fingerprint
+            .as_deref()
+            .map(pjdesk_proto::discover::fingerprint_prefix)
+            .unwrap_or_else(|| "unpinned".into());
+        info!("Connected to {server} via {} ({}), key {key}", ready.via, ready.addr);
+        if ready.via == "LAN" && same_site {
+            let key = net_key(resolved);
             let value = ready.addr.to_string();
             if config.lan_path_cache.get(&key).map(String::as_str) != Some(value.as_str()) {
                 config.lan_path_cache.insert(key, value);
@@ -245,19 +278,14 @@ fn same_public_ip(mine: Option<&str>, published: &str) -> bool {
     !published.is_empty() && mine == published
 }
 
-/// True when this computer should try the server's LAN address before the public one.
-async fn prefer_lan(published_public: &str, lan: &[SocketAddr]) -> bool {
-    if lan.is_empty() {
+/// True when this computer is on the primary's public network.
+async fn same_site(published_public: &str) -> bool {
+    let published = published_public.trim().to_string();
+    if published.is_empty() {
         return false;
     }
-    let published = published_public.trim().to_string();
-    let same = if published.is_empty() {
-        false
-    } else {
-        let mine = tokio::task::spawn_blocking(my_public_ip).await.ok().flatten();
-        same_public_ip(mine.as_deref(), &published)
-    };
-    same || probe_lan(lan).await
+    let mine = tokio::task::spawn_blocking(my_public_ip).await.ok().flatten();
+    same_public_ip(mine.as_deref(), &published)
 }
 
 fn my_public_ip() -> Option<String> {
@@ -292,22 +320,6 @@ fn fetch_my_public_ip() -> Option<String> {
     let ip = value.get("ip")?.as_str()?.trim().to_string();
     ip.parse::<IpAddr>().ok()?;
     Some(ip)
-}
-
-async fn probe_lan(addrs: &[SocketAddr]) -> bool {
-    let mut set = JoinSet::new();
-    for &addr in addrs {
-        set.spawn(async move {
-            timeout(LAN_PROBE, TcpStream::connect(addr)).await.ok().and_then(Result::ok).is_some()
-        });
-    }
-    while let Some(result) = set.join_next().await {
-        if matches!(result, Ok(true)) {
-            set.abort_all();
-            return true;
-        }
-    }
-    false
 }
 
 /// LAN and the public address in parallel. Each path has its own fingerprint check.
@@ -349,7 +361,11 @@ async fn race_paths(
 /// A hostname that resolves to a private address is the LAN, even when it was
 /// the published server name (`pjdesk.spader.us` → `192.168.0.231`).
 fn path_label(addr: SocketAddr) -> &'static str {
-    if crate::p2p::is_lan_ip(addr.ip()) { "LAN" } else { "Internet" }
+    if crate::p2p::is_lan_ip(addr.ip()) {
+        "LAN"
+    } else {
+        "Internet"
+    }
 }
 
 async fn handshake(
@@ -363,7 +379,9 @@ async fn handshake(
     let tcp = timeout(limit, TcpStream::connect(addr))
         .await
         .map_err(|_| anyhow!("timed out connecting to the server at {label}"))?
-        .with_context(|| format!("cannot reach the PJDesk server at {label} (is it running, and is TCP port {} open?)", addr.port()))?;
+        .with_context(|| {
+            format!("cannot reach the PJDesk server at {label} (is it running, and is TCP port {} open?)", addr.port())
+        })?;
     tcp.set_nodelay(true)?;
     let verifier = PinnedCertVerifier::new(pinned);
     let connector = TlsConnector::from(Arc::new(tls::client_config(verifier.clone(), ALPN_SIGNAL)?));
