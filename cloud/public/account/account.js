@@ -1,7 +1,30 @@
 (() => {
   const $ = (id) => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+  const preview = params.get("preview") === "1";
   let creating = false;
   PJ.revealToggles();
+
+  function themeNow() {
+    return params.get("theme") || localStorage.getItem("pjdesk.account.theme") || "dark";
+  }
+  function applyTheme(theme) {
+    document.body.classList.toggle("light", theme === "light");
+    const btn = $("theme");
+    if (btn) btn.textContent = theme === "light" ? "Dark" : "Light";
+  }
+  applyTheme(themeNow());
+  $("theme").onclick = () => {
+    const next = document.body.classList.contains("light") ? "dark" : "light";
+    try { localStorage.setItem("pjdesk.account.theme", next); } catch { /* private window */ }
+    if (params.get("theme")) {
+      const url = new URL(location.href);
+      url.searchParams.set("theme", next);
+      history.replaceState(null, "", url);
+    }
+    applyTheme(next);
+  };
+  if (params.get("section") === "network") document.body.classList.add("shot");
 
   function setMode(create) {
     creating = create;
@@ -93,7 +116,31 @@
     $("sync-status").replaceChildren(pill);
   }
 
+  function showNetwork() {
+    if (!window.PJNetwork) return;
+    return PJNetwork.render($("my-network"), { preview, title: true });
+  }
+
   async function load() {
+    if (preview) {
+      $("me-email").textContent = "Signed in as ben@spader.us";
+      $("me-email").dataset.email = "ben@spader.us";
+      syncPill(true);
+      $("sync-last").textContent = "Oct 15, 2024, 1:00 PM";
+      $("sync-size").textContent = "23.4 KB";
+      const tr = document.createElement("tr");
+      for (const v of ["Office PC", "Oct 15, 2024", "Oct 15, 2024"]) {
+        const td = document.createElement("td");
+        td.textContent = v;
+        tr.append(td);
+      }
+      $("devices").replaceChildren(tr);
+      PJ.show($("admin-link"), false);
+      PJ.show($("signed-out"), false);
+      PJ.show($("signed-in"), true);
+      await showNetwork();
+      return;
+    }
     if (!PJ.token()) {
       PJ.show($("signed-in"), false);
       PJ.show($("signed-out"), true);
@@ -120,6 +167,7 @@
       PJ.show($("admin-link"), me.is_admin);
       PJ.show($("signed-out"), false);
       PJ.show($("signed-in"), true);
+      await showNetwork();
     } catch (e) {
       if (e.status === 401) {
         PJ.setToken(null);

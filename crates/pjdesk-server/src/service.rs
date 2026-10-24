@@ -195,18 +195,20 @@ pub fn install(opts: &ServerOpts, data_dir: &Path, firewall: bool) -> Result<()>
         account_name: None, // LocalSystem
         account_password: None,
     };
-    let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-        .context("could not create the service (is it already installed?)")?;
-    service.set_description(DESCRIPTION)?;
+    let (service, created) = open_or_create(&manager, &info)?;
+    let _ = service.set_description(DESCRIPTION);
 
     if firewall {
         add_firewall_rule(&exe)?;
     }
     repair_data_dir(data_dir);
 
-    service.start::<&str>(&[]).context("service installed but failed to start")?;
-    println!("Installed and started the \"{DISPLAY_NAME}\" service ({SERVICE_NAME}).");
+    start_if_needed(&service)?;
+    if created {
+        println!("Installed and started the \"{DISPLAY_NAME}\" service ({SERVICE_NAME}).");
+    } else {
+        println!("The \"{DISPLAY_NAME}\" service is already installed. It is updated and running.");
+    }
     println!("It starts automatically with Windows and logs to server.log in its data folder.");
     if !firewall {
         println!("Tip: re-install with --firewall, or allow TCP+UDP port {} in Windows Firewall.", opts.port);
@@ -277,35 +279,86 @@ pub fn restart() -> Result<()> {
     start()
 }
 
-/// One program-based inbound rule covers both TCP and UDP.
+/// One program-based inbound rule, plus explicit TCP and UDP 21200 rules.
+/// The program path is quoted the way netsh parses it, so a path with spaces applies.
 fn add_firewall_rule(exe: &Path) -> Result<()> {
+    use std::os::windows::process::CommandExt;
     remove_firewall_rule();
+    let program = format!("program=\"{}\"", exe.display());
     let status = std::process::Command::new("netsh")
-        .args([
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            &format!("name={FIREWALL_RULE}"),
-            "dir=in",
-            "action=allow",
-            &format!("program={}", exe.display()),
-            "enable=yes",
-            "profile=any",
-        ])
+        .raw_arg(format!(
+            "advfirewall firewall add rule name=\"{FIREWALL_RULE}\" dir=in action=allow {program} enable=yes profile=any"
+        ))
         .status()
         .context("running netsh")?;
     if !status.success() {
         anyhow::bail!("netsh could not add the firewall rule");
+    }
+    for (name, proto) in [("PJDesk Server TCP", "TCP"), ("PJDesk Server UDP", "UDP")] {
+        let _ = std::process::Command::new("netsh")
+            .raw_arg(format!(
+                "advfirewall firewall add rule name=\"{name}\" dir=in action=allow protocol={proto} localport=21200 profile=any"
+            ))
+            .status();
     }
     println!("Added Windows Firewall rule \"{FIREWALL_RULE}\".");
     Ok(())
 }
 
 fn remove_firewall_rule() {
-    let _ = std::process::Command::new("netsh")
-        .args(["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    use std::os::windows::process::CommandExt;
+    for name in [FIREWALL_RULE, "PJDesk Server TCP", "PJDesk Server UDP"] {
+        let _ = std::process::Command::new("netsh")
+            .raw_arg(format!("advfirewall firewall delete rule name=\"{name}\""))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+fn open_or_create(
+    manager: &ServiceManager,
+    info: &ServiceInfo,
+) -> Result<(windows_service::service::Service, bool)> {
+    let rights = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS;
+    match manager.create_service(info, rights) {
+        Ok(service) => Ok((service, true)),
+        Err(e) if win_code(&e) == Some(1073) => {
+            let service = manager
+                .open_service(SERVICE_NAME, rights)
+                .context("PJDesk Server is already installed, but the existing service could not be opened")?;
+            if let Err(err) = service.change_config(info) {
+                tracing::warn!("could not update the existing PJDesk Server service: {err}");
+            }
+            Ok((service, false))
+        }
+        Err(e) => Err(e).context("could not create the PJDesk Server service"),
+    }
+}
+
+fn start_if_needed(service: &windows_service::service::Service) -> Result<()> {
+    match service.start::<&str>(&[]) {
+        Ok(()) => Ok(()),
+        Err(e) if win_code(&e) == Some(1056) => Ok(()),
+        Err(e) => {
+            let running = service.query_status().ok().is_some_and(|status| {
+                matches!(
+                    status.current_state,
+                    ServiceState::Running | ServiceState::StartPending | ServiceState::ContinuePending
+                )
+            });
+            if running {
+                Ok(())
+            } else {
+                Err(e).context("the PJDesk Server service is installed but did not start")
+            }
+        }
+    }
+}
+
+fn win_code(err: &windows_service::Error) -> Option<i32> {
+    match err {
+        windows_service::Error::Winapi(io) => io.raw_os_error(),
+        _ => None,
+    }
 }

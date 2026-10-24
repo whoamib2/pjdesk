@@ -84,6 +84,26 @@ pub struct Snapshot {
     /// Registered computers, without secrets. Filled when the data folder is readable.
     #[serde(default)]
     pub devices: Vec<ListedDevice>,
+    /// True when register, lookup, and relay require a network access token.
+    #[serde(default)]
+    pub require_accounts: bool,
+    /// Address computers use to reach this server. Not a secret.
+    #[serde(default)]
+    pub public_address: String,
+    #[serde(default)]
+    pub public_note: String,
+    #[serde(default)]
+    pub public_needs_confirm: bool,
+    #[serde(default)]
+    pub public_confirmed: bool,
+    /// Whether the public-IP watch setting was read.
+    #[serde(default)]
+    pub public_watch_known: bool,
+    /// True when this server updates a raw IP address on its own.
+    #[serde(default)]
+    pub public_watch: bool,
+    #[serde(default)]
+    pub public_ip_line: String,
 }
 
 /// One computer, safe to put on the status pipe. No password, secret, or key.
@@ -96,6 +116,9 @@ pub struct ListedDevice {
     pub version: String,
     #[serde(default)]
     pub online: bool,
+    /// False when this computer has not registered with a network access token.
+    #[serde(default)]
+    pub signed_in: bool,
 }
 
 impl Snapshot {
@@ -158,6 +181,18 @@ impl Snapshot {
             snap.cloud_on = config_exists;
         }
         snap.devices = listed_devices(dir);
+        let policy = crate::access::Policy::load(dir);
+        snap.require_accounts = policy.require_accounts;
+        if let Some(address) = crate::public_addr::load(dir) {
+            snap.public_address = address.address;
+            snap.public_note = address.note;
+            snap.public_needs_confirm = address.needs_confirm;
+            snap.public_confirmed = address.confirmed;
+        }
+        let watch = crate::public_addr::IpWatch::load(dir);
+        snap.public_watch_known = true;
+        snap.public_watch = watch.enabled(&snap.public_address);
+        snap.public_ip_line = watch.line();
         snap
     }
 }
@@ -175,6 +210,8 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
         hostname: String,
         #[serde(default)]
         app_version: String,
+        #[serde(default)]
+        signed_in: bool,
     }
     #[derive(Deserialize)]
     struct Online {
@@ -211,6 +248,7 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
                 hostname: rec.hostname,
                 version: live.cloned().unwrap_or(rec.app_version),
                 online: live.is_some(),
+                signed_in: rec.signed_in,
             }
         })
         .collect();

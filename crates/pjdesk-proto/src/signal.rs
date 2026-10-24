@@ -64,6 +64,23 @@ pub enum ClientMsg {
     /// Version 3. The signed-in user replaces their own password. The server
     /// drops saved tokens, so the client signs in again.
     ChangePassword { token: String, new_password: String },
+    /// Presents a pjdesk.com network access token. Sent only by 0.6.0+ clients
+    /// that have one, before Register or Connect. Older servers cannot decode
+    /// this variant and drop the connection; those clients retry once without it.
+    PresentAccess { token: String },
+    /// 0.6.2+. Hostname, operating system, and the last interactive user.
+    /// Sent only after [`ServerMsg::WantHostReport`]. The user name is stored
+    /// for the account owner. It is not forwarded to other peers.
+    ReportHost {
+        hostname: String,
+        os_family: String,
+        os_version: String,
+        console_user: String,
+    },
+    /// 0.6.2+. Friendly name for this computer. Sent only after
+    /// [`ServerMsg::WantHostReport`]. An empty name clears the stored one
+    /// so other computers show the hostname.
+    ReportDisplayName { name: String },
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -242,6 +259,9 @@ pub enum ServerMsg {
     DeviceList { devices: Vec<DeviceBrief> },
     /// Version 3. Reply to [`ClientMsg::GetAudit`].
     Audit { events: Vec<AuditEvent> },
+    /// 0.6.2+. Asks a host that understands it to send [`ClientMsg::ReportHost`].
+    /// A server sends this only when the host's app version can decode it.
+    WantHostReport,
 }
 
 /// Machine-readable error categories.
@@ -269,6 +289,20 @@ mod tests {
         assert_eq!(ping[0], 8);
         let update = postcard::to_stdvec(&ServerMsg::UpdateNow).unwrap();
         assert_eq!(update[0], 8);
+        let access = postcard::to_stdvec(&ClientMsg::PresentAccess { token: "t".into() }).unwrap();
+        assert_eq!(access[0], 16, "PresentAccess is appended after ChangePassword");
+        let report = postcard::to_stdvec(&ClientMsg::ReportHost {
+            hostname: "PC".into(),
+            os_family: "windows".into(),
+            os_version: "11".into(),
+            console_user: "BEN".into(),
+        })
+        .unwrap();
+        assert_eq!(report[0], 17, "ReportHost is appended after PresentAccess");
+        let named = postcard::to_stdvec(&ClientMsg::ReportDisplayName { name: "Cabin".into() }).unwrap();
+        assert_eq!(named[0], 18, "ReportDisplayName is appended after ReportHost");
+        let ask = postcard::to_stdvec(&ServerMsg::WantHostReport).unwrap();
+        assert_eq!(ask[0], 12, "WantHostReport is appended after Audit");
         let back: ClientMsg = postcard::from_bytes(&ping).unwrap();
         assert!(matches!(back, ClientMsg::Ping));
     }

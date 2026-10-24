@@ -32,19 +32,25 @@ pub fn write_service_config(server: Option<&str>, password: Option<&str>) -> Res
     let path = crate::syspaths::service_config_path();
     let mut cfg = Config::load_from(&path).unwrap_or_default();
 
-    // Server: explicit flag, else keep existing, else copy the installing user's,
-    // else the baked-in default — so the service can always register, even when
-    // it's installed as SYSTEM and the user hasn't signed in yet.
+    // Server: explicit flag, else keep existing, else copy the installing user's.
+    // A fresh install has no server until someone signs in. An install that
+    // already registered keeps that address through effective_server.
     if let Some(s) = server {
         cfg.server = Some(s.to_string());
-    } else if cfg.server.is_none() {
+    } else if cfg.server.as_deref().map(str::trim).unwrap_or("").is_empty() {
         if let Ok(user) = Config::load() {
-            cfg.server = user.server;
-            cfg.server_fingerprint = user.server_fingerprint;
+            cfg.server = user.server.clone();
+            cfg.server_fingerprint = user.server_fingerprint.clone();
+            if cfg.network_refresh.is_none() {
+                cfg.network_email = user.network_email;
+                cfg.network_refresh = user.network_refresh;
+                cfg.network_access = user.network_access;
+                cfg.network_access_exp = user.network_access_exp;
+                cfg.network_device_id = user.network_device_id;
+                cfg.network_standby = user.network_standby;
+                cfg.network_standby_fingerprint = user.network_standby_fingerprint;
+            }
         }
-    }
-    if cfg.server.as_deref().map(str::trim).unwrap_or("").is_empty() {
-        cfg.server = Some(pjdesk_proto::DEFAULT_SERVER.to_string());
     }
 
     // Unattended password: set a *permanent* one only when explicitly provided
@@ -96,8 +102,9 @@ mod imp {
     use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess, CREATE_NO_WINDOW,
-        CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+        CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
     };
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
     use windows_service::service::{
         ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo,
         ServiceStartType, ServiceState, ServiceStatus, ServiceType,
@@ -131,15 +138,17 @@ mod imp {
             account_name: None, // LocalSystem
             account_password: None,
         };
-        let service = manager
-            .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-            .context("could not create the service (is it already installed?)")?;
-        service.set_description(DESCRIPTION)?;
+        let (service, created) = super::open_or_create(&manager, &info)?;
+        let _ = service.set_description(DESCRIPTION);
         if firewall {
             super::add_firewall_rule(&exe);
         }
-        service.start::<&str>(&[]).context("service installed but failed to start")?;
-        println!("Installed and started the PJDesk background service.");
+        super::start_if_needed(&service)?;
+        if created {
+            println!("Installed and started the PJDesk background service.");
+        } else {
+            println!("The PJDesk service is already installed. It is updated and running.");
+        }
         if effective.is_empty() {
             println!("This computer uses a one-time password, shown in the PJDesk window.");
             println!("Open PJDesk to see its ID and the current password to share.");
@@ -268,6 +277,13 @@ mod imp {
 
         set(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, Duration::default())?;
         super::protect_service_dir();
+        // Drop the scheduled task older installs registered. Defender was
+        // matching svchost launching that task. The service checks itself.
+        let _ = super::delete_update_task();
+        if let Ok(exe) = std::env::current_exe() {
+            super::add_firewall_rule(&exe);
+        }
+        let _ = std::thread::Builder::new().name("update-pipe".into()).spawn(crate::update_pipe::serve);
         supervise(&stop_rx);
         set(ServiceState::StopPending, ServiceControlAccept::empty(), Duration::from_secs(3))?;
         set(ServiceState::Stopped, ServiceControlAccept::empty(), Duration::default())?;
@@ -286,6 +302,7 @@ mod imp {
             if stop_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
                 break;
             }
+            super::maybe_client_update();
             let active = unsafe { WTSGetActiveConsoleSessionId() };
             if active == u32::MAX {
                 continue; // No console session right now (fast user switching, etc.).
@@ -429,9 +446,13 @@ mod imp {
             let mut env_block: *mut core::ffi::c_void = std::ptr::null_mut();
             let have_env = CreateEnvironmentBlock(&mut env_block, Some(token), false).is_ok();
 
+            // Same rule as the post-update relaunch: do not inherit the
+            // service's std handles. They are invalid in the user session.
             let mut si = STARTUPINFOW {
                 cb: std::mem::size_of::<STARTUPINFOW>() as u32,
                 lpDesktop: PWSTR(desktop.as_mut_ptr()),
+                dwFlags: STARTF_USESHOWWINDOW,
+                wShowWindow: SW_HIDE.0 as u16,
                 ..Default::default()
             };
             let mut pi = PROCESS_INFORMATION::default();
@@ -443,7 +464,7 @@ mod imp {
                 Some(PWSTR(cmdline.as_mut_ptr())),
                 None,
                 None,
-                false,
+                crate::handoff::relaunch_inherits_handles(),
                 flags,
                 if have_env { Some(env_block) } else { None },
                 windows::core::PCWSTR::null(),
@@ -497,14 +518,24 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
             let _ = config.save();
         }
     }
-    // Falls back to the baked-in default server, so the service registers and
-    // gets an ID even if its config was never seeded with one.
+    // No server until this computer has signed in (or it already registered,
+    // in which case effective_server keeps the previous address).
+    if config.effective_server().trim().is_empty() {
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            config = Config::load().unwrap_or_default();
+            if !config.effective_server().trim().is_empty() {
+                break;
+            }
+        }
+    }
     let server = ServerAddr::parse(&config.effective_server())
         .map_err(|e| anyhow::anyhow!("invalid server address \"{}\": {e}", config.effective_server()))?;
 
     let shared = Arc::new(HostShared::default());
     let mut args = crate::HostArgs::from_settings(&config.settings);
     args.follow_desktop = true;
+    args.service_host = true;
 
     let host_shared = shared.clone();
     std::thread::Builder::new().name("host".into()).spawn(move || {
@@ -527,90 +558,104 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
             shared.permanent_set(),
         );
         status.rtt_ms = shared.rtt_ms();
+        status.reach = shared.reach();
+        status.support_code = shared.support_code();
+        status.support_password = shared.support_password();
+        status.support_born_unix = shared.support_born();
+        let refresh = crate::syspaths::service_dir().join("support.refresh");
+        if refresh.is_file() {
+            let _ = std::fs::remove_file(&refresh);
+            shared.request_support_refresh();
+        }
         status.write();
         std::thread::sleep(Duration::from_secs(2));
     }
 }
 
-/// Name of the daily auto-update scheduled task (matches the installer).
+/// Name of the scheduled task older installs registered. 0.6.6 deletes it.
+/// The service checks for updates itself.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const UPDATE_TASK: &str = "PJDesk Update";
 
-/// Whether the daily auto-update task is registered.
-#[cfg(windows)]
-pub fn update_task_enabled() -> bool {
-    std::process::Command::new("schtasks")
-        .args(["/Query", "/TN", UPDATE_TASK])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+fn auto_update_off_path() -> std::path::PathBuf {
+    crate::syspaths::program_data_dir().join("client-update.off")
 }
 
-/// Creates or removes the daily auto-update task (needs Administrator rights).
+/// Automatic updates are on unless an administrator turned them off.
+/// There is no scheduled task to query.
+pub fn update_task_enabled() -> bool {
+    !auto_update_off_path().is_file()
+}
+
+/// Turns automatic updates on or off and deletes any leftover scheduled task.
+/// The PJDesk service performs the check. Needs Administrator rights to write
+/// the flag under ProgramData and to delete the old task.
 #[cfg(windows)]
 pub fn set_update_task(enable: bool) -> Result<()> {
-    if !enable {
-        let _ = std::process::Command::new("schtasks").args(["/Delete", "/TN", UPDATE_TASK, "/F"]).status();
-        println!("Automatic updates turned off.");
-        return Ok(());
+    let _ = delete_update_task();
+    let path = auto_update_off_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
     }
-    let exe = std::env::current_exe()?;
-    // A short (8.3) path has no spaces, so the task's /TR needs no inner quotes.
-    let tr = format!("{} update", short_path(&exe).unwrap_or_else(|| exe.display().to_string()));
-    let status = std::process::Command::new("schtasks")
-        .args([
-            "/Create",
-            "/TN",
-            UPDATE_TASK,
-            "/TR",
-            &tr,
-            "/SC",
-            "MINUTE",
-            "/MO",
-            "30",
-            "/RU",
-            "SYSTEM",
-            "/RL",
-            "HIGHEST",
-            "/F",
-        ])
-        .status()
-        .context("running schtasks")?;
-    if !status.success() {
-        anyhow::bail!("schtasks could not create the update task (run as Administrator)");
+    if enable {
+        let _ = std::fs::remove_file(&path);
+        println!("Automatic updates are on. The PJDesk service checks every 30 minutes.");
+    } else {
+        std::fs::write(&path, b"off\n")?;
+        println!("Automatic updates are off.");
     }
-    println!("Automatic updates turned on (checks every 30 minutes).");
     Ok(())
 }
 
 #[cfg(windows)]
-fn short_path(path: &std::path::Path) -> Option<String> {
-    use windows::core::{HSTRING, PCWSTR};
-    use windows::Win32::Storage::FileSystem::GetShortPathNameW;
-    let wide = HSTRING::from(path.as_os_str());
-    unsafe {
-        let len = GetShortPathNameW(PCWSTR(wide.as_ptr()), None);
-        if len == 0 {
-            return None;
-        }
-        let mut buf = vec![0u16; len as usize];
-        let written = GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf));
-        if written == 0 || written as usize >= buf.len() + 1 {
-            return None;
-        }
-        Some(String::from_utf16_lossy(&buf[..written as usize]))
+fn delete_update_task() -> Result<()> {
+    let _ = std::process::Command::new("schtasks").args(["/Delete", "/TN", UPDATE_TASK, "/F"]).status();
+    Ok(())
+}
+
+/// The service calls this about once a second. The download runs at most
+/// every 30 minutes, inside this process, with no scheduled task and no script.
+#[cfg(windows)]
+fn maybe_client_update() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    if !update_task_enabled() {
+        return;
     }
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let next = NEXT.load(Ordering::Relaxed);
+    if next == 0 {
+        // Let the computer finish signing in before the first check.
+        NEXT.store(now.saturating_add(120), Ordering::Relaxed);
+        return;
+    }
+    if now < next {
+        return;
+    }
+    if !crate::client_update::start_from_service() {
+        tracing::info!("Skipped the update check because one is already running");
+        NEXT.store(now.saturating_add(60), Ordering::Relaxed);
+        return;
+    }
+    NEXT.store(now.saturating_add(30 * 60), Ordering::Relaxed);
+    tracing::info!("Checking for a PJDesk update from the service");
 }
 
 #[cfg(not(windows))]
-pub fn update_task_enabled() -> bool {
-    false
-}
-#[cfg(not(windows))]
-pub fn set_update_task(_enable: bool) -> Result<()> {
-    anyhow::bail!("scheduled updates are only available on Windows")
+pub fn set_update_task(enable: bool) -> Result<()> {
+    let path = auto_update_off_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if enable {
+        let _ = std::fs::remove_file(&path);
+    } else {
+        std::fs::write(&path, b"off\n")?;
+    }
+    Ok(())
 }
 
 /// Logs to a file in the service folder (the service has no console).
@@ -719,31 +764,91 @@ fn session_user_sid(session_id: u32) -> Option<String> {
 }
 
 #[cfg(windows)]
+const LAN_RULE: &str = "PJDesk LAN";
+
+/// Opens the existing service when it is already installed (error 1073) and
+/// points it at this executable. Installing again is not a failure.
+#[cfg(windows)]
+fn open_or_create(
+    manager: &windows_service::service_manager::ServiceManager,
+    info: &windows_service::service::ServiceInfo,
+) -> Result<(windows_service::service::Service, bool)> {
+    use windows_service::service::ServiceAccess;
+    let rights = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS;
+    match manager.create_service(info, rights) {
+        Ok(service) => Ok((service, true)),
+        Err(e) if win_code(&e) == Some(1073) => {
+            let service = manager
+                .open_service(SERVICE_NAME, rights)
+                .context("PJDesk is already installed, but the existing service could not be opened")?;
+            if let Err(err) = service.change_config(info) {
+                tracing::warn!("could not update the existing PJDesk service: {err}");
+            }
+            Ok((service, false))
+        }
+        Err(e) => Err(anyhow::Error::from(e)).context("could not create the PJDesk service"),
+    }
+}
+
+#[cfg(windows)]
+fn start_if_needed(service: &windows_service::service::Service) -> Result<()> {
+    use windows_service::service::ServiceState;
+    match service.start::<&str>(&[]) {
+        Ok(()) => Ok(()),
+        Err(e) if win_code(&e) == Some(1056) => Ok(()),
+        Err(e) => {
+            let running = service.query_status().ok().is_some_and(|status| {
+                matches!(
+                    status.current_state,
+                    ServiceState::Running | ServiceState::StartPending | ServiceState::ContinuePending
+                )
+            });
+            if running {
+                Ok(())
+            } else {
+                Err(e).context("the PJDesk service is installed but did not start")
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn win_code(err: &windows_service::Error) -> Option<i32> {
+    match err {
+        windows_service::Error::Winapi(io) => io.raw_os_error(),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
 fn add_firewall_rule(exe: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
     remove_firewall_rule();
+    let program = format!("program=\"{}\"", exe.display());
     let _ = std::process::Command::new("netsh")
-        .args([
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            &format!("name={FIREWALL_RULE}"),
-            "dir=in",
-            "action=allow",
-            &format!("program={}", exe.display()),
-            "enable=yes",
-            "profile=any",
-        ])
+        .raw_arg(format!(
+            "advfirewall firewall add rule name=\"{FIREWALL_RULE}\" dir=in action=allow {program} enable=yes profile=any"
+        ))
+        .status();
+    // A program rule with a spaced path often does not apply. UDP 21201 is the
+    // LAN direct port the other computer dials.
+    let _ = std::process::Command::new("netsh")
+        .raw_arg(format!(
+            "advfirewall firewall add rule name=\"{LAN_RULE}\" dir=in action=allow protocol=UDP localport=21201 profile=any"
+        ))
         .status();
 }
 
 #[cfg(windows)]
 fn remove_firewall_rule() {
-    let _ = std::process::Command::new("netsh")
-        .args(["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    use std::os::windows::process::CommandExt;
+    for name in [FIREWALL_RULE, LAN_RULE] {
+        let _ = std::process::Command::new("netsh")
+            .raw_arg(format!("advfirewall firewall delete rule name=\"{name}\""))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 // ----------------------------------------------------------------------------

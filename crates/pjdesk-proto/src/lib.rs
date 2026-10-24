@@ -14,6 +14,10 @@
 //!   between controller and host, either direct or through the relay. The
 //!   password is checked with SPAKE2 ([`auth`]) so it never crosses the wire.
 
+pub mod access;
+pub mod applock;
+pub mod netkey;
+pub mod vault;
 pub mod auth;
 pub mod discover;
 pub mod filesafe;
@@ -65,10 +69,15 @@ pub const DISCOVERY_PORT: u16 = 21202;
 /// Default port of the server, used for TCP (signaling) and UDP (rendezvous/relay).
 pub const DEFAULT_PORT: u16 = 21200;
 
-/// The server a fresh install points at until the user sets their own in
-/// Settings. Baking this in means the app gets an ID and is reachable out of the
-/// box, without a sign-in — the way a self-hosted RustDesk points at its server.
-pub const DEFAULT_SERVER: &str = "pjdesk.spader.us:21200";
+/// A fresh install has no server until the user signs in to their PJDesk account.
+/// The account supplies the address and the pinned key. Nothing is baked in.
+pub const DEFAULT_SERVER: &str = "";
+
+/// Address an install that already registered (it has a device id) keeps using
+/// when its saved server is empty. This is only so an update does not take an
+/// existing computer offline. A fresh install has no device id and does not use it.
+/// Do not show this name in the client, the website, or the installer.
+pub const LEGACY_REGISTERED_SERVER: &str = "pjdesk.spader.us:21200";
 
 /// ALPN protocol id for the signaling TLS connection.
 pub const ALPN_SIGNAL: &[u8] = b"pjdesk-signal/1";
@@ -102,6 +111,17 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 /// A random `u64` from the operating system's secure RNG.
 pub fn random_u64() -> u64 {
     u64::from_le_bytes(random_bytes::<8>())
+}
+
+/// `count` decimal digits from the operating system's secure RNG.
+pub fn random_digits(count: usize) -> String {
+    (0..count).map(|_| char::from(b'0' + random_below(10) as u8)).collect()
+}
+
+/// Lowercase hex SHA-256. Invite and support codes are stored as this, never as digits.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// A random integer in `0..bound` (rejection sampling, no modulo bias).
@@ -147,6 +167,17 @@ pub fn generate_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn support_codes_are_eight_digits() {
+        let code = random_digits(8);
+        assert_eq!(code.len(), 8);
+        assert!(code.bytes().all(|b| b.is_ascii_digit()));
+        assert_eq!(
+            sha256_hex(b"12345678"),
+            "ef797c8118f02dfb649607dd5d3f8c7623048c9c063d532cc95c5ed7a898a64f"
+        );
+    }
 
     #[test]
     fn ids_format_and_validate() {

@@ -51,8 +51,20 @@ pub struct ServiceStatus {
     /// Last measured round-trip to the server, in milliseconds. 0 means unknown.
     #[serde(default)]
     pub rtt_ms: u64,
+    /// `LAN` or `Internet` once the service has reached the server.
+    #[serde(default)]
+    pub reach: String,
     #[serde(default)]
     pub updated_unix: u64,
+    /// Temporary 8-digit support code. Empty until the service has made one.
+    #[serde(default)]
+    pub support_code: String,
+    /// Temporary password that matches the support code. Not the permanent one.
+    #[serde(default)]
+    pub support_password: String,
+    /// Unix time the support pair was created. 0 until the first pair.
+    #[serde(default)]
+    pub support_born_unix: u64,
 }
 
 impl ServiceStatus {
@@ -70,7 +82,11 @@ impl ServiceStatus {
             password,
             permanent_set,
             rtt_ms: 0,
+            reach: String::new(),
             updated_unix: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            support_code: String::new(),
+            support_password: String::new(),
+            support_born_unix: 0,
         }
     }
 

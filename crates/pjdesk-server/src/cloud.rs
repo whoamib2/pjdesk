@@ -131,20 +131,7 @@ pub struct AccountKeys {
 }
 
 pub fn derive_account_keys(email: &str, password: &str) -> AccountKeys {
-    let email = email.trim().to_lowercase();
-    let salt = Sha256::digest(format!("pjdesk-cloud-v1\0{email}").as_bytes());
-    let mut master = [0u8; 32];
-    ring::pbkdf2::derive(
-        ring::pbkdf2::PBKDF2_HMAC_SHA256,
-        std::num::NonZeroU32::new(600_000).expect("non-zero"),
-        &salt,
-        password.as_bytes(),
-        &mut master,
-    );
-    let mut auth = [0u8; 32];
-    let mut sync = [0u8; 32];
-    auth.copy_from_slice(&hmac(&master, "pjdesk-cloud-auth"));
-    sync.copy_from_slice(&hmac(&master, "pjdesk-cloud-sync-key"));
+    let (auth, sync) = pjdesk_proto::access::derive_account_keys(email, password);
     AccountKeys { auth, sync }
 }
 
@@ -430,7 +417,7 @@ fn authorization(
     )
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build()
 }
 
@@ -1102,10 +1089,12 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
-fn effective_role(st: &SyncState, heuristic: Role) -> Role {
+fn effective_role(st: &SyncState, mine: &str, heuristic: Role) -> Role {
     match st.desired.as_str() {
         "active" => Role::Active,
         "standby" => Role::Standby,
+        _ if !st.active_instance.is_empty() && st.active_instance == mine => Role::Active,
+        _ if !st.active_instance.is_empty() => Role::Standby,
         _ => heuristic,
     }
 }
@@ -1127,7 +1116,8 @@ pub fn sync_once(data_dir: &Path, role: Role, force_push: bool) -> bool {
         return false;
     };
     let mut applied = false;
-    let mut effective = effective_role(&SyncState::load(data_dir), role);
+    let mine = instance_id(data_dir);
+    let mut effective = effective_role(&SyncState::load(data_dir), &mine, role);
     let result = (|| -> Result<()> {
         match absorb(data_dir, &cfg)? {
             Fence::Superseded => {
@@ -1141,7 +1131,7 @@ pub fn sync_once(data_dir: &Path, role: Role, force_push: bool) -> bool {
                 }
             }
             Fence::MayUpload => {
-                effective = effective_role(&SyncState::load(data_dir), role);
+                effective = effective_role(&SyncState::load(data_dir), &mine, role);
                 match effective {
                     Role::Standby => {
                         if pull(data_dir, &cfg, false)? {
@@ -1340,6 +1330,7 @@ pub fn promote(data_dir: &Path) -> Result<()> {
     st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Active);
     tracing::info!("{}", st.notice);
+    register_network(data_dir, Role::Active, true);
     Ok(())
 }
 
@@ -1357,6 +1348,7 @@ pub fn demote(data_dir: &Path) -> Result<()> {
     st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Standby);
     tracing::info!("{}", st.notice);
+    register_network(data_dir, Role::Standby, false);
     Ok(())
 }
 
@@ -1636,6 +1628,432 @@ fn publish_health(data_dir: &Path, role: Role) {
     if let Err(e) = write_health(&cfg, &me) {
         tracing::debug!("cloud health: {e:#}");
     }
+    if let Err(e) = pull_network_policy(data_dir, &cfg) {
+        tracing::debug!("network policy: {e:#}");
+    }
+    let _ = crate::public_addr::poll_public_ip(data_dir, now());
+    register_network(data_dir, role, false);
+    publish_presence(data_dir);
+}
+
+/// Uploads this server's computer list to the owner's account. The user name
+/// is in the body the account API stores; it is not written to the log.
+fn publish_presence(data_dir: &Path) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return;
+    }
+    let Ok(reg) = crate::registry::Registry::load(data_dir.join("devices.json")) else { return };
+    let online = online_ids(data_dir);
+    let now = now();
+    let mut devices = Vec::new();
+    for row in reg.presence() {
+        if row.last_seen == 0 || now.saturating_sub(row.last_seen) > 90 * 24 * 3600 {
+            continue;
+        }
+        devices.push(serde_json::json!({
+            "id": row.id,
+            "hostname": row.hostname,
+            "os_family": row.os_family,
+            "os_version": row.os_version,
+            "console_user": row.console_user,
+            "display_name": row.display_name,
+            "last_seen": row.last_seen,
+            "online": online.contains(&row.id),
+            "signed_in": row.signed_in,
+        }));
+        if devices.len() >= 500 {
+            break;
+        }
+    }
+    let body = serde_json::json!({ "devices": devices });
+    let stamp = data_dir.join("presence-publish.json");
+    if let Ok(prev) = std::fs::read(&stamp) {
+        if serde_json::from_slice::<serde_json::Value>(&prev).ok().as_ref() == Some(&body) {
+            return;
+        }
+    }
+    let result = agent()
+        .post(&format!("{}/api/network/presence", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string());
+    match result {
+        Ok(_) => {
+            if let Ok(bytes) = serde_json::to_vec(&body) {
+                let _ = std::fs::write(&stamp, bytes);
+            }
+            tracing::info!("presence: published {} computers", devices.len());
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            tracing::debug!("presence: the account did not accept the list ({code})");
+        }
+        Err(_) => tracing::debug!("presence: could not reach the account"),
+    }
+}
+
+fn online_ids(data_dir: &Path) -> std::collections::HashSet<String> {
+    let Ok(bytes) = std::fs::read(data_dir.join("online.json")) else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) else {
+        return std::collections::HashSet::new();
+    };
+    rows.into_iter().filter_map(|row| row.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())).collect()
+}
+
+/// Copies the account's network policy into `network-access.json`. The local
+/// certificate fingerprint is kept. Failure leaves the current file alone.
+fn pull_network_policy(data_dir: &Path, cfg: &CloudConfig) -> Result<()> {
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return Ok(());
+    }
+    #[derive(Deserialize)]
+    struct Reply {
+        #[serde(default)]
+        require_accounts: bool,
+        #[serde(default)]
+        public_key: String,
+        #[serde(default)]
+        allowed_accounts: Vec<String>,
+        #[serde(default)]
+        revoked_devices: Vec<String>,
+    }
+    let reply = match agent()
+        .get(&format!("{}/api/network/policy", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            serde_json::from_str::<Reply>(&text).context("unexpected network policy")?
+        }
+        Err(ureq::Error::Status(404, _)) => return Ok(()),
+        Err(e) => return Err(api_error(&cfg.api, &cfg.email, e)),
+    };
+    let mut policy = crate::access::Policy::load(data_dir);
+    let cloud_on = reply.require_accounts;
+    let push_off = cloud_on && !policy.require_chosen;
+    policy.require_accounts = crate::access::adopt_cloud_require(policy.require_chosen, cloud_on);
+    if reply.public_key.len() == 64 {
+        policy.public_key = reply.public_key;
+    }
+    policy.allowed_accounts = reply.allowed_accounts;
+    policy.revoked_devices = reply.revoked_devices;
+    policy.save(data_dir).context("saving network policy")?;
+    if push_off {
+        push_require_accounts(data_dir, false);
+    }
+    Ok(())
+}
+
+/// Publishes this server into the owner's network using the role it has now.
+/// `online` is how many computers are connected, used only when no role has
+/// been chosen yet. `replace` is the owner's confirmation that a different
+/// server already listed there should be overwritten.
+pub fn publish_network(data_dir: &Path, online: usize, replace: bool) {
+    let hint = if online > 0 { Role::Active } else { Role::Standby };
+    let role = effective_role(&SyncState::load(data_dir), &instance_id(data_dir), hint);
+    register_network(data_dir, role, replace);
+}
+
+/// Registers this server's fingerprint and public address in the slot for
+/// `role`. A missing cloud sign-in, a private address that has not been
+/// confirmed, and a network error leave the local note for the Server window.
+fn register_network(data_dir: &Path, role: Role, replace: bool) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return;
+    }
+    let Some(identity) = crate::server::read_identity(data_dir) else { return };
+    let fingerprint = pjdesk_proto::tls::format_fingerprint(&identity.fingerprint());
+    let port = crate::public_addr::remembered_port(data_dir);
+    let mut record = crate::public_addr::ensure(data_dir, port);
+    if record.address.trim().is_empty() {
+        record.note = "Type the public address computers use to reach this server.".into();
+        crate::public_addr::save(data_dir, &record);
+        return;
+    }
+    if crate::public_addr::is_private_address(&record.address) && !record.confirmed {
+        record.needs_confirm = false;
+        record.note = "This is a local network address. Confirm it before it is published. It is not sent until you do.".into();
+        crate::public_addr::save(data_dir, &record);
+        return;
+    }
+    let watch = crate::public_addr::IpWatch::load(data_dir);
+    let lan = crate::public_addr::lan_endpoints(port);
+    let publication = serde_json::json!({
+        "role": role_name(role),
+        "address": record.address.trim(),
+        "fingerprint": fingerprint,
+        "instance": instance_id(data_dir),
+        "lan": lan,
+        "public_ip": watch.observed,
+        "checked_at": watch.checked_at,
+        "replace": replace,
+    });
+    let stamp = data_dir.join("network-publish.json");
+    if !replace {
+        if let Ok(prev) = std::fs::read(&stamp) {
+            if serde_json::from_slice::<serde_json::Value>(&prev).ok().as_ref() == Some(&publication) {
+                return;
+            }
+        }
+    }
+    let body = serde_json::json!({
+        "role": role_name(role),
+        "address": record.address.trim(),
+        "fingerprint": fingerprint,
+        "instance": instance_id(data_dir),
+        "lan": lan,
+        "public_ip": watch.observed,
+        "checked_at": watch.checked_at,
+        "confirm": record.confirmed || !crate::public_addr::is_private_address(&record.address),
+        "replace": replace,
+    });
+    let result = agent()
+        .post(&format!("{}/api/network/register", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string());
+    match result {
+        Ok(resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            let needs = value.get("needs_confirm").and_then(|v| v.as_bool()).unwrap_or(false);
+            record.needs_confirm = needs;
+            record.note = if needs {
+                value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("My network already lists a different server. Confirm in the PJDesk Server window to replace it.")
+                    .to_string()
+            } else if role == Role::Active {
+                "Published as the active server.".into()
+            } else {
+                "Published as the standby server.".into()
+            };
+            crate::public_addr::save(data_dir, &record);
+            if !needs {
+                let changed = value.get("changed").and_then(|v| v.as_bool()).unwrap_or(true);
+                if changed {
+                    tracing::info!("network: published this server as {}", role_name(role));
+                }
+                if let Ok(bytes) = serde_json::to_vec(&publication) {
+                    let _ = std::fs::write(&stamp, bytes);
+                }
+            }
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            let message = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Could not publish this server.")
+                .to_string();
+            record.needs_confirm = value.get("needs_confirm").and_then(|v| v.as_bool()).unwrap_or(code == 409);
+            record.note = message;
+            crate::public_addr::save(data_dir, &record);
+            tracing::debug!("network register: {code}");
+        }
+        Err(e) => {
+            record.note = "Could not reach pjdesk.com to publish this server.".into();
+            crate::public_addr::save(data_dir, &record);
+            tracing::debug!("network register: {e}");
+        }
+    }
+}
+
+/// Tells pjdesk.com that this server now requires (or no longer requires) a
+/// signed-in account. The local file is already updated by the caller.
+pub fn push_require_accounts(data_dir: &Path, require: bool) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return;
+    }
+    let body = serde_json::json!({ "require_accounts": require }).to_string();
+    let result = agent()
+        .put(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body);
+    if let Err(e) = result {
+        tracing::debug!("could not publish the signed-in-accounts switch: {e}");
+    }
+}
+
+/// A network key the owner created. The blob itself is not stored.
+#[derive(Clone, Deserialize)]
+pub struct NetworkInvite {
+    pub id: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub bound_email: String,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub uses: u32,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    #[serde(default)]
+    pub revoked_at: Option<u64>,
+    #[serde(default)]
+    pub history: Vec<InviteUse>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct InviteUse {
+    #[serde(default)]
+    pub device_name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub used_at: u64,
+}
+
+pub struct CreatedKey {
+    pub blob: String,
+    pub embedded: bool,
+}
+
+fn account_cfg(data_dir: &Path) -> Result<CloudConfig> {
+    let cfg = CloudConfig::load(data_dir).context("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → Account → My network.")?;
+    if !cfg.is_account() || cfg.token.is_empty() {
+        bail!("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → Account → My network.");
+    }
+    Ok(cfg)
+}
+
+fn cloud_api_error(err: ureq::Error) -> anyhow::Error {
+    match err {
+        ureq::Error::Status(_, resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            let message = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                .unwrap_or_else(|| "PJDesk could not update the network key.".into());
+            anyhow::anyhow!(message)
+        }
+        ureq::Error::Transport(_) => anyhow::anyhow!("Could not reach pjdesk.com."),
+    }
+}
+
+/// Creates a network key. The blob is returned once and is not written to disk.
+/// Call this off the UI thread: a passphrase key runs Argon2id.
+pub fn create_network_key(
+    data_dir: &Path,
+    passphrase: Option<&str>,
+    days: Option<u64>,
+    max_uses: Option<u32>,
+    bound_email: &str,
+) -> Result<CreatedKey> {
+    let cfg = account_cfg(data_dir)?;
+    #[derive(Deserialize)]
+    struct Net {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        active_address: String,
+        #[serde(default)]
+        active_fingerprint: String,
+        #[serde(default)]
+        standby_address: String,
+        #[serde(default)]
+        standby_fingerprint: String,
+    }
+    #[derive(Deserialize)]
+    struct Doc {
+        #[serde(default)]
+        network: Option<Net>,
+    }
+    let doc: Doc = match agent()
+        .get(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(resp) => serde_json::from_str(&resp.into_string().unwrap_or_default()).context("unexpected reply from PJDesk")?,
+        Err(e) => return Err(cloud_api_error(e)),
+    };
+    let net = doc.network.context(
+        "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network.",
+    )?;
+    if net.active_address.trim().is_empty() || net.active_fingerprint.trim().is_empty() {
+        bail!(
+            "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network."
+        );
+    }
+    let secret = pjdesk_proto::random_bytes::<32>();
+    let secret_hex = hex::encode(secret);
+    let hash = pjdesk_proto::netkey::secret_hash(&secret_hex);
+    let expires_at = days.map(|d| {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_secs()).unwrap_or(0) + d.saturating_mul(86_400)
+    });
+    let body = serde_json::json!({
+        "secret_hash": hash,
+        "mode": if passphrase.is_some() { "passphrase" } else { "embedded" },
+        "bound_email": bound_email.trim(),
+        "max_uses": max_uses,
+        "expires_at": expires_at,
+    });
+    match agent()
+        .post(&format!("{}/api/network/invites", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string())
+    {
+        Ok(_) => {}
+        Err(e) => return Err(cloud_api_error(e)),
+    }
+    let contents = pjdesk_proto::netkey::Contents {
+        network_id: &net.id,
+        active: &net.active_address,
+        active_fingerprint: &net.active_fingerprint,
+        standby: &net.standby_address,
+        standby_fingerprint: &net.standby_fingerprint,
+    };
+    let embedded = passphrase.is_none();
+    let blob = if let Some(pass) = passphrase {
+        pjdesk_proto::netkey::seal_passphrase(&contents, &secret, pass).map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        pjdesk_proto::netkey::seal_embedded(&contents, &secret).map_err(|e| anyhow::anyhow!(e.to_string()))?
+    };
+    Ok(CreatedKey { blob, embedded })
+}
+
+pub fn list_network_keys(data_dir: &Path) -> Result<Vec<NetworkInvite>> {
+    let cfg = account_cfg(data_dir)?;
+    #[derive(Deserialize)]
+    struct Doc {
+        #[serde(default)]
+        invites: Vec<NetworkInvite>,
+    }
+    match agent()
+        .get(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(resp) => {
+            let doc: Doc = serde_json::from_str(&resp.into_string().unwrap_or_default()).context("unexpected reply from PJDesk")?;
+            Ok(doc.invites)
+        }
+        Err(e) => Err(cloud_api_error(e)),
+    }
+}
+
+pub fn revoke_network_key(data_dir: &Path, id: &str) -> Result<()> {
+    let cfg = account_cfg(data_dir)?;
+    let body = serde_json::json!({ "id": id }).to_string();
+    match agent()
+        .post(&format!("{}/api/network/invites/revoke", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body)
+    {
+        Ok(_) => Ok(()),
+        Err(e) => Err(cloud_api_error(e)),
+    }
 }
 
 /// Other servers' health reports. Empty when sync is off or the website has
@@ -1886,6 +2304,24 @@ mod tests {
         assert_eq!(next_epoch(0), 1);
         assert_eq!(next_epoch(7), 8);
         assert_eq!(next_epoch(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn the_server_that_owns_the_cloud_copy_stays_active_with_no_computers_online() {
+        let mine = "1b401af7870a921b0629820f04e82433";
+        let st = SyncState {
+            active_instance: mine.into(),
+            active_name: "BENLENOVODESK".into(),
+            ..SyncState::default()
+        };
+        assert_eq!(effective_role(&st, mine, Role::Standby), Role::Active);
+        let other = SyncState { active_instance: mine.into(), ..SyncState::default() };
+        assert_eq!(effective_role(&other, "someone-else", Role::Active), Role::Standby);
+        let stepped = SyncState { desired: "standby".into(), active_instance: mine.into(), ..SyncState::default() };
+        assert_eq!(effective_role(&stepped, mine, Role::Active), Role::Standby);
+        let fresh = SyncState::default();
+        assert_eq!(effective_role(&fresh, mine, Role::Standby), Role::Standby);
+        assert_eq!(effective_role(&fresh, mine, Role::Active), Role::Active);
     }
 
     #[test]

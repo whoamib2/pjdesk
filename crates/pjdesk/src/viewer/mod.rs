@@ -7,6 +7,7 @@ pub(crate) fn render_monitor_shots(dir: &std::path::Path) {
 
 mod controls;
 pub mod decoder;
+mod filedrop;
 mod keymap;
 mod panel;
 mod render;
@@ -51,19 +52,31 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         bail!("\"{typed}\" is not a PJDesk ID (IDs have 9 digits). For a direct connection, pass --direct host:port.");
     }
     let label = direct.clone().unwrap_or_else(|| format_id(&target));
-    let password = match args.password.clone() {
-        Some(password) => password,
-        None => rpassword::prompt_password(format!("Password for {label}: "))?,
+    let ask = std::env::var("PJDESK_ASK").ok().map(std::path::PathBuf::from).filter(|p| !p.as_os_str().is_empty());
+    // View phone sets PJDESK_ASK_VIEW and no password, and it does not set
+    // PJDESK_ASK. That is an empty password, the same as the 0.6.15 hotfix.
+    // rpassword opens CONIN$ and fails with os error 6 when there is no console.
+    let ask_view = std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1");
+    let ask_person = std::env::var("PJDESK_ASK_PERSON").ok().as_deref() == Some("1");
+    let stdin_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let password = match password_source(args.password.as_deref(), ask.is_some(), ask_view, ask_person, stdin_is_terminal)
+    {
+        PasswordSource::Given(password) => password,
+        PasswordSource::Empty => String::new(),
+        PasswordSource::Prompt => rpassword::prompt_password(format!("Password for {label}: "))?,
+        PasswordSource::NoConsole => {
+            bail!("No password for {label}, and there is no console to ask for one.");
+        }
     };
 
-    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let mut waiting = false;
     let mut tries = 0u32;
     loop {
         let link = if let Some(addr) = direct.clone() {
-            runtime.block_on(connect_direct(&mut config, &addr, &password, args.trust && !waiting))
+            runtime.block_on(connect_direct(&mut config, &addr, &password, ask.as_deref(), args.trust && !waiting))
         } else {
-            runtime.block_on(connect(&server, &mut config, &target, &password, args.force_relay))
+            runtime.block_on(connect(&server, &mut config, &target, &password, ask.as_deref(), args.force_relay, waiting))
         };
         let link = match link {
             Ok(link) => link,
@@ -74,6 +87,10 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
             }
             Err(e) => {
                 let wrong = e.to_string().to_ascii_lowercase().contains("wrong password");
+                if wrong && ask.is_some() {
+                    crate::note_failure(&format!("{e:#}"));
+                    std::process::exit(3);
+                }
                 if wrong && std::env::var("PJDESK_SAVED").ok().as_deref() == Some("1") && is_valid_id(&target) {
                     config.remember_password(&target, None);
                     if let Some(entry) = config.address_book.iter_mut().find(|e| e.id == target) {
@@ -95,18 +112,52 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
             }
             let _ = config.save();
         }
-        println!("Connected to \"{}\" ({}, {})", link.host_name, format_id(&link.host_id), link.path);
+        tracing::info!("Connected to \"{}\" ({}, {})", link.host_name, format_id(&link.host_id), link.path);
         if args.headless {
             return runtime.block_on(headless(link, args.frames));
         }
         if !window::run(&runtime, link)? {
             break;
         }
+        if std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1") {
+            break;
+        }
         waiting = true;
-        println!("Waiting for the computer to come back…");
+        tracing::info!("Waiting for the computer to come back");
         std::thread::sleep(Duration::from_secs(5));
     }
     Ok(())
+}
+
+/// How the viewer gets the computer password.
+///
+/// `PJDESK_ASK` and `PJDESK_ASK_VIEW` send no password. The window asks later,
+/// or the phone shows its share prompt. A console prompt is only for
+/// `pjdesk connect` when stdin is a terminal. Otherwise `rpassword` opens
+/// CONIN$ and fails with os error 6.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PasswordSource {
+    Given(String),
+    Empty,
+    Prompt,
+    NoConsole,
+}
+
+pub(crate) fn password_source(
+    supplied: Option<&str>,
+    ask: bool,
+    ask_view: bool,
+    ask_person: bool,
+    stdin_is_terminal: bool,
+) -> PasswordSource {
+    if ask || ask_view || ask_person {
+        return PasswordSource::Empty;
+    }
+    match supplied {
+        Some(password) => PasswordSource::Given(password.to_string()),
+        None if stdin_is_terminal => PasswordSource::Prompt,
+        None => PasswordSource::NoConsole,
+    }
 }
 
 /// Signaling → UDP binding → hole punching / relay → QUIC → password check.
@@ -115,22 +166,50 @@ async fn connect(
     config: &mut Config,
     target: &str,
     password: &str,
+    ask: Option<&std::path::Path>,
     force_relay: bool,
+    waiting_retry: bool,
 ) -> Result<Link> {
     tracing::info!("Connecting to {} through {server}", format_id(target));
-    println!("Connecting to {} through {server}...", format_id(target));
-    let mut signal = SignalClient::connect(server, config).await?;
-    signal.send(ClientMsg::Connect {
+    if waiting_retry {
+        crate::network::refresh_config_now(config);
+    } else {
+        crate::network::refresh_config(config);
+    }
+    let server = ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone());
+    let mut access = config.network_access_token();
+    if access.is_empty() {
+        // A temporary sign-in keeps the access token in this process only.
+        access = std::env::var("PJDESK_ACCESS").unwrap_or_default();
+    }
+    let mut signal = SignalClient::connect(&server, config).await?;
+    tracing::info!("Reached the server via {}", signal.via);
+    if !access.is_empty() {
+        let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
+    }
+    let connect = ClientMsg::Connect {
         proto: PROTOCOL_VERSION,
         target_id: target.into(),
         controller_name: crate::hostname(),
-    })?;
+    };
+    signal.send(connect.clone())?;
 
-    tracing::info!("Waiting for {} to allow the connection", format_id(target));
+    tracing::info!("Waiting for {} to answer", format_id(target));
+    let mut retried_without_token = false;
     let (session_id, token, udp_port, host_name) = loop {
         match timeout(Duration::from_secs(90), signal.recv()).await {
+            Ok(None) if !access.is_empty() && !retried_without_token => {
+                retried_without_token = true;
+                signal = SignalClient::connect(&server, config).await?;
+                signal.send(connect.clone())?;
+                continue;
+            }
             Ok(Some(ServerMsg::SessionReady { session_id, token, udp_port, host_name })) => {
                 tracing::info!("Host accepted session {session_id:x}");
+                cache_host_name(target, &host_name);
+                if let Some(path) = ask {
+                    let _ = std::fs::write(path, format!("ready\n{host_name}\n"));
+                }
                 break (session_id, token, udp_port, host_name);
             }
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
@@ -152,6 +231,14 @@ async fn connect(
     let (peer_public, peer_local, fingerprint) = loop {
         match timeout(Duration::from_secs(20), signal.recv()).await {
             Ok(Some(ServerMsg::PeerInfo { public_addr, local_addrs, cert_fingerprint, .. })) => {
+                tracing::info!(
+                    "Host addresses: public {public_addr}, on this network {}",
+                    if local_addrs.is_empty() {
+                        "none reported".to_string()
+                    } else {
+                        local_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                    }
+                );
                 break (public_addr, local_addrs, cert_fingerprint.context("the server didn't send the host's key")?)
             }
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
@@ -165,38 +252,208 @@ async fn connect(
 
     let endpoint = p2p::controller_endpoint(binding.socket, fingerprint)?;
     let candidates = p2p::candidates(peer_public, &peer_local);
-    let punching = p2p::spawn_punching(binding.punch_socket, candidates.clone(), session_id, Duration::from_secs(5));
-    let connected = p2p::connect_to_host(&endpoint, &candidates, server_udp, force_relay).await;
-    punching.abort();
-    let (connection, path) = connected?;
-
-    tracing::info!("Checking the password with {}", format_id(target));
-    let auth = match session::controller_auth(&connection, password, &crate::hostname()).await {
-        Ok(auth) => auth,
-        Err(e) => {
-            // Hang up properly so the host is free again right away.
-            connection.close(1u32.into(), b"authentication failed");
-            let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
-            let err = if e.is::<WrongPassword>() { anyhow!("wrong password for {}", format_id(target)) } else { e };
-            tracing::error!("session failed: {err:#}");
-            return Err(err);
+    let ask_person = std::env::var("PJDESK_ASK_PERSON").ok().as_deref() == Some("1");
+    let ask_view = std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1");
+    let mut attempt = if ask_view {
+        let label = std::env::var("PJDESK_PEER_LABEL").unwrap_or_default();
+        let label = if label.trim().is_empty() { host_name.clone() } else { label };
+        crate::note_status(&format!("Waiting for {label} to accept"));
+        Asked::View
+    } else if ask_person {
+        Asked::Person
+    } else if let Some(path) = ask {
+        wait_asked_password(path, &host_name).await?
+    } else {
+        Asked::Password(password.to_string())
+    };
+    let mut from_store = std::env::var("PJDESK_SAVED").ok().as_deref() == Some("1");
+    let mut tries = 0u32;
+    let (connection, path, auth) = loop {
+        let punching = binding.punch_socket.try_clone().ok().map(|sock| {
+            p2p::spawn_punching(sock, candidates.clone(), session_id, Duration::from_secs(8))
+        });
+        let connected = p2p::connect_to_host(&endpoint, &candidates, server_udp, force_relay).await;
+        if let Some(punching) = punching {
+            punching.abort();
+        }
+        let (connection, path) = connected?;
+        let authed = match &attempt {
+            Asked::View => {
+                tracing::info!("Requesting view access to {}", format_id(target));
+                let account = signed_in_account(config);
+                let id = config.device_id.clone().unwrap_or_default();
+                session::controller_ask_view(&connection, &account, &crate::hostname(), &id).await
+            }
+            Asked::Person => {
+                tracing::info!("Asking the person at {}", format_id(target));
+                let who = if host_name.trim().is_empty() { format_id(target) } else { host_name.clone() };
+                crate::note_status(&format!("Waiting for {who} to accept..."));
+                session::controller_ask_person_for(&connection, &presenter_name(), std::time::Duration::from_secs(60)).await
+            }
+            Asked::Password(password) => {
+                tracing::info!("Checking the password with {}", format_id(target));
+                session::controller_auth(&connection, password, &crate::hostname()).await
+            }
+        };
+        match authed {
+            Ok(auth) => {
+                if let Some(path) = ask {
+                    let _ = std::fs::write(path, "accepted\n");
+                }
+                break (connection, path, auth);
+            }
+            Err(e) if e.is::<session::LockedOut>() => {
+                connection.close(1u32.into(), b"locked out");
+                let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+                crate::note_failure(&e.to_string());
+                std::process::exit(4);
+            }
+            Err(e) if e.is::<session::WrongPassword>() && ask.is_some() && tries < 4 => {
+                connection.close(1u32.into(), b"authentication failed");
+                tries += 1;
+                let path = ask.unwrap();
+                let _ = std::fs::write(path, format!("rejected\n{host_name}\n"));
+                let _ = std::fs::remove_file(ask_reply_path(path));
+                from_store = false;
+                attempt = wait_asked_password(path, &host_name).await?;
+            }
+            Err(e) if e.is::<session::WrongPassword>() => {
+                connection.close(1u32.into(), b"authentication failed");
+                let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+                let mut text = format!("Incorrect password for {}", format_id(target));
+                if from_store && is_valid_id(target) {
+                    config.remember_password(target, None);
+                    if let Some(entry) = config.address_book.iter_mut().find(|e| e.id == target) {
+                        entry.password = None;
+                    }
+                    let _ = config.save();
+                    text.push_str(". The saved password on this computer was cleared.");
+                }
+                crate::note_failure(&text);
+                std::process::exit(3);
+            }
+            Err(e) => {
+                connection.close(1u32.into(), b"authentication failed");
+                let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+                tracing::error!("session failed: {e:#}");
+                return Err(e);
+            }
         }
     };
-    tracing::info!("Password accepted by {}", auth.peer_name);
+    let opened = if matches!(attempt, Asked::View) {
+        format!("{} accepted the view. Starting the picture ({path}).", auth.peer_name)
+    } else {
+        format!("Password accepted by {}. Starting the picture ({path}).", auth.peer_name)
+    };
+    tracing::info!("{opened}");
+    tracing::info!("{}", crate::host_log_hint());
+    crate::note_status(&opened);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    if let Some(reason) = connection.close_reason() {
+        let text = format!(
+            "Password accepted by {}, then the host closed the session: {reason}",
+            auth.peer_name
+        );
+        crate::note_failure(&text);
+        bail!(text);
+    }
+    let reported = if auth.peer_name.is_empty() { host_name } else { auth.peer_name };
+    cache_host_name(target, &reported);
     Ok(Link {
         connection,
         endpoint,
         control_send: auth.send,
         control_recv: auth.recv,
-        host_name: if auth.peer_name.is_empty() { host_name } else { auth.peer_name },
+        host_name: reported,
         host_id: target.to_string(),
         path,
         peer_proto: auth.peer_proto,
     })
 }
 
+fn ask_reply_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".reply");
+    std::path::PathBuf::from(name)
+}
+
+enum Asked {
+    Password(String),
+    Person,
+    View,
+}
+
+/// The pjdesk.com account when this computer is signed in. Empty otherwise,
+/// so the phone names this computer instead.
+fn signed_in_account(cfg: &crate::config::Config) -> String {
+    let from_parent = std::env::var("PJDESK_ACCOUNT").unwrap_or_default();
+    let email = if !from_parent.trim().is_empty() { from_parent } else { cfg.network_email.clone().unwrap_or_default() };
+    let signed_in = !email.trim().is_empty()
+        || !cfg.network_refresh_token().trim().is_empty()
+        || !std::env::var("PJDESK_ACCESS").unwrap_or_default().trim().is_empty();
+    if signed_in { email.trim().chars().filter(|c| !c.is_control()).take(80).collect() } else { String::new() }
+}
+
+/// Account and this computer's name, packed into the one field an ask can send.
+fn presenter_name() -> String {
+    let email = std::env::var("PJDESK_ACCOUNT").unwrap_or_default();
+    let email = email.trim().to_string();
+    let device = crate::hostname();
+    if email.contains('@') {
+        format!("{email} — {device}").chars().take(120).collect()
+    } else {
+        device
+    }
+}
+
+/// Blocks until the window writes a password, asks the person, or cancels.
+/// The host has already answered; this is the only password prompt for the attempt.
+async fn wait_asked_password(path: &std::path::Path, host_name: &str) -> Result<Asked> {
+    let current = std::fs::read_to_string(path).unwrap_or_default();
+    if !current.starts_with("rejected") {
+        let _ = std::fs::write(path, format!("ready\n{host_name}\n"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let reply = ask_reply_path(path);
+    loop {
+        if Instant::now() > deadline {
+            bail!("the password was not entered in time");
+        }
+        if let Ok(text) = std::fs::read_to_string(&reply) {
+            let _ = std::fs::remove_file(&reply);
+            if text.starts_with("cancel") {
+                bail!("cancelled");
+            }
+            if text.starts_with("ask") {
+                return Ok(Asked::Person);
+            }
+            if let Some(hexed) = text.strip_prefix("password\n") {
+                let bytes = hex::decode(hexed.trim()).unwrap_or_default();
+                if let Ok(password) = String::from_utf8(bytes) {
+                    if !password.is_empty() {
+                        return Ok(Asked::Password(password));
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Writes the host's name onto the saved computer. SessionReady supplies it
+/// before the password, and the handshake refreshes it after the password is accepted.
+fn cache_host_name(id: &str, name: &str) {
+    crate::config::Config::remember_hostname(id, name);
+}
+
 /// Direct IP: QUIC to `host:port` with the saved certificate pin (or first use).
-async fn connect_direct(config: &mut Config, addr: &str, password: &str, trust: bool) -> Result<Link> {
+async fn connect_direct(
+    config: &mut Config,
+    addr: &str,
+    password: &str,
+    ask: Option<&std::path::Path>,
+    trust: bool,
+) -> Result<Link> {
     let socket_addr: SocketAddr = addr
         .parse()
         .or_else(|_| format!("{addr}:{}", pjdesk_proto::DIRECT_PORT).parse())
@@ -212,6 +469,15 @@ async fn connect_direct(config: &mut Config, addr: &str, password: &str, trust: 
     let connecting =
         endpoint.connect(socket_addr, pjdesk_proto::PEER_SERVER_NAME).context("starting the direct connection")?;
     let connection = timeout(Duration::from_secs(8), connecting).await.context("the computer did not answer")??;
+    let label = socket_addr.to_string();
+    if let Some(path) = ask {
+        let _ = std::fs::write(path, format!("ready\n{label}\n"));
+    }
+    let asked = if let Some(path) = ask {
+        wait_asked_password(path, &label).await?
+    } else {
+        Asked::Password(password.to_string())
+    };
     if verifier.mismatch() {
         connection.close(1u32.into(), b"certificate mismatch");
         bail!("this computer's key changed. Connect again and choose to trust it.");
@@ -222,11 +488,36 @@ async fn connect_direct(config: &mut Config, addr: &str, password: &str, trust: 
             let _ = config.save();
         }
     }
-    let auth = match session::controller_auth(&connection, password, &crate::hostname()).await {
-        Ok(auth) => auth,
+    let authed = match &asked {
+        Asked::Person => session::controller_ask_person_for(&connection, &presenter_name(), std::time::Duration::from_secs(60)).await,
+        Asked::View => {
+            let account = signed_in_account(config);
+            let id = config.device_id.clone().unwrap_or_default();
+            session::controller_ask_view(&connection, &account, &crate::hostname(), &id).await
+        }
+        Asked::Password(password) => session::controller_auth(&connection, password, &crate::hostname()).await,
+    };
+    let auth = match authed {
+        Ok(auth) => {
+            if let Some(path) = ask {
+                let _ = std::fs::write(path, "accepted\n");
+            }
+            auth
+        }
+        Err(e) if e.is::<session::LockedOut>() => {
+            connection.close(1u32.into(), b"locked out");
+            crate::note_failure(&e.to_string());
+            std::process::exit(4);
+        }
         Err(e) => {
             connection.close(1u32.into(), b"authentication failed");
-            return Err(if e.is::<WrongPassword>() { anyhow!("wrong password") } else { e });
+            if e.is::<WrongPassword>() {
+                if let Some(path) = ask {
+                    let _ = std::fs::write(path, format!("rejected\n{label}\n"));
+                }
+                return Err(anyhow!("wrong password"));
+            }
+            return Err(e);
         }
     };
     Ok(Link {
@@ -290,4 +581,26 @@ async fn receive_frames(connection: &Connection, control_send: &mut SendStream, 
         println!("Center-row colors: {}", samples.join(" "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{password_source, PasswordSource};
+
+    #[test]
+    fn view_phone_does_not_ask_the_console_for_a_password() {
+        assert_eq!(password_source(None, false, true, false, false), PasswordSource::Empty);
+        assert_eq!(password_source(None, false, false, true, false), PasswordSource::Empty);
+        assert_eq!(password_source(None, true, false, false, false), PasswordSource::Empty);
+    }
+
+    #[test]
+    fn a_window_with_no_console_does_not_open_conin() {
+        assert_eq!(password_source(None, false, false, false, false), PasswordSource::NoConsole);
+        assert_eq!(
+            password_source(Some("secret"), false, false, false, false),
+            PasswordSource::Given("secret".into())
+        );
+        assert_eq!(password_source(None, false, false, false, true), PasswordSource::Prompt);
+    }
 }

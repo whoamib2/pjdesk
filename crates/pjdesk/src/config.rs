@@ -40,9 +40,80 @@ pub struct Config {
     #[serde(default)]
     pub address_book: Vec<AddressEntry>,
     /// Remembered passwords for direct connections, by device ID (encrypted).
-    /// The account address book is the synced store; this is the local one.
+    /// The account also keeps a sealed copy. This file never stores them in
+    /// the clear, and the account service only stores ciphertext.
     #[serde(default)]
-    saved_passwords: BTreeMap<String, String>,
+    pub(crate) saved_passwords: BTreeMap<String, String>,
+    /// When each saved password was last changed here, including a deletion.
+    /// An id with a time and no password was deleted.
+    #[serde(default)]
+    pub(crate) password_vault_times: BTreeMap<String, u64>,
+    /// Hex vault key, sealed with DPAPI. Empty for a temporary sign-in.
+    #[serde(default)]
+    pub password_vault_key: Option<String>,
+    /// Sealed PJLOCK01 blob for the account PIN. Empty when no PIN is set.
+    #[serde(default)]
+    pub app_lock_sealed: String,
+    #[serde(default)]
+    pub app_lock_updated: u64,
+    /// Account the cached verifier belongs to.
+    #[serde(default)]
+    pub app_lock_email: String,
+    /// Opened verifier (salt and slow hash), sealed with DPAPI. Not the PIN.
+    #[serde(default)]
+    pub app_lock_verifier: Option<String>,
+    #[serde(default)]
+    pub app_lock_fails: u32,
+    /// Unix time until which more PIN tries wait. 0 when there is no wait.
+    #[serde(default)]
+    pub app_lock_until: u64,
+    /// PJDesk account that owns the private server this client uses.
+    #[serde(default)]
+    pub network_email: Option<String>,
+    /// Refresh token for that account, sealed so the background service can read it.
+    #[serde(default)]
+    pub network_refresh: Option<String>,
+    /// Short-lived access token for the private server.
+    #[serde(default)]
+    pub network_access: Option<String>,
+    #[serde(default)]
+    pub network_access_exp: u64,
+    /// Stable id named by the access token. Not the nine-digit PJDesk ID.
+    #[serde(default)]
+    pub network_device_id: Option<String>,
+    #[serde(default)]
+    pub network_standby: Option<String>,
+    #[serde(default)]
+    pub network_standby_fingerprint: Option<String>,
+    /// LAN addresses of the active server (`ip:port`), published with its public address.
+    #[serde(default)]
+    pub network_lan: Vec<String>,
+    /// The active server's observed public IP, without a port. Empty until it publishes one.
+    #[serde(default)]
+    pub network_public_ip: String,
+    /// LAN address that completed a handshake on this network, keyed by the local IPv4 (`ip:10.0.0.8`).
+    #[serde(default)]
+    pub lan_path_cache: BTreeMap<String, String>,
+    /// The encrypted network key last applied on this computer. The passphrase
+    /// is not stored. Export copies this string; nothing logs it.
+    #[serde(default)]
+    pub network_key: Option<String>,
+    /// True after this computer has merged its local Saved list into the account once.
+    /// Sign-out clears it so the next sign-in merges again. The list itself stays.
+    #[serde(default)]
+    pub network_list_merged: bool,
+    /// Saved computers this person removed on this computer only.
+    /// They stay off this list. The account still has them.
+    #[serde(default)]
+    pub saved_hidden: Vec<String>,
+    /// Computers deleted from the pjdesk.com account. They stay off every
+    /// signed-in client until that computer signs in again.
+    #[serde(default)]
+    pub account_removed: Vec<String>,
+    /// A sign-in that must not be written. Saves keep the account, the saved
+    /// list, and passwords already on disk, and write this process's device id.
+    #[serde(skip)]
+    pub ephemeral_network: bool,
 }
 
 /// Quality, behaviour and startup preferences.
@@ -73,6 +144,9 @@ pub struct Settings {
     /// The first-login "Remember password" box starts checked.
     #[serde(default)]
     pub remember_passwords: bool,
+    /// Minutes with no PJDesk activity before a temporary sign-in ends.
+    #[serde(default = "default_temp_idle")]
+    pub temp_idle_minutes: u32,
     /// "system" follows Windows, or "dark" / "light".
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -83,9 +157,16 @@ pub struct Settings {
     /// Folder received files are written into. Empty means file transfer is refused.
     #[serde(default)]
     pub receive_dir: String,
-    /// Listen for direct IP connections and announce this computer on the LAN.
+    /// Listen for direct IP connections.
     #[serde(default = "yes")]
     pub allow_direct: bool,
+    /// Look for PJDesk on the local network, and let others find this computer.
+    /// On unless the person turns it off. The announcement has no password.
+    #[serde(default = "yes")]
+    pub discover_lan: bool,
+    /// Saved-list layout on this computer: "list", "small", or "big".
+    #[serde(default = "default_saved_view")]
+    pub saved_view: String,
     /// Host ports a remote session may forward to (loopback only unless the server policy says otherwise).
     #[serde(default)]
     pub tunnel_ports: Vec<u16>,
@@ -100,11 +181,37 @@ pub struct Settings {
 fn yes() -> bool {
     true
 }
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(1)
+}
 fn default_theme() -> String {
     "system".into()
 }
 fn default_approval() -> String {
     "prompt".into()
+}
+fn default_saved_view() -> String {
+    "list".into()
+}
+
+/// True when `text` is the same 9-digit ID, ignoring spaces.
+pub fn same_id(text: &str, id: &str) -> bool {
+    let a: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let b: String = id.chars().filter(|c| !c.is_whitespace()).collect();
+    !a.is_empty() && a.eq_ignore_ascii_case(&b)
+}
+
+/// A name the user typed. The ID and the computer's own hostname are not nicknames.
+pub fn nickname_text(alias: &str, id: &str, hostname: &str) -> String {
+    let alias = alias.trim();
+    if alias.is_empty() || same_id(alias, id) {
+        return String::new();
+    }
+    if !hostname.trim().is_empty() && alias.eq_ignore_ascii_case(hostname.trim()) {
+        return String::new();
+    }
+    alias.to_string()
 }
 
 /// Remembered locally, not part of the synced address book.
@@ -114,11 +221,29 @@ pub struct PeerNote {
     pub favorite: bool,
     #[serde(default)]
     pub last_connected: u64,
+    /// Hostname the host reported. Empty until a connection, LAN presence, or the account list supplies one.
+    #[serde(default)]
+    pub hostname: String,
     /// "windows", "macos", "linux", "android", or empty when the host did not say.
     #[serde(default)]
     pub os_family: String,
     #[serde(default)]
     pub os_version: String,
+    /// Last interactive user reported by that computer. Empty until one is known.
+    #[serde(default)]
+    pub console_user: String,
+    /// User order in Saved. 0 means unordered. Not a password and not uploaded by itself.
+    #[serde(default)]
+    pub sort_order: u32,
+    /// Friendly name reported by that computer. A nickname typed here still wins on this screen.
+    #[serde(default)]
+    pub display_name: String,
+    /// When the account's server last saw this computer. 0 until then.
+    #[serde(default)]
+    pub last_seen: u64,
+    /// True when the account's server says this computer is connected.
+    #[serde(default)]
+    pub reported_online: bool,
     /// 0 = one display, 1 = all displays, 2 = a window per display.
     #[serde(default)]
     pub view_mode: u8,
@@ -156,6 +281,9 @@ fn default_bitrate() -> u32 {
 fn default_max_width() -> u32 {
     2560
 }
+fn default_temp_idle() -> u32 {
+    30
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -168,10 +296,13 @@ impl Default for Settings {
             permanent_password: None,
             start_with_windows: false,
             remember_passwords: false,
+            temp_idle_minutes: default_temp_idle(),
             theme: default_theme(),
             approval: default_approval(),
             receive_dir: String::new(),
             allow_direct: true,
+            discover_lan: true,
+            saved_view: default_saved_view(),
             tunnel_ports: Vec::new(),
             peers: BTreeMap::new(),
             direct_pins: BTreeMap::new(),
@@ -267,19 +398,188 @@ impl Config {
         let _ = cfg.save_to(&path);
     }
 
+    /// Caches the hostname a host reported, reloading first so a save from the
+    /// window does not drop it. Refreshed on each connect. An ID is not a hostname.
+    pub fn remember_hostname(id: &str, hostname: &str) {
+        let hostname = hostname.trim();
+        if hostname.is_empty() || !pjdesk_proto::is_valid_id(id) || same_id(hostname, id) {
+            return;
+        }
+        let path = Self::path();
+        let mut cfg = Self::load_from(&path).unwrap_or_default();
+        let note = cfg.settings.peers.entry(id.to_string()).or_default();
+        if note.hostname == hostname {
+            return;
+        }
+        note.hostname = hostname.to_string();
+        let _ = cfg.save_to(&path);
+        std::thread::spawn(|| {
+            let _ = crate::network::push_saved_computers_from_disk();
+        });
+    }
+
+    /// Fills hostname and OS this copy does not have yet. A value already in
+    /// memory is kept. Used before a save so the window does not wipe what the
+    /// viewer just wrote.
+    pub fn fill_peer_facts_from(&mut self, disk: &Config) {
+        for (id, src) in &disk.settings.peers {
+            let note = self.settings.peers.entry(id.clone()).or_default();
+            if note.hostname.trim().is_empty() && !src.hostname.trim().is_empty() {
+                note.hostname = src.hostname.clone();
+            }
+            if note.os_family.trim().is_empty() && !src.os_family.trim().is_empty() {
+                note.os_family = src.os_family.clone();
+                note.os_version = src.os_version.clone();
+            } else if note.os_version.is_empty() && note.os_family == src.os_family && !src.os_version.is_empty() {
+                note.os_version = src.os_version.clone();
+            }
+            if note.console_user.trim().is_empty() && !src.console_user.trim().is_empty() {
+                note.console_user = src.console_user.clone();
+            }
+            if src.last_seen > note.last_seen {
+                note.last_seen = src.last_seen;
+                note.reported_online = src.reported_online;
+            }
+            if src.last_connected > note.last_connected {
+                note.last_connected = src.last_connected;
+            }
+            if note.windows.is_empty() && !src.windows.is_empty() {
+                note.windows = src.windows.clone();
+            }
+            if note.view_mode == 0 && note.last_display == 0 && (src.view_mode != 0 || src.last_display != 0) {
+                note.view_mode = src.view_mode;
+                note.last_display = src.last_display;
+            }
+        }
+    }
+
+    /// Copies host-reported hostname and OS from `disk` when that file has them.
+    /// The viewer writes those after a connect; the window re-reads them when
+    /// Saved computers opens and when the viewer exits.
+    pub fn take_peer_reports_from(&mut self, disk: &Config) {
+        for (id, src) in &disk.settings.peers {
+            let note = self.settings.peers.entry(id.clone()).or_default();
+            if !src.hostname.trim().is_empty() {
+                note.hostname = src.hostname.clone();
+            }
+            if !src.os_family.trim().is_empty() {
+                note.os_family = src.os_family.clone();
+                if !src.os_version.is_empty() {
+                    note.os_version = src.os_version.clone();
+                }
+            }
+            if !src.console_user.trim().is_empty() {
+                note.console_user = src.console_user.clone();
+            }
+            if src.last_seen > note.last_seen {
+                note.last_seen = src.last_seen;
+            }
+            note.reported_online = src.reported_online;
+            if src.last_connected > note.last_connected {
+                note.last_connected = src.last_connected;
+            }
+        }
+        for entry in &disk.address_book {
+            let id = pjdesk_proto::normalize_id(&entry.id);
+            if !pjdesk_proto::is_valid_id(&id) {
+                continue;
+            }
+            if self.address_book.iter().any(|e| e.id == id) {
+                continue;
+            }
+            self.address_book.push(AddressEntry {
+                id,
+                alias: entry.alias.clone(),
+                password: None,
+                tags: entry.tags.clone(),
+            });
+        }
+    }
+
     pub fn save(&self) -> Result<()> {
         self.save_to(&Self::path())
     }
 
     /// Writes this config to a specific file (atomically).
     pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        let writing = self.for_disk(path);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&writing)?)?;
         std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
+    }
+
+    /// A temporary sign-in keeps the account fields already on disk.
+    fn for_disk(&self, path: &std::path::Path) -> Self {
+        if !self.ephemeral_network {
+            return self.clone();
+        }
+        let mut writing = self.clone();
+        writing.ephemeral_network = false;
+        let disk = Self::load_from(path).ok();
+        if let Some(disk) = disk {
+            writing.network_email = disk.network_email;
+            writing.network_refresh = disk.network_refresh;
+            writing.network_access = disk.network_access;
+            writing.network_access_exp = disk.network_access_exp;
+            writing.network_list_merged = disk.network_list_merged;
+            writing.network_standby = disk.network_standby;
+            writing.network_standby_fingerprint = disk.network_standby_fingerprint;
+            writing.network_lan = disk.network_lan;
+            writing.network_public_ip = disk.network_public_ip;
+            writing.lan_path_cache = disk.lan_path_cache;
+            writing.network_key = disk.network_key;
+            writing.server = disk.server;
+            writing.server_fingerprint = disk.server_fingerprint;
+            writing.address_book = disk.address_book;
+            writing.saved_hidden = disk.saved_hidden;
+            writing.saved_passwords = disk.saved_passwords;
+            writing.password_vault_times = disk.password_vault_times;
+            writing.password_vault_key = disk.password_vault_key;
+            writing.settings.peers = disk.settings.peers;
+            let mut removed = disk.account_removed;
+            for id in &self.account_removed {
+                if !removed.iter().any(|h| h == id) {
+                    removed.push(id.clone());
+                }
+            }
+            writing.account_removed = removed;
+            let gone = writing.account_removed.clone();
+            writing.address_book.retain(|e| !gone.iter().any(|h| h == &e.id));
+            for id in &gone {
+                writing.settings.peers.remove(id);
+                writing.saved_passwords.remove(id);
+            }
+            if writing.device_id.is_none() {
+                writing.device_id = disk.device_id;
+            }
+            if writing.device_secret.is_none() {
+                writing.device_secret = disk.device_secret;
+            }
+            if writing.network_device_id.is_none() {
+                writing.network_device_id = disk.network_device_id;
+            }
+        } else {
+            writing.network_email = None;
+            writing.network_refresh = None;
+            writing.network_access = None;
+            writing.network_access_exp = 0;
+            writing.network_list_merged = false;
+            writing.address_book.clear();
+            writing.saved_hidden.clear();
+            writing.account_removed.clear();
+            writing.saved_passwords.clear();
+            writing.password_vault_times.clear();
+            writing.password_vault_key = None;
+            writing.settings.peers.clear();
+            writing.server = None;
+            writing.server_fingerprint = None;
+            writing.network_key = None;
+        }
+        writing
     }
 
     /// The device secret, created (and saved) on first use.
@@ -318,14 +618,304 @@ impl Config {
         self.server_fingerprint.as_deref().and_then(|s| parse_fingerprint(s).ok())
     }
 
-    /// The server to use: the one the user set, else the baked-in default, so a
-    /// fresh install is reachable without any configuration.
+    /// The server to use. An explicit address wins. An install that already has
+    /// a device id keeps the server it registered with, so an update does not
+    /// take it offline. A fresh install has neither, and waits for sign-in.
     pub fn effective_server(&self) -> String {
-        self.server
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| pjdesk_proto::DEFAULT_SERVER.to_string())
+        if let Some(s) = self.server.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return s.to_string();
+        }
+        if self.device_id.is_some() {
+            return pjdesk_proto::LEGACY_REGISTERED_SERVER.to_string();
+        }
+        String::new()
+    }
+
+    pub fn network_access_token(&self) -> String {
+        self.network_access.as_deref().and_then(secure::reveal).filter(|s| !s.is_empty()).unwrap_or_default()
+    }
+
+    pub fn network_refresh_token(&self) -> String {
+        self.network_refresh.as_deref().and_then(secure::reveal).filter(|s| !s.is_empty()).unwrap_or_default()
+    }
+
+    /// Ensures this install has a stable id to put in a network access token.
+    pub fn network_device(&mut self) -> String {
+        if let Some(id) = self.network_device_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return id.to_string();
+        }
+        let id = hex::encode(pjdesk_proto::random_bytes::<16>());
+        self.network_device_id = Some(id.clone());
+        id
+    }
+
+    pub fn apply_network_session(&mut self, session: &crate::network::Session) {
+        self.network_email = Some(session.email.clone());
+        if !session.refresh.is_empty() {
+            self.network_refresh = Some(secure::protect_machine(&session.refresh));
+        }
+        if !session.access.is_empty() {
+            self.network_access = Some(secure::protect(&session.access));
+        }
+        self.network_access_exp = session.exp;
+        if !session.device_id.is_empty() {
+            self.network_device_id = Some(session.device_id.clone());
+        }
+        if !session.address.trim().is_empty() {
+            let next = crate::network::keep_hostname(self.server.as_deref().unwrap_or(""), session.address.trim());
+            if !next.is_empty() {
+                self.server = Some(next);
+            }
+        }
+        self.network_lan = session.lan.clone();
+        self.network_public_ip = session.public_ip.clone();
+        if let Ok(fp) = parse_fingerprint(&session.fingerprint) {
+            self.server_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
+        }
+        if !session.standby_address.trim().is_empty() {
+            self.network_standby = Some(session.standby_address.trim().to_string());
+        }
+        if let Ok(fp) = parse_fingerprint(&session.standby_fingerprint) {
+            self.network_standby_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
+        }
+        for id in &session.removed {
+            self.forget_account_computer(id);
+        }
+        for computer in &session.computers {
+            let id = pjdesk_proto::normalize_id(&computer.id);
+            let still = session.removed.iter().any(|r| pjdesk_proto::normalize_id(r) == id);
+            if !computer.hidden && !still {
+                self.account_removed.retain(|h| h != &id);
+            }
+        }
+        let first = !self.network_list_merged;
+        self.merge_computers(&session.computers, first);
+        self.merge_presence(&session.presence);
+        if !session.email.trim().is_empty() || !session.refresh.is_empty() {
+            self.network_list_merged = true;
+        }
+    }
+
+    /// Drops the pjdesk.com sign-in. The saved list, nicknames, stars, order,
+    /// and per-computer passwords stay on this computer. Syncing stops.
+    pub fn app_lock_for(&self, email: &str) -> Option<pjdesk_proto::applock::Verifier> {
+        let email = email.trim().to_lowercase();
+        if email.is_empty() || !self.app_lock_email.eq_ignore_ascii_case(&email) {
+            return None;
+        }
+        let stored = self.app_lock_verifier.as_deref()?;
+        let text = secure::reveal(stored)?;
+        serde_json::from_str(&text).ok()
+    }
+
+    pub fn write_app_lock(&mut self, email: &str, sealed: &str, updated: u64, verifier: Option<&pjdesk_proto::applock::Verifier>) {
+        self.app_lock_email = email.trim().to_lowercase();
+        self.app_lock_sealed = sealed.to_string();
+        self.app_lock_updated = updated;
+        self.app_lock_verifier = verifier.and_then(|v| serde_json::to_string(v).ok()).map(|text| secure::protect(&text));
+        if verifier.is_none() {
+            self.app_lock_fails = 0;
+            self.app_lock_until = 0;
+        }
+    }
+
+    pub fn clear_app_lock(&mut self) {
+        self.app_lock_email.clear();
+        self.app_lock_sealed.clear();
+        self.app_lock_updated = 0;
+        self.app_lock_verifier = None;
+        self.app_lock_fails = 0;
+        self.app_lock_until = 0;
+    }
+
+    pub fn note_app_lock_fail(&mut self, fails: u32, until: u64) {
+        self.app_lock_fails = fails;
+        self.app_lock_until = until;
+    }
+
+    pub fn clear_app_lock_fails(&mut self) {
+        self.app_lock_fails = 0;
+        self.app_lock_until = 0;
+    }
+
+    pub fn leave_network_sign_in(&mut self) {
+        self.network_email = None;
+        self.network_refresh = None;
+        self.network_access = None;
+        self.network_access_exp = 0;
+        self.network_list_merged = false;
+        self.password_vault_key = None;
+    }
+
+    pub(crate) fn password_vault_times(&self) -> &BTreeMap<String, u64> {
+        &self.password_vault_times
+    }
+
+    pub(crate) fn saved_password_ids(&self) -> Vec<String> {
+        self.saved_passwords.keys().cloned().collect()
+    }
+
+    /// Stores a password or a deletion at a known time, without treating the
+    /// write as a new local edit.
+    pub fn set_saved_password_at(&mut self, id: &str, password: &str, updated: u64) {
+        let id = pjdesk_proto::normalize_id(id);
+        if !pjdesk_proto::is_valid_id(&id) {
+            return;
+        }
+        if password.is_empty() {
+            self.saved_passwords.remove(&id);
+        } else {
+            self.saved_passwords.insert(id.clone(), secure::protect(password));
+        }
+        self.password_vault_times.insert(id, updated);
+    }
+
+    pub fn is_saved_hidden(&self, id: &str) -> bool {
+        let id = pjdesk_proto::normalize_id(id);
+        self.saved_hidden.iter().any(|h| h == &id)
+    }
+
+    /// Removes a computer from the local Saved list and remembers the hide.
+    /// The password on this computer is dropped with it. Nothing here is uploaded
+    /// until the caller syncs.
+    pub fn hide_saved(&mut self, id: &str) {
+        let id = pjdesk_proto::normalize_id(id);
+        if !pjdesk_proto::is_valid_id(&id) {
+            return;
+        }
+        self.address_book.retain(|e| e.id != id);
+        self.saved_passwords.remove(&id);
+        self.password_vault_times.insert(id.clone(), unix_now());
+        if !self.saved_hidden.iter().any(|h| h == &id) {
+            self.saved_hidden.push(id);
+        }
+    }
+
+    /// Drops a computer the account deleted. The password on this computer goes
+    /// with it. A later sign-in on that computer puts the row back.
+    pub fn forget_account_computer(&mut self, id: &str) {
+        let id = pjdesk_proto::normalize_id(id);
+        if !pjdesk_proto::is_valid_id(&id) {
+            return;
+        }
+        self.address_book.retain(|e| e.id != id);
+        self.saved_passwords.remove(&id);
+        self.password_vault_times.insert(id.clone(), unix_now());
+        self.settings.peers.remove(&id);
+        self.saved_hidden.retain(|h| h != &id);
+        if !self.account_removed.iter().any(|h| h == &id) {
+            self.account_removed.push(id);
+        }
+    }
+
+    /// Adds computers the account's server has seen, including ones saved
+    /// earlier with no name. A nickname already typed here is left as it is.
+    /// An empty hostname or user does not erase one already stored.
+    pub fn merge_presence(&mut self, rows: &[crate::network::HostPresence]) {
+        for row in rows {
+            let id = pjdesk_proto::normalize_id(&row.id);
+            if !pjdesk_proto::is_valid_id(&id) || self.account_removed.iter().any(|h| h == &id) {
+                continue;
+            }
+            let note = self.settings.peers.entry(id.clone()).or_default();
+            if !row.hostname.trim().is_empty() {
+                note.hostname = row.hostname.trim().to_string();
+            }
+            if !row.os_family.trim().is_empty() {
+                note.os_family = row.os_family.trim().to_string();
+            }
+            if !row.os_version.trim().is_empty() {
+                note.os_version = row.os_version.trim().to_string();
+            }
+            if !row.console_user.trim().is_empty() {
+                note.console_user = row.console_user.trim().to_string();
+            }
+            if let Some(name) = &row.display_name {
+                note.display_name = name.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+            }
+            if row.last_seen > note.last_seen {
+                note.last_seen = row.last_seen;
+            }
+            note.reported_online = row.online;
+            if self.is_saved_hidden(&id) || self.account_removed.iter().any(|h| h == &id) {
+                continue;
+            }
+            if !self.address_book.iter().any(|e| e.id == id) {
+                self.address_book.push(AddressEntry { id, alias: String::new(), ..Default::default() });
+            }
+        }
+    }
+
+    /// Adds the account's saved computers. Local passwords are left as they are.
+    ///
+    /// `prefer_account` is the first sign-in merge: the same computer keeps one
+    /// row, and the account's nickname wins when both sides have one. Later
+    /// refreshes leave a nickname typed on this computer alone.
+    pub fn merge_computers(&mut self, computers: &[crate::network::SavedComputer], prefer_account: bool) {
+        for computer in computers {
+            let id = pjdesk_proto::normalize_id(&computer.id);
+            if !pjdesk_proto::is_valid_id(&id) {
+                continue;
+            }
+            if self.account_removed.iter().any(|h| h == &id) {
+                continue;
+            }
+            if computer.hidden {
+                self.address_book.retain(|e| e.id != id);
+                if !self.saved_hidden.iter().any(|h| h == &id) {
+                    self.saved_hidden.push(id);
+                }
+                continue;
+            }
+            if prefer_account {
+                self.saved_hidden.retain(|h| h != &id);
+            }
+            if self.is_saved_hidden(&id) {
+                continue;
+            }
+            let note = self.settings.peers.entry(id.clone()).or_default();
+            if note.hostname.trim().is_empty() && !computer.hostname.trim().is_empty() {
+                note.hostname = computer.hostname.trim().to_string();
+            }
+            if note.os_family.is_empty() {
+                note.os_family = computer.os_family.clone();
+            }
+            if note.os_version.is_empty() {
+                note.os_version = computer.os_version.clone();
+            }
+            if !computer.display_name.trim().is_empty() {
+                note.display_name = computer.display_name.trim().to_string();
+            }
+            if let Some(starred) = computer.starred {
+                note.favorite = starred;
+            }
+            if let Some(position) = computer.position {
+                note.sort_order = position;
+            }
+            let known_host = note.hostname.clone();
+            let incoming = nickname_text(&computer.name, &id, &known_host);
+            if let Some(entry) = self.address_book.iter_mut().find(|e| e.id == id) {
+                entry.password = None;
+                let local = nickname_text(&entry.alias, &id, &known_host);
+                if prefer_account && !incoming.is_empty() {
+                    entry.alias = incoming;
+                } else if local.is_empty() {
+                    if !incoming.is_empty() {
+                        entry.alias = incoming;
+                    } else if same_id(&entry.alias, &id) {
+                        entry.alias.clear();
+                    }
+                }
+            } else if !incoming.is_empty() || !known_host.is_empty() || !computer.os_family.is_empty() || computer.starred.is_some()
+            {
+                self.address_book.push(AddressEntry {
+                    id: id.clone(),
+                    alias: incoming,
+                    password: None,
+                    ..Default::default()
+                });
+            }
+        }
     }
 
     /// Re-reads the device identity and pinned fingerprint from disk. The host
@@ -333,6 +923,7 @@ impl Config {
     /// the GUI from clobbering them when it writes settings.
     pub fn reload_identity_from_disk(&mut self) {
         if let Ok(disk) = Self::load() {
+            self.fill_peer_facts_from(&disk);
             if disk.device_id.is_some() {
                 self.device_id = disk.device_id;
             }
@@ -342,6 +933,20 @@ impl Config {
             if disk.server_fingerprint.is_some() {
                 self.server_fingerprint = disk.server_fingerprint;
             }
+            if disk.network_refresh.is_some() {
+                self.network_email = disk.network_email;
+                self.network_refresh = disk.network_refresh;
+                self.network_access = disk.network_access;
+                self.network_access_exp = disk.network_access_exp;
+                self.network_device_id = disk.network_device_id;
+                self.network_standby = disk.network_standby;
+                self.network_standby_fingerprint = disk.network_standby_fingerprint;
+            }
+            if self.network_key.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                if disk.network_key.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                    self.network_key = disk.network_key;
+                }
+            }
         }
     }
 
@@ -349,14 +954,9 @@ impl Config {
 
     /// Remembers (encrypted) or, with `None`, forgets a device's password.
     pub fn remember_password(&mut self, id: &str, password: Option<&str>) {
-        match password.filter(|p| !p.is_empty()) {
-            Some(pw) => {
-                self.saved_passwords.insert(id.to_string(), secure::protect(pw));
-            }
-            None => {
-                self.saved_passwords.remove(id);
-            }
-        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(1);
+        let password = password.unwrap_or("");
+        self.set_saved_password_at(id, password, now);
     }
 
     /// A remembered password for `id`. The encrypted local copy wins. A password
@@ -424,7 +1024,308 @@ mod tests {
         let old: PeerNote = serde_json::from_str(r#"{"favorite":true,"last_connected":3}"#).unwrap();
         assert!(old.favorite);
         assert!(old.os_family.is_empty());
+        assert!(old.hostname.is_empty());
         assert_eq!(old.view_mode, 0);
+    }
+
+    #[test]
+    fn a_nickname_is_not_the_id_or_the_hostname() {
+        assert_eq!(nickname_text("386 626 882", "386626882", "BEN-PC"), "");
+        assert_eq!(nickname_text("BEN-PC", "386626882", "ben-pc"), "");
+        assert_eq!(nickname_text("Front desk", "386626882", "BEN-PC"), "Front desk");
+        assert_eq!(nickname_text("  ", "386626882", "BEN-PC"), "");
+    }
+
+    #[test]
+    fn a_save_keeps_the_hostname_and_os_the_viewer_wrote() {
+        let mut memory = Config::default();
+        memory.settings.peers.insert(
+            "123456789".into(),
+            PeerNote { last_connected: 50, ..Default::default() },
+        );
+        let mut disk = Config::default();
+        disk.settings.peers.insert(
+            "123456789".into(),
+            PeerNote {
+                hostname: "BEN-PC".into(),
+                os_family: "windows".into(),
+                os_version: "11".into(),
+                last_connected: 10,
+                ..Default::default()
+            },
+        );
+        memory.fill_peer_facts_from(&disk);
+        let note = memory.settings.peers.get("123456789").unwrap();
+        assert_eq!(note.hostname, "BEN-PC");
+        assert_eq!(note.os_family, "windows");
+        assert_eq!(note.os_version, "11");
+        assert_eq!(note.last_connected, 50);
+
+        let mut typed = Config::default();
+        typed.settings.peers.insert(
+            "123456789".into(),
+            PeerNote { hostname: "OFFICE-PC".into(), os_family: "windows".into(), ..Default::default() },
+        );
+        let empty = Config::default();
+        typed.fill_peer_facts_from(&empty);
+        assert_eq!(typed.settings.peers.get("123456789").unwrap().hostname, "OFFICE-PC");
+
+        typed.take_peer_reports_from(&disk);
+        let note = typed.settings.peers.get("123456789").unwrap();
+        assert_eq!(note.hostname, "BEN-PC");
+        assert_eq!(note.os_version, "11");
+    }
+
+    #[test]
+    fn merge_keeps_a_nickname_and_fills_an_empty_hostname() {
+        let mut c = Config::default();
+        c.address_book = vec![AddressEntry { id: "123456789".into(), alias: "Front desk".into(), ..Default::default() }];
+        c.merge_computers(
+            &[crate::network::SavedComputer {
+                id: "123456789".into(),
+                name: "Other name".into(),
+                hostname: "OFFICE-PC".into(),
+                os_family: "windows".into(),
+                os_version: "11".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        assert_eq!(c.address_book[0].alias, "Front desk");
+        assert_eq!(c.settings.peers.get("123456789").unwrap().hostname, "OFFICE-PC");
+
+        let mut fresh = Config::default();
+        fresh.merge_computers(
+            &[crate::network::SavedComputer {
+                id: "386626882".into(),
+                name: "386 626 882".into(),
+                hostname: "BEN-PC".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        assert!(fresh.address_book.iter().all(|e| e.alias.is_empty()));
+        assert_eq!(fresh.settings.peers.get("386626882").unwrap().hostname, "BEN-PC");
+    }
+
+    #[test]
+    fn a_fresh_install_has_no_server_until_sign_in() {
+        let fresh = Config::default();
+        assert!(fresh.effective_server().is_empty());
+        let mut registered = Config::default();
+        registered.device_id = Some("123456789".into());
+        assert_eq!(registered.effective_server(), pjdesk_proto::LEGACY_REGISTERED_SERVER);
+        registered.server = Some("office.example:21200".into());
+        assert_eq!(registered.effective_server(), "office.example:21200");
+    }
+
+    #[test]
+    fn save_password_stays_on_this_computer() {
+        let mut c = Config::default();
+        c.remember_password("123456789", Some("correct horse"));
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("correct horse"));
+        assert!(json.contains("dpapi:") || json.contains("plain:"));
+        c.merge_computers(
+            &[crate::network::SavedComputer {
+                id: "123456789".into(),
+                name: "Office".into(),
+                hostname: String::new(),
+                os_family: "windows".into(),
+                os_version: "11".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        assert_eq!(c.saved_password("123456789").as_deref(), Some("correct horse"));
+        assert!(c.address_book.iter().all(|e| e.password.is_none()));
+    }
+
+    #[test]
+    fn first_sign_in_merges_local_computers_and_prefers_the_account_nickname() {
+        let mut c = Config::default();
+        c.remember_password("111111111", Some("local-secret"));
+        c.address_book = vec![
+            AddressEntry { id: "111111111".into(), alias: "Local name".into(), ..Default::default() },
+            AddressEntry { id: "222222222".into(), alias: "Only here".into(), ..Default::default() },
+        ];
+        c.settings.peers.insert("222222222".into(), PeerNote { favorite: true, sort_order: 20, ..Default::default() });
+        c.merge_computers(
+            &[
+                crate::network::SavedComputer {
+                    id: "111111111".into(),
+                    name: "Account name".into(),
+                    hostname: "CABINDESK".into(),
+                    os_family: "windows".into(),
+                    os_version: "11".into(),
+                    display_name: String::new(),
+                    starred: Some(true),
+                    position: Some(5),
+                    hidden: false,
+                },
+                crate::network::SavedComputer {
+                    id: "333333333".into(),
+                    name: "Pixel".into(),
+                    hostname: "Pixel 11".into(),
+                    os_family: "android".into(),
+                    os_version: "16".into(),
+                    ..Default::default()
+                },
+                crate::network::SavedComputer {
+                    id: "444444444".into(),
+                    name: "Old".into(),
+                    hidden: true,
+                    ..Default::default()
+                },
+            ],
+            true,
+        );
+        assert_eq!(c.address_book.iter().find(|e| e.id == "111111111").unwrap().alias, "Account name");
+        assert_eq!(c.address_book.iter().find(|e| e.id == "222222222").unwrap().alias, "Only here");
+        assert_eq!(c.address_book.iter().find(|e| e.id == "333333333").unwrap().alias, "Pixel");
+        assert!(c.address_book.iter().all(|e| e.id != "444444444"));
+        assert!(c.is_saved_hidden("444444444"));
+        assert_eq!(c.settings.peers.get("111111111").unwrap().favorite, true);
+        assert_eq!(c.settings.peers.get("111111111").unwrap().sort_order, 5);
+        assert_eq!(c.settings.peers.get("222222222").unwrap().sort_order, 20);
+        assert_eq!(c.saved_password("111111111").as_deref(), Some("local-secret"));
+        assert!(c.address_book.iter().all(|e| e.password.is_none()));
+
+        let mut later = c.clone();
+        later.address_book.iter_mut().find(|e| e.id == "111111111").unwrap().alias = "Typed here".into();
+        later.merge_computers(
+            &[crate::network::SavedComputer {
+                id: "111111111".into(),
+                name: "Account name".into(),
+                hostname: "CABINDESK".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        assert_eq!(later.address_book.iter().find(|e| e.id == "111111111").unwrap().alias, "Typed here");
+
+        c.leave_network_sign_in();
+        assert!(c.network_email.is_none());
+        assert!(c.network_refresh.is_none());
+        assert!(!c.network_list_merged);
+        assert_eq!(c.address_book.len(), 3);
+        assert_eq!(c.saved_password("111111111").as_deref(), Some("local-secret"));
+        assert!(c.settings.peers.get("222222222").unwrap().favorite);
+    }
+
+    #[test]
+    fn a_local_remove_stays_and_an_account_delete_does_not_come_back() {
+        let mut c = Config::default();
+        c.address_book = vec![AddressEntry { id: "333333333".into(), alias: "Pixel".into(), ..Default::default() }];
+        c.remember_password("333333333", Some("phone-secret"));
+        c.remember_password("692996394", Some("desk-secret"));
+        c.settings.peers.insert("692996394".into(), PeerNote { hostname: "BENLENOVODESK".into(), ..Default::default() });
+        c.hide_saved("333333333");
+        c.merge_computers(
+            &[crate::network::SavedComputer {
+                id: "333333333".into(),
+                name: "Pixel".into(),
+                hostname: "Pixel 11".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        assert!(c.is_saved_hidden("333333333"));
+        assert!(c.address_book.iter().all(|e| e.id != "333333333"));
+        assert_eq!(c.saved_password("333333333"), None);
+        c.forget_account_computer("692996394");
+        c.merge_presence(&[crate::network::HostPresence {
+            id: "692996394".into(),
+            hostname: "BENLENOVODESK".into(),
+            os_family: "windows".into(),
+            os_version: "11".into(),
+            console_user: String::new(),
+            display_name: None,
+            last_seen: 50,
+            online: false,
+        }]);
+        assert!(c.address_book.iter().all(|e| e.id != "692996394"));
+        assert!(c.settings.peers.get("692996394").is_none());
+        assert_eq!(c.saved_password("692996394"), None);
+    }
+
+    #[test]
+    fn presence_fills_a_blank_row_and_keeps_the_nickname_and_user() {
+        let mut c = Config::default();
+        c.address_book = vec![AddressEntry { id: "386626882".into(), alias: "Pixel".into(), ..Default::default() }];
+        c.settings.peers.insert(
+            "386626882".into(),
+            PeerNote { console_user: "Ben".into(), hostname: "Pixel 11".into(), ..Default::default() },
+        );
+        c.merge_presence(&[
+            crate::network::HostPresence {
+                id: "386 626 882".into(),
+                hostname: String::new(),
+                os_family: "android".into(),
+                os_version: "16".into(),
+                console_user: String::new(),
+                display_name: Some("Pocket".into()),
+                last_seen: 20,
+                online: true,
+            },
+            crate::network::HostPresence {
+                id: "692996394".into(),
+                hostname: "BENLENOVODESK".into(),
+                os_family: "windows".into(),
+                os_version: "11".into(),
+                console_user: "SPADER\\Ben".into(),
+                display_name: None,
+                last_seen: 50,
+                online: false,
+            },
+        ]);
+        assert_eq!(c.address_book.iter().find(|e| e.id == "386626882").unwrap().alias, "Pixel");
+        let pixel = c.settings.peers.get("386626882").unwrap();
+        assert_eq!(pixel.hostname, "Pixel 11");
+        assert_eq!(pixel.display_name, "Pocket");
+        assert_eq!(pixel.console_user, "Ben");
+        assert_eq!(pixel.os_family, "android");
+        assert!(pixel.reported_online);
+        let desk = c.settings.peers.get("692996394").unwrap();
+        assert_eq!(desk.hostname, "BENLENOVODESK");
+        assert_eq!(desk.console_user, "SPADER\\Ben");
+        assert!(c.address_book.iter().any(|e| e.id == "692996394" && e.alias.is_empty()));
+    }
+
+    #[test]
+    fn a_temporary_sign_in_does_not_write_the_account() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-temp-sign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client.json");
+        let mut before = Config::default();
+        before.address_book =
+            vec![AddressEntry { id: "111111111".into(), alias: "Friend".into(), ..Default::default() }];
+        before.server = Some("friend.example:21200".into());
+        before.save_to(&path).unwrap();
+
+        let mut live = before.clone();
+        live.ephemeral_network = true;
+        live.network_email = Some("ben@spader.us".into());
+        live.network_refresh = Some("plain:session-token".into());
+        live.network_access = Some("plain:access-token".into());
+        live.address_book.push(AddressEntry { id: "692996394".into(), alias: "Office".into(), ..Default::default() });
+        live.server = Some("pjdesk.spader.us:21200".into());
+        live.device_id = Some("386626882".into());
+        live.save_to(&path).unwrap();
+
+        let disk = Config::load_from(&path).unwrap();
+        assert!(disk.network_email.is_none());
+        assert!(disk.network_refresh.is_none());
+        assert!(disk.network_access.is_none());
+        assert_eq!(disk.address_book.len(), 1);
+        assert_eq!(disk.address_book[0].alias, "Friend");
+        assert_eq!(disk.server.as_deref(), Some("friend.example:21200"));
+        assert_eq!(disk.device_id.as_deref(), Some("386626882"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("session-token"));
+        assert!(!text.contains("ben@spader.us"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

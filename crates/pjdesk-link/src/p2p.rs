@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use pjdesk_proto::signal::SessionId;
 use pjdesk_proto::tls::{self, Fingerprint, PinnedCertVerifier, TlsIdentity};
 use pjdesk_proto::udp::{self, Role, UdpMsg};
-use pjdesk_proto::{ALPN_PEER, PEER_SERVER_NAME};
+use pjdesk_proto::{ALPN_PEER, DIRECT_PORT, PEER_SERVER_NAME};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::debug;
@@ -104,14 +104,98 @@ fn local_ip_toward(target: SocketAddr) -> Option<IpAddr> {
     (!ip.is_unspecified()).then_some(ip)
 }
 
-/// All addresses worth trying for a peer: its public address plus its LAN
-/// addresses, without duplicates.
-pub fn candidates(public: SocketAddr, local: &[SocketAddr]) -> Vec<SocketAddr> {
-    let mut out = vec![public];
-    for addr in local {
-        if !out.contains(addr) && addr.is_ipv4() && !addr.ip().is_unspecified() {
-            out.push(*addr);
+/// True for a private or link-local address (a same-LAN candidate).
+pub fn is_lan_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            (octets[0] & 0xfe) == 0xfc || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
         }
+    }
+}
+
+/// All addresses worth trying for a peer. LAN addresses come first so two
+/// computers on the same network do not hairpin out through the public IP.
+pub fn candidates(public: SocketAddr, local: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut lan = Vec::new();
+    let mut other = Vec::new();
+    for addr in local {
+        if *addr == public || !addr.is_ipv4() || addr.ip().is_unspecified() || addr.ip().is_loopback() {
+            continue;
+        }
+        if is_lan_ip(addr.ip()) {
+            if !lan.contains(addr) {
+                lan.push(*addr);
+            }
+        } else if !other.contains(addr) {
+            other.push(*addr);
+        }
+    }
+    let mut out = Vec::new();
+    // When the server is on the same LAN, the address it observed is the one
+    // that already reaches this computer. Try it before other interfaces
+    // (a VPN, Hyper-V) that also look private.
+    if is_lan_ip(public.ip()) && public.is_ipv4() && !public.ip().is_unspecified() && !public.ip().is_loopback() {
+        out.push(public);
+    }
+    for addr in lan {
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    if !out.contains(&public) {
+        out.push(public);
+    }
+    for addr in other {
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
+}
+
+/// LAN addresses to try on the host's fixed direct port (UDP 21201).
+///
+/// The punched ephemeral port is a different socket. Windows Firewall often
+/// drops inbound UDP to that port even when two computers are on the same
+/// LAN. The host already listens on 21201 when direct connections are allowed,
+/// and that port can have an explicit firewall rule.
+pub fn direct_port_candidates(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for addr in candidates {
+        if !is_lan_ip(addr.ip()) || addr.ip().is_unspecified() || addr.ip().is_loopback() {
+            continue;
+        }
+        let direct = SocketAddr::new(addr.ip(), DIRECT_PORT);
+        if direct != *addr && !out.contains(&direct) {
+            out.push(direct);
+        }
+    }
+    out
+}
+
+/// Dial order for [`connect_to_host`]. Direct-port LAN addresses go first,
+/// with no delay. Ephemeral LAN addresses wait briefly so a punch can open
+/// the firewall. A public address waits longer so a same-LAN path wins.
+pub fn dial_order(candidates: &[SocketAddr]) -> Vec<(SocketAddr, Duration)> {
+    let mut out = Vec::new();
+    for addr in direct_port_candidates(candidates) {
+        out.push((addr, Duration::ZERO));
+    }
+    let any_lan = candidates.iter().any(|addr| is_lan_ip(addr.ip())) || !out.is_empty();
+    for addr in candidates {
+        if out.iter().any(|(have, _)| have == addr) {
+            continue;
+        }
+        let delay = if any_lan && !is_lan_ip(addr.ip()) {
+            Duration::from_millis(400)
+        } else if is_lan_ip(addr.ip()) {
+            Duration::from_millis(200)
+        } else {
+            Duration::ZERO
+        };
+        out.push((*addr, delay));
     }
     out
 }
@@ -127,10 +211,16 @@ pub fn spawn_punching(
         let msg = udp::encode(&UdpMsg::Punch { session_id });
         let end = tokio::time::Instant::now() + duration;
         let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let mut logged = false;
         while tokio::time::Instant::now() < end {
             tick.tick().await;
             for target in &targets {
-                let _ = socket.send_to(&msg, target);
+                if let Err(e) = socket.send_to(&msg, target) {
+                    if !logged {
+                        logged = true;
+                        tracing::info!("Hole punch to {target} was not sent: {e}");
+                    }
+                }
             }
         }
     })
@@ -145,6 +235,12 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     t.initial_rtt(Duration::from_millis(100));
     t.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
     t.send_window(16 * 1024 * 1024);
+    // One QUIC packet per UDP datagram. Segmentation offload batches several
+    // packets into one send, and the server relay then forwards that blob as a
+    // single datagram the other side cannot decode. Handshake packets are small
+    // enough to survive; the picture after the password is not.
+    t.enable_segmentation_offload(false);
+    t.initial_mtu(1200);
     Arc::new(t)
 }
 
@@ -209,8 +305,9 @@ pub enum LinkPath {
 impl fmt::Display for LinkPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LinkPath::Direct(addr) => write!(f, "direct P2P to {addr}"),
-            LinkPath::Relay(addr) => write!(f, "relayed via {addr}"),
+            LinkPath::Direct(addr) if is_lan_ip(addr.ip()) => write!(f, "LAN ({addr})"),
+            LinkPath::Direct(addr) => write!(f, "Internet ({addr})"),
+            LinkPath::Relay(addr) => write!(f, "Internet, relayed via {addr}"),
         }
     }
 }
@@ -223,10 +320,16 @@ pub async fn connect_to_host(
     force_relay: bool,
 ) -> Result<(quinn::Connection, LinkPath)> {
     if !force_relay && !candidates.is_empty() {
+        let order = dial_order(candidates);
+        let listed = order.iter().map(|(addr, _)| addr.to_string()).collect::<Vec<_>>().join(", ");
+        tracing::info!("Trying a direct connection: {listed}");
         let mut attempts = JoinSet::new();
-        for &addr in candidates {
+        for (addr, delay) in order {
             let endpoint = endpoint.clone();
             attempts.spawn(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 let connection = endpoint.connect(addr, PEER_SERVER_NAME)?.await?;
                 Ok::<_, anyhow::Error>((connection, addr))
             });
@@ -235,7 +338,7 @@ pub async fn connect_to_host(
             while let Some(result) = attempts.join_next().await {
                 match result {
                     Ok(Ok(found)) => return Some(found),
-                    Ok(Err(e)) => debug!("direct attempt failed: {e:#}"),
+                    Ok(Err(e)) => tracing::info!("Direct attempt failed: {e:#}"),
                     Err(_) => {}
                 }
             }
@@ -246,9 +349,11 @@ pub async fn connect_to_host(
         .flatten();
         attempts.abort_all();
         if let Some((connection, addr)) = winner {
+            let via = if addr.port() == DIRECT_PORT { "direct port" } else { "punched port" };
+            tracing::info!("Direct connection to {addr} ({via})");
             return Ok((connection, LinkPath::Direct(addr)));
         }
-        tracing::info!("No direct route to the host (NAT/firewall); using the server's relay");
+        tracing::info!("No direct route to the host (tried {listed}); using the server's relay");
     }
 
     let connecting = endpoint.connect(relay, PEER_SERVER_NAME)?;
@@ -256,4 +361,44 @@ pub async fn connect_to_host(
         .await
         .map_err(|_| anyhow!("could not reach the host, even through the relay"))??;
     Ok((connection, LinkPath::Relay(relay)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+
+    #[test]
+    fn lan_candidates_are_tried_before_the_public_address() {
+        let public = "203.0.113.5:21116".parse().unwrap();
+        let local = vec!["192.168.1.20:9".parse().unwrap(), "10.0.0.4:9".parse().unwrap(), public];
+        let got = candidates(public, &local);
+        assert!(is_lan_ip(got[0].ip()));
+        assert!(is_lan_ip(got[1].ip()));
+        assert_eq!(*got.last().unwrap(), public);
+    }
+
+    #[test]
+    fn same_lan_is_also_tried_on_udp_21201() {
+        let public = "192.168.0.20:40000".parse().unwrap();
+        let local = vec!["192.168.0.20:40000".parse().unwrap(), "10.1.1.5:40001".parse().unwrap()];
+        let got = candidates(public, &local);
+        let order = dial_order(&got);
+        assert_eq!(order[0].0, "192.168.0.20:21201".parse().unwrap());
+        assert!(order[0].1.is_zero());
+        assert!(order.iter().any(|(addr, _)| *addr == "10.1.1.5:21201".parse().unwrap()));
+        assert!(order.iter().any(|(addr, delay)| *addr == public && !delay.is_zero()));
+        let wan: SocketAddr = "203.0.113.8:9".parse().unwrap();
+        assert!(direct_port_candidates(&[wan]).is_empty());
+    }
+
+    #[test]
+    fn the_path_says_lan_or_internet() {
+        let lan: SocketAddr = "192.168.1.9:1".parse().unwrap();
+        let wan: SocketAddr = "203.0.113.8:1".parse().unwrap();
+        assert_eq!(LinkPath::Direct(lan).to_string(), "LAN (192.168.1.9:1)");
+        assert_eq!(LinkPath::Direct(wan).to_string(), "Internet (203.0.113.8:1)");
+        assert_eq!(LinkPath::Relay(wan).to_string(), "Internet, relayed via 203.0.113.8:1");
+    }
 }

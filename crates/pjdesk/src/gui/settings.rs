@@ -25,6 +25,7 @@ pub struct SettingsDraft {
     server: String,
     start_with_windows: bool,
     remember_passwords: bool,
+    temp_idle_minutes: u32,
     view_only: bool,
     use_permanent: bool,
     permanent_password: String,
@@ -44,11 +45,21 @@ pub struct SettingsDraft {
     theme: String,
     approval: String,
     receive_dir: String,
+    computer_name: String,
     allow_direct: bool,
+    discover_lan: bool,
     tunnel_ports: String,
 }
 
 impl SettingsDraft {
+    pub(super) fn show_about(&mut self) {
+        self.tab = Tab::About;
+    }
+
+    pub(super) fn show_security(&mut self) {
+        self.tab = Tab::Security;
+    }
+
     /// `update_task` is the cached probe result. `None` means "still checking"
     /// — this function does not ask Windows.
     pub fn from_config(cfg: &Config, update_task: Option<bool>) -> Self {
@@ -58,6 +69,7 @@ impl SettingsDraft {
             server: cfg.server.clone().unwrap_or_default(),
             start_with_windows: s.start_with_windows,
             remember_passwords: s.remember_passwords,
+            temp_idle_minutes: s.temp_idle_minutes.clamp(1, 24 * 60),
             view_only: s.view_only,
             use_permanent: s.permanent_password.is_some(),
             permanent_password: s.permanent_password().unwrap_or_default(),
@@ -75,7 +87,9 @@ impl SettingsDraft {
             theme: normalize_theme(&s.theme),
             approval: if s.approval == "unattended" { "unattended".into() } else { "prompt".into() },
             receive_dir: s.receive_dir.clone(),
+            computer_name: crate::hostfacts::read_computer_name(),
             allow_direct: s.allow_direct,
+            discover_lan: s.discover_lan,
             tunnel_ports: s.tunnel_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
         }
     }
@@ -83,6 +97,15 @@ impl SettingsDraft {
     #[cfg(feature = "ui-shots")]
     pub(crate) fn preview_security(&mut self) {
         self.tab = Tab::Security;
+    }
+
+    #[cfg(feature = "ui-shots")]
+    pub(crate) fn preview_network(&mut self) {
+        self.tab = Tab::Network;
+    }
+
+    pub(crate) fn set_server_text(&mut self, server: &str) {
+        self.server = server.to_string();
     }
 }
 
@@ -171,14 +194,17 @@ impl App {
                                             ui.set_min_width(ui.available_width());
                                             match self.settings.tab {
                                                 Tab::General => general_tab(ui, &mut self.settings),
-                                                Tab::Security => security_tab(
-                                                    ui,
-                                                    &mut self.settings,
-                                                    self.scm_installed,
-                                                    self.scm_running,
-                                                    self.scm_known,
-                                                ),
-                                                Tab::Network => network_tab(ui, &mut self.settings),
+                                                Tab::Security => {
+                                                    self.app_lock_settings(ui);
+                                                    security_tab(
+                                                        ui,
+                                                        &mut self.settings,
+                                                        self.scm_installed,
+                                                        self.scm_running,
+                                                        self.scm_known,
+                                                    );
+                                                }
+                                                Tab::Network => self.network_tab(ui),
                                                 Tab::Display => display_tab(ui, &mut self.settings),
                                                 Tab::Account => self.account_tab(ui),
                                                 Tab::About => about_tab(ui),
@@ -208,37 +234,30 @@ impl App {
 
     fn account_tab(&mut self, ui: &mut egui::Ui) {
         widgets::heading(ui, "PJDESK ACCOUNT");
-        match self.cfg.account.clone() {
-            Some(acct) => {
-                let who = if acct.display_name.is_empty() { acct.username.clone() } else { acct.display_name.clone() };
-                ui.label(RichText::new(who).strong().size(16.0));
-                ui.label(widgets::muted(ui, &format!("Signed in as {}", acct.username)));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Sign out").clicked() {
-                        self.sign_out();
-                    }
-                    if ui.button("Change password").clicked() {
-                        self.password_notice =
-                            "Choose a new password: at least 12 characters, with upper and lower case, a digit, and a symbol."
-                                .into();
-                        self.show_change = true;
-                    }
-                });
+        let email = self.cfg.network_email.clone().unwrap_or_default();
+        if email.trim().is_empty() {
+            ui.label("Sign in with your pjdesk.com account.");
+            ui.add_space(8.0);
+            if ui.button("Sign in").clicked() {
+                self.show_net_sign_in = true;
+                self.show_settings = false;
             }
-            None => {
-                ui.label("Sign in to sync your address book with the server you run.");
-                ui.add_space(8.0);
-                if ui.button("Sign in").clicked() {
-                    self.show_login = true;
-                    self.status.clear();
+        } else {
+            ui.label(RichText::new(email.trim()).strong().size(16.0));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Manage account").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab("https://pjdesk.com/account"));
                 }
-            }
+                if ui.button("Sign out").clicked() {
+                    self.sign_out_network();
+                }
+            });
         }
         ui.add_space(8.0);
         ui.label(widgets::muted(
             ui,
-            "Account passwords are checked by your server (12 characters, mixed case, a digit, a symbol). That rule does not apply to the permanent password for this computer.",
+            "The account is managed at pjdesk.com. Passwords for individual computers stay on this computer.",
         ));
     }
 
@@ -283,6 +302,7 @@ impl App {
         let s = &mut self.cfg.settings;
         s.start_with_windows = d.start_with_windows;
         s.remember_passwords = d.remember_passwords;
+        s.temp_idle_minutes = d.temp_idle_minutes.clamp(1, 24 * 60);
         s.view_only = d.view_only;
         s.fps = d.fps.clamp(1, 120);
         s.bitrate_kbps = d.bitrate_kbps.clamp(200, 50_000);
@@ -292,6 +312,7 @@ impl App {
         s.approval = if d.approval == "unattended" { "unattended".into() } else { "prompt".into() };
         s.receive_dir = d.receive_dir.trim().to_string();
         s.allow_direct = d.allow_direct;
+        s.discover_lan = d.discover_lan;
         s.tunnel_ports = ports;
         if d.use_permanent {
             s.set_permanent_password(Some(d.permanent_password.trim()));
@@ -309,6 +330,7 @@ impl App {
             || old.approval != s.approval
             || old.receive_dir != s.receive_dir
             || old.allow_direct != s.allow_direct
+            || old.discover_lan != s.discover_lan
             || old.tunnel_ports != s.tunnel_ports;
         theme::apply(&self.egui_ctx(), &theme_name);
 
@@ -330,6 +352,10 @@ impl App {
             self.toast.show("Approve the administrator prompt to change automatic updates");
         }
 
+        if let Err(e) = crate::hostfacts::write_computer_name(d.computer_name.trim()) {
+            self.status = format!("Could not save this computer's name: {e}");
+        }
+
         self.save_cfg();
 
         if server_changed && self.scm_known && self.scm_installed {
@@ -338,6 +364,8 @@ impl App {
             }
         }
 
+        crate::host::direct::set_lan_discovery(self.cfg.settings.discover_lan);
+        self.ensure_lan_watch();
         if server_changed || host_changed {
             let running = if self.scm_known { self.scm_running } else { self.engine.service_running };
             let cfg = self.cfg.clone();
@@ -398,22 +426,24 @@ fn nav(ui: &mut egui::Ui, tab: &mut Tab) {
     ] {
         let selected = *tab == which;
         let p = theme::paint(ui);
-        let text = if selected {
-            RichText::new(label).strong().color(p.text)
-        } else {
-            RichText::new(label).color(p.muted)
-        };
+        let text =
+            if selected { RichText::new(label).strong().color(p.text) } else { RichText::new(label).color(p.muted) };
         let fill = if selected { p.accent.linear_multiply(0.18) } else { Color32::TRANSPARENT };
-        if ui
-            .add_sized([ui.available_width(), 36.0], egui::Button::new(text).fill(fill).frame(selected))
-            .clicked()
-        {
+        if ui.add_sized([ui.available_width(), 36.0], egui::Button::new(text).fill(fill).frame(selected)).clicked() {
             *tab = which;
         }
     }
 }
 
 fn general_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
+    widgets::heading(ui, "THIS COMPUTER");
+    ui.label("This computer's name");
+    widgets::text_field(ui, &mut d.computer_name, "Leave blank to use the Windows name", false);
+    ui.label(widgets::muted(
+        ui,
+        "Shown in Saved computers on every signed-in computer. A nickname typed in Saved computers replaces it on that screen only.",
+    ));
+    ui.add_space(12.0);
     widgets::heading(ui, "APPEARANCE");
     ui.label(widgets::muted(ui, "Match Windows follows the Windows app theme."));
     let before = d.theme.clone();
@@ -432,6 +462,9 @@ fn general_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
         ui,
         "When this is on, the password prompt starts with Remember password checked. The password is saved only after the other computer accepts it.",
     ));
+    ui.add_space(8.0);
+    ui.label("Sign out a temporary sign-in after this many minutes with no PJDesk activity");
+    ui.add(egui::DragValue::new(&mut d.temp_idle_minutes).range(1..=24 * 60).suffix(" min"));
     ui.label(widgets::muted(
         ui,
         "For always-on access (even at the login screen), install the background service on the Security page.",
@@ -442,7 +475,7 @@ fn general_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
     ui.horizontal(|ui| {
         if !d.auto_update_known && !d.auto_update_touched {
             widgets::spinner(ui, theme::paint(ui).muted);
-            ui.label(widgets::muted(ui, "Checking the update schedule…"));
+            ui.label(widgets::muted(ui, "Checking automatic updates…"));
         }
     });
     if widgets::checkbox(ui, &mut d.auto_update, "Install updates automatically (checks every 30 minutes)") {
@@ -451,8 +484,10 @@ fn general_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
     }
     ui.label(widgets::muted(
         ui,
-        "Downloads new versions from the project's GitHub releases, verifies them, and installs silently. Changing this asks for Administrator rights.",
+        "The background service checks every 30 minutes and installs the update itself. PJDesk does not register a scheduled task. Changing this asks for Administrator rights.",
     ));
+    ui.add_space(8.0);
+    update_now_button(ui);
 }
 
 fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, running: bool, known: bool) {
@@ -476,8 +511,11 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
     ui.add_space(12.0);
     widgets::heading(ui, "INCOMING FILES");
     widgets::field_label(ui, "Folder for files people send you");
-    widgets::text_field(ui, &mut d.receive_dir, "Empty refuses incoming files", false);
-    ui.label(widgets::muted(ui, "Leave this empty to refuse file transfer. Files are never executed."));
+    widgets::text_field(ui, &mut d.receive_dir, "Empty uses this computer's Desktop", false);
+    ui.label(widgets::muted(
+        ui,
+        "Files dropped on a remote session are saved here. Leave this empty to use the Desktop. Type Downloads to use that folder. Files are never executed.",
+    ));
 
     ui.add_space(12.0);
     widgets::heading(ui, "BACKGROUND SERVICE");
@@ -488,7 +526,11 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
             ui.label(widgets::muted(ui, "Checking the background service…"));
         });
     } else if installed {
-        widgets::status_dot(ui, if running { p.ok } else { p.warn }, if running { "Installed and running" } else { "Installed, not running" });
+        widgets::status_dot(
+            ui,
+            if running { p.ok } else { p.warn },
+            if running { "Installed and running" } else { "Installed, not running" },
+        );
     } else {
         widgets::status_dot(ui, p.muted, "Not installed");
     }
@@ -548,22 +590,74 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
     }
 }
 
-fn network_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
-    widgets::heading(ui, "YOUR PJDESK SERVER");
-    widgets::field_label(ui, "Address (host or host:port)");
-    widgets::text_field(ui, &mut d.server, "desk.example.com  or  192.168.1.10", false);
-    ui.label(widgets::muted(
-        ui,
-        "This is the self-hosted PJDesk server your computers connect through. The default port is 21200.",
-    ));
+impl App {
+    fn network_tab(&mut self, ui: &mut egui::Ui) {
+        let mut do_import = false;
+        let mut do_export = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("ID/RELAY SERVER").color(theme::paint(ui).muted).size(11.5).strong());
+            ui.add_space(8.0);
+            if ui
+                .button("Import server config")
+                .on_hover_text("Read a network key from the clipboard and apply it")
+                .clicked()
+            {
+                do_import = true;
+            }
+            if ui.button("Export server config").on_hover_text("Copy this computer's network key").clicked() {
+                do_export = true;
+            }
+        });
+        ui.add_space(4.0);
+        widgets::field_label(ui, "Address (host or host:port)");
+        widgets::text_field(ui, &mut self.settings.server, "desk.example.com  or  192.168.1.10", false);
+        let pinned = self.cfg.server_fingerprint.clone().unwrap_or_default();
+        ui.label(widgets::muted(
+            ui,
+            if pinned.is_empty() {
+                "Filled in when you import a server config or sign in. The default port is 21200."
+            } else {
+                "The pinned key is saved with the server. The default port is 21200."
+            },
+        ));
+        if !pinned.is_empty() {
+            ui.add_space(6.0);
+            widgets::field_label(ui, "Key");
+            ui.label(RichText::new(&pinned).monospace().size(13.0));
+        }
+        ui.add_space(6.0);
+        ui.label(widgets::muted(
+            ui,
+            "Import reads a network key from the clipboard and applies it. Export copies this computer's network key. The text is encrypted, so it does not show the server address.",
+        ));
 
-    ui.add_space(12.0);
-    widgets::heading(ui, "DIRECT CONNECTIONS");
-    widgets::checkbox(ui, &mut d.allow_direct, "Allow direct IP connections and announce this computer on the local network");
-    ui.add_space(8.0);
-    widgets::field_label(ui, "Ports a remote session may forward");
-    widgets::text_field(ui, &mut d.tunnel_ports, "22, 3389", false);
-    ui.label(widgets::muted(ui, "Comma-separated. Empty means no ports. Forwarding stays on this computer unless the server policy says otherwise."));
+        ui.add_space(12.0);
+        widgets::heading(ui, "DIRECT CONNECTIONS");
+        widgets::checkbox(ui, &mut self.settings.allow_direct, "Allow direct IP connections");
+        ui.add_space(6.0);
+        widgets::checkbox(
+            ui,
+            &mut self.settings.discover_lan,
+            "Let other computers on this network find this one",
+        );
+        ui.label(widgets::muted(
+            ui,
+            "On unless you uncheck it. PJDesk only answers on a private network. The announcement is the name and ID, never a password. Direct connections must also be allowed for someone to connect.",
+        ));
+        ui.add_space(8.0);
+        widgets::field_label(ui, "Ports a remote session may forward");
+        widgets::text_field(ui, &mut self.settings.tunnel_ports, "22, 3389", false);
+        ui.label(widgets::muted(
+            ui,
+            "Comma-separated. Empty means no ports. Forwarding stays on this computer unless the server policy says otherwise.",
+        ));
+        if do_import {
+            self.import_server_config();
+        }
+        if do_export {
+            self.export_server_config();
+        }
+    }
 }
 
 fn display_tab(ui: &mut egui::Ui, d: &mut SettingsDraft) {
@@ -598,7 +692,26 @@ fn about_tab(ui: &mut egui::Ui) {
         ui.hyperlink_to("Source on GitHub", "https://github.com/whoamib2/pjdesk");
     });
     ui.add_space(12.0);
+    update_now_button(ui);
+    ui.add_space(8.0);
     ui.label(widgets::muted(ui, "Keyboard: Enter connects, Ctrl+, opens Settings."));
+}
+
+/// Settings → General → Updates, and Settings → About. Also on the tray menu.
+fn update_now_button(ui: &mut egui::Ui) {
+    let note = crate::client_update::note();
+    if !note.is_empty() {
+        ui.label(RichText::new(&note).color(theme::paint(ui).text));
+        ui.add_space(4.0);
+    }
+    let busy = crate::client_update::running();
+    if ui.add_enabled(!busy, egui::Button::new("Check for updates now")).clicked() {
+        crate::client_update::start();
+    }
+    ui.label(widgets::muted(
+        ui,
+        "Downloads the latest release, checks it, installs it, and opens PJDesk again.",
+    ));
 }
 
 fn parse_ports(text: &str) -> Result<Vec<u16>, String> {

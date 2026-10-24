@@ -7,6 +7,7 @@
 #[cfg_attr(not(windows), allow(dead_code))]
 pub enum Action {
     Show,
+    Update,
     Quit,
 }
 
@@ -30,6 +31,7 @@ mod imp {
     pub struct Tray {
         _icon: TrayIcon,
         show_id: String,
+        update_id: String,
         quit_id: String,
     }
 
@@ -40,10 +42,13 @@ mod imp {
 
             let menu = Menu::new();
             let show = MenuItem::new("Show PJDesk", true, None);
+            let update = MenuItem::new("Check for updates now", true, None);
             let quit = MenuItem::new("Quit PJDesk", true, None);
             menu.append(&show).ok()?;
+            menu.append(&update).ok()?;
             menu.append(&quit).ok()?;
             let show_id = show.id().0.clone();
+            let update_id = update.id().0.clone();
             let quit_id = quit.id().0.clone();
 
             // Wake the UI whenever a tray event arrives, so Show/Quit work even
@@ -67,7 +72,7 @@ mod imp {
                 .with_menu(Box::new(menu))
                 .build()
                 .ok()?;
-            Some(Self { _icon: icon, show_id, quit_id })
+            Some(Self { _icon: icon, show_id, update_id, quit_id })
         }
 
         /// Drains any pending tray actions.
@@ -79,6 +84,8 @@ mod imp {
             for id in MENU_IDS.lock().unwrap().drain(..) {
                 if id == self.show_id {
                     out.push(Action::Show);
+                } else if id == self.update_id {
+                    out.push(Action::Update);
                 } else if id == self.quit_id {
                     out.push(Action::Quit);
                 }

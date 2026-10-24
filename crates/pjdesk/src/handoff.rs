@@ -87,8 +87,10 @@ fn relaunch_users() -> u32 {
         WTSEnumerateSessionsW, WTSFreeMemory, WTSQueryUserToken, WTSActive, WTS_SESSION_INFOW,
     };
     use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+        CreateProcessAsUserW, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
+        STARTUPINFOW,
     };
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
     let Ok(exe) = std::env::current_exe() else {
         pjdesk_proto::update::record_handoff("client relaunch: cannot find pjdesk.exe");
@@ -134,9 +136,15 @@ fn relaunch_users() -> u32 {
                 let _ = CloseHandle(token);
                 continue;
             }
+            // Do not inherit the service's std handles. They are not valid in
+            // the user session, and the window then cannot start a viewer
+            // (os error 6). CREATE_NO_WINDOW keeps a console-subsystem build
+            // from attaching a console the service does not have.
             let mut si = STARTUPINFOW {
                 cb: std::mem::size_of::<STARTUPINFOW>() as u32,
                 lpDesktop: PWSTR(desktop.as_mut_ptr()),
+                dwFlags: STARTF_USESHOWWINDOW,
+                wShowWindow: SW_HIDE.0 as u16,
                 ..Default::default()
             };
             let mut pi = PROCESS_INFORMATION::default();
@@ -146,8 +154,8 @@ fn relaunch_users() -> u32 {
                 Some(PWSTR(cmdline.as_mut_ptr())),
                 None,
                 None,
-                false,
-                CREATE_UNICODE_ENVIRONMENT,
+                relaunch_inherits_handles(),
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
                 Some(env),
                 PCWSTR::null(),
                 &si,
@@ -190,4 +198,15 @@ mod tests {
     fn the_user_process_is_the_normal_window() {
         assert!(relaunch_args().is_empty());
     }
+
+    #[test]
+    fn the_service_does_not_hand_its_handles_to_the_window() {
+        assert!(!relaunch_inherits_handles());
+    }
+}
+
+/// `CreateProcessAsUser` from the service must not inherit handles. The
+/// service has no console, and those handles are invalid in the user session.
+pub(crate) fn relaunch_inherits_handles() -> bool {
+    false
 }

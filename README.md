@@ -3,7 +3,7 @@
 A self-hosted, open-source remote desktop in the spirit of RustDesk, written in Rust. Your computers connect only through a server you run — no cloud, no accounts with anyone but you. [pjdesk.com](https://pjdesk.com)
 
 * **`pjdesk.exe`** — the app. A window to share this computer (ID + password) and control others, with a settings window, a sign-in to your server, a synced address book, and an optional background service so you can connect at the sign-in screen and during UAC prompts.
-* **`pjdesk-server.exe`** — the hub. Signaling, NAT rendezvous and relay, with a management window for the service, user accounts and registered computers. Runs in a console or as a Windows service.
+* **`pjdesk-server.exe`** — the hub. Signaling, NAT rendezvous and relay, with a management window. Sign in once with the PJDesk account. Runs in a console or as a Windows service.
 
 Connections are **peer-to-peer** whenever UDP hole punching works, and are **relayed** through your server when it doesn't. Video is **end-to-end encrypted** either way (QUIC/TLS 1.3). Passwords are checked with **SPAKE2**, so they never travel over the network, not even to your own server.
 
@@ -14,10 +14,10 @@ Connections are **peer-to-peer** whenever UDP hole punching works, and are **rel
 ## Getting started
 
 1. **Run the server.** Install `PJDesk-Server-Setup` on a computer that stays on (or build it and run `pjdesk-server`). Tick "run as a service" so it starts with Windows. Note its address — a hostname or LAN IP — and, for use over the internet, forward TCP + UDP 21200 to it.
-2. **Install the app.** Run `PJDesk-Setup` on each computer. Open PJDesk, go to **Settings ▸ Network**, and enter your server's address.
+2. **Install the app.** Run `PJDesk-Client-Setup` on each computer (the same file is also published as `PJDesk-Setup` so an already-installed copy can update). Open PJDesk, go to **Settings ▸ Network**, and enter your server's address.
 3. **Connect.** Your computer now shows a 9-digit **ID** and a password. Give those to someone, or type another computer's ID and password to control it.
 4. **(Optional) Always-on access.** In **Settings ▸ Security**, install the **background service** to reach this computer before anyone signs in and during UAC prompts. Set a permanent password there too.
-5. **(Optional) Sign in.** Create an account on the server (its window, or `pjdesk-server account add <name>`), then sign in from the app to sync an **address book** of saved computers across your machines.
+5. **Sign in.** Use the same PJDesk account (pjdesk.com) in the app and in the PJDesk Server window. That one login is Cloud Sync, the server's role, and My network. An older local account (`pjdesk-server account add`) still works for an address book. A new server does not need one.
 
 ---
 
@@ -254,14 +254,21 @@ S3-compatible bucket works). A second server signed in to the same copy stays
 in sync as a **standby**. You make it the **primary** when you want it to
 take over.
 
-**With a PJDesk account (easiest).** In the PJDesk Server window, open
-**Cloud Sync & Backup Server** → **PJDesk account** and sign in (create the
-account at pjdesk.com/account). The first server you sign in is the primary.
-Sign in on another PJDesk Server with the same account and it becomes the
-standby — nothing to copy between them. The password never leaves your servers:
+**With a PJDesk account (easiest).** In the PJDesk Server window, the
+**PJDesk account** card at the top is the one sign-in (create the account at
+pjdesk.com/account). The window shows **Signed in as** that email, with
+**Sign out** and **Switch account**. That login is Cloud Sync and backup, the
+active or standby role, and My network (address, fingerprint, and slot).
+Allowed accounts and Require signed-in accounts follow it. There is no
+separate server password. Install, stop, and uninstall still need a Windows
+administrator. The first server you sign in is the primary. Sign in on another
+PJDesk Server with the same account and it becomes the standby. No join code,
+and nothing to copy between them. The password never leaves your servers:
 they derive one key from it to sign in and another to encrypt the copy, so
 PJDesk Cloud can't read it. (`pjdesk-server cloud signin --email you@example.com`
 does the same from the command line.) See [cloud/README.md](cloud/README.md).
+Older local accounts in `accounts.json` keep working. A new server does not
+need them.
 
 **Your own bucket (advanced).** Prefer to keep the copy in your own Cloudflare
 R2 / S3 bucket? Choose **Your own bucket** instead:
@@ -286,8 +293,8 @@ offline, so you do not stop it yourself. The primary can **Step down to
 standby** (`pjdesk-server cloud demote`); that does not promote the other
 server — you still choose **Make this the primary** there.
 
-Computers connect to whichever server the DNS name points to (for example
-`pjdesk.spader.us`). If the new primary is on a different network, forward
+Computers connect to whichever server the account's network names (the active
+address on pjdesk.com → Account → My network). If the new primary is on a different network, forward
 TCP + UDP 21200 to it and point that name at its public IP. A short TTL
 (1–5 minutes) makes the change quick. Computers reconnect within a couple of
 minutes (a client that hears nothing from its server for 70 s reconnects and
@@ -327,7 +334,9 @@ folder, readable by SYSTEM and Administrators only.
 ## Troubleshooting
 
 * **"no UDP reply from the server"**: UDP 21200 is blocked. Allow it in the server's firewall and forward it on the router.
-* **Always "relayed"**: P2P is not possible between those networks (for example symmetric NAT or carrier-grade NAT). The relay still works, at the cost of server bandwidth.
+* **Always "relayed" on the same LAN**: the direct path is UDP 21201. Allow inbound UDP 21201 (the installer adds a rule named PJDesk LAN). The log line "Connected via LAN" is only the path to the server, not the path to the other computer. A relay across different networks is normal when NAT blocks a direct route.
+* **Microsoft Defender quarantines PJDesk** (Trojan:Script/Wacatac.H!ml): 0.6.6 no longer registers a scheduled task for updates. Submit the file as a false positive at https://www.microsoft.com/en-us/wdsi/filesubmission. Sign in with a Microsoft account, choose Software developer, and mark it a false positive. Upload `C:\Program Files\PJDesk\pjdesk.exe`, the installer, and any quarantined update from `C:\ProgramData\PJDesk\updates`. The detection name is Trojan:Script/Wacatac.H!ml. Company and product are PJDesk, a remote desktop. After Microsoft clears it, restore the quarantined files or install 0.6.6 again.
+* **Session stays on "Opening" after the password**: the status line under the main window names the step that stopped. On the other computer, check `%APPDATA%\PJDesk\pjdesk.log`. If the PJDesk service is hosting, also check `C:\ProgramData\PJDesk\service\service.log`.
 * **"SERVER KEY MISMATCH"**: the server was reinstalled (new key), or something is intercepting. Compare with `pjdesk-server fingerprint`, then `pjdesk config --reset-fingerprint`.
 * **Can't control admin windows or UAC prompts**: Windows blocks input from normal apps into elevated apps. Run `pjdesk.exe` as administrator on the host. UAC's secure desktop and Ctrl+Alt+Del need a SYSTEM service (roadmap).
 * **Slow encoding at 4K**: use `--max-width 1920`, and build with NASM installed.

@@ -192,7 +192,12 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     // or leak its key. Harmless if the service path already did it.
     #[cfg(windows)]
     crate::service::repair_data_dir(&data_dir);
+    crate::public_addr::remember_port(&data_dir, opts.port);
     let identity = load_identity(&data_dir)?;
+    crate::access::remember_fingerprint(&data_dir, &identity.fingerprint());
+    if crate::access::restore_grace(&data_dir) {
+        info!("Require signed-in accounts was on without being chosen. Grace mode is on again, so existing computers can connect.");
+    }
     let registry = Registry::load(data_dir.join("devices.json"))?;
     let device_count = registry.len();
     let accounts = crate::accounts::Accounts::load(&data_dir)?;
@@ -210,7 +215,11 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     info!("  Rendezvous/relay (UDP)   : {}:{}", opts.bind, opts.port);
     info!("  Data folder              : {}", data_dir.display());
     info!("  Registered devices       : {device_count}");
-    info!("  User accounts            : {account_count}");
+    if account_count == 0 {
+        info!("  Local accounts           : none (a PJDesk account is the server sign-in)");
+    } else {
+        info!("  Local accounts (legacy)  : {account_count}");
+    }
     info!("  Server key fingerprint   : {}", tls::format_fingerprint(&identity.fingerprint()));
     info!("Clients trust this key on first connect; compare it with what they print.");
 
@@ -227,6 +236,12 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     // Swappable, so a standby server can take on the key it syncs from the cloud.
     let acceptor = Arc::new(RwLock::new(TlsAcceptor::from(Arc::new(tls::server_config(&identity, ALPN_SIGNAL)?))));
 
+    let beacon_port = opts.port;
+    let beacon_fp = identity.fingerprint();
+    let _ = std::thread::Builder::new().name("lan-beacon".into()).spawn(move || {
+        crate::public_addr::announce_lan(beacon_port, beacon_fp);
+    });
+
     let relay = tokio::spawn(crate::relay::run(Arc::new(udp), state.clone()));
     let janitor = tokio::spawn(janitor(state.clone()));
     let fleet = tokio::spawn(fleet_sync(state.clone()));
@@ -238,6 +253,10 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         let pipe_port = opts.port;
         let _ = std::thread::Builder::new().name("status-pipe".into()).spawn(move || {
             crate::status_pipe::serve(pipe_dir, pipe_port);
+        });
+        let control_dir = data_dir.clone();
+        let _ = std::thread::Builder::new().name("control-pipe".into()).spawn(move || {
+            crate::control::serve(control_dir);
         });
     }
     crate::self_update::retire_legacy_task_if_disabled(&data_dir);
@@ -329,6 +348,8 @@ struct Conn {
     host_id: Option<String>,
     /// Highest protocol version this connection has offered.
     proto: u16,
+    /// Network access token from [`ClientMsg::PresentAccess`], if this peer sent one.
+    access_token: String,
 }
 
 impl Conn {
@@ -359,7 +380,14 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
         }
     });
 
-    let mut conn = Conn { id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed), addr, tx, host_id: None, proto: 0 };
+    let mut conn = Conn {
+        id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
+        addr,
+        tx,
+        host_id: None,
+        proto: 0,
+        access_token: String::new(),
+    };
     debug!("{addr}: connected (conn {})", conn.id);
 
     let result: Result<()> = async {
@@ -513,6 +541,20 @@ fn handle_login(
     }
 }
 
+/// Loads the policy and checks this connection's token. `Ok(None)` is grace
+/// (no usable token, and the switch is still off). `Err` is "Sign in required".
+fn gate(st: &State, conn: &Conn) -> Result<Option<pjdesk_proto::access::Claims>, ()> {
+    let policy = crate::access::Policy::load(&st.data_dir);
+    match crate::access::admit(&policy, &conn.access_token, crate::access::now_unix()) {
+        Ok(crate::access::Decision::Open) => Ok(None),
+        Ok(crate::access::Decision::Signed(claims)) => Ok(Some(claims)),
+        Err(reason) => {
+            warn!("{}: network access refused ({reason})", conn.addr);
+            Err(())
+        }
+    }
+}
+
 fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
     // Password checks are slow (Argon2). Do them off the process-wide lock so
     // one sign-in attempt cannot stall every other connection.
@@ -528,7 +570,18 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
 
         ClientMsg::Ping => conn.send(ServerMsg::Pong),
 
+        ClientMsg::PresentAccess { token } => {
+            conn.access_token = token.chars().take(4096).collect();
+        }
+
         ClientMsg::Register { proto, device_id, device_secret, hostname, app_version } => {
+            let signed = match gate(st, conn) {
+                Ok(claims) => claims,
+                Err(()) => {
+                    conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
+                    return;
+                }
+            };
             if !note_proto(conn, proto) {
                 return;
             }
@@ -562,9 +615,14 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                         }
                     }
                     conn.host_id = Some(id.clone());
+                    st.registry.mark_signed_in(&id, signed.is_some());
                     conn.send(ServerMsg::Registered { device_id: id.clone() });
                     if conn.proto >= 3 {
                         conn.send(ServerMsg::Policy(st.accounts.policy()));
+                    }
+                    let os = st.registry.os_family(&id);
+                    if crate::registry::supports_host_report_for(&app_version, &os) {
+                        conn.send(ServerMsg::WantHostReport);
                     }
                     crate::audit::AuditLog::open(&st.data_dir).record(
                         "register",
@@ -587,6 +645,11 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::Connect { proto, target_id, controller_name } => {
+            // Before any ID lookup, so a refused peer learns nothing about the target.
+            if gate(st, conn).is_err() {
+                conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
+                return;
+            }
             if !note_proto(conn, proto) {
                 return;
             }
@@ -675,6 +738,12 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::UdpReady { session_id, local_addrs, cert_fingerprint } => {
+            // The UDP bind that follows is authorized by the session token issued
+            // here, so refusing this message refuses punch and relay as well.
+            if gate(st, conn).is_err() {
+                conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
+                return;
+            }
             let Some(session) = st.sessions.get_mut(&session_id) else { return };
             let role = if session.host_conn == conn.id {
                 Role::Host
@@ -797,6 +866,24 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             Some(_) => conn.error(ErrorCode::Unauthorized, "only an administrator can change roles"),
             None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
         },
+
+        ClientMsg::ReportDisplayName { name } => {
+            let Some(id) = conn.host_id.clone() else { return };
+            let name = name.chars().filter(|c| !c.is_control()).take(64).collect::<String>();
+            st.registry.note_display_name(&id, &name);
+        }
+
+        ClientMsg::ReportHost { hostname, os_family, os_version, console_user } => {
+            let Some(id) = conn.host_id.clone() else { return };
+            let hostname = hostname.chars().filter(|c| !c.is_control()).take(64).collect::<String>();
+            st.registry.note_report(&id, &hostname, &os_family, &os_version, &console_user);
+            if !hostname.is_empty() {
+                if let Some(host) = st.online.get_mut(&id) {
+                    host.hostname = hostname.clone();
+                }
+            }
+            info!("Host {} reported {}", format_id(&id), if hostname.is_empty() { "its system".into() } else { hostname });
+        }
 
         ClientMsg::ChangePassword { token, new_password } => match st.accounts.user_for_token(&token) {
             Some(username) => match st.accounts.set_password(&username, &new_password) {
@@ -923,11 +1010,21 @@ async fn fleet_sync(state: Shared) {
         let mut st = state.lock().unwrap();
         for req in &updates {
             if req == "*" {
-                for h in st.online.values() {
+                info!("Update all online computers: asking {} client(s) to install the latest release", st.online.len());
+                for (id, h) in &st.online {
+                    info!(
+                        "Asking {} \"{}\" (v{}) to update now",
+                        format_id(id),
+                        h.hostname,
+                        h.app_version
+                    );
                     let _ = h.tx.send(ServerMsg::UpdateNow);
                 }
             } else if let Some(h) = st.online.get(req) {
+                info!("Asking {} \"{}\" (v{}) to update now", format_id(req), h.hostname, h.app_version);
                 let _ = h.tx.send(ServerMsg::UpdateNow);
+            } else {
+                info!("Update request for {} was not sent; that computer is not online", format_id(req));
             }
         }
         for id in &forgets {
@@ -1071,5 +1168,103 @@ mod tests {
         }
         assert!(!limiter.allow(ip, "x", 5));
         assert!(limiter.allow(ip, "y", 5));
+    }
+
+    fn state_in(dir: &std::path::Path) -> Shared {
+        let _ = std::fs::create_dir_all(dir);
+        Arc::new(Mutex::new(State {
+            registry: Registry::load(dir.join("devices.json")).unwrap(),
+            accounts: crate::accounts::Accounts::load(dir).unwrap(),
+            online: HashMap::new(),
+            standby: HashMap::new(),
+            sessions: HashMap::new(),
+            limiter: RateLimiter::default(),
+            udp_port: 21200,
+            data_dir: dir.to_path_buf(),
+        }))
+    }
+
+    fn conn_pair() -> (Conn, mpsc::UnboundedReceiver<ServerMsg>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let conn = Conn {
+            id: 1,
+            addr: "192.0.2.10:40000".parse().unwrap(),
+            tx,
+            host_id: None,
+            proto: 0,
+            access_token: String::new(),
+        };
+        (conn, rx)
+    }
+
+    #[test]
+    fn connect_without_a_token_does_not_confirm_the_id_when_accounts_are_required() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::access::Policy {
+            require_accounts: true,
+            ..crate::access::Policy::default()
+        }
+        .save(&dir)
+        .unwrap();
+        let state = state_in(&dir);
+        let (mut conn, mut rx) = conn_pair();
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::Connect { proto: 3, target_id: "123456789".into(), controller_name: "laptop".into() },
+        );
+        match rx.try_recv().unwrap() {
+            ServerMsg::Error { code, message } => {
+                assert_eq!(code, ErrorCode::Unauthorized);
+                assert_eq!(message, "Sign in required");
+                assert!(!message.contains("123"));
+            }
+            other => panic!("{other:?}"),
+        }
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::Register {
+                proto: 3,
+                device_id: Some("123456789".into()),
+                device_secret: [1u8; 32],
+                hostname: "Office".into(),
+                app_version: "0.6.0".into(),
+            },
+        );
+        match rx.try_recv().unwrap() {
+            ServerMsg::Error { message, .. } => assert_eq!(message, "Sign in required"),
+            other => panic!("{other:?}"),
+        }
+        assert!(state.lock().unwrap().registry.list().is_empty(), "a refused register must not create a record");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grace_still_registers_a_computer_that_has_not_signed_in() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-grace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = state_in(&dir);
+        let (mut conn, mut rx) = conn_pair();
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::Register {
+                proto: 3,
+                device_id: None,
+                device_secret: [2u8; 32],
+                hostname: "Office".into(),
+                app_version: "0.6.0".into(),
+            },
+        );
+        let id = match rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => device_id,
+            other => panic!("{other:?}"),
+        };
+        let row = state.lock().unwrap().registry.list().into_iter().find(|d| d.id == id).unwrap();
+        assert!(!row.signed_in);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

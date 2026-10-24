@@ -426,51 +426,16 @@ pub fn service_tick(data_dir: &Path) {
     }
 }
 
-/// Removes the always-on task an older installer registered, when automatic
-/// updates are off. The new task is created only by `update-task`.
-pub fn retire_legacy_task_if_disabled(data_dir: &Path) {
-    if Settings::load(data_dir).auto {
-        return;
-    }
+/// Removes the scheduled task older installs registered. The service checks
+/// on its own. A task that launches from svchost is what Defender was matching.
+pub fn retire_legacy_task_if_disabled(_data_dir: &Path) {
     let _ = delete_task();
 }
 
-/// Creates or removes the scheduled task and stores the setting.
+/// Stores the setting and deletes any leftover scheduled task.
 pub fn set_task(data_dir: &Path, enable: bool) -> Result<()> {
     set_auto(data_dir, enable);
-    if enable {
-        create_task()
-    } else {
-        delete_task()
-    }
-}
-
-#[cfg(windows)]
-fn create_task() -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let tr = format!("{} update --auto", exe.display());
-    let status = std::process::Command::new("schtasks")
-        .args([
-            "/Create",
-            "/TN",
-            UPDATE_TASK,
-            "/TR",
-            &tr,
-            "/SC",
-            "MINUTE",
-            "/MO",
-            "30",
-            "/RU",
-            "SYSTEM",
-            "/RL",
-            "HIGHEST",
-            "/F",
-        ])
-        .status()
-        .context("running schtasks")?;
-    if !status.success() {
-        bail!("schtasks could not create the update task (run as Administrator). The service will still check while it is running.");
-    }
+    delete_task()?;
     Ok(())
 }
 
@@ -478,11 +443,6 @@ fn create_task() -> Result<()> {
 fn delete_task() -> Result<()> {
     let _ = std::process::Command::new("schtasks").args(["/Delete", "/TN", UPDATE_TASK, "/F"]).status();
     Ok(())
-}
-
-#[cfg(not(windows))]
-fn create_task() -> Result<()> {
-    bail!("the scheduled update task is only available on Windows; the service checks on its own while it is running")
 }
 
 #[cfg(not(windows))]
@@ -587,6 +547,15 @@ mod tests {
         let mut s = base();
         s.available = Some("0.3.9".into());
         assert_eq!(decide(&s), Plan::Skip { reason: "not newer" });
+        // The public feed still names 0.5.2. Neither an automatic nor a manual
+        // check on 0.6.0 may install it.
+        s.current = "0.6.0".into();
+        s.available = Some("0.5.2".into());
+        s.manual = true;
+        assert_eq!(decide(&s), Plan::Skip { reason: "not newer" });
+        s.manual = false;
+        assert_eq!(decide(&s), Plan::Skip { reason: "not newer" });
+        s.current = "0.4.0".into();
         s.available = Some("0.9.0-rc1".into());
         assert_eq!(decide(&s), Plan::Skip { reason: "pre-release" });
         s.available = Some("0.5.0".into());

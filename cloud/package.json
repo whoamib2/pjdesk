@@ -8,9 +8,13 @@
     "migrate:local": "wrangler d1 migrations apply pjdesk-cloud --local",
     "migrate:remote": "wrangler d1 migrations apply pjdesk-cloud --remote",
     "deploy": "wrangler d1 migrations apply pjdesk-cloud --remote && wrangler deploy",
-    "test": "node --test test/plans.test.js"
+    "test": "node --test test/plans.test.js test/delete-computer.test.js test/network.test.js"
   },
   "devDependencies": {
+    "@noble/ciphers": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
+    "esbuild": "^0.25.0",
+    "qrcode": "^1.5.4",
     "wrangler": "^4"
   }
 }

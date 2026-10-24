@@ -12,11 +12,14 @@
 //! Runs in a console (`pjdesk-server`) or as a Windows service
 //! (`pjdesk-server service install`).
 
+mod access;
 mod accounts;
 mod audit;
 mod cloud;
+mod control;
 mod handoff;
 mod password_policy;
+mod public_addr;
 mod gui;
 mod registry;
 mod relay;

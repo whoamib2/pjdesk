@@ -7,14 +7,22 @@ use pjdesk_proto::{format_id, normalize_id};
 use super::icons::Icon;
 use super::{theme, widgets, App};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RowAction {
-    Connect,
-    Files,
-    Favorite,
-    Forget,
-    Remove,
-    CopyId,
+/// How the main window divides the area under the top bar.
+pub(crate) struct DeskSplit {
+    pub stacked: bool,
+    pub left: f32,
+    pub list: f32,
+}
+
+/// `body_width` is the width of the main area, after the window margin.
+pub(crate) fn desk_split(body_width: f32) -> DeskSplit {
+    if body_width < 960.0 {
+        DeskSplit { stacked: true, left: body_width, list: body_width }
+    } else {
+        let left = 400.0_f32.min((body_width * 0.34).max(340.0));
+        let list = (body_width - left - 12.0).max(320.0);
+        DeskSplit { stacked: false, left, list }
+    }
 }
 
 impl App {
@@ -29,76 +37,158 @@ impl App {
             }
             ui.label(RichText::new("PJDesk").size(20.0).strong().color(p.text));
             ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(p.muted).size(12.5));
-            ui.add_space(12.0);
-            let connect_on = self.page == super::MainPage::Connect;
-            let saved_on = self.page == super::MainPage::Saved;
-            if ui.selectable_label(connect_on, "Connect").clicked() {
-                self.page = super::MainPage::Connect;
-            }
-            if ui.selectable_label(saved_on, "Saved computers").clicked() {
-                self.page = super::MainPage::Saved;
-            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if widgets::icon_button(ui, Icon::Gear, "Settings (Ctrl+,)").clicked() {
                     self.open_settings();
                 }
                 ui.separator();
-                match &self.cfg.account {
-                    Some(acct) => {
-                        let who = if acct.display_name.is_empty() {
-                            acct.username.clone()
-                        } else {
-                            acct.display_name.clone()
-                        };
+                let email = self.cfg.network_email.clone().unwrap_or_default();
+                let signed_in = self.temp.is_some() || !email.trim().is_empty();
+                if signed_in && ui.button("Invite").on_hover_text("Make an 8-digit code someone can use to join your network.").clicked()
+                {
+                    self.open_invite();
+                }
+                if self.temp.is_some() {
+                    ui.label(RichText::new("Signed in until you close PJDesk").color(p.warn).size(13.0));
+                    if ui.button("Sign out").clicked() {
+                        self.end_temporary_sign_in();
+                    }
+                } else if !email.trim().is_empty() {
+                    ui.menu_button(RichText::new(email.trim()).color(p.ok), |ui| {
+                        if ui.button("Manage account").clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab("https://pjdesk.com/account"));
+                            ui.close();
+                        }
                         if ui.button("Sign out").clicked() {
-                            self.sign_out();
+                            self.sign_out_network();
+                            ui.close();
                         }
-                        theme::icon_in(ui, Icon::User, 16.0, p.ok);
-                        ui.label(RichText::new(who).color(p.ok));
+                    });
+                    theme::icon_in(ui, Icon::User, 16.0, p.ok);
+                } else {
+                    if ui
+                        .button("Sign in")
+                        .on_hover_text("Sign in with your PJDesk account for this network and its servers.")
+                        .clicked()
+                    {
+                        self.show_net_sign_in = true;
+                        self.net_temporary = true;
+                        self.net_enroll_only = false;
+                        self.status.clear();
                     }
-                    None => {
-                        if ui.button("Sign in").on_hover_text("Sign in to your PJDesk server").clicked() {
-                            self.show_login = true;
-                            self.status.clear();
-                        }
-                        theme::icon_in(ui, Icon::User, 16.0, p.muted);
-                    }
+                    theme::icon_in(ui, Icon::User, 16.0, p.muted);
                 }
             });
         });
     }
 
     pub(super) fn body(&mut self, ui: &mut egui::Ui) {
-        if self.page == super::MainPage::Saved {
-            self.saved_page(ui);
+        if self.cfg.effective_server().trim().is_empty() || self.show_net_sign_in {
+            self.sign_in_panel(ui);
             return;
         }
         let width = ui.available_width();
-        let height = ui.available_height();
-        if width < 900.0 {
+        // Narrow windows stack the connect form above the list. The list pins
+        // Connect and Menu to its own right edge at every width.
+        let split = desk_split(width);
+        if split.stacked {
             ScrollArea::vertical().id_salt("stacked").auto_shrink([false, false]).show(ui, |ui| {
-                self.rail(ui);
+                self.support_card(ui);
                 ui.add_space(12.0);
                 self.remote(ui);
+                ui.add_space(12.0);
+                self.rail(ui);
+                ui.add_space(12.0);
+                self.computer_list(ui);
             });
             return;
         }
+        // Place the two columns in the space the window actually has. A horizontal
+        // layout would let the left column's minimum width push Connect and Menu
+        // past the right edge.
+        let rect = ui.available_rect_before_wrap();
         let gap = 12.0;
-        let left = 360.0;
-        let right = (width - left - gap).max(320.0);
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(Vec2::new(left, height), egui::Layout::top_down(egui::Align::Min), |ui| {
-                ScrollArea::vertical().id_salt("rail").auto_shrink([false, false]).show(ui, |ui| {
-                    self.rail(ui);
-                });
-            });
-            ui.add_space(gap);
-            ui.allocate_ui_with_layout(Vec2::new(right, height), egui::Layout::top_down(egui::Align::Min), |ui| {
-                ScrollArea::vertical().id_salt("remote").auto_shrink([false, false]).show(ui, |ui| {
-                    self.remote(ui);
-                });
-            });
+        let left_w = split.left.min((rect.width() - gap - 280.0).max(0.0));
+        let right_x = rect.left() + left_w + gap;
+        let left_rect = egui::Rect::from_min_max(rect.left_top(), egui::pos2(right_x - gap, rect.bottom()));
+        let right_rect = egui::Rect::from_min_max(egui::pos2(right_x.min(rect.right()), rect.top()), rect.right_bottom());
+        let mut left_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("connect-col-wrap")
+                .max_rect(left_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        left_ui.set_clip_rect(left_rect);
+        ScrollArea::vertical().id_salt("connect-col").auto_shrink([false, false]).show(&mut left_ui, |ui| {
+            ui.set_max_width(left_rect.width());
+            self.support_card(ui);
+            ui.add_space(12.0);
+            self.remote(ui);
+            ui.add_space(12.0);
+            self.rail(ui);
+        });
+        let mut right_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("saved-col-wrap")
+                .max_rect(right_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        right_ui.set_clip_rect(right_rect);
+        right_ui.set_max_width(right_rect.width());
+        self.computer_list(&mut right_ui);
+        ui.advance_cursor_after_rect(rect);
+    }
+
+    fn support_card(&mut self, ui: &mut egui::Ui) {
+        let p = theme::paint(ui);
+        let (code, password, id, _) = self.support_view();
+        let online = pjdesk_proto::is_valid_id(&id) && !self.cfg.effective_server().trim().is_empty();
+        theme::card(ui, |ui| {
+            widgets::heading(ui, "LET SOMEONE CONNECT");
+            ui.add_space(4.0);
+            if !online {
+                ui.label(widgets::muted(
+                    ui,
+                    "This computer is not on a network yet, so a support code cannot be used.",
+                ));
+            } else {
+            ui.label(widgets::muted(
+                ui,
+                "Give them this code and the temporary password. They connect without an Allow prompt. This is not the permanent password. This computer still shows who connected. A code lasts about 10 minutes if it is not used, and a new one is made when the session ends.",
+            ));
+            ui.add_space(8.0);
+            match code {
+                Some(code) => {
+                    ui.label(RichText::new(crate::network::group_digits(&code)).size(28.0).strong().monospace().color(p.text));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let shown = match &password {
+                            Some(pw) if self.show_support_password => pw.clone(),
+                            Some(pw) => "•".repeat(pw.chars().count().max(6)),
+                            None => "—".into(),
+                        };
+                        ui.label(RichText::new(shown).size(18.0).monospace().color(p.text));
+                        if password.is_some() {
+                            let eye = if self.show_support_password { Icon::EyeOff } else { Icon::Eye };
+                            let tip = if self.show_support_password { "Hide password" } else { "Show password" };
+                            if widgets::icon_button(ui, eye, tip).clicked() {
+                                self.show_support_password = !self.show_support_password;
+                            }
+                        }
+                        if widgets::icon_button(ui, Icon::Refresh, "New code and password").clicked() {
+                            self.refresh_support_pair();
+                        }
+                    });
+                    ui.label(RichText::new("Temporary password").color(p.muted).size(12.5));
+                }
+                None => {
+                    widgets::spinner(ui, p.muted);
+                    ui.label(RichText::new("Preparing a code").color(p.muted));
+                }
+            }
+            }
         });
     }
 
@@ -168,6 +258,217 @@ impl App {
         });
     }
 
+    fn sign_in_panel(&mut self, ui: &mut egui::Ui) {
+        let p = theme::paint(ui);
+        let mut go = false;
+        let mut enroll_only = false;
+        let mut cancel = false;
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(440.0);
+            ui.add_space(24.0);
+            ui.label(RichText::new("Sign in to your network").size(26.0).strong().color(p.text));
+            ui.add_space(4.0);
+            let intro = match self.net_mode {
+                2 if self.net_temporary => {
+                    "Paste a network key. This computer is added to your account. This sign-in ends when you close PJDesk."
+                }
+                2 => "Paste a network key from My network or the PJDesk Server window. This computer enrolls and stays signed in after a restart.",
+                1 => "Enter an 8-digit code from someone on this network. It works once, lasts one hour, and you do not need a PJDesk account. An older enrollment code still works in this box.",
+                _ => "Your PJDesk account sets the servers for this network. It does not connect you to a computer, and it is not that computer's password.",
+            };
+            ui.label(widgets::muted(ui, intro));
+            ui.add_space(16.0);
+        });
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(440.0);
+            theme::card(ui, |ui| {
+                if self.net_mode == 2 {
+                    widgets::field_label(ui, "Network key");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.net_blob)
+                            .hint_text("pjdesk-net1:…")
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    let embedded = pjdesk_proto::netkey::is_embedded(&self.net_blob);
+                    if !embedded {
+                        ui.add_space(8.0);
+                        widgets::field_label(ui, "Passphrase");
+                        widgets::password_field(ui, &mut self.net_key_pass, "Passphrase", &mut self.net_key_show);
+                        ui.label(widgets::muted(
+                            ui,
+                            "Only if the key was created with a passphrase. Leave this empty for a self-contained key.",
+                        ));
+                    }
+                    if embedded {
+                        ui.add_space(6.0);
+                        ui.colored_label(p.warn, "Anyone who has this network key can join.");
+                    }
+                    if self.net_key_account || self.net_error.contains("specific account") {
+                        self.net_key_account = true;
+                        ui.add_space(8.0);
+                        widgets::field_label(ui, "Account email");
+                        widgets::account_email_field(ui, &mut self.net_email);
+                        ui.add_space(8.0);
+                        widgets::field_label(ui, "Account password");
+                        widgets::account_password_field(ui, &mut self.net_pass, &mut self.net_show);
+                    }
+                } else if self.net_mode == 0 {
+                    widgets::field_label(ui, "Email");
+                    widgets::account_email_field(ui, &mut self.net_email);
+                    ui.add_space(8.0);
+                    widgets::field_label(ui, "PJDesk account password");
+                    widgets::account_password_field(ui, &mut self.net_pass, &mut self.net_show);
+                } else {
+                    widgets::field_label(ui, "8-digit code");
+                    widgets::text_field(ui, &mut self.net_code, "1234 5678", true);
+                    ui.label(widgets::muted(
+                        ui,
+                        "From Invite on a signed-in PJDesk. One use, one hour. An older enrollment code from pjdesk.com still works here.",
+                    ));
+                }
+                ui.add_space(8.0);
+                widgets::checkbox(
+                    ui,
+                    &mut self.net_temporary,
+                    "Sign me out when I'm done (use on someone else's computer)",
+                );
+                ui.label(widgets::muted(
+                    ui,
+                    "This computer is added to your account either way. When this is checked, the sign-in ends when you close PJDesk and is not kept on this computer.",
+                ));
+                ui.add_space(8.0);
+                if !self.net_error.is_empty() {
+                    ui.colored_label(p.warn, &self.net_error);
+                    ui.add_space(6.0);
+                }
+                if self.net_offer
+                    && !self.net_busy
+                    && ui.button(format!("Use this computer's current server ({}) for my network", self.cfg.effective_server())).clicked()
+                {
+                    self.claim_current_server();
+                }
+                let label = if self.net_busy {
+                    "Signing in…"
+                } else if self.net_mode == 2 {
+                    "Use network key"
+                } else if self.net_mode == 1 {
+                    "Join"
+                } else {
+                    "Sign in"
+                };
+                if widgets::accent_button(ui, label, egui::vec2(ui.available_width(), 40.0)) && !self.net_busy {
+                    go = true;
+                }
+                if self.net_mode == 0 && !self.net_busy {
+                    ui.add_space(4.0);
+                    let link = ui.add(
+                        egui::Button::new(
+                            RichText::new("Just add this computer to my account").underline().color(p.accent),
+                        )
+                        .frame(false),
+                    );
+                    if link.clicked() {
+                        enroll_only = true;
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if self.net_mode != 0 && ui.button("Use email and password").clicked() && !self.net_busy {
+                        self.net_mode = 0;
+                        self.net_error.clear();
+                        self.net_offer = false;
+                        self.net_login.clear();
+                    }
+                    if self.net_mode != 1 && ui.button("Join with an 8-digit code").clicked() && !self.net_busy {
+                        self.net_mode = 1;
+                        self.net_error.clear();
+                        self.net_offer = false;
+                        self.net_login.clear();
+                    }
+                    if self.net_mode != 2 && ui.button("Use a network key").clicked() && !self.net_busy {
+                        self.net_mode = 2;
+                        self.net_error.clear();
+                        self.net_offer = false;
+                        self.net_login.clear();
+                    }
+                    if self.show_net_sign_in && !self.cfg.effective_server().is_empty() && ui.button("Cancel").clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+        });
+        if cancel {
+            self.show_net_sign_in = false;
+        }
+        if enroll_only {
+            self.net_enroll_only = true;
+            self.start_network_sign_in();
+        } else if go {
+            self.net_enroll_only = false;
+            self.start_network_sign_in();
+        }
+    }
+
+    pub(super) fn import_prompt(&mut self, ctx: &egui::Context) {
+        if self.import_blob.is_none() {
+            return;
+        }
+        let blob = self.import_blob.clone().unwrap_or_default();
+        let needs = pjdesk_proto::netkey::needs_passphrase(&blob);
+        let embedded = pjdesk_proto::netkey::is_embedded(&blob);
+        let confirm = self.import_confirm;
+        let hint = self.import_hint.clone();
+        let mut go = false;
+        let mut cancel = false;
+        let mut open = true;
+        egui::Window::new("Import server config")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                if confirm {
+                    ui.label(RichText::new("Import this server config?").strong());
+                    ui.add_space(4.0);
+                }
+                if !hint.is_empty() {
+                    ui.label(widgets::muted(ui, &hint));
+                }
+                if embedded {
+                    ui.add_space(6.0);
+                    ui.colored_label(theme::paint(ui).warn, "Anyone who has this network key can join.");
+                }
+                if needs {
+                    ui.add_space(8.0);
+                    widgets::field_label(ui, "Passphrase");
+                    widgets::password_field(ui, &mut self.import_pass, "Passphrase", &mut self.import_show);
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("Import server config").clicked() {
+                        go = true;
+                    }
+                });
+            });
+        if cancel || !open {
+            self.dismiss_import();
+        } else if go {
+            if needs && self.import_pass.trim().is_empty() {
+                self.import_hint = "Enter the passphrase.".into();
+                return;
+            }
+            let pass = self.import_pass.clone();
+            self.begin_import(blob, pass);
+        }
+    }
+
     fn share_status(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
         if !self.engine.ready {
@@ -178,6 +479,12 @@ impl App {
             return;
         }
         let server = server_host(&self.cfg.effective_server());
+        let reach = if self.engine.service_running {
+            self.svc_status.reach.clone()
+        } else {
+            self.engine.shared.reach()
+        };
+        let server = if reach.is_empty() { server } else { format!("{server} · {reach}") };
         let rtt = self.share_rtt();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -294,14 +601,28 @@ impl App {
                 .horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     let menu_w = 96.0;
-                    let width = (ui.available_width() - menu_w - 8.0).max(80.0);
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.connect_id)
-                            .hint_text("123 456 789")
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(width)
-                            .margin(egui::Margin::symmetric(12, 10)),
-                    );
+                    let width = (ui.available_width() - menu_w - 8.0).max(120.0);
+                    let before = self.connect_id.clone();
+                    let mut output = egui::TextEdit::singleline(&mut self.connect_id)
+                        .hint_text("123 456 789")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(width)
+                        .margin(egui::Margin::symmetric(12, 10))
+                        .show(ui);
+                    if output.response.changed() {
+                        let after_caret = output
+                            .state
+                            .cursor
+                            .char_range()
+                            .map(|range| usize::from(range.primary.index))
+                            .unwrap_or_else(|| self.connect_id.chars().count());
+                        let (formatted, caret) = crate::idfmt::reformat_id_change(&before, &self.connect_id, after_caret, 9);
+                        self.connect_id = formatted;
+                        let cursor = egui::text::CCursor::new(caret);
+                        output.state.cursor.set_char_range(Some(egui::text::CCursorRange::one(cursor)));
+                        output.state.store(ui.ctx(), output.response.id);
+                    }
+                    let resp = output.response;
                     let recent = self.recent_ids();
                     ui.menu_button("Recent", |ui| {
                         if recent.is_empty() {
@@ -310,7 +631,7 @@ impl App {
                         for id in recent {
                             let label = self.row_title(&id);
                             if ui.button(label).clicked() {
-                                self.connect_id = format_typed_id(&id);
+                                self.connect_id = crate::idfmt::format_typed_id(&id);
                                 ui.close();
                             }
                         }
@@ -320,39 +641,44 @@ impl App {
                     resp
                 })
                 .inner;
-            if id_resp.changed() {
-                let formatted = format_typed_id(&self.connect_id);
-                if formatted != self.connect_id {
-                    self.connect_id = formatted;
-                }
-            }
 
             ui.add_space(8.0);
-            widgets::field_label(ui, "Password (optional if saved)");
-            let pw_resp =
-                widgets::password_field(ui, &mut self.connect_password, "Password", &mut self.show_connect_password);
-            ui.add_space(4.0);
-            widgets::checkbox(ui, &mut self.remember, "Remember this computer's password");
-
+            ui.label(widgets::muted(
+                ui,
+                "Enter the ID and click Connect. A saved password is used on its own. Otherwise PJDesk asks after that computer answers.",
+            ));
             ui.add_space(8.0);
-            let enter = (id_resp.lost_focus() || pw_resp.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let mut connect = false;
-            let mut files = false;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let total = ui.available_width();
-                let primary = (total * 0.58).max(120.0);
-                let secondary = (total - primary - 8.0).max(120.0);
-                connect = widgets::accent_button(ui, "Connect", Vec2::new(primary, 40.0));
-                files = ui
-                    .add_sized([secondary, 40.0], egui::Button::new(RichText::new("Transfer file").strong()))
-                    .on_hover_text("Connect and open file transfer")
-                    .clicked();
-            });
-            if connect || files || enter {
-                let (id, pw) = (self.connect_id.clone(), self.connect_password.clone());
-                self.connect_to(&id, Some(pw), files);
+            let enter = id_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let connect = widgets::accent_button(ui, "Connect", Vec2::new(ui.available_width(), 40.0));
+            if connect || enter {
+                let id = self.connect_id.clone();
+                self.connect_to(&id, None, false);
             }
+            if ui.button("Request view access").clicked() {
+                let id = self.connect_id.clone();
+                self.request_view(&id);
+            }
+            ui.label(widgets::muted(
+                ui,
+                "Request view access asks that phone to allow the screen. It uses your pjdesk.com account when you are signed in.",
+            ));
+
+            ui.add_space(12.0);
+            widgets::field_label(ui, "Or use their support code");
+            widgets::text_field(ui, &mut self.support_code_in, "1234 5678", true);
+            ui.add_space(6.0);
+            widgets::password_field(ui, &mut self.support_pass_in, "Temporary password", &mut self.support_pass_show);
+            if !self.support_error.is_empty() {
+                ui.colored_label(p.warn, &self.support_error);
+            }
+            let support_label = if self.support_busy { "Connecting…" } else { "Connect with code" };
+            if widgets::accent_button(ui, support_label, Vec2::new(ui.available_width(), 36.0)) && !self.support_busy {
+                self.start_support_connect();
+            }
+            ui.label(widgets::muted(
+                ui,
+                "From Let someone connect on their computer. The code and the temporary password are both required.",
+            ));
 
             ui.add_space(12.0);
             widgets::field_label(ui, "Or connect directly");
@@ -362,233 +688,71 @@ impl App {
                     let addr = self.direct_addr.clone();
                     self.connect_direct(&addr);
                 }
-                if self.lan_rx.is_some() {
-                    widgets::spinner(ui, p.muted);
-                    ui.label(widgets::muted(ui, "Looking on this network…"));
-                } else if ui.button("Find on this network").clicked() {
+                if ui.button("Find on this network").clicked() {
                     self.find_on_lan();
-                    self.desk_tab = super::DeskTab::Lan;
                 }
             });
         });
-
-        ui.add_space(12.0);
-        self.desk_tabs(ui);
     }
 
-    fn desk_tabs(&mut self, ui: &mut egui::Ui) {
-        let p = theme::paint(ui);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (tab, label) in [
-                (super::DeskTab::Recent, "Recent"),
-                (super::DeskTab::Favorites, "Favorites"),
-                (super::DeskTab::Address, "Address book"),
-                (super::DeskTab::Lan, "Discovered"),
-            ] {
-                let selected = self.desk_tab == tab;
-                let text = if selected {
-                    RichText::new(label).strong().color(p.text)
-                } else {
-                    RichText::new(label).color(p.muted)
-                };
-                let fill = if selected { p.elev } else { egui::Color32::TRANSPARENT };
-                if ui.add(egui::Button::new(text).fill(fill).frame(selected)).clicked() {
-                    self.desk_tab = tab;
-                }
-            }
-            if self.cfg.account.is_some() && self.desk_tab == super::DeskTab::Address {
-                ui.label(widgets::muted(ui, "synced"));
-            }
-        });
-        ui.add_space(8.0);
-
-        let rows = self.rows_for_tab();
-        if rows.is_empty() {
-            ui.label(widgets::muted(ui, self.empty_hint()));
-            if self.desk_tab == super::DeskTab::Address && ui.button("Add the ID above").clicked() {
-                self.book_target = Some(normalize_id(&self.connect_id));
-                self.book_alias.clear();
-            }
+    pub(super) fn invite_window(&mut self, ctx: &egui::Context) {
+        if !self.show_invite {
             return;
         }
-
-        let mut action: Option<(RowAction, String)> = None;
-        for row in rows {
-            let id = row.id.clone();
-            theme::card(ui, |ui| {
+        let mut open = true;
+        let mut create = false;
+        let mut revoke = false;
+        let code = self.join_code.clone();
+        let expires = self.join_expires;
+        let busy = self.join_busy;
+        let error = self.join_error.clone();
+        let has_id = !self.join_id.is_empty();
+        egui::Window::new("Invite someone")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                let p = theme::paint(ui);
+                if !code.is_empty() {
+                    ui.label(RichText::new(crate::network::group_digits(&code)).size(32.0).strong().monospace().color(p.text));
+                    ui.add_space(6.0);
+                    ui.label(format!(
+                        "Expires in {}. One use. They do not need a PJDesk account. They choose Join with an 8-digit code.",
+                        crate::network::remaining_label(expires, super::unix_now())
+                    ));
+                } else if has_id {
+                    ui.label(format!(
+                        "A code is already active and expires in {}. The digits were shown once. Revoke it, or create a new one (that replaces it).",
+                        crate::network::remaining_label(expires, super::unix_now())
+                    ));
+                } else {
+                    ui.label("Create an 8-digit code. It works once, lasts one hour, and the other person does not need a PJDesk account.");
+                }
+                if !error.is_empty() {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.warn, &error);
+                }
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    let family = self.cfg.settings.peers.get(&row.id).map(|n| n.os_family.as_str()).unwrap_or("");
-                    let icon = if family.is_empty() { Icon::Monitor } else { super::saved::os_icon(family) };
-                    theme::icon_in(ui, icon, 22.0, p.muted);
-                    if row.online {
-                        theme::icon_in(ui, Icon::Check, 10.0, p.ok);
+                    let create_label = if busy { "Working…" } else if code.is_empty() && !has_id { "Create code" } else { "Create a new code" };
+                    if ui.add_enabled(!busy, egui::Button::new(create_label)).clicked() {
+                        create = true;
                     }
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&row.title).strong().color(p.text));
-                        ui.label(widgets::muted(ui, &row.detail));
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Connect").clicked() {
-                            action = Some((RowAction::Connect, id.clone()));
-                        }
-                        let star_tip = if row.favorite { "Remove from favorites" } else { "Add to favorites" };
-                        if widgets::icon_button_active(ui, Icon::Star, star_tip, row.favorite).clicked() {
-                            action = Some((RowAction::Favorite, id.clone()));
-                        }
-                        if self.desk_tab == super::DeskTab::Address
-                            && widgets::icon_button(ui, Icon::Trash, "Remove").clicked()
-                        {
-                            action = Some((RowAction::Remove, id.clone()));
-                        }
-                    });
-                })
-                .response
-                .context_menu(|ui| {
-                    if ui.button("Connect").clicked() {
-                        action = Some((RowAction::Connect, id.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Transfer file").clicked() {
-                        action = Some((RowAction::Files, id.clone()));
-                        ui.close();
-                    }
-                    if ui.button(if row.favorite { "Remove from favorites" } else { "Add to favorites" }).clicked() {
-                        action = Some((RowAction::Favorite, id.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Copy ID").clicked() {
-                        action = Some((RowAction::CopyId, id.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Forget").clicked() {
-                        action = Some((RowAction::Forget, id.clone()));
-                        ui.close();
-                    }
-                    if row.in_book && ui.button("Remove from address book").clicked() {
-                        action = Some((RowAction::Remove, id.clone()));
-                        ui.close();
+                    if has_id && ui.add_enabled(!busy, egui::Button::new("Revoke")).clicked() {
+                        revoke = true;
                     }
                 });
             });
-            ui.add_space(8.0);
+        if !open {
+            self.show_invite = false;
         }
-
-        if self.desk_tab == super::DeskTab::Address && ui.button("Add the ID above").clicked() {
-            self.book_target = Some(normalize_id(&self.connect_id));
-            self.book_alias.clear();
+        if create {
+            self.start_invite(super::InviteKind::Create);
         }
-
-        if let Some((kind, id)) = action {
-            self.apply_row(kind, &id);
-        }
-    }
-
-    fn apply_row(&mut self, kind: RowAction, id: &str) {
-        match kind {
-            RowAction::Connect => self.connect_to(id, None, false),
-            RowAction::Files => self.connect_to(id, None, true),
-            RowAction::Favorite => self.toggle_favorite(id),
-            RowAction::Forget => {
-                self.cfg.settings.peers.remove(id);
-                self.save_cfg();
-                self.toast.show("Forgotten");
-            }
-            RowAction::Remove => {
-                self.cfg.address_book.retain(|e| e.id != id);
-                self.cfg.remember_password(id, None);
-                self.sync_address_book();
-                self.toast.show("Removed");
-            }
-            RowAction::CopyId => {
-                if widgets::copy_to_clipboard(&normalize_id(id)) {
-                    self.toast.show("ID copied");
-                }
-            }
-        }
-    }
-
-    fn rows_for_tab(&self) -> Vec<DeskRow> {
-        match self.desk_tab {
-            super::DeskTab::Recent => {
-                let mut ids = self.recent_ids();
-                ids.truncate(12);
-                ids.into_iter().map(|id| self.desk_row(&id, false)).collect()
-            }
-            super::DeskTab::Favorites => self
-                .cfg
-                .settings
-                .peers
-                .iter()
-                .filter(|(_, n)| n.favorite)
-                .map(|(id, _)| id.clone())
-                .map(|id| self.desk_row(&id, false))
-                .collect(),
-            super::DeskTab::Address => self.cfg.address_book.iter().map(|e| self.desk_row(&e.id, false)).collect(),
-            super::DeskTab::Lan => self
-                .lan
-                .iter()
-                .map(|(name, id, addr)| DeskRow {
-                    id: id.clone(),
-                    title: name.clone(),
-                    detail: format!("{} · {addr}", format_id(id)),
-                    favorite: self.cfg.settings.peers.get(id).is_some_and(|n| n.favorite),
-                    online: true,
-                    in_book: self.cfg.address_book.iter().any(|e| e.id == *id),
-                })
-                .collect(),
-        }
-    }
-
-    fn desk_row(&self, id: &str, online: bool) -> DeskRow {
-        let title = self.row_title(id);
-        let mut bits = Vec::new();
-        if title != format_id(id) {
-            bits.push(format_id(id));
-        }
-        if let Some(note) = self.cfg.settings.peers.get(id) {
-            if note.last_connected > 0 {
-                bits.push(ago(note.last_connected));
-            }
-        }
-        if let Some(note) = self.cfg.settings.peers.get(id) {
-            if !note.os_family.is_empty() {
-                bits.push(super::saved::os_label(&note.os_family).to_string());
-            }
-        }
-        if self.saved_for(id).is_some() {
-            bits.push("Password saved".into());
-        }
-        if bits.is_empty() {
-            bits.push(format_id(id));
-        }
-        DeskRow {
-            id: id.to_string(),
-            title,
-            detail: bits.join(" · "),
-            favorite: self.cfg.settings.peers.get(id).is_some_and(|n| n.favorite),
-            online,
-            in_book: self.cfg.address_book.iter().any(|e| e.id == id),
-        }
-    }
-
-    pub(super) fn row_title(&self, id: &str) -> String {
-        self.cfg
-            .address_book
-            .iter()
-            .find(|e| e.id == id)
-            .map(|e| e.alias.clone())
-            .filter(|a| !a.is_empty())
-            .unwrap_or_else(|| format_id(id))
-    }
-
-    fn empty_hint(&self) -> &'static str {
-        match self.desk_tab {
-            super::DeskTab::Recent => "Computers you connect to show up here.",
-            super::DeskTab::Favorites => "Star a computer to keep it here.",
-            super::DeskTab::Address => "No saved computers yet. Connect to one, or add the ID above.",
-            super::DeskTab::Lan => "Choose Find on this network to look for PJDesk on this LAN.",
+        if revoke {
+            self.start_invite(super::InviteKind::Revoke);
         }
     }
 
@@ -653,7 +817,7 @@ impl App {
         let mut open = true;
         let mut submit = false;
         let p = theme::paint_ctx(ctx);
-        egui::Window::new("Sign in to your server")
+        egui::Window::new("Older local account")
             .collapsible(false)
             .resizable(false)
             .default_width(420.0)
@@ -662,14 +826,19 @@ impl App {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_min_width(360.0);
+                ui.label(widgets::muted(
+                    ui,
+                    "An older account stored on the server. It is not your PJDesk account, and it is not the password for a computer.",
+                ));
+                ui.add_space(8.0);
                 if self.cfg.server.is_none() {
                     ui.colored_label(p.warn, "Set your server in Settings first.");
                 }
                 ui.label("Username");
                 ui.text_edit_singleline(&mut self.login_user);
                 ui.add_space(8.0);
-                ui.label("Password");
-                let pw = widgets::password_field(ui, &mut self.login_pass, "Password", &mut self.show_login_pass);
+                ui.label("Local account password");
+                let pw = widgets::password_field(ui, &mut self.login_pass, "Local account password", &mut self.show_login_pass);
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if self.login_busy {
@@ -771,27 +940,24 @@ impl App {
             });
         }
     }
-}
 
-struct DeskRow {
-    id: String,
-    title: String,
-    detail: String,
-    favorite: bool,
-    online: bool,
-    in_book: bool,
-}
-
-pub(super) fn format_typed_id(raw: &str) -> String {
-    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).take(9).collect();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            out.push(' ');
+    /// Nickname, then the name this computer chose, then its hostname.
+    pub(super) fn row_title(&self, id: &str) -> String {
+        let hostname = self.cfg.settings.peers.get(id).map(|n| n.hostname.trim().to_string()).unwrap_or_default();
+        let display = self.cfg.settings.peers.get(id).map(|n| n.display_name.trim().to_string()).unwrap_or_default();
+        let alias = self.cfg.address_book.iter().find(|e| e.id == id).map(|e| e.alias.clone()).unwrap_or_default();
+        let nick = crate::config::nickname_text(&alias, id, &hostname);
+        if !nick.is_empty() {
+            return nick;
         }
-        out.push(c);
+        if !display.is_empty() {
+            return display;
+        }
+        if !hostname.is_empty() {
+            return hostname;
+        }
+        format_id(id)
     }
-    out
 }
 
 fn server_host(server: &str) -> String {

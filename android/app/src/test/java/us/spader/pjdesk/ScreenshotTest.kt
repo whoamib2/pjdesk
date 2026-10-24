@@ -28,7 +28,8 @@ import us.spader.pjdesk.ui.HomeScreen
 import us.spader.pjdesk.ui.OnboardingScreen
 import us.spader.pjdesk.ui.PjTheme
 import us.spader.pjdesk.ui.SavedScreen
-import us.spader.pjdesk.ui.SessionChrome
+import us.spader.pjdesk.ui.SignInScreen
+import us.spader.pjdesk.ui.SessionScreen
 import us.spader.pjdesk.ui.SettingsScreen
 import java.io.File
 
@@ -44,13 +45,11 @@ class ScreenshotTest {
                 idFormatted = "123 456 789",
                 password = "k7mw4qpn",
                 status = "Online",
-                server = "pjdesk.spader.us:21200",
+                server = "office.example:21200",
                 fingerprint = "ab:cd:ef",
             ),
             connectId = "",
-            connectPassword = "",
             onConnectId = {},
-            onConnectPassword = {},
             onConnect = {},
             onCopyId = {},
             onCopyPassword = {},
@@ -60,25 +59,31 @@ class ScreenshotTest {
     }
 
     @Test
-    fun saved() = shot("saved") {
+    fun saved() = shot("saved") { savedList() }
+
+    @Test
+    fun savedLight() = shot("saved-light", "light") { savedList() }
+
+    @Composable
+    private fun savedList() {
         SavedScreen(
             computers = listOf(
-                SavedComputer("123456789", "Office", "windows", "11"),
-                SavedComputer("555000111", "Pixel", "android", "15"),
-                SavedComputer("424242424", "Studio", "macos", "15"),
+                SavedComputer("123456789", "Front desk", "windows", "11", hostname = "OFFICE-PC"),
+                SavedComputer("555000111", "", "android", "15", hostname = "Pixel-8"),
+                SavedComputer("424242424", "Studio", "macos", "15", hostname = "mac-studio"),
+                SavedComputer("386626882", "386 626 882", "", ""),
             ),
             query = "",
             onQuery = {},
-            onOpen = {},
             onForget = {},
         )
     }
 
     @Test
-    fun settings() = shot("settings") {
+    fun settings() = shot("servercfg-dark") {
         SettingsScreen(
             state = DeskState(
-                server = "pjdesk.spader.us:21200",
+                server = "office.example:21200",
                 fingerprint = "12:34:56:78:9a:bc:de:f0:11:22:33:44:55:66:77:88",
                 hasPermanent = true,
                 approval = "prompt",
@@ -87,6 +92,99 @@ class ScreenshotTest {
             onTheme = {},
             onServer = {},
             onResetFingerprint = {},
+        )
+    }
+
+    @Test
+    fun settingsLight() = shot("servercfg-light", "light") {
+        SettingsScreen(
+            state = DeskState(
+                server = "office.example:21200",
+                fingerprint = "12:34:56:78:9a:bc:de:f0:11:22:33:44:55:66:77:88",
+                hasPermanent = true,
+                approval = "prompt",
+            ),
+            theme = "light",
+            onTheme = {},
+            onServer = {},
+            onResetFingerprint = {},
+        )
+    }
+
+    @Test
+    fun importOfferDark() = shot("import-offer-dark", "dark") { importOffer() }
+
+    @Test
+    fun importOfferLight() = shot("import-offer-light", "light") { importOffer() }
+
+    @Composable
+    private fun importOffer() {
+        SignInScreen(
+            email = "ben@spader.us",
+            password = "",
+            code = "",
+            useCode = false,
+            busy = false,
+            error = "",
+            onEmail = {},
+            onPassword = {},
+            onCode = {},
+            onUseCode = {},
+            onSubmit = {},
+            importOffer = "pjdesk-net1:paste-the-key-here",
+        )
+    }
+
+    @Test
+    fun networkKeyDark() = shot("netkey-dark", "dark") { networkKey() }
+
+    @Test
+    fun networkKeyLight() = shot("netkey-light", "light") { networkKey() }
+
+    @Composable
+    private fun networkKey() {
+        SignInScreen(
+            email = "",
+            password = "",
+            code = "",
+            useCode = false,
+            useKey = true,
+            blob = "pjdesk-net1:paste-the-key-here",
+            keyPass = "",
+            busy = false,
+            error = "",
+            onEmail = {},
+            onPassword = {},
+            onCode = {},
+            onBlob = {},
+            onKeyPass = {},
+            onUseCode = {},
+            onUseKey = {},
+            onScan = {},
+            onSubmit = {},
+        )
+    }
+
+    @Test
+    fun signInDark() = shot("signin-dark", "dark") { signIn() }
+
+    @Test
+    fun signInLight() = shot("signin-light", "light") { signIn() }
+
+    @Composable
+    private fun signIn() {
+        SignInScreen(
+            email = "ben@spader.us",
+            password = "",
+            code = "",
+            useCode = false,
+            busy = false,
+            error = "",
+            onEmail = {},
+            onPassword = {},
+            onCode = {},
+            onUseCode = {},
+            onSubmit = {},
         )
     }
 
@@ -105,9 +203,7 @@ class ScreenshotTest {
 
     @Test
     fun sessionToolbar() = shot("session") {
-        Box(Modifier.fillMaxSize().background(Color.Black)) {
-        SessionChrome(
-            modifier = Modifier.align(Alignment.BottomCenter),
+        SessionScreen(
             session = SessionInfo(
                 peer = "Pixel",
                 id = "555000111",
@@ -122,19 +218,21 @@ class ScreenshotTest {
                 frameW = 1080,
                 frameH = 2400,
             ),
+            onGesture = {},
+            onMouse = { _, _, _, _, _ -> },
             onText = {},
             onSpecial = {},
             onKey = { _, _ -> },
             onQuality = {},
             onDisplay = {},
             onEnd = {},
+            decoder = null,
         )
-        }
     }
 
-    private fun shot(name: String, content: @Composable () -> Unit) {
+    private fun shot(name: String, theme: String = "dark", content: @Composable () -> Unit) {
         val activity = Robolectric.buildActivity(ComponentActivity::class.java).setup().get()
-        activity.setContent { PjTheme(theme = "dark") { content() } }
+        activity.setContent { PjTheme(theme = theme) { content() } }
         ShadowLooper.idleMainLooper()
         val view = activity.window.decorView
         val width = 1080
