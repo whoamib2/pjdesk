@@ -56,6 +56,7 @@ pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result
     if pjdesk_proto::applock::second_window_should_exit(instance::acquire_or_signal()) {
         return Ok(());
     }
+    crate::client_update::adopt_completed_update();
     crate::temp_sign::scrub_abandoned();
     let mut config = Config::load().unwrap_or_default();
     if let Some(flag) = &server_flag {

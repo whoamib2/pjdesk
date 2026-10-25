@@ -59,21 +59,66 @@ fn classify(line: &str) -> Step {
     }
 }
 
-/// The service closed the pipe after it had started the installer.
+/// The service closed the pipe. A restart after the check has already decided,
+/// or after the installer has been launched, is not a failed update.
 fn finish_from_disconnect(last_progress: &str) -> UpdateReply {
+    if let Some(message) = up_to_date_line(last_progress) {
+        return UpdateReply { ok: true, message };
+    }
     if last_progress.starts_with("Installing") {
         UpdateReply { ok: true, message: last_progress.to_string() }
     } else if last_progress.is_empty() {
-        UpdateReply {
-            ok: false,
-            message: "The PJDesk service closed the update before it finished.".into(),
-        }
+        UpdateReply { ok: false, message: "The PJDesk service closed the update before it finished.".into() }
     } else {
-        UpdateReply {
-            ok: false,
-            message: format!("The PJDesk service stopped during the update ({last_progress})."),
+        UpdateReply { ok: false, message: format!("The PJDesk service stopped during the update ({last_progress}).") }
+    }
+}
+
+/// `PJDesk 0.6.31 is up to date.` when `text` already says this copy is current.
+///
+/// The installed version and `GitHub latest is v…` have to be the same release
+/// when both are present. A newer GitHub release is not reported as current,
+/// so an old error stays until a check really is current.
+pub(crate) fn up_to_date_line(text: &str) -> Option<String> {
+    let version = version_before(text, "is up to date")?;
+    if let Some(latest) = version_after(text, "GitHub latest is ") {
+        let have = pjdesk_proto::update::parse_version(&version)?;
+        let want = pjdesk_proto::update::parse_version(&latest)?;
+        if want > have {
+            return None;
         }
     }
+    Some(format!("PJDesk {version} is up to date."))
+}
+
+/// Version named by `Installing PJDesk 0.6.32. …`.
+pub(crate) fn installing_version(text: &str) -> Option<String> {
+    let rest = text.split("Installing PJDesk ").nth(1)?;
+    let version = rest.split(". ").next()?.trim();
+    pjdesk_proto::update::parse_version(version)?;
+    Some(version.to_string())
+}
+
+pub(crate) fn updated_line(version: &str) -> String {
+    format!("Updated to {version}.")
+}
+
+fn version_before(text: &str, marker: &str) -> Option<String> {
+    let at = text.find(marker)?;
+    let before = text[..at].trim();
+    let version = before.rsplit_once("PJDesk ")?.1.trim().trim_end_matches('.').trim_start_matches('v');
+    pjdesk_proto::update::parse_version(version)?;
+    Some(version.to_string())
+}
+
+fn version_after(text: &str, marker: &str) -> Option<String> {
+    let rest = text.split(marker).nth(1)?;
+    let token = rest.split(|c: char| c.is_whitespace() || c == ')').next()?.trim().trim_end_matches('.');
+    let version = token.trim_start_matches('v');
+    if version.is_empty() {
+        return None;
+    }
+    Some(version.to_string())
 }
 
 #[cfg(windows)]
@@ -96,13 +141,13 @@ fn serve_once() -> bool {
     use windows::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
+    use windows::Win32::Security::RevertToSelf;
     use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile, PIPE_ACCESS_DUPLEX};
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, ImpersonateNamedPipeClient, PIPE_READMODE_BYTE,
         PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
-    use windows::Win32::Security::RevertToSelf;
 
     static BUSY: AtomicBool = AtomicBool::new(false);
 
@@ -196,34 +241,17 @@ fn serve_once() -> bool {
             write_line(Outgoing { progress: "", done: true, ok: true, message: "ready" });
         } else if cmd == "update" {
             if BUSY.swap(true, Ordering::SeqCst) {
-                write_line(Outgoing {
-                    progress: "",
-                    done: true,
-                    ok: false,
-                    message: "An update is already running.",
-                });
+                write_line(Outgoing { progress: "", done: true, ok: false, message: "An update is already running." });
             } else {
-                let last_line = std::sync::Mutex::new(String::new());
                 let outcome = pjdesk_proto::update::install_client_as_service(env!("CARGO_PKG_VERSION"), &|line| {
                     tracing::info!("{line}");
-                    *last_line.lock().unwrap() = line.to_string();
                     write_line(Outgoing { progress: line, done: false, ok: false, message: "" });
                 });
                 BUSY.store(false, Ordering::SeqCst);
                 match outcome {
                     Ok(pjdesk_proto::update::Outcome::UpToDate(version)) => {
-                        let saved = last_line.lock().unwrap().clone();
-                        let message = if saved.contains("GitHub latest") {
-                            saved
-                        } else {
-                            format!("PJDesk {version} is up to date.")
-                        };
-                        write_line(Outgoing {
-                            progress: "",
-                            done: true,
-                            ok: true,
-                            message: &message,
-                        });
+                        let message = format!("PJDesk {version} is up to date.");
+                        write_line(Outgoing { progress: "", done: true, ok: true, message: &message });
                     }
                     Ok(pjdesk_proto::update::Outcome::Installing(version)) => write_line(Outgoing {
                         progress: "",
@@ -239,12 +267,7 @@ fn serve_once() -> bool {
                     }),
                     Err(e) => {
                         tracing::warn!("update failed: {e:#}");
-                        write_line(Outgoing {
-                            progress: "",
-                            done: true,
-                            ok: false,
-                            message: &format!("{e:#}"),
-                        });
+                        write_line(Outgoing { progress: "", done: true, ok: false, message: &format!("{e:#}") });
                     }
                 }
             }
@@ -352,7 +375,20 @@ mod tests {
     fn a_dropped_pipe_after_install_started_is_still_success() {
         let reply = finish_from_disconnect("Installing PJDesk 0.6.6. PJDesk will close and open again.");
         assert!(reply.ok);
+        assert_eq!(installing_version(&reply.message).as_deref(), Some("0.6.6"));
         let failed = finish_from_disconnect("Downloading PJDesk 0.6.6… 10%");
         assert!(!failed.ok);
+        assert!(up_to_date_line(&failed.message).is_none());
+    }
+
+    #[test]
+    fn a_restart_after_the_check_is_current_is_not_a_failure() {
+        let reply = finish_from_disconnect("PJDesk 0.6.31 is up to date. GitHub latest is v0.6.31.");
+        assert!(reply.ok);
+        assert_eq!(reply.message, "PJDesk 0.6.31 is up to date.");
+        let stale = "Could not update: The PJDesk service stopped during the update (PJDesk 0.6.31 is up to date. GitHub latest is v0.6.31.).";
+        assert_eq!(up_to_date_line(stale).as_deref(), Some("PJDesk 0.6.31 is up to date."));
+        assert!(up_to_date_line("PJDesk 0.6.31 is up to date. GitHub latest is v0.6.32.").is_none());
+        assert_eq!(up_to_date_line("PJDesk 0.6.31 is up to date.").as_deref(), Some("PJDesk 0.6.31 is up to date."));
     }
 }
