@@ -189,7 +189,8 @@ impl Engine {
 }
 
 fn spawn_host(server: ServerAddr, config: Config, shared: Arc<HostShared>) {
-    let args = HostArgs::from_settings(&config.settings);
+    let mut args = HostArgs::from_settings(&config.settings);
+    args.support_unattended = config.support_unattended();
     std::thread::Builder::new()
         .name("host".into())
         .spawn(move || {
@@ -247,6 +248,9 @@ pub struct App {
     show_settings: bool,
     settings: settings::SettingsDraft,
     access_panel: crate::access_keys::Panel,
+    support_keys: crate::support_keys::Panel,
+    show_support_keys: bool,
+    support_tip: String,
     book_alias: String,
     book_target: Option<String>,
     desk_tab: DeskTab,
@@ -289,6 +293,7 @@ pub struct App {
     net_pass: String,
     net_show: bool,
     net_code: String,
+    net_consent: bool,
     /// 0 account, 1 enrollment code, 2 network key.
     net_mode: u8,
     net_blob: String,
@@ -450,6 +455,9 @@ impl App {
             show_settings: false,
             settings,
             access_panel: crate::access_keys::Panel::default(),
+            support_keys: crate::support_keys::Panel::default(),
+            show_support_keys: false,
+            support_tip: String::new(),
             book_alias: String::new(),
             book_target: None,
             desk_tab: DeskTab::Saved,
@@ -488,6 +496,7 @@ impl App {
             net_pass: String::new(),
             net_show: false,
             net_code: String::new(),
+            net_consent: false,
             net_mode: 0,
             net_blob: String::new(),
             net_key_pass: String::new(),
@@ -846,6 +855,7 @@ impl App {
         self.settings.set_server_text(&self.cfg.effective_server());
         self.temp = Some(TempHold { snapshot, last_activity: Instant::now(), warning: false });
         self.temp_left = 0;
+        crate::network::copy_to_service(&self.cfg);
         self.engine.retarget(&self.cfg);
         self.toast.show("Signed in until you close PJDesk");
     }
@@ -868,6 +878,7 @@ impl App {
             self.status = format!("Could not save settings: {e}");
         }
         self.cfg = disk;
+        crate::network::copy_to_service(&self.cfg);
         self.net_email = self.cfg.network_email.clone().unwrap_or_default();
         self.show_net_sign_in = false;
         self.enrolled_for.clear();
@@ -1005,8 +1016,16 @@ impl App {
             return;
         }
         self.enrolled_for = id.clone();
-        let account = self.account_computers.clone();
-        let local = if self.temp.is_some() { Vec::new() } else { crate::network::saved_from_config(&self.cfg) };
+        let mut account = self.account_computers.clone();
+        let support = self.cfg.support_grant.clone();
+        if let Some(grant) = &support {
+            crate::network::ensure_support_computer(&mut account, &id, &grant.label);
+        }
+        let local = if self.temp.is_some() || support.is_some() {
+            Vec::new()
+        } else {
+            crate::network::saved_from_config(&self.cfg)
+        };
         let this = crate::network::ThisComputer::local(&id);
         let (tx, rx) = std::sync::mpsc::channel();
         self.enroll_rx = Some(rx);
@@ -1245,6 +1264,10 @@ impl App {
                 self.net_importing = false;
                 self.net_pass.clear();
                 self.net_code.clear();
+                self.net_consent = false;
+                self.support_keys.need_consent = false;
+                self.support_keys.enter_consent = false;
+                self.support_keys.enter_code.clear();
                 self.net_blob.clear();
                 self.net_key_pass.clear();
                 self.import_pass.clear();
@@ -1274,6 +1297,10 @@ impl App {
                 self.net_importing = false;
                 self.net_pass.clear();
                 self.net_code.clear();
+                self.net_consent = false;
+                self.support_keys.need_consent = false;
+                self.support_keys.enter_consent = false;
+                self.support_keys.enter_code.clear();
                 self.net_blob.clear();
                 self.net_key_pass.clear();
                 self.import_pass.clear();
@@ -1328,7 +1355,19 @@ impl App {
                 }
                 self.net_offer = false;
                 self.net_login.clear();
-                self.net_error = e;
+                if let Some((owner, label)) = crate::support_keys::parse_consent(&e) {
+                    self.net_consent = false;
+                    self.support_keys.need_consent = true;
+                    self.support_keys.enter_owner = owner.clone();
+                    self.support_keys.enter_label = label;
+                    self.support_keys.enter_note = format!(
+                        "{owner} needs your permission before this computer can be opened without asking."
+                    );
+                    self.net_error = e;
+                } else {
+                    self.support_keys.enter_note = e.clone();
+                    self.net_error = e;
+                }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -1398,12 +1437,17 @@ impl App {
         self.net_login.clear();
         if self.net_mode == 1 {
             let code = self.net_code.clone();
+            let consent = self.net_consent;
+            let pjdesk_for_key = pjdesk_id.clone();
             std::thread::Builder::new()
                 .name("network-sign-in".into())
                 .spawn(move || {
-                    let result = match crate::network::enroll(&code, &device, &name) {
-                        Ok(session) => crate::network::finish_account_sign_in(session, &this, &local, enroll_only)
-                            .map_err(|e| e.to_string()),
+                    let result = match crate::network::enroll(&code, &device, &name, &pjdesk_for_key, consent) {
+                        Ok(session) => {
+                            let upload = if session.support.is_some() { Vec::new() } else { local };
+                            crate::network::finish_account_sign_in(session, &this, &upload, enroll_only)
+                                .map_err(|e| e.to_string())
+                        }
                         Err(e) => Err(e.to_string()),
                     };
                     let _ = tx.send(result);
@@ -1643,6 +1687,8 @@ impl App {
         }
         self.cfg.reload_identity_from_disk();
         self.cfg.leave_network_sign_in();
+        crate::network::copy_to_service(&self.cfg);
+        self.engine.retarget(&self.cfg);
         self.show_net_sign_in = false;
         if let Err(e) = self.cfg.save() {
             self.status = format!("Could not save settings: {e}");
@@ -1689,6 +1735,8 @@ impl App {
                 if revoked {
                     self.cfg.leave_network_sign_in();
                     let _ = self.cfg.save();
+                    crate::network::copy_to_service(&self.cfg);
+                    self.engine.retarget(&self.cfg);
                     return;
                 }
                 self.cfg.apply_network_session(&session);
@@ -1699,6 +1747,8 @@ impl App {
                 if message.contains("Sign in required") || message.to_ascii_lowercase().contains("revoked") {
                     self.cfg.leave_network_sign_in();
                     let _ = self.cfg.save();
+                    crate::network::copy_to_service(&self.cfg);
+                    self.engine.retarget(&self.cfg);
                     self.toast.show("Signed out");
                 }
             }
@@ -2701,6 +2751,8 @@ impl eframe::App for App {
         self.poll_support_offer();
         self.poll_support_connect();
         self.poll_invite();
+        self.poll_support_keys();
+        self.poll_support_leave();
         self.poll_app_lock();
         self.note_lock_visibility(&ctx);
         self.notice_sign_in_paste(&ctx);
@@ -2732,10 +2784,19 @@ impl eframe::App for App {
                     }
                     crate::client_update::start();
                 }
+                tray::Action::Revoke => self.revoke_support_access(),
                 tray::Action::Quit => {
                     self.really_quit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+            }
+        }
+        let banner = self.cfg.support_banner();
+        let tip = if banner.is_empty() { "PJDesk".to_string() } else { banner };
+        if tip != self.support_tip {
+            self.support_tip = tip.clone();
+            if let Some(tray) = &self.tray {
+                tray.set_tooltip(&tip);
             }
         }
         let closing = ctx.input(|i| i.viewport().close_requested());
@@ -2791,6 +2852,7 @@ impl eframe::App for App {
 
         self.settings_window(&ctx);
         self.invite_window(&ctx);
+        self.support_keys_window(&ctx);
         self.session_error_dialog(&ctx);
         self.temporary_warning(&ctx);
         self.import_prompt(&ctx);

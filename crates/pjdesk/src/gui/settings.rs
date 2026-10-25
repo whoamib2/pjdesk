@@ -655,6 +655,10 @@ impl App {
         ui.add_space(12.0);
         self.owner_access_keys(ui);
         ui.add_space(12.0);
+        self.enter_support_key(ui);
+        ui.add_space(12.0);
+        self.support_keys_editor(ui);
+        ui.add_space(12.0);
         widgets::heading(ui, "DIRECT CONNECTIONS");
         widgets::checkbox(ui, &mut self.settings.allow_direct, "Allow direct IP connections");
         ui.add_space(6.0);
@@ -840,10 +844,10 @@ impl App {
             return;
         };
         let limit = if op == "create" {
-            match self.access_panel.limit.trim().parse::<u32>() {
-                Ok(n) if (1..=100).contains(&n) => n,
-                _ => {
-                    self.access_panel.note = "The computer limit is a number from 1 to 100.".into();
+            match crate::access_keys::parse_computer_limit(&self.access_panel.limit) {
+                Ok(n) => n,
+                Err(message) => {
+                    self.access_panel.note = message.into();
                     return;
                 }
             }
@@ -868,6 +872,360 @@ impl App {
             let job = match rt.block_on(crate::access_keys::manage(&server, &mut cfg, &op, &label, expires, limit, &key_id)) {
                 Ok(reply) => crate::access_keys::Job::Ready(reply),
                 Err(e) => crate::access_keys::Job::Failed(e.to_string()),
+            };
+            let _ = tx.send(job);
+        });
+    }
+
+    pub(super) fn support_keys_window(&mut self, ctx: &egui::Context) {
+        if !self.show_support_keys {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Support keys")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                self.support_keys_editor(ui);
+            });
+        if !open {
+            self.show_support_keys = false;
+        }
+    }
+
+    fn enter_support_key(&mut self, ui: &mut egui::Ui) {
+        widgets::heading(ui, "ENTER SUPPORT KEY");
+        ui.label(widgets::muted(
+            ui,
+            "From the person supporting this computer. No PJDesk account is required. The key is not saved on this computer.",
+        ));
+        ui.add_space(6.0);
+        widgets::field_label(ui, "Support key");
+        widgets::password_field(ui, &mut self.support_keys.enter_code, "1234 5678", &mut self.support_keys.enter_show);
+        if self.support_keys.need_consent {
+            ui.add_space(6.0);
+            let owner = self.support_keys.enter_owner.clone();
+            let allow = format!("I allow {owner} to connect to this computer without asking each time.");
+            widgets::checkbox(ui, &mut self.support_keys.enter_consent, &allow);
+            if !self.support_keys.enter_label.is_empty() {
+                ui.label(widgets::muted(ui, &format!("This key is labeled {}.", self.support_keys.enter_label)));
+            }
+        }
+        let busy = self.net_busy;
+        if ui.add_enabled(!busy, egui::Button::new(if busy { "Checking…" } else { "Use this key" })).clicked() {
+            self.submit_support_key();
+        }
+        if !self.support_keys.enter_note.is_empty() && !self.support_keys.need_consent {
+            ui.label(widgets::muted(ui, &self.support_keys.enter_note));
+        } else if self.support_keys.need_consent && self.support_keys.enter_note.contains("Tick") {
+            ui.label(widgets::muted(ui, &self.support_keys.enter_note));
+        } else if self.support_keys.need_consent {
+            ui.label(widgets::muted(ui, &self.support_keys.enter_note));
+        }
+    }
+
+    fn submit_support_key(&mut self) {
+        let digits: String = self.support_keys.enter_code.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() != 8 {
+            self.support_keys.enter_note = "Enter the 8-digit support key.".into();
+            return;
+        }
+        if self.support_keys.need_consent && !self.support_keys.enter_consent {
+            self.support_keys.enter_note = "Tick the box to allow unattended access.".into();
+            return;
+        }
+        self.net_mode = 1;
+        self.net_code = digits;
+        self.net_consent = self.support_keys.enter_consent;
+        self.net_temporary = false;
+        self.net_enroll_only = false;
+        self.support_keys.enter_note.clear();
+        self.start_network_sign_in();
+    }
+
+    fn support_keys_editor(&mut self, ui: &mut egui::Ui) {
+        let signed_in = self.cfg.network_email.as_deref().map(str::trim).is_some_and(|email| !email.is_empty());
+        if !signed_in || !self.cfg.can_manage_support_keys() {
+            if !signed_in && self.cfg.support_grant.is_none() {
+                ui.label(widgets::muted(ui, "Sign in to create a support key."));
+            }
+            return;
+        }
+        widgets::heading(ui, "SUPPORT KEYS");
+        ui.label(widgets::muted(
+            ui,
+            "A support key lets a client join your network without an account. It is shown once. Only a hash is stored. This is separate from a server access key.",
+        ));
+        ui.add_space(6.0);
+        if !self.support_keys.loaded && self.support_keys.rx.is_none() {
+            self.spawn_support_keys("list", String::new(), String::new(), String::new());
+        }
+        if self.support_keys.busy {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if !self.support_keys.secret.is_empty() {
+            ui.label(widgets::muted(ui, "Copy this key now. It is shown once."));
+            let shown = crate::network::group_digits(&self.support_keys.secret);
+            ui.label(RichText::new(shown).size(28.0).strong().monospace());
+            ui.horizontal(|ui| {
+                if ui.button("Copy").clicked() {
+                    widgets::copy_to_clipboard(&crate::network::group_digits(&self.support_keys.secret));
+                    self.support_keys.note = "Support key copied.".into();
+                }
+                if ui.button("Done").clicked() {
+                    self.support_keys.secret.clear();
+                    self.support_keys.show = false;
+                }
+            });
+            ui.add_space(6.0);
+        }
+        widgets::field_label(ui, "Label");
+        widgets::text_field(ui, &mut self.support_keys.label, "Client or company", false);
+        ui.label(widgets::muted(ui, "Use"));
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.support_keys.reusable, false, "Single-use");
+            ui.selectable_value(&mut self.support_keys.reusable, true, "Reusable");
+        });
+        ui.label(widgets::muted(ui, "Expires"));
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.support_keys.expiry, 3600, "1 hour");
+            ui.selectable_value(&mut self.support_keys.expiry, 86_400, "1 day");
+            ui.selectable_value(&mut self.support_keys.expiry, 604_800, "7 days");
+            ui.selectable_value(&mut self.support_keys.expiry, 2_592_000, "30 days");
+            ui.selectable_value(&mut self.support_keys.expiry, 0, "Never");
+        });
+        widgets::field_label(ui, "Computer limit");
+        widgets::text_field(ui, &mut self.support_keys.limit, "1", false);
+        if self.support_keys.limit.is_empty() {
+            self.support_keys.limit = "1".into();
+        }
+        ui.label(widgets::muted(ui, "Connecting"));
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.support_keys.unattended, false, "Client clicks Allow");
+            ui.selectable_value(&mut self.support_keys.unattended, true, "Unattended");
+        });
+        ui.label(widgets::muted(
+            ui,
+            "Unattended opens the computer without an Allow click. The client still ticks a consent box when they enter the key.",
+        ));
+        let busy = self.support_keys.busy;
+        if ui.add_enabled(!busy, egui::Button::new(if busy { "Creating…" } else { "Create" })).clicked() {
+            if self.support_keys.label.trim().is_empty() {
+                self.support_keys.note = "Give the key a label, such as the client's name.".into();
+            } else if !crate::support_keys::expiry_allowed(self.support_keys.expiry) {
+                self.support_keys.note = "Choose 1 hour, 1 day, 7 days, 30 days, or never.".into();
+            } else {
+                self.spawn_support_keys("create", String::new(), String::new(), String::new());
+            }
+        }
+        if !self.support_keys.note.is_empty() {
+            ui.label(widgets::muted(ui, &self.support_keys.note));
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let keys = self.support_keys.keys.clone();
+        for key in keys {
+            let expired = key.expires_at != 0 && now >= key.expires_at;
+            if expired {
+                continue;
+            }
+            let when = if key.expires_at == 0 {
+                "does not expire".to_string()
+            } else {
+                format!("expires {}", crate::network::remaining_label(key.expires_at, now))
+            };
+            let kind = if key.reusable { "reusable" } else { "single-use" };
+            let door = if key.unattended { "unattended" } else { "client clicks Allow" };
+            ui.add_space(6.0);
+            ui.label(RichText::new(&key.label).strong());
+            ui.label(widgets::muted(
+                ui,
+                &format!("{kind} · {when} · limit {} · {door}", key.computer_limit.max(1)),
+            ));
+            let computers = key.computers.clone();
+            for computer in computers {
+                let who = if !computer.name.trim().is_empty() {
+                    computer.name.clone()
+                } else if !computer.pjdesk_id.is_empty() {
+                    computer.pjdesk_id.clone()
+                } else {
+                    "A computer".into()
+                };
+                let mark_id = if computer.pjdesk_id.is_empty() { computer.device_id.clone() } else { computer.pjdesk_id.clone() };
+                let mark = (key.id.clone(), mark_id);
+                let confirming = self.support_keys.confirm_computer.as_ref() == Some(&mark);
+                ui.horizontal(|ui| {
+                    ui.label(who);
+                    if confirming {
+                        if ui.small_button("Remove").clicked() {
+                            let id = key.id.clone();
+                            let pjdesk = computer.pjdesk_id.clone();
+                            let target = computer.device_id.clone();
+                            self.support_keys.confirm_computer = None;
+                            self.spawn_support_keys("remove", id, pjdesk, target);
+                        }
+                        if ui.small_button("Cancel").clicked() {
+                            self.support_keys.confirm_computer = None;
+                        }
+                    } else if ui.small_button("Remove").clicked() {
+                        self.support_keys.confirm_computer = Some(mark);
+                    }
+                });
+            }
+            let confirming = self.support_keys.confirm.as_deref() == Some(key.id.as_str());
+            ui.horizontal(|ui| {
+                if confirming {
+                    ui.label("Revoke this key? Computers that used it lose access.");
+                    if ui.small_button("Revoke").clicked() {
+                        let id = key.id.clone();
+                        self.support_keys.confirm = None;
+                        self.spawn_support_keys("revoke", id, String::new(), String::new());
+                    }
+                    if ui.small_button("Cancel").clicked() {
+                        self.support_keys.confirm = None;
+                    }
+                } else if ui.small_button("Revoke").clicked() {
+                    self.support_keys.confirm = Some(key.id.clone());
+                }
+            });
+        }
+    }
+
+    pub(super) fn poll_support_keys(&mut self) {
+        let Some(rx) = &self.support_keys.rx else { return };
+        let Ok(job) = rx.try_recv() else { return };
+        self.support_keys.rx = None;
+        self.support_keys.busy = false;
+        match job {
+            crate::support_keys::Job::Created { code, keys } => {
+                self.support_keys.secret = code;
+                self.support_keys.keys = keys;
+                self.support_keys.loaded = true;
+                self.support_keys.label.clear();
+                self.support_keys.note = "Copy this key now. It is shown once.".into();
+            }
+            crate::support_keys::Job::Listed(keys) => {
+                self.support_keys.keys = keys;
+                self.support_keys.loaded = true;
+                if self.support_keys.note == "Working…" {
+                    self.support_keys.note.clear();
+                }
+            }
+            crate::support_keys::Job::Failed(message) => {
+                self.support_keys.loaded = true;
+                if message.contains("Only the") || message.contains("No network") {
+                    self.support_keys.hidden = true;
+                }
+                self.support_keys.note = message;
+            }
+        }
+    }
+
+    pub(super) fn poll_support_leave(&mut self) {
+        let Some(rx) = &self.support_keys.leave_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.support_keys.leave_rx = None;
+        self.support_keys.leaving = false;
+        match result {
+            Ok(()) => self.finish_support_leave(),
+            Err(message) => {
+                if message.contains("Sign in required") || message.to_ascii_lowercase().contains("revoked") {
+                    self.finish_support_leave();
+                } else {
+                    self.toast.show(message);
+                }
+            }
+        }
+    }
+
+    fn finish_support_leave(&mut self) {
+        self.cfg.leave_network_sign_in();
+        let _ = self.cfg.save();
+        crate::network::copy_to_service(&self.cfg);
+        self.engine.retarget(&self.cfg);
+        self.toast.show("Support access revoked");
+    }
+
+    pub(super) fn revoke_support_access(&mut self) {
+        if self.support_keys.leaving || self.cfg.support_grant.is_none() {
+            return;
+        }
+        let refresh = self.cfg.network_refresh_token();
+        let device = self.cfg.network_device_id.clone().unwrap_or_default();
+        if refresh.is_empty() || device.is_empty() {
+            self.finish_support_leave();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.support_keys.leaving = true;
+        self.support_keys.leave_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = crate::support_keys::leave(&refresh, &device).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn spawn_support_keys(&mut self, op: &str, key_id: String, pjdesk_id: String, target_device: String) {
+        if self.support_keys.busy {
+            return;
+        }
+        let refresh = self.cfg.network_refresh_token();
+        let device = self.cfg.network_device_id.clone().unwrap_or_default();
+        if refresh.is_empty() || device.is_empty() {
+            self.support_keys.note = "Sign in again.".into();
+            return;
+        }
+        let limit = if op == "create" {
+            match crate::access_keys::parse_computer_limit(&self.support_keys.limit) {
+                Ok(n) => n,
+                Err(message) => {
+                    self.support_keys.note = message.into();
+                    return;
+                }
+            }
+        } else {
+            1
+        };
+        let label = self.support_keys.label.trim().to_string();
+        let reusable = self.support_keys.reusable;
+        let expiry = self.support_keys.expiry;
+        let unattended = self.support_keys.unattended;
+        let op = op.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.support_keys.busy = true;
+        self.support_keys.rx = Some(rx);
+        if op == "create" {
+            self.support_keys.note = "Working…".into();
+        }
+        std::thread::spawn(move || {
+            let job = match op.as_str() {
+                "create" => match crate::support_keys::create_key(&refresh, &device, &label, reusable, expiry, limit, unattended) {
+                    Ok(created) => {
+                        let keys = crate::support_keys::list_keys(&refresh, &device).unwrap_or_default();
+                        crate::support_keys::Job::Created { code: created.code, keys }
+                    }
+                    Err(e) => crate::support_keys::Job::Failed(e.to_string()),
+                },
+                "revoke" => match crate::support_keys::revoke_key(&refresh, &device, &key_id) {
+                    Ok(()) => match crate::support_keys::list_keys(&refresh, &device) {
+                        Ok(keys) => crate::support_keys::Job::Listed(keys),
+                        Err(e) => crate::support_keys::Job::Failed(e.to_string()),
+                    },
+                    Err(e) => crate::support_keys::Job::Failed(e.to_string()),
+                },
+                "remove" => match crate::support_keys::remove_computer(&refresh, &device, &key_id, &pjdesk_id, &target_device) {
+                    Ok(()) => match crate::support_keys::list_keys(&refresh, &device) {
+                        Ok(keys) => crate::support_keys::Job::Listed(keys),
+                        Err(e) => crate::support_keys::Job::Failed(e.to_string()),
+                    },
+                    Err(e) => crate::support_keys::Job::Failed(e.to_string()),
+                },
+                _ => match crate::support_keys::list_keys(&refresh, &device) {
+                    Ok(keys) => crate::support_keys::Job::Listed(keys),
+                    Err(e) => crate::support_keys::Job::Failed(e.to_string()),
+                },
             };
             let _ = tx.send(job);
         });

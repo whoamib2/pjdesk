@@ -86,3 +86,11 @@ pub fn expires_secs(days: u64) -> u64 {
         _ => 0,
     }
 }
+
+/// Shared with support keys. A blank or out-of-range limit is refused.
+pub fn parse_computer_limit(text: &str) -> Result<u32, &'static str> {
+    match text.trim().parse::<u32>() {
+        Ok(n) if (1..=100).contains(&n) => Ok(n),
+        _ => Err("The computer limit is a number from 1 to 100."),
+    }
+}

@@ -282,9 +282,54 @@ pub(crate) struct HostState {
     server_proto: AtomicU16,
     /// This computer's ID, once the server has assigned it (also used by LAN beacons).
     device_id: Mutex<String>,
+    /// Refresh token and key id for the connection log. Absent when this computer
+    /// has no support key. The digits are not here.
+    support_log: Mutex<Option<SupportLog>>,
+}
+
+#[derive(Clone)]
+struct SupportLog {
+    #[allow(dead_code)]
+    key_id: String,
+    refresh: String,
+    device_id: String,
+    pjdesk_id: String,
 }
 
 impl HostState {
+    fn remember_support(&self, config: &crate::config::Config) {
+        let grant = config.support_grant.as_ref();
+        let next = grant.and_then(|grant| {
+            if grant.key_id.trim().is_empty() {
+                return None;
+            }
+            let refresh = config.network_refresh_token();
+            if refresh.is_empty() {
+                return None;
+            }
+            Some(SupportLog {
+                key_id: grant.key_id.clone(),
+                refresh,
+                device_id: config.network_device_id.clone().unwrap_or_default(),
+                pjdesk_id: config.device_id.clone().unwrap_or_default(),
+            })
+        });
+        *self.support_log.lock().unwrap() = next;
+    }
+
+    fn note_support_connection(&self, via_server: bool, from_name: &str) {
+        if !via_server {
+            return;
+        }
+        let Some(log) = self.support_log.lock().unwrap().clone() else { return };
+        let from_name = from_name.trim().to_string();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::support_keys::log_connection(&log.refresh, &log.device_id, &log.pjdesk_id, &from_name) {
+                debug!("support connection was not logged: {e}");
+            }
+        });
+    }
+
     /// Publishes the current password to the UI handle, if any.
     fn publish_password(&self) {
         if let Some(shared) = &self.shared {
@@ -447,6 +492,7 @@ async fn host_main(
         policy: Mutex::new(Policy::default()),
         server_proto: AtomicU16::new(pjdesk_proto::PROTOCOL_VERSION),
         device_id: Mutex::new(String::new()),
+        support_log: Mutex::new(None),
     });
     if args.allow_direct {
         let direct = state.clone();
@@ -548,6 +594,7 @@ async fn signaling_loop(
         config.network_public_ip = refreshed.network_public_ip;
     });
     let _ = config.reload_access_key();
+    state.remember_support(config);
     let server = ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone());
     let token = config.presented_access();
     let access_key = pjdesk_proto::access::is_access_key(&token);
@@ -613,6 +660,7 @@ async fn signaling_loop(
         config.device_id = Some(device_id.clone());
         config.save()?;
     }
+    state.remember_support(config);
     let has_permanent = state.permanent.lock().unwrap().is_some();
     print_banner(&device_id, &state.password.lock().unwrap(), has_permanent, &server);
     crate::HOST_ONLINE.store(true, Ordering::SeqCst);
@@ -852,7 +900,7 @@ async fn session_inner(
         state.note_success(&source);
     }
     let (mut ceiling, receive_dir) =
-        open_session(state, &mut auth, &passwords, permanent.as_deref(), controller_name, controller_ip).await?;
+        open_session(state, &mut auth, &passwords, permanent.as_deref(), controller_name, controller_ip, true).await?;
 
     // Authenticated: this session takes the screen, unless another one got there first.
     state.pending.fetch_sub(1, Ordering::SeqCst);
@@ -1024,12 +1072,14 @@ async fn open_session(
     permanent: Option<&str>,
     controller_name: &str,
     controller_ip: &str,
+    via_server: bool,
 ) -> Result<(u32, String)> {
     if auth.password_slot != ASK_SLOT {
         let support = state.support_password.lock().unwrap().clone();
         if admit::matched_support(passwords, auth.password_slot, Some(support.as_str())) {
             let policy = state.policy.lock().unwrap().clone();
             grant_auth(&mut auth.send, &state.name).await?;
+            state.note_support_connection(via_server, controller_name);
             return Ok((
                 admit::support_open(&policy, state.args.view_only),
                 crate::resolve_receive_dir(&state.args.receive_dir),
@@ -1042,8 +1092,18 @@ async fn open_session(
             admit::after_password(&state.args.approval, matched, permanent_set, &policy, state.args.view_only)
         {
             grant_auth(&mut auth.send, &state.name).await?;
+            state.note_support_connection(via_server, controller_name);
             return Ok((bits, crate::resolve_receive_dir(&state.args.receive_dir)));
         }
+    }
+    if admit::support_key_admits(state.args.support_unattended, via_server) {
+        let policy = state.policy.lock().unwrap().clone();
+        grant_auth(&mut auth.send, &state.name).await?;
+        state.note_support_connection(true, controller_name);
+        return Ok((
+            admit::support_open(&policy, state.args.view_only),
+            crate::resolve_receive_dir(&state.args.receive_dir),
+        ));
     }
     let who = if auth.password_slot == ASK_SLOT && !auth.peer_name.trim().is_empty() {
         auth.peer_name.as_str()
@@ -1053,6 +1113,7 @@ async fn open_session(
     match approve(state, who, controller_ip).await {
         Person::Yes(bits, dir) => {
             grant_auth(&mut auth.send, &state.name).await?;
+            state.note_support_connection(via_server, controller_name);
             Ok((bits, dir))
         }
         Person::No => {

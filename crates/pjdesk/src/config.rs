@@ -16,6 +16,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::secure;
 
+/// A support key this computer accepted. The 8 digits are not kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupportGrant {
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub key_id: String,
+    #[serde(default)]
+    pub unattended: bool,
+    /// True after the client ticked the consent box for an unattended key.
+    #[serde(default)]
+    pub consented: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// Server address, `host[:port]`.
@@ -73,6 +89,9 @@ pub struct Config {
     /// `owner` or `member`, from the last sign-in. Empty until then.
     #[serde(default)]
     pub network_role: String,
+    /// Set when this computer was enrolled with a support key. The digits are not stored.
+    #[serde(default)]
+    pub support_grant: Option<SupportGrant>,
     /// Server access key, sealed so the background service can present it.
     /// The key text is not stored in the clear.
     #[serde(default)]
@@ -701,6 +720,15 @@ impl Config {
         if !session.role.is_empty() {
             self.network_role = session.role.clone();
         }
+        if let Some(info) = &session.support {
+            self.support_grant = Some(SupportGrant {
+                owner: info.owner.clone(),
+                label: info.label.clone(),
+                key_id: info.key_id.clone(),
+                unattended: info.unattended,
+                consented: info.unattended,
+            });
+        }
         if !session.address.trim().is_empty() {
             let next = crate::network::keep_hostname(self.server.as_deref().unwrap_or(""), session.address.trim());
             if !next.is_empty() {
@@ -785,6 +813,28 @@ impl Config {
         self.network_access_exp = 0;
         self.network_list_merged = false;
         self.password_vault_key = None;
+        self.support_grant = None;
+        if self.network_role == "support" {
+            self.network_role.clear();
+        }
+    }
+
+    /// Ben's signed-in computer can create and revoke support keys.
+    /// A computer that joined with a key cannot.
+    pub fn can_manage_support_keys(&self) -> bool {
+        self.support_grant.is_none()
+            && !self.network_refresh_token().is_empty()
+            && self.network_role != "member"
+            && self.network_role != "support"
+    }
+
+    pub fn support_banner(&self) -> String {
+        self.support_grant.as_ref().map(|grant| crate::support_keys::banner(&grant.owner)).unwrap_or_default()
+    }
+
+    /// Unattended support access, after the client ticked the consent box.
+    pub fn support_unattended(&self) -> bool {
+        self.support_grant.as_ref().is_some_and(|grant| grant.unattended && grant.consented)
     }
 
     pub(crate) fn password_vault_times(&self) -> &BTreeMap<String, u64> {
@@ -936,6 +986,9 @@ impl Config {
             let incoming = nickname_text(&computer.name, &id, &known_host);
             if let Some(entry) = self.address_book.iter_mut().find(|e| e.id == id) {
                 entry.password = None;
+                if computer.group == crate::support_keys::CLIENTS && !crate::support_keys::is_clients(&entry.tags) {
+                    entry.tags.push(crate::support_keys::CLIENTS.into());
+                }
                 let local = nickname_text(&entry.alias, &id, &known_host);
                 if prefer_account && !incoming.is_empty() {
                     entry.alias = incoming;
@@ -946,13 +999,21 @@ impl Config {
                         entry.alias.clear();
                     }
                 }
-            } else if !incoming.is_empty() || !known_host.is_empty() || !computer.os_family.is_empty() || computer.starred.is_some()
+            } else if !incoming.is_empty()
+                || !known_host.is_empty()
+                || !computer.os_family.is_empty()
+                || computer.starred.is_some()
+                || computer.group == crate::support_keys::CLIENTS
             {
                 self.address_book.push(AddressEntry {
                     id: id.clone(),
                     alias: incoming,
                     password: None,
-                    ..Default::default()
+                    tags: if computer.group == crate::support_keys::CLIENTS {
+                        vec![crate::support_keys::CLIENTS.into()]
+                    } else {
+                        Vec::new()
+                    },
                 });
             }
         }
@@ -1134,6 +1195,21 @@ mod tests {
         assert_eq!(c.address_book[0].alias, "Front desk");
         assert_eq!(c.settings.peers.get("123456789").unwrap().hostname, "OFFICE-PC");
 
+        let mut clients = Config::default();
+        clients.merge_computers(
+            &[crate::network::SavedComputer {
+                id: "902488771".into(),
+                name: "Acme".into(),
+                hostname: "ACME-PC".into(),
+                group: "Clients".into(),
+                ..Default::default()
+            }],
+            true,
+        );
+        assert_eq!(clients.address_book[0].alias, "Acme");
+        assert!(crate::support_keys::is_clients(&clients.address_book[0].tags));
+        assert_eq!(crate::support_keys::banner("Ben Spader"), "Ben Spader (support) has access");
+
         let mut fresh = Config::default();
         fresh.merge_computers(
             &[crate::network::SavedComputer {
@@ -1202,6 +1278,7 @@ mod tests {
                     starred: Some(true),
                     position: Some(5),
                     hidden: false,
+                    group: String::new(),
                 },
                 crate::network::SavedComputer {
                     id: "333333333".into(),

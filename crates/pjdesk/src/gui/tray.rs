@@ -8,6 +8,7 @@
 pub enum Action {
     Show,
     Update,
+    Revoke,
     Quit,
 }
 
@@ -32,6 +33,7 @@ mod imp {
         _icon: TrayIcon,
         show_id: String,
         update_id: String,
+        revoke_id: String,
         quit_id: String,
     }
 
@@ -43,12 +45,15 @@ mod imp {
             let menu = Menu::new();
             let show = MenuItem::new("Show PJDesk", true, None);
             let update = MenuItem::new("Check for updates now", true, None);
+            let revoke = MenuItem::new("Revoke access", true, None);
             let quit = MenuItem::new("Quit PJDesk", true, None);
             menu.append(&show).ok()?;
             menu.append(&update).ok()?;
+            menu.append(&revoke).ok()?;
             menu.append(&quit).ok()?;
             let show_id = show.id().0.clone();
             let update_id = update.id().0.clone();
+            let revoke_id = revoke.id().0.clone();
             let quit_id = quit.id().0.clone();
 
             // Wake the UI whenever a tray event arrives, so Show/Quit work even
@@ -88,7 +93,11 @@ mod imp {
                 .with_menu_on_left_click(false)
                 .build()
                 .ok()?;
-            Some(Self { _icon: icon, show_id, update_id, quit_id })
+            Some(Self { _icon: icon, show_id, update_id, revoke_id, quit_id })
+        }
+
+        pub fn set_tooltip(&self, text: &str) {
+            let _ = self._icon.set_tooltip(Some(text));
         }
 
         /// Drains any pending tray actions.
@@ -107,6 +116,8 @@ mod imp {
                     out.push(Action::Show);
                 } else if id == self.update_id {
                     out.push(Action::Update);
+                } else if id == self.revoke_id {
+                    out.push(Action::Revoke);
                 } else if id == self.quit_id {
                     out.push(Action::Quit);
                 }
@@ -132,5 +143,6 @@ mod stub {
         pub fn poll(&self) -> Vec<Action> {
             Vec::new()
         }
+        pub fn set_tooltip(&self, _text: &str) {}
     }
 }

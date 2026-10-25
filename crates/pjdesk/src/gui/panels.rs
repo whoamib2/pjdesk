@@ -37,6 +37,13 @@ impl App {
             }
             ui.label(RichText::new("PJDesk").size(20.0).strong().color(p.text));
             ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(p.muted).size(12.5));
+            let banner = self.cfg.support_banner();
+            if !banner.is_empty() {
+                ui.label(RichText::new(banner).color(p.warn).size(13.0));
+                if ui.button("Revoke access").clicked() && !self.support_keys.leaving {
+                    self.revoke_support_access();
+                }
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if widgets::icon_button(ui, Icon::Gear, "Settings (Ctrl+,)").clicked() {
@@ -273,7 +280,7 @@ impl App {
                     "Paste a network key. This computer is added to your account. This sign-in ends when you close PJDesk."
                 }
                 2 => "Paste a network key from My network or the PJDesk Server window. This computer enrolls and stays signed in after a restart.",
-                1 => "Enter an 8-digit code from someone on this network. It works once, lasts one hour, and you do not need a PJDesk account. An older enrollment code still works in this box.",
+                1 => "Enter an 8-digit code. An invite works once and lasts one hour. A support key uses the options chosen when it was created. You do not need a PJDesk account.",
                 _ => "Your PJDesk account sets the servers for this network. It does not connect you to a computer, and it is not that computer's password.",
             };
             ui.label(widgets::muted(ui, intro));
@@ -325,8 +332,19 @@ impl App {
                     widgets::text_field(ui, &mut self.net_code, "1234 5678", true);
                     ui.label(widgets::muted(
                         ui,
-                        "From Invite on a signed-in PJDesk. One use, one hour. An older enrollment code from pjdesk.com still works here.",
+                        "An invite from a signed-in PJDesk works once, for one hour. A support key works for as long as that key allows. An older enrollment code still works here.",
                     ));
+                    if let Some((owner, label)) = crate::support_keys::parse_consent(&self.net_error) {
+                        ui.add_space(8.0);
+                        let allow = format!("I allow {owner} to connect to this computer without asking each time.");
+                        widgets::checkbox(ui, &mut self.net_consent, &allow);
+                        if !label.is_empty() {
+                            ui.label(widgets::muted(ui, &format!("This key is labeled {label}.")));
+                        }
+                        if self.support_keys.enter_note.contains("Tick") {
+                            ui.colored_label(p.warn, &self.support_keys.enter_note);
+                        }
+                    }
                 }
                 ui.add_space(8.0);
                 widgets::checkbox(
@@ -339,7 +357,7 @@ impl App {
                     "This computer is added to your account either way. When this is checked, the sign-in ends when you close PJDesk and is not kept on this computer.",
                 ));
                 ui.add_space(8.0);
-                if !self.net_error.is_empty() {
+                if !self.net_error.is_empty() && crate::support_keys::parse_consent(&self.net_error).is_none() {
                     ui.colored_label(p.warn, &self.net_error);
                     ui.add_space(6.0);
                 }
@@ -408,7 +426,11 @@ impl App {
             self.start_network_sign_in();
         } else if go {
             self.net_enroll_only = false;
-            self.start_network_sign_in();
+            if self.net_mode == 1 && crate::support_keys::parse_consent(&self.net_error).is_some() && !self.net_consent {
+                self.support_keys.enter_note = "Tick the box to allow unattended access.".into();
+            } else {
+                self.start_network_sign_in();
+            }
         }
     }
 

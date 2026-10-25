@@ -85,7 +85,7 @@ async fn one(state: Arc<HostState>, incoming: quinn::Incoming) -> Result<()> {
     }
     let peer_name = auth.peer_name.clone();
     let (mut ceiling, receive_dir) =
-        super::open_session(&state, &mut auth, &passwords, permanent.as_deref(), &peer_name, &ip).await?;
+        super::open_session(&state, &mut auth, &passwords, permanent.as_deref(), &peer_name, &ip, false).await?;
     if state.streaming.swap(true, Ordering::SeqCst) {
         let message = "another controller is already connected";
         warn!("Password was accepted, then the direct session stopped: {message}");

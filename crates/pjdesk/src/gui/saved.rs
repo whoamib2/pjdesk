@@ -38,6 +38,8 @@ pub struct SavedRow {
     /// Name chosen on that computer. A nickname typed here replaces it on this row only.
     pub display_name: String,
     pub in_book: bool,
+    /// This computer joined through a support key. It is listed under Clients.
+    pub clients: bool,
     /// Direct LAN address (`host:port`). Set only for a computer found on this network.
     pub direct: Option<String>,
 }
@@ -197,12 +199,31 @@ pub fn sort_rows(rows: &mut [SavedRow], sort: SavedSort) {
         }
         SavedSort::Os => rows
             .sort_by(|a, b| os_label(&a.os_family).cmp(os_label(&b.os_family)).then(sort_label(a).cmp(&sort_label(b)))),
-        SavedSort::Order => rows.sort_by(|a, b| {
+            SavedSort::Order => rows.sort_by(|a, b| {
             let ao = if a.sort_order == 0 { u32::MAX } else { a.sort_order };
             let bo = if b.sort_order == 0 { u32::MAX } else { b.sort_order };
             ao.cmp(&bo).then(sort_label(a).cmp(&sort_label(b))).then(a.id.cmp(&b.id))
         }),
     }
+}
+
+/// Clients first, grouped by the key's label. Everyone else stays in the original order.
+pub fn client_sections(rows: Vec<SavedRow>) -> (Vec<(String, Vec<SavedRow>)>, Vec<SavedRow>) {
+    let mut groups: Vec<(String, Vec<SavedRow>)> = Vec::new();
+    let mut rest = Vec::new();
+    for row in rows {
+        if row.clients {
+            let label = if row.nickname.trim().is_empty() { "Support key".to_string() } else { row.nickname.clone() };
+            if let Some((_, list)) = groups.iter_mut().find(|(name, _)| name == &label) {
+                list.push(row);
+            } else {
+                groups.push((label, vec![row]));
+            }
+        } else {
+            rest.push(row);
+        }
+    }
+    (groups, rest)
 }
 
 impl App {
@@ -275,6 +296,10 @@ impl App {
             submitted = search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
+                let can_keys = self.cfg.can_manage_support_keys();
+                if can_keys && ui.button("Support keys").clicked() {
+                    self.show_support_keys = true;
+                }
                 ui.label(widgets::muted(ui, "Sort"));
                 egui::ComboBox::from_id_salt("saved-sort")
                     .selected_text(match self.saved_sort {
@@ -338,18 +363,24 @@ impl App {
             };
             egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]).show(ui, |ui| {
                 let mut action: Option<RowCmd> = None;
-                match view {
-                    SavedView::List => {
-                        let available = ui.available_width();
-                        let width = if available.is_finite() { (available - ROW_GUTTER).max(0.0) } else { 640.0 };
-                        let layout = saved_layout(width);
-                        saved_header(ui, width, &layout);
-                        for row in &rows {
-                            self.saved_row(ui, row, width, &layout, &mut action);
-                        }
+                let available = ui.available_width();
+                let width = if available.is_finite() { (available - ROW_GUTTER).max(0.0) } else { 640.0 };
+                let layout = saved_layout(width);
+                if view == SavedView::List {
+                    saved_header(ui, width, &layout);
+                }
+                let (groups, rest) = client_sections(rows);
+                if !groups.is_empty() {
+                    ui.label(RichText::new("Clients").strong());
+                    ui.add_space(4.0);
+                    for (label, group) in &groups {
+                        ui.label(widgets::muted(ui, label));
+                        self.paint_saved_rows(ui, group, view, width, &layout, &mut action);
+                        ui.add_space(8.0);
                     }
-                    SavedView::Small => self.tile_grid(ui, &rows, false, &mut action),
-                    SavedView::Big => self.tile_grid(ui, &rows, true, &mut action),
+                }
+                if !rest.is_empty() {
+                    self.paint_saved_rows(ui, &rest, view, width, &layout, &mut action);
                 }
                 if let Some(cmd) = action {
                     self.apply_saved(cmd);
@@ -362,6 +393,26 @@ impl App {
         }
         if let Some(id) = self.confirm_delete.clone() {
             self.delete_dialog(ui, &id);
+        }
+    }
+
+    fn paint_saved_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        rows: &[SavedRow],
+        view: SavedView,
+        width: f32,
+        layout: &SavedLayout,
+        action: &mut Option<RowCmd>,
+    ) {
+        match view {
+            SavedView::List => {
+                for row in rows {
+                    self.saved_row(ui, row, width, layout, action);
+                }
+            }
+            SavedView::Small => self.tile_grid(ui, rows, false, action),
+            SavedView::Big => self.tile_grid(ui, rows, true, action),
         }
     }
 
@@ -384,6 +435,7 @@ impl App {
             let note = self.cfg.settings.peers.get(&id);
             let hostname = note.map(|n| n.hostname.trim().to_string()).unwrap_or_default();
             let alias = entry.map(|e| e.alias.clone()).unwrap_or_default();
+            let clients = entry.is_some_and(|e| crate::support_keys::is_clients(&e.tags));
             let nickname = crate::config::nickname_text(&alias, &id, &hostname);
             let on_lan = self.lan.iter().any(|(_, lan_id, _)| normalize_id(lan_id) == id);
             let online = presence_online(note.is_some_and(|n| n.reported_online), on_lan);
@@ -403,6 +455,7 @@ impl App {
                 sort_order: note.map(|n| n.sort_order).unwrap_or(0),
                 display_name: note.map(|n| n.display_name.clone()).unwrap_or_default(),
                 in_book: entry.is_some(),
+                clients,
                 direct: None,
             });
         }
@@ -439,6 +492,7 @@ impl App {
                 sort_order: note.map(|n| n.sort_order).unwrap_or(0),
                 display_name: note.map(|n| n.display_name.clone()).unwrap_or_default(),
                 in_book: entry.is_some() && !self.cfg.is_saved_hidden(&id),
+                clients: entry.is_some_and(|e| crate::support_keys::is_clients(&e.tags)),
                 direct: Some(addr.clone()),
             });
         }
@@ -612,6 +666,15 @@ impl App {
     }
 
     fn menu_items(&mut self, ui: &mut egui::Ui, row: &SavedRow, id: &str, action: &mut Option<RowCmd>) {
+                    let can_keys = self.cfg.can_manage_support_keys();
+                    if can_keys && ui.button("Support keys").clicked() {
+                        self.show_support_keys = true;
+                        ui.close();
+                    }
+                    if can_keys && row.clients && ui.button("Remove from this support key").clicked() {
+                        *action = Some(RowCmd::RemoveSupport(id.to_string()));
+                        ui.close();
+                    }
                     if !row.this_computer && ui.button("Request view access").clicked() {
                         *action = Some(RowCmd::View(id.to_string()));
                         ui.close();
@@ -780,7 +843,15 @@ impl App {
 
     fn apply_saved(&mut self, cmd: RowCmd) {
         match cmd {
-            RowCmd::Connect(id) => self.connect_to(&id, None, false),
+            RowCmd::Connect(id) => {
+                let client = self.cfg.address_book.iter().any(|e| e.id == id && crate::support_keys::is_clients(&e.tags));
+                if client && self.cfg.saved_password(&id).is_none() {
+                    self.ask_person_next = true;
+                    self.spawn_viewer(&id, "", false, false, false);
+                } else {
+                    self.connect_to(&id, None, false);
+                }
+            }
             RowCmd::Direct(id, addr) => self.connect_discovered(&id, &addr),
             RowCmd::View(id) => self.request_view(&id),
             RowCmd::Files(id) => self.connect_to(&id, None, false),
@@ -798,6 +869,7 @@ impl App {
             RowCmd::Remove(id) => self.confirm_remove = Some(id),
             RowCmd::DeleteAccount(id) => self.confirm_delete = Some(id),
             RowCmd::Move(id, up) => self.move_saved(&id, up),
+            RowCmd::RemoveSupport(id) => self.remove_support_computer(&id),
             RowCmd::Rename(id) => {
                 let hostname = self.cfg.settings.peers.get(&id).map(|n| n.hostname.clone()).unwrap_or_default();
                 let alias =
@@ -824,6 +896,40 @@ impl App {
                 self.toast.show("Nickname saved");
             }
         }
+    }
+
+    fn remove_support_computer(&mut self, id: &str) {
+        if self.support_keys.busy {
+            return;
+        }
+        let refresh = self.cfg.network_refresh_token();
+        let device = self.cfg.network_device_id.clone().unwrap_or_default();
+        if refresh.is_empty() || device.is_empty() {
+            self.status = "Sign in to remove a computer from a support key.".into();
+            return;
+        }
+        let id = id.to_string();
+        let sent = id.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.support_keys.busy = true;
+        self.support_keys.rx = Some(rx);
+        self.support_keys.note = "Working…".into();
+        std::thread::spawn(move || {
+            let job = match crate::support_keys::remove_computer_by_id(&refresh, &device, &sent) {
+                Ok(()) => match crate::support_keys::list_keys(&refresh, &device) {
+                    Ok(keys) => crate::support_keys::Job::Listed(keys),
+                    Err(e) => crate::support_keys::Job::Failed(e.to_string()),
+                },
+                Err(e) => crate::support_keys::Job::Failed(e.to_string()),
+            };
+            let _ = tx.send(job);
+        });
+        self.cfg.address_book.retain(|entry| entry.id != id);
+        if !self.cfg.saved_hidden.iter().any(|hidden| hidden == &id) {
+            self.cfg.saved_hidden.push(id);
+        }
+        let _ = self.cfg.save();
+        self.request_saved_refresh();
     }
 
     fn computer_label(&self, id: &str) -> String {
@@ -1074,6 +1180,7 @@ enum RowCmd {
     Rename(String),
     CommitRename(String),
     Move(String, bool),
+    RemoveSupport(String),
 }
 
 fn ago(unix: u64) -> String {
@@ -1610,6 +1717,7 @@ mod tests {
                 sort_order: 0,
                 display_name: String::new(),
                 in_book: true,
+                clients: false,
                 direct: None,
             },
             SavedRow {
@@ -1628,6 +1736,7 @@ mod tests {
                 sort_order: 0,
                 display_name: String::new(),
                 in_book: true,
+                clients: false,
                 direct: None,
             },
         ];
@@ -1657,6 +1766,7 @@ mod tests {
             sort_order: 0,
             display_name: String::new(),
             in_book: true,
+            clients: false,
             direct: None,
         };
         assert_eq!(status_text(&row), "Offline");
@@ -1832,6 +1942,7 @@ mod tests {
             sort_order: 0,
             display_name: String::new(),
             in_book: false,
+            clients: false,
             direct: direct.map(str::to_string),
         }
     }

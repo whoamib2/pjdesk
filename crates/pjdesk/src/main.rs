@@ -33,6 +33,7 @@ mod platform;
 mod secure;
 mod service;
 mod session;
+mod support_keys;
 mod signaling;
 mod syspaths;
 mod temp_sign;
@@ -212,6 +213,10 @@ pub struct HostArgs {
     /// True when this process is the background service helper (runs as SYSTEM).
     #[arg(skip)]
     pub service_host: bool,
+    /// This computer accepted an unattended support key. Signaling sessions open
+    /// without Allow. Direct connections still ask.
+    #[arg(skip)]
+    pub support_unattended: bool,
 }
 
 impl Default for HostArgs {
@@ -232,6 +237,7 @@ impl Default for HostArgs {
             discover_lan: true,
             tunnel_ports: Vec::new(),
             service_host: false,
+            support_unattended: false,
         }
     }
 }
@@ -276,6 +282,7 @@ impl HostArgs {
             discover_lan: settings.discover_lan,
             tunnel_ports: settings.tunnel_ports.clone(),
             service_host: false,
+            support_unattended: false,
         }
     }
 }

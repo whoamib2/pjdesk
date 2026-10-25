@@ -58,6 +58,8 @@ pub struct SavedComputer {
     pub position: Option<u32>,
     /// The account says this computer was removed from Saved.
     pub hidden: bool,
+    /// Saved-list group. "Clients" is a support-key computer.
+    pub group: String,
 }
 
 /// A computer registered on the account's server. The user name is present only
@@ -96,6 +98,17 @@ pub struct Session {
     pub vault_key: Option<[u8; 32]>,
     /// `owner` or `member` when sign-in could read it. Empty leaves the saved role.
     pub role: String,
+    /// Set when this sign-in redeemed a support key.
+    pub support: Option<SupportInfo>,
+}
+
+/// What the supported computer shows, and how its host admits Ben.
+#[derive(Debug, Clone)]
+pub struct SupportInfo {
+    pub owner: String,
+    pub label: String,
+    pub key_id: String,
+    pub unattended: bool,
 }
 
 /// A hostname is kept when a later update only has the raw IP it points at.
@@ -148,6 +161,8 @@ struct NetworkReply {
     presence: Vec<PresenceBody>,
     #[serde(default)]
     removed: Vec<String>,
+    #[serde(default)]
+    support: Option<SupportBody>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +201,20 @@ struct ComputerBody {
     position: Option<u32>,
     #[serde(default)]
     hidden: bool,
+    #[serde(default)]
+    group: String,
+}
+
+#[derive(Deserialize, Default)]
+struct SupportBody {
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    unattended: bool,
+    #[serde(default)]
+    key_id: String,
 }
 
 #[derive(Deserialize)]
@@ -208,7 +237,7 @@ struct PresenceBody {
     online: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct ErrorBody {
     #[serde(default)]
     error: String,
@@ -216,13 +245,20 @@ struct ErrorBody {
     code: String,
     #[serde(default)]
     role: String,
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    label: String,
 }
 
-struct ApiFail {
-    status: u16,
-    message: String,
-    code: String,
-    role: String,
+#[derive(Clone)]
+pub(crate) struct ApiFail {
+    pub status: u16,
+    pub message: String,
+    pub code: String,
+    pub role: String,
+    pub owner: String,
+    pub label: String,
 }
 
 /// A failed token refresh. `revoked` is an explicit 401 or a revoked key.
@@ -247,7 +283,7 @@ pub fn refresh_failure_revokes(status: u16, message: &str) -> bool {
         || message.contains("Sign in required")
 }
 
-fn api_base() -> String {
+pub(crate) fn api_base() -> String {
     std::env::var("PJDESK_CLOUD_API")
         .ok()
         .map(|s| s.trim().trim_end_matches('/').to_string())
@@ -272,7 +308,7 @@ fn post_api(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> std::r
         Ok(resp) => Ok(resp.into_string().unwrap_or_default()),
         Err(ureq::Error::Status(code, resp)) => {
             let text = resp.into_string().unwrap_or_default();
-            let parsed: ErrorBody = serde_json::from_str(&text).unwrap_or(ErrorBody { error: String::new(), code: String::new(), role: String::new() });
+            let parsed: ErrorBody = serde_json::from_str(&text).unwrap_or_default();
             let message = if !parsed.error.is_empty() {
                 parsed.error
             } else if code == 401 {
@@ -280,13 +316,22 @@ fn post_api(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> std::r
             } else {
                 format!("PJDesk could not sign in ({code}).")
             };
-            Err(ApiFail { status: code, message, code: parsed.code, role: parsed.role })
+            Err(ApiFail {
+                status: code,
+                message,
+                code: parsed.code,
+                role: parsed.role,
+                owner: parsed.owner,
+                label: parsed.label,
+            })
         }
         Err(ureq::Error::Transport(_)) => Err(ApiFail {
             status: 0,
             message: "Could not reach pjdesk.com.".into(),
             code: String::new(),
             role: String::new(),
+            owner: String::new(),
+            label: String::new(),
         }),
     }
 }
@@ -396,6 +441,7 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
                 starred: c.starred,
                 position: c.position,
                 hidden: c.hidden,
+                group: if c.group == crate::support_keys::CLIENTS { crate::support_keys::CLIENTS.into() } else { String::new() },
             })
             .collect(),
         presence: reply
@@ -414,7 +460,23 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
             .collect(),
         removed: reply.removed.into_iter().map(|id| pjdesk_proto::normalize_id(&id)).filter(|id| pjdesk_proto::is_valid_id(id)).collect(),
         vault_key: None,
-        role: String::new(),
+        role: if reply.support.as_ref().is_some_and(|item| !item.owner.trim().is_empty() || !item.key_id.trim().is_empty()) {
+            "support".into()
+        } else {
+            String::new()
+        },
+        support: reply.support.and_then(|item| {
+            if item.owner.trim().is_empty() && item.key_id.trim().is_empty() {
+                None
+            } else {
+                Some(SupportInfo {
+                    owner: item.owner,
+                    label: item.label,
+                    key_id: item.key_id,
+                    unattended: item.unattended,
+                })
+            }
+        }),
     })
 }
 
@@ -622,13 +684,25 @@ fn login_token(email: &str, password: &str) -> Result<String> {
     Ok(login.token)
 }
 
-/// Enrolls this device with a one-time code from My network. No password is typed.
-pub fn enroll(code: &str, device_id: &str, device_name: &str) -> Result<Session> {
-    let text = post_json(
-        &format!("{}/api/network/enroll", api_base()),
-        None,
-        &serde_json::json!({ "code": code, "device_id": device_id, "device_name": device_name }),
-    )?;
+/// Enrolls this device with an 8-digit invite or a support key. No account password is typed.
+/// `consent` is the box the client ticks for an unattended support key.
+pub fn enroll(code: &str, device_id: &str, device_name: &str, pjdesk_id: &str, consent: bool) -> Result<Session> {
+    let body = serde_json::json!({
+        "code": code,
+        "device_id": device_id,
+        "device_name": device_name,
+        "pjdesk_id": pjdesk_id,
+        "consent": consent,
+    });
+    let text = match post_api(&format!("{}/api/network/enroll", api_base()), None, &body) {
+        Ok(text) => text,
+        Err(fail) => {
+            if let Some((owner, label)) = crate::support_keys::consent_from_fail(&fail) {
+                bail!(crate::support_keys::consent_wire(&owner, &label));
+            }
+            bail!(fail.message);
+        }
+    };
     let reply: NetworkReply = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
     session_from("", device_id, reply)
 }
@@ -707,6 +781,7 @@ fn saved_value(computers: &[SavedComputer]) -> serde_json::Value {
                 "starred": c.starred.unwrap_or(false),
                 "position": c.position.unwrap_or(0),
                 "hidden": c.hidden,
+                "group": if c.group == crate::support_keys::CLIENTS { crate::support_keys::CLIENTS } else { "" },
             })
         })
         .collect();
@@ -730,7 +805,10 @@ pub fn publish_this_computer(session: &Session, this: &ThisComputer, local: &[Sa
             }
         }
     }
-    let list = enroll_this_computer(&list, this);
+    let mut list = enroll_this_computer(&list, this);
+    if let Some(info) = &session.support {
+        ensure_support_computer(&mut list, &this.id, &info.label);
+    }
     let body = saved_value(&list);
     let mut next = refresh_account(&session.refresh, &session.device_id, Some(&body), &this.id, true)?;
     if next.email.is_empty() {
@@ -741,7 +819,31 @@ pub fn publish_this_computer(session: &Session, this: &ThisComputer, local: &[Sa
         next.fingerprint = session.fingerprint.clone();
     }
     next.vault_key = session.vault_key;
+    next.support = session.support.clone();
     Ok(next)
+}
+
+/// Puts this computer on the account under the support key's label, in Clients.
+pub fn ensure_support_computer(computers: &mut Vec<SavedComputer>, id: &str, label: &str) {
+    let id = pjdesk_proto::normalize_id(id);
+    if !pjdesk_proto::is_valid_id(&id) {
+        return;
+    }
+    let label = label.trim();
+    if let Some(row) = computers.iter_mut().find(|c| pjdesk_proto::normalize_id(&c.id) == id) {
+        if row.name.trim().is_empty() && !label.is_empty() {
+            row.name = label.to_string();
+        }
+        row.group = crate::support_keys::CLIENTS.into();
+        row.hidden = false;
+        return;
+    }
+    computers.push(SavedComputer {
+        id,
+        name: label.to_string(),
+        group: crate::support_keys::CLIENTS.into(),
+        ..SavedComputer::default()
+    });
 }
 
 /// Enrolls this computer on a sign-in that already has a refresh token.
@@ -771,6 +873,7 @@ pub fn enroll_known(
         removed: Vec::new(),
         vault_key: None,
         role: String::new(),
+        support: None,
     };
     let _ = publish_this_computer(&session, this, local)?;
     Ok(())
@@ -809,6 +912,11 @@ pub fn saved_from_config(config: &Config) -> Vec<SavedComputer> {
                 starred: Some(row.get("starred").and_then(|v| v.as_bool()).unwrap_or(false)),
                 position: Some(row.get("position").and_then(|v| v.as_u64()).unwrap_or(0) as u32),
                 hidden: row.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
+                group: if row.get("group").and_then(|v| v.as_str()) == Some(crate::support_keys::CLIENTS) {
+                    crate::support_keys::CLIENTS.into()
+                } else {
+                    String::new()
+                },
             })
         })
         .collect()
@@ -837,9 +945,11 @@ pub fn computers_body(
         .into_iter()
         .map(|id| {
             if hidden.iter().any(|h| h == &id) {
-                return serde_json::json!({ "id": id, "name": "", "hostname": "", "os_family": "", "os_version": "", "hidden": true });
+                return serde_json::json!({ "id": id, "name": "", "hostname": "", "os_family": "", "os_version": "", "hidden": true, "group": "" });
             }
-            let alias = entries.iter().find(|e| e.id == id).map(|e| e.alias.as_str()).unwrap_or("");
+            let entry = entries.iter().find(|e| e.id == id);
+            let alias = entry.map(|e| e.alias.as_str()).unwrap_or("");
+            let group = if entry.is_some_and(|e| crate::support_keys::is_clients(&e.tags)) { crate::support_keys::CLIENTS } else { "" };
             let note = notes.get(&id);
             let hostname = note.map(|n| n.hostname.as_str()).unwrap_or("");
             serde_json::json!({
@@ -852,6 +962,7 @@ pub fn computers_body(
                 "starred": note.is_some_and(|n| n.favorite),
                 "position": note.map(|n| n.sort_order).unwrap_or(0),
                 "hidden": false,
+                "group": group,
             })
         })
         .collect();
@@ -961,7 +1072,13 @@ pub fn copy_to_service(user: &Config) {
     cfg.network_public_ip = user.network_public_ip.clone();
     cfg.server_access_key = user.server_access_key.clone();
     cfg.network_role = user.network_role.clone();
+    let grant_changed = cfg.support_grant != user.support_grant;
+    cfg.support_grant = user.support_grant.clone();
     let _ = cfg.save_to(&path);
+    if grant_changed {
+        let marker = crate::syspaths::service_dir().join("support-key.reload");
+        let _ = std::fs::write(marker, b"1\n");
+    }
 }
 
 /// `owner` or `member` from GET /api/network. Empty when pjdesk.com does not say.
@@ -1030,7 +1147,7 @@ fn require_saved_sign_in(refresh: &str, device_id: &str) -> Result<()> {
 /// The message pjdesk.com returned. A body that is not JSON keeps the status
 /// and the text.
 pub fn invite_failure_message(status: u16, body: &str) -> String {
-    let parsed: ErrorBody = serde_json::from_str(body).unwrap_or(ErrorBody { error: String::new(), code: String::new(), role: String::new() });
+    let parsed: ErrorBody = serde_json::from_str(body).unwrap_or_default();
     if !parsed.error.is_empty() {
         return parsed.error;
     }
@@ -1174,6 +1291,16 @@ pub fn group_digits(code: &str) -> String {
     }
 }
 
+pub(crate) fn post_saved(url: &str, refresh: &str, device_id: &str, body: Option<&serde_json::Value>) -> Result<String> {
+    if refresh.trim().is_empty() || device_id.trim().is_empty() {
+        bail!("Sign in again.");
+    }
+    match body {
+        Some(body) => post_join(url, body),
+        None => get_join(url, refresh, device_id),
+    }
+}
+
 fn post_join(url: &str, body: &serde_json::Value) -> Result<String> {
     let req = agent().post(url).set("content-type", "application/json");
     match req.send_string(&body.to_string()) {
@@ -1201,7 +1328,7 @@ fn post_json_timeout(url: &str, bearer: Option<&str>, body: &serde_json::Value, 
         Ok(resp) => Ok(resp.into_string().unwrap_or_default()),
         Err(ureq::Error::Status(_, resp)) => {
             let text = resp.into_string().unwrap_or_default();
-            let parsed: ErrorBody = serde_json::from_str(&text).unwrap_or(ErrorBody { error: String::new(), code: String::new(), role: String::new() });
+            let parsed: ErrorBody = serde_json::from_str(&text).unwrap_or_default();
             bail!(if parsed.error.is_empty() { "Could not reach pjdesk.com.".to_string() } else { parsed.error })
         }
         Err(ureq::Error::Transport(_)) => bail!("Could not reach pjdesk.com."),

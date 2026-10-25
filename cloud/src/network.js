@@ -9,7 +9,17 @@
 // Android client:
 //   PJN1\n{email}\n{network id}\n{sorted fingerprints}\n{device id}\n{exp}\n
 
-import { JOIN_TTL_SEC, SUPPORT_TTL_SEC, joinRedeemable, nextGuess, randomDigits } from "./codes.js";
+import {
+  JOIN_TTL_SEC,
+  SUPPORT_TTL_SEC,
+  joinRedeemable,
+  nextGuess,
+  randomDigits,
+  supportBanner,
+  supportKeyExpiry,
+  supportKeyStatus,
+  supportOwnerName,
+} from "./codes.js";
 
 const TOKEN_TTL = 15 * 60;
 const REFRESH_TTL = 365 * 24 * 3600;
@@ -375,7 +385,12 @@ function cleanComputer(row) {
     position: Number.isFinite(position) && position > 0 ? Math.min(position, 1_000_000) : 0,
     hidden,
     display_name: String(row.display_name || "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 64),
+    group: savedGroup(row.group || row.grp),
   };
+}
+
+function savedGroup(value) {
+  return String(value || "").trim() === "Clients" ? "Clients" : "";
 }
 
 /** Fields the account stores for one saved computer. Passwords are not among them. */
@@ -532,6 +547,11 @@ function missingSavedDisplay(err) {
   return /no such column/i.test(message) && /display_name/i.test(message);
 }
 
+function missingGroup(err) {
+  const message = columnMessage(err);
+  return /no such column/i.test(message) && /\bgrp\b/i.test(message);
+}
+
 async function computersFor(env, networkId, accountId) {
   const rows = await computersForStored(env, networkId, accountId);
   return keepListed(rows, await removedFor(env, networkId));
@@ -540,7 +560,7 @@ async function computersFor(env, networkId, accountId) {
 async function computersForStored(env, networkId, accountId) {
   try {
     const { results } = await env.DB.prepare(
-      `SELECT device_id, name, hostname, os_family, os_version, starred, position, hidden, display_name FROM network_computers
+      `SELECT device_id, name, hostname, os_family, os_version, starred, position, hidden, display_name, grp FROM network_computers
         WHERE network_id = ? AND account_id = ? ORDER BY position, updated_at DESC LIMIT 500`,
     )
       .bind(networkId, accountId)
@@ -555,11 +575,34 @@ async function computersForStored(env, networkId, accountId) {
       position: Number(r.position) || 0,
       hidden: !!r.hidden,
       display_name: r.display_name || "",
+      group: savedGroup(r.grp),
     }));
   } catch (err) {
+    if (missingGroup(err)) return computersForNamed(env, networkId, accountId);
     if (missingSavedDisplay(err)) return computersForLegacy(env, networkId, accountId);
     return computersForLegacy(env, networkId, accountId, err);
   }
+}
+
+async function computersForNamed(env, networkId, accountId) {
+  const { results } = await env.DB.prepare(
+    `SELECT device_id, name, hostname, os_family, os_version, starred, position, hidden, display_name FROM network_computers
+      WHERE network_id = ? AND account_id = ? ORDER BY position, updated_at DESC LIMIT 500`,
+  )
+    .bind(networkId, accountId)
+    .all();
+  return (results || []).map((r) => ({
+    id: r.device_id,
+    name: r.hidden ? "" : r.name,
+    hostname: r.hostname || "",
+    os_family: r.os_family,
+    os_version: r.os_version,
+    starred: !!r.starred,
+    position: Number(r.position) || 0,
+    hidden: !!r.hidden,
+    display_name: r.display_name || "",
+    group: "",
+  }));
 }
 
 async function computersForLegacy(env, networkId, accountId, err) {
@@ -620,11 +663,51 @@ async function saveComputers(env, networkId, accountId, list) {
   const t = now();
   if (!rows.length) return;
   try {
-    await saveComputersDisplay(env, networkId, accountId, rows, t);
+    await saveComputersGrouped(env, networkId, accountId, rows, t);
   } catch (err) {
+    if (missingGroup(err)) {
+      try {
+        await saveComputersDisplay(env, networkId, accountId, rows, t);
+        return;
+      } catch (next) {
+        if (!missingSavedDisplay(next) && !missingSavedColumn(next) && !missingHostnameColumn(next)) throw next;
+        await saveComputersLegacy(env, networkId, accountId, rows, t);
+        return;
+      }
+    }
     if (!missingSavedDisplay(err) && !missingSavedColumn(err) && !missingHostnameColumn(err)) throw err;
     await saveComputersLegacy(env, networkId, accountId, rows, t);
   }
+}
+
+async function saveComputersGrouped(env, networkId, accountId, rows, t) {
+  const writes = rows.map((c) =>
+    env.DB.prepare(
+      `INSERT INTO network_computers (network_id, account_id, device_id, name, hostname, os_family, os_version, updated_at, starred, position, hidden, display_name, grp)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(network_id, account_id, device_id) DO UPDATE SET
+         name = excluded.name, hostname = excluded.hostname, os_family = excluded.os_family,
+         os_version = excluded.os_version, updated_at = excluded.updated_at,
+         starred = excluded.starred, position = excluded.position, hidden = excluded.hidden,
+         display_name = CASE WHEN excluded.display_name != '' THEN excluded.display_name ELSE network_computers.display_name END,
+         grp = CASE WHEN excluded.grp != '' THEN excluded.grp ELSE network_computers.grp END`,
+    ).bind(
+      networkId,
+      accountId,
+      c.id,
+      c.hidden ? "" : c.name,
+      c.hidden ? "" : c.hostname,
+      c.os_family,
+      c.os_version,
+      t,
+      c.starred ? 1 : 0,
+      c.position || 0,
+      c.hidden ? 1 : 0,
+      c.display_name || "",
+      c.group || "",
+    ),
+  );
+  await env.DB.batch(writes);
 }
 
 async function saveComputersDisplay(env, networkId, accountId, rows, t) {
@@ -1085,6 +1168,20 @@ async function handle(request, env, url) {
     if (m === "GET") return listJoinCodes(env, opened.account);
     if (p.endsWith("/revoke")) return revokeJoinCode(opened.body, env, opened.account);
     return createJoinCode(env, opened.account);
+  }
+
+  if (p === "/api/network/support-key/leave" && m === "POST") return leaveSupportKey(request, env);
+  if (p === "/api/network/support-key/connect" && m === "POST") return logSupportConnection(request, env);
+  if (
+    (p === "/api/network/support-key" && (m === "GET" || m === "POST")) ||
+    (p === "/api/network/support-key/revoke" && m === "POST") ||
+    (p === "/api/network/support-key/remove" && m === "POST")
+  ) {
+    const opened = await openJoin(request, env);
+    if (m === "GET") return listSupportKeys(env, opened.account, opened.deviceId);
+    if (p.endsWith("/revoke")) return revokeSupportKey(opened.body, env, opened.account, opened.deviceId);
+    if (p.endsWith("/remove")) return removeSupportComputer(opened.body, env, opened.account, opened.deviceId);
+    return createSupportKey(opened.body, env, opened.account, opened.deviceId);
   }
 
   const account = await session(request, env);
@@ -1658,6 +1755,8 @@ async function enroll(request, env) {
   if (/^\d{8}$/.test(code)) {
     const joined = await redeemJoinCode(env, request, hash, deviceId, body.device_name || "Joined computer");
     if (joined) return joined;
+    const support = await redeemSupportKey(env, request, hash, body);
+    if (support) return support;
   }
   const row = await env.DB.prepare(
     `SELECT c.expires_at, c.used_at, n.* FROM enroll_codes c JOIN networks n ON n.id = c.network_id WHERE c.code_hash = ?`,
@@ -1767,15 +1866,39 @@ async function openJoin(request, env) {
   if (request.method === "POST" || request.method === "PUT") body = await readJson(request);
   const mode = joinAuthMode(header, deviceHeader, body);
   if (mode === "device") {
+    const deviceId = String(body?.device_id || "").trim() || String(deviceHeader || "").trim();
     const device = await openedDevice(env, {
       refresh: String(body?.refresh || "").trim() || bearerToken(header),
-      device_id: String(body?.device_id || "").trim() || String(deviceHeader || "").trim(),
+      device_id: deviceId,
     });
-    return { account: { accountId: device.accountId, email: device.email }, body };
+    return { account: { accountId: device.accountId, email: device.email }, body, deviceId };
   }
-  if (mode === "bearer") return { account: await session(request, env), body };
-  if (mode === "relay") return { account: await accountFromRelay(env, bearerToken(header)), body };
+  if (mode === "bearer") return { account: await session(request, env), body, deviceId: "" };
+  if (mode === "relay") {
+    const parts = relayAccessParts(bearerToken(header));
+    return { account: await accountFromRelay(env, bearerToken(header)), body, deviceId: parts?.deviceId || "" };
+  }
   throw new HttpError(401, "Sign in required.");
+}
+
+/// A computer that joined with a support key uses the owner's account so it can
+/// register. It must not create, list, or revoke keys.
+async function assertNotSupportClient(env, networkId, deviceId) {
+  if (!deviceId) return;
+  let use;
+  try {
+    use = await env.DB.prepare(
+      `SELECT u.device_id FROM support_key_uses u
+         JOIN support_keys k ON k.id = u.key_id
+        WHERE u.device_id = ? AND u.revoked_at IS NULL AND k.revoked_at IS NULL AND k.network_id = ?`,
+    )
+      .bind(deviceId, networkId)
+      .first();
+  } catch (err) {
+    if (supportDeployMessage(err)) return;
+    throw err;
+  }
+  if (use) throw new HttpError(403, "Only the account this server is signed in to can manage support keys.");
 }
 
 async function accountFromRelay(env, token) {
@@ -1854,6 +1977,346 @@ async function createJoinCode(env, account) {
     .bind(id, await sha256Hex(code), row.id, t, expires)
     .run();
   return json({ id, code, expires_at: expires });
+}
+
+function supportDeployMessage(err) {
+  return /no such table/i.test(String(err?.message || err)) || /no such column/i.test(String(err?.message || err));
+}
+
+function supportKeyMessage(reason) {
+  if (reason === "limit") return "That support key has reached its computer limit.";
+  if (reason === "expired") return "That support key has expired.";
+  if (reason === "revoked") return "That support key is no longer valid.";
+  if (reason === "used") return "That support key has already been used.";
+  return "That code is not valid.";
+}
+
+async function redeemSupportKey(env, request, hash, body) {
+  let row;
+  try {
+    row = await env.DB.prepare(
+      `SELECT k.id AS key_id, k.label, k.reusable, k.expires_at AS key_expires, k.computer_limit,
+              k.unattended, k.uses, k.revoked_at AS key_revoked, n.*
+         FROM support_keys k JOIN networks n ON n.id = k.network_id
+        WHERE k.code_hash = ?`,
+    )
+      .bind(hash)
+      .first();
+  } catch (err) {
+    if (supportDeployMessage(err)) return null;
+    throw err;
+  }
+  if (!row) return null;
+  const deviceId = String(body.device_id || "");
+  if (!validDevice(deviceId)) throw new HttpError(400, "This device needs an id.");
+  const t = now();
+  const { results } = await env.DB.prepare(
+    "SELECT device_id, revoked_at FROM support_key_uses WHERE key_id = ?",
+  )
+    .bind(row.key_id)
+    .all();
+  const live = (results || []).filter((item) => !item.revoked_at);
+  const same = live.some((item) => item.device_id === deviceId);
+  const status = supportKeyStatus({
+    revokedAt: row.key_revoked,
+    expiresAt: row.key_expires,
+    reusable: Number(row.reusable) === 1,
+    uses: row.uses,
+    computers: live.length,
+    limit: row.computer_limit,
+    now: t,
+    sameDevice: same,
+  });
+  if (!status.ok) {
+    await recordGuess(env, request, "join", false);
+    throw new HttpError(400, supportKeyMessage(status.reason));
+  }
+  const owner = await env.DB.prepare("SELECT id, email FROM accounts WHERE id = ?").bind(row.owner_id).first();
+  if (!owner) {
+    await recordGuess(env, request, "join", false);
+    throw new HttpError(400, "That code is not valid.");
+  }
+  const ownerName = supportOwnerName(row.name, owner.email);
+  const label = cleanLabel(row.label, 80);
+  if (Number(row.unattended) === 1 && body.consent !== true) {
+    await recordGuess(env, request, "join", true);
+    return json(
+      {
+        error: `${ownerName} needs your permission before this computer can be opened without asking.`,
+        code: "consent",
+        owner: ownerName,
+        label,
+        banner: supportBanner(ownerName),
+      },
+      409,
+    );
+  }
+  const pjdesk = pjdeskId(body.pjdesk_id);
+  const deviceName = cleanLabel(body.device_name, 80);
+  if (same) {
+    await env.DB.prepare(
+      `UPDATE support_key_uses SET pjdesk_id = CASE WHEN ? != '' THEN ? ELSE pjdesk_id END,
+              device_name = CASE WHEN ? != '' THEN ? ELSE device_name END, used_at = ?, revoked_at = NULL
+        WHERE key_id = ? AND device_id = ?`,
+    )
+      .bind(pjdesk, pjdesk, deviceName, deviceName, t, row.key_id, deviceId)
+      .run();
+  } else {
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO support_key_uses (key_id, device_id, pjdesk_id, device_name, used_at, revoked_at)
+         VALUES (?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(key_id, device_id) DO UPDATE SET
+           pjdesk_id = excluded.pjdesk_id, device_name = excluded.device_name,
+           used_at = excluded.used_at, revoked_at = NULL`,
+      ).bind(row.key_id, deviceId, pjdesk, deviceName, t),
+      env.DB.prepare("UPDATE support_keys SET uses = uses + 1 WHERE id = ?").bind(row.key_id),
+    ]);
+  }
+  await rememberSupportComputer(env, row, owner.id, pjdesk, label, deviceName);
+  await recordGuess(env, request, "join", true);
+  const issued = await issue(env, { accountId: owner.id, email: owner.email }, row, deviceId, deviceName || "Joined computer", null);
+  issued.support = {
+    owner: ownerName,
+    label,
+    unattended: Number(row.unattended) === 1,
+    key_id: row.key_id,
+    banner: supportBanner(ownerName),
+  };
+  return json(issued);
+}
+
+async function rememberSupportComputer(env, network, accountId, pjdesk, label, hostname) {
+  if (!pjdesk) return;
+  try {
+    await saveComputers(env, network.id, accountId, [
+      { id: pjdesk, name: label, hostname, os_family: "", os_version: "", group: "Clients" },
+    ]);
+  } catch (err) {
+    if (supportDeployMessage(err)) return;
+    throw err;
+  }
+}
+
+async function listSupportKeys(env, account, deviceId) {
+  const row = await owned(env, account.accountId);
+  if (!row) return json({ keys: [] });
+  await assertNotSupportClient(env, row.id, deviceId);
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT id, label, reusable, expires_at, computer_limit, unattended, uses, created_at
+         FROM support_keys WHERE network_id = ? AND revoked_at IS NULL ORDER BY created_at DESC`,
+    )
+      .bind(row.id)
+      .all();
+    const ids = (results || []).map((item) => item.id);
+    let uses = [];
+    if (ids.length) {
+      const placeholders = ids.map(() => "?").join(", ");
+      const found = await env.DB.prepare(
+        `SELECT key_id, device_id, pjdesk_id, device_name, used_at FROM support_key_uses
+          WHERE revoked_at IS NULL AND key_id IN (${placeholders})`,
+      )
+        .bind(...ids)
+        .all();
+      uses = found.results || [];
+    }
+    return json({
+      keys: (results || []).map((item) => ({
+        id: item.id,
+        label: item.label,
+        reusable: Number(item.reusable) === 1,
+        expires_at: item.expires_at,
+        computer_limit: item.computer_limit,
+        unattended: Number(item.unattended) === 1,
+        computers: uses
+          .filter((use) => use.key_id === item.id)
+          .map((use) => ({
+            device_id: use.device_id,
+            pjdesk_id: use.pjdesk_id || "",
+            name: use.device_name || "",
+            used_at: use.used_at,
+          })),
+      })),
+    });
+  } catch (err) {
+    if (supportDeployMessage(err)) {
+      throw new HttpError(503, "Support keys are not ready yet. On your PC, in cloud\\, run cloud\\deploy.cmd.");
+    }
+    throw err;
+  }
+}
+
+async function createSupportKey(body, env, account, deviceId) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "Set your network before creating a support key.");
+  await assertNotSupportClient(env, row.id, deviceId);
+  const label = cleanLabel(body.label, 80);
+  if (!label) throw new HttpError(400, "Give the key a label, such as the client's name.");
+  const expiry = supportKeyExpiry(body.expires_in);
+  if (expiry == null) throw new HttpError(400, "Choose 1 hour, 1 day, 7 days, 30 days, or never.");
+  const limit = Number(body.computer_limit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new HttpError(400, "The computer limit is a number from 1 to 100.");
+  }
+  const reusable = body.reusable === true || body.reusable === 1 ? 1 : 0;
+  const unattended = body.unattended === true || body.unattended === 1 ? 1 : 0;
+  const t = now();
+  const expires = expiry === 0 ? 0 : t + expiry;
+  try {
+    let code = "";
+    let hash = "";
+    for (let attempt = 0; attempt < 5 && !code; attempt += 1) {
+      const digits = randomDigits(8);
+      const digest = await sha256Hex(digits);
+      const clash = await env.DB.prepare(
+        `SELECT code_hash FROM support_keys WHERE code_hash = ?
+         UNION SELECT code_hash FROM join_codes WHERE code_hash = ?`,
+      )
+        .bind(digest, digest)
+        .first();
+      if (!clash) {
+        code = digits;
+        hash = digest;
+      }
+    }
+    if (!code) throw new HttpError(500, "Could not create a support key.");
+    const id = `sup_${randomHex(8)}`;
+    await env.DB.prepare(
+      `INSERT INTO support_keys
+        (id, code_hash, network_id, label, reusable, expires_at, computer_limit, unattended, uses, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+    )
+      .bind(id, hash, row.id, label, reusable, expires, limit, unattended, t)
+      .run();
+    return json({ id, code, expires_at: expires });
+  } catch (err) {
+    if (err instanceof HttpError) throw err;
+    if (supportDeployMessage(err)) {
+      throw new HttpError(503, "Support keys are not ready yet. On your PC, in cloud\\, run cloud\\deploy.cmd.");
+    }
+    throw err;
+  }
+}
+
+async function revokeSupportKey(body, env, account, deviceId) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "No network.");
+  await assertNotSupportClient(env, row.id, deviceId);
+  const id = String(body.id || "");
+  if (!id.startsWith("sup_")) throw new HttpError(400, "Unknown support key.");
+  const t = now();
+  await env.DB.prepare(
+    "UPDATE support_keys SET revoked_at = ? WHERE id = ? AND network_id = ? AND revoked_at IS NULL",
+  )
+    .bind(t, id, row.id)
+    .run();
+  const { results } = await env.DB.prepare(
+    "SELECT device_id, pjdesk_id FROM support_key_uses WHERE key_id = ? AND revoked_at IS NULL",
+  )
+    .bind(id)
+    .all();
+  await env.DB.prepare("UPDATE support_key_uses SET revoked_at = ? WHERE key_id = ? AND revoked_at IS NULL")
+    .bind(t, id)
+    .run();
+  for (const use of results || []) {
+    await dropSupportDevice(env, row.id, use.device_id, use.pjdesk_id);
+  }
+  return json({ ok: true, id });
+}
+
+async function removeSupportComputer(body, env, account, deviceId) {
+  const row = await owned(env, account.accountId);
+  if (!row) throw new HttpError(404, "No network.");
+  await assertNotSupportClient(env, row.id, deviceId);
+  const keyId = String(body.id || "");
+  const pjdesk = pjdeskId(body.pjdesk_id);
+  const target = String(body.target_device || "");
+  if (!keyId.startsWith("sup_") || (!pjdesk && !target)) throw new HttpError(400, "Unknown computer.");
+  const key = await env.DB.prepare("SELECT id FROM support_keys WHERE id = ? AND network_id = ?")
+    .bind(keyId, row.id)
+    .first();
+  if (!key) throw new HttpError(404, "Unknown support key.");
+  const use = pjdesk
+    ? await env.DB.prepare(
+        "SELECT device_id, pjdesk_id FROM support_key_uses WHERE key_id = ? AND revoked_at IS NULL AND pjdesk_id = ?",
+      )
+        .bind(keyId, pjdesk)
+        .first()
+    : await env.DB.prepare(
+        "SELECT device_id, pjdesk_id FROM support_key_uses WHERE key_id = ? AND revoked_at IS NULL AND device_id = ?",
+      )
+        .bind(keyId, target)
+        .first();
+  if (!use) throw new HttpError(404, "That computer is not on this support key.");
+  const t = now();
+  await env.DB.prepare("UPDATE support_key_uses SET revoked_at = ? WHERE key_id = ? AND device_id = ?")
+    .bind(t, keyId, use.device_id)
+    .run();
+  await dropSupportDevice(env, row.id, use.device_id, use.pjdesk_id || pjdesk);
+  return json({ ok: true, id: keyId, pjdesk_id: use.pjdesk_id || pjdesk });
+}
+
+async function dropSupportDevice(env, networkId, deviceId, pjdeskRaw) {
+  if (deviceId) {
+    await env.DB.prepare("UPDATE network_devices SET revoked_at = ? WHERE network_id = ? AND device_id = ? AND revoked_at IS NULL")
+      .bind(now(), networkId, deviceId)
+      .run();
+  }
+  const id = pjdeskId(pjdeskRaw);
+  if (!id) return;
+  try {
+    await forgetComputer(env, networkId, id);
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 400) return;
+    throw err;
+  }
+}
+
+async function leaveSupportKey(request, env) {
+  const body = await readJson(request);
+  const device = await openedDevice(env, body);
+  const deviceId = String(body.device_id || "");
+  const t = now();
+  await env.DB.prepare(
+    `UPDATE support_key_uses SET revoked_at = ?
+      WHERE device_id = ? AND revoked_at IS NULL
+        AND key_id IN (SELECT id FROM support_keys WHERE network_id = ?)`,
+  )
+    .bind(t, deviceId, device.networkId)
+    .run();
+  await env.DB.prepare("UPDATE network_devices SET revoked_at = ? WHERE network_id = ? AND device_id = ? AND revoked_at IS NULL")
+    .bind(t, device.networkId, deviceId)
+    .run();
+  return json({ ok: true });
+}
+
+async function logSupportConnection(request, env) {
+  const body = await readJson(request);
+  const device = await openedDevice(env, body);
+  const deviceId = String(body.device_id || "");
+  const use = await env.DB.prepare(
+    `SELECT u.key_id FROM support_key_uses u
+       JOIN support_keys k ON k.id = u.key_id
+      WHERE u.device_id = ? AND u.revoked_at IS NULL AND k.revoked_at IS NULL AND k.network_id = ?`,
+  )
+    .bind(deviceId, device.networkId)
+    .first();
+  if (!use) throw new HttpError(403, "This computer is not on a support key.");
+  const fromName = cleanLabel(body.from_name, 80);
+  const pjdesk = pjdeskId(body.pjdesk_id);
+  if (pjdesk) {
+    await env.DB.prepare(
+      `UPDATE support_key_uses SET pjdesk_id = CASE WHEN pjdesk_id = '' THEN ? ELSE pjdesk_id END
+        WHERE key_id = ? AND device_id = ?`,
+    )
+      .bind(pjdesk, use.key_id, deviceId)
+      .run();
+  }
+  await env.DB.prepare("INSERT INTO support_connections (key_id, pjdesk_id, from_name, at) VALUES (?, ?, ?, ?)")
+    .bind(use.key_id, pjdesk, fromName, now())
+    .run();
+  return json({ ok: true });
 }
 
 async function revokeJoinCode(body, env, account) {

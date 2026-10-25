@@ -39,6 +39,49 @@ export function joinRedeemable({ usedAt, revokedAt, expiresAt, now }) {
   return true;
 }
 
+/** Seconds a support key may live. 0 means it does not expire. */
+export const SUPPORT_KEY_EXPIRY = [3600, 86400, 7 * 86400, 30 * 86400, 0];
+
+/** One of the allowed expiries, or null when the choice is not one of them. */
+export function supportKeyExpiry(seconds) {
+  const n = Number(seconds);
+  return SUPPORT_KEY_EXPIRY.includes(n) ? n : null;
+}
+
+/**
+ * Whether this support key can enroll a computer.
+ * `uses` counts every new computer, including ones later removed.
+ * `computers` counts computers still enrolled. The same computer does not
+ * take another slot. Single-use stops after the first new computer.
+ * Reusable stops when the live count reaches the limit.
+ */
+export function supportKeyStatus({ revokedAt, expiresAt, reusable, uses, computers, limit, now, sameDevice }) {
+  if (revokedAt) return { ok: false, reason: "revoked" };
+  if (Number(expiresAt) > 0 && Number(expiresAt) <= now) return { ok: false, reason: "expired" };
+  if (sameDevice) return { ok: true, reason: "" };
+  const cap = Math.max(1, Number(limit) || 1);
+  const enrolled = Number(computers) || 0;
+  const ever = Number(uses) || 0;
+  if (!reusable && ever > 0) return { ok: false, reason: "used" };
+  if (enrolled >= cap) return { ok: false, reason: "limit" };
+  return { ok: true, reason: "" };
+}
+
+/** Network name when it is set, otherwise the account email. */
+export function supportOwnerName(networkName, email) {
+  const name = String(networkName || "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim()
+    .slice(0, 80);
+  return name || String(email || "").trim();
+}
+
+/** The line the supported computer shows. */
+export function supportBanner(owner) {
+  const who = String(owner || "").trim() || "Support";
+  return `${who} (support) has access`;
+}
+
 /**
  * One step of the guess lockout. `record` counts a failure. `success` clears
  * the counter. A lock that has expired starts a fresh window, so the person

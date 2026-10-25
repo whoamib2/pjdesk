@@ -57,6 +57,12 @@ pub fn support_open(policy: &Policy, view_only: bool) -> u32 {
     grant(perms::UNATTENDED_DEFAULT | perms::FILE, policy.max_permissions, view_only)
 }
 
+/// An unattended support key opens a session that arrived through Ben's server.
+/// A direct connection still asks. Consent was already ticked when the key was entered.
+pub fn support_key_admits(unattended_consent: bool, via_server: bool) -> bool {
+    unattended_consent && via_server
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +118,13 @@ mod tests {
             Admit::Open(bits) => assert!(!perms::has(bits, perms::FILE)),
             Admit::Ask => panic!("expected the session to open"),
         }
+    }
+
+    #[test]
+    fn a_support_key_opens_only_through_the_server_and_only_after_consent() {
+        assert!(support_key_admits(true, true));
+        assert!(!support_key_admits(true, false));
+        assert!(!support_key_admits(false, true));
+        assert!(!support_key_admits(false, false));
     }
 }

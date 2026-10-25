@@ -538,13 +538,14 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
             }
         }
     }
-    let server = ServerAddr::parse(&config.effective_server())
+    let mut server = ServerAddr::parse(&config.effective_server())
         .map_err(|e| anyhow::anyhow!("invalid server address \"{}\": {e}", config.effective_server()))?;
 
     let mut shared = Arc::new(HostShared::default());
     let mut args = crate::HostArgs::from_settings(&config.settings);
     args.follow_desktop = true;
     args.service_host = true;
+    args.support_unattended = config.support_unattended();
 
     let spawn_host = |shared: Arc<HostShared>, server: ServerAddr, config: Config, args: crate::HostArgs| {
         std::thread::Builder::new().name("host".into()).spawn(move || {
@@ -590,7 +591,18 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
             std::thread::sleep(Duration::from_secs(2));
             let fresh = Config::load().unwrap_or_else(|_| config.clone());
             let next = ServerAddr::parse(&fresh.effective_server()).unwrap_or_else(|_| server.clone());
-            host_thread = spawn_host(shared.clone(), next, fresh, args.clone())?;
+            let mut next_args = crate::HostArgs::from_settings(&fresh.settings);
+            next_args.follow_desktop = true;
+            next_args.service_host = true;
+            next_args.support_unattended = fresh.support_unattended();
+            config = fresh.clone();
+            server = next.clone();
+            host_thread = spawn_host(shared.clone(), next, fresh, next_args)?;
+        }
+        let reload = crate::syspaths::service_dir().join("support-key.reload");
+        if reload.is_file() {
+            let _ = std::fs::remove_file(&reload);
+            shared.request_stop();
         }
         publish(&shared);
         std::thread::sleep(Duration::from_secs(2));
