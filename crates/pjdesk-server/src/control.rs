@@ -57,6 +57,17 @@ pub struct Request {
     /// Computer to block or unblock. A nine-digit PJDesk ID.
     #[serde(default)]
     pub device_id: String,
+    /// Label for a new server access key. Not a secret.
+    #[serde(default)]
+    pub label: String,
+    /// `0`, one day, 7 days, or 30 days.
+    #[serde(default)]
+    pub expires_secs: u64,
+    #[serde(default)]
+    pub computer_limit: u32,
+    /// Access key id to revoke. Not a secret.
+    #[serde(default)]
+    pub key_id: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,6 +85,10 @@ pub struct Response {
     pub written_at: u64,
     #[serde(default)]
     pub readable: bool,
+    /// Set only when a key was just created. The caller shows it once.
+    /// It is not written to the audit log.
+    #[serde(default)]
+    pub secret: String,
 }
 
 fn ok(message: impl Into<String>) -> Response {
@@ -208,6 +223,8 @@ pub fn execute(data_dir: &Path, req: &Request, actor: &str) -> Response {
         "set_watch" => set_watch(data_dir, req),
         "block" => block_computer(data_dir, &req.device_id),
         "unblock" => unblock_computer(data_dir, &req.device_id),
+        "create_access_key" => create_access_key(data_dir, req),
+        "revoke_access_key" => revoke_access_key_cmd(data_dir, &req.key_id),
         "restart" => schedule_restart(),
         _ => fail("That command was not understood."),
     };
@@ -281,6 +298,7 @@ fn finish_sign_in(data_dir: &Path, cfg: CloudConfig, choice: Option<crate::cloud
                 from,
                 written_at,
                 readable,
+                secret: String::new(),
             }
         }
         Ok(done) => {
@@ -438,6 +456,25 @@ fn block_computer(data_dir: &Path, id: &str) -> Response {
             pjdesk_proto::format_id(id.trim())
         )),
         Err(e) => fail(format!("Could not remove that computer: {e}")),
+    }
+}
+
+fn create_access_key(data_dir: &Path, req: &Request) -> Response {
+    match crate::access_keys::Store::create(data_dir, &req.label, req.expires_secs, req.computer_limit) {
+        Ok(secret) => Response {
+            ok: true,
+            message: "Copy this key now. It is shown once.".into(),
+            secret,
+            ..Response::default()
+        },
+        Err(e) => fail(e),
+    }
+}
+
+fn revoke_access_key_cmd(data_dir: &Path, id: &str) -> Response {
+    match crate::requests::revoke_access_key(data_dir, id.trim()) {
+        Ok(()) => ok("Revoked. Every computer that used it will be disconnected and removed."),
+        Err(e) => fail(format!("Could not revoke that key: {e}")),
     }
 }
 

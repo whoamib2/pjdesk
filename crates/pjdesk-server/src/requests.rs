@@ -16,6 +16,8 @@ pub const FORGET_FILE: &str = "forget-requests.json";
 pub const BLOCK_FILE: &str = "block-requests.json";
 /// Device IDs to allow to register again.
 pub const UNBLOCK_FILE: &str = "unblock-requests.json";
+/// Access key ids to revoke. The running server disconnects those computers.
+pub const REVOKE_KEY_FILE: &str = "revoke-key-requests.json";
 /// Run a cloud sync pass now.
 pub const SYNC_FILE: &str = "sync-requests.json";
 /// Make this server the cloud primary.
@@ -35,6 +37,7 @@ pub fn acceptable_target(file: &str, target: &str) -> bool {
     match file {
         UPDATE_FILE => target == "*" || pjdesk_proto::is_valid_id(target),
         FORGET_FILE | BLOCK_FILE | UNBLOCK_FILE => pjdesk_proto::is_valid_id(target),
+        REVOKE_KEY_FILE => crate::access_keys::is_key_id(target),
         SYNC_FILE | RELOAD_FILE | PROMOTE_FILE | DEMOTE_FILE => target == "now",
         GROUP_FILE => parse_group_target(target).is_some(),
         _ => false,
@@ -115,6 +118,16 @@ pub fn block_device(data_dir: &Path, id: &str) -> anyhow::Result<()> {
         anyhow::bail!("that computer is not registered");
     }
     push(data_dir, BLOCK_FILE, id)?;
+    Ok(())
+}
+
+/// Revokes an access key and removes every computer that used it from the file.
+/// A running server applies the same request to its live table and disconnects them.
+pub fn revoke_access_key(data_dir: &Path, id: &str) -> anyhow::Result<()> {
+    crate::access_keys::Store::revoke(data_dir, id.trim()).map_err(|e| anyhow::anyhow!(e))?;
+    let mut reg = crate::registry::Registry::load(data_dir.join("devices.json"))?;
+    let _ = reg.take_access_key(id.trim());
+    push(data_dir, REVOKE_KEY_FILE, id.trim())?;
     Ok(())
 }
 

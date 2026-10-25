@@ -90,8 +90,12 @@ fun SettingsScreen(
     onSignOut: (() -> Unit)? = null,
     remote: us.spader.pjdesk.core.RemoteOptions = us.spader.pjdesk.core.RemoteOptions(),
     onRemote: (us.spader.pjdesk.core.RemoteOptions) -> Unit = {},
+    savedAccessKey: String = "",
+    onAccessKey: (String) -> Unit = {},
 ) {
     var server by rememberSaveable(state.server) { mutableStateOf(state.server) }
+    var accessKey by rememberSaveable(savedAccessKey) { mutableStateOf(savedAccessKey) }
+    var showAccessKey by rememberSaveable { mutableStateOf(false) }
     var name by rememberSaveable(computerName) { mutableStateOf(computerName) }
     Column(
         Modifier
@@ -159,7 +163,24 @@ fun SettingsScreen(
                 label = { Text("Address") },
                 supportingText = { Text("Filled in when you sign in. Add :port if it is not 21200.") },
             )
-            Button(onClick = { onServer(server.trim()) }) { Text("Save server") }
+            OutlinedTextField(
+                value = accessKey,
+                onValueChange = { accessKey = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("Access key") },
+                visualTransformation = if (showAccessKey) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = {
+                    TextButton(onClick = { showAccessKey = !showAccessKey }) {
+                        Text(if (showAccessKey) "Hide" else "Show")
+                    }
+                },
+                supportingText = { Text("From the person who runs the server. This phone can register when sign-in is required.") },
+            )
+            Button(onClick = {
+                onAccessKey(accessKey.trim())
+                onServer(server.trim())
+            }) { Text("Save server") }
             Text("Key fingerprint", color = pjMuted(), style = MaterialTheme.typography.labelMedium)
             Text(
                 state.fingerprint.ifBlank { "Not pinned yet. The first connection saves it." },

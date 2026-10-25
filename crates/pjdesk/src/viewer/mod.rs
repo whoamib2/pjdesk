@@ -177,11 +177,12 @@ async fn connect(
         crate::network::refresh_config(config);
     }
     let server = ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone());
-    let mut access = config.network_access_token();
+    let mut access = config.presented_access();
     if access.is_empty() {
         // A temporary sign-in keeps the access token in this process only.
         access = std::env::var("PJDESK_ACCESS").unwrap_or_default();
     }
+    let access_key = pjdesk_proto::access::is_access_key(&access);
     let mut signal = SignalClient::connect(&server, config).await?;
     tracing::info!("Reached the server via {}", signal.via);
     if !access.is_empty() {
@@ -198,7 +199,7 @@ async fn connect(
     let mut retried_without_token = false;
     let (session_id, token, udp_port, host_name) = loop {
         match timeout(Duration::from_secs(90), signal.recv()).await {
-            Ok(None) if !access.is_empty() && !retried_without_token => {
+            Ok(None) if !access.is_empty() && !access_key && !retried_without_token => {
                 retried_without_token = true;
                 signal = SignalClient::connect(&server, config).await?;
                 signal.send(connect.clone())?;

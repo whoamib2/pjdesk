@@ -547,8 +547,10 @@ async fn signaling_loop(
         config.network_lan = refreshed.network_lan;
         config.network_public_ip = refreshed.network_public_ip;
     });
+    let _ = config.reload_access_key();
     let server = ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone());
-    let token = config.network_access_token();
+    let token = config.presented_access();
+    let access_key = pjdesk_proto::access::is_access_key(&token);
     let mut signal = SignalClient::connect_mode(&server, config, public_only).await?;
     if !token.is_empty() {
         let _ = signal.send(ClientMsg::PresentAccess { token: token.clone() });
@@ -566,9 +568,10 @@ async fn signaling_loop(
 
     let first = timeout(Duration::from_secs(10), signal.recv()).await;
     let device_id = match first {
-        Ok(None) if !token.is_empty() => {
+        Ok(None) if !token.is_empty() && !access_key => {
             // A server from before 0.6.0 cannot decode PresentAccess and drops
             // the socket. Try once without the token so this computer stays online.
+            // An access key is not retried without: the server asked for it.
             signal = SignalClient::connect_mode(&server, config, public_only).await?;
             signal.send(register)?;
             timeout(Duration::from_secs(10), signal.recv()).await
@@ -656,6 +659,10 @@ async fn signaling_loop(
             _ = ping.tick() => {
                 if last_heard.elapsed() >= Duration::from_secs(30) {
                     warn!("No reply from the server for 30 s ({role}); reconnecting");
+                    return Ok(());
+                }
+                if config.reload_access_key() {
+                    tracing::info!("The access key changed; registering again");
                     return Ok(());
                 }
                 signal.send(ClientMsg::Ping)?;

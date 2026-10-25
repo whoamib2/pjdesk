@@ -1998,6 +1998,8 @@ class MainActivity : FragmentActivity() {
                                         app.store.theme = it
                                     },
                                     onServer = engine::setServer,
+                                    savedAccessKey = app.store.accessKey,
+                                    onAccessKey = { engine.setAccessKey(it) },
                                     onResetFingerprint = engine::resetFingerprint,
                                     onSavePermanent = { password, confirm -> savePermanent(password, confirm) },
                                     onClearPermanent = { removePermanent() },

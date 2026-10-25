@@ -27,6 +27,7 @@ pub const PRESERVED: &[&str] = &[
     "cloud-status.json",
     "cloud-state.json",
     "cloud-instance.txt",
+    "access-keys.json",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +108,9 @@ pub struct Snapshot {
     pub public_watch: bool,
     #[serde(default)]
     pub public_ip_line: String,
+    /// Server access keys, without the secret or its hash.
+    #[serde(default)]
+    pub access_keys: Vec<pjdesk_proto::signal::AccessKeyBrief>,
     /// Last lines of server.log, with passwords and tokens removed.
     /// An unelevated window can copy this. The data folder stays locked.
     #[serde(default)]
@@ -132,6 +136,9 @@ pub struct ListedDevice {
     pub first_seen: u64,
     #[serde(default)]
     pub last_seen: u64,
+    /// Label of the access key this computer used. Empty when it did not.
+    #[serde(default)]
+    pub access_label: String,
 }
 
 /// A blocked computer, safe to put on the status pipe. The secret hash stays in the file.
@@ -219,6 +226,7 @@ impl Snapshot {
         snap.public_watch = watch.enabled(&snap.public_address);
         snap.public_ip_line = watch.line();
         snap.log_tail = redacted_log_tail(&dir.join("server.log"));
+        snap.access_keys = crate::access_keys::Store::public_list(dir);
         snap
     }
 }
@@ -273,6 +281,9 @@ fn redact_word(word: &str) -> String {
     if trimmed.starts_with("eyJ") && trimmed.len() >= 20 {
         return format!("[redacted]{ws}");
     }
+    if trimmed.contains("pjdesk-key1.") {
+        return format!("[redacted]{ws}");
+    }
     let alnum = trimmed.chars().filter(|c| c.is_ascii_alphanumeric()).count();
     if alnum >= 40 && !trimmed.contains('.') && !trimmed.contains(':') {
         return format!("[redacted]{ws}");
@@ -301,6 +312,8 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
         first_seen: u64,
         #[serde(default)]
         last_seen: u64,
+        #[serde(default)]
+        access_key_id: String,
     }
     #[derive(Deserialize)]
     struct Online {
@@ -324,11 +337,16 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
     } else {
         std::collections::BTreeMap::new()
     };
+    let labels: std::collections::HashMap<String, String> = crate::access_keys::Store::public_list(dir)
+        .into_iter()
+        .map(|key| (key.id, key.label))
+        .collect();
     let mut rows: Vec<ListedDevice> = file
         .devices
         .into_iter()
         .map(|(id, rec)| {
             let live = online.get(&id);
+            let access_label = labels.get(&rec.access_key_id).cloned().unwrap_or_default();
             ListedDevice {
                 id,
                 hostname: rec.hostname,
@@ -338,6 +356,7 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
                 last_ip: rec.last_ip,
                 first_seen: rec.first_seen,
                 last_seen: rec.last_seen,
+                access_label,
             }
         })
         .collect();

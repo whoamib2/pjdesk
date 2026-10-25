@@ -57,6 +57,10 @@ struct DeviceRecord {
     /// Missing before 0.6.33.
     #[serde(default)]
     last_ip: String,
+    /// Server access key that admitted this computer. Empty when it used an
+    /// account or grace. Missing before 0.6.33. Not a secret.
+    #[serde(default)]
+    access_key_id: String,
 }
 
 /// A computer that was removed and must not register again.
@@ -103,6 +107,8 @@ pub struct DeviceRow {
     pub signed_in: bool,
     /// Empty until this computer has connected once on 0.6.33 or later.
     pub last_ip: String,
+    /// Set when this computer registered with a server access key.
+    pub access_key_id: String,
 }
 
 /// A removed computer, for the Blocked computers list. No secret.
@@ -237,6 +243,7 @@ impl Registry {
                 last_seen: d.last_seen,
                 signed_in: d.signed_in,
                 last_ip: d.last_ip.clone(),
+                access_key_id: d.access_key_id.clone(),
             })
             .collect();
         rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
@@ -266,6 +273,56 @@ impl Registry {
     /// Operating system last reported by this computer. Empty until a host report.
     pub fn os_family(&self, id: &str) -> String {
         self.data.devices.get(id).map(|d| d.os_family.clone()).unwrap_or_default()
+    }
+
+    /// How many computers are using this key, and whether `secret` is already one of them.
+    pub fn key_has_room(&self, key_id: &str, secret: &[u8; 32], limit: u32) -> bool {
+        let hash = hex::encode(Sha256::digest(secret));
+        let limit = limit.max(1) as usize;
+        let mut count = 0usize;
+        let mut same = false;
+        for record in self.data.devices.values() {
+            if record.access_key_id == key_id {
+                count += 1;
+                if record.secret_sha256 == hash {
+                    same = true;
+                }
+            }
+        }
+        if same { count <= limit } else { count + 1 <= limit }
+    }
+
+    /// Remembers or clears the access key on a registration. An empty id clears it.
+    pub fn note_access_key(&mut self, id: &str, key_id: &str) {
+        let Some(record) = self.data.devices.get_mut(id) else { return };
+        if record.access_key_id == key_id {
+            return;
+        }
+        record.access_key_id = key_id.to_string();
+        if let Err(e) = self.save() {
+            tracing::warn!("could not save the access key for {id}: {e}");
+        }
+    }
+
+    /// Removes every computer that registered with this key. Does not block them.
+    pub fn take_access_key(&mut self, key_id: &str) -> Vec<String> {
+        let ids: Vec<String> = self
+            .data
+            .devices
+            .iter()
+            .filter(|(_, record)| record.access_key_id == key_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if ids.is_empty() {
+            return ids;
+        }
+        for id in &ids {
+            self.data.devices.remove(id);
+        }
+        if let Err(e) = self.save() {
+            tracing::warn!("could not remove computers for an access key: {e}");
+        }
+        ids
     }
 
     /// Marks whether the latest registration presented a valid network token.
@@ -450,6 +507,7 @@ impl Registry {
                 console_user: String::new(),
                 display_name: String::new(),
                 last_ip: String::new(),
+                access_key_id: String::new(),
             },
         );
         self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
@@ -759,6 +817,7 @@ mod tests {
         .unwrap();
         let reg = Registry::load(path).unwrap();
         assert!(!reg.list()[0].signed_in);
+        assert!(reg.list()[0].access_key_id.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

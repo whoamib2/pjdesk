@@ -91,6 +91,8 @@ pub struct OnlineHost {
     pub since: Instant,
     /// Wakes the connection task so a removed computer drops immediately.
     pub close: Arc<Notify>,
+    /// Access key this registration presented. Empty when it used an account or grace.
+    pub access_key_id: String,
 }
 
 /// A connection attempt between a controller and a host.
@@ -585,18 +587,112 @@ fn handle_login(
     }
 }
 
-/// Loads the policy and checks this connection's token. `Ok(None)` is grace
-/// (no usable token, and the switch is still off). `Err` is "Sign in required".
-fn gate(st: &State, conn: &Conn) -> Result<Option<pjdesk_proto::access::Claims>, ()> {
+/// How this connection was admitted.
+enum Admitted {
+    /// Grace: no token, and signed-in accounts are not required yet.
+    Open,
+    Signed(pjdesk_proto::access::Claims),
+    Key(crate::access_keys::LiveKey),
+}
+
+/// Loads the policy and checks this connection's token.
+/// An access key that is unknown, revoked, or expired is refused even during grace.
+/// `Err` is "Sign in required". The computer limit is checked by the caller on Register.
+fn gate(st: &State, conn: &Conn) -> Result<Admitted, ()> {
+    let token = conn.access_token.trim();
+    if pjdesk_proto::access::is_access_key(token) {
+        return match crate::access_keys::Store::check(&st.data_dir, token, crate::access::now_unix()) {
+            Ok(key) => Ok(Admitted::Key(key)),
+            Err(reason) => {
+                warn!("{}: access key refused ({reason})", conn.addr);
+                Err(())
+            }
+        };
+    }
     let policy = crate::access::Policy::load(&st.data_dir);
-    match crate::access::admit(&policy, &conn.access_token, crate::access::now_unix()) {
-        Ok(crate::access::Decision::Open) => Ok(None),
-        Ok(crate::access::Decision::Signed(claims)) => Ok(Some(claims)),
+    match crate::access::admit(&policy, token, crate::access::now_unix()) {
+        Ok(crate::access::Decision::Open) => Ok(Admitted::Open),
+        Ok(crate::access::Decision::Signed(claims)) => Ok(Admitted::Signed(claims)),
         Err(reason) => {
             warn!("{}: network access refused ({reason})", conn.addr);
             Err(())
         }
     }
+}
+
+fn manage_access_keys(
+    st: &mut State,
+    conn: &Conn,
+    token: &str,
+    op: &str,
+    label: &str,
+    expires_secs: u64,
+    computer_limit: u32,
+    key_id: &str,
+) {
+    let actor = match owner_email(st, token) {
+        Ok(email) => email,
+        Err(message) => {
+            conn.send(ServerMsg::AccessKeys { ok: false, message, secret: String::new(), keys: Vec::new() });
+            return;
+        }
+    };
+    let op = op.trim();
+    let outcome = match op {
+        "list" => Ok((String::new(), crate::access_keys::Store::public_list(&st.data_dir))),
+        "create" => match crate::access_keys::Store::create(&st.data_dir, label, expires_secs, computer_limit) {
+            Ok(secret) => Ok((secret, crate::access_keys::Store::public_list(&st.data_dir))),
+            Err(message) => Err(message),
+        },
+        "revoke" => match crate::access_keys::Store::revoke(&st.data_dir, key_id) {
+            Ok(()) => {
+                let _ = drop_access_key(st, key_id.trim());
+                crate::audit::AuditLog::open(&st.data_dir).record("access_key", &actor, "revoked");
+                Ok((String::new(), crate::access_keys::Store::public_list(&st.data_dir)))
+            }
+            Err(message) => Err(message),
+        },
+        _ => Err("That was not understood.".into()),
+    };
+    match outcome {
+        Ok((secret, keys)) => {
+            if op == "create" {
+                crate::audit::AuditLog::open(&st.data_dir).record("access_key", &actor, &format!("created {label}"));
+            }
+            let message = if secret.is_empty() {
+                String::new()
+            } else {
+                "Copy this key now. It is shown once.".into()
+            };
+            conn.send(ServerMsg::AccessKeys { ok: true, message, secret, keys });
+        }
+        Err(message) => conn.send(ServerMsg::AccessKeys { ok: false, message, secret: String::new(), keys: Vec::new() }),
+    }
+}
+
+/// The presented network token must name the account this server is signed in to.
+fn owner_email(st: &State, token: &str) -> Result<String, String> {
+    let token = token.trim();
+    if token.is_empty() || pjdesk_proto::access::is_access_key(token) {
+        return Err("Sign in on this computer as the owner of this server.".into());
+    }
+    let policy = crate::access::Policy::load(&st.data_dir);
+    let key = hex::decode(policy.public_key.trim()).unwrap_or_default();
+    if key.len() != 32 {
+        return Err("This server has not checked in with pjdesk.com yet, so it cannot confirm the owner.".into());
+    }
+    let claims = pjdesk_proto::access::verify(&key, token, crate::access::now_unix(), &policy.fingerprint)
+        .map_err(|_| "Sign in again. This server could not confirm the account.".to_string())?;
+    let Some(cfg) = crate::cloud::CloudConfig::load(&st.data_dir) else {
+        return Err("This server is not signed in to a PJDesk account.".into());
+    };
+    if !cfg.is_account() || cfg.email.trim().is_empty() {
+        return Err("This server is not signed in to a PJDesk account.".into());
+    }
+    if !cfg.email.trim().eq_ignore_ascii_case(claims.email.trim()) {
+        return Err("Only the account this server is signed in to can manage access keys.".into());
+    }
+    Ok(claims.email)
 }
 
 struct ControllerSide {
@@ -683,6 +779,10 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             conn.access_token = token.chars().take(4096).collect();
         }
 
+        ClientMsg::ManageAccessKey { token, op, label, expires_secs, computer_limit, key_id } => {
+            manage_access_keys(st, conn, &token, &op, &label, expires_secs, computer_limit, &key_id);
+        }
+
         ClientMsg::Register { proto, device_id, device_secret, hostname, app_version } => {
             if !crate::cloud::accepts_host_registrations(&st.data_dir) {
                 info!(
@@ -692,13 +792,20 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 conn.error(ErrorCode::Unauthorized, pjdesk_proto::signal::STANDBY_REGISTRATION);
                 return;
             }
-            let signed = match gate(st, conn) {
-                Ok(claims) => claims,
+            let admitted = match gate(st, conn) {
+                Ok(admitted) => admitted,
                 Err(()) => {
                     conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
                     return;
                 }
             };
+            if let Admitted::Key(key) = &admitted {
+                if !st.registry.key_has_room(&key.id, &device_secret, key.computer_limit) {
+                    warn!("{}: access key {} is at its computer limit", conn.addr, key.label);
+                    conn.error(ErrorCode::Unauthorized, crate::access_keys::LIMIT_MESSAGE);
+                    return;
+                }
+            }
             if !note_proto(conn, proto) {
                 return;
             }
@@ -710,6 +817,10 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             let app_version: String = app_version.chars().take(32).collect();
             match st.registry.register(device_id.as_deref(), &device_secret, &hostname, &app_version) {
                 Ok(id) => {
+                    let access_key_id = match &admitted {
+                        Admitted::Key(key) => key.id.clone(),
+                        Admitted::Open | Admitted::Signed(_) => String::new(),
+                    };
                     let host = OnlineHost {
                         conn_id: conn.id,
                         tx: conn.tx.clone(),
@@ -719,6 +830,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                         proto: conn.proto,
                         since: Instant::now(),
                         close: Arc::clone(&conn.close),
+                        access_key_id: access_key_id.clone(),
                     };
                     if let Some(prev) = st.online.insert(id.clone(), host) {
                         if prev.conn_id != conn.id {
@@ -745,7 +857,9 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                     }
                     conn.host_id = Some(id.clone());
                     st.registry.note_address(&id, &conn.addr.ip().to_string());
-                    st.registry.mark_signed_in(&id, signed.is_some());
+                    let signed_in = matches!(admitted, Admitted::Signed(_));
+                    st.registry.note_access_key(&id, &access_key_id);
+                    st.registry.mark_signed_in(&id, signed_in);
                     conn.send(ServerMsg::Registered { device_id: id.clone() });
                     if conn.proto >= 3 {
                         conn.send(ServerMsg::Policy(st.accounts.policy()));
@@ -1105,9 +1219,33 @@ async fn janitor(state: Shared) {
     }
 }
 
+/// Removes every computer that used this key and disconnects the ones that are online.
+/// Returns true when a computer was removed or disconnected.
+fn drop_access_key(st: &mut State, key_id: &str) -> bool {
+    if !crate::access_keys::is_key_id(key_id) {
+        return false;
+    }
+    let removed = st.registry.take_access_key(key_id);
+    let mut live: Vec<String> = st
+        .online
+        .iter()
+        .filter(|(_, host)| host.access_key_id == key_id)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for (id, hosts) in &st.standby {
+        if hosts.iter().any(|host| host.access_key_id == key_id) && !live.contains(id) {
+            live.push(id.clone());
+        }
+    }
+    let any = !removed.is_empty() || !live.is_empty();
+    for id in removed.iter().chain(live.iter()) {
+        disconnect_device(st, id, "This access key is no longer valid.");
+    }
+    any
+}
+
 /// Drops a computer's live connections and any session it is hosting.
-fn disconnect_device(st: &mut State, id: &str) {
-    let message = "This computer was removed from PJDesk Server.";
+fn disconnect_device(st: &mut State, id: &str, message: &str) {
     let mut notify = Vec::new();
     if let Some(host) = st.online.remove(id) {
         let _ = host.tx.send(ServerMsg::Error { code: ErrorCode::Unauthorized, message: message.to_string() });
@@ -1115,7 +1253,7 @@ fn disconnect_device(st: &mut State, id: &str) {
     }
     if let Some(list) = st.standby.remove(id) {
         for host in list {
-            let _ = host.tx.send(ServerMsg::Error { code: ErrorCode::Unauthorized, message: message.to_string() });
+            let _ = host.tx.send(ServerMsg::Error { code: ErrorCode::Unauthorized, message: message.into() });
             notify.push(host.close);
         }
     }
@@ -1124,7 +1262,7 @@ fn disconnect_device(st: &mut State, id: &str) {
         if let Some(session) = st.sessions.remove(&sid) {
             let _ = session.host_tx.send(ServerMsg::Error {
                 code: ErrorCode::Unauthorized,
-                message: message.to_string(),
+                message: message.into(),
             });
             let _ = session.controller_tx.send(ServerMsg::Error {
                 code: ErrorCode::HostOffline,
@@ -1212,7 +1350,16 @@ async fn fleet_sync(state: Shared) {
         let blocks = take(&data_dir, crate::requests::BLOCK_FILE);
         let unblocks = take(&data_dir, crate::requests::UNBLOCK_FILE);
         let groups = take(&data_dir, crate::requests::GROUP_FILE);
-        if updates.is_empty() && forgets.is_empty() && groups.is_empty() && blocks.is_empty() && unblocks.is_empty() {
+        let revokes = take(&data_dir, crate::requests::REVOKE_KEY_FILE);
+        let dead = crate::access_keys::Store::dead_ids(&data_dir, crate::registry::unix_now());
+        if updates.is_empty()
+            && forgets.is_empty()
+            && groups.is_empty()
+            && blocks.is_empty()
+            && unblocks.is_empty()
+            && revokes.is_empty()
+            && dead.is_empty()
+        {
             continue;
         }
         let mut st = state.lock().unwrap();
@@ -1245,7 +1392,7 @@ async fn fleet_sync(state: Shared) {
             match st.registry.block(id) {
                 Ok(true) => {
                     info!("Blocked {} and dropped its connection", format_id(id));
-                    disconnect_device(&mut st, id);
+                    disconnect_device(&mut st, id, "This computer was removed from PJDesk Server.");
                     crate::audit::AuditLog::open(&st.data_dir).record("block", "server", &format_id(id));
                 }
                 Ok(false) => info!("Block request for {} did not match a computer", format_id(id)),
@@ -1260,6 +1407,18 @@ async fn fleet_sync(state: Shared) {
                 }
                 Ok(false) => info!("Unblock request for {} did not match a blocked computer", format_id(id)),
                 Err(e) => warn!("could not unblock {}: {e}", format_id(id)),
+            }
+        }
+        let mut dropped_keys = revokes;
+        for id in dead {
+            if !dropped_keys.iter().any(|have| have == &id) {
+                dropped_keys.push(id);
+            }
+        }
+        for key_id in &dropped_keys {
+            if drop_access_key(&mut st, key_id) {
+                info!("Removed the computers that used access key {key_id}");
+                crate::audit::AuditLog::open(&st.data_dir).record("access_key", "server", "removed computers");
             }
         }
         for target in &groups {

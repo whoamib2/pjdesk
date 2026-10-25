@@ -13,6 +13,7 @@
 //! (`pjdesk-server service install`).
 
 mod access;
+mod access_keys;
 mod accounts;
 mod audit;
 mod cloud;

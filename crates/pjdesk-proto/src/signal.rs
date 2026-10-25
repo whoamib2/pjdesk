@@ -137,6 +137,23 @@ pub enum ClientMsg {
     ReportDisplayName {
         name: String,
     },
+    /// 0.6.33+. The account this server is signed in to lists, creates, or
+    /// revokes a server access key. A guest does not send this. An older
+    /// server cannot decode it and drops the connection.
+    ManageAccessKey {
+        token: String,
+        /// `list`, `create`, or `revoke`.
+        op: String,
+        #[serde(default)]
+        label: String,
+        /// `0`, one day, 7 days, or 30 days. `0` does not expire.
+        #[serde(default)]
+        expires_secs: u64,
+        #[serde(default)]
+        computer_limit: u32,
+        #[serde(default)]
+        key_id: String,
+    },
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -318,6 +335,38 @@ pub enum ServerMsg {
     /// 0.6.2+. Asks a host that understands it to send [`ClientMsg::ReportHost`].
     /// A server sends this only when the host's app version can decode it.
     WantHostReport,
+    /// 0.6.33+. Reply to [`ClientMsg::ManageAccessKey`]. `secret` is set only
+    /// on create, and only in this reply. It is not stored.
+    AccessKeys {
+        ok: bool,
+        message: String,
+        #[serde(default)]
+        secret: String,
+        #[serde(default)]
+        keys: Vec<AccessKeyBrief>,
+    },
+}
+
+/// One server access key, safe to list. The secret and its hash are not here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessKeyBrief {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub created_at: u64,
+    /// Unix time, or 0 when the key does not expire.
+    #[serde(default)]
+    pub expires_at: u64,
+    #[serde(default)]
+    pub computer_limit: u32,
+    /// Unix time, or 0 while the key is still active.
+    #[serde(default)]
+    pub revoked_at: u64,
+    #[serde(default)]
+    pub computers: u32,
+    #[serde(default)]
+    pub names: Vec<String>,
 }
 
 /// Machine-readable error categories.
@@ -393,8 +442,30 @@ mod tests {
         assert_eq!(named[0], 18, "ReportDisplayName is appended after ReportHost");
         let ask = postcard::to_stdvec(&ServerMsg::WantHostReport).unwrap();
         assert_eq!(ask[0], 12, "WantHostReport is appended after Audit");
+        let manage = postcard::to_stdvec(&ClientMsg::ManageAccessKey {
+            token: "t".into(),
+            op: "list".into(),
+            label: String::new(),
+            expires_secs: 0,
+            computer_limit: 1,
+            key_id: String::new(),
+        })
+        .unwrap();
+        assert_eq!(manage[0], 19, "ManageAccessKey is appended after ReportDisplayName");
+        let keys = postcard::to_stdvec(&ServerMsg::AccessKeys {
+            ok: true,
+            message: String::new(),
+            secret: String::new(),
+            keys: vec![AccessKeyBrief { id: "ab".into(), label: "Ada".into(), computer_limit: 1, ..AccessKeyBrief::default() }],
+        })
+        .unwrap();
+        assert_eq!(keys[0], 13, "AccessKeys is appended after WantHostReport");
         let back: ClientMsg = postcard::from_bytes(&ping).unwrap();
         assert!(matches!(back, ClientMsg::Ping));
+        match postcard::from_bytes::<ServerMsg>(&keys).unwrap() {
+            ServerMsg::AccessKeys { keys, .. } => assert_eq!(keys[0].label, "Ada"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

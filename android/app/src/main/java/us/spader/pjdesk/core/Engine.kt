@@ -97,6 +97,7 @@ class Engine(context: Context) : EngineListener {
                         .toString(),
                 )
                 pushPermanent()
+                pushAccessKey()
                 command("""{"cmd":"setApproval","mode":"${store.approval}"}""")
                 syncUnattendedAccess()
                 pushTrusted()
@@ -528,6 +529,16 @@ class Engine(context: Context) : EngineListener {
     private fun pushPermanent() {
         // The command carries the secret to the host. Do not log this JSON.
         command(JSONObject().put("cmd", "setPermanent").put("password", store.permanent).toString())
+    }
+
+    /** Saves the server access key and gives it to the host. Do not log this JSON. */
+    fun setAccessKey(value: String) {
+        store.accessKey = value.trim()
+        pushAccessKey()
+    }
+
+    private fun pushAccessKey() {
+        command(JSONObject().put("cmd", "setAccessKey").put("key", store.accessKey).toString())
     }
 
     fun regenerate() = command("""{"cmd":"regenerate"}""")

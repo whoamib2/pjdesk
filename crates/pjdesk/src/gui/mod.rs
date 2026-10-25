@@ -246,6 +246,7 @@ pub struct App {
 
     show_settings: bool,
     settings: settings::SettingsDraft,
+    access_panel: crate::access_keys::Panel,
     book_alias: String,
     book_target: Option<String>,
     desk_tab: DeskTab,
@@ -448,6 +449,7 @@ impl App {
             login_rx: None,
             show_settings: false,
             settings,
+            access_panel: crate::access_keys::Panel::default(),
             book_alias: String::new(),
             book_target: None,
             desk_tab: DeskTab::Saved,

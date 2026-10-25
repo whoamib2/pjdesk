@@ -49,6 +49,8 @@ pub struct SettingsDraft {
     allow_direct: bool,
     discover_lan: bool,
     tunnel_ports: String,
+    access_key: String,
+    show_access_key: bool,
 }
 
 impl SettingsDraft {
@@ -92,6 +94,8 @@ impl SettingsDraft {
             allow_direct: s.allow_direct,
             discover_lan: s.discover_lan,
             tunnel_ports: s.tunnel_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
+            access_key: cfg.server_access_key(),
+            show_access_key: false,
         }
     }
 
@@ -293,11 +297,16 @@ impl App {
             }
         };
 
+        let key_text = d.access_key.trim().to_string();
+        let key_changed = key_text != self.cfg.server_access_key();
         let server_changed = self.cfg.server != new_server;
         if server_changed {
             self.cfg.server_fingerprint = None;
         }
         self.cfg.server = new_server;
+        if key_changed {
+            self.cfg.set_server_access_key(&key_text);
+        }
 
         let old = self.cfg.settings.clone();
         let s = &mut self.cfg.settings;
@@ -358,6 +367,9 @@ impl App {
         }
 
         self.save_cfg();
+        if key_changed {
+            crate::network::copy_to_service(&self.cfg);
+        }
 
         if server_changed && self.scm_known && self.scm_installed {
             if let Some(addr) = self.cfg.server.clone() {
@@ -367,7 +379,7 @@ impl App {
 
         crate::host::direct::set_lan_discovery(self.cfg.settings.discover_lan);
         self.ensure_lan_watch();
-        if server_changed || host_changed {
+        if server_changed || host_changed || key_changed {
             let running = if self.scm_known { self.scm_running } else { self.engine.service_running };
             let cfg = self.cfg.clone();
             self.engine.restart(&cfg, running);
@@ -593,6 +605,7 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
 
 impl App {
     fn network_tab(&mut self, ui: &mut egui::Ui) {
+        self.poll_access_keys();
         let mut do_import = false;
         let mut do_export = false;
         ui.horizontal_wrapped(|ui| {
@@ -612,6 +625,13 @@ impl App {
         ui.add_space(4.0);
         widgets::field_label(ui, "Address (host or host:port)");
         widgets::text_field(ui, &mut self.settings.server, "desk.example.com  or  192.168.1.10", false);
+        ui.add_space(6.0);
+        widgets::field_label(ui, "Access key");
+        widgets::password_field(ui, &mut self.settings.access_key, "Optional", &mut self.settings.show_access_key);
+        ui.label(widgets::muted(
+            ui,
+            "From the person who runs the server. With this key, this computer can register when signed-in accounts are required.",
+        ));
         let pinned = self.cfg.server_fingerprint.clone().unwrap_or_default();
         ui.label(widgets::muted(
             ui,
@@ -632,6 +652,8 @@ impl App {
             "Import reads a network key from the clipboard and applies it. Export copies this computer's network key. The text is encrypted, so it does not show the server address.",
         ));
 
+        ui.add_space(12.0);
+        self.owner_access_keys(ui);
         ui.add_space(12.0);
         widgets::heading(ui, "DIRECT CONNECTIONS");
         widgets::checkbox(ui, &mut self.settings.allow_direct, "Allow direct IP connections");
@@ -658,6 +680,197 @@ impl App {
         if do_export {
             self.export_server_config();
         }
+    }
+
+    fn poll_access_keys(&mut self) {
+        let Some(rx) = &self.access_panel.rx else { return };
+        let Ok(job) = rx.try_recv() else { return };
+        self.access_panel.rx = None;
+        self.access_panel.busy = false;
+        match job {
+            crate::access_keys::Job::Ready(reply) => {
+                self.access_panel.keys = reply.keys;
+                self.access_panel.loaded = true;
+                self.access_panel.hidden = false;
+                if self.cfg.network_role != "owner" {
+                    self.cfg.network_role = "owner".into();
+                    self.save_cfg();
+                }
+                if !reply.secret.is_empty() {
+                    self.access_panel.secret = reply.secret;
+                    self.access_panel.show = true;
+                    self.access_panel.label.clear();
+                    self.access_panel.note = "Copy this key now. It is shown once.".into();
+                } else if !reply.message.is_empty() {
+                    self.access_panel.note = reply.message;
+                } else {
+                    self.access_panel.note.clear();
+                }
+            }
+            crate::access_keys::Job::Failed(message) => {
+                self.access_panel.loaded = true;
+                if message.contains("Only the account") {
+                    self.access_panel.hidden = true;
+                    if self.cfg.network_role.is_empty() {
+                        self.cfg.network_role = "member".into();
+                        self.save_cfg();
+                    }
+                }
+                self.access_panel.note = message;
+            }
+        }
+    }
+
+    fn owner_access_keys(&mut self, ui: &mut egui::Ui) {
+        let signed_in = self.cfg.network_email.as_deref().map(str::trim).is_some_and(|email| !email.is_empty());
+        if !signed_in || self.cfg.network_role == "member" || self.access_panel.hidden {
+            return;
+        }
+        if !self.access_panel.loaded && self.access_panel.rx.is_none() {
+            self.spawn_access_keys("list", String::new());
+        }
+        if self.cfg.network_role != "owner" && !self.access_panel.loaded {
+            return;
+        }
+        if self.access_panel.busy || self.access_panel.rx.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        widgets::heading(ui, "SERVER ACCESS KEYS");
+        ui.label(widgets::muted(
+            ui,
+            "A key lets someone use your server without signing in to your account. It is shown once. The server stores only a hash.",
+        ));
+        ui.add_space(6.0);
+        if !self.access_panel.secret.is_empty() {
+            ui.label(widgets::muted(ui, "Copy this key now. It is shown once and is not saved here."));
+            let mut shown = self.access_panel.secret.clone();
+            ui.add(
+                egui::TextEdit::multiline(&mut shown)
+                    .desired_rows(2)
+                    .desired_width(420.0)
+                    .font(egui::TextStyle::Monospace)
+                    .password(!self.access_panel.show)
+                    .interactive(false),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Copy").clicked() {
+                    widgets::copy_to_clipboard(&self.access_panel.secret);
+                    self.access_panel.note = "Access key copied.".into();
+                }
+                let toggle = if self.access_panel.show { "Hide" } else { "Show" };
+                if ui.button(toggle).clicked() {
+                    self.access_panel.show = !self.access_panel.show;
+                }
+                if ui.button("Done").clicked() {
+                    self.access_panel.secret.clear();
+                    self.access_panel.show = false;
+                }
+            });
+            ui.add_space(6.0);
+        }
+        widgets::field_label(ui, "Label");
+        widgets::text_field(ui, &mut self.access_panel.label, "Ada", false);
+        ui.label(widgets::muted(ui, "Expires"));
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.access_panel.days, 0, "Never");
+            ui.selectable_value(&mut self.access_panel.days, 1, "1 day");
+            ui.selectable_value(&mut self.access_panel.days, 7, "7 days");
+            ui.selectable_value(&mut self.access_panel.days, 30, "30 days");
+        });
+        widgets::field_label(ui, "Computer limit");
+        widgets::text_field(ui, &mut self.access_panel.limit, "1", false);
+        if self.access_panel.limit.is_empty() {
+            self.access_panel.limit = "1".into();
+        }
+        let busy = self.access_panel.busy;
+        if ui.add_enabled(!busy, egui::Button::new(if busy { "Creating…" } else { "Create key" })).clicked() {
+            let label = self.access_panel.label.trim().to_string();
+            if label.is_empty() {
+                self.access_panel.note = "Give the key a label, such as the person's name.".into();
+            } else {
+                self.spawn_access_keys("create", String::new());
+            }
+        }
+        if !self.access_panel.note.is_empty() {
+            ui.label(widgets::muted(ui, &self.access_panel.note));
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let keys = self.access_panel.keys.clone();
+        for key in keys {
+            let expired = key.revoked_at == 0 && key.expires_at != 0 && now >= key.expires_at;
+            if key.revoked_at != 0 || expired {
+                continue;
+            }
+            let when = if key.expires_at == 0 { "does not expire" } else { "expires" };
+            ui.add_space(4.0);
+            ui.label(RichText::new(&key.label).strong());
+            ui.label(widgets::muted(
+                ui,
+                &format!("{when} · limit {} · {} computer(s)", key.computer_limit.max(1), key.computers),
+            ));
+            if !key.names.is_empty() {
+                ui.label(widgets::muted(ui, &key.names.join(", ")));
+            }
+            let confirming = self.access_panel.confirm.as_deref() == Some(key.id.as_str());
+            ui.horizontal(|ui| {
+                if confirming {
+                    ui.label("Revoke this key? Every computer that used it will be disconnected and removed.");
+                    if ui.small_button("Revoke").clicked() {
+                        let id = key.id.clone();
+                        self.access_panel.confirm = None;
+                        self.spawn_access_keys("revoke", id);
+                    }
+                    if ui.small_button("Cancel").clicked() {
+                        self.access_panel.confirm = None;
+                    }
+                } else if ui.small_button("Revoke").clicked() {
+                    self.access_panel.confirm = Some(key.id.clone());
+                }
+            });
+        }
+        ui.add_space(8.0);
+    }
+
+    fn spawn_access_keys(&mut self, op: &str, key_id: String) {
+        if self.access_panel.busy {
+            return;
+        }
+        let Some(server) = self.server_addr() else {
+            self.access_panel.note = "Set the server address first.".into();
+            return;
+        };
+        let limit = if op == "create" {
+            match self.access_panel.limit.trim().parse::<u32>() {
+                Ok(n) if (1..=100).contains(&n) => n,
+                _ => {
+                    self.access_panel.note = "The computer limit is a number from 1 to 100.".into();
+                    return;
+                }
+            }
+        } else {
+            1
+        };
+        let label = self.access_panel.label.clone();
+        let expires = crate::access_keys::expires_secs(self.access_panel.days);
+        let mut cfg = self.cfg.clone();
+        let op = op.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.access_panel.busy = true;
+        self.access_panel.rx = Some(rx);
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(crate::access_keys::Job::Failed(e.to_string()));
+                    return;
+                }
+            };
+            let job = match rt.block_on(crate::access_keys::manage(&server, &mut cfg, &op, &label, expires, limit, &key_id)) {
+                Ok(reply) => crate::access_keys::Job::Ready(reply),
+                Err(e) => crate::access_keys::Job::Failed(e.to_string()),
+            };
+            let _ = tx.send(job);
+        });
     }
 }
 

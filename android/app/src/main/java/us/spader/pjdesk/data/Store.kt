@@ -22,6 +22,7 @@ class Store(context: Context) {
     private val prefs = context.getSharedPreferences("pjdesk", Context.MODE_PRIVATE)
     private val secret = PermanentSecret(context.applicationContext)
     private val refreshBlob = KeystoreBlob(context.applicationContext, "pjdesk-network-refresh", "refresh")
+    private val accessKeyBlob = KeystoreBlob(context.applicationContext, "pjdesk-server-access-key", "access-key")
     private val passwordBlob = KeystoreBlob(context.applicationContext, "pjdesk-computer-passwords", "passwords")
     private val savedFile = File(dir, "saved.json")
     private val snapshotFile = File(dir, "saved-before-temp.json")
@@ -31,6 +32,11 @@ class Store(context: Context) {
         movePlainPermanentIntoKeystore()
         if (markerFile.exists()) endTemporaryVisit()
     }
+
+    /** Server access key. Sealed in the Android keystore. Not written to pjdesk.json. */
+    var accessKey: String
+        get() = accessKeyBlob.read()
+        set(value) { accessKeyBlob.write(value.trim()) }
 
     var onboarded: Boolean
         get() = prefs.getBoolean("onboarded", false)

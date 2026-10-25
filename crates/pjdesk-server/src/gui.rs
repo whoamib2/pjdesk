@@ -171,6 +171,16 @@ struct App {
     window_log: String,
     /// Device id waiting for Remove to be confirmed.
     confirm_remove: Option<String>,
+    ak_label: String,
+    ak_secs: u64,
+    ak_limit: String,
+    /// Shown once after Create. Not written to the status line.
+    ak_secret: String,
+    ak_show: bool,
+    ak_keys: Vec<pjdesk_proto::signal::AccessKeyBrief>,
+    ak_confirm: Option<String>,
+    ak_rx: Option<std::sync::mpsc::Receiver<AkResult>>,
+    ak_busy: bool,
 }
 
 /// How a cloud job (network calls on a worker thread) ended.
@@ -325,6 +335,15 @@ impl App {
             own_bucket: false,
             window_log: String::new(),
             confirm_remove: None,
+            ak_label: String::new(),
+            ak_secs: 0,
+            ak_limit: "1".into(),
+            ak_secret: String::new(),
+            ak_show: false,
+            ak_keys: Vec::new(),
+            ak_confirm: None,
+            ak_rx: None,
+            ak_busy: false,
         };
         crate::public_addr::remember_port(&app.data_dir, port);
         if spawn_probe {
@@ -510,6 +529,7 @@ impl App {
         self.blocked = view.blocked;
         self.online = view.online;
         self.log_tail = view.log_tail;
+        self.ak_keys = view.access_keys;
         self.cloud_on = view.cloud_on;
         self.cloud = view.cloud;
         if self.check_release {
@@ -555,6 +575,7 @@ impl eframe::App for App {
         }
         self.poll_disk();
         self.poll_notes();
+        self.poll_access_keys();
         if let Some(rx) = &self.probe {
             while let Ok(msg) = rx.try_recv() {
                 if let Some(snap) = msg {
@@ -563,7 +584,7 @@ impl eframe::App for App {
             }
         }
         let ctx = ui.ctx().clone();
-        ctx.request_repaint_after(if self.waiting_for_service() || self.disk_rx.is_some() || self.svc_rx.is_some() {
+        ctx.request_repaint_after(if self.waiting_for_service() || self.disk_rx.is_some() || self.svc_rx.is_some() || self.ak_rx.is_some() {
             Duration::from_millis(50)
         } else {
             Duration::from_secs(1)
@@ -2119,6 +2140,7 @@ impl App {
         }
         if self.access != Access::Readable {
             let snap = self.live.clone();
+            let mut ak_act = None;
             card(ui, |ui| {
                 heading(ui, "SIGNED-IN ACCOUNTS");
                 if let Some(live) = &snap {
@@ -2133,8 +2155,12 @@ impl App {
                     ui.add_space(6.0);
                     self.not_signed_in(ui, &waiting, &blocked, false);
                 }
+                ak_act = self.server_access_keys(ui, false);
                 self.locked_line(ui);
             });
+            if let Some(act) = ak_act {
+                self.start_access_key(act);
+            }
             return;
         }
         let mut policy = self.policy.clone();
@@ -2143,6 +2169,7 @@ impl App {
         let mut require = policy.require_accounts;
         let mut changed = false;
         let mut block_act = None;
+        let mut ak_act = None;
         self.poll_public_address();
         let saved_address = self.saved_address.clone();
         let dirty = self.pub_addr.trim() != saved_address.trim();
@@ -2223,6 +2250,7 @@ impl App {
             });
             ui.add_space(8.0);
             block_act = self.not_signed_in(ui, &unsigned, &blocked, true);
+            ak_act = self.server_access_keys(ui, self.can_write || self.control_ready);
             ui.add_space(8.0);
             ui.label(RichText::new("Allowed accounts").strong());
             if policy.allowed_accounts.is_empty() {
@@ -2320,6 +2348,9 @@ impl App {
         if publish {
             self.publish_public_address(replace);
         }
+        if let Some(act) = ak_act {
+            self.start_access_key(act);
+        }
     }
 
     fn network_managed(&mut self, ui: &mut egui::Ui) {
@@ -2344,6 +2375,7 @@ impl App {
         let mut publish = false;
         let mut replace = false;
         let mut block_act = None;
+        let mut ak_act = None;
         let address = self.pub_addr.clone();
         card(ui, |ui| {
             heading(ui, "PUBLIC ADDRESS");
@@ -2402,6 +2434,7 @@ impl App {
                 ui.add_space(6.0);
                 block_act = self.not_signed_in(ui, &waiting, &blocked_rows, true);
             }
+            ak_act = self.server_access_keys(ui, true);
         });
         if changed {
             self.ask_service(crate::control::Request {
@@ -2427,6 +2460,9 @@ impl App {
         }
         if let Some(act) = block_act {
             self.apply_block(act);
+        }
+        if let Some(act) = ak_act {
+            self.start_access_key(act);
         }
     }
 
@@ -2708,6 +2744,238 @@ impl App {
         }
     }
 
+    fn shown_keys(&self) -> Vec<pjdesk_proto::signal::AccessKeyBrief> {
+        if self.access == Access::Readable {
+            self.ak_keys.clone()
+        } else {
+            self.live.as_ref().map(|snap| snap.access_keys.clone()).unwrap_or_default()
+        }
+    }
+
+    fn key_label(&self, key_id: &str) -> String {
+        if key_id.is_empty() {
+            return String::new();
+        }
+        self.shown_keys()
+            .into_iter()
+            .find(|key| key.id == key_id)
+            .map(|key| key.label)
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| "Access key".into())
+    }
+
+    fn poll_access_keys(&mut self) {
+        let Some(rx) = &self.ak_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.ak_rx = None;
+        self.ak_busy = false;
+        match result {
+            AkResult::Secret(secret) => {
+                self.ak_secret = secret;
+                self.ak_show = true;
+                self.ak_label.clear();
+                self.status = "Copy this key now. It is shown once.".into();
+                self.request_refresh();
+            }
+            AkResult::Note(message) => {
+                self.status = message;
+                self.request_refresh();
+            }
+        }
+    }
+
+    fn start_access_key(&mut self, act: AkAct) {
+        if let AkAct::Dismiss = act {
+            self.ak_secret.clear();
+            self.ak_show = false;
+            return;
+        }
+        if self.ak_busy {
+            return;
+        }
+        let create = matches!(act, AkAct::Create);
+        let key_id = match act {
+            AkAct::Revoke(id) => id,
+            _ => String::new(),
+        };
+        if create && self.ak_label.trim().is_empty() {
+            self.status = "Give the key a label, such as the person's name.".into();
+            return;
+        }
+        let limit = if create {
+            match self.ak_limit.trim().parse::<u32>() {
+                Ok(n) if (1..=100).contains(&n) => n,
+                _ => {
+                    self.status = "The computer limit is a number from 1 to 100.".into();
+                    return;
+                }
+            }
+        } else {
+            1
+        };
+        let label = self.ak_label.clone();
+        let secs = self.ak_secs;
+        let dir = self.data_dir.clone();
+        let can_write = self.can_write;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ak_busy = true;
+        self.ak_confirm = None;
+        self.status = if create { "Creating an access key…".into() } else { "Revoking that access key…".into() };
+        std::thread::spawn(move || {
+            let result = if create {
+                if can_write {
+                    match crate::access_keys::Store::create(&dir, &label, secs, limit) {
+                        Ok(secret) => AkResult::Secret(secret),
+                        Err(e) => AkResult::Note(e),
+                    }
+                } else {
+                    match crate::control::call(&crate::control::Request {
+                        cmd: "create_access_key".into(),
+                        label,
+                        expires_secs: secs,
+                        computer_limit: limit,
+                        ..Default::default()
+                    }) {
+                        Some(response) if response.ok && !response.secret.is_empty() => AkResult::Secret(response.secret),
+                        Some(response) => AkResult::Note(if response.message.is_empty() {
+                            "Could not create an access key.".into()
+                        } else {
+                            response.message
+                        }),
+                        None => AkResult::Note(
+                            "The PJDesk service did not answer. Restart as administrator, or start the service.".into(),
+                        ),
+                    }
+                }
+            } else if can_write {
+                match crate::requests::revoke_access_key(&dir, &key_id) {
+                    Ok(()) => AkResult::Note("Revoked. Every computer that used it will be disconnected and removed.".into()),
+                    Err(e) => AkResult::Note(format!("Could not revoke that key: {e}")),
+                }
+            } else {
+                match crate::control::call(&crate::control::Request {
+                    cmd: "revoke_access_key".into(),
+                    key_id,
+                    ..Default::default()
+                }) {
+                    Some(response) => AkResult::Note(response.message),
+                    None => AkResult::Note(
+                        "The PJDesk service did not answer. Restart as administrator, or start the service.".into(),
+                    ),
+                }
+            };
+            let _ = tx.send(result);
+        });
+        self.ak_rx = Some(rx);
+    }
+
+    /// Create, copy, and revoke server access keys. The secret stays in this window.
+    fn server_access_keys(&mut self, ui: &mut egui::Ui, can_act: bool) -> Option<AkAct> {
+        let mut act = None;
+        ui.add_space(10.0);
+        heading(ui, "SERVER ACCESS KEYS");
+        ui.label(
+            RichText::new(
+                "A key lets someone use this server without signing in to your account. It is shown once. This server stores only a hash. Network keys are separate and are not changed.",
+            )
+            .color(p(ui).muted),
+        );
+        ui.add_space(6.0);
+        if !self.ak_secret.is_empty() {
+            ui.label(RichText::new("Copy this key now. It is shown once and is not saved here.").color(p(ui).warn));
+            let mut shown = self.ak_secret.clone();
+            ui.add(
+                egui::TextEdit::multiline(&mut shown)
+                    .desired_rows(2)
+                    .desired_width(420.0)
+                    .font(egui::TextStyle::Monospace)
+                    .password(!self.ak_show)
+                    .interactive(false),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Copy").clicked() {
+                    copy(&self.ak_secret);
+                    self.status = "Access key copied.".into();
+                }
+                let toggle = if self.ak_show { "Hide" } else { "Show" };
+                if ui.button(toggle).clicked() {
+                    self.ak_show = !self.ak_show;
+                }
+                if ui.button("Done").clicked() {
+                    act = Some(AkAct::Dismiss);
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if can_act {
+            ui.label("Label");
+            ui.add(egui::TextEdit::singleline(&mut self.ak_label).hint_text("Ada").desired_width(280.0));
+            ui.label("Expires");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.ak_secs, 0, "Never");
+                ui.selectable_value(&mut self.ak_secs, 86_400, "1 day");
+                ui.selectable_value(&mut self.ak_secs, 7 * 86_400, "7 days");
+                ui.selectable_value(&mut self.ak_secs, 30 * 86_400, "30 days");
+            });
+            ui.label("Computer limit");
+            ui.add(egui::TextEdit::singleline(&mut self.ak_limit).hint_text("1").desired_width(80.0));
+            let label = if self.ak_busy { "Creating…" } else { "Create key" };
+            if ui.add_enabled(!self.ak_busy, egui::Button::new(label)).clicked() {
+                act = Some(AkAct::Create);
+            }
+        } else if self.access != Access::Readable && !self.control_ready {
+            ui.label(
+                RichText::new("Restart as administrator, or start the PJDesk service, to create a key.")
+                    .color(p(ui).muted)
+                    .size(12.0),
+            );
+        }
+        let keys = self.shown_keys();
+        let now = crate::registry::unix_now();
+        if keys.is_empty() {
+            ui.label(RichText::new("No access keys yet.").color(p(ui).muted));
+        }
+        for key in &keys {
+            let expired = key.revoked_at == 0 && key.expires_at != 0 && now >= key.expires_at;
+            let state = if key.revoked_at != 0 {
+                "revoked"
+            } else if expired {
+                "expired"
+            } else {
+                "active"
+            };
+            let until = if key.expires_at == 0 {
+                "does not expire".to_string()
+            } else {
+                format!("expires {}", format_local(key.expires_at))
+            };
+            let count = if key.computers == 1 { "1 computer".to_string() } else { format!("{} computers", key.computers) };
+            ui.add_space(4.0);
+            ui.label(RichText::new(&key.label).strong());
+            ui.label(RichText::new(format!("{state} · {until} · limit {} · {count}", key.computer_limit.max(1))).color(p(ui).muted).size(12.0));
+            if !key.names.is_empty() {
+                ui.label(RichText::new(key.names.join(", ")).color(p(ui).text).size(12.0));
+            }
+            if can_act && key.revoked_at == 0 && !expired {
+                let confirming = self.ak_confirm.as_deref() == Some(key.id.as_str());
+                ui.horizontal(|ui| {
+                    if confirming {
+                        ui.label(RichText::new("Revoke this key? Every computer that used it will be disconnected and removed.").color(p(ui).warn));
+                        if ui.small_button("Revoke").clicked() {
+                            act = Some(AkAct::Revoke(key.id.clone()));
+                        }
+                        if ui.small_button("Cancel").clicked() {
+                            self.ak_confirm = None;
+                        }
+                    } else if ui.small_button("Revoke").clicked() {
+                        self.ak_confirm = Some(key.id.clone());
+                    }
+                });
+            }
+        }
+        act
+    }
+
     /// Computers that registered without a PJDesk account, and computers Ben removed.
     fn not_signed_in(
         &mut self,
@@ -2739,6 +3007,14 @@ impl App {
                 ui.label(RichText::new(&shown).monospace().strong());
                 ui.label(RichText::new(&name).strong());
             });
+            let access_label = if row.access_label.is_empty() {
+                self.key_label(&row.access_key_id)
+            } else {
+                row.access_label.clone()
+            };
+            if !access_label.is_empty() {
+                ui.label(RichText::new(format!("Access key: {access_label}")).color(p(ui).text).size(12.0));
+            }
             ui.label(RichText::new(computer_facts(&row.last_ip, row.first_seen, row.last_seen, 0)).color(p(ui).muted).size(12.0));
             if can_act {
                 let confirming = self.confirm_remove.as_deref() == Some(row.id.as_str());
@@ -2912,7 +3188,9 @@ impl App {
                         } else {
                             format!("Last seen {}", format_local(d.last_seen))
                         };
-                        if !d.signed_in {
+                        if !d.access_label.is_empty() {
+                            ui.label(RichText::new(&d.access_label).color(p(ui).text).size(11.0));
+                        } else if !d.signed_in {
                             ui.label(RichText::new("not signed in").color(p(ui).warn).size(11.0));
                         }
                         if d.online {
@@ -2969,6 +3247,7 @@ impl App {
                             last_seen: d.last_seen,
                             first_seen: d.first_seen,
                             signed_in: d.signed_in,
+                            access_label: d.access_label.clone(),
                         })
                         .collect()
                 })
@@ -2986,6 +3265,7 @@ impl App {
                     last_seen: d.last_seen,
                     first_seen: d.first_seen,
                     signed_in: d.signed_in,
+                    access_label: self.key_label(&d.access_key_id),
                 }
             })
             .collect()
@@ -3189,6 +3469,8 @@ struct UnknownComputer {
     last_ip: String,
     first_seen: u64,
     last_seen: u64,
+    access_key_id: String,
+    access_label: String,
 }
 
 struct BlockedComputer {
@@ -3203,6 +3485,17 @@ struct BlockedComputer {
 enum BlockAct {
     Remove(String),
     Unblock(String),
+}
+
+enum AkAct {
+    Create,
+    Revoke(String),
+    Dismiss,
+}
+
+enum AkResult {
+    Secret(String),
+    Note(String),
 }
 
 struct ServiceProbe {
@@ -3234,6 +3527,7 @@ struct FolderView {
     log_tail: String,
     cloud_on: bool,
     cloud: Option<crate::cloud::CloudStatus>,
+    access_keys: Vec<pjdesk_proto::signal::AccessKeyBrief>,
 }
 
 /// Local files only. The control pipe and the service manager are [`request_service_probe`].
@@ -3287,6 +3581,7 @@ fn read_folder(dir: &std::path::Path) -> FolderView {
         log_tail: String::new(),
         cloud_on: false,
         cloud: None,
+        access_keys: Vec::new(),
     };
     if access != Access::Readable {
         return view;
@@ -3304,6 +3599,7 @@ fn read_folder(dir: &std::path::Path) -> FolderView {
     }
     view.online = read_online(dir);
     view.log_tail = status_view::redacted_log_tail(&dir.join("server.log"));
+    view.access_keys = crate::access_keys::Store::public_list(dir);
     view.cloud_on = dir.join(crate::cloud::CONFIG_FILE).exists();
     view.cloud = crate::cloud::CloudStatus::load(dir);
     view
@@ -3316,6 +3612,8 @@ fn unknown_from_devices<'a>(rows: impl Iterator<Item = &'a DeviceRow>) -> Vec<Un
         last_ip: d.last_ip.clone(),
         first_seen: d.first_seen,
         last_seen: d.last_seen,
+        access_key_id: d.access_key_id.clone(),
+        access_label: String::new(),
     })
     .collect()
 }
@@ -3327,6 +3625,8 @@ fn unknown_from_listed<'a>(rows: impl Iterator<Item = &'a status_view::ListedDev
         last_ip: d.last_ip.clone(),
         first_seen: d.first_seen,
         last_seen: d.last_seen,
+        access_key_id: String::new(),
+        access_label: d.access_label.clone(),
     })
     .collect()
 }
@@ -3376,6 +3676,7 @@ struct ShownDevice {
     last_seen: u64,
     first_seen: u64,
     signed_in: bool,
+    access_label: String,
 }
 
 fn version_text(version: &str) -> String {

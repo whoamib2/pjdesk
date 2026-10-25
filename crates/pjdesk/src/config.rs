@@ -70,6 +70,13 @@ pub struct Config {
     /// PJDesk account that owns the private server this client uses.
     #[serde(default)]
     pub network_email: Option<String>,
+    /// `owner` or `member`, from the last sign-in. Empty until then.
+    #[serde(default)]
+    pub network_role: String,
+    /// Server access key, sealed so the background service can present it.
+    /// The key text is not stored in the clear.
+    #[serde(default)]
+    pub server_access_key: Option<String>,
     /// Refresh token for that account, sealed so the background service can read it.
     #[serde(default)]
     pub network_refresh: Option<String>,
@@ -635,6 +642,36 @@ impl Config {
         self.network_access.as_deref().and_then(secure::reveal).filter(|s| !s.is_empty()).unwrap_or_default()
     }
 
+    pub fn server_access_key(&self) -> String {
+        self.server_access_key.as_deref().and_then(secure::reveal).filter(|s| !s.is_empty()).unwrap_or_default()
+    }
+
+    pub fn set_server_access_key(&mut self, key: &str) {
+        let key = key.trim();
+        self.server_access_key = if key.is_empty() { None } else { Some(secure::protect_machine(key)) };
+    }
+
+    /// What this computer sends before Register or Connect.
+    /// A server access key wins over the account token.
+    pub fn presented_access(&self) -> String {
+        let key = self.server_access_key();
+        if !key.is_empty() {
+            return key;
+        }
+        self.network_access_token()
+    }
+
+    /// Copies a key saved by Settings into this in-memory config.
+    /// Returns true when it changed, so the host can register again.
+    pub fn reload_access_key(&mut self) -> bool {
+        let Ok(fresh) = Self::load() else { return false };
+        if fresh.server_access_key == self.server_access_key {
+            return false;
+        }
+        self.server_access_key = fresh.server_access_key;
+        true
+    }
+
     pub fn network_refresh_token(&self) -> String {
         self.network_refresh.as_deref().and_then(secure::reveal).filter(|s| !s.is_empty()).unwrap_or_default()
     }
@@ -660,6 +697,9 @@ impl Config {
         self.network_access_exp = session.exp;
         if !session.device_id.is_empty() {
             self.network_device_id = Some(session.device_id.clone());
+        }
+        if !session.role.is_empty() {
+            self.network_role = session.role.clone();
         }
         if !session.address.trim().is_empty() {
             let next = crate::network::keep_hostname(self.server.as_deref().unwrap_or(""), session.address.trim());

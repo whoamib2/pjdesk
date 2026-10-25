@@ -30,6 +30,14 @@ pub const TOKEN_TTL_SECS: u64 = 15 * 60;
 /// so the reply never confirms that an ID exists.
 pub const SIGN_IN_REQUIRED: &str = "Sign in required";
 
+/// Prefix of a server access key. This is not a network invite (`pjdesk-net1:`).
+pub const ACCESS_KEY_PREFIX: &str = "pjdesk-key1.";
+
+/// True when `token` is a server access key rather than a signed account token.
+pub fn is_access_key(token: &str) -> bool {
+    token.trim().starts_with(ACCESS_KEY_PREFIX)
+}
+
 /// Who a token was issued to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claims {

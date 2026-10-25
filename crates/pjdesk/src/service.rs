@@ -49,7 +49,16 @@ pub fn write_service_config(server: Option<&str>, password: Option<&str>) -> Res
                 cfg.network_device_id = user.network_device_id;
                 cfg.network_standby = user.network_standby;
                 cfg.network_standby_fingerprint = user.network_standby_fingerprint;
+                cfg.network_role = user.network_role;
             }
+            if cfg.server_access_key.is_none() {
+                cfg.server_access_key = user.server_access_key;
+            }
+        }
+    }
+    if cfg.server_access_key.is_none() {
+        if let Ok(user) = Config::load() {
+            cfg.server_access_key = user.server_access_key;
         }
     }
 

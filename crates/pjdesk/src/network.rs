@@ -94,6 +94,8 @@ pub struct Session {
     pub removed: Vec<String>,
     /// Present only when this sign-in had the account password. Not serialized.
     pub vault_key: Option<[u8; 32]>,
+    /// `owner` or `member` when sign-in could read it. Empty leaves the saved role.
+    pub role: String,
 }
 
 /// A hostname is kept when a later update only has the raw IP it points at.
@@ -412,6 +414,7 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
             .collect(),
         removed: reply.removed.into_iter().map(|id| pjdesk_proto::normalize_id(&id)).filter(|id| pjdesk_proto::is_valid_id(id)).collect(),
         vault_key: None,
+        role: String::new(),
     })
 }
 
@@ -443,6 +446,7 @@ pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) 
             let reply: NetworkReply = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
             match session_from(&email, device_id, reply) {
                 Ok(mut session) => {
+                    session.role = account_role(&login.token);
                     session.vault_key = Some(pjdesk_proto::access::derive_password_vault_key(&email, password));
                     Ok(SignIn::Ready(session))
                 }
@@ -766,6 +770,7 @@ pub fn enroll_known(
         presence: Vec::new(),
         removed: Vec::new(),
         vault_key: None,
+        role: String::new(),
     };
     let _ = publish_this_computer(&session, this, local)?;
     Ok(())
@@ -954,7 +959,26 @@ pub fn copy_to_service(user: &Config) {
     cfg.network_standby_fingerprint = user.network_standby_fingerprint.clone();
     cfg.network_lan = user.network_lan.clone();
     cfg.network_public_ip = user.network_public_ip.clone();
+    cfg.server_access_key = user.server_access_key.clone();
+    cfg.network_role = user.network_role.clone();
     let _ = cfg.save_to(&path);
+}
+
+/// `owner` or `member` from GET /api/network. Empty when pjdesk.com does not say.
+pub fn account_role(login_token: &str) -> String {
+    if login_token.trim().is_empty() {
+        return String::new();
+    }
+    #[derive(Deserialize)]
+    struct Body {
+        #[serde(default)]
+        role: Option<String>,
+    }
+    let url = format!("{}/api/network", api_base());
+    let response = agent().get(&url).set("Authorization", &format!("Bearer {login_token}")).call();
+    let Ok(response) = response else { return String::new() };
+    let Ok(text) = response.into_string() else { return String::new() };
+    serde_json::from_str::<Body>(&text).ok().and_then(|body| body.role).unwrap_or_default()
 }
 
 /// A network key carried by `--config`, by this executable's file name

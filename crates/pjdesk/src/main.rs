@@ -15,6 +15,7 @@
 mod icon_asset;
 
 mod account;
+mod access_keys;
 mod audio;
 mod client_update;
 mod clip;

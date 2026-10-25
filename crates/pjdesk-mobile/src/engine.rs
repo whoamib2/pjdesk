@@ -142,6 +142,10 @@ struct State {
     view_ask: Mutex<ViewAsk>,
     /// Set when a server from before 0.6.0 drops the connection after PresentAccess.
     suppress_token: AtomicBool,
+    /// Server access key. Kept in memory. The Android keystore is what saves it.
+    access_key: Mutex<String>,
+    /// Bumped when the key changes so the host presents it on the next connection.
+    access_epoch: AtomicU64,
     /// Connection for the session this phone is controlling. File bytes use it.
     viewer: Mutex<Option<quinn::Connection>>,
     files: Mutex<HashMap<u64, FileOffer>>,
@@ -279,6 +283,8 @@ impl Engine {
             trusted_computers: Mutex::new(Vec::new()),
             view_ask: Mutex::new(ViewAsk::default()),
             suppress_token: AtomicBool::new(false),
+            access_key: Mutex::new(String::new()),
+            access_epoch: AtomicU64::new(0),
             viewer: Mutex::new(None),
             files: Mutex::new(HashMap::new()),
             file_seq: AtomicU64::new(1),
@@ -517,6 +523,11 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             *state.access_token.lock().unwrap() = token;
             state.suppress_token.store(false, Ordering::SeqCst);
             persist(state);
+        }
+        "setAccessKey" => {
+            let key = cmd.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            *state.access_key.lock().unwrap() = key;
+            state.access_epoch.fetch_add(1, Ordering::SeqCst);
         }
         "account" => {
             let email = cmd.get("email").and_then(|v| v.as_str()).unwrap_or("").trim();
@@ -1001,7 +1012,12 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool)
         persist(&state);
         publish(&state, &cb);
     }
-    let token = if state.suppress_token.swap(false, Ordering::SeqCst) {
+    let epoch = state.access_epoch.load(Ordering::SeqCst);
+    let key = state.access_key.lock().unwrap().trim().to_string();
+    let keyed = !key.is_empty();
+    let token = if keyed {
+        key
+    } else if state.suppress_token.swap(false, Ordering::SeqCst) {
         String::new()
     } else {
         state.access_token.lock().unwrap().clone()
@@ -1039,6 +1055,9 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool)
         }
         tokio::select! {
             _ = ping.tick() => {
+                if state.access_epoch.load(Ordering::SeqCst) != epoch {
+                    return Ok(());
+                }
                 if last_heard.elapsed() >= Duration::from_secs(30) {
                     warn!("No reply from the server for 30 s (phone); reconnecting");
                     return Ok(());
@@ -1063,7 +1082,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool)
             msg = signal.recv() => {
                 let Some(msg) = msg else {
                     warn!("Lost the connection to the server (phone); reconnecting");
-                    if presented && !saw_registered {
+                    if presented && !saw_registered && !keyed {
                         state.suppress_token.store(true, Ordering::SeqCst);
                     }
                     return Ok(());
@@ -2092,7 +2111,8 @@ async fn controller_session(
         *state.fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         persist(&state);
     }
-    let access = state.access_token.lock().unwrap().clone();
+    let key = state.access_key.lock().unwrap().trim().to_string();
+    let access = if !key.is_empty() { key } else { state.access_token.lock().unwrap().clone() };
     if !access.is_empty() {
         let _ = signal.send(ClientMsg::PresentAccess { token: access });
     }
@@ -2772,6 +2792,8 @@ mod tests {
             trusted_computers: Mutex::new(Vec::new()),
             view_ask: Mutex::new(ViewAsk::default()),
             suppress_token: AtomicBool::new(false),
+            access_key: Mutex::new(String::new()),
+            access_epoch: AtomicU64::new(0),
             viewer: Mutex::new(None),
             files: Mutex::new(HashMap::new()),
             file_seq: AtomicU64::new(1),
