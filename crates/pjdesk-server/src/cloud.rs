@@ -1105,6 +1105,11 @@ fn effective_role(st: &SyncState, mine: &str, heuristic: Role) -> Role {
 /// A server with no cloud sync is the only server. A cloud standby, including
 /// one whose desired role is standby or whose epoch belongs to another
 /// instance, must not accept host registrations as authoritative.
+///
+/// `cloud-status.json` saying standby is not enough to refuse. After a
+/// restart the live table is empty, and an older sync wrote that file from
+/// the empty table. The server that owns the cloud copy, and a server with
+/// no owner recorded yet, still accepts hosts so the table can fill again.
 pub fn accepts_host_registrations(data_dir: &Path) -> bool {
     if CloudConfig::load(data_dir).is_none() {
         return true;
@@ -1113,16 +1118,15 @@ pub fn accepts_host_registrations(data_dir: &Path) -> bool {
     if st.desired == "standby" {
         return false;
     }
-    let mine = instance_id(data_dir);
-    if !st.active_instance.is_empty() && st.active_instance != mine && st.desired != "active" {
-        return false;
+    if st.desired == "active" {
+        return true;
     }
-    if st.desired != "active" {
-        if let Some(status) = CloudStatus::load(data_dir) {
-            if status.role == "standby" {
-                return false;
-            }
-        }
+    let mine = instance_id(data_dir);
+    if !st.active_instance.is_empty() && st.active_instance == mine {
+        return true;
+    }
+    if !st.active_instance.is_empty() {
+        return false;
     }
     true
 }
@@ -2299,6 +2303,31 @@ mod tests {
         )
         .unwrap();
         assert!(accepts_host_registrations(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restarted_primary_accepts_hosts_when_the_status_file_says_standby() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-role-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = "0123456789abcdef0123456789abcdef";
+        std::fs::write(dir.join(CONFIG_FILE), r#"{"mode":"account","key":"abcd","email":"ben@spader.us"}"#).unwrap();
+        std::fs::write(dir.join(INSTANCE_FILE), mine).unwrap();
+        std::fs::write(dir.join(STATE_FILE), r#"{"desired":"","active_instance":"0123456789abcdef0123456789abcdef"}"#)
+            .unwrap();
+        std::fs::write(dir.join(STATUS_FILE), r#"{"role":"standby"}"#).unwrap();
+        assert!(
+            accepts_host_registrations(&dir),
+            "the server that owns the cloud copy still accepts hosts after a restart"
+        );
+        // No owner recorded, and the status file only says standby because the
+        // table was empty. That must not lock the only server out.
+        std::fs::write(dir.join(STATE_FILE), r#"{"desired":""}"#).unwrap();
+        assert!(accepts_host_registrations(&dir));
+        std::fs::write(dir.join(STATE_FILE), r#"{"desired":"","active_instance":"fedcba9876543210fedcba9876543210"}"#)
+            .unwrap();
+        assert!(!accepts_host_registrations(&dir), "another instance owns the copy");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1239,7 +1239,11 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
         if !promote_now && !forced && ticks % PASS_EVERY != 1 {
             continue;
         }
-        let role = if state.lock().unwrap().online.is_empty() { Role::Standby } else { Role::Active };
+        // An empty table after a restart is not a demotion. Treating it as
+        // standby wrote cloud-status.json as standby, and that file then
+        // refused every registration, so every computer stayed offline.
+        let accepts = crate::cloud::accepts_host_registrations(&data_dir);
+        let role = if accepts { Role::Active } else { Role::Standby };
         let dir = data_dir.clone();
         let applied = tokio::task::spawn_blocking(move || sync_once(&dir, role, forced)).await.unwrap_or(false);
         if applied {

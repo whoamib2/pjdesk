@@ -90,14 +90,16 @@ pub struct HostDuty {
     pub window_hosts: bool,
 }
 
-/// The first sample starts the window immediately when the service is down.
-/// After the service has been seen running, [`SERVICE_DOWN_POLLS`] consecutive
-/// down samples are required.
-pub fn host_duty(ready: bool, service_running: bool, down_polls: u32, sample_running: bool) -> HostDuty {
+/// The first sample starts the window immediately when the service is not
+/// registered. After the service has been seen hosting, [`SERVICE_DOWN_POLLS`]
+/// consecutive misses are required. `sample_hosting` is true only when the
+/// service status file is fresh and says this computer is online. Service
+/// Control Manager "Running" is not enough.
+pub fn host_duty(ready: bool, service_running: bool, down_polls: u32, sample_hosting: bool) -> HostDuty {
     if !ready {
-        return HostDuty { service_running: sample_running, down_polls: 0, window_hosts: !sample_running };
+        return HostDuty { service_running: sample_hosting, down_polls: 0, window_hosts: !sample_hosting };
     }
-    if sample_running {
+    if sample_hosting {
         return HostDuty { service_running: true, down_polls: 0, window_hosts: false };
     }
     if !service_running {
@@ -165,5 +167,20 @@ mod tests {
         assert!(back.service_running);
         assert_eq!(back.down_polls, 0);
         assert!(!back.window_hosts);
+    }
+
+    #[test]
+    fn the_window_yields_only_when_the_service_is_actually_online() {
+        let mut stale = ServiceStatus::default();
+        stale.online = true;
+        assert!(!stale.is_hosting());
+        let still = host_duty(true, false, 0, stale.is_hosting());
+        assert!(still.window_hosts, "a service process with no fresh registration does not take over");
+
+        let fresh = ServiceStatus::now(Some("692996394".into()), true, None, None, false);
+        assert!(fresh.is_hosting());
+        let yielded = host_duty(true, false, 0, fresh.is_hosting());
+        assert!(!yielded.window_hosts);
+        assert!(yielded.service_running);
     }
 }

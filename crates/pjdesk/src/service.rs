@@ -532,23 +532,27 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
     let server = ServerAddr::parse(&config.effective_server())
         .map_err(|e| anyhow::anyhow!("invalid server address \"{}\": {e}", config.effective_server()))?;
 
-    let shared = Arc::new(HostShared::default());
+    let mut shared = Arc::new(HostShared::default());
     let mut args = crate::HostArgs::from_settings(&config.settings);
     args.follow_desktop = true;
     args.service_host = true;
 
-    let host_shared = shared.clone();
-    std::thread::Builder::new().name("host".into()).spawn(move || {
-        if let Err(e) = host::run_with(server, config, args, Some(host_shared.clone())) {
-            tracing::error!("session host stopped: {e:#}");
-            *host_shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
-        }
-    })?;
+    let spawn_host = |shared: Arc<HostShared>, server: ServerAddr, config: Config, args: crate::HostArgs| {
+        std::thread::Builder::new().name("host".into()).spawn(move || {
+            if let Err(e) = host::run_with(server, config, args, Some(shared.clone())) {
+                tracing::error!("session host stopped: {e:#}");
+                *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
+            }
+        })
+    };
+    let mut host_thread = spawn_host(shared.clone(), server.clone(), config.clone(), args.clone())?;
 
     // Publish status for the GUI until the process is killed. The one-time
     // password is always shown; a permanent password (if set) works too but is
-    // never written here.
-    loop {
+    // never written here. If the host thread returns, publish offline at once
+    // and start it again. A service that stays "Running" with a dead host
+    // would otherwise leave this computer unregistered.
+    let publish = |shared: &HostShared| {
         let password = Some(shared.password()).filter(|p| !p.is_empty());
         let mut status = ServiceStatus::now(
             shared.id(),
@@ -568,6 +572,18 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
             shared.request_support_refresh();
         }
         status.write();
+    };
+    loop {
+        if host_thread.is_finished() {
+            tracing::warn!("The service host stopped; starting it again so this computer stays registered");
+            shared = Arc::new(HostShared::default());
+            publish(&shared);
+            std::thread::sleep(Duration::from_secs(2));
+            let fresh = Config::load().unwrap_or_else(|_| config.clone());
+            let next = ServerAddr::parse(&fresh.effective_server()).unwrap_or_else(|_| server.clone());
+            host_thread = spawn_host(shared.clone(), next, fresh, args.clone())?;
+        }
+        publish(&shared);
         std::thread::sleep(Duration::from_secs(2));
     }
 }

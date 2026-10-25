@@ -127,24 +127,24 @@ impl Engine {
         }
     }
 
-    fn on_service(&mut self, config: &Config, running: bool) {
+    fn on_service(&mut self, config: &Config, hosting: bool) {
         let was_ready = self.ready;
         let window_was_hosting = self.ready && !self.service_running;
-        let duty = probe::host_duty(self.ready, self.service_running, self.service_down_polls, running);
+        let duty = probe::host_duty(self.ready, self.service_running, self.service_down_polls, hosting);
         self.ready = true;
         self.service_down_polls = duty.down_polls;
         if !was_ready {
             self.service_running = duty.service_running;
             if duty.window_hosts {
-                tracing::info!("The background service is not running; this window will register this computer");
+                tracing::info!("The background service is not registered; this window will register this computer");
                 self.spawn(config);
             }
             return;
         }
         if duty.window_hosts == window_was_hosting && duty.service_running == self.service_running {
-            if !running && self.service_running {
+            if !hosting && self.service_running {
                 tracing::info!(
-                    "The background service missed a status check ({}/{})",
+                    "The background service missed a registration check ({}/{})",
                     duty.down_polls,
                     probe::SERVICE_DOWN_POLLS
                 );
@@ -153,11 +153,11 @@ impl Engine {
         }
         if duty.window_hosts && !window_was_hosting {
             tracing::info!(
-                "The background service missed {} status checks; this window will register this computer",
+                "The background service missed {} registration checks; this window will register this computer",
                 probe::SERVICE_DOWN_POLLS
             );
         } else if !duty.window_hosts && window_was_hosting {
-            tracing::info!("The background service is running; this window stopped registering this computer");
+            tracing::info!("The background service is registered; this window stopped registering this computer");
         }
         self.restart(config, duty.service_running);
     }
@@ -1018,8 +1018,12 @@ impl App {
     }
 
     fn hosting_by_service(&self) -> bool {
-        if self.scm_known {
-            self.scm_running
+        if self.svc_status.is_hosting() {
+            true
+        } else if self.scm_known {
+            // The probe has reported. SCM Running without a fresh online
+            // status means this window is the registrar.
+            false
         } else {
             self.engine.service_running
         }
@@ -1072,7 +1076,9 @@ impl App {
         self.scm_known = true;
         self.svc_status = snap.svc;
         let cfg = self.cfg.clone();
-        self.engine.on_service(&cfg, snap.running);
+        // SCM "Running" only means the service process is up. The window keeps
+        // this computer registered until status.json is fresh and online.
+        self.engine.on_service(&cfg, self.svc_status.is_hosting());
     }
 
     fn share_rtt(&self) -> u64 {

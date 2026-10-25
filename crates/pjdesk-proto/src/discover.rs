@@ -162,7 +162,17 @@ pub fn listen_servers(limit: std::time::Duration) -> Vec<(std::net::SocketAddr, 
         Ok(socket) => socket,
         Err(_) => return Vec::new(),
     };
-    let _ = socket.set_read_timeout(Some(std::time::Duration::from_millis(80)));
+    collect_beacons(socket, limit)
+}
+
+/// Reads beacons until `limit`. The socket is non-blocking, so a failed
+/// `SO_RCVTIMEO` cannot leave the registrar blocked in `recv` forever.
+fn collect_beacons(
+    socket: std::net::UdpSocket,
+    limit: std::time::Duration,
+) -> Vec<(std::net::SocketAddr, ServerBeacon)> {
+    let _ = socket.set_nonblocking(true);
+    let _ = socket.set_read_timeout(Some(std::time::Duration::from_millis(40)));
     let deadline = std::time::Instant::now() + limit;
     let mut found: Vec<(std::net::SocketAddr, ServerBeacon)> = Vec::new();
     let mut buf = [0u8; 128];
@@ -183,7 +193,13 @@ pub fn listen_servers(limit: std::time::Duration) -> Vec<(std::net::SocketAddr, 
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::sleep(left.min(std::time::Duration::from_millis(40)));
+            }
             Err(_) => break,
         }
     }
@@ -563,5 +579,16 @@ mod tests {
         assert!(!announce_now(false, false, &lan));
         assert!(!announce_now(false, true, &public));
         assert!(!announce_now(false, true, &[]));
+    }
+
+    #[test]
+    fn a_quiet_discovery_socket_returns_at_the_deadline() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let started = std::time::Instant::now();
+        let found = collect_beacons(socket, std::time::Duration::from_millis(200));
+        let elapsed = started.elapsed();
+        assert!(found.is_empty());
+        assert!(elapsed >= std::time::Duration::from_millis(150), "returned too early: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(2), "listen stayed open for {elapsed:?}");
     }
 }

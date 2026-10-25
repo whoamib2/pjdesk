@@ -112,4 +112,27 @@ impl ServiceStatus {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         now.saturating_sub(self.updated_unix) < 10
     }
+
+    /// The service process is up and this computer is registered through it.
+    /// Service Control Manager "Running" is not enough: the helper can be
+    /// alive while its host thread has stopped.
+    pub fn is_hosting(&self) -> bool {
+        self.is_fresh() && self.online
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosting_requires_a_fresh_online_status() {
+        let mut status = ServiceStatus::now(Some("692996394".into()), true, None, None, false);
+        assert!(status.is_hosting());
+        status.online = false;
+        assert!(!status.is_hosting(), "a fresh file that is not online is not hosting");
+        status.online = true;
+        status.updated_unix = 0;
+        assert!(!status.is_hosting(), "a stale file is not hosting");
+    }
 }

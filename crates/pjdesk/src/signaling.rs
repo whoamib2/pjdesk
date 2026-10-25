@@ -52,11 +52,15 @@ impl ServerAddr {
     }
 
     /// Resolves to an IPv4 address (the P2P layer is IPv4-only for now).
+    /// The lookup is bounded. A stuck resolver used to sit on "Looking up"
+    /// forever, so the only registrar never reached Register.
     pub async fn resolve(&self) -> Result<SocketAddr> {
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((self.host.as_str(), self.port))
-            .await
-            .with_context(|| format!("cannot resolve server name \"{}\"", self.host))?
-            .collect();
+        let lookup =
+            tokio::time::timeout(Duration::from_secs(8), tokio::net::lookup_host((self.host.as_str(), self.port)))
+                .await
+                .map_err(|_| anyhow!("timed out resolving server name \"{}\"", self.host))?;
+        let addrs: Vec<SocketAddr> =
+            lookup.with_context(|| format!("cannot resolve server name \"{}\"", self.host))?.collect();
         addrs
             .iter()
             .find(|a| a.is_ipv4())
@@ -114,9 +118,16 @@ impl SignalClient {
         info!("Looking up {server}");
         let (resolved, heard) = tokio::join!(
             server.resolve(),
-            tokio::task::spawn_blocking(|| pjdesk_proto::discover::listen_servers(Duration::from_millis(250))),
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                tokio::task::spawn_blocking(|| pjdesk_proto::discover::listen_servers(Duration::from_millis(250))),
+            ),
         );
         let resolved = resolved?;
+        let heard = match heard {
+            Ok(Ok(list)) => list,
+            _ => Vec::new(),
+        };
         let same_site = if public_only { false } else { same_site(&config.network_public_ip).await };
         let own = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
         let pinned = config.pinned_fingerprint();
@@ -132,11 +143,7 @@ impl SignalClient {
         let beacons = if public_only {
             Vec::new()
         } else {
-            heard
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(addr, beacon)| (addr, beacon.fingerprint, beacon.role))
-                .collect()
+            heard.into_iter().map(|(addr, beacon)| (addr, beacon.fingerprint, beacon.role)).collect()
         };
         let plan = pjdesk_proto::discover::reach_plan(
             resolved,

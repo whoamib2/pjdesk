@@ -462,6 +462,7 @@ async fn host_main(
     let mut delay = Duration::from_secs(1);
     let mut force_refresh = false;
     let mut public_only = false;
+    let role = if args.service_host { "service" } else { "window" };
     loop {
         if state.shared.as_ref().is_some_and(|s| s.stopping()) {
             return Ok(());
@@ -486,10 +487,11 @@ async fn host_main(
                 if let Some(shared) = &state.shared {
                     *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
                 }
+                info!("This computer is not registered ({role}). {e:#}");
                 return Err(e);
             }
             Err(e) if pjdesk_proto::signal::is_standby_refusal(&format!("{e:#}")) => {
-                warn!("{e:#}");
+                info!("This computer is not registered ({role}). {e:#}");
                 public_only = true;
                 delay = Duration::from_secs(1);
                 if let Some(shared) = &state.shared {
@@ -497,7 +499,7 @@ async fn host_main(
                 }
             }
             Err(e) => {
-                warn!("{e:#}");
+                info!("This computer is not registered ({role}). {e:#}");
                 advance = true;
                 if let Some(shared) = &state.shared {
                     *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
