@@ -272,6 +272,7 @@ class MainActivity : FragmentActivity() {
             var confirmUnattended by remember { mutableStateOf(false) }
             var unattendedPin by remember { mutableStateOf("") }
             var pinRejects by remember { mutableIntStateOf(0) }
+            var pinEpoch by remember { mutableIntStateOf(0) }
             var lockBusy by remember { mutableStateOf(false) }
             var lockError by remember { mutableStateOf("") }
             var vaultRejected by remember { mutableStateOf(false) }
@@ -1150,6 +1151,7 @@ class MainActivity : FragmentActivity() {
                     this@MainActivity,
                     stored,
                     onKey = { key ->
+                        pinEpoch++
                         app.bioPrompt = false
                         app.holdVaultKey(key)
                         app.store.pinFails = 0
@@ -1181,14 +1183,67 @@ class MainActivity : FragmentActivity() {
                 }
                 AppLog.i("app pin rejected fails=$fails")
             }
+            fun unlockWithPin(key: ByteArray?) {
+                pinEpoch++
+                lockBusy = false
+                app.store.pinFails = 0
+                app.store.pinLockedUntil = 0L
+                if (key != null) app.holdVaultKey(key)
+                lockError = ""
+                forgotPin = false
+                app.markUnlocked()
+                syncPasswords(!temporarySession)
+            }
+            fun notePinEdit() {
+                if (app.store.pinLockedUntil > System.currentTimeMillis()) return
+                lockError = ""
+            }
+            fun peekPin(pin: String) {
+                if (lockBusy || app.store.pinLockedUntil > System.currentTimeMillis()) return
+                val epoch = pinEpoch
+                if (app.store.hasAccountPin()) {
+                    val salt = app.store.accountPinSalt
+                    val hash = app.store.accountPinHash
+                    val iters = app.store.accountPinIters
+                    val pinSalt = app.store.pinSaltBytes()
+                    val wrapped = app.store.pinWrap
+                    scope.launch {
+                        val ok = withContext(Dispatchers.IO) {
+                            AccountPin.matches(pin, salt, hash, iters)
+                        }
+                        if (epoch != pinEpoch || !ok) return@launch
+                        val key = if (pinSalt != null && wrapped.isNotBlank()) {
+                            withContext(Dispatchers.IO) { PinWrap.unwrap(wrapped, pin, pinSalt) }
+                        } else {
+                            null
+                        }
+                        if (epoch != pinEpoch) return@launch
+                        unlockWithPin(key)
+                    }
+                    return
+                }
+                val pinSalt = app.store.pinSaltBytes() ?: return
+                val wrapped = app.store.pinWrap
+                if (wrapped.isBlank()) return
+                scope.launch {
+                    val key = withContext(Dispatchers.IO) { PinWrap.unwrap(wrapped, pin, pinSalt) }
+                    if (epoch != pinEpoch || key == null) return@launch
+                    unlockWithPin(key)
+                }
+            }
             fun submitPin(pin: String) {
                 if (app.store.pinLockedUntil > System.currentTimeMillis()) return
+                val epoch = pinEpoch
                 if (app.store.hasAccountPin()) {
                     lockBusy = true
                     lockError = ""
                     scope.launch {
                         val ok = withContext(Dispatchers.IO) {
                             AccountPin.matches(pin, app.store.accountPinSalt, app.store.accountPinHash, app.store.accountPinIters)
+                        }
+                        if (epoch != pinEpoch) {
+                            lockBusy = false
+                            return@launch
                         }
                         if (!ok) {
                             lockBusy = false
@@ -1202,14 +1257,11 @@ class MainActivity : FragmentActivity() {
                         } else {
                             null
                         }
-                        lockBusy = false
-                        app.store.pinFails = 0
-                        app.store.pinLockedUntil = 0L
-                        if (key != null) app.holdVaultKey(key)
-                        lockError = ""
-                        forgotPin = false
-                        app.markUnlocked()
-                        syncPasswords(!temporarySession)
+                        if (epoch != pinEpoch) {
+                            lockBusy = false
+                            return@launch
+                        }
+                        unlockWithPin(key)
                     }
                     return
                 }
@@ -1220,17 +1272,16 @@ class MainActivity : FragmentActivity() {
                 lockError = ""
                 scope.launch {
                     val key = withContext(Dispatchers.IO) { PinWrap.unwrap(wrapped, pin, salt) }
-                    lockBusy = false
+                    if (epoch != pinEpoch) {
+                        lockBusy = false
+                        return@launch
+                    }
                     if (key == null) {
+                        lockBusy = false
                         notePinMiss()
                         return@launch
                     }
-                    app.store.pinFails = 0
-                    app.store.pinLockedUntil = 0L
-                    app.holdVaultKey(key)
-                    lockError = ""
-                    app.markUnlocked()
-                    syncPasswords(!temporarySession)
+                    unlockWithPin(key)
                 }
             }
             fun finishPin(pin: String, password: String, enableBio: Boolean) {
@@ -1530,6 +1581,7 @@ class MainActivity : FragmentActivity() {
                         },
                     )
                 } else if (gate == "unlock") {
+                    LaunchedEffect(Unit) { pinEpoch++ }
                     UnlockScreen(
                         busy = lockBusy,
                         error = lockError,
@@ -1538,6 +1590,8 @@ class MainActivity : FragmentActivity() {
                         rejectCount = pinRejects,
                         lockedOut = pinWait,
                         onSubmit = { submitPin(it) },
+                        onPeek = { peekPin(it) },
+                        onEdit = { notePinEdit() },
                         onBiometric = { tryBio() },
                         onForgot = { forgotPin = true; lockError = "" },
                     )

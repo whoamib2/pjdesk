@@ -103,10 +103,18 @@ impl App {
         self.show_settings = false;
         self.show_invite = false;
         self.show_login = false;
+        self.drop_pin_peek();
+    }
+
+    fn drop_pin_peek(&mut self) {
+        self.lock_peeked.clear();
+        self.lock_peek_tx = None;
+        self.lock_peek_rx = None;
     }
 
     pub(super) fn poll_app_lock(&mut self) {
         self.absorb_shared_lock();
+        self.poll_pin_peek();
         if self.lock_rx.is_some() {
             let msg = self.lock_rx.as_ref().and_then(|rx| match rx.try_recv() {
                 Ok(msg) => Some(msg),
@@ -219,9 +227,13 @@ impl App {
                 self.lock_resetting = false;
                 self.lock_error.clear();
                 self.lock_pin.clear();
+                self.drop_pin_peek();
                 self.last_input = Instant::now();
             }
             LockMsg::Rejected => {
+                if !self.lock_ui {
+                    return;
+                }
                 let now = super::unix_now();
                 let (fails, until) = pjdesk_proto::applock::note_miss(self.cfg.app_lock_fails, now);
                 self.cfg.note_app_lock_fail(fails, until);
@@ -229,6 +241,7 @@ impl App {
                 self.publish_shared();
                 tracing::info!("Wrong PIN ({fails} misses)");
                 self.lock_pin.clear();
+                self.lock_peeked.clear();
                 self.lock_error = if until > now {
                     wait_label(until - now)
                 } else {
@@ -396,7 +409,12 @@ impl App {
                         pin_box.request_focus();
                         self.lock_pin_armed = true;
                     }
+                    let prior = self.lock_pin.clone();
                     self.lock_pin = digits_only(&pin);
+                    if self.lock_pin != prior && !waiting {
+                        self.lock_error.clear();
+                    }
+                    self.peek_pin();
                     let can = !self.lock_busy && !waiting && pjdesk_proto::applock::pin_acceptable(&self.lock_pin);
                     if widgets::submitted(ui, &pin_box) && can {
                         self.start_unlock();
@@ -492,6 +510,65 @@ impl App {
                     }
                 });
             });
+    }
+
+    /// Hash the current PIN in the background. A match unlocks. Anything else
+    /// is ignored: it is not a wrong attempt and it does not show an error.
+    /// Enter and Unlock still use [`Self::start_unlock`].
+    fn peek_pin(&mut self) {
+        if self.lock_busy || self.lock_resetting || !self.lock_ui {
+            return;
+        }
+        if self.cfg.app_lock_until > super::unix_now() {
+            return;
+        }
+        if !pjdesk_proto::applock::pin_acceptable(&self.lock_pin) || self.lock_pin == self.lock_peeked {
+            return;
+        }
+        let Some(verifier) = self.cfg.app_lock_for(&self.account_email()) else {
+            return;
+        };
+        let pin = self.lock_pin.clone();
+        if self.lock_peek_tx.is_none() {
+            let (tx, rx) = mpsc::channel();
+            self.lock_peek_tx = Some(tx);
+            self.lock_peek_rx = Some(rx);
+        }
+        let Some(tx) = self.lock_peek_tx.clone() else { return };
+        let spawned = std::thread::Builder::new()
+            .name("app-lock-peek".into())
+            .spawn(move || {
+                let _ = tx.send(pjdesk_proto::applock::matches(&verifier, &pin));
+            })
+            .is_ok();
+        if spawned {
+            self.lock_peeked = self.lock_pin.clone();
+        }
+    }
+
+    fn poll_pin_peek(&mut self) {
+        let mut matched = false;
+        let mut dead = false;
+        if let Some(rx) = &self.lock_peek_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(true) => matched = true,
+                    Ok(false) => {}
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if dead {
+            self.lock_peek_rx = None;
+            self.lock_peek_tx = None;
+        }
+        if matched && self.lock_ui && !self.lock_resetting {
+            self.apply_lock_msg(LockMsg::Unlocked);
+        }
     }
 
     fn start_unlock(&mut self) {

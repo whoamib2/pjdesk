@@ -192,6 +192,20 @@ fun SetPinScreen(
     }
 }
 
+private fun pinDigit(key: Key): Char? = when (key) {
+    Key.Zero, Key.NumPad0 -> '0'
+    Key.One, Key.NumPad1 -> '1'
+    Key.Two, Key.NumPad2 -> '2'
+    Key.Three, Key.NumPad3 -> '3'
+    Key.Four, Key.NumPad4 -> '4'
+    Key.Five, Key.NumPad5 -> '5'
+    Key.Six, Key.NumPad6 -> '6'
+    Key.Seven, Key.NumPad7 -> '7'
+    Key.Eight, Key.NumPad8 -> '8'
+    Key.Nine, Key.NumPad9 -> '9'
+    else -> null
+}
+
 @Composable
 fun UnlockScreen(
     busy: Boolean,
@@ -200,16 +214,31 @@ fun UnlockScreen(
     rejectCount: Int = 0,
     lockedOut: Boolean = false,
     onSubmit: (String) -> Unit,
+    onPeek: (String) -> Unit = {},
+    onEdit: () -> Unit = {},
     onBiometric: () -> Unit,
     onForgot: () -> Unit = {},
 ) {
     var pin by remember { mutableStateOf("") }
+    var peeked by remember { mutableStateOf("") }
     val focus = remember { FocusRequester() }
     fun submit() {
         if (!busy && !lockedOut && AppLockPolicy.pinAcceptable(pin)) onSubmit(pin)
     }
+    fun replacePin(next: String) {
+        if (next == pin) return
+        pin = next
+        onEdit()
+        if (!busy && !lockedOut && AppLockPolicy.pinAcceptable(next) && next != peeked) {
+            peeked = next
+            onPeek(next)
+        }
+    }
     LaunchedEffect(rejectCount) {
-        if (rejectCount > 0) pin = ""
+        if (rejectCount > 0) {
+            pin = ""
+            peeked = ""
+        }
     }
     LaunchedEffect(biometrics) {
         if (!biometrics) runCatching { focus.requestFocus() }
@@ -221,9 +250,21 @@ fun UnlockScreen(
             .focusable()
             .onPreviewKeyEvent { event ->
                 val enter = event.key == Key.Enter || event.key == Key.NumPadEnter
-                if (!enter) return@onPreviewKeyEvent false
-                if (event.type == KeyEventType.KeyUp) submit()
-                true
+                if (enter) {
+                    if (event.type == KeyEventType.KeyUp) submit()
+                    return@onPreviewKeyEvent true
+                }
+                if (event.type != KeyEventType.KeyDown || busy || lockedOut) return@onPreviewKeyEvent false
+                val digit = pinDigit(event.key)
+                if (digit != null) {
+                    if (pin.length < 8) replacePin(pin + digit)
+                    return@onPreviewKeyEvent true
+                }
+                if (event.key == Key.Backspace || event.key == Key.Delete) {
+                    if (pin.isNotEmpty()) replacePin(pin.dropLast(1))
+                    return@onPreviewKeyEvent true
+                }
+                false
             }
             .padding(horizontal = 24.dp, vertical = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -250,11 +291,9 @@ fun UnlockScreen(
             showBiometric = biometrics && !lockedOut,
             onDigit = { digit ->
                 if (pin.length >= 8) return@PinKeypad
-                val next = pin + digit
-                pin = next
-                if (next.length == 8) onSubmit(next)
+                replacePin(pin + digit)
             },
-            onBackspace = { if (pin.isNotEmpty()) pin = pin.dropLast(1) },
+            onBackspace = { if (pin.isNotEmpty()) replacePin(pin.dropLast(1)) },
             onBiometric = onBiometric,
         )
         Spacer(Modifier.size(20.dp))

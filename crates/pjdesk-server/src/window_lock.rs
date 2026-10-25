@@ -56,6 +56,10 @@ pub struct Gate {
     pin_armed: bool,
     /// The Set-a-PIN field has been focused for this appearance.
     setup_focused: bool,
+    /// Last unlock PIN already sent to a silent hash check.
+    peeked: String,
+    peek_tx: Option<mpsc::Sender<bool>>,
+    peek_rx: Option<Receiver<bool>>,
 }
 
 impl Gate {
@@ -92,6 +96,9 @@ impl Gate {
             hidden_at: None,
             pin_armed: false,
             setup_focused: false,
+            peeked: String::new(),
+            peek_tx: None,
+            peek_rx: None,
         }
     }
 
@@ -123,6 +130,13 @@ impl Gate {
         self.pin_armed = false;
         self.setup_focused = false;
         self.error.clear();
+        self.drop_peek();
+    }
+
+    fn drop_peek(&mut self) {
+        self.peeked.clear();
+        self.peek_tx = None;
+        self.peek_rx = None;
     }
 
     /// Minimize, tray, and a second launch all come back through here.
@@ -277,7 +291,12 @@ impl Gate {
                     pin_box.request_focus();
                     self.pin_armed = true;
                 }
+                let prior = self.pin.clone();
                 self.pin = digits(&pin);
+                if self.pin != prior && !waiting {
+                    self.error.clear();
+                }
+                self.peek_pin();
                 let can = !self.busy && !waiting && applock::pin_acceptable(&self.pin);
                 if submitted(ui, &pin_box) && can {
                     self.start_unlock();
@@ -329,6 +348,62 @@ impl Gate {
             } else {
                 self.start_unlock();
             }
+        }
+    }
+
+    /// Hash the current PIN in the background. A match unlocks. A mismatch
+    /// while typing is not a failed attempt and shows no error.
+    fn peek_pin(&mut self) {
+        if self.busy || self.resetting || !self.ui {
+            return;
+        }
+        if self.until > unix_now() {
+            return;
+        }
+        if !applock::pin_acceptable(&self.pin) || self.pin == self.peeked {
+            return;
+        }
+        let Some(verifier) = self.verifier.clone() else { return };
+        let pin = self.pin.clone();
+        if self.peek_tx.is_none() {
+            let (tx, rx) = mpsc::channel();
+            self.peek_tx = Some(tx);
+            self.peek_rx = Some(rx);
+        }
+        let Some(tx) = self.peek_tx.clone() else { return };
+        let spawned = std::thread::Builder::new()
+            .name("app-lock-peek".into())
+            .spawn(move || {
+                let _ = tx.send(applock::matches(&verifier, &pin));
+            })
+            .is_ok();
+        if spawned {
+            self.peeked = self.pin.clone();
+        }
+    }
+
+    fn poll_peek(&mut self) {
+        let mut matched = false;
+        let mut dead = false;
+        if let Some(rx) = &self.peek_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(true) => matched = true,
+                    Ok(false) => {}
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if dead {
+            self.peek_rx = None;
+            self.peek_tx = None;
+        }
+        if matched && self.ui && !self.resetting {
+            self.unlock();
         }
     }
 
@@ -402,6 +477,7 @@ impl Gate {
     }
 
     fn poll_jobs(&mut self) {
+        self.poll_peek();
         let msg = self.rx.as_ref().and_then(|rx| match rx.try_recv() {
             Ok(msg) => Some(msg),
             Err(mpsc::TryRecvError::Empty) => None,
@@ -417,10 +493,14 @@ impl Gate {
         match msg {
             Msg::Unlocked => self.unlock(),
             Msg::Rejected => {
+                if !self.ui {
+                    return;
+                }
                 let (fails, until) = applock::note_miss(self.fails, unix_now());
                 self.fails = fails;
                 self.until = until;
                 self.pin.clear();
+                self.peeked.clear();
                 self.persist();
                 self.error = if until > unix_now() {
                     wait_label(until - unix_now())
@@ -521,6 +601,7 @@ impl Gate {
         self.confirm.clear();
         self.error.clear();
         self.forgot = false;
+        self.drop_peek();
         self.last_input = Instant::now();
         self.persist();
     }
