@@ -180,6 +180,7 @@ impl Snapshot {
             Loaded::Absent => snap.update_known = true,
             Loaded::Unreadable => snap.update_known = false,
         }
+        self_update::UpdateStatus::reconcile(dir);
         match self_update::UpdateStatus::read(dir) {
             Loaded::Present(s) => {
                 snap.last_check_at = s.last_check_at;
@@ -485,6 +486,26 @@ mod tests {
         assert!(!json.contains("SUPERSECRETKEY"));
         assert!(!json.contains("BEGIN"));
         assert!(!json.contains(&key_pem));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_installing_line_for_this_version_is_up_to_date() {
+        let dir = dir("installing");
+        let current = env!("CARGO_PKG_VERSION");
+        std::fs::write(
+            dir.join("server-update-status.json"),
+            format!(r#"{{"last_check_at":1700000000,"last_result":"Installing {current}","available":"{current}","error":""}}"#),
+        )
+        .unwrap();
+        let snap = Snapshot::from_disk(&dir, 21200, true);
+        assert_eq!(snap.last_result, "Up to date");
+        assert!(snap.update_available.is_empty(), "{}", snap.update_available);
+        assert!(snap.update_error.is_empty());
+        assert_eq!(snap.last_check_at, 1_700_000_000);
+        let text = std::fs::read_to_string(dir.join("server-update-status.json")).unwrap();
+        assert!(text.contains("Up to date"), "{text}");
+        assert!(!text.contains("Installing"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -698,6 +698,7 @@ impl eframe::App for App {
                     self.online.len(),
                 )
             };
+            let reported = shown_update(0, &last_result, &available, "");
             tray.set_tooltip(&crate::tray_tip::format(&crate::tray_tip::Tip {
                 installed,
                 running,
@@ -705,8 +706,8 @@ impl eframe::App for App {
                 role: &role,
                 epoch,
                 active: &who,
-                available: &available,
-                last_result: &last_result,
+                available: &reported.available,
+                last_result: &reported.last_result,
             }));
         }
 
@@ -831,7 +832,12 @@ impl App {
             return;
         }
         use crate::self_update::{self};
-        let reported = self.update_status.clone();
+        let reported = shown_update(
+            self.update_status.last_check_at,
+            &self.update_status.last_result,
+            &self.update_status.available,
+            &self.update_status.error,
+        );
         let may_edit = self.may_edit_settings();
         card(ui, |ui| {
             heading(ui, "UPDATES");
@@ -1150,18 +1156,19 @@ impl App {
             if !snap.window_start.is_empty() || !snap.window_end.is_empty() {
                 ui.label(format!("Maintenance window {} to {}", snap.window_start, snap.window_end));
             }
-            let checked = if snap.last_check_at == 0 {
+            let reported = shown_update(snap.last_check_at, &snap.last_result, &snap.update_available, &snap.update_error);
+            let checked = if reported.last_check_at == 0 {
                 "Last check: never".to_string()
             } else {
-                format!("Last check: {}", format_local(snap.last_check_at))
+                format!("Last check: {}", format_local(reported.last_check_at))
             };
-            let result = if snap.last_result.is_empty() { "no result yet" } else { snap.last_result.as_str() };
+            let result = if reported.last_result.is_empty() { "no result yet" } else { reported.last_result.as_str() };
             ui.label(RichText::new(format!("{checked} · {result}")).color(p(ui).muted).size(12.0));
-            if !snap.update_available.is_empty() {
-                ui.label(format!("Available version: {}", snap.update_available));
+            if !reported.available.is_empty() {
+                ui.label(format!("Available version: {}", reported.available));
             }
-            if !snap.update_error.is_empty() {
-                ui.colored_label(p(ui).warn, &snap.update_error);
+            if !reported.error.is_empty() {
+                ui.colored_label(p(ui).warn, &reported.error);
             }
             if managed {
                 ui.add_space(6.0);
@@ -1169,7 +1176,7 @@ impl App {
                     if ui.button("Check for updates now").clicked() {
                         check_now = true;
                     }
-                    if !snap.update_available.is_empty() && ui.button("Install this update").clicked() {
+                    if !reported.available.is_empty() && ui.button("Install this update").clicked() {
                         install_now = true;
                     }
                 });
@@ -3540,6 +3547,7 @@ fn read_folder(dir: &std::path::Path) -> FolderView {
     let policy = crate::access::Policy::load(dir);
     let watch = crate::public_addr::IpWatch::load(dir);
     let public_address = crate::public_addr::load(dir);
+    crate::self_update::UpdateStatus::reconcile(dir);
     let update_status = crate::self_update::UpdateStatus::load(dir);
     let (update_auto, update_start, update_end) = match crate::self_update::Settings::read(dir) {
         crate::self_update::Loaded::Present(settings) => (settings.auto, settings.window_start, settings.window_end),
@@ -3677,6 +3685,18 @@ struct ShownDevice {
     first_seen: u64,
     signed_in: bool,
     access_label: String,
+}
+
+/// Installed version against the saved update line. Local only: a stale
+/// `Installing 0.6.32` does not wait on the service pipe or a new check.
+fn shown_update(last_check_at: u64, last_result: &str, available: &str, error: &str) -> crate::self_update::UpdateStatus {
+    crate::self_update::UpdateStatus {
+        last_check_at,
+        last_result: last_result.to_string(),
+        available: available.to_string(),
+        error: error.to_string(),
+    }
+    .settled(env!("CARGO_PKG_VERSION"))
 }
 
 fn version_text(version: &str) -> String {
