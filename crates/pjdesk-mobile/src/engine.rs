@@ -41,7 +41,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.31";
+pub const APP_VERSION: &str = "0.6.32";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
