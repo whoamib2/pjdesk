@@ -1351,6 +1351,7 @@ async fn fleet_sync(state: Shared) {
         let unblocks = take(&data_dir, crate::requests::UNBLOCK_FILE);
         let groups = take(&data_dir, crate::requests::GROUP_FILE);
         let revokes = take(&data_dir, crate::requests::REVOKE_KEY_FILE);
+        let require_now = take(&data_dir, crate::requests::REQUIRE_DISCONNECT_FILE);
         let dead = crate::access_keys::Store::dead_ids(&data_dir, crate::registry::unix_now());
         if updates.is_empty()
             && forgets.is_empty()
@@ -1358,6 +1359,7 @@ async fn fleet_sync(state: Shared) {
             && blocks.is_empty()
             && unblocks.is_empty()
             && revokes.is_empty()
+            && require_now.is_empty()
             && dead.is_empty()
         {
             continue;
@@ -1407,6 +1409,13 @@ async fn fleet_sync(state: Shared) {
                 }
                 Ok(false) => info!("Unblock request for {} did not match a blocked computer", format_id(id)),
                 Err(e) => warn!("could not unblock {}: {e}", format_id(id)),
+            }
+        }
+        if !require_now.is_empty() && crate::access::Policy::load(&data_dir).require_accounts {
+            let ids = st.registry.grace_ids();
+            for id in &ids {
+                info!("Require signed-in accounts dropped {}", format_id(id));
+                disconnect_device(&mut st, id, "This server now requires a signed-in PJDesk account.");
             }
         }
         let mut dropped_keys = revokes;

@@ -18,6 +18,10 @@ pub const BLOCK_FILE: &str = "block-requests.json";
 pub const UNBLOCK_FILE: &str = "unblock-requests.json";
 /// Access key ids to revoke. The running server disconnects those computers.
 pub const REVOKE_KEY_FILE: &str = "revoke-key-requests.json";
+/// Drop live connections that have neither an account nor a server access key.
+/// Written when Require signed-in accounts is turned on. Offline computers are
+/// not waited on.
+pub const REQUIRE_DISCONNECT_FILE: &str = "require-disconnect.json";
 /// Run a cloud sync pass now.
 pub const SYNC_FILE: &str = "sync-requests.json";
 /// Make this server the cloud primary.
@@ -38,7 +42,7 @@ pub fn acceptable_target(file: &str, target: &str) -> bool {
         UPDATE_FILE => target == "*" || pjdesk_proto::is_valid_id(target),
         FORGET_FILE | BLOCK_FILE | UNBLOCK_FILE => pjdesk_proto::is_valid_id(target),
         REVOKE_KEY_FILE => crate::access_keys::is_key_id(target),
-        SYNC_FILE | RELOAD_FILE | PROMOTE_FILE | DEMOTE_FILE => target == "now",
+        SYNC_FILE | RELOAD_FILE | PROMOTE_FILE | DEMOTE_FILE | REQUIRE_DISCONNECT_FILE => target == "now",
         GROUP_FILE => parse_group_target(target).is_some(),
         _ => false,
     }

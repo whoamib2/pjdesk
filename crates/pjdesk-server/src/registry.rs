@@ -387,6 +387,18 @@ impl Registry {
         Ok(self.data.blocked.contains_key(id))
     }
 
+    /// Computers that registered with neither a PJDesk account nor a server access key.
+    /// Turning Require signed-in accounts on disconnects these if they are online.
+    /// An access key stays connected.
+    pub fn grace_ids(&self) -> Vec<String> {
+        self.data
+            .devices
+            .iter()
+            .filter(|(_, device)| !device.signed_in && device.access_key_id.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Lets that computer register again. It is not put back on the list until it connects.
     pub fn unblock(&mut self, id: &str) -> Result<bool> {
         if !is_valid_id(id) {
@@ -801,6 +813,21 @@ mod tests {
         assert_eq!(reg.register(Some(&id), &secret, "UNKNOWN-PC", "0.6.33").unwrap(), id);
         let reg = Registry::load(path.clone()).unwrap();
         assert_eq!(reg.list().iter().find(|row| row.id == id).unwrap().last_ip, "");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn grace_ids_skip_signed_in_computers_and_access_keys() {
+        let (path, mut reg) = fresh("grace");
+        let grace = reg.register(None, &[1u8; 32], "DESKTOP-D7E4AOR", "0.6.33").unwrap();
+        let signed = reg.register(None, &[2u8; 32], "Office", "0.6.33").unwrap();
+        reg.mark_signed_in(&signed, true);
+        let keyed = reg.register(None, &[3u8; 32], "Ada-PC", "0.6.33").unwrap();
+        reg.note_access_key(&keyed, "key-ada");
+        let ids = reg.grace_ids();
+        assert_eq!(ids, vec![grace]);
+        assert!(!ids.contains(&signed));
+        assert!(!ids.contains(&keyed));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

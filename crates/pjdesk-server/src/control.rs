@@ -371,6 +371,11 @@ fn set_require(data_dir: &Path, req: &Request) -> Response {
     if let Err(e) = policy.save(data_dir) {
         return fail(format!("Could not save the signed-in accounts setting: {e}"));
     }
+    if require {
+        if let Err(e) = crate::requests::push(data_dir, crate::requests::REQUIRE_DISCONNECT_FILE, "now") {
+            return fail(format!("Saved the setting, but could not ask the server to disconnect unsigned computers: {e}"));
+        }
+    }
     let dir = data_dir.to_path_buf();
     std::thread::spawn(move || crate::cloud::push_require_accounts(&dir, require));
     ok(if require {
@@ -733,9 +738,50 @@ fn token_label(token: windows::Win32::Foundation::HANDLE) -> String {
     }
 }
 
+/// How long the window waits for the service. A stuck pipe must not leave Remove spinning.
+const CALL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Runs `job` and returns its response. If it is still going when `timeout` elapses,
+/// returns a failed response with `code` `timeout`. `None` from `job` is preserved
+/// (the service is not listening).
+pub(crate) fn finish_within(
+    timeout: Duration,
+    job: impl FnOnce() -> Option<Response> + Send + 'static,
+) -> Option<Response> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(job());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(value) => value,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(Response {
+            ok: false,
+            code: "timeout".into(),
+            message: "The PJDesk service did not answer.".into(),
+            ..Response::default()
+        }),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+    }
+}
+
+/// One round trip. `None` when the service is not listening.
+/// A response with `code` `timeout` means the pipe was asked and did not finish.
+pub fn call(req: &Request) -> Option<Response> {
+    #[cfg(windows)]
+    {
+        let req = req.clone();
+        return finish_within(CALL_TIMEOUT, move || call_pipe(&req));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (req, CALL_TIMEOUT);
+        None
+    }
+}
+
 /// One round trip. `None` when the service is not listening.
 #[cfg(windows)]
-pub fn call(req: &Request) -> Option<Response> {
+fn call_pipe(req: &Request) -> Option<Response> {
     use windows::core::w;
     use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
     use windows::Win32::Storage::FileSystem::{
@@ -783,14 +829,15 @@ pub fn call(req: &Request) -> Option<Response> {
     }
 }
 
-#[cfg(not(windows))]
-pub fn call(_req: &Request) -> Option<Response> {
-    None
-}
-
-/// True when the service accepted a management ping from this user.
-pub fn ready() -> bool {
-    call(&Request { cmd: "ping".into(), ..Request::default() }).is_some_and(|r| r.ok)
+/// Ping with the signed-in account token, so the owner is allowed without elevation.
+/// An empty token still succeeds for an administrator, including a filtered UAC token.
+pub fn ready_with(account_token: &str) -> bool {
+    call(&Request {
+        cmd: "ping".into(),
+        account_token: account_token.to_string(),
+        ..Request::default()
+    })
+    .is_some_and(|r| r.ok)
 }
 
 #[cfg(test)]
@@ -916,6 +963,80 @@ mod tests {
         assert!(!crate::access::Policy::load(&dir).require_accounts);
         let log = std::fs::read_to_string(dir.join("audit.log")).unwrap_or_default();
         assert!(log.contains("denied"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_slow_pipe_returns_a_timeout_instead_of_waiting_forever() {
+        let started = Instant::now();
+        let response = finish_within(Duration::from_millis(40), || {
+            std::thread::sleep(Duration::from_millis(250));
+            Some(ok("too late"))
+        })
+        .expect("timeout is a response");
+        assert!(!response.ok);
+        assert_eq!(response.code, "timeout");
+        assert!(response.message.contains("did not answer"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let ready = finish_within(Duration::from_secs(1), || Some(ok("ready"))).unwrap();
+        assert!(ready.ok);
+        assert!(finish_within(Duration::from_secs(1), || None).is_none());
+    }
+
+    #[test]
+    fn an_offline_computer_is_removed_without_a_live_connection() {
+        let dir = dir("offline-block");
+        let mut reg = crate::registry::Registry::load(dir.join("devices.json")).unwrap();
+        let secret = [3u8; 32];
+        let id = reg.register(None, &secret, "DESKTOP-D7E4AOR", "0.6.33").unwrap();
+        reg.note_address(&id, "203.0.113.8");
+        let response = execute(
+            &dir,
+            &Request { cmd: "block".into(), device_id: id.clone(), ..Request::default() },
+            "account:ben@spader.us",
+        );
+        assert!(response.ok, "{}", response.message);
+        assert!(!response.message.is_empty());
+        let reg = crate::registry::Registry::load(dir.join("devices.json")).unwrap();
+        assert!(reg.list().iter().all(|row| row.id != id));
+        assert_eq!(reg.blocked().len(), 1);
+        assert_eq!(reg.blocked()[0].id, id);
+        assert_eq!(reg.blocked()[0].last_ip, "203.0.113.8");
+        assert_eq!(
+            crate::requests::take(&dir, crate::requests::BLOCK_FILE),
+            vec![id]
+        );
+        let missing = execute(
+            &dir,
+            &Request { cmd: "block".into(), device_id: "111222333".into(), ..Request::default() },
+            "account:ben@spader.us",
+        );
+        assert!(!missing.ok);
+        assert!(missing.message.contains("not registered"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turning_require_on_asks_for_unsigned_computers_to_be_disconnected() {
+        let dir = dir("require-drop");
+        let response = execute(
+            &dir,
+            &Request { cmd: "set_require".into(), require_accounts: Some(true), ..Request::default() },
+            "account:ben@spader.us",
+        );
+        assert!(response.ok, "{}", response.message);
+        assert!(crate::access::Policy::load(&dir).require_accounts);
+        assert_eq!(
+            crate::requests::take(&dir, crate::requests::REQUIRE_DISCONNECT_FILE),
+            vec!["now".to_string()]
+        );
+        let off = execute(
+            &dir,
+            &Request { cmd: "set_require".into(), require_accounts: Some(false), ..Request::default() },
+            "account:ben@spader.us",
+        );
+        assert!(off.ok, "{}", off.message);
+        assert!(crate::requests::take(&dir, crate::requests::REQUIRE_DISCONNECT_FILE).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

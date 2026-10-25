@@ -171,6 +171,13 @@ struct App {
     window_log: String,
     /// Device id waiting for Remove to be confirmed.
     confirm_remove: Option<String>,
+    /// Require signed-in accounts is waiting for Turn on. The checkbox stays on the saved value.
+    confirm_require: bool,
+    /// The service has not answered the signed-in-accounts switch yet.
+    require_busy: bool,
+    /// Value the service just saved. The checkbox shows this until the folder or the snapshot agrees.
+    require_hold: Option<bool>,
+    require_rx: Option<std::sync::mpsc::Receiver<RequireResult>>,
     ak_label: String,
     ak_secs: u64,
     ak_limit: String,
@@ -335,6 +342,10 @@ impl App {
             own_bucket: false,
             window_log: String::new(),
             confirm_remove: None,
+            confirm_require: false,
+            require_busy: false,
+            require_hold: None,
+            require_rx: None,
             ak_label: String::new(),
             ak_secs: 0,
             ak_limit: "1".into(),
@@ -445,11 +456,12 @@ impl App {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.svc_rx = Some(rx);
+        let token = self.cloud_token.clone();
         std::thread::Builder::new()
             .name("pjdesk-server-service".into())
             .spawn(move || {
                 let (installed, running) = svc_status();
-                let _ = tx.send(ServiceProbe { control_ready: crate::control::ready(), installed, running });
+                let _ = tx.send(ServiceProbe { control_ready: crate::control::ready_with(&token), installed, running });
             })
             .ok();
     }
@@ -486,7 +498,16 @@ impl App {
     fn apply_folder(&mut self, view: FolderView) {
         self.access = view.access;
         self.window_log = view.window_log;
+        let incoming_require = view.policy.require_accounts;
+        if self.require_hold == Some(incoming_require) {
+            self.require_hold = None;
+        }
+        let held = self.require_hold;
         self.policy = view.policy;
+        if let Some(held) = held {
+            self.policy.require_accounts = held;
+            self.policy.require_chosen = true;
+        }
         self.watch = view.watch;
         self.saved_address = view.public_address.as_ref().map(|saved| saved.address.clone()).unwrap_or_default();
         if !self.pub_addr_ready {
@@ -576,15 +597,17 @@ impl eframe::App for App {
         self.poll_disk();
         self.poll_notes();
         self.poll_access_keys();
-        if let Some(rx) = &self.probe {
-            while let Ok(msg) = rx.try_recv() {
-                if let Some(snap) = msg {
-                    self.live = Some(snap);
-                }
-            }
+        self.poll_require();
+        let snaps: Vec<Snapshot> = self
+            .probe
+            .as_ref()
+            .map(|rx| rx.try_iter().filter_map(|snap| snap).collect())
+            .unwrap_or_default();
+        for snap in snaps {
+            self.accept_snapshot(snap);
         }
         let ctx = ui.ctx().clone();
-        ctx.request_repaint_after(if self.waiting_for_service() || self.disk_rx.is_some() || self.svc_rx.is_some() || self.ak_rx.is_some() {
+        ctx.request_repaint_after(if self.waiting_for_service() || self.disk_rx.is_some() || self.svc_rx.is_some() || self.ak_rx.is_some() || self.require_rx.is_some() {
             Duration::from_millis(50)
         } else {
             Duration::from_secs(1)
@@ -1052,11 +1075,179 @@ impl App {
     }
 
     fn ask_service(&mut self, req: crate::control::Request) {
-        self.status = "Asking the PJDesk service…".into();
+        self.ask_service_or(req, "Asking the PJDesk service…", "The PJDesk service did not answer.".into());
+    }
+
+    /// Sends one command to the service. The account token is attached when this window has it,
+    /// so the signed-in owner does not need elevation. A timeout replaces the pending line.
+    fn ask_service_or(&mut self, mut req: crate::control::Request, pending: &str, unanswered: String) {
+        if req.account_token.is_empty() {
+            req.account_token = self.cloud_token.clone();
+        }
+        self.status = pending.to_string();
         self.spawn_note(move || match crate::control::call(&req) {
+            Some(response) if response.code == "timeout" => unanswered,
+            Some(response) if response.message.is_empty() && !response.ok => unanswered,
             Some(response) => response.message,
-            None => "The PJDesk service did not answer.".into(),
+            None => unanswered,
         });
+    }
+
+    fn owner_signed_in(&self) -> bool {
+        !self.signed_in_email().is_empty()
+    }
+
+    /// The service is the writer. A signed-in owner uses the pipe even when this window cannot
+    /// write ProgramData and even when the last ping did not carry the account token yet.
+    fn owner_uses_pipe(&self) -> bool {
+        self.owner_signed_in() || self.svc_running || self.control_ready
+    }
+
+    fn require_accounts_saved(&self) -> bool {
+        if let Some(held) = self.require_hold {
+            return held;
+        }
+        if self.access == Access::Readable {
+            self.policy.require_accounts
+        } else {
+            self.live.as_ref().map(|snap| snap.require_accounts).unwrap_or(false)
+        }
+    }
+
+    fn accept_snapshot(&mut self, mut snap: Snapshot) {
+        if self.access != Access::Readable && self.require_hold == Some(snap.require_accounts) {
+            self.require_hold = None;
+        }
+        if let Some(held) = self.require_hold {
+            snap.require_accounts = held;
+        }
+        self.live = Some(snap);
+    }
+
+    fn poll_require(&mut self) {
+        let Some(rx) = &self.require_rx else { return };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.require_rx = None;
+                self.require_busy = false;
+                self.status = result.message;
+                if result.ok {
+                    self.require_hold = Some(result.require);
+                    self.policy.require_accounts = result.require;
+                    self.policy.require_chosen = true;
+                    if let Some(live) = &mut self.live {
+                        live.require_accounts = result.require;
+                    }
+                }
+                self.request_refresh();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.require_rx = None;
+                self.require_busy = false;
+                self.status = "The PJDesk service did not answer. Require signed-in accounts was not changed.".into();
+            }
+        }
+    }
+
+    fn commit_require(&mut self, require: bool) {
+        if self.require_busy {
+            return;
+        }
+        self.require_busy = true;
+        self.confirm_require = false;
+        self.status = "Saving the signed-in accounts setting…".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.require_rx = Some(rx);
+        let dir = self.data_dir.clone();
+        let token = self.cloud_token.clone();
+        let service = self.owner_uses_pipe();
+        let can_write = self.can_write;
+        std::thread::spawn(move || {
+            let result = if service {
+                match crate::control::call(&crate::control::Request {
+                    cmd: "set_require".into(),
+                    require_accounts: Some(require),
+                    account_token: token,
+                    ..Default::default()
+                }) {
+                    Some(response) if response.ok => RequireResult { ok: true, require, message: response.message },
+                    Some(response) if response.code == "timeout" => RequireResult {
+                        ok: false,
+                        require,
+                        message: "The PJDesk service did not answer. Require signed-in accounts was not changed.".into(),
+                    },
+                    None if can_write => save_require_local(&dir, require),
+                    Some(response) => RequireResult {
+                        ok: false,
+                        require,
+                        message: if response.message.is_empty() {
+                            "Require signed-in accounts was not changed.".into()
+                        } else {
+                            response.message
+                        },
+                    },
+                    None => RequireResult {
+                        ok: false,
+                        require,
+                        message: "The PJDesk service did not answer. Require signed-in accounts was not changed.".into(),
+                    },
+                }
+            } else if can_write {
+                save_require_local(&dir, require)
+            } else {
+                RequireResult {
+                    ok: false,
+                    require,
+                    message: "The PJDesk service did not answer. Require signed-in accounts was not changed.".into(),
+                }
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// The checkbox shows the saved value. Turning it on while unsigned computers are listed
+    /// asks first. It does not stay ticked when the save fails.
+    fn require_checkbox(&mut self, ui: &mut egui::Ui, unsigned: &[UnknownComputer]) {
+        let saved = self.require_accounts_saved();
+        let mut shown = saved;
+        let enabled = self.owner_signed_in() || self.control_ready || (self.can_write && self.using_own_bucket());
+        let names = unsigned_labels(unsigned);
+        ui.add_enabled_ui(enabled, |ui| {
+            if ui.checkbox(&mut shown, "Require signed-in accounts").changed() {
+                if shown && !names.is_empty() {
+                    self.confirm_require = true;
+                } else {
+                    self.confirm_require = false;
+                    self.commit_require(shown);
+                }
+            }
+        });
+        if !enabled {
+            ui.label(
+                RichText::new("Sign in with your PJDesk account above to change this.")
+                    .color(p(ui).muted)
+                    .size(12.0),
+            );
+        }
+        if self.confirm_require {
+            if names.is_empty() {
+                self.confirm_require = false;
+            } else {
+                ui.label(
+                    RichText::new(format!("These computers will be disconnected: {}.", names.join(", ")))
+                        .color(p(ui).warn),
+                );
+                ui.horizontal(|ui| {
+                    if ui.small_button("Turn on").clicked() {
+                        self.commit_require(true);
+                    }
+                    if ui.small_button("Cancel").clicked() {
+                        self.confirm_require = false;
+                    }
+                });
+            }
+        }
     }
 
     fn run_service_action(&mut self, action: SvcAction) {
@@ -2141,7 +2332,7 @@ impl App {
     }
 
     fn network_card(&mut self, ui: &mut egui::Ui) {
-        if self.access != Access::Readable && self.control_ready {
+        if self.access != Access::Readable && (self.control_ready || self.owner_signed_in()) {
             self.network_managed(ui);
             return;
         }
@@ -2170,11 +2361,9 @@ impl App {
             }
             return;
         }
-        let mut policy = self.policy.clone();
+        let policy = self.policy.clone();
         let unsigned = unknown_from_devices(self.devices.iter().filter(|d| !d.signed_in));
         let blocked = blocks_from_registry(&self.blocked);
-        let mut require = policy.require_accounts;
-        let mut changed = false;
         let mut block_act = None;
         let mut ak_act = None;
         self.poll_public_address();
@@ -2247,17 +2436,14 @@ impl App {
             ui.add_space(12.0);
             heading(ui, "SIGNED-IN ACCOUNTS");
             ui.label(RichText::new(
-                "Off by default, so an update does not take a computer offline. Turn this on only after every computer below has signed in. This follows the PJDesk account signed in above.",
+                "Off by default, so an update does not take a computer offline. Turning this on disconnects computers that have not signed in. This follows the PJDesk account signed in above.",
             ).color(p(ui).muted));
             ui.add_space(6.0);
-            ui.add_enabled_ui(may_edit, |ui| {
-                if ui.checkbox(&mut require, "Require signed-in accounts").changed() {
-                    changed = true;
-                }
-            });
+            self.require_checkbox(ui, &unsigned);
             ui.add_space(8.0);
-            block_act = self.not_signed_in(ui, &unsigned, &blocked, true);
-            ak_act = self.server_access_keys(ui, self.can_write || self.control_ready);
+            let can_act = self.owner_uses_pipe() || self.can_write;
+            block_act = self.not_signed_in(ui, &unsigned, &blocked, can_act);
+            ak_act = self.server_access_keys(ui, can_act);
             ui.add_space(8.0);
             ui.label(RichText::new("Allowed accounts").strong());
             if policy.allowed_accounts.is_empty() {
@@ -2334,24 +2520,6 @@ impl App {
         if let Some(act) = block_act {
             self.apply_block(act);
         }
-        if changed {
-            policy.require_accounts = require;
-            policy.require_chosen = true;
-            self.policy = policy.clone();
-            let dir = self.data_dir.clone();
-            self.status = "Saving the signed-in accounts setting…".into();
-            self.spawn_note(move || {
-                if let Err(e) = policy.save(&dir) {
-                    return format!("Could not save the signed-in accounts setting: {e}");
-                }
-                crate::cloud::push_require_accounts(&dir, require);
-                if require {
-                    "Signed-in accounts are required.".into()
-                } else {
-                    "Signed-in accounts are not required. Already-registered computers keep connecting.".into()
-                }
-            });
-        }
         if publish {
             self.publish_public_address(replace);
         }
@@ -2372,12 +2540,10 @@ impl App {
             }
         }
         let live = self.live.clone();
-        let mut require = live.as_ref().map(|s| s.require_accounts).unwrap_or(false);
         let watch_known = live.as_ref().is_some_and(|s| s.public_watch_known);
         let mut watch = live.as_ref().is_some_and(|s| s.public_watch);
         let ip_line = live.as_ref().map(|s| s.public_ip_line.clone()).unwrap_or_default();
         let hostname = crate::public_addr::is_hostname(self.pub_addr.trim());
-        let mut changed = false;
         let mut watch_changed = false;
         let mut publish = false;
         let mut replace = false;
@@ -2424,12 +2590,6 @@ impl App {
             ui.add_space(12.0);
             heading(ui, "SIGNED-IN ACCOUNTS");
             ui.add_space(6.0);
-            if ui.checkbox(&mut require, "Require signed-in accounts").changed() {
-                changed = true;
-            }
-            ui.label(RichText::new(
-                "Off by default, so an update does not take a computer offline. Turn this on only after every computer has signed in.",
-            ).color(p(ui).muted).size(12.0));
             let (waiting, blocked_rows) = match &live {
                 Some(live) => (
                     unknown_from_listed(live.devices.iter().filter(|d| !d.signed_in)),
@@ -2437,19 +2597,17 @@ impl App {
                 ),
                 None => (Vec::new(), Vec::new()),
             };
+            self.require_checkbox(ui, &waiting);
+            ui.label(RichText::new(
+                "Off by default, so an update does not take a computer offline. Turning this on disconnects computers that have not signed in.",
+            ).color(p(ui).muted).size(12.0));
             if live.is_some() {
                 ui.add_space(6.0);
-                block_act = self.not_signed_in(ui, &waiting, &blocked_rows, true);
+                let can_act = self.owner_uses_pipe() || self.can_write;
+                block_act = self.not_signed_in(ui, &waiting, &blocked_rows, can_act);
             }
-            ak_act = self.server_access_keys(ui, true);
+            ak_act = self.server_access_keys(ui, self.owner_uses_pipe() || self.can_write);
         });
-        if changed {
-            self.ask_service(crate::control::Request {
-                cmd: "set_require".into(),
-                require_accounts: Some(require),
-                ..Default::default()
-            });
-        }
         if watch_changed {
             self.ask_service(crate::control::Request {
                 cmd: "set_watch".into(),
@@ -2824,51 +2982,75 @@ impl App {
         let secs = self.ak_secs;
         let dir = self.data_dir.clone();
         let can_write = self.can_write;
+        let via_pipe = self.owner_uses_pipe() || !can_write;
+        let token = self.cloud_token.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.ak_busy = true;
         self.ak_confirm = None;
         self.status = if create { "Creating an access key…".into() } else { "Revoking that access key…".into() };
         std::thread::spawn(move || {
+            let unanswered = if create {
+                "The PJDesk service did not answer. The key was not created."
+            } else {
+                "The PJDesk service did not answer. The key was not revoked."
+            };
             let result = if create {
-                if can_write {
-                    match crate::access_keys::Store::create(&dir, &label, secs, limit) {
-                        Ok(secret) => AkResult::Secret(secret),
-                        Err(e) => AkResult::Note(e),
-                    }
-                } else {
-                    match crate::control::call(&crate::control::Request {
+                let pipe = || {
+                    crate::control::call(&crate::control::Request {
                         cmd: "create_access_key".into(),
-                        label,
+                        account_token: token.clone(),
+                        label: label.clone(),
                         expires_secs: secs,
                         computer_limit: limit,
                         ..Default::default()
-                    }) {
+                    })
+                };
+                let local = || match crate::access_keys::Store::create(&dir, &label, secs, limit) {
+                    Ok(secret) => AkResult::Secret(secret),
+                    Err(e) => AkResult::Note(e),
+                };
+                if via_pipe {
+                    match pipe() {
                         Some(response) if response.ok && !response.secret.is_empty() => AkResult::Secret(response.secret),
+                        Some(response) if response.code == "timeout" => AkResult::Note(unanswered.into()),
+                        None if can_write => local(),
                         Some(response) => AkResult::Note(if response.message.is_empty() {
                             "Could not create an access key.".into()
                         } else {
                             response.message
                         }),
-                        None => AkResult::Note(
-                            "The PJDesk service did not answer. Restart as administrator, or start the service.".into(),
-                        ),
+                        None => AkResult::Note(unanswered.into()),
                     }
-                }
-            } else if can_write {
-                match crate::requests::revoke_access_key(&dir, &key_id) {
-                    Ok(()) => AkResult::Note("Revoked. Every computer that used it will be disconnected and removed.".into()),
-                    Err(e) => AkResult::Note(format!("Could not revoke that key: {e}")),
+                } else {
+                    local()
                 }
             } else {
-                match crate::control::call(&crate::control::Request {
-                    cmd: "revoke_access_key".into(),
-                    key_id,
-                    ..Default::default()
-                }) {
-                    Some(response) => AkResult::Note(response.message),
-                    None => AkResult::Note(
-                        "The PJDesk service did not answer. Restart as administrator, or start the service.".into(),
-                    ),
+                let pipe = || {
+                    crate::control::call(&crate::control::Request {
+                        cmd: "revoke_access_key".into(),
+                        account_token: token,
+                        key_id: key_id.clone(),
+                        ..Default::default()
+                    })
+                };
+                let local = || match crate::requests::revoke_access_key(&dir, &key_id) {
+                    Ok(()) => AkResult::Note("Revoked. Every computer that used it will be disconnected and removed.".into()),
+                    Err(e) => AkResult::Note(format!("Could not revoke that key: {e}")),
+                };
+                if via_pipe {
+                    match pipe() {
+                        Some(response) if response.ok => AkResult::Note(response.message),
+                        Some(response) if response.code == "timeout" => AkResult::Note(unanswered.into()),
+                        None if can_write => local(),
+                        Some(response) => AkResult::Note(if response.message.is_empty() {
+                            "Could not revoke that key.".into()
+                        } else {
+                            response.message
+                        }),
+                        None => AkResult::Note(unanswered.into()),
+                    }
+                } else {
+                    local()
                 }
             };
             let _ = tx.send(result);
@@ -3013,6 +3195,9 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&shown).monospace().strong());
                 ui.label(RichText::new(&name).strong());
+                if !row.last_ip.trim().is_empty() {
+                    ui.label(RichText::new(row.last_ip.trim()).monospace().color(p(ui).muted));
+                }
             });
             let access_label = if row.access_label.is_empty() {
                 self.key_label(&row.access_key_id)
@@ -3054,6 +3239,9 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&shown).monospace());
                     ui.label(&name);
+                    if !row.last_ip.trim().is_empty() {
+                        ui.label(RichText::new(row.last_ip.trim()).monospace().color(p(ui).muted));
+                    }
                     if can_act && ui.small_button("Unblock").clicked() {
                         act = Some(BlockAct::Unblock(row.id.clone()));
                     }
@@ -3075,40 +3263,57 @@ impl App {
         };
         self.confirm_remove = None;
         let shown = pjdesk_proto::format_id(&id);
-        if self.can_write {
-            let dir = self.data_dir.clone();
-            self.status = if removing { format!("Removing {shown}…") } else { format!("Unblocking {shown}…") };
-            self.spawn_note(move || {
-                let result = if removing {
-                    crate::requests::block_device(&dir, &id)
-                } else {
-                    crate::requests::unblock_device(&dir, &id)
-                };
-                match result {
-                    Ok(()) if removing => format!(
-                        "Removed {shown}. It is disconnected and cannot register again until it is unblocked."
-                    ),
-                    Ok(()) => format!("{shown} can register again."),
-                    Err(e) if removing => format!("Could not remove {shown}: {e}"),
-                    Err(e) => format!("Could not unblock {shown}: {e}"),
-                }
-            });
-            return;
-        }
-        if self.control_ready {
-            self.ask_service(crate::control::Request {
-                cmd: if removing { "block" } else { "unblock" }.into(),
-                device_id: id,
-                ..Default::default()
-            });
-            return;
-        }
-        let cmd = if removing { "block-device" } else { "unblock-device" };
-        if run_elevated(&[cmd, &id]) {
-            self.status = format!("Asked Windows to approve that for {shown}.");
+        let unanswered = if removing {
+            format!("The PJDesk service did not answer. {shown} was not removed.")
         } else {
-            self.status = "Windows did not start the elevated action.".into();
+            format!("The PJDesk service did not answer. {shown} was not unblocked.")
+        };
+        if !self.owner_uses_pipe() && !self.can_write {
+            let cmd = if removing { "block-device" } else { "unblock-device" };
+            if run_elevated(&[cmd, &id]) {
+                self.status = format!("Asked Windows to approve that for {shown}.");
+            } else {
+                self.status = unanswered;
+            }
+            return;
         }
+        let dir = self.data_dir.clone();
+        let token = self.cloud_token.clone();
+        let via_pipe = self.owner_uses_pipe();
+        let can_write = self.can_write;
+        let cmd = if removing { "block" } else { "unblock" };
+        self.status = if removing { format!("Removing {shown}…") } else { format!("Unblocking {shown}…") };
+        self.spawn_note(move || {
+            if via_pipe {
+                match crate::control::call(&crate::control::Request {
+                    cmd: cmd.into(),
+                    account_token: token,
+                    device_id: id.clone(),
+                    ..Default::default()
+                }) {
+                    Some(response) if response.code == "timeout" => return unanswered,
+                    Some(response) if response.ok => return response.message,
+                    Some(response) => {
+                        return if response.message.is_empty() { unanswered } else { response.message };
+                    }
+                    None if can_write => {}
+                    None => return unanswered,
+                }
+            }
+            let result = if removing {
+                crate::requests::block_device(&dir, &id)
+            } else {
+                crate::requests::unblock_device(&dir, &id)
+            };
+            match result {
+                Ok(()) if removing => format!(
+                    "Removed {shown}. It is disconnected and cannot register again until it is unblocked."
+                ),
+                Ok(()) => format!("{shown} can register again."),
+                Err(e) if removing => format!("Could not remove {shown}: {e}"),
+                Err(e) => format!("Could not unblock {shown}: {e}"),
+            }
+        });
     }
 
     fn devices_card(&mut self, ui: &mut egui::Ui) {
@@ -3188,13 +3393,19 @@ impl App {
                                     .background_color(p(ui).elev),
                             );
                         }
-                        let seen = if d.last_seen == 0 {
+                        let mut seen = if d.last_seen == 0 {
                             String::new()
                         } else if d.first_seen > 0 {
                             format!("Last seen {} ({})\nFirst registered {}", format_local(d.last_seen), ago(d.last_seen), format_local(d.first_seen))
                         } else {
                             format!("Last seen {}", format_local(d.last_seen))
                         };
+                        if !d.last_ip.trim().is_empty() {
+                            if !seen.is_empty() {
+                                seen.push('\n');
+                            }
+                            seen.push_str(&format!("Last IP {}", d.last_ip.trim()));
+                        }
                         if !d.access_label.is_empty() {
                             ui.label(RichText::new(&d.access_label).color(p(ui).text).size(11.0));
                         } else if !d.signed_in {
@@ -3255,6 +3466,7 @@ impl App {
                             first_seen: d.first_seen,
                             signed_in: d.signed_in,
                             access_label: d.access_label.clone(),
+                            last_ip: d.last_ip.clone(),
                         })
                         .collect()
                 })
@@ -3273,6 +3485,7 @@ impl App {
                     first_seen: d.first_seen,
                     signed_in: d.signed_in,
                     access_label: self.key_label(&d.access_key_id),
+                    last_ip: d.last_ip.clone(),
                 }
             })
             .collect()
@@ -3665,6 +3878,61 @@ fn blocks_from_listed(rows: &[status_view::ListedBlock]) -> Vec<BlockedComputer>
         .collect()
 }
 
+struct RequireResult {
+    ok: bool,
+    require: bool,
+    message: String,
+}
+
+/// Names for the confirm line. A computer on a server access key is not listed:
+/// turning the setting on leaves that key connected.
+fn unsigned_labels(rows: &[UnknownComputer]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| row.access_key_id.is_empty() && row.access_label.is_empty())
+        .map(|row| {
+            let id = pjdesk_proto::format_id(&row.id);
+            let host = row.hostname.trim();
+            if host.is_empty() {
+                id
+            } else {
+                format!("{id} {host}")
+            }
+        })
+        .collect()
+}
+
+fn save_require_local(dir: &std::path::Path, require: bool) -> RequireResult {
+    let mut policy = crate::access::Policy::load(dir);
+    policy.require_accounts = require;
+    policy.require_chosen = true;
+    if let Err(e) = policy.save(dir) {
+        return RequireResult {
+            ok: false,
+            require,
+            message: format!("Could not save the signed-in accounts setting: {e}"),
+        };
+    }
+    if require {
+        if let Err(e) = crate::requests::push(dir, crate::requests::REQUIRE_DISCONNECT_FILE, "now") {
+            return RequireResult {
+                ok: false,
+                require,
+                message: format!("Saved the setting, but could not ask the server to disconnect unsigned computers: {e}"),
+            };
+        }
+    }
+    crate::cloud::push_require_accounts(dir, require);
+    RequireResult {
+        ok: true,
+        require,
+        message: if require {
+            "Require signed-in accounts is on.".into()
+        } else {
+            "Require signed-in accounts is off. Already-registered computers keep connecting.".into()
+        },
+    }
+}
+
 fn computer_facts(ip: &str, first_seen: u64, last_seen: u64, blocked_at: u64) -> String {
     let ip = if ip.trim().is_empty() { "unknown" } else { ip.trim() };
     let first = if first_seen == 0 { "unknown".into() } else { format_local(first_seen) };
@@ -3685,6 +3953,7 @@ struct ShownDevice {
     first_seen: u64,
     signed_in: bool,
     access_label: String,
+    last_ip: String,
 }
 
 /// Installed version against the saved update line. Local only: a stale
@@ -3856,4 +4125,40 @@ fn svc_status() -> (bool, bool) {
 #[cfg(not(windows))]
 fn svc_status() -> (bool, bool) {
     (false, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_confirm_names_unsigned_computers_and_skips_access_keys() {
+        let rows = vec![
+            UnknownComputer {
+                id: "833201199".into(),
+                hostname: "DESKTOP-D7E4AOR".into(),
+                last_ip: "203.0.113.8".into(),
+                first_seen: 1,
+                last_seen: 2,
+                access_key_id: String::new(),
+                access_label: String::new(),
+            },
+            UnknownComputer {
+                id: "111222333".into(),
+                hostname: "Ada-PC".into(),
+                last_ip: String::new(),
+                first_seen: 1,
+                last_seen: 2,
+                access_key_id: "key".into(),
+                access_label: "Ada".into(),
+            },
+        ];
+        assert_eq!(
+            unsigned_labels(&rows),
+            vec!["833 201 199 DESKTOP-D7E4AOR".to_string()]
+        );
+        let facts = computer_facts("203.0.113.8", 0, 0, 0);
+        assert!(facts.contains("Last IP 203.0.113.8"));
+        assert!(computer_facts("", 0, 0, 0).contains("Last IP unknown"));
+    }
 }
