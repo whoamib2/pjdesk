@@ -49,7 +49,9 @@ Point a server at it with `PJDESK_CLOUD_API=http://127.0.0.1:8787` (window) or
 ## Deploy
 
 From your PC (no CI): open a terminal in `cloud\` and run `deploy.cmd`. It
-installs Cloudflare's deploy tool on first run, signs in to Cloudflare as
-pjdesk@spader.us (browser, first time only), applies database migrations
-(through `0010_display_name.sql`) and deploys. `wrangler.toml` holds the account, D1
-database ID and bucket name.
+installs Cloudflare's deploy tool on first run, checks that Wrangler is signed
+in as pjdesk@spader.us, applies database migrations, and deploys. If Wrangler
+is not signed in, or a later step fails, it stops and exits with an error. It
+does not print "PJDesk Cloud is deployed." after a failure. Sign in with
+`npx wrangler login`. `wrangler.toml` holds the account, D1 database ID and
+bucket name.
