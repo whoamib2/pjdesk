@@ -18,6 +18,10 @@ use sha2::{Digest, Sha256};
 #[derive(Default, Serialize, Deserialize)]
 struct RegistryFile {
     devices: BTreeMap<String, DeviceRecord>,
+    /// Computers Ben removed. The ID and the secret hash stay here so the same
+    /// computer cannot register again, including under a new ID.
+    #[serde(default)]
+    blocked: BTreeMap<String, BlockedRecord>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -49,6 +53,27 @@ struct DeviceRecord {
     /// An empty report clears it. Missing before the display-name report.
     #[serde(default)]
     display_name: String,
+    /// Last address this computer registered or stayed connected from.
+    /// Missing before 0.6.33.
+    #[serde(default)]
+    last_ip: String,
+}
+
+/// A computer that was removed and must not register again.
+#[derive(Clone, Serialize, Deserialize)]
+struct BlockedRecord {
+    #[serde(default)]
+    hostname: String,
+    #[serde(default)]
+    secret_sha256: String,
+    #[serde(default)]
+    last_ip: String,
+    #[serde(default)]
+    first_seen: u64,
+    #[serde(default)]
+    last_seen: u64,
+    #[serde(default)]
+    blocked_at: u64,
 }
 
 /// One computer for the account's saved list. The user name stays on this server
@@ -65,6 +90,7 @@ pub struct PresenceRow {
 }
 
 /// A registered device, for the management window.
+#[derive(Clone)]
 pub struct DeviceRow {
     pub id: String,
     pub hostname: String,
@@ -75,6 +101,19 @@ pub struct DeviceRow {
     pub last_seen: u64,
     /// False until this computer registers with a network access token.
     pub signed_in: bool,
+    /// Empty until this computer has connected once on 0.6.33 or later.
+    pub last_ip: String,
+}
+
+/// A removed computer, for the Blocked computers list. No secret.
+#[derive(Clone)]
+pub struct BlockedRow {
+    pub id: String,
+    pub hostname: String,
+    pub last_ip: String,
+    pub first_seen: u64,
+    pub last_seen: u64,
+    pub blocked_at: u64,
 }
 
 pub struct Registry {
@@ -86,6 +125,8 @@ pub struct Registry {
 pub enum RegisterError {
     /// The ID exists and the secret does not match.
     Conflict(String),
+    /// This computer was removed. The ID and the secret stay blocked.
+    Blocked(String),
     Io(String),
 }
 
@@ -93,6 +134,13 @@ impl std::fmt::Display for RegisterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RegisterError::Conflict(id) => write!(f, "ID {} belongs to another device", format_id(id)),
+            RegisterError::Blocked(id) => {
+                if id.is_empty() {
+                    write!(f, "this computer is blocked")
+                } else {
+                    write!(f, "this computer ({}) is blocked", format_id(id))
+                }
+            }
             RegisterError::Io(e) => write!(f, "could not save the device registry: {e}"),
         }
     }
@@ -188,6 +236,7 @@ impl Registry {
                 first_seen: d.first_seen,
                 last_seen: d.last_seen,
                 signed_in: d.signed_in,
+                last_ip: d.last_ip.clone(),
             })
             .collect();
         rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
@@ -238,6 +287,82 @@ impl Registry {
         Ok(())
     }
 
+    /// Rows for Blocked computers, most recently blocked first.
+    pub fn blocked(&self) -> Vec<BlockedRow> {
+        let mut rows: Vec<BlockedRow> = self
+            .data
+            .blocked
+            .iter()
+            .map(|(id, d)| BlockedRow {
+                id: id.clone(),
+                hostname: d.hostname.clone(),
+                last_ip: d.last_ip.clone(),
+                first_seen: d.first_seen,
+                last_seen: d.last_seen,
+                blocked_at: d.blocked_at,
+            })
+            .collect();
+        rows.sort_by(|a, b| b.blocked_at.cmp(&a.blocked_at).then(a.id.cmp(&b.id)));
+        rows
+    }
+
+    /// Disconnect is the caller's job. This deletes the registration and keeps
+    /// the ID and the secret hash so the same computer cannot come back.
+    pub fn block(&mut self, id: &str) -> Result<bool> {
+        if !is_valid_id(id) {
+            anyhow::bail!("that is not a PJDesk computer ID");
+        }
+        if let Some(device) = self.data.devices.remove(id) {
+            self.data.blocked.insert(
+                id.to_string(),
+                BlockedRecord {
+                    hostname: device.hostname,
+                    secret_sha256: device.secret_sha256,
+                    last_ip: device.last_ip,
+                    first_seen: device.first_seen,
+                    last_seen: device.last_seen,
+                    blocked_at: now(),
+                },
+            );
+            self.save()?;
+            return Ok(true);
+        }
+        Ok(self.data.blocked.contains_key(id))
+    }
+
+    /// Lets that computer register again. It is not put back on the list until it connects.
+    pub fn unblock(&mut self, id: &str) -> Result<bool> {
+        if !is_valid_id(id) {
+            anyhow::bail!("that is not a PJDesk computer ID");
+        }
+        if self.data.blocked.remove(id).is_some() {
+            self.save()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Remembers the address a live computer is using. A repeat of the same address does not write.
+    pub fn note_address(&mut self, id: &str, ip: &str) {
+        let ip = ip.trim();
+        if ip.is_empty() {
+            return;
+        }
+        let Some(record) = self.data.devices.get_mut(id) else { return };
+        if record.last_ip == ip {
+            return;
+        }
+        record.last_ip = ip.to_string();
+        if let Err(e) = self.save() {
+            tracing::warn!("could not save the last address for {id}: {e}");
+        }
+    }
+
+    fn secret_is_blocked(&self, secret_sha256: &str) -> bool {
+        !secret_sha256.is_empty()
+            && self.data.blocked.values().any(|row| !row.secret_sha256.is_empty() && row.secret_sha256 == secret_sha256)
+    }
+
     /// Registers a device. Returns its ID.
     ///
     /// * Secret already known → that device's ID, whatever ID (if any) the
@@ -259,6 +384,12 @@ impl Registry {
     ) -> Result<String, RegisterError> {
         let secret_sha256 = hex::encode(Sha256::digest(secret));
         let now = now();
+        if self.secret_is_blocked(&secret_sha256) {
+            return Err(RegisterError::Blocked(requested.unwrap_or("").to_string()));
+        }
+        if requested.is_some_and(|id| self.data.blocked.contains_key(id)) {
+            return Err(RegisterError::Blocked(requested.unwrap_or("").to_string()));
+        }
 
         let mut owned: Vec<(String, u64)> = self
             .data
@@ -298,7 +429,7 @@ impl Registry {
             }
             None => loop {
                 let candidate = generate_id();
-                if !self.data.devices.contains_key(&candidate) {
+                if !self.data.devices.contains_key(&candidate) && !self.data.blocked.contains_key(&candidate) {
                     break candidate;
                 }
             },
@@ -318,6 +449,7 @@ impl Registry {
                 os_version: String::new(),
                 console_user: String::new(),
                 display_name: String::new(),
+                last_ip: String::new(),
             },
         );
         self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
@@ -585,6 +717,33 @@ mod tests {
         assert!(supports_host_report_for("0.6.3", "windows"));
         assert!(supports_host_report("0.6.4"));
         assert!(supports_host_report("0.7.0"));
+    }
+
+    #[test]
+    fn a_removed_computer_stays_blocked_until_it_is_unblocked() {
+        let (path, mut reg) = fresh("block");
+        let secret = [4u8; 32];
+        let id = reg.register(None, &secret, "UNKNOWN-PC", "0.6.32").unwrap();
+        reg.note_address(&id, "203.0.113.9");
+        assert!(reg.block(&id).unwrap());
+        assert!(reg.list().is_empty());
+        let blocked = reg.blocked();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].id, id);
+        assert_eq!(blocked[0].hostname, "UNKNOWN-PC");
+        assert_eq!(blocked[0].last_ip, "203.0.113.9");
+        assert!(blocked[0].first_seen > 0 && blocked[0].last_seen > 0);
+        assert!(matches!(reg.register(Some(&id), &secret, "UNKNOWN-PC", "0.6.33"), Err(RegisterError::Blocked(_))));
+        assert!(matches!(reg.register(None, &secret, "UNKNOWN-PC", "0.6.33"), Err(RegisterError::Blocked(_))));
+        assert!(matches!(reg.register(Some(&id), &[9u8; 32], "other", "0.6.33"), Err(RegisterError::Blocked(_))));
+        let fresh_id = reg.register(None, &[9u8; 32], "other", "0.6.33").unwrap();
+        assert_ne!(fresh_id, id);
+        assert!(reg.unblock(&id).unwrap());
+        assert!(reg.blocked().is_empty());
+        assert_eq!(reg.register(Some(&id), &secret, "UNKNOWN-PC", "0.6.33").unwrap(), id);
+        let reg = Registry::load(path.clone()).unwrap();
+        assert_eq!(reg.list().iter().find(|row| row.id == id).unwrap().last_ip, "");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

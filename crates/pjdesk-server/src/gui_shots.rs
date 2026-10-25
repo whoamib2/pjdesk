@@ -228,6 +228,7 @@ fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -
                     version: "0.5.1".into(),
                     online: true,
                     signed_in: true,
+                    ..Default::default()
                 },
                 crate::status_view::ListedDevice {
                     id: "444555666".into(),
@@ -235,6 +236,7 @@ fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -
                     version: String::new(),
                     online: false,
                     signed_in: false,
+                    ..Default::default()
                 },
             ],
             ..Snapshot::default()

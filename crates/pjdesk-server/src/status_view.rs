@@ -84,6 +84,9 @@ pub struct Snapshot {
     /// Registered computers, without secrets. Filled when the data folder is readable.
     #[serde(default)]
     pub devices: Vec<ListedDevice>,
+    /// Computers removed from Not signed in yet. No secrets.
+    #[serde(default)]
+    pub blocked: Vec<ListedBlock>,
     /// True when register, lookup, and relay require a network access token.
     #[serde(default)]
     pub require_accounts: bool,
@@ -123,6 +126,28 @@ pub struct ListedDevice {
     /// False when this computer has not registered with a network access token.
     #[serde(default)]
     pub signed_in: bool,
+    #[serde(default)]
+    pub last_ip: String,
+    #[serde(default)]
+    pub first_seen: u64,
+    #[serde(default)]
+    pub last_seen: u64,
+}
+
+/// A blocked computer, safe to put on the status pipe. The secret hash stays in the file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedBlock {
+    pub id: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub last_ip: String,
+    #[serde(default)]
+    pub first_seen: u64,
+    #[serde(default)]
+    pub last_seen: u64,
+    #[serde(default)]
+    pub blocked_at: u64,
 }
 
 impl Snapshot {
@@ -180,6 +205,7 @@ impl Snapshot {
             snap.cloud_on = config_exists;
         }
         snap.devices = listed_devices(dir);
+        snap.blocked = listed_blocked(dir);
         let policy = crate::access::Policy::load(dir);
         snap.require_accounts = policy.require_accounts;
         if let Some(address) = crate::public_addr::load(dir) {
@@ -269,6 +295,12 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
         app_version: String,
         #[serde(default)]
         signed_in: bool,
+        #[serde(default)]
+        last_ip: String,
+        #[serde(default)]
+        first_seen: u64,
+        #[serde(default)]
+        last_seen: u64,
     }
     #[derive(Deserialize)]
     struct Online {
@@ -303,10 +335,55 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
                 version: live.cloned().unwrap_or(rec.app_version),
                 online: live.is_some(),
                 signed_in: rec.signed_in,
+                last_ip: rec.last_ip,
+                first_seen: rec.first_seen,
+                last_seen: rec.last_seen,
             }
         })
         .collect();
     rows.sort_by(|a, b| a.hostname.cmp(&b.hostname).then(a.id.cmp(&b.id)));
+    rows
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn listed_blocked(dir: &Path) -> Vec<ListedBlock> {
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        blocked: std::collections::BTreeMap<String, Rec>,
+    }
+    #[derive(Deserialize)]
+    struct Rec {
+        #[serde(default)]
+        hostname: String,
+        #[serde(default)]
+        last_ip: String,
+        #[serde(default)]
+        first_seen: u64,
+        #[serde(default)]
+        last_seen: u64,
+        #[serde(default)]
+        blocked_at: u64,
+    }
+    let Ok(bytes) = std::fs::read(dir.join("devices.json")) else {
+        return Vec::new();
+    };
+    let Ok(file) = serde_json::from_slice::<File>(&bytes) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<ListedBlock> = file
+        .blocked
+        .into_iter()
+        .map(|(id, rec)| ListedBlock {
+            id,
+            hostname: rec.hostname,
+            last_ip: rec.last_ip,
+            first_seen: rec.first_seen,
+            last_seen: rec.last_seen,
+            blocked_at: rec.blocked_at,
+        })
+        .collect();
+    rows.sort_by(|a, b| b.blocked_at.cmp(&a.blocked_at).then(a.id.cmp(&b.id)));
     rows
 }
 

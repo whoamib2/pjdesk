@@ -22,7 +22,7 @@ use eframe::egui::{self, Color32, RichText};
 use std::collections::HashMap;
 
 use crate::accounts::{self, Accounts};
-use crate::registry::{format_local, DeviceRow, Registry};
+use crate::registry::{format_local, BlockedRow, DeviceRow, Registry};
 use crate::status_view::{self, Access, Snapshot};
 use crate::ui_icons::Icon;
 use crate::ui_theme::{self, Paint};
@@ -86,6 +86,7 @@ struct App {
     control_ready: bool,
     accounts: Vec<accounts::AccountInfo>,
     devices: Vec<DeviceRow>,
+    blocked: Vec<BlockedRow>,
     /// Live online devices (id → reported version), from the server's online.json.
     online: HashMap<String, String>,
     log_tail: String,
@@ -148,6 +149,28 @@ struct App {
     release_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
     check_release: bool,
     gate: crate::window_lock::Gate,
+    /// Folder reads. The window paints the last result.
+    disk_rx: Option<std::sync::mpsc::Receiver<FolderView>>,
+    /// Pipe ping and service-manager query. Separate from the folder read so a
+    /// stuck pipe cannot stop the window from painting.
+    svc_rx: Option<std::sync::mpsc::Receiver<ServiceProbe>>,
+    bg_tx: std::sync::mpsc::Sender<String>,
+    bg_rx: std::sync::mpsc::Receiver<String>,
+    svc_installed: bool,
+    svc_running: bool,
+    policy: crate::access::Policy,
+    watch: crate::public_addr::IpWatch,
+    saved_address: String,
+    update_auto: bool,
+    update_auto_dirty: bool,
+    update_status: crate::self_update::UpdateStatus,
+    cloud_email: String,
+    cloud_token: String,
+    cloud_api: String,
+    own_bucket: bool,
+    window_log: String,
+    /// Device id waiting for Remove to be confirmed.
+    confirm_remove: Option<String>,
 }
 
 /// How a cloud job (network calls on a worker thread) ended.
@@ -225,6 +248,7 @@ impl App {
 
     fn build(cc: &eframe::CreationContext<'_>, data_dir: PathBuf, port: u16, spawn_probe: bool) -> Self {
         ui_theme::apply(&cc.egui_ctx, "system");
+        let (bg_tx, bg_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             data_dir,
             port,
@@ -233,6 +257,7 @@ impl App {
             control_ready: false,
             accounts: Vec::new(),
             devices: Vec::new(),
+            blocked: Vec::new(),
             online: HashMap::new(),
             log_tail: String::new(),
             status: String::new(),
@@ -282,27 +307,45 @@ impl App {
             release_rx: None,
             check_release: spawn_probe,
             gate: crate::window_lock::Gate::new(),
+            disk_rx: None,
+            svc_rx: None,
+            bg_tx,
+            bg_rx,
+            svc_installed: false,
+            svc_running: false,
+            policy: crate::access::Policy::default(),
+            watch: crate::public_addr::IpWatch::default(),
+            saved_address: String::new(),
+            update_auto: false,
+            update_auto_dirty: false,
+            update_status: crate::self_update::UpdateStatus::default(),
+            cloud_email: String::new(),
+            cloud_token: String::new(),
+            cloud_api: crate::cloud::default_api(),
+            own_bucket: false,
+            window_log: String::new(),
+            confirm_remove: None,
         };
-        if let crate::self_update::Loaded::Present(update) = crate::self_update::Settings::read(&app.data_dir) {
-            app.update_start = update.window_start;
-            app.update_end = update.window_end;
-        }
         crate::public_addr::remember_port(&app.data_dir, port);
-        app.refresh();
+        if spawn_probe {
+            // The first paint must not wait on the data folder, the control pipe,
+            // or the service manager. Headless shots still read inline.
+            app.request_refresh();
+            app.request_service_probe();
+        } else {
+            app.refresh();
+        }
         let email = app.signed_in_email();
         let (token, api) = app.cloud_session();
         app.gate.arm(&email, &token, &api);
         if spawn_probe {
             app.probe = spawn_status_probe(&cc.egui_ctx);
-            app.start_address_guess();
         }
         app
     }
 
     fn start_address_guess(&mut self) {
-        if self.pub_guess_rx.is_some()
-            || crate::public_addr::load(&self.data_dir).is_some_and(|saved| !saved.address.trim().is_empty())
-        {
+        if self.pub_guess_rx.is_some() || !self.saved_address.trim().is_empty() {
             return;
         }
         let dir = self.data_dir.clone();
@@ -326,28 +369,13 @@ impl App {
                 }
             }
         }
-        if !self.pub_addr_ready {
-            if let Some(saved) = crate::public_addr::load(&self.data_dir) {
-                self.pub_addr = saved.address;
-                self.pub_addr_note = saved.note;
-                self.pub_addr_needs_confirm = saved.needs_confirm;
-                self.pub_addr_confirmed = saved.confirmed;
-            }
-            self.pub_addr_ready = true;
-        } else if let Some(saved) = crate::public_addr::load(&self.data_dir) {
-            if saved.address.trim() == self.pub_addr.trim() {
-                self.pub_addr_note = saved.note;
-                self.pub_addr_needs_confirm = saved.needs_confirm;
-                self.pub_addr_confirmed = saved.confirmed;
-            }
-        }
     }
 
     fn service_state(&self) -> (bool, bool) {
         if let Some(state) = self.svc_override {
             return state;
         }
-        svc_status()
+        (self.svc_installed, self.svc_running)
     }
 
     fn waiting_for_service(&self) -> bool {
@@ -365,34 +393,146 @@ impl App {
             self.control_ready = false;
             return;
         }
-        self.control_ready = crate::control::ready();
-        self.access = status_view::access(&self.data_dir);
-        if self.access == Access::Missing && std::fs::create_dir_all(&self.data_dir).is_ok() {
-            self.access = status_view::access(&self.data_dir);
+        self.apply_folder(read_folder(&self.data_dir));
+    }
+
+    /// Reads the data folder on a worker. Painting never waits on a pipe, the
+    /// service manager, a public-address file, or the log.
+    fn request_refresh(&mut self) {
+        if self.disk_rx.is_some()
+            || self.preview_locked
+            || self.preview_devices
+            || self.preview_network
+            || self.preview_netkey
+            || self.preview_account
+        {
+            return;
         }
-        // A locked folder must not be filled in with defaults. The pipe, if
-        // the service is running, is what this window shows instead.
-        if self.access != Access::Readable {
+        let dir = self.data_dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.disk_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("pjdesk-server-window".into())
+            .spawn(move || {
+                let _ = tx.send(read_folder(&dir));
+            })
+            .ok();
+    }
+
+    /// Pipe ping and Service Control Manager. A hung pipe stays on this worker.
+    fn request_service_probe(&mut self) {
+        if self.svc_rx.is_some() || self.preview_locked || self.svc_override.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.svc_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("pjdesk-server-service".into())
+            .spawn(move || {
+                let (installed, running) = svc_status();
+                let _ = tx.send(ServiceProbe { control_ready: crate::control::ready(), installed, running });
+            })
+            .ok();
+    }
+
+    fn poll_disk(&mut self) {
+        if let Some(rx) = &self.disk_rx {
+            match rx.try_recv() {
+                Ok(view) => {
+                    self.disk_rx = None;
+                    if !self.preview_locked {
+                        self.apply_folder(view);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.disk_rx = None,
+            }
+        }
+        if let Some(rx) = &self.svc_rx {
+            match rx.try_recv() {
+                Ok(probe) => {
+                    self.svc_rx = None;
+                    if self.svc_override.is_none() && !self.preview_locked {
+                        self.control_ready = probe.control_ready;
+                        self.svc_installed = probe.installed;
+                        self.svc_running = probe.running;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.svc_rx = None,
+            }
+        }
+    }
+
+    fn apply_folder(&mut self, view: FolderView) {
+        self.access = view.access;
+        self.window_log = view.window_log;
+        self.policy = view.policy;
+        self.watch = view.watch;
+        self.saved_address = view.public_address.as_ref().map(|saved| saved.address.clone()).unwrap_or_default();
+        if !self.pub_addr_ready {
+            if let Some(saved) = &view.public_address {
+                self.pub_addr = saved.address.clone();
+                self.pub_addr_note = saved.note.clone();
+                self.pub_addr_needs_confirm = saved.needs_confirm;
+                self.pub_addr_confirmed = saved.confirmed;
+            }
+            if !view.update_start.is_empty() || !view.update_end.is_empty() {
+                self.update_start = view.update_start.clone();
+                self.update_end = view.update_end.clone();
+            }
+            self.pub_addr_ready = true;
+        } else if let Some(saved) = &view.public_address {
+            if saved.address.trim() == self.pub_addr.trim() {
+                self.pub_addr_note = saved.note.clone();
+                self.pub_addr_needs_confirm = saved.needs_confirm;
+                self.pub_addr_confirmed = saved.confirmed;
+            }
+        }
+        self.update_status = view.update_status;
+        if self.update_auto == view.update_auto {
+            self.update_auto_dirty = false;
+        } else if !self.update_auto_dirty {
+            self.update_auto = view.update_auto;
+        }
+        self.cloud_email = view.cloud_email;
+        self.cloud_token = view.cloud_token;
+        self.cloud_api = view.cloud_api;
+        self.own_bucket = view.own_bucket;
+        if view.access != Access::Readable {
             self.can_write = false;
             return;
         }
-        self.can_write = std::fs::write(self.data_dir.join(".wtest"), b"1").is_ok();
-        let _ = std::fs::remove_file(self.data_dir.join(".wtest"));
+        self.can_write = view.can_write;
+        self.fingerprint = view.fingerprint;
+        self.accounts = view.accounts;
+        self.devices = view.devices;
+        self.blocked = view.blocked;
+        self.online = view.online;
+        self.log_tail = view.log_tail;
+        self.cloud_on = view.cloud_on;
+        self.cloud = view.cloud;
+        if self.check_release {
+            self.start_address_guess();
+        }
+    }
 
-        // Display the fingerprint read-only. This NEVER creates, regenerates or
-        // re-permissions anything — doing that on every refresh rotated the key
-        // and flashed console windows. The server's run path owns the identity;
-        // the window just shows it.
-        self.fingerprint = match crate::server::read_identity(&self.data_dir) {
-            Some(id) => pjdesk_proto::tls::format_fingerprint(&id.fingerprint()),
-            None => "(unknown — start the server to create it)".into(),
-        };
-        self.accounts = Accounts::load(&self.data_dir).map(|a| a.list()).unwrap_or_default();
-        self.devices = Registry::load(self.data_dir.join("devices.json")).map(|r| r.list()).unwrap_or_default();
-        self.online = read_online(&self.data_dir);
-        self.log_tail = status_view::redacted_log_tail(&self.data_dir.join("server.log"));
-        self.cloud_on = self.data_dir.join(crate::cloud::CONFIG_FILE).exists();
-        self.cloud = crate::cloud::CloudStatus::load(&self.data_dir);
+    fn spawn_note(&self, job: impl FnOnce() -> String + Send + 'static) {
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+    }
+
+    fn poll_notes(&mut self) {
+        let mut refresh = false;
+        while let Ok(msg) = self.bg_rx.try_recv() {
+            self.status = msg;
+            refresh = true;
+        }
+        if refresh {
+            self.request_refresh();
+        }
     }
 
     fn accounts_mut(&mut self) -> Option<Accounts> {
@@ -410,8 +550,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.last_refresh.elapsed() > Duration::from_secs(3) {
             self.last_refresh = Instant::now();
-            self.refresh();
+            self.request_refresh();
+            self.request_service_probe();
         }
+        self.poll_disk();
+        self.poll_notes();
         if let Some(rx) = &self.probe {
             while let Ok(msg) = rx.try_recv() {
                 if let Some(snap) = msg {
@@ -420,7 +563,7 @@ impl eframe::App for App {
             }
         }
         let ctx = ui.ctx().clone();
-        ctx.request_repaint_after(if self.waiting_for_service() {
+        ctx.request_repaint_after(if self.waiting_for_service() || self.disk_rx.is_some() || self.svc_rx.is_some() {
             Duration::from_millis(50)
         } else {
             Duration::from_secs(1)
@@ -525,13 +668,12 @@ impl eframe::App for App {
                     (String::new(), 0, String::new(), String::new(), String::new(), 0)
                 }
             } else {
-                let upd = crate::self_update::UpdateStatus::load(&self.data_dir);
                 (
                     self.cloud.as_ref().map(|s| s.role.clone()).unwrap_or_default(),
                     self.cloud.as_ref().map(|s| s.epoch).unwrap_or(0),
                     self.cloud.as_ref().map(|s| s.active_name.clone()).unwrap_or_default(),
-                    upd.available,
-                    upd.last_result,
+                    self.update_status.available.clone(),
+                    self.update_status.last_result.clone(),
                     self.online.len(),
                 )
             };
@@ -555,6 +697,15 @@ impl eframe::App for App {
         if self.gate.blocking() {
             ctx.request_repaint_after(Duration::from_millis(200));
             self.gate.draw(ui);
+            return;
+        }
+        if self.check_release && !self.pub_addr_ready {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui_widgets::spinner(ui, p(ui).accent);
+                    ui.label("Opening PJDesk Server…");
+                });
+            });
             return;
         }
 
@@ -658,33 +809,41 @@ impl App {
             self.updates_locked(ui);
             return;
         }
-        use crate::self_update::{self, Settings};
-        let mut settings = Settings::load(&self.data_dir);
-        let reported = self_update::UpdateStatus::load(&self.data_dir);
+        use crate::self_update::{self};
+        let reported = self.update_status.clone();
         let may_edit = self.may_edit_settings();
         card(ui, |ui| {
             heading(ui, "UPDATES");
-            let mut auto = settings.auto;
+            let mut auto = self.update_auto;
             let auto_changed = ui
                 .add_enabled_ui(may_edit, |ui| {
                     ui_widgets::checkbox(ui, &mut auto, "Install server updates automatically")
                 })
                 .inner;
             if auto_changed {
-                settings.auto = auto;
-                settings.save(&self.data_dir);
-                match self_update::set_task(&self.data_dir, auto) {
-                    Ok(()) => {
-                        self.status = if auto {
-                            "Automatic server updates are on. The service checks about once an hour.".into()
-                        } else {
-                            "Automatic server updates are off.".into()
-                        };
+                self.update_auto = auto;
+                self.update_auto_dirty = true;
+                let dir = self.data_dir.clone();
+                self.status = if auto {
+                    "Turning automatic server updates on…".into()
+                } else {
+                    "Turning automatic server updates off…".into()
+                };
+                self.spawn_note(move || {
+                    let mut settings = self_update::Settings::load(&dir);
+                    settings.auto = auto;
+                    settings.save(&dir);
+                    match self_update::set_task(&dir, auto) {
+                        Ok(()) => {
+                            if auto {
+                                "Automatic server updates are on. The service checks about once an hour.".into()
+                            } else {
+                                "Automatic server updates are off.".into()
+                            }
+                        }
+                        Err(e) => format!("{e:#}"),
                     }
-                    Err(e) => {
-                        self.status = format!("{e:#}");
-                    }
-                }
+                });
             }
             ui.label(
                 RichText::new(
@@ -703,11 +862,14 @@ impl App {
                     ui.label("to");
                     ui.add(egui::TextEdit::singleline(&mut self.update_end).hint_text("HH:MM").desired_width(70.0));
                     if ui.button("Save").clicked() {
-                        self.status =
-                            match self_update::set_window(&self.data_dir, &self.update_start, &self.update_end) {
-                                Ok(()) => "Saved the maintenance window. Leave both blank for any time.".into(),
-                                Err(e) => format!("{e}"),
-                            };
+                        let dir = self.data_dir.clone();
+                        let start = self.update_start.clone();
+                        let end = self.update_end.clone();
+                        self.status = "Saving the maintenance window…".into();
+                        self.spawn_note(move || match self_update::set_window(&dir, &start, &end) {
+                            Ok(()) => "Saved the maintenance window. Leave both blank for any time.".into(),
+                            Err(e) => format!("{e}"),
+                        });
                     }
                 });
             });
@@ -863,10 +1025,11 @@ impl App {
     }
 
     fn ask_service(&mut self, req: crate::control::Request) {
-        self.status = match crate::control::call(&req) {
+        self.status = "Asking the PJDesk service…".into();
+        self.spawn_note(move || match crate::control::call(&req) {
             Some(response) => response.message,
             None => "The PJDesk service did not answer.".into(),
-        };
+        });
     }
 
     fn run_service_action(&mut self, action: SvcAction) {
@@ -885,25 +1048,29 @@ impl App {
             self.elevate_service(args);
             return;
         }
-        let result = match action {
-            SvcAction::Install => {
-                let opts = crate::ServerOpts {
-                    bind: std::net::IpAddr::from([0, 0, 0, 0]),
-                    port: self.port,
-                    data_dir: Some(self.data_dir.clone()),
-                };
-                crate::service::install(&opts, &self.data_dir, true).map(|_| "Service installed and started.")
+        let data_dir = self.data_dir.clone();
+        let port = self.port;
+        self.status = "Working on the PJDesk service…".into();
+        self.spawn_note(move || {
+            let result = match action {
+                SvcAction::Install => {
+                    let opts = crate::ServerOpts {
+                        bind: std::net::IpAddr::from([0, 0, 0, 0]),
+                        port,
+                        data_dir: Some(data_dir.clone()),
+                    };
+                    crate::service::install(&opts, &data_dir, true).map(|_| "Service installed and started.")
+                }
+                SvcAction::Uninstall => crate::service::uninstall().map(|_| "Service removed."),
+                SvcAction::Start => crate::service::start().map(|_| "Service started."),
+                SvcAction::Stop => crate::service::stop().map(|_| "Service stopped."),
+                SvcAction::Restart => crate::service::restart().map(|_| "Service restarted."),
+            };
+            match result {
+                Ok(msg) => msg.to_string(),
+                Err(e) => format!("{e:#}"),
             }
-            SvcAction::Uninstall => crate::service::uninstall().map(|_| "Service removed."),
-            SvcAction::Start => crate::service::start().map(|_| "Service started."),
-            SvcAction::Stop => crate::service::stop().map(|_| "Service stopped."),
-            SvcAction::Restart => crate::service::restart().map(|_| "Service restarted."),
-        };
-        self.status = match result {
-            Ok(msg) => msg.to_string(),
-            Err(e) => format!("{e:#}"),
-        };
-        self.refresh();
+        });
     }
 
     fn fingerprint_line(&self) -> (String, bool) {
@@ -1096,20 +1263,10 @@ impl App {
 
     /// Bearer token for the signed-in PJDesk account, when this window can read it.
     fn cloud_session(&self) -> (String, String) {
-        let api_fallback = crate::cloud::default_api();
-        if self.access == Access::Readable {
-            if let Some(cfg) = crate::cloud::CloudConfig::load(&self.data_dir) {
-                if cfg.is_account() && !cfg.token.is_empty() {
-                    let api = if cfg.api.trim().is_empty() {
-                        api_fallback
-                    } else {
-                        cfg.api.trim_end_matches('/').to_string()
-                    };
-                    return (cfg.token, api);
-                }
-            }
+        if self.access == Access::Readable && !self.cloud_token.is_empty() {
+            return (self.cloud_token.clone(), self.cloud_api.clone());
         }
-        (String::new(), api_fallback)
+        (String::new(), crate::cloud::default_api())
     }
 
     /// Email of the PJDesk account this server is signed in as.
@@ -1119,21 +1276,15 @@ impl App {
                 return cloud.account.clone();
             }
         }
-        if self.access == Access::Readable {
-            if let Some(cfg) = crate::cloud::CloudConfig::load(&self.data_dir) {
-                if cfg.is_account() && !cfg.email.is_empty() {
-                    return cfg.email;
-                }
-            }
+        if self.access == Access::Readable && !self.cloud_email.is_empty() {
+            return self.cloud_email.clone();
         }
         self.live.as_ref().map(|s| s.account.clone()).filter(|s| !s.is_empty()).unwrap_or_default()
     }
 
     /// True when Cloud Sync is the advanced "your own bucket" path.
     fn using_own_bucket(&self) -> bool {
-        self.access == Access::Readable
-            && self.cloud_on
-            && crate::cloud::CloudConfig::load(&self.data_dir).is_some_and(|cfg| !cfg.is_account())
+        self.access == Access::Readable && self.cloud_on && self.own_bucket
     }
 
     /// PJDesk settings save when this window can write the data folder and a
@@ -1432,13 +1583,13 @@ impl App {
             if let Some(u) = remove {
                 if let Some(mut accts) = self.accounts_mut() {
                     let _ = accts.delete(&u);
-                    self.refresh();
+                    self.request_refresh();
                 }
             }
             if let Some((u, disabled)) = toggle_disabled {
                 if let Some(mut accts) = self.accounts_mut() {
                     let _ = accts.set_disabled(&u, disabled);
-                    self.refresh();
+                    self.request_refresh();
                 }
             }
         });
@@ -1791,7 +1942,7 @@ impl App {
                 self.cloud_form.own_bucket = false;
                 cloud::turn_off(&dir);
                 self.status = "Enter your PJDesk account password to sign in again.".into();
-                self.refresh();
+                self.request_refresh();
             }
             CloudAct::SyncNow => {
                 if self.via_service() {
@@ -1879,7 +2030,7 @@ impl App {
                 } else {
                     "Cloud sync is off on this server. The copy in the bucket is kept.".into()
                 };
-                self.refresh();
+                self.request_refresh();
             }
             CloudAct::Setup { replace } => {
                 let f = &self.cloud_form;
@@ -1945,7 +2096,7 @@ impl App {
                 f.show_secret = false;
                 f.show_code = false;
                 f.show_acct_password = false;
-                self.refresh();
+                self.request_refresh();
             }
             Ok(JobDone::BucketOccupied) => self.cloud_form.confirm_replace = true,
             Ok(JobDone::Ask { cfg, from, written_at, readable }) => {
@@ -1967,41 +2118,33 @@ impl App {
             return;
         }
         if self.access != Access::Readable {
+            let snap = self.live.clone();
             card(ui, |ui| {
                 heading(ui, "SIGNED-IN ACCOUNTS");
-                if let Some(live) = &self.live {
+                if let Some(live) = &snap {
                     let on = live.require_accounts;
                     ui.label(if on {
                         "Require signed-in accounts is on."
                     } else {
                         "Require signed-in accounts is off. Already-registered computers keep connecting."
                     });
-                    let waiting: Vec<_> = live.devices.iter().filter(|d| !d.signed_in).cloned().collect();
+                    let waiting = unknown_from_listed(live.devices.iter().filter(|d| !d.signed_in));
+                    let blocked = blocks_from_listed(&live.blocked);
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Not signed in yet").strong());
-                    if waiting.is_empty() {
-                        ui.label(RichText::new("No computer is waiting to sign in.").color(p(ui).muted));
-                    } else {
-                        for d in waiting {
-                            ui.label(format!("{}  {}", pjdesk_proto::format_id(&d.id), d.hostname));
-                        }
-                    }
+                    self.not_signed_in(ui, &waiting, &blocked, false);
                 }
                 self.locked_line(ui);
             });
             return;
         }
-        let mut policy = crate::access::Policy::load(&self.data_dir);
-        let unsigned: Vec<(String, String)> = self
-            .devices
-            .iter()
-            .filter(|d| !d.signed_in)
-            .map(|d| (pjdesk_proto::format_id(&d.id), d.hostname.clone()))
-            .collect();
+        let mut policy = self.policy.clone();
+        let unsigned = unknown_from_devices(self.devices.iter().filter(|d| !d.signed_in));
+        let blocked = blocks_from_registry(&self.blocked);
         let mut require = policy.require_accounts;
         let mut changed = false;
+        let mut block_act = None;
         self.poll_public_address();
-        let saved_address = crate::public_addr::load(&self.data_dir).map(|saved| saved.address).unwrap_or_default();
+        let saved_address = self.saved_address.clone();
         let dirty = self.pub_addr.trim() != saved_address.trim();
         let mut publish = false;
         let mut replace = false;
@@ -2023,12 +2166,9 @@ impl App {
                     .desired_width(360.0)
                     .font(egui::TextStyle::Monospace),
             );
-            ui.label(
-                RichText::new(crate::public_addr::IpWatch::load(&self.data_dir).line()).color(p(ui).muted).size(12.0),
-            );
+            ui.label(RichText::new(self.watch.line()).color(p(ui).muted).size(12.0));
             let hostname = crate::public_addr::is_hostname(self.pub_addr.trim());
-            let mut watch = crate::public_addr::IpWatch::load(&self.data_dir);
-            let mut auto = watch.enabled(self.pub_addr.trim());
+            let mut auto = self.watch.enabled(self.pub_addr.trim());
             if hostname {
                 ui.label(
                     RichText::new("This address is a hostname, so a public IP change does not replace it.")
@@ -2038,8 +2178,10 @@ impl App {
             }
             ui.add_enabled_ui(may_edit && !hostname, |ui| {
                 if ui.checkbox(&mut auto, "Update the address when my public IP changes").changed() {
-                    watch.auto = Some(auto);
-                    watch.save(&self.data_dir);
+                    self.watch.auto = Some(auto);
+                    let watch = self.watch.clone();
+                    let dir = self.data_dir.clone();
+                    std::thread::spawn(move || watch.save(&dir));
                 }
             });
             if !self.pub_addr_note.is_empty() {
@@ -2080,20 +2222,7 @@ impl App {
                 }
             });
             ui.add_space(8.0);
-            ui.label(RichText::new("Not signed in yet").strong());
-            if unsigned.is_empty() {
-                ui.label(
-                    RichText::new("Every registered computer has signed in, or none have registered.")
-                        .color(p(ui).muted),
-                );
-            } else {
-                for (id, name) in &unsigned {
-                    ui.horizontal(|ui| {
-                        ui_widgets::dot(ui, p(ui).warn);
-                        ui.label(format!("{id}  {name}"));
-                    });
-                }
-            }
+            block_act = self.not_signed_in(ui, &unsigned, &blocked, true);
             ui.add_space(8.0);
             ui.label(RichText::new("Allowed accounts").strong());
             if policy.allowed_accounts.is_empty() {
@@ -2167,15 +2296,26 @@ impl App {
                 self.spawn_revoke_key(id);
             }
         });
+        if let Some(act) = block_act {
+            self.apply_block(act);
+        }
         if changed {
             policy.require_accounts = require;
             policy.require_chosen = true;
-            if let Err(e) = policy.save(&self.data_dir) {
-                self.status = format!("Could not save the signed-in accounts setting: {e}");
-            } else {
-                let dir = self.data_dir.clone();
-                std::thread::spawn(move || crate::cloud::push_require_accounts(&dir, require));
-            }
+            self.policy = policy.clone();
+            let dir = self.data_dir.clone();
+            self.status = "Saving the signed-in accounts setting…".into();
+            self.spawn_note(move || {
+                if let Err(e) = policy.save(&dir) {
+                    return format!("Could not save the signed-in accounts setting: {e}");
+                }
+                crate::cloud::push_require_accounts(&dir, require);
+                if require {
+                    "Signed-in accounts are required.".into()
+                } else {
+                    "Signed-in accounts are not required. Already-registered computers keep connecting.".into()
+                }
+            });
         }
         if publish {
             self.publish_public_address(replace);
@@ -2203,6 +2343,7 @@ impl App {
         let mut watch_changed = false;
         let mut publish = false;
         let mut replace = false;
+        let mut block_act = None;
         let address = self.pub_addr.clone();
         card(ui, |ui| {
             heading(ui, "PUBLIC ADDRESS");
@@ -2250,17 +2391,16 @@ impl App {
             ui.label(RichText::new(
                 "Off by default, so an update does not take a computer offline. Turn this on only after every computer has signed in.",
             ).color(p(ui).muted).size(12.0));
-            if let Some(live) = &live {
-                let waiting: Vec<_> = live.devices.iter().filter(|d| !d.signed_in).cloned().collect();
+            let (waiting, blocked_rows) = match &live {
+                Some(live) => (
+                    unknown_from_listed(live.devices.iter().filter(|d| !d.signed_in)),
+                    blocks_from_listed(&live.blocked),
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
+            if live.is_some() {
                 ui.add_space(6.0);
-                ui.label(RichText::new("Not signed in yet").strong());
-                if waiting.is_empty() {
-                    ui.label(RichText::new("No computer is waiting to sign in.").color(p(ui).muted));
-                } else {
-                    for d in waiting {
-                        ui.label(format!("{}  {}", pjdesk_proto::format_id(&d.id), d.hostname));
-                    }
-                }
+                block_act = self.not_signed_in(ui, &waiting, &blocked_rows, true);
             }
         });
         if changed {
@@ -2285,6 +2425,9 @@ impl App {
                 ..Default::default()
             });
         }
+        if let Some(act) = block_act {
+            self.apply_block(act);
+        }
     }
 
     fn publish_public_address(&mut self, replace: bool) {
@@ -2293,36 +2436,41 @@ impl App {
             self.pub_addr_note = "Type the public address computers use to reach this server.".into();
             return;
         }
-        let mut record = crate::public_addr::load(&self.data_dir).unwrap_or(crate::public_addr::PublicAddress {
-            address: String::new(),
-            confirmed: false,
-            source: String::new(),
-            needs_confirm: false,
-            note: String::new(),
-        });
-        if record.address.trim() != address {
-            record.source = "manual".into();
-        }
-        record.address = address;
-        record.confirmed = true;
-        record.needs_confirm = false;
-        let signed_in = crate::cloud::CloudConfig::load(&self.data_dir)
-            .is_some_and(|cfg| cfg.is_account() && !cfg.token.is_empty());
-        record.note = if signed_in {
-            "Publishing this address…".into()
-        } else {
-            "Sign in with your PJDesk account above to publish this address.".into()
-        };
-        crate::public_addr::save(&self.data_dir, &record);
         self.pub_addr_confirmed = true;
         self.pub_addr_needs_confirm = false;
-        self.pub_addr_note = record.note.clone();
-        if !signed_in {
-            return;
-        }
+        self.pub_addr_note = "Publishing this address…".into();
+        self.saved_address = address.clone();
         let dir = self.data_dir.clone();
         let online = self.online.len();
-        std::thread::spawn(move || crate::cloud::publish_network(&dir, online, replace));
+        self.status = "Publishing this address…".into();
+        self.spawn_note(move || {
+            let mut record = crate::public_addr::load(&dir).unwrap_or(crate::public_addr::PublicAddress {
+                address: String::new(),
+                confirmed: false,
+                source: String::new(),
+                needs_confirm: false,
+                note: String::new(),
+            });
+            if record.address.trim() != address {
+                record.source = "manual".into();
+            }
+            record.address = address;
+            record.confirmed = true;
+            record.needs_confirm = false;
+            let signed_in = crate::cloud::CloudConfig::load(&dir)
+                .is_some_and(|cfg| cfg.is_account() && !cfg.token.is_empty());
+            record.note = if signed_in {
+                "Publishing this address…".into()
+            } else {
+                "Sign in with your PJDesk account above to publish this address.".into()
+            };
+            crate::public_addr::save(&dir, &record);
+            if !signed_in {
+                return record.note;
+            }
+            crate::cloud::publish_network(&dir, online, replace);
+            "Published this address.".into()
+        });
     }
 
     fn ensure_invites(&mut self) {
@@ -2560,6 +2708,126 @@ impl App {
         }
     }
 
+    /// Computers that registered without a PJDesk account, and computers Ben removed.
+    fn not_signed_in(
+        &mut self,
+        ui: &mut egui::Ui,
+        waiting: &[UnknownComputer],
+        blocked: &[BlockedComputer],
+        can_act: bool,
+    ) -> Option<BlockAct> {
+        let mut act = None;
+        heading(ui, "NOT SIGNED IN YET");
+        ui.label(
+            RichText::new(
+                "These computers registered without a signed-in PJDesk account. Remove one that is not yours. It is disconnected, its registration is deleted, and it cannot register again until you unblock it.",
+            )
+            .color(p(ui).muted),
+        );
+        ui.add_space(6.0);
+        if waiting.is_empty() {
+            ui.label(RichText::new("No computers are waiting to sign in.").color(p(ui).muted));
+        }
+        if self.confirm_remove.as_ref().is_some_and(|id| waiting.iter().all(|row| row.id != *id)) {
+            self.confirm_remove = None;
+        }
+        for row in waiting {
+            let shown = pjdesk_proto::format_id(&row.id);
+            let name = if row.hostname.trim().is_empty() { "Unknown computer".to_string() } else { row.hostname.clone() };
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&shown).monospace().strong());
+                ui.label(RichText::new(&name).strong());
+            });
+            ui.label(RichText::new(computer_facts(&row.last_ip, row.first_seen, row.last_seen, 0)).color(p(ui).muted).size(12.0));
+            if can_act {
+                let confirming = self.confirm_remove.as_deref() == Some(row.id.as_str());
+                ui.horizontal(|ui| {
+                    if confirming {
+                        ui.label(RichText::new("Remove this computer?").color(p(ui).warn));
+                        if ui.small_button("Remove").clicked() {
+                            act = Some(BlockAct::Remove(row.id.clone()));
+                        }
+                        if ui.small_button("Cancel").clicked() {
+                            self.confirm_remove = None;
+                        }
+                    } else if ui.small_button("Remove").clicked() {
+                        self.confirm_remove = Some(row.id.clone());
+                    }
+                });
+            }
+        }
+        if !blocked.is_empty() {
+            ui.add_space(10.0);
+            heading(ui, "BLOCKED COMPUTERS");
+            ui.label(
+                RichText::new("These computers cannot register. Unblock lets that computer register again.")
+                    .color(p(ui).muted),
+            );
+            for row in blocked {
+                let shown = pjdesk_proto::format_id(&row.id);
+                let name = if row.hostname.trim().is_empty() { "Unknown computer".to_string() } else { row.hostname.clone() };
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&shown).monospace());
+                    ui.label(&name);
+                    if can_act && ui.small_button("Unblock").clicked() {
+                        act = Some(BlockAct::Unblock(row.id.clone()));
+                    }
+                });
+                ui.label(
+                    RichText::new(computer_facts(&row.last_ip, row.first_seen, row.last_seen, row.blocked_at))
+                        .color(p(ui).muted)
+                        .size(12.0),
+                );
+            }
+        }
+        act
+    }
+
+    fn apply_block(&mut self, act: BlockAct) {
+        let (id, removing) = match act {
+            BlockAct::Remove(id) => (id, true),
+            BlockAct::Unblock(id) => (id, false),
+        };
+        self.confirm_remove = None;
+        let shown = pjdesk_proto::format_id(&id);
+        if self.can_write {
+            let dir = self.data_dir.clone();
+            self.status = if removing { format!("Removing {shown}…") } else { format!("Unblocking {shown}…") };
+            self.spawn_note(move || {
+                let result = if removing {
+                    crate::requests::block_device(&dir, &id)
+                } else {
+                    crate::requests::unblock_device(&dir, &id)
+                };
+                match result {
+                    Ok(()) if removing => format!(
+                        "Removed {shown}. It is disconnected and cannot register again until it is unblocked."
+                    ),
+                    Ok(()) => format!("{shown} can register again."),
+                    Err(e) if removing => format!("Could not remove {shown}: {e}"),
+                    Err(e) => format!("Could not unblock {shown}: {e}"),
+                }
+            });
+            return;
+        }
+        if self.control_ready {
+            self.ask_service(crate::control::Request {
+                cmd: if removing { "block" } else { "unblock" }.into(),
+                device_id: id,
+                ..Default::default()
+            });
+            return;
+        }
+        let cmd = if removing { "block-device" } else { "unblock-device" };
+        if run_elevated(&[cmd, &id]) {
+            self.status = format!("Asked Windows to approve that for {shown}.");
+        } else {
+            self.status = "Windows did not start the elevated action.".into();
+        }
+    }
+
     fn devices_card(&mut self, ui: &mut egui::Ui) {
         let locked = self.access != Access::Readable;
         if locked && self.live.as_ref().map(|s| s.devices.is_empty()).unwrap_or(true) {
@@ -2698,8 +2966,8 @@ impl App {
                             hostname: d.hostname.clone(),
                             version: d.version.clone(),
                             online: d.online,
-                            last_seen: 0,
-                            first_seen: 0,
+                            last_seen: d.last_seen,
+                            first_seen: d.first_seen,
                             signed_in: d.signed_in,
                         })
                         .collect()
@@ -2777,7 +3045,7 @@ impl App {
         } else if run_elevated(&["forget-device", id]) {
             self.status = format!("Forgot {shown}.");
         }
-        self.refresh();
+        self.request_refresh();
     }
 
     /// Asks the running server to update one device (`"*"` = every online one)
@@ -2824,7 +3092,7 @@ impl App {
             }
             ui.add_space(8.0);
             if ui.button("Copy diagnostics").clicked() {
-                copy(&diagnostics_text(&service_log));
+                copy(&diagnostics_text(&service_log, &self.window_log));
                 self.status = "Copied diagnostics. Passwords and tokens are left out.".into();
             }
             ui.label(
@@ -2913,6 +3181,191 @@ fn open_url(url: &str) {
 /// A show/hide toggle for a password field. The label is a word, not an icon.
 fn reveal_toggle(ui: &mut egui::Ui, shown: &mut bool) {
     ui_widgets::reveal(ui, shown);
+}
+
+struct UnknownComputer {
+    id: String,
+    hostname: String,
+    last_ip: String,
+    first_seen: u64,
+    last_seen: u64,
+}
+
+struct BlockedComputer {
+    id: String,
+    hostname: String,
+    last_ip: String,
+    first_seen: u64,
+    last_seen: u64,
+    blocked_at: u64,
+}
+
+enum BlockAct {
+    Remove(String),
+    Unblock(String),
+}
+
+struct ServiceProbe {
+    control_ready: bool,
+    installed: bool,
+    running: bool,
+}
+
+struct FolderView {
+    access: Access,
+    window_log: String,
+    policy: crate::access::Policy,
+    watch: crate::public_addr::IpWatch,
+    public_address: Option<crate::public_addr::PublicAddress>,
+    update_status: crate::self_update::UpdateStatus,
+    update_auto: bool,
+    update_start: String,
+    update_end: String,
+    cloud_email: String,
+    cloud_token: String,
+    cloud_api: String,
+    own_bucket: bool,
+    can_write: bool,
+    fingerprint: String,
+    accounts: Vec<accounts::AccountInfo>,
+    devices: Vec<DeviceRow>,
+    blocked: Vec<BlockedRow>,
+    online: HashMap<String, String>,
+    log_tail: String,
+    cloud_on: bool,
+    cloud: Option<crate::cloud::CloudStatus>,
+}
+
+/// Local files only. The control pipe and the service manager are [`request_service_probe`].
+fn read_folder(dir: &std::path::Path) -> FolderView {
+    let window_log = status_view::redacted_log_tail(&window_log_path());
+    let mut access = status_view::access(dir);
+    if access == Access::Missing && std::fs::create_dir_all(dir).is_ok() {
+        access = status_view::access(dir);
+    }
+    let policy = crate::access::Policy::load(dir);
+    let watch = crate::public_addr::IpWatch::load(dir);
+    let public_address = crate::public_addr::load(dir);
+    let update_status = crate::self_update::UpdateStatus::load(dir);
+    let (update_auto, update_start, update_end) = match crate::self_update::Settings::read(dir) {
+        crate::self_update::Loaded::Present(settings) => (settings.auto, settings.window_start, settings.window_end),
+        _ => (false, String::new(), String::new()),
+    };
+    let (cloud_email, cloud_token, cloud_api, own_bucket) = match crate::cloud::CloudConfig::load(dir) {
+        Some(cfg) if cfg.is_account() => {
+            let api = if cfg.api.trim().is_empty() {
+                crate::cloud::default_api()
+            } else {
+                cfg.api.trim_end_matches('/').to_string()
+            };
+            let token = if cfg.token.is_empty() { String::new() } else { cfg.token };
+            (cfg.email, token, api, false)
+        }
+        Some(_) => (String::new(), String::new(), crate::cloud::default_api(), true),
+        None => (String::new(), String::new(), crate::cloud::default_api(), false),
+    };
+    let mut view = FolderView {
+        access,
+        window_log,
+        policy,
+        watch,
+        public_address,
+        update_status,
+        update_auto,
+        update_start,
+        update_end,
+        cloud_email,
+        cloud_token,
+        cloud_api,
+        own_bucket,
+        can_write: false,
+        fingerprint: String::new(),
+        accounts: Vec::new(),
+        devices: Vec::new(),
+        blocked: Vec::new(),
+        online: HashMap::new(),
+        log_tail: String::new(),
+        cloud_on: false,
+        cloud: None,
+    };
+    if access != Access::Readable {
+        return view;
+    }
+    view.can_write = std::fs::write(dir.join(".wtest"), b"1").is_ok();
+    let _ = std::fs::remove_file(dir.join(".wtest"));
+    view.fingerprint = match crate::server::read_identity(dir) {
+        Some(id) => pjdesk_proto::tls::format_fingerprint(&id.fingerprint()),
+        None => "(unknown — start the server to create it)".into(),
+    };
+    view.accounts = Accounts::load(dir).map(|a| a.list()).unwrap_or_default();
+    if let Ok(reg) = Registry::load(dir.join("devices.json")) {
+        view.blocked = reg.blocked();
+        view.devices = reg.list();
+    }
+    view.online = read_online(dir);
+    view.log_tail = status_view::redacted_log_tail(&dir.join("server.log"));
+    view.cloud_on = dir.join(crate::cloud::CONFIG_FILE).exists();
+    view.cloud = crate::cloud::CloudStatus::load(dir);
+    view
+}
+
+fn unknown_from_devices<'a>(rows: impl Iterator<Item = &'a DeviceRow>) -> Vec<UnknownComputer> {
+    rows.map(|d| UnknownComputer {
+        id: d.id.clone(),
+        hostname: d.hostname.clone(),
+        last_ip: d.last_ip.clone(),
+        first_seen: d.first_seen,
+        last_seen: d.last_seen,
+    })
+    .collect()
+}
+
+fn unknown_from_listed<'a>(rows: impl Iterator<Item = &'a status_view::ListedDevice>) -> Vec<UnknownComputer> {
+    rows.map(|d| UnknownComputer {
+        id: d.id.clone(),
+        hostname: d.hostname.clone(),
+        last_ip: d.last_ip.clone(),
+        first_seen: d.first_seen,
+        last_seen: d.last_seen,
+    })
+    .collect()
+}
+
+fn blocks_from_registry(rows: &[BlockedRow]) -> Vec<BlockedComputer> {
+    rows.iter()
+        .map(|d| BlockedComputer {
+            id: d.id.clone(),
+            hostname: d.hostname.clone(),
+            last_ip: d.last_ip.clone(),
+            first_seen: d.first_seen,
+            last_seen: d.last_seen,
+            blocked_at: d.blocked_at,
+        })
+        .collect()
+}
+
+fn blocks_from_listed(rows: &[status_view::ListedBlock]) -> Vec<BlockedComputer> {
+    rows.iter()
+        .map(|d| BlockedComputer {
+            id: d.id.clone(),
+            hostname: d.hostname.clone(),
+            last_ip: d.last_ip.clone(),
+            first_seen: d.first_seen,
+            last_seen: d.last_seen,
+            blocked_at: d.blocked_at,
+        })
+        .collect()
+}
+
+fn computer_facts(ip: &str, first_seen: u64, last_seen: u64, blocked_at: u64) -> String {
+    let ip = if ip.trim().is_empty() { "unknown" } else { ip.trim() };
+    let first = if first_seen == 0 { "unknown".into() } else { format_local(first_seen) };
+    let last = if last_seen == 0 { "unknown".into() } else { format!("{} ({})", format_local(last_seen), ago(last_seen)) };
+    let mut line = format!("Last IP {ip}   ·   First seen {first}   ·   Last seen {last}");
+    if blocked_at > 0 {
+        line.push_str(&format!("   ·   Blocked {}", format_local(blocked_at)));
+    }
+    line
 }
 
 struct ShownDevice {
@@ -3010,8 +3463,7 @@ fn copy(text: &str) {
     }
 }
 
-fn diagnostics_text(service_log: &str) -> String {
-    let window = status_view::redacted_log_tail(&window_log_path());
+fn diagnostics_text(service_log: &str, window: &str) -> String {
     let mut out = String::from("PJDesk Server diagnostics\n\n--- server.log ---\n");
     if service_log.is_empty() {
         out.push_str("(not available)\n");

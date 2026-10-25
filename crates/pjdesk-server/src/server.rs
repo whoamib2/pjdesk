@@ -18,7 +18,7 @@ use pjdesk_proto::{
     format_id, normalize_id, protocol_ok, ALPN_SIGNAL, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SIGNAL_SERVER_NAME,
 };
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
@@ -89,6 +89,8 @@ pub struct OnlineHost {
     pub proto: u16,
     /// When this connection became the active registration.
     pub since: Instant,
+    /// Wakes the connection task so a removed computer drops immediately.
+    pub close: Arc<Notify>,
 }
 
 /// A connection attempt between a controller and a host.
@@ -368,6 +370,8 @@ struct Conn {
     proto: u16,
     /// Network access token from [`ClientMsg::PresentAccess`], if this peer sent one.
     access_token: String,
+    /// Set when this computer is removed. The read loop ends on the next wait.
+    close: Arc<Notify>,
 }
 
 impl Conn {
@@ -390,6 +394,7 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
     // Outgoing messages go through a channel so other tasks (e.g. the UDP
     // relay, or the other side of a session) can push messages to this client.
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let close = Arc::new(Notify::new());
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if write_msg(&mut writer, &msg).await.is_err() {
@@ -405,6 +410,7 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
         host_id: None,
         proto: 0,
         access_token: String::new(),
+        close,
     };
     debug!("{addr}: connected (conn {})", conn.id);
 
@@ -412,10 +418,18 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
         let mut burst_start = Instant::now();
         let mut burst = 0u32;
         loop {
-            let msg: ClientMsg = match tokio::time::timeout(IDLE_TIMEOUT, read_msg(&mut reader, MAX_SIGNAL_FRAME)).await
-            {
-                Ok(msg) => msg?,
-                Err(_) => bail!("idle timeout"),
+            let close = Arc::clone(&conn.close);
+            let closed = close.notified();
+            let closed = std::pin::pin!(closed);
+            let msg: ClientMsg = tokio::select! {
+                biased;
+                _ = closed => bail!("removed from this server"),
+                msg = tokio::time::timeout(IDLE_TIMEOUT, read_msg(&mut reader, MAX_SIGNAL_FRAME)) => {
+                    match msg {
+                        Ok(msg) => msg?,
+                        Err(_) => bail!("idle timeout"),
+                    }
+                }
             };
             // A single connection that sprays messages holds the process-wide
             // lock on every one of them. Drop it instead of queuing forever.
@@ -704,6 +718,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                         addr: conn.addr,
                         proto: conn.proto,
                         since: Instant::now(),
+                        close: Arc::clone(&conn.close),
                     };
                     if let Some(prev) = st.online.insert(id.clone(), host) {
                         if prev.conn_id != conn.id {
@@ -729,6 +744,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                         }
                     }
                     conn.host_id = Some(id.clone());
+                    st.registry.note_address(&id, &conn.addr.ip().to_string());
                     st.registry.mark_signed_in(&id, signed.is_some());
                     conn.send(ServerMsg::Registered { device_id: id.clone() });
                     if conn.proto >= 3 {
@@ -757,7 +773,11 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 }
                 Err(e) => {
                     warn!("{}: registration refused: {e}", conn.addr);
-                    conn.error(ErrorCode::IdConflict, e.to_string());
+                    if matches!(e, crate::registry::RegisterError::Blocked(_)) {
+                        conn.error(ErrorCode::Unauthorized, "This computer is blocked.");
+                    } else {
+                        conn.error(ErrorCode::IdConflict, e.to_string());
+                    }
                 }
             }
         }
@@ -1085,6 +1105,38 @@ async fn janitor(state: Shared) {
     }
 }
 
+/// Drops a computer's live connections and any session it is hosting.
+fn disconnect_device(st: &mut State, id: &str) {
+    let message = "This computer was removed from PJDesk Server.";
+    let mut notify = Vec::new();
+    if let Some(host) = st.online.remove(id) {
+        let _ = host.tx.send(ServerMsg::Error { code: ErrorCode::Unauthorized, message: message.to_string() });
+        notify.push(host.close);
+    }
+    if let Some(list) = st.standby.remove(id) {
+        for host in list {
+            let _ = host.tx.send(ServerMsg::Error { code: ErrorCode::Unauthorized, message: message.to_string() });
+            notify.push(host.close);
+        }
+    }
+    let ended: Vec<SessionId> = st.sessions.iter().filter(|(_, session)| session.host_id == id).map(|(sid, _)| *sid).collect();
+    for sid in ended {
+        if let Some(session) = st.sessions.remove(&sid) {
+            let _ = session.host_tx.send(ServerMsg::Error {
+                code: ErrorCode::Unauthorized,
+                message: message.to_string(),
+            });
+            let _ = session.controller_tx.send(ServerMsg::Error {
+                code: ErrorCode::HostOffline,
+                message: "That computer was removed from the server.".into(),
+            });
+        }
+    }
+    for close in notify {
+        close.notify_one();
+    }
+}
+
 /// One online device, published to `online.json` for the management window.
 /// `at` is unix seconds. Readers use it when the file's modification time stalls.
 #[derive(serde::Serialize)]
@@ -1112,7 +1164,12 @@ async fn fleet_sync(state: Shared) {
             let st = &mut *guard;
             if ticks % TOUCH_EVERY == 0 {
                 let ids: Vec<String> = st.online.keys().cloned().collect();
+                let ips: Vec<(String, String)> =
+                    st.online.iter().map(|(id, host)| (id.clone(), host.addr.ip().to_string())).collect();
                 st.registry.touch(&ids);
+                for (id, ip) in ips {
+                    st.registry.note_address(&id, &ip);
+                }
             }
             let at = crate::registry::unix_now();
             let snapshot: Vec<OnlineInfo> = st
@@ -1152,8 +1209,10 @@ async fn fleet_sync(state: Shared) {
 
         let updates = take(&data_dir, UPDATE_FILE);
         let forgets = take(&data_dir, FORGET_FILE);
+        let blocks = take(&data_dir, crate::requests::BLOCK_FILE);
+        let unblocks = take(&data_dir, crate::requests::UNBLOCK_FILE);
         let groups = take(&data_dir, crate::requests::GROUP_FILE);
-        if updates.is_empty() && forgets.is_empty() && groups.is_empty() {
+        if updates.is_empty() && forgets.is_empty() && groups.is_empty() && blocks.is_empty() && unblocks.is_empty() {
             continue;
         }
         let mut st = state.lock().unwrap();
@@ -1180,6 +1239,27 @@ async fn fleet_sync(state: Shared) {
             } else {
                 info!("Forgot device {}", format_id(id));
                 crate::audit::AuditLog::open(&st.data_dir).record("forget", "server", &format_id(id));
+            }
+        }
+        for id in &blocks {
+            match st.registry.block(id) {
+                Ok(true) => {
+                    info!("Blocked {} and dropped its connection", format_id(id));
+                    disconnect_device(&mut st, id);
+                    crate::audit::AuditLog::open(&st.data_dir).record("block", "server", &format_id(id));
+                }
+                Ok(false) => info!("Block request for {} did not match a computer", format_id(id)),
+                Err(e) => warn!("could not block {}: {e}", format_id(id)),
+            }
+        }
+        for id in &unblocks {
+            match st.registry.unblock(id) {
+                Ok(true) => {
+                    info!("Unblocked {}", format_id(id));
+                    crate::audit::AuditLog::open(&st.data_dir).record("unblock", "server", &format_id(id));
+                }
+                Ok(false) => info!("Unblock request for {} did not match a blocked computer", format_id(id)),
+                Err(e) => warn!("could not unblock {}: {e}", format_id(id)),
             }
         }
         for target in &groups {
@@ -1357,6 +1437,7 @@ mod tests {
             host_id: None,
             proto: 0,
             access_token: String::new(),
+            close: Arc::new(Notify::new()),
         };
         (conn, rx)
     }

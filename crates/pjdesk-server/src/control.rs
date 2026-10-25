@@ -54,6 +54,9 @@ pub struct Request {
     /// Handle returned when sign-in needs a choice. Not a secret.
     #[serde(default)]
     pub pending: String,
+    /// Computer to block or unblock. A nine-digit PJDesk ID.
+    #[serde(default)]
+    pub device_id: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -203,6 +206,8 @@ pub fn execute(data_dir: &Path, req: &Request, actor: &str) -> Response {
         "set_require" => set_require(data_dir, req),
         "set_address" => set_address(data_dir, req),
         "set_watch" => set_watch(data_dir, req),
+        "block" => block_computer(data_dir, &req.device_id),
+        "unblock" => unblock_computer(data_dir, &req.device_id),
         "restart" => schedule_restart(),
         _ => fail("That command was not understood."),
     };
@@ -423,6 +428,23 @@ fn schedule_restart() -> Response {
     #[cfg(not(windows))]
     {
         fail("Restarting the service is only available on Windows.")
+    }
+}
+
+fn block_computer(data_dir: &Path, id: &str) -> Response {
+    match crate::requests::block_device(data_dir, id.trim()) {
+        Ok(()) => ok(format!(
+            "Removed {}. It is disconnected and cannot register again until it is unblocked.",
+            pjdesk_proto::format_id(id.trim())
+        )),
+        Err(e) => fail(format!("Could not remove that computer: {e}")),
+    }
+}
+
+fn unblock_computer(data_dir: &Path, id: &str) -> Response {
+    match crate::requests::unblock_device(data_dir, id.trim()) {
+        Ok(()) => ok(format!("{} can register again.", pjdesk_proto::format_id(id.trim()))),
+        Err(e) => fail(format!("Could not unblock that computer: {e}")),
     }
 }
 

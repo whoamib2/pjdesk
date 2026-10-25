@@ -112,6 +112,12 @@ enum Command {
     /// Forget a device (used by the window when it isn't elevated).
     #[command(hide = true)]
     ForgetDevice { id: String },
+    /// Remove a computer and block it from registering again.
+    #[command(hide = true)]
+    BlockDevice { id: String },
+    /// Let a blocked computer register again.
+    #[command(hide = true)]
+    UnblockDevice { id: String },
     /// Manage user accounts (sign-in for the address book and saved logins).
     #[command(subcommand)]
     Account(AccountCommand),
@@ -317,6 +323,14 @@ fn main() -> Result<()> {
         Some(Command::ForgetDevice { id }) => {
             std::fs::create_dir_all(&data_dir)?;
             requests::forget_device(&data_dir, &id)
+        }
+        Some(Command::BlockDevice { id }) => {
+            std::fs::create_dir_all(&data_dir)?;
+            requests::block_device(&data_dir, &id)
+        }
+        Some(Command::UnblockDevice { id }) => {
+            std::fs::create_dir_all(&data_dir)?;
+            requests::unblock_device(&data_dir, &id)
         }
         Some(Command::Account(cmd)) => account_command(cmd, &data_dir),
         Some(Command::Cloud(cmd)) => cloud_command(cmd, &data_dir),
