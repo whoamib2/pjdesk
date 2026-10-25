@@ -773,10 +773,9 @@ fn confirm_password(api: &str, email: &str, password: &str) -> Result<[u8; 32], 
     let url = format!("{}/api/login", api.trim_end_matches('/'));
     let text = match crate::cloud::agent().post(&url).set("content-type", "application/json").send_string(&body) {
         Ok(resp) => resp.into_string().map_err(|e| e.to_string())?,
-        Err(ureq::Error::Status(401, _)) => return Err("Wrong email or password.".into()),
         Err(ureq::Error::Status(code, resp)) => {
-            let msg = resp.into_string().unwrap_or_default();
-            return Err(if msg.is_empty() { format!("PJDesk Cloud error (HTTP {code})") } else { msg });
+            let text = resp.into_string().unwrap_or_default();
+            return Err(crate::cloud::cloud_error_text(code, &text));
         }
         Err(ureq::Error::Transport(err)) => return Err(format!("Could not reach pjdesk.com. {err}")),
     };

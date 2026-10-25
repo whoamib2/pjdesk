@@ -144,11 +144,7 @@ pub fn sign_in(api: &str, email: &str, password: &str) -> Result<CloudConfig> {
     }
     let api = api.trim().trim_end_matches('/').to_string();
     let keys = derive_account_keys(&email, password);
-    let body = serde_json::json!({
-        "email": email,
-        "auth_key": hex::encode(keys.auth),
-        "device": format!("PJDesk Server on {}", hostname()),
-    });
+    let body = login_body(&email, &hex::encode(keys.auth), &format!("PJDesk Server on {}", hostname()));
     #[derive(Deserialize)]
     struct LoginReply {
         token: String,
@@ -161,7 +157,10 @@ pub fn sign_in(api: &str, email: &str, password: &str) -> Result<CloudConfig> {
         .send_string(&body.to_string())
     {
         Ok(resp) => serde_json::from_str(&resp.into_string()?).context("unexpected reply from PJDesk Cloud")?,
-        Err(ureq::Error::Status(401, _)) => bail!("wrong email or password"),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            bail!("{}", cloud_error_text(code, &text))
+        }
         Err(e) => return Err(api_error(&api, &email, e)),
     };
     let cfg = CloudConfig {
@@ -603,6 +602,56 @@ use std::io::Read as _;
 
 // ---------------------------------------------------------------------------
 // PJDesk Cloud client
+
+/// POST /api/login body. pjdesk.com expects `auth_key`, the hex HMAC derived
+/// from the password. A `password` field is rejected with
+/// "Enter your email and password."
+pub fn login_body(email: &str, auth_key_hex: &str, device: &str) -> serde_json::Value {
+    serde_json::json!({
+        "email": email,
+        "auth_key": auth_key_hex,
+        "device": device,
+    })
+}
+
+/// The `error` string from a PJDesk Cloud HTTP response, unchanged.
+/// A 400 from login is "Enter your email and password." A 401 is
+/// "Wrong email or password."
+pub fn cloud_error_text(status: u16, body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(msg) = v.get("error").and_then(|m| m.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            return msg.to_string();
+        }
+    }
+    if status == 401 {
+        "Wrong email or password.".into()
+    } else if body.trim().is_empty() {
+        format!("PJDesk Cloud error (HTTP {status})")
+    } else {
+        body.trim().to_string()
+    }
+}
+
+/// Email stored in `cloud-sync.json`, when that file is an account sign-in.
+/// The token stays in the file. Callers that show this to the window must not
+/// copy the token out with it.
+pub fn saved_account_email(data_dir: &Path) -> String {
+    let Ok(bytes) = std::fs::read(data_dir.join(CONFIG_FILE)) else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return String::new();
+    };
+    if value.get("mode").and_then(|m| m.as_str()) == Some("r2") {
+        return String::new();
+    }
+    let email = value.get("email").and_then(|e| e.as_str()).unwrap_or("").trim();
+    let token = value.get("token").and_then(|t| t.as_str()).unwrap_or("").trim();
+    if email.is_empty() || token.is_empty() {
+        return String::new();
+    }
+    email.to_string()
+}
 
 /// A readable error from PJDesk Cloud.
 fn api_error(api: &str, email: &str, e: ureq::Error) -> anyhow::Error {
@@ -1144,7 +1193,12 @@ pub fn status_is_fresh(data_dir: &Path) -> bool {
 /// promote or demote, and a newer cloud epoch, override it.
 pub fn sync_once(data_dir: &Path, role: Role, force_push: bool) -> bool {
     let Some(cfg) = CloudConfig::load(data_dir) else {
-        let _ = std::fs::remove_file(data_dir.join(STATUS_FILE));
+        // Sign-out removes the file. An upgrade, a reinstall, and a bad read
+        // leave it in place. Do not clear the status the window uses to show
+        // the account while that file is still there.
+        if !data_dir.join(CONFIG_FILE).exists() {
+            let _ = std::fs::remove_file(data_dir.join(STATUS_FILE));
+        }
         return false;
     };
     let mut applied = false;
@@ -2356,6 +2410,59 @@ mod tests {
              SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
              Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
         );
+    }
+
+    #[test]
+    fn login_posts_auth_key_and_keeps_the_worker_error() {
+        let body = login_body("ben@spader.us", &"ab".repeat(32), "PJDesk Server on BenLenovoDesk");
+        assert!(body.get("password").is_none());
+        assert_eq!(body["email"], "ben@spader.us");
+        assert_eq!(body["auth_key"].as_str().unwrap().len(), 64);
+        assert!(body["device"].as_str().unwrap().starts_with("PJDesk Server"));
+        assert!(!body.to_string().contains("password"));
+        assert_eq!(
+            cloud_error_text(400, r#"{"error":"Enter your email and password."}"#),
+            "Enter your email and password."
+        );
+        assert_eq!(
+            cloud_error_text(401, r#"{"error":"Wrong email or password."}"#),
+            "Wrong email or password."
+        );
+    }
+
+    #[test]
+    fn a_failed_read_does_not_clear_the_saved_sign_in() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-keep-account-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(CONFIG_FILE), b"{not-json").unwrap();
+        std::fs::write(dir.join(STATUS_FILE), br#"{"enabled":true,"account":"ben@spader.us"}"#).unwrap();
+        assert!(!sync_once(&dir, Role::Standby, false));
+        assert!(dir.join(CONFIG_FILE).exists());
+        let status = std::fs::read_to_string(dir.join(STATUS_FILE)).unwrap();
+        assert!(status.contains("ben@spader.us"), "{status}");
+        assert_eq!(saved_account_email(&dir), "");
+        std::fs::write(
+            dir.join(CONFIG_FILE),
+            r#"{"mode":"account","email":"ben@spader.us","token":"SECRETTOKENVALUE1234567890"}"#,
+        )
+        .unwrap();
+        assert_eq!(saved_account_email(&dir), "ben@spader.us");
+        let _ = std::fs::remove_file(dir.join(CONFIG_FILE));
+        assert!(sync_once(&dir, Role::Standby, false) == false);
+        assert!(!dir.join(STATUS_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upgrade_code_does_not_sign_the_server_out() {
+        let handoff = include_str!("handoff.rs");
+        let update = include_str!("self_update.rs");
+        let service = include_str!("service.rs");
+        for (name, src) in [("handoff", handoff), ("update", update), ("service", service)] {
+            assert!(!src.contains("turn_off"), "{name} clears cloud sync");
+            assert!(!src.contains("sign_out"), "{name} signs out");
+        }
     }
 
     #[test]

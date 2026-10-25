@@ -193,10 +193,11 @@ impl Snapshot {
         }
         let status = CloudStatus::load(dir);
         let config_exists = dir.join(cloud::CONFIG_FILE).exists();
+        let saved_email = cloud::saved_account_email(dir);
         if let Some(s) = status {
             snap.cloud_known = true;
             snap.cloud_on = s.enabled || config_exists;
-            snap.account = s.account;
+            snap.account = if s.account.trim().is_empty() { saved_email.clone() } else { s.account };
             snap.role = s.role;
             snap.epoch = s.epoch;
             snap.active_name = s.active_name;
@@ -210,7 +211,12 @@ impl Snapshot {
             snap.peer_role = s.peer_role;
         } else if !dir.join(cloud::STATUS_FILE).exists() {
             snap.cloud_known = true;
-            snap.cloud_on = config_exists;
+            snap.cloud_on = config_exists || !saved_email.is_empty();
+            snap.account = saved_email;
+        } else if !saved_email.is_empty() {
+            snap.cloud_known = true;
+            snap.cloud_on = true;
+            snap.account = saved_email;
         }
         snap.devices = listed_devices(dir);
         snap.blocked = listed_blocked(dir);
@@ -486,6 +492,25 @@ mod tests {
         assert!(!json.contains("SUPERSECRETKEY"));
         assert!(!json.contains("BEGIN"));
         assert!(!json.contains(&key_pem));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_saved_account_shows_when_status_was_cleared() {
+        let dir = dir("account-kept");
+        std::fs::write(
+            dir.join("cloud-sync.json"),
+            r#"{"mode":"account","email":"ben@spader.us","token":"SECRETTOKENVALUE1234567890"}"#,
+        )
+        .unwrap();
+        let snap = Snapshot::from_disk(&dir, 21200, true);
+        assert_eq!(snap.account, "ben@spader.us");
+        assert!(snap.cloud_on);
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("SECRETTOKEN"), "{json}");
+        std::fs::write(dir.join("cloud-status.json"), b"not json").unwrap();
+        let snap = Snapshot::from_disk(&dir, 21200, true);
+        assert_eq!(snap.account, "ben@spader.us");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

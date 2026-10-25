@@ -220,6 +220,8 @@ struct CloudForm {
     acct_email: String,
     acct_password: String,
     show_acct_password: bool,
+    /// Last sign-in failure, shown on the account card. No password or token.
+    sign_error: String,
     /// Signed in, waiting for the user to choose backup vs. replace.
     pending: Option<crate::cloud::CloudConfig>,
     /// Sign-in held by the service until this window chooses join or replace.
@@ -1556,14 +1558,17 @@ impl App {
         let choosing_bucket = self.cloud_form.own_bucket;
         card(ui, |ui| {
             heading(ui, "PJDESK ACCOUNT");
-            if !readable && !self.control_ready {
-                if email.is_empty() {
-                    ui.label("Not signed in.");
-                } else {
-                    ui.label(RichText::new(format!("Signed in as {email}")).strong().size(18.0).color(p(ui).text));
-                    if !role_line.is_empty() {
-                        ui.label(&role_line);
-                    }
+            if !readable && email.is_empty() && self.waiting_for_service() {
+                ui.horizontal(|ui| {
+                    ui_widgets::spinner(ui, p(ui).accent);
+                    ui.label("Reading the saved sign-in from the service…");
+                });
+                return;
+            }
+            if !readable && !self.control_ready && !email.is_empty() {
+                ui.label(RichText::new(format!("Signed in as {email}")).strong().size(18.0).color(p(ui).text));
+                if !role_line.is_empty() {
+                    ui.label(&role_line);
                 }
                 ui.add_space(4.0);
                 ui.label(
@@ -1646,7 +1651,8 @@ impl App {
             );
             ui.add_space(6.0);
             let online = self.online.len();
-            ui.add_enabled_ui(can_act && !busy, |ui| {
+            let sign_error = self.cloud_form.sign_error.clone();
+            ui.add_enabled_ui(!busy, |ui| {
                 let f = &mut self.cloud_form;
                 if let Some((from, written_at, readable_copy)) = f.ask.clone() {
                     if readable_copy {
@@ -1713,12 +1719,9 @@ impl App {
                     }
                 }
             });
-            if !can_act {
-                ui.label(
-                    RichText::new("Restart as administrator to sign in. Windows protects the data folder. There is no separate PJDesk password.")
-                        .color(p(ui).muted)
-                        .size(12.0),
-                );
+            if !sign_error.is_empty() {
+                ui.add_space(4.0);
+                ui.colored_label(p(ui).warn, &sign_error);
             }
             if busy {
                 ui.horizontal(|ui| {
@@ -2085,24 +2088,31 @@ impl App {
             CloudAct::SignIn => {
                 let email = self.cloud_form.acct_email.trim().to_string();
                 let password = std::mem::take(&mut self.cloud_form.acct_password);
+                self.cloud_form.sign_error.clear();
                 if email.is_empty() || password.is_empty() {
-                    self.status = "Enter your PJDesk account email and password.".into();
+                    let who = if email.is_empty() { "(no email)".to_string() } else { email.clone() };
+                    tracing::info!("sign-in: {who}: not sent (email or password empty)");
+                    let msg = "Enter your PJDesk account email and password.".to_string();
+                    self.cloud_form.sign_error = msg.clone();
+                    self.status = msg;
+                    if email.is_empty() {
+                        self.cloud_form.acct_password = password;
+                    }
                     return;
                 }
-                if self.via_service() {
-                    self.spawn_cloud_job(move || {
-                        service_job(crate::control::Request {
-                            cmd: "sign_in".into(),
-                            email,
-                            password,
-                            ..Default::default()
-                        })
-                    });
+                tracing::info!("sign-in: {email}: starting");
+                self.status = format!("Signing in as {email}…");
+                if !self.can_write {
+                    self.spawn_cloud_job(move || sign_in_through_service(email, password));
                     return;
                 }
                 self.spawn_cloud_job(move || {
-                    let cfg = cloud::sign_in(&cloud::default_api(), &email, &password)?;
-                    finish_account(&dir, cfg, online, None)
+                    let outcome = (|| {
+                        let cfg = cloud::sign_in(&cloud::default_api(), &email, &password)?;
+                        finish_account(&dir, cfg, online, None)
+                    })();
+                    log_sign_in_outcome(&email, &outcome);
+                    outcome
                 });
             }
             CloudAct::Choose(choice) => {
@@ -2114,12 +2124,28 @@ impl App {
                         crate::cloud::Choice::Replace => "replace",
                     };
                     self.spawn_cloud_job(move || {
-                        service_job(crate::control::Request {
-                            cmd: "sign_in_choose".into(),
-                            pending,
-                            choice: choice.into(),
-                            ..Default::default()
-                        })
+                        let outcome = match crate::control::call_for(
+                            &crate::control::Request {
+                                cmd: "sign_in_choose".into(),
+                                pending,
+                                choice: choice.into(),
+                                ..Default::default()
+                            },
+                            crate::control::SIGN_IN_WAIT,
+                        ) {
+                            Some(response) if response.ok => Ok(JobDone::Message(response.message)),
+                            Some(response) if response.code == "timeout" || response.message.trim().is_empty() => {
+                                Err(anyhow::anyhow!("The PJDesk service did not answer. Sign-in was not finished."))
+                            }
+                            Some(response) => Err(anyhow::anyhow!(response.message)),
+                            None => Err(anyhow::anyhow!("The PJDesk service did not answer. Sign-in was not finished.")),
+                        };
+                        match &outcome {
+                            Ok(JobDone::Message(msg)) => tracing::info!("sign-in: choice: {msg}"),
+                            Err(err) => tracing::info!("sign-in: choice failed: {err:#}"),
+                            _ => {}
+                        }
+                        outcome
                     });
                     return;
                 }
@@ -2309,6 +2335,7 @@ impl App {
             Ok(JobDone::Message(msg)) => {
                 self.status = msg;
                 let f = &mut self.cloud_form;
+                f.sign_error.clear();
                 f.secret.clear();
                 f.code.clear();
                 f.acct_password.clear();
@@ -2327,7 +2354,10 @@ impl App {
                 self.cloud_form.ask = Some((from, written_at, readable));
                 self.status = "Choose which copy to keep.".into();
             }
-            Err(e) => self.status = e,
+            Err(e) => {
+                self.cloud_form.sign_error = e.clone();
+                self.status = e;
+            }
         }
     }
 
@@ -3602,6 +3632,46 @@ impl App {
             );
         });
     }
+}
+
+fn log_sign_in_outcome(email: &str, outcome: &anyhow::Result<JobDone>) {
+    match outcome {
+        Ok(JobDone::Message(msg)) => tracing::info!("sign-in: {email}: {msg}"),
+        Ok(JobDone::Ask { .. } | JobDone::ServiceAsk { .. }) => {
+            tracing::info!("sign-in: {email}: choose which copy to keep")
+        }
+        Ok(_) => tracing::info!("sign-in: {email}: finished"),
+        Err(err) => tracing::info!("sign-in: {email}: {err:#}"),
+    }
+}
+
+/// Asks the service to sign in. The password goes to the service and is not logged.
+/// The window log records the email and the result text only.
+fn sign_in_through_service(email: String, password: String) -> anyhow::Result<JobDone> {
+    let outcome = match crate::control::call_for(
+        &crate::control::Request {
+            cmd: "sign_in".into(),
+            email: email.clone(),
+            password,
+            ..Default::default()
+        },
+        crate::control::SIGN_IN_WAIT,
+    ) {
+        Some(response) if response.code == "ask" => Ok(JobDone::ServiceAsk {
+            pending: response.pending,
+            from: response.from,
+            written_at: response.written_at,
+            readable: response.readable,
+        }),
+        Some(response) if response.ok => Ok(JobDone::Message(response.message)),
+        Some(response) if response.code == "timeout" || response.message.trim().is_empty() => {
+            Err(anyhow::anyhow!("The PJDesk service did not answer. Sign-in was not finished."))
+        }
+        Some(response) => Err(anyhow::anyhow!(response.message)),
+        None => Err(anyhow::anyhow!("The PJDesk service did not answer. Sign-in was not finished.")),
+    };
+    log_sign_in_outcome(&email, &outcome);
+    outcome
 }
 
 fn service_job(req: crate::control::Request) -> anyhow::Result<JobDone> {

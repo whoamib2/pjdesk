@@ -8,7 +8,10 @@
 //! the command only when the caller is an administrator (including a UAC-filtered
 //! token, checked through the linked token) or the request carries a valid
 //! pjdesk.com access token for the account this server is signed in to.
-//! Every command is written to the audit log. Passwords and tokens are not.
+//! Sign-in is the exception: the interactive window may sign in without elevation
+//! and without an existing token, because that is how the token is created.
+//! The password is checked by pjdesk.com. Every command is written to the audit
+//! log. Passwords and tokens are not.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -241,13 +244,25 @@ fn sign_in(data_dir: &Path, req: &Request) -> Response {
     let email = req.email.trim().to_string();
     let password = req.password.clone();
     if email.is_empty() || password.is_empty() {
+        tracing::info!("sign-in: not sent (email or password empty)");
         return fail("Enter your PJDesk account email and password.");
     }
+    tracing::info!("sign-in: attempt for {email}");
     let cfg = match crate::cloud::sign_in(&crate::cloud::default_api(), &email, &password) {
         Ok(cfg) => cfg,
-        Err(e) => return fail(format!("{e:#}")),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::info!("sign-in: failed for {email}: {msg}");
+            return fail(msg);
+        }
     };
-    finish_sign_in(data_dir, cfg, None)
+    let response = finish_sign_in(data_dir, cfg, None);
+    if response.ok {
+        tracing::info!("sign-in: ok for {email}: {}", response.message);
+    } else {
+        tracing::info!("sign-in: failed for {email}: {}", response.message);
+    }
+    response
 }
 
 fn sign_in_choose(data_dir: &Path, req: &Request) -> Response {
@@ -506,16 +521,23 @@ fn online_count(data_dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Sign-in does not need an existing token. The interactive window uses it to
+/// create one. Other commands stay limited to an administrator or that token.
+pub fn interactive_sign_in(cmd: &str) -> bool {
+    matches!(cmd.trim(), "sign_in" | "sign_in_choose" | "sign_in_cancel")
+}
+
 /// Applies a request after the pipe has checked the caller.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn execute_authorized(data_dir: &Path, req: &Request, windows_ok: bool, actor: &str) -> Response {
-    if req.cmd.trim() == "ping" && !windows_ok && req.account_token.trim().is_empty() {
+    let cmd = req.cmd.trim();
+    if cmd == "ping" && !windows_ok && req.account_token.trim().is_empty() {
         audit_throttled(data_dir, actor, "ping denied: caller is not an administrator");
         return fail("Not allowed.");
     }
     let account_ok = !windows_ok && account_token_ok(data_dir, &req.account_token);
-    if !windows_ok && !account_ok {
-        audit(data_dir, actor, &format!("{} denied: caller is not an administrator", req.cmd.trim()));
+    if !windows_ok && !account_ok && !interactive_sign_in(cmd) {
+        audit(data_dir, actor, &format!("{cmd} denied: caller is not an administrator"));
         return fail(
             "This Windows user cannot manage the server. An administrator can, and so can the pjdesk.com account this server is signed in to.",
         );
@@ -741,6 +763,10 @@ fn token_label(token: windows::Win32::Foundation::HANDLE) -> String {
 /// How long the window waits for the service. A stuck pipe must not leave Remove spinning.
 const CALL_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Sign-in derives the auth key (PBKDF2) and then talks to pjdesk.com.
+/// That is longer than a local file change, so it does not use [`CALL_TIMEOUT`].
+pub const SIGN_IN_WAIT: Duration = Duration::from_secs(45);
+
 /// Runs `job` and returns its response. If it is still going when `timeout` elapses,
 /// returns a failed response with `code` `timeout`. `None` from `job` is preserved
 /// (the service is not listening).
@@ -767,14 +793,19 @@ pub(crate) fn finish_within(
 /// One round trip. `None` when the service is not listening.
 /// A response with `code` `timeout` means the pipe was asked and did not finish.
 pub fn call(req: &Request) -> Option<Response> {
+    call_for(req, CALL_TIMEOUT)
+}
+
+/// Same as [`call`], with the caller's deadline. Sign-in uses [`SIGN_IN_WAIT`].
+pub fn call_for(req: &Request, timeout: Duration) -> Option<Response> {
     #[cfg(windows)]
     {
         let req = req.clone();
-        return finish_within(CALL_TIMEOUT, move || call_pipe(&req));
+        return finish_within(timeout, move || call_pipe(&req));
     }
     #[cfg(not(windows))]
     {
-        let _ = (req, CALL_TIMEOUT);
+        let _ = (req, timeout);
         None
     }
 }
@@ -946,6 +977,45 @@ mod tests {
             "S-1-5-32-545",
         );
         assert!(allowed.ok, "{}", allowed.message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unelevated_sign_in_reaches_the_password_check() {
+        let dir = dir("signin-open");
+        let response = execute_authorized(
+            &dir,
+            &Request {
+                cmd: "sign_in".into(),
+                email: "ben@spader.us".into(),
+                password: String::new(),
+                ..Request::default()
+            },
+            false,
+            "S-1-5-32-545",
+        );
+        assert!(!response.ok);
+        assert_eq!(response.message, "Enter your PJDesk account email and password.");
+        let blocked = execute_authorized(
+            &dir,
+            &Request {
+                cmd: "set_require".into(),
+                require_accounts: Some(true),
+                password: "secret-pass".into(),
+                ..Request::default()
+            },
+            false,
+            "S-1-5-32-545",
+        );
+        assert!(!blocked.ok);
+        assert!(blocked.message.contains("cannot manage"), "{}", blocked.message);
+        assert!(!crate::access::Policy::load(&dir).require_accounts);
+        let log = std::fs::read_to_string(dir.join("audit.log")).unwrap_or_default();
+        assert!(log.contains("sign_in"), "{log}");
+        assert!(!log.contains("secret-pass"), "{log}");
+        assert!(interactive_sign_in("sign_in"));
+        assert!(interactive_sign_in("sign_in_choose"));
+        assert!(!interactive_sign_in("set_require"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -295,6 +295,15 @@ fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(Duration::from_secs(25)).build()
 }
 
+/// POST /api/login body. The website expects `auth_key` (hex), not `password`.
+pub(crate) fn account_login_body(email: &str, auth_key_hex: &str, device: &str) -> serde_json::Value {
+    serde_json::json!({
+        "email": email,
+        "auth_key": auth_key_hex,
+        "device": device,
+    })
+}
+
 fn post_json(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> Result<String> {
     post_api(url, bearer, body).map_err(|fail| anyhow::anyhow!(fail.message))
 }
@@ -377,11 +386,7 @@ pub fn confirm_account_password(email: &str, password: &str) -> Result<[u8; 32]>
     let login: LoginReply = serde_json::from_str(&post_json(
         &format!("{}/api/login", api_base()),
         None,
-        &serde_json::json!({
-            "email": email,
-            "auth_key": hex::encode(auth),
-            "device": "PJDesk PIN check",
-        }),
+        &account_login_body(&email, &hex::encode(auth), "PJDesk PIN check"),
     )?)
     .context("unexpected reply from PJDesk")?;
     let _ = post_json(&format!("{}/api/logout", api_base()), Some(&login.token), &serde_json::json!({}));
@@ -492,11 +497,7 @@ pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) 
     let login: LoginReply = serde_json::from_str(&post_json(
         &format!("{}/api/login", api_base()),
         None,
-        &serde_json::json!({
-            "email": email,
-            "auth_key": hex::encode(auth),
-            "device": format!("PJDesk on {device_name}"),
-        }),
+        &account_login_body(&email, &hex::encode(auth), &format!("PJDesk on {device_name}")),
     )?)
     .context("unexpected reply from PJDesk")?;
     match post_api(
@@ -674,11 +675,7 @@ fn login_token(email: &str, password: &str) -> Result<String> {
     let login: LoginReply = serde_json::from_str(&post_json(
         &format!("{}/api/login", api_base()),
         None,
-        &serde_json::json!({
-            "email": email,
-            "auth_key": hex::encode(auth),
-            "device": "PJDesk",
-        }),
+        &account_login_body(&email, &hex::encode(auth), "PJDesk"),
     )?)
     .context("unexpected reply from PJDesk")?;
     Ok(login.token)
@@ -1345,6 +1342,16 @@ pub fn clear_installer_network_key() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_login_uses_auth_key_not_password() {
+        let body = account_login_body("ben@spader.us", &"ab".repeat(32), "PJDesk on desk");
+        assert!(body.get("password").is_none());
+        assert_eq!(body["email"], "ben@spader.us");
+        assert_eq!(body["auth_key"].as_str().unwrap().len(), 64);
+        assert_eq!(body["device"], "PJDesk on desk");
+        assert!(!body.to_string().contains("password"));
+    }
 
     #[test]
     fn a_transport_error_does_not_count_as_signed_out() {
