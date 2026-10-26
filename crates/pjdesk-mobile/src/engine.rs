@@ -41,7 +41,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.44";
+pub const APP_VERSION: &str = "0.6.45";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -98,6 +98,8 @@ struct State {
     standby: Mutex<String>,
     /// This phone's public IP from pjdesk.com, used to decide the LAN path.
     my_public_ip: Mutex<String>,
+    /// Advertised addresses of both servers. Hostnames are dialed last.
+    routes: Mutex<pjdesk_proto::routes::ServerRoutes>,
     fingerprint: Mutex<Option<String>>,
     otp: Mutex<String>,
     /// Temporary 8-digit code for Let someone connect.
@@ -185,6 +187,8 @@ struct Disk {
     secret_hex: String,
     #[serde(default)]
     access_token: String,
+    #[serde(default)]
+    routes: String,
 }
 
 pub struct Engine {
@@ -245,6 +249,7 @@ impl Engine {
             stored.secret_hex = hex::encode(secret);
             save_disk(&dir, &stored);
         }
+        let routes = stored_routes(&stored);
         let state = Arc::new(State {
             dir,
             hostname: if hostname.trim().is_empty() { "Android".into() } else { hostname },
@@ -257,6 +262,7 @@ impl Engine {
             public_ip: Mutex::new(stored.public_ip),
             standby: Mutex::new(stored.standby),
             my_public_ip: Mutex::new(stored.my_public_ip),
+            routes: Mutex::new(routes),
             fingerprint: Mutex::new((!stored.fingerprint.is_empty()).then_some(stored.fingerprint)),
             otp: Mutex::new(generate_password()),
             support_code: Mutex::new(pjdesk_proto::random_digits(8)),
@@ -375,6 +381,7 @@ fn persist(state: &State) {
         device_id: state.device_id.lock().unwrap().clone().unwrap_or_default(),
         secret_hex: String::new(),
         access_token: state.access_token.lock().unwrap().clone(),
+        routes: serde_json::to_string(&*state.routes.lock().unwrap()).unwrap_or_default(),
     };
     // Keep a derived secret out of the file. A random one (no Android id) is rewritten
     // only when it was already stored.
@@ -585,6 +592,7 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 if let Some(ip) = cmd.get("myPublicIp").and_then(|v| v.as_str()) {
                     *state.my_public_ip.lock().unwrap() = ip.trim().to_string();
                 }
+                *state.routes.lock().unwrap() = routes_from_command(&cmd);
                 persist(state);
                 publish(state, cb);
                 log_line(
@@ -971,7 +979,69 @@ fn split_lan(text: &str) -> Vec<String> {
     text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
 }
 
+fn stored_routes(disk: &Disk) -> pjdesk_proto::routes::ServerRoutes {
+    serde_json::from_str(&disk.routes).unwrap_or_else(|_| {
+        pjdesk_proto::routes::ServerRoutes::from_legacy(&disk.server, &split_lan(&disk.lan), &disk.public_ip, &disk.standby, &[], "")
+    })
+}
+
+fn routes_from_command(cmd: &Value) -> pjdesk_proto::routes::ServerRoutes {
+    if let Some(text) = cmd.get("routes").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(parsed) = serde_json::from_str::<pjdesk_proto::routes::ServerRoutes>(text) {
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+    }
+    let address = cmd.get("address").and_then(|v| v.as_str()).unwrap_or("");
+    let lan = cmd
+        .get("lan")
+        .and_then(|v| v.as_array())
+        .map(|list| list.iter().filter_map(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let public_ip = cmd.get("publicIp").and_then(|v| v.as_str()).unwrap_or("");
+    let standby = cmd.get("standby").and_then(|v| v.as_str()).unwrap_or("");
+    let standby_lan = cmd
+        .get("standbyLan")
+        .and_then(|v| v.as_str())
+        .map(split_lan)
+        .or_else(|| {
+            cmd.get("standbyLan").and_then(|v| v.as_array()).map(|list| {
+                list.iter().filter_map(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+            })
+        })
+        .unwrap_or_default();
+    let standby_public = cmd.get("standbyPublicIp").and_then(|v| v.as_str()).unwrap_or("");
+    pjdesk_proto::routes::ServerRoutes::from_legacy(address, &lan, public_ip, standby, &standby_lan, standby_public)
+}
+
+async fn open_ordered(state: &State, cb: &Arc<dyn Callbacks>, pinned: Option<pjdesk_proto::tls::Fingerprint>) -> Result<SignalClient> {
+    let routes = state.routes.lock().unwrap().clone();
+    let saved = state.server.lock().unwrap().clone();
+    let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
+    let targets = pjdesk_proto::routes::dial_targets(&routes, &mine, &saved);
+    if targets.is_empty() {
+        bail!("This phone has no server address yet. Sign in again, or set the server in Settings.");
+    }
+    let mut last = None;
+    for target in &targets {
+        log_line(cb, format!("dialing {target}"));
+        match SignalClient::connect_endpoint(target, pinned, pjdesk_proto::routes::dial_budget(target)).await {
+            Ok(signal) => {
+                log_line(cb, format!("signaling via {} {} (TCP 21200)", signal.via, signal.server_addr));
+                return Ok(signal);
+            }
+            Err(err) => {
+                log_line(cb, format!("dial {target} failed: {err:#}"));
+                last = Some(err);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("could not reach the primary or the standby")))
+}
+
 /// TCP 21200 to the account's LAN address and the public address, the same race Windows uses.
+#[allow(dead_code)]
 async fn open_signal(
     state: &State,
     cb: &Arc<dyn Callbacks>,
@@ -1094,7 +1164,15 @@ async fn host_loop(state: Arc<State>, cb: Arc<dyn Callbacks>) {
                     };
                     log_line(&cb, format!("failover: {} {next}", hop.log));
                 }
-                emit(&cb, &json!({"event":"status","text": head}));
+                let shown = if matches!(
+                    kind,
+                    pjdesk_proto::failover::RegFail::Unreachable | pjdesk_proto::failover::RegFail::StillStandby
+                ) {
+                    "Reconnecting"
+                } else {
+                    head
+                };
+                emit(&cb, &json!({"event":"status","text": shown}));
                 use_standby = hop.use_standby;
                 public_only = hop.use_standby || kind == pjdesk_proto::failover::RegFail::StillStandby;
                 wait = hop.delay;
@@ -1117,23 +1195,12 @@ async fn host_loop(state: Arc<State>, cb: Arc<dyn Callbacks>) {
 }
 
 async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool, use_standby: bool) -> Result<PhoneHost> {
-    let primary = state.server.lock().unwrap().clone();
-    let standby = state.standby.lock().unwrap().clone();
-    let server_text = if use_standby && !standby.trim().is_empty() { standby } else { primary };
-    if server_text.trim().is_empty() {
-        emit(&cb, &json!({"event":"status","text":"Sign in required"}));
-        bail!("Sign in required");
-    }
-    let server = ServerAddr::parse(&server_text)?;
-    log_line(
-        &cb,
-        format!(
-            "registration target (phone): {server}, {}",
-            if public_only { "public address only" } else { "LAN or public" }
-        ),
-    );
+    let _ = (public_only, use_standby);
     let pinned = state.fingerprint.lock().unwrap().clone().and_then(|s| pjdesk_proto::tls::parse_fingerprint(&s).ok());
-    let mut signal = open_signal(&state, &cb, &server, pinned, public_only).await?;
+    let mut signal = open_ordered(&state, &cb, pinned).await?;
+    let server = signal.server_addr.to_string();
+    log_line(&cb, format!("registration target (phone): {server}"));
+    let mut redirected = false;
     if let Some(fp) = signal.observed {
         let text = pjdesk_proto::tls::format_fingerprint(&fp);
         *state.fingerprint.lock().unwrap() = Some(text);
@@ -1301,7 +1368,47 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                             routes.remove(&session_id);
                         }
                     }
+                    ServerMsg::Routes(routes) => {
+                        if !routes.is_empty() {
+                            *state.routes.lock().unwrap() = routes;
+                            persist(&state);
+                        }
+                    }
                     ServerMsg::Error { message, .. } => {
+                        if !redirected && pjdesk_proto::signal::is_standby_refusal(&message) {
+                            redirected = true;
+                            if let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) {
+                                if !routes.is_empty() {
+                                    *state.routes.lock().unwrap() = routes;
+                                    persist(&state);
+                                }
+                                if !addr.is_empty() {
+                                    log_line(&cb, format!("standby redirected registration to {addr}"));
+                                    signal = SignalClient::connect_endpoint(&addr, pinned, pjdesk_proto::routes::dial_budget(&addr)).await?;
+                                    if presented {
+                                        let token = if keyed {
+                                            state.access_key.lock().unwrap().trim().to_string()
+                                        } else {
+                                            state.access_token.lock().unwrap().clone()
+                                        };
+                                        if !token.is_empty() {
+                                            let _ = signal.send(ClientMsg::PresentAccess { token });
+                                        }
+                                    }
+                                    signal.send(ClientMsg::Register {
+                                        proto: PROTOCOL_VERSION,
+                                        device_id: state.device_id.lock().unwrap().clone().filter(|id| is_valid_id(id)),
+                                        device_secret: state.secret,
+                                        hostname: {
+                                            let reported = state.facts.lock().unwrap().hostname.clone();
+                                            if reported.trim().is_empty() { state.hostname.clone() } else { reported }
+                                        },
+                                        app_version: APP_VERSION.into(),
+                                    })?;
+                                    continue;
+                                }
+                            }
+                        }
                         if pjdesk_proto::signal::is_standby_refusal(&message) {
                             let key = state.fingerprint.lock().unwrap().clone().unwrap_or_default();
                             let key = pjdesk_proto::discover::fingerprint_prefix(&key);
@@ -2255,13 +2362,10 @@ async fn controller_session(
     *state.end_reason.lock().unwrap() = String::new();
     let primary = state.server.lock().unwrap().clone();
     let standby = state.standby.lock().unwrap().clone();
-    let server_text = if prefer_standby && !standby.trim().is_empty() { standby } else { primary };
-    if server_text.trim().is_empty() {
-        bail!("This phone has no server address yet. Sign in again, or set the server in Settings.");
-    }
-    let server = ServerAddr::parse(&server_text)?;
+    let _ = (primary, standby, prefer_standby);
     let pinned = state.fingerprint.lock().unwrap().clone().and_then(|s| pjdesk_proto::tls::parse_fingerprint(&s).ok());
-    let mut signal = open_signal(&state, &cb, &server, pinned, false).await?;
+    let mut signal = open_ordered(&state, &cb, pinned).await?;
+    let mut followed_redirect = false;
     if let Some(fp) = signal.observed {
         *state.fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         persist(&state);
@@ -2269,7 +2373,7 @@ async fn controller_session(
     let key = state.access_key.lock().unwrap().trim().to_string();
     let access = if !key.is_empty() { key } else { state.access_token.lock().unwrap().clone() };
     if !access.is_empty() {
-        let _ = signal.send(ClientMsg::PresentAccess { token: access });
+        let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
     }
     let label = presenter(&state);
     signal.send(ClientMsg::Connect {
@@ -2285,6 +2389,32 @@ async fn controller_session(
             Ok(Some(ServerMsg::SessionReady { session_id, token, udp_port, host_name })) => {
                 log_line(&cb, format!("the other computer accepted, session {session_id:x}"));
                 break (session_id, token, udp_port, host_name);
+            }
+            Ok(Some(ServerMsg::Error { message, .. }))
+                if !followed_redirect && pjdesk_proto::signal::is_standby_refusal(&message) =>
+            {
+                followed_redirect = true;
+                let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) else {
+                    bail!("{message}");
+                };
+                if !routes.is_empty() {
+                    *state.routes.lock().unwrap() = routes;
+                    persist(&state);
+                }
+                if addr.is_empty() {
+                    bail!("{message}");
+                }
+                log_line(&cb, format!("standby redirected the session to {addr}"));
+                signal = SignalClient::connect_endpoint(&addr, pinned, pjdesk_proto::routes::dial_budget(&addr)).await?;
+                if !access.is_empty() {
+                    let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
+                }
+                signal.send(ClientMsg::Connect {
+                    proto: PROTOCOL_VERSION,
+                    target_id: target.into(),
+                    controller_name: label.clone(),
+                })?;
+                continue;
             }
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
             Ok(Some(_)) => continue,
@@ -2927,6 +3057,7 @@ mod tests {
             public_ip: Mutex::new(String::new()),
             standby: Mutex::new(String::new()),
             my_public_ip: Mutex::new(String::new()),
+            routes: Mutex::new(pjdesk_proto::routes::ServerRoutes::default()),
             fingerprint: Mutex::new(None),
             otp: Mutex::new(generate_password()),
             support_code: Mutex::new(pjdesk_proto::random_digits(8)),

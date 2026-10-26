@@ -17,6 +17,7 @@
 pub mod access;
 pub mod applock;
 pub mod failover;
+pub mod routes;
 pub mod netkey;
 pub mod vault;
 pub mod auth;

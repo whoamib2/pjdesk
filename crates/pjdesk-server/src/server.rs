@@ -788,10 +788,10 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         ClientMsg::Register { proto, device_id, device_secret, hostname, app_version } => {
             if !crate::cloud::accepts_host_registrations(&st.data_dir) {
                 info!(
-                    "Refused host registration from {}: this server is the standby and is not the live table",
+                    "Redirecting host registration from {}: this server is the standby and is not the live table",
                     conn.addr
                 );
-                conn.error(ErrorCode::Unauthorized, pjdesk_proto::signal::STANDBY_REGISTRATION);
+                conn.error(ErrorCode::Unauthorized, crate::cloud::redirect_text(&st.data_dir));
                 return;
             }
             let admitted = match gate(st, conn) {
@@ -880,6 +880,9 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                         format_id(&id),
                         conn.addr.ip()
                     );
+                    if pjdesk_proto::update::version_at_least(&app_version, "0.6.45") {
+                        conn.send(ServerMsg::Routes(crate::cloud::advertised_routes(&st.data_dir)));
+                    }
                     // One record per computer: drop its old, offline records.
                     let online: HashSet<String> = st.online.keys().cloned().collect();
                     let removed = st.registry.remove_stale_duplicates(&id, &online);
@@ -900,8 +903,8 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
 
         ClientMsg::Connect { proto, target_id, controller_name } => {
             if !crate::cloud::accepts_host_registrations(&st.data_dir) {
-                info!("Refused a connection from {}: this server is the standby and is not the live table", conn.addr);
-                conn.error(ErrorCode::Unauthorized, pjdesk_proto::signal::STANDBY_REGISTRATION);
+                info!("Redirecting a connection from {}: this server is the standby and is not the live table", conn.addr);
+                conn.error(ErrorCode::Unauthorized, crate::cloud::redirect_text(&st.data_dir));
                 return;
             }
             // Before any ID lookup, so a refused peer learns nothing about the target.
@@ -1474,6 +1477,7 @@ async fn failover_watch(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
     let mut tick = tokio::time::interval(Duration::from_secs(pjdesk_proto::failover::BEAT_SECS));
     let mut misses = 0u32;
     let mut last_log = String::new();
+    let mut routes_gen = 0u64;
     loop {
         tick.tick().await;
         let dir = data_dir.clone();
@@ -1516,6 +1520,19 @@ async fn failover_watch(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
                 release_hosts_for_failover(&state);
                 reload_from_disk(&state, &acceptor, &data_dir);
             }
+        }
+        if let Some(routes) = crate::cloud::take_routes_push(&data_dir, &mut routes_gen) {
+            push_routes(&state, &routes);
+        }
+    }
+}
+
+fn push_routes(state: &Shared, routes: &pjdesk_proto::routes::ServerRoutes) {
+    let guard = state.lock().unwrap();
+    let msg = ServerMsg::Routes(routes.clone());
+    for host in guard.online.values() {
+        if host.proto >= 3 && pjdesk_proto::update::version_at_least(&host.app_version, "0.6.45") {
+            let _ = host.tx.send(msg.clone());
         }
     }
 }

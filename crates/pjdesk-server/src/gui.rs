@@ -2735,6 +2735,18 @@ impl App {
             if !ip_line.is_empty() {
                 ui.label(RichText::new(&ip_line).color(p(ui).muted).size(12.0));
             }
+            if let Some(live) = &live {
+                if !live.address_warn.is_empty() {
+                    ui.label(
+                        RichText::new(&live.address_warn)
+                            .color(egui::Color32::from_rgb(0xb5, 0x86, 0x0b))
+                            .size(13.0),
+                    );
+                }
+                if !live.routes_line.is_empty() {
+                    ui.label(RichText::new(&live.routes_line).color(p(ui).muted).size(12.0));
+                }
+            }
             if hostname {
                 ui.label(
                     RichText::new("This address is a hostname, so a public IP change does not replace it.")

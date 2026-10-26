@@ -117,6 +117,9 @@ pub struct Config {
     /// The active server's observed public IP, without a port. Empty until it publishes one.
     #[serde(default)]
     pub network_public_ip: String,
+    /// Public and LAN addresses of both servers. Hostnames are listed separately.
+    #[serde(default)]
+    pub network_routes: pjdesk_proto::routes::ServerRoutes,
     /// LAN address that completed a handshake on this network, keyed by the local IPv4 (`ip:10.0.0.8`).
     #[serde(default)]
     pub lan_path_cache: BTreeMap<String, String>,
@@ -559,6 +562,7 @@ impl Config {
             writing.network_standby_fingerprint = disk.network_standby_fingerprint;
             writing.network_lan = disk.network_lan;
             writing.network_public_ip = disk.network_public_ip;
+            writing.network_routes = disk.network_routes;
             writing.lan_path_cache = disk.lan_path_cache;
             writing.network_key = disk.network_key;
             writing.server = disk.server;
@@ -740,6 +744,7 @@ impl Config {
         }
         self.network_lan = session.lan.clone();
         self.network_public_ip = session.public_ip.clone();
+        self.network_routes = session.routes.clone();
         if let Ok(fp) = parse_fingerprint(&session.fingerprint) {
             self.server_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         }

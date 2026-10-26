@@ -536,6 +536,9 @@ mod tests {
             healthy: true,
             at,
             maintenance_until: 0,
+            public_addrs: Vec::new(),
+            lan_addrs: Vec::new(),
+            names: Vec::new(),
         }
     }
 

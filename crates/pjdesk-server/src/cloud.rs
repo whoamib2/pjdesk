@@ -1747,6 +1747,15 @@ pub struct PeerHealth {
     /// Unix seconds until which a standby must not promote. Missing on older reports.
     #[serde(default)]
     pub maintenance_until: u64,
+    /// This server's public IP endpoints. Missing on older reports.
+    #[serde(default)]
+    pub public_addrs: Vec<String>,
+    /// This server's LAN endpoints. Missing on older reports.
+    #[serde(default)]
+    pub lan_addrs: Vec<String>,
+    /// Hostnames this server still publishes. Missing on older reports.
+    #[serde(default)]
+    pub names: Vec<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -1758,6 +1767,7 @@ struct HealthDoc {
 /// Health only, every few seconds. The full sync still publishes presence
 /// and the network address on its own pass.
 pub fn publish_heartbeat(data_dir: &Path) {
+    let changed = refresh_advertisement(data_dir);
     let Some(cfg) = CloudConfig::load(data_dir) else { return };
     let role = if accepts_host_registrations(data_dir) { Role::Active } else { Role::Standby };
     let me = health_report(data_dir, role);
@@ -1765,6 +1775,9 @@ pub fn publish_heartbeat(data_dir: &Path) {
         tracing::debug!("failover heartbeat: {e:#}");
     }
     stamp_live_peer(data_dir, role);
+    if changed {
+        register_network(data_dir, role, false);
+    }
 }
 
 const MAINT_FILE: &str = "maintenance-until.txt";
@@ -1778,6 +1791,7 @@ fn health_report(data_dir: &Path, role: Role) -> PeerHealth {
     let st = SyncState::load(data_dir);
     let until = maintenance_deadline(data_dir);
     let holding = until > now();
+    let mine = local_advertised(data_dir);
     PeerHealth {
         instance: instance_id(data_dir),
         name: hostname(),
@@ -1787,6 +1801,129 @@ fn health_report(data_dir: &Path, role: Role) -> PeerHealth {
         healthy: !holding,
         maintenance_until: if holding { until } else { 0 },
         at: now(),
+        public_addrs: mine.public,
+        lan_addrs: mine.lan,
+        names: mine.names,
+    }
+}
+
+const ROUTES_FILE: &str = "server-routes.json";
+const ROUTES_GEN: &str = "routes-generation.txt";
+
+/// Rewrites the cached catalog when this server's addresses or the peer's
+/// addresses changed. Returns true when clients and the cloud should be told now.
+pub fn refresh_advertisement(data_dir: &Path) -> bool {
+    let _ = crate::public_addr::poll_public_ip(data_dir, now());
+    let _ = crate::public_addr::refresh_address_warning(data_dir);
+    let routes = assemble_routes(data_dir);
+    let bytes = serde_json::to_vec(&routes).unwrap_or_default();
+    let prev = std::fs::read(data_dir.join(ROUTES_FILE)).unwrap_or_default();
+    if bytes == prev {
+        return false;
+    }
+    if std::fs::write(data_dir.join(ROUTES_FILE), &bytes).is_err() {
+        return false;
+    }
+    let gen = std::fs::read_to_string(data_dir.join(ROUTES_GEN)).ok().and_then(|text| text.trim().parse::<u64>().ok()).unwrap_or(0);
+    let _ = std::fs::write(data_dir.join(ROUTES_GEN), gen.saturating_add(1).to_string());
+    true
+}
+
+pub fn advertised_routes(data_dir: &Path) -> pjdesk_proto::routes::ServerRoutes {
+    std::fs::read(data_dir.join(ROUTES_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| assemble_routes(data_dir))
+}
+
+pub fn routes_line(data_dir: &Path) -> String {
+    let routes = std::fs::read(data_dir.join(ROUTES_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    pjdesk_proto::routes::routes_text(&routes)
+}
+
+/// The catalog to push, once, when `last` is behind the generation on disk.
+pub fn take_routes_push(data_dir: &Path, last: &mut u64) -> Option<pjdesk_proto::routes::ServerRoutes> {
+    let gen = std::fs::read_to_string(data_dir.join(ROUTES_GEN)).ok().and_then(|text| text.trim().parse::<u64>().ok()).unwrap_or(0);
+    if gen == 0 || gen == *last {
+        return None;
+    }
+    *last = gen;
+    Some(advertised_routes(data_dir))
+}
+
+pub fn redirect_text(data_dir: &Path) -> String {
+    let routes = advertised_routes(data_dir);
+    let primary = routes
+        .primary_public
+        .first()
+        .cloned()
+        .or_else(|| routes.primary_lan.first().cloned())
+        .unwrap_or_default();
+    pjdesk_proto::signal::standby_redirect(&primary, &routes)
+}
+
+fn local_advertised(data_dir: &Path) -> pjdesk_proto::routes::Advertised {
+    let port = crate::public_addr::remembered_port(data_dir);
+    let published = crate::public_addr::load(data_dir).map(|record| record.address).unwrap_or_default();
+    let watch = crate::public_addr::IpWatch::load(data_dir);
+    let lan = crate::public_addr::lan_endpoints(port);
+    pjdesk_proto::routes::advertise(&published, &watch.observed, &lan, port)
+}
+
+fn assemble_routes(data_dir: &Path) -> pjdesk_proto::routes::ServerRoutes {
+    let mine = local_advertised(data_dir);
+    let (peer_public, peer_lan, peer_names) = peer_endpoints(data_dir);
+    let primary = accepts_host_registrations(data_dir);
+    let mut names = mine.names.clone();
+    for name in &peer_names {
+        if !names.iter().any(|have| have.eq_ignore_ascii_case(name)) {
+            names.push(name.clone());
+        }
+    }
+    if primary {
+        return pjdesk_proto::routes::ServerRoutes {
+            primary_lan: mine.lan,
+            primary_public: mine.public,
+            standby_lan: peer_lan,
+            standby_public: peer_public,
+            names,
+        };
+    }
+    let mut primary_public = peer_public;
+    let primary_lan = peer_lan;
+    if primary_public.is_empty() && primary_lan.is_empty() {
+        if let Some(addr) = peer_target(data_dir) {
+            let legacy = pjdesk_proto::routes::ServerRoutes::from_legacy(&addr, &[], "", "", &[], "");
+            primary_public = legacy.primary_public;
+            names.extend(legacy.names);
+        }
+    }
+    pjdesk_proto::routes::ServerRoutes {
+        primary_lan,
+        primary_public,
+        standby_lan: mine.lan,
+        standby_public: mine.public,
+        names,
+    }
+}
+
+fn peer_endpoints(data_dir: &Path) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (ok, mut peers) = peer_health_result(data_dir);
+    if !ok {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let mine = instance_id(data_dir);
+    let mine_name = hostname();
+    peers.retain(|peer| {
+        pjdesk_proto::failover::counts_as_other_server(&peer.instance, &peer.name, &peer.version, &mine, &mine_name)
+    });
+    peers.sort_by_key(|peer| std::cmp::Reverse(peer.at));
+    match peers.into_iter().next() {
+        Some(peer) => (peer.public_addrs, peer.lan_addrs, peer.names),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     }
 }
 
@@ -2243,6 +2380,7 @@ fn register_network(data_dir: &Path, role: Role, replace: bool) {
     }
     let watch = crate::public_addr::IpWatch::load(data_dir);
     let lan = crate::public_addr::lan_endpoints(port);
+    let endpoints = pjdesk_proto::routes::advertise(record.address.trim(), &watch.observed, &lan, port);
     let publication = serde_json::json!({
         "role": role_name(role),
         "address": record.address.trim(),
@@ -2252,6 +2390,11 @@ fn register_network(data_dir: &Path, role: Role, replace: bool) {
         "public_ip": watch.observed,
         "checked_at": watch.checked_at,
         "replace": replace,
+        "endpoints": {
+            "public": endpoints.public,
+            "lan": endpoints.lan,
+            "names": endpoints.names,
+        },
     });
     let stamp = data_dir.join("network-publish.json");
     if !replace {
@@ -2271,6 +2414,11 @@ fn register_network(data_dir: &Path, role: Role, replace: bool) {
         "checked_at": watch.checked_at,
         "confirm": record.confirmed || !crate::public_addr::is_private_address(&record.address),
         "replace": replace,
+        "endpoints": {
+            "public": endpoints.public,
+            "lan": endpoints.lan,
+            "names": endpoints.names,
+        },
     });
     let result = agent()
         .post(&format!("{}/api/network/register", cfg.api.trim_end_matches('/')))

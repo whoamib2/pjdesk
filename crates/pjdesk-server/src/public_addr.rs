@@ -354,25 +354,179 @@ pub fn announce_lan(port: u16, fingerprint: [u8; 32], data_dir: std::path::PathB
     }
 }
 
-/// Private IPv4 addresses of the interfaces this host would use.
+/// LAN IPv4 addresses of active interfaces that have a gateway.
+/// The source address chosen for that gateway is the primary address, so a
+/// stale or secondary address on the same interface is left out.
 pub fn lan_endpoints(port: u16) -> Vec<String> {
     let port = if port == 0 { pjdesk_proto::DEFAULT_PORT } else { port };
+    discover_gateway_lans().into_iter().map(|ip| format!("{ip}:{port}")).collect()
+}
+
+pub fn discover_gateway_lans() -> Vec<std::net::Ipv4Addr> {
     let mut ips = Vec::new();
-    for dest in ["1.1.1.1:80", "10.255.255.254:9", "172.31.255.254:9", "192.168.255.254:9"] {
-        let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else { continue };
-        let Ok(target) = dest.parse::<std::net::SocketAddr>() else { continue };
-        if socket.connect(target).is_err() {
-            continue;
+    for gateway in routing_gateways() {
+        if let Some(ip) = source_toward(gateway) {
+            if usable_lan(ip) {
+                ips.push(ip);
+            }
         }
-        if let Some(IpAddr::V4(ip)) = socket.local_addr().ok().map(|addr| addr.ip()) {
-            if is_private_ip(IpAddr::V4(ip)) && !ip.is_loopback() && !ip.is_unspecified() {
+    }
+    if ips.is_empty() {
+        if let Some(ip) = source_toward_text("1.1.1.1:80") {
+            if usable_lan(ip) {
                 ips.push(ip);
             }
         }
     }
     ips.sort();
     ips.dedup();
-    ips.into_iter().map(|ip| format!("{ip}:{port}")).collect()
+    ips
+}
+
+fn usable_lan(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() && !ip.is_broadcast()
+}
+
+fn source_toward(gateway: std::net::Ipv4Addr) -> Option<std::net::Ipv4Addr> {
+    source_toward_text(&format!("{gateway}:9"))
+}
+
+fn source_toward_text(dest: &str) -> Option<std::net::Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    let target = dest.parse::<std::net::SocketAddr>().ok()?;
+    socket.connect(target).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(_) => None,
+    }
+}
+
+fn routing_gateways() -> Vec<std::net::Ipv4Addr> {
+    #[cfg(windows)]
+    {
+        windows_gateways()
+    }
+    #[cfg(not(windows))]
+    {
+        let text = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+        gateways_from_proc_route(&text)
+    }
+}
+
+/// `/proc/net/route` rows whose flags include RTF_GATEWAY. The gateway column
+/// is a little-endian hex IPv4 address.
+pub fn gateways_from_proc_route(text: &str) -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        let Ok(flags) = u32::from_str_radix(cols[3], 16) else { continue };
+        if flags & 0x2 == 0 {
+            continue;
+        }
+        let Ok(gateway) = u32::from_str_radix(cols[2], 16) else { continue };
+        if gateway == 0 {
+            continue;
+        }
+        let ip = std::net::Ipv4Addr::from(gateway.to_le_bytes());
+        if !ip.is_unspecified() && !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn windows_gateways() -> Vec<std::net::Ipv4Addr> {
+    #[link(name = "iphlpapi")]
+    extern "system" {
+        fn GetIpForwardTable(table: *mut u8, size: *mut u32, order: i32) -> u32;
+    }
+    let mut size = 0u32;
+    let _ = unsafe { GetIpForwardTable(std::ptr::null_mut(), &mut size, 0) };
+    if size == 0 || size > 1_000_000 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; size as usize];
+    let rc = unsafe { GetIpForwardTable(buf.as_mut_ptr(), &mut size, 0) };
+    if rc != 0 {
+        return Vec::new();
+    }
+    let count = u32::from_ne_bytes(buf.get(0..4).unwrap_or(&[0, 0, 0, 0]).try_into().unwrap_or([0, 0, 0, 0])) as usize;
+    const ROW: usize = 56;
+    let mut out = Vec::new();
+    for index in 0..count {
+        let start = 4 + index * ROW;
+        let Some(row) = buf.get(start..start + 16) else { break };
+        let dest = u32::from_ne_bytes(row[0..4].try_into().unwrap_or([0, 0, 0, 0]));
+        let next = u32::from_ne_bytes(row[12..16].try_into().unwrap_or([0, 0, 0, 0]));
+        if next == 0 {
+            continue;
+        }
+        // The forward table stores addresses in network byte order.
+        let ip = std::net::Ipv4Addr::from(u32::from_be(next));
+        let dest_ip = std::net::Ipv4Addr::from(u32::from_be(dest));
+        if dest_ip.is_unspecified() || ip.is_private() {
+            if !ip.is_unspecified() && !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+const WARN_FILE: &str = "address-warn.json";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct WarnCache {
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    at: u64,
+    #[serde(default)]
+    text: String,
+}
+
+/// Resolves the published address at most every five minutes and records a
+/// warning when that answer is not this server.
+pub fn refresh_address_warning(data_dir: &Path) -> String {
+    let published = load(data_dir).map(|record| record.address).unwrap_or_default();
+    let watch = IpWatch::load(data_dir);
+    let lan = discover_gateway_lans();
+    let public_ip = watch.observed.parse().ok();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let path = data_dir.join(WARN_FILE);
+    let cache: WarnCache = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+    let host = host_of(&published).unwrap_or("").to_string();
+    if !host.is_empty() && cache.host == host && cache.at != 0 && now.saturating_sub(cache.at) < IP_CHECK_EVERY {
+        return cache.text;
+    }
+    let resolved = if is_hostname(&published) {
+        resolve_host(&host)
+    } else if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![ip]
+    } else {
+        Vec::new()
+    };
+    let text = pjdesk_proto::routes::address_warning(&published, &resolved, &lan, public_ip);
+    let next = WarnCache { host, at: now, text: text.clone() };
+    if let Ok(bytes) = serde_json::to_vec(&next) {
+        let _ = std::fs::write(path, bytes);
+    }
+    text
+}
+
+pub fn stored_address_warning(data_dir: &Path) -> String {
+    std::fs::read(data_dir.join(WARN_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<WarnCache>(&bytes).ok())
+        .map(|cache| cache.text)
+        .unwrap_or_default()
 }
 
 /// Checks the public IP at most every five minutes. Returns true when a
@@ -524,5 +678,16 @@ mod tests {
         assert_eq!(obs, "203.0.113.9");
         let (_, _, _, changed) = note_ip_reading(&obs, "", 0, "198.51.100.1");
         assert!(!changed);
+    }
+
+    #[test]
+    fn a_route_without_a_gateway_is_not_a_lan_source() {
+        let text = "\
+Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+eth0 00000000 0101A8C0 0003 0 0 100 00000000 0 0 0
+eth1 0002A8C0 00000000 0001 0 0 100 00FFFFFF 0 0 0
+";
+        let gateways = gateways_from_proc_route(text);
+        assert_eq!(gateways, vec![Ipv4Addr::new(192, 168, 1, 1)]);
     }
 }

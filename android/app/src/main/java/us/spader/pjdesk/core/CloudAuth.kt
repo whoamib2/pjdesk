@@ -423,6 +423,9 @@ object CloudAuth {
             standbyFingerprint = network.optString("standby_fingerprint"),
             lan = network.optString("active_lan").split(',').map { it.trim() }.filter { it.isNotEmpty() },
             publicIp = network.optString("active_public_ip"),
+            routes = network.optJSONObject("routes")?.toString().orEmpty(),
+            standbyLan = network.optString("standby_lan").split(',').map { it.trim() }.filter { it.isNotEmpty() },
+            standbyPublicIp = network.optString("standby_public_ip"),
             computers = mergePresence(computers, presence),
         )
     }
@@ -516,4 +519,7 @@ data class Session(
     val lan: List<String> = emptyList(),
     val publicIp: String = "",
     val computers: List<SavedComputer>,
+    val routes: String = "",
+    val standbyLan: List<String> = emptyList(),
+    val standbyPublicIp: String = "",
 )
