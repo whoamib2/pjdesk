@@ -18,6 +18,7 @@ mod accounts;
 mod audit;
 mod cloud;
 mod control;
+mod failover;
 mod gui;
 mod handoff;
 mod password_policy;

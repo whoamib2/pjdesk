@@ -71,18 +71,37 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
 
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let mut waiting = false;
+    let mut prefer_standby = false;
     let mut tries = 0u32;
     loop {
         let link = if let Some(addr) = direct.clone() {
             runtime.block_on(connect_direct(&mut config, &addr, &password, ask.as_deref(), args.trust && !waiting))
         } else {
-            runtime.block_on(connect(&server, &mut config, &target, &password, ask.as_deref(), args.force_relay, waiting))
+            runtime.block_on(connect(
+                &server,
+                &mut config,
+                &target,
+                &password,
+                ask.as_deref(),
+                args.force_relay,
+                waiting,
+                prefer_standby,
+            ))
         };
         let link = match link {
             Ok(link) => link,
-            Err(_) if waiting && tries < 40 => {
+            Err(e) if waiting && tries < 40 => {
+                let text = format!("{e:#}");
+                if pjdesk_proto::signal::is_standby_refusal(&text) {
+                    tracing::info!("failover: standby has not taken over; trying the primary again");
+                    prefer_standby = false;
+                } else if config.network_standby.as_deref().is_some_and(|s| !s.trim().is_empty()) && !prefer_standby
+                {
+                    tracing::info!("failover: primary did not answer; reconnecting through the standby");
+                    prefer_standby = true;
+                }
                 tries += 1;
-                std::thread::sleep(Duration::from_secs(3));
+                std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
             Err(e) => {
@@ -116,15 +135,34 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         if args.headless {
             return runtime.block_on(headless(link, args.frames));
         }
-        if !window::run(&runtime, link)? {
-            break;
+        let was_relay = matches!(link.path, crate::p2p::LinkPath::Relay(_));
+        match window::run(&runtime, link)? {
+            window::ViewerStop::UserClosed => break,
+            window::ViewerStop::HostRestart => {
+                prefer_standby = false;
+                if std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1") {
+                    break;
+                }
+                waiting = true;
+                tracing::info!("Waiting for the computer to come back");
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            window::ViewerStop::RelayResume => {
+                waiting = true;
+                prefer_standby = was_relay;
+                let standby = config.network_standby.clone().unwrap_or_default();
+                if prefer_standby && !standby.trim().is_empty() {
+                    tracing::info!(
+                        "failover: relayed session lost the rendezvous server; reconnecting through the standby {standby}"
+                    );
+                } else {
+                    tracing::info!(
+                        "failover: relayed session lost the rendezvous server; reconnecting with the password already entered"
+                    );
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
-        if std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1") {
-            break;
-        }
-        waiting = true;
-        tracing::info!("Waiting for the computer to come back");
-        std::thread::sleep(Duration::from_secs(5));
     }
     Ok(())
 }
@@ -169,6 +207,7 @@ async fn connect(
     ask: Option<&std::path::Path>,
     force_relay: bool,
     waiting_retry: bool,
+    prefer_standby: bool,
 ) -> Result<Link> {
     tracing::info!("Connecting to {} through {server}", format_id(target));
     if waiting_retry {
@@ -176,7 +215,17 @@ async fn connect(
     } else {
         crate::network::refresh_config(config);
     }
-    let server = ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone());
+    let standby_target = if prefer_standby {
+        config.network_standby.clone().filter(|s| !s.trim().is_empty()).and_then(|s| {
+            tracing::info!("failover: reconnecting the session through the standby {s}");
+            ServerAddr::parse(&s).ok()
+        })
+    } else {
+        None
+    };
+    let server = standby_target
+        .or_else(|| ServerAddr::parse(&config.effective_server()).ok())
+        .unwrap_or_else(|| server.clone());
     let mut access = config.presented_access();
     if access.is_empty() {
         // A temporary sign-in keeps the access token in this process only.

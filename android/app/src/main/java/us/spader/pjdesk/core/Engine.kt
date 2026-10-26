@@ -241,10 +241,11 @@ class Engine(context: Context) : EngineListener {
     }
 
     /** Account sync sets the address and pinned key without replacing "Connecting…". */
-    fun applyAccountServer(address: String, fingerprint: String = "", quiet: Boolean = true) {
+    fun applyAccountServer(address: String, fingerprint: String = "", quiet: Boolean = true, standby: String = "") {
         if (address.isBlank()) return
         val body = JSONObject().put("cmd", "server").put("address", address).put("quiet", quiet)
         if (fingerprint.isNotBlank()) body.put("fingerprint", fingerprint)
+        if (standby.isNotBlank()) body.put("standby", standby)
         if (quiet) {
             body.put("lan", lanForEngine())
             body.put("publicIp", store.accountPublicIp)

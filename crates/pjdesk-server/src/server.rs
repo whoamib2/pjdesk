@@ -268,6 +268,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     let janitor = tokio::spawn(janitor(state.clone()));
     let fleet = tokio::spawn(fleet_sync(state.clone()));
     let cloud = tokio::spawn(cloud_sync(state.clone(), acceptor.clone()));
+    let failover = tokio::spawn(failover_watch(state.clone(), acceptor.clone()));
     let updates = tokio::spawn(server_updates(data_dir.clone()));
     // The management window reads this when it cannot open the data folder.
     {
@@ -317,6 +318,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     janitor.abort();
     fleet.abort();
     cloud.abort();
+    failover.abort();
     updates.abort();
     Ok(())
 }
@@ -1244,6 +1246,23 @@ fn drop_access_key(st: &mut State, key_id: &str) -> bool {
     any
 }
 
+/// Closes live registrations so those computers connect to the new primary.
+/// A direct or hole-punched session does not use this socket for its picture.
+fn release_hosts_for_failover(state: &Shared) {
+    let ids: Vec<String> = {
+        let st = state.lock().unwrap();
+        st.online.keys().cloned().chain(st.standby.keys().cloned()).collect()
+    };
+    let mut st = state.lock().unwrap();
+    let n = ids.len();
+    for id in ids {
+        disconnect_device(&mut st, &id, pjdesk_proto::signal::STANDBY_REGISTRATION);
+    }
+    if n > 0 {
+        info!("failover: released {n} computers so they register with the new primary");
+    }
+}
+
 /// Drops a computer's live connections and any session it is hosting.
 fn disconnect_device(st: &mut State, id: &str, message: &str) {
     let mut notify = Vec::new();
@@ -1443,6 +1462,59 @@ async fn fleet_sync(state: Shared) {
                     }
                     Err(e) => warn!("could not set a group on {}: {e}", format_id(&id)),
                 }
+            }
+        }
+    }
+}
+
+/// Probes the primary every few seconds while this server is the standby,
+/// and steps down when another server publishes a higher generation.
+async fn failover_watch(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
+    let data_dir = state.lock().unwrap().data_dir.clone();
+    let mut tick = tokio::time::interval(Duration::from_secs(pjdesk_proto::failover::BEAT_SECS));
+    let mut misses = 0u32;
+    let mut last_log = String::new();
+    loop {
+        tick.tick().await;
+        let dir = data_dir.clone();
+        let seen = misses;
+        let step = match tokio::task::spawn_blocking(move || crate::failover::watch_once(&dir, seen)).await {
+            Ok(step) => step,
+            Err(e) => {
+                warn!("failover watch stopped: {e}");
+                continue;
+            }
+        };
+        match step {
+            crate::failover::Step::Stay { misses: next, log } => {
+                misses = next;
+                if !log.is_empty() && log != last_log {
+                    info!("{log}");
+                    last_log = log;
+                }
+            }
+            crate::failover::Step::Promote { from, misses: next } => {
+                misses = 0;
+                last_log.clear();
+                warn!(
+                    "failover: primary {from} missed {next} heartbeats and its cloud health is stale; taking over"
+                );
+                let dir = data_dir.clone();
+                match tokio::task::spawn_blocking(move || crate::cloud::promote(&dir)).await {
+                    Ok(Ok(())) => {
+                        info!("failover: this server is now the primary");
+                        reload_from_disk(&state, &acceptor, &data_dir);
+                    }
+                    Ok(Err(e)) => warn!("failover: could not take over: {e:#}"),
+                    Err(e) => warn!("failover: could not take over: {e}"),
+                }
+            }
+            crate::failover::Step::Yielded { epoch, name } => {
+                misses = 0;
+                last_log.clear();
+                warn!("failover: generation {epoch} belongs to {name}; this server is now the standby");
+                release_hosts_for_failover(&state);
+                reload_from_disk(&state, &acceptor, &data_dir);
             }
         }
     }

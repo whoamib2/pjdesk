@@ -547,49 +547,95 @@ async fn host_main(
     let mut delay = Duration::from_secs(1);
     let mut force_refresh = false;
     let mut public_only = false;
+    let mut use_standby = false;
+    let mut fast_tries = 0u32;
     let role = if args.service_host { "service" } else { "window" };
     loop {
         if state.shared.as_ref().is_some_and(|s| s.stopping()) {
             return Ok(());
         }
-        let outcome = signaling_loop(&server, &mut config, &state, force_refresh, public_only).await;
+        let outcome = signaling_loop(&server, &mut config, &state, force_refresh, public_only, use_standby).await;
         force_refresh = true;
-        if let Some(shared) = &state.shared {
-            shared.clear_registration();
-            *shared.connected.lock().unwrap() = None;
-            *shared.reach.lock().unwrap() = String::new();
-            if shared.stopping() {
+        if state.shared.as_ref().is_some_and(|s| s.stopping()) {
+            if let Some(shared) = &state.shared {
+                shared.clear_registration();
+            }
+            return Ok(());
+        }
+        let has_standby = config.network_standby.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let fail = match &outcome {
+            Ok(SignalEnd::Stop) => {
+                if let Some(shared) = &state.shared {
+                    shared.clear_registration();
+                }
                 return Ok(());
             }
-        }
-        let mut advance = false;
-        match outcome {
-            Ok(()) => {
-                public_only = false;
-                delay = Duration::from_secs(1);
-            }
+            Ok(SignalEnd::Again) => None,
+            Ok(SignalEnd::Lost) => Some(pjdesk_proto::failover::RegFail::Unreachable),
             Err(e) if format!("{e:#}").contains("SERVER KEY MISMATCH") => {
                 if let Some(shared) = &state.shared {
+                    shared.clear_registration();
                     *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
                 }
                 info!("This computer is not registered ({role}). {e:#}");
-                return Err(e);
+                return Err(anyhow::anyhow!("{e:#}"));
             }
             Err(e) if pjdesk_proto::signal::is_standby_refusal(&format!("{e:#}")) => {
                 info!("This computer is not registered ({role}). {e:#}");
-                public_only = true;
-                delay = Duration::from_secs(1);
                 if let Some(shared) = &state.shared {
                     *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
                 }
+                Some(pjdesk_proto::failover::RegFail::StillStandby)
             }
             Err(e) => {
                 info!("This computer is not registered ({role}). {e:#}");
-                advance = true;
                 if let Some(shared) = &state.shared {
                     *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
                 }
+                Some(pjdesk_proto::failover::RegFail::Unreachable)
             }
+        };
+        let streaming = state.streaming.load(Ordering::SeqCst);
+        if streaming && matches!(fail, Some(pjdesk_proto::failover::RegFail::Unreachable)) {
+            info!(
+                "rendezvous connection lost; a direct, LAN, or hole-punched session keeps running. A relayed session reconnects on its own."
+            );
+        }
+        let mut advance = false;
+        if let Some(kind) = fail {
+            let hop = pjdesk_proto::failover::next_register(kind, use_standby, has_standby, fast_tries, delay);
+            let keep = pjdesk_proto::failover::keep_saved_status(
+                has_standby,
+                state.shared.as_ref().is_some_and(|s| s.acked_recently()),
+            );
+            if let Some(shared) = &state.shared {
+                if !keep {
+                    shared.clear_registration();
+                }
+                *shared.connected.lock().unwrap() = None;
+                *shared.reach.lock().unwrap() = String::new();
+            }
+            if !hop.log.is_empty() {
+                let where_next = if hop.use_standby {
+                    config.network_standby.clone().unwrap_or_default()
+                } else {
+                    config.effective_server()
+                };
+                info!("failover: {} {where_next}", hop.log);
+            }
+            use_standby = hop.use_standby;
+            public_only = hop.use_standby || kind == pjdesk_proto::failover::RegFail::StillStandby;
+            delay = hop.delay;
+            advance = hop.advance_backoff;
+            if advance {
+                fast_tries = pjdesk_proto::failover::FAST_REGISTER_TRIES;
+            } else {
+                fast_tries = fast_tries.saturating_add(1);
+            }
+        } else {
+            public_only = false;
+            fast_tries = 0;
+            delay = Duration::from_secs(1);
         }
         let pause = pjdesk_proto::signal::jitter_reconnect(delay);
         info!("Reconnecting to the server in {:.1} s...", pause.as_secs_f32());
@@ -600,6 +646,14 @@ async fn host_main(
     }
 }
 
+enum SignalEnd {
+    Stop,
+    /// Register again with the same server. The access key changed.
+    Again,
+    /// The server stopped answering.
+    Lost,
+}
+
 /// One signaling connection: register, then handle incoming sessions.
 /// Returns `Ok` if we were registered before the connection dropped.
 async fn signaling_loop(
@@ -608,7 +662,8 @@ async fn signaling_loop(
     state: &Arc<HostState>,
     force_refresh: bool,
     public_only: bool,
-) -> Result<()> {
+    use_standby: bool,
+) -> Result<SignalEnd> {
     tokio::task::spawn_blocking({
         let mut copy = config.clone();
         move || {
@@ -636,7 +691,14 @@ async fn signaling_loop(
     });
     let _ = config.reload_access_key();
     state.remember_support(config);
-    let server = ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone());
+    let standby_text = config.network_standby.clone().unwrap_or_default();
+    let server = if use_standby {
+        ServerAddr::parse(standby_text.trim()).unwrap_or_else(|_| {
+            ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone())
+        })
+    } else {
+        ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone())
+    };
     let role = if state.args.service_host { "service" } else { "window" };
     let key = config
         .server_fingerprint
@@ -645,17 +707,25 @@ async fn signaling_loop(
         .unwrap_or_else(|| "unpinned".into());
     info!(
         "Registration target ({role}): {server}, key {key}, {}",
-        if public_only { "public address only" } else { "LAN or public" }
+        if use_standby {
+            "standby address"
+        } else if public_only {
+            "public address only"
+        } else {
+            "LAN or public"
+        }
     );
     let token = config.presented_access();
     let access_key = pjdesk_proto::access::is_access_key(&token);
-    let mut signal = SignalClient::connect_mode(&server, config, public_only).await?;
-    if let Some(reason) = landed_on_standby(config, &server, signal.server_addr).await {
-        warn!(
-            "Registration target {server} reached {} via {} ({role}), key {key}; {reason}",
-            signal.server_addr, signal.via
-        );
-        bail!(pjdesk_proto::signal::STANDBY_REGISTRATION);
+    let mut signal = SignalClient::connect_mode(&server, config, public_only || use_standby).await?;
+    if !use_standby {
+        if let Some(reason) = landed_on_standby(config, &server, signal.server_addr).await {
+            warn!(
+                "Registration target {server} reached {} via {} ({role}), key {key}; {reason}",
+                signal.server_addr, signal.via
+            );
+            bail!(pjdesk_proto::signal::STANDBY_REGISTRATION);
+        }
     }
     if !token.is_empty() {
         let _ = signal.send(ClientMsg::PresentAccess { token: token.clone() });
@@ -677,8 +747,8 @@ async fn signaling_loop(
             // A server from before 0.6.0 cannot decode PresentAccess and drops
             // the socket. Try once without the token so this computer stays online.
             // An access key is not retried without: the server asked for it.
-            signal = SignalClient::connect_mode(&server, config, public_only).await?;
-            if landed_on_standby(config, &server, signal.server_addr).await.is_some() {
+            signal = SignalClient::connect_mode(&server, config, public_only || use_standby).await?;
+            if !use_standby && landed_on_standby(config, &server, signal.server_addr).await.is_some() {
                 bail!(pjdesk_proto::signal::STANDBY_REGISTRATION);
             }
             signal.send(register)?;
@@ -759,7 +829,7 @@ async fn signaling_loop(
         tokio::select! {
             _ = ui_tick.tick() => {
                 if state.shared.as_ref().is_some_and(|s| s.stopping()) {
-                    return Ok(());
+                    return Ok(SignalEnd::Stop);
                 }
                 state.apply_ui_requests();
             }
@@ -769,21 +839,15 @@ async fn signaling_loop(
                         "Heartbeat missed ({role}) from {server} via {} ({}); no pong since the last ping. Reconnecting",
                         signal.via, signal.server_addr
                     );
-                    if let Some(shared) = &state.shared {
-                        shared.clear_registration();
-                    }
-                    return Ok(());
+                    return Ok(SignalEnd::Lost);
                 }
                 if last_heard.elapsed() >= Duration::from_secs(30) {
                     warn!("No reply from the server for 30 s ({role}); reconnecting");
-                    if let Some(shared) = &state.shared {
-                        shared.clear_registration();
-                    }
-                    return Ok(());
+                    return Ok(SignalEnd::Lost);
                 }
                 if config.reload_access_key() {
                     tracing::info!("The access key changed; registering again");
-                    return Ok(());
+                    return Ok(SignalEnd::Again);
                 }
                 signal.send(ClientMsg::Ping)?;
                 awaiting_pong = true;
@@ -800,7 +864,7 @@ async fn signaling_loop(
             msg = signal.recv() => {
                 let Some(msg) = msg else {
                     warn!("Lost the connection to the server ({role}); reconnecting");
-                    return Ok(());
+                    return Ok(SignalEnd::Lost);
                 };
                 last_heard = std::time::Instant::now();
                 match msg {

@@ -344,6 +344,11 @@ class Store(context: Context) {
         get() = prefs.getString("accountServer", "") ?: ""
         set(value) { prefs.edit().putString("accountServer", value).apply() }
 
+    /** Standby server from the account. The phone registers here when the primary stops answering. */
+    var accountStandby: String
+        get() = prefs.getString("accountStandby", "") ?: ""
+        set(value) { prefs.edit().putString("accountStandby", value).apply() }
+
     var accountFingerprint: String
         get() = prefs.getString("accountFingerprint", "") ?: ""
         set(value) { prefs.edit().putString("accountFingerprint", value).apply() }

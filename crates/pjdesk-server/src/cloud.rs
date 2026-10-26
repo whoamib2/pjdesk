@@ -51,7 +51,14 @@ const FORMAT: u32 = 1;
 
 /// The server's state files (relative to the data folder), plus every
 /// `addressbook/<user>.json`.
-const STATE_FILES: [&str; 4] = ["server-cert.pem", "server-key.pem", "accounts.json", "devices.json"];
+const STATE_FILES: [&str; 6] = [
+    "server-cert.pem",
+    "server-key.pem",
+    "accounts.json",
+    "devices.json",
+    "access-keys.json",
+    "network-access.json",
+];
 /// Upload a changed computer list at most this often (accounts and the key go
 /// up straight away).
 const DEVICES_PUSH_INTERVAL: u64 = 300;
@@ -988,6 +995,13 @@ struct SyncState {
     /// Shown in the window until the next role change replaces it.
     #[serde(default)]
     notice: String,
+    /// Generation that made this server step down. Higher than `epoch` until
+    /// this server accepts that copy or promotes past it.
+    #[serde(default)]
+    fenced_epoch: u64,
+    /// Instance that owns `fenced_epoch`.
+    #[serde(default)]
+    fenced_instance: String,
 }
 
 impl SyncState {
@@ -1003,6 +1017,18 @@ impl SyncState {
 }
 
 /// A random ID for this data folder, made once.
+pub fn instance_of(data_dir: &Path) -> String {
+    instance_id(data_dir)
+}
+
+pub fn local_epoch(data_dir: &Path) -> u64 {
+    SyncState::load(data_dir).epoch
+}
+
+pub fn unix_now() -> u64 {
+    now()
+}
+
 fn instance_id(data_dir: &Path) -> String {
     let path = data_dir.join(INSTANCE_FILE);
     if let Ok(text) = std::fs::read_to_string(&path) {
@@ -1140,7 +1166,14 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
+fn yielded(st: &SyncState, mine: &str) -> bool {
+    pjdesk_proto::failover::epoch_fences(st.epoch, st.fenced_epoch, &st.fenced_instance, mine)
+}
+
 fn effective_role(st: &SyncState, mine: &str, heuristic: Role) -> Role {
+    if yielded(st, mine) {
+        return Role::Standby;
+    }
     match st.desired.as_str() {
         "active" => Role::Active,
         "standby" => Role::Standby,
@@ -1164,13 +1197,16 @@ pub fn accepts_host_registrations(data_dir: &Path) -> bool {
         return true;
     }
     let st = SyncState::load(data_dir);
+    let mine = instance_id(data_dir);
+    if yielded(&st, &mine) {
+        return false;
+    }
     if st.desired == "standby" {
         return false;
     }
     if st.desired == "active" {
         return true;
     }
-    let mine = instance_id(data_dir);
     if !st.active_instance.is_empty() && st.active_instance == mine {
         return true;
     }
@@ -1274,11 +1310,13 @@ fn absorb(data_dir: &Path, cfg: &CloudConfig) -> Result<Fence> {
             apply_bundle(data_dir, &bundle, etag)?;
             let mut st = SyncState::load(data_dir);
             st.desired = "standby".into();
+            st.fenced_epoch = epoch;
+            st.fenced_instance = bundle.instance.clone();
             st.notice = format!(
-                "{name} is now the primary (generation {epoch}). This server switched to standby and will apply updates from the cloud."
+                "{name} is now the primary (generation {epoch}). This server switched to standby and will not take the primary back on its own."
             );
             st.save(data_dir);
-            tracing::warn!("{}", st.notice);
+            tracing::warn!("failover: {}", st.notice);
             Ok(Fence::Superseded)
         }
         Fence::Held => {
@@ -1412,12 +1450,15 @@ pub fn promote(data_dir: &Path) -> Result<()> {
     }
     let mut st = SyncState::load(data_dir);
     st.desired = "active".into();
+    st.fenced_epoch = 0;
+    st.fenced_instance.clear();
     st.notice =
         "This server is now the primary. The other server will switch to standby the next time it checks.".into();
     st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Active);
-    tracing::info!("{}", st.notice);
+    tracing::info!("failover: {}", st.notice);
     register_network(data_dir, Role::Active, true);
+    publish_heartbeat(data_dir);
     Ok(())
 }
 
@@ -1698,6 +1739,118 @@ pub struct PeerHealth {
 struct HealthDoc {
     #[serde(default)]
     peers: BTreeMap<String, PeerHealth>,
+}
+
+/// Health only, every few seconds. The full sync still publishes presence
+/// and the network address on its own pass.
+pub fn publish_heartbeat(data_dir: &Path) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    let role = if accepts_host_registrations(data_dir) { Role::Active } else { Role::Standby };
+    let st = SyncState::load(data_dir);
+    let me = PeerHealth {
+        instance: instance_id(data_dir),
+        name: hostname(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        role: role_name(role).into(),
+        epoch: st.epoch,
+        healthy: true,
+        at: now(),
+    };
+    if let Err(e) = write_health(&cfg, &me) {
+        tracing::debug!("failover heartbeat: {e:#}");
+    }
+}
+
+/// Steps down because another server holds a newer generation.
+/// Returns false when this server already recorded that generation.
+pub fn yield_to_epoch(data_dir: &Path, remote_epoch: u64, remote_instance: &str, remote_name: &str) -> bool {
+    let mut st = SyncState::load(data_dir);
+    if st.desired == "standby" && st.fenced_epoch == remote_epoch && st.fenced_instance == remote_instance {
+        return false;
+    }
+    let name = if remote_name.trim().is_empty() { "The other server" } else { remote_name.trim() };
+    st.desired = "standby".into();
+    st.fenced_epoch = remote_epoch;
+    st.fenced_instance = remote_instance.to_string();
+    st.notice = format!(
+        "{name} is now the primary (generation {remote_epoch}). This server switched to standby and will not take the primary back on its own."
+    );
+    st.save(data_dir);
+    tracing::warn!("failover: {}", st.notice);
+    let _ = sync_status_now(data_dir, Role::Standby);
+    register_network(data_dir, Role::Standby, false);
+    true
+}
+
+const PEER_FILE: &str = "failover-peer.txt";
+
+/// Address of the account's active server, when it is not this server.
+/// A failed lookup keeps the last address this server learned.
+pub fn peer_target(data_dir: &Path) -> Option<String> {
+    let cached = std::fs::read_to_string(data_dir.join(PEER_FILE))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let Some(cfg) = CloudConfig::load(data_dir) else {
+        return cached;
+    };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return cached;
+    }
+    let mine = crate::public_addr::load(data_dir).map(|record| record.address).unwrap_or_default();
+    match network_addresses(&cfg) {
+        Ok((active, standby)) => match pjdesk_proto::failover::choose_peer(&mine, &active, &standby) {
+            Some(addr) => {
+                let _ = std::fs::write(data_dir.join(PEER_FILE), &addr);
+                Some(addr)
+            }
+            None => cached,
+        },
+        Err(e) => {
+            tracing::debug!("failover: could not read the account server list: {e:#}");
+            cached
+        }
+    }
+}
+
+fn network_addresses(cfg: &CloudConfig) -> Result<(String, String)> {
+    #[derive(Deserialize)]
+    struct Net {
+        #[serde(default)]
+        active_address: String,
+        #[serde(default)]
+        standby_address: String,
+    }
+    #[derive(Deserialize)]
+    struct Doc {
+        #[serde(default)]
+        network: Option<Net>,
+    }
+    let text = match agent()
+        .get(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(resp) => resp.into_string().unwrap_or_default(),
+        Err(e) => return Err(api_error(&cfg.api, &cfg.email, e)),
+    };
+    let doc: Doc = serde_json::from_str(&text).context("unexpected network reply")?;
+    let net = doc.network.unwrap_or(Net { active_address: String::new(), standby_address: String::new() });
+    Ok((net.active_address, net.standby_address))
+}
+
+/// `(read succeeded, peers)`. A failed read is not an empty fleet.
+pub fn peer_health_result(data_dir: &Path) -> (bool, Vec<PeerHealth>) {
+    let Some(cfg) = CloudConfig::load(data_dir) else {
+        return (false, Vec::new());
+    };
+    match read_health(&cfg) {
+        Ok(doc) => (true, doc.peers.into_values().collect()),
+        Err(e) => {
+            tracing::debug!("failover: cloud health: {e:#}");
+            (false, Vec::new())
+        }
+    }
 }
 
 fn publish_health(data_dir: &Path, role: Role) {
@@ -2375,6 +2528,15 @@ mod tests {
         )
         .unwrap();
         assert!(accepts_host_registrations(&dir));
+        std::fs::write(
+            dir.join(STATE_FILE),
+            r#"{"desired":"active","epoch":4,"fenced_epoch":5,"fenced_instance":"cccccccccccccccccccccccccccccccc","active_instance":"cccccccccccccccccccccccccccccccc"}"#,
+        )
+        .unwrap();
+        assert!(
+            !accepts_host_registrations(&dir),
+            "a higher generation demotes a server that still wants to be primary"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2542,6 +2704,9 @@ mod tests {
     #[test]
     fn only_state_files_are_accepted() {
         assert!(allowed_path("accounts.json"));
+        assert!(allowed_path("devices.json"));
+        assert!(allowed_path("access-keys.json"));
+        assert!(allowed_path("network-access.json"));
         assert!(allowed_path("addressbook/ben.json"));
         assert!(!allowed_path("addressbook/../server-key.pem"));
         assert!(!allowed_path("../evil.json"));

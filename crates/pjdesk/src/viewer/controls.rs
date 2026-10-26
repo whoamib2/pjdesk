@@ -77,6 +77,10 @@ pub struct Live {
     pub block_host: bool,
     pub recording: bool,
     pub restart: bool,
+    /// The QUIC path is the server relay.
+    pub relayed: bool,
+    /// That relay path dropped. The window reconnects without asking again.
+    pub resume_relay: bool,
     pub closed: Option<String>,
     /// The phone's accessibility service is off, so clicks do not land.
     pub control_off: bool,
@@ -109,6 +113,8 @@ impl Live {
             block_host: false,
             recording: false,
             restart: false,
+            relayed: false,
+            resume_relay: false,
             closed: None,
             control_off: false,
             paths: HashMap::new(),
@@ -150,6 +156,8 @@ impl Live {
             block_host: self.block_host,
             recording: self.recording,
             restart: self.restart,
+            relayed: self.relayed,
+            resume_relay: self.resume_relay,
             closed: self.closed.clone(),
             control_off: self.control_off,
             paths: HashMap::new(),
@@ -194,10 +202,13 @@ pub fn start(
     frames: std::sync::mpsc::Sender<(VideoHeader, Vec<u8>)>,
     peer_proto: u16,
     host_id: String,
+    relayed: bool,
     wake: impl Fn() + Send + Sync + 'static,
 ) -> (Arc<Mutex<Live>>, mpsc::UnboundedSender<Cmd>, Arc<Mutex<RecorderSlot>>) {
     let _ = VIEWER_RT.set(rt);
-    let live = Arc::new(Mutex::new(Live::new(peer_proto >= 3)));
+    let mut session = Live::new(peer_proto >= 3);
+    session.relayed = relayed;
+    let live = Arc::new(Mutex::new(session));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let recorder = Arc::new(Mutex::new(RecorderSlot::new()));
     let wake = Arc::new(wake);
@@ -250,6 +261,13 @@ pub fn start(
     (live, cmd_tx, recorder)
 }
 
+fn note_relay_resume(live: &mut Live) {
+    live.resume_relay = true;
+    live.closed = Some(pjdesk_proto::failover::RELAY_RESUME.into());
+    live.note("Reconnecting…");
+    tracing::info!("{}", pjdesk_proto::failover::RELAY_RESUME);
+}
+
 async fn run_loop(
     connection: Connection,
     mut control_recv: quinn::RecvStream,
@@ -269,10 +287,14 @@ async fn run_loop(
                     Err(e) => {
                         let mut g = live.lock().unwrap();
                         if g.closed.is_none() && !g.restart {
-                            let text = format!("The host closed the session: {e:#}");
-                            tracing::error!("{text}");
-                            crate::note_failure(&text);
-                            g.closed = Some(text);
+                            if g.relayed {
+                                note_relay_resume(&mut g);
+                            } else {
+                                let text = format!("The host closed the session: {e:#}");
+                                tracing::error!("{text}");
+                                crate::note_failure(&text);
+                                g.closed = Some(text);
+                            }
                         }
                         wake();
                         break;
@@ -286,14 +308,18 @@ async fn run_loop(
             _ = connection.closed() => {
                 let mut g = live.lock().unwrap();
                 if g.closed.is_none() && !g.restart {
-                    let why = connection
-                        .close_reason()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "the connection ended".into());
-                    let text = session_end_message(&why);
-                    tracing::error!("{text}");
-                    crate::note_failure(&text);
-                    g.closed = Some(text);
+                    if g.relayed {
+                        note_relay_resume(&mut g);
+                    } else {
+                        let why = connection
+                            .close_reason()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "the connection ended".into());
+                        let text = session_end_message(&why);
+                        tracing::error!("{text}");
+                        crate::note_failure(&text);
+                        g.closed = Some(text);
+                    }
                 }
                 wake();
                 break;
@@ -1079,7 +1105,7 @@ mod tests {
         assert!(Handle::try_current().is_err(), "this thread must be outside the Tokio runtime");
         let (control, _rx) = mpsc::unbounded_channel();
         let (frames, _frames_rx) = std::sync::mpsc::channel();
-        let _ = start(rt.handle().clone(), connection.clone(), recv, control, frames, 3, "100000001".into(), || {});
+        let _ = start(rt.handle().clone(), connection.clone(), recv, control, frames, 3, "100000001".into(), false, || {});
         connection.close(0u32.into(), b"test");
         rt.shutdown_timeout(Duration::from_secs(3));
     }

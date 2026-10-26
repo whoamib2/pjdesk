@@ -63,7 +63,16 @@ struct Stats {
     encode_us: AtomicU64,
 }
 
-pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
+pub enum ViewerStop {
+    /// The person closed the window.
+    UserClosed,
+    /// The host is restarting. Wait, then connect again.
+    HostRestart,
+    /// A relayed session lost the server. Connect again with the same password.
+    RelayResume,
+}
+
+pub fn run(runtime: &Runtime, link: Link) -> Result<ViewerStop> {
     if let Some(reason) = link.connection.close_reason() {
         let text = format!("The host closed the session before the window opened: {reason}");
         crate::note_failure(&text);
@@ -78,6 +87,7 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
     let (frame_tx, frame_rx) = std::sync::mpsc::channel::<(VideoHeader, Vec<u8>)>();
 
     let Link { connection, endpoint, control_send, control_recv, host_name, host_id, path, peer_proto } = link;
+    let relayed = matches!(path, crate::p2p::LinkPath::Relay(_));
     let title = format!("{host_name} ({}) — PJDesk, {path}", format_id(&host_id));
 
     runtime.spawn(send_control(control_send, control_rx));
@@ -90,6 +100,7 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         frame_tx,
         peer_proto,
         host_id.clone(),
+        relayed,
         move || {
             let _ = wake_proxy.send_event(UserEvent::Frame);
         },
@@ -135,6 +146,7 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         cmds,
         panel: super::panel::Panel::default(),
         restarting: false,
+        relay_resume: false,
         peer_id: host_id.clone(),
         host_name,
         extra: Vec::new(),
@@ -166,6 +178,11 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
                 return;
             }
             let guard = live_watch.lock().unwrap();
+            if guard.resume_relay {
+                drop(guard);
+                let _ = proxy_watch.send_event(UserEvent::Closed(pjdesk_proto::failover::RELAY_RESUME.into()));
+                return;
+            }
             if guard.restart {
                 return;
             }
@@ -215,14 +232,20 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<bool> {
         anyhow::bail!(text);
     }
 
-    let restarting = app.restarting;
-    if !restarting {
+    let stop = if app.relay_resume {
+        ViewerStop::RelayResume
+    } else if app.restarting {
+        ViewerStop::HostRestart
+    } else {
+        ViewerStop::UserClosed
+    };
+    if !matches!(stop, ViewerStop::HostRestart | ViewerStop::RelayResume) {
         connection.close(0u32.into(), b"viewer closed");
     }
     runtime.block_on(async {
         let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
     });
-    Ok(restarting)
+    Ok(stop)
 }
 
 /// Writes queued control messages, batching whatever is pending.
@@ -365,6 +388,7 @@ struct App {
     cmds: mpsc::UnboundedSender<super::controls::Cmd>,
     panel: super::panel::Panel,
     restarting: bool,
+    relay_resume: bool,
     peer_id: String,
     host_name: String,
     extra: Vec<ExtraPane>,
@@ -1776,8 +1800,18 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(window) = self.window.clone() else { return };
         match event {
             UserEvent::Frame => {
-                if self.live.lock().unwrap().restart {
+                let (restart, resume) = {
+                    let live = self.live.lock().unwrap();
+                    (live.restart, live.resume_relay)
+                };
+                if restart {
                     self.restarting = true;
+                    event_loop.exit();
+                    return;
+                }
+                if resume {
+                    self.relay_resume = true;
+                    info!("{}", pjdesk_proto::failover::RELAY_RESUME);
                     event_loop.exit();
                     return;
                 }
@@ -1802,6 +1836,12 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Files(paths) => self.accept_dropped(paths),
             UserEvent::Closed(reason) => {
+                if self.live.lock().unwrap().resume_relay || pjdesk_proto::failover::is_relay_resume(&reason) {
+                    self.relay_resume = true;
+                    info!("{}", pjdesk_proto::failover::RELAY_RESUME);
+                    event_loop.exit();
+                    return;
+                }
                 self.closed = true;
                 info!("Disconnected: {reason}");
                 crate::note_status(&format!("Session stopped: {reason}"));

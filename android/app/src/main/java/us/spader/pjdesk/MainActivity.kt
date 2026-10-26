@@ -197,7 +197,7 @@ class MainActivity : FragmentActivity() {
         AppLog.i("main activity created task=$taskId")
         if (app.store.temporaryActive() && !tempFlag.get()) app.store.endTemporaryVisit()
         if (app.store.accountServer.isNotBlank()) {
-            app.engine.applyAccountServer(app.store.accountServer, app.store.accountFingerprint, quiet = true)
+            app.engine.applyAccountServer(app.store.accountServer, app.store.accountFingerprint, quiet = true, standby = app.store.accountStandby)
         }
         enableEdgeToEdge()
         HostService.arm(this)
@@ -398,13 +398,20 @@ class MainActivity : FragmentActivity() {
                     }
                 }
             }
-            fun rememberAccountServer(address: String, fingerprint: String, lan: List<String>, publicIp: String) {
+            fun rememberAccountServer(
+                address: String,
+                fingerprint: String,
+                lan: List<String>,
+                publicIp: String,
+                standby: String = "",
+            ) {
                 if (address.isBlank()) return
                 app.store.accountServer = address
                 app.store.accountFingerprint = fingerprint
                 app.store.accountLan = lan.joinToString(",")
                 app.store.accountPublicIp = publicIp
-                engine.applyAccountServer(address, fingerprint, quiet = true)
+                if (standby.isNotBlank()) app.store.accountStandby = standby
+                engine.applyAccountServer(address, fingerprint, quiet = true, standby = app.store.accountStandby)
                 AppLog.i(
                     "account server $address lan=${lan.joinToString(",").ifBlank { "none" }} " +
                         "public=${publicIp.ifBlank { "none" }} fingerprint=${if (fingerprint.isBlank()) "missing" else "set"}",
@@ -503,7 +510,7 @@ class MainActivity : FragmentActivity() {
                         }
                         accountComputers = enrolled.computers
                         enrolledFor = if (pjdeskId.length == 9) pjdeskId else ""
-                        rememberAccountServer(enrolled.address, enrolled.fingerprint, enrolled.lan, enrolled.publicIp)
+                        rememberAccountServer(enrolled.address, enrolled.fingerprint, enrolled.lan, enrolled.publicIp, enrolled.standbyAddress)
                         cloudAccess = enrolled.access
                         engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", enrolled.access).toString())
                         account = who
@@ -652,7 +659,7 @@ class MainActivity : FragmentActivity() {
                             cloudAccess = session.access
                             engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
                         }
-                        rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp)
+                        rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress)
                         app.store.mergeCloud(session.computers)
                         saved = app.store.saved()
                     } finally {
@@ -716,7 +723,7 @@ class MainActivity : FragmentActivity() {
                                 AppLog.e(connectError.orEmpty())
                                 return@launch
                             }
-                            rememberAccountServer(fetched.address, fetched.fingerprint, fetched.lan, fetched.publicIp)
+                            rememberAccountServer(fetched.address, fetched.fingerprint, fetched.lan, fetched.publicIp, fetched.standbyAddress)
                             cloudAccess = fetched.access
                             engine.command(JSONObject().put("cmd", "accessToken").put("token", fetched.access).toString())
                             beginConnect(rawId, ignoreOffline)
@@ -912,7 +919,7 @@ class MainActivity : FragmentActivity() {
                 cloudAccess = session.access
                 engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
                 if (!temporarySession) {
-                    rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp)
+                    rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress)
                     app.store.mergeCloud(session.computers)
                     saved = app.store.saved()
                     if (app.vaultKey != null) syncPasswords(true)
@@ -1311,7 +1318,7 @@ class MainActivity : FragmentActivity() {
                             account = who
                             netEmail = who
                             if (signed.refresh.isNotBlank()) app.store.saveNetworkRefresh(signed.refresh)
-                            rememberAccountServer(signed.address, signed.fingerprint, signed.lan, signed.publicIp)
+                            rememberAccountServer(signed.address, signed.fingerprint, signed.lan, signed.publicIp, signed.standbyAddress)
                             cloudAccess = signed.access
                             engine.command(JSONObject().put("cmd", "accessToken").put("token", signed.access).toString())
                             commitAutofill()

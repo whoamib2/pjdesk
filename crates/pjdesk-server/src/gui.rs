@@ -1500,14 +1500,14 @@ impl App {
                 let (color, text) = if snap.role == "active" {
                     let who =
                         if snap.active_name.is_empty() { "this server".to_string() } else { snap.active_name.clone() };
-                    (p(ui).ok, format!("Primary: {who} uploads to the cloud (generation {}).", snap.epoch))
+                    (p(ui).ok, format!("Role: Primary. {who} uploads to the cloud (generation {}).", snap.epoch))
                 } else {
                     let who = if snap.active_name.is_empty() {
                         "the other server".to_string()
                     } else {
                         snap.active_name.clone()
                     };
-                    (p(ui).accent, format!("Standby. Primary: {who} (generation {}).", snap.epoch))
+                    (p(ui).accent, format!("Role: Standby. Primary: {who} (generation {}).", snap.epoch))
                 };
                 ui_widgets::dot(ui, color);
                 ui.label(text);
@@ -1915,7 +1915,7 @@ impl App {
                         ui_widgets::dot(ui, p(ui).ok);
                         let who =
                             if s.active_name.is_empty() { "this server".to_string() } else { s.active_name.clone() };
-                        ui.label(format!("Primary: {who} uploads to the cloud (generation {}).", s.epoch));
+                        ui.label(format!("Role: Primary. {who} uploads to the cloud (generation {}).", s.epoch));
                     } else {
                         ui_widgets::dot(ui, p(ui).accent);
                         let who = if s.active_name.is_empty() {
@@ -1923,7 +1923,7 @@ impl App {
                         } else {
                             s.active_name.clone()
                         };
-                        ui.label(format!("Standby. Primary: {who} (generation {}).", s.epoch));
+                        ui.label(format!("Role: Standby. Primary: {who} (generation {}).", s.epoch));
                     }
                 });
                 if let Some(peer) = self.peer_version_line() {
