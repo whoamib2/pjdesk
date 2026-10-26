@@ -7,10 +7,11 @@ the stand, because the white plastic is the same color as the light squares.
 These marks are redrawn: crisp curves, a transparent background, and a thin
 dark outline so the white reads on a dark title bar.
 
-The client keeps the monitor. PJDesk Server has its own mark in the same
-palette: a large server box in front, with a small monitor and cursor behind
-it. Sizes 16 and 24 use a bolder drawing of the same shapes so the tray stays
-legible.
+The client keeps the monitor. PJDesk Server does not use this drawing.
+Its mark is the dark stack with green status lights from 2026-10-16
+(commit 51d6fc1, tools/make_server_icon.py). This script must not
+overwrite those server files. Sizes 16 and 24 use a bolder drawing of
+the client shapes so the tray stays legible.
 """
 import io
 import math
@@ -377,15 +378,13 @@ def write_svgs():
     docs = os.path.join(ROOT, "docs")
     os.makedirs(docs, exist_ok=True)
     open(os.path.join(docs, "pjdesk-icon.svg"), "w").write(svg_for("client", 256))
-    open(os.path.join(docs, "pjdesk-server-icon.svg"), "w").write(svg_for("server", 256))
 
 
 def write_windows(images):
     client = os.path.join(ROOT, "crates", "pjdesk", "assets")
-    server = os.path.join(ROOT, "crates", "pjdesk-server", "assets")
+    # The server icon is the 2026-10-16 dark stack. Do not write it from here.
     for kind, folder, ico_name, png_name, rgba_prefix in (
         ("client", client, "pjdesk.ico", "icon_256.png", "icon"),
-        ("server", server, "pjdesk-server.ico", "icon_server_256.png", "icon_server"),
     ):
         os.makedirs(folder, exist_ok=True)
         frames = [images[kind][s] for s in SIZES]
@@ -428,7 +427,6 @@ def write_site(images):
         [images["client"][16], images["client"][32], images["client"][48]],
     )
     save_png(master, os.path.join(ROOT, "docs", "pjdesk-icon.png"))
-    save_png(images["server"][256], os.path.join(ROOT, "docs", "pjdesk-server-icon.png"))
 
 
 def _caption(draw, text, x, y):

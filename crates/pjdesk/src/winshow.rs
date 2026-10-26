@@ -31,6 +31,31 @@ pub fn activate(reason: &str, title: &str, owns_gui: bool) {
     }
 }
 
+/// Take the taskbar button off a window that is already minimized.
+/// Returns false when the window is not iconic yet, so the caller waits.
+/// The window thread calls this. The tray thread does not.
+pub fn conceal_from_taskbar(title: &str) -> bool {
+    #[cfg(windows)]
+    {
+        imp::conceal_from_taskbar(title)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+        false
+    }
+}
+
+/// Put the taskbar button back before the window is restored.
+pub fn reveal_on_taskbar(title: &str) {
+    #[cfg(windows)]
+    imp::reveal_on_taskbar(title);
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::os::windows::process::CommandExt;
@@ -40,11 +65,14 @@ mod imp {
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM, RECT};
     use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
+    use windows::Win32::UI::Shell::{ITaskbarList, TaskbarList};
     use windows::Win32::UI::WindowsAndMessaging::{
         AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
         GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MoveWindow, SetForegroundWindow,
-        SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW,
+        SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOP, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWMINNOACTIVE, WS_EX_APPWINDOW,
         WS_EX_TOOLWINDOW,
     };
 
@@ -52,6 +80,8 @@ mod imp {
 
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     static LAST_LAUNCH: Mutex<Option<Instant>> = Mutex::new(None);
+    /// Exstyle from before the window left the taskbar. Restored on open.
+    static SAVED_EXSTYLE: Mutex<Option<isize>> = Mutex::new(None);
 
     struct Query {
         title: String,
@@ -134,15 +164,88 @@ mod imp {
         Some((hwnd, pid))
     }
 
+    /// The window is already minimized. Drop the taskbar button and keep it iconic,
+    /// so the next frame does not paint a hidden window.
+    pub fn conceal_from_taskbar(title: &str) -> bool {
+        let Some((hwnd, _)) = find(title) else { return false };
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() || !IsIconic(hwnd).as_bool() {
+                return false;
+            }
+            let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            {
+                let mut saved = SAVED_EXSTYLE.lock().unwrap_or_else(|err| err.into_inner());
+                if saved.is_none() {
+                    *saved = Some(current);
+                }
+            }
+            let parked = (current | WS_EX_TOOLWINDOW.0 as isize) & !(WS_EX_APPWINDOW.0 as isize);
+            if current != parked {
+                let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, parked);
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+                // The shell keeps a minimized window's taskbar button until the
+                // window is hidden and minimized again. It must end iconic:
+                // a hidden window that is not minimized is painted, and that
+                // paint waits forever.
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                let _ = ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+            }
+            if !IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            }
+            if let Some(list) = taskbar_list() {
+                let _ = list.DeleteTab(hwnd);
+            }
+            IsIconic(hwnd).as_bool()
+        }
+    }
+
+    pub fn reveal_on_taskbar(title: &str) {
+        let Some((hwnd, _)) = find(title) else { return };
+        unsafe {
+            if let Some(original) = SAVED_EXSTYLE.lock().unwrap_or_else(|err| err.into_inner()).take() {
+                let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, original);
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+            if let Some(list) = taskbar_list() {
+                let _ = list.AddTab(hwnd);
+            }
+        }
+    }
+
+    fn taskbar_list() -> Option<ITaskbarList> {
+        unsafe {
+            // Already initialized is fine, including a different apartment.
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let list: ITaskbarList = CoCreateInstance(&TaskbarList, None, CLSCTX_ALL).ok()?;
+            list.HrInit().ok()?;
+            Some(list)
+        }
+    }
+
     unsafe extern "system" fn enum_window(hwnd: HWND, data: LPARAM) -> BOOL {
         let query = unsafe { &mut *(data.0 as *mut Query) };
         if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return BOOL(1);
         }
-        let ex = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
-        if ex & WS_EX_TOOLWINDOW.0 != 0 {
-            return BOOL(1);
-        }
+        // A window parked in the tray is a tool window. It still has this title,
+        // so it has to be found when the tray opens it.
         let mut buf = [0u16; 256];
         let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
         if n <= 0 {

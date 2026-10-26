@@ -348,6 +348,10 @@ pub struct App {
     logo: Option<egui::TextureHandle>,
     really_quit: bool,
     told_tray: bool,
+    /// Close (X) parked the window in the tray. The minimize button does not.
+    in_tray: bool,
+    /// The taskbar button has been removed for this hide.
+    tray_hidden: bool,
     /// Show toggle for the support password. Separate from the one-time password.
     show_support_password: bool,
     support_code_in: String,
@@ -540,6 +544,8 @@ impl App {
             )),
             really_quit: false,
             told_tray: false,
+            in_tray: false,
+            tray_hidden: false,
             show_support_password: false,
             support_code_in: String::new(),
             support_pass_in: String::new(),
@@ -2442,6 +2448,8 @@ impl App {
 fn reveal_window(ctx: &egui::Context, reason: &str) {
     crate::traywatch::ack();
     crate::winshow::note_user_open();
+    // Put the taskbar button back before the restore looks the window up.
+    crate::winshow::reveal_on_taskbar("PJDesk");
     ctx.request_repaint();
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -2721,11 +2729,15 @@ impl App {
             match action {
                 tray::Action::Show => {
                     tracing::info!("Tray click reached PJDesk. Showing the window. The PIN lock is shown when one is set.");
+                    self.in_tray = false;
+                    self.tray_hidden = false;
                     reveal_window(ctx, "Open");
                     self.lock_from_tray();
                 }
                 tray::Action::Update => {
                     tracing::info!("Tray click: Check for updates. Showing the window.");
+                    self.in_tray = false;
+                    self.tray_hidden = false;
                     reveal_window(ctx, "Check for updates");
                     if self.signed_in() {
                         self.lock_from_tray();
@@ -2750,10 +2762,22 @@ impl App {
         if closing && pjdesk_proto::trayshow::minimize_on_close(has_tray, self.really_quit, crate::winshow::user_just_opened()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.in_tray = true;
             if !self.told_tray {
                 self.told_tray = true;
-                tracing::info!("The window was closed. PJDesk stays minimized in the tray. A click or double-click opens it again.");
+                tracing::info!("The window was closed. PJDesk stays in the tray. A click or double-click opens it again.");
                 self.toast.show("PJDesk is still running — click the tray icon, or right-click it to Quit");
+            }
+        }
+        // The minimize button leaves the taskbar button. Only X (in_tray) removes it,
+        // and only once the window is already minimized so this frame is not painted.
+        if self.in_tray && !self.really_quit && !crate::winshow::user_just_opened() {
+            let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
+            if minimized {
+                if crate::winshow::conceal_from_taskbar("PJDesk") && !self.tray_hidden {
+                    self.tray_hidden = true;
+                    tracing::info!("The taskbar button is removed. PJDesk is only in the tray.");
+                }
             }
         }
     }
@@ -2787,10 +2811,11 @@ impl eframe::App for App {
         self.on_tray(ctx);
         // Windows does not redraw a minimized window. Keep waking so a tray
         // click is still noticed and the window thread is not left idle.
-        let parked = ctx.input(|i| {
-            let view = i.viewport();
-            view.minimized == Some(true) || view.visible() == Some(false)
-        });
+        let parked = self.in_tray
+            || ctx.input(|i| {
+                let view = i.viewport();
+                view.minimized == Some(true) || view.visible() == Some(false)
+            });
         if parked {
             ctx.request_repaint_after(Duration::from_millis(100));
         }

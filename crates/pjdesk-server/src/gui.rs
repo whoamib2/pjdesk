@@ -43,6 +43,8 @@ fn p(ui: &egui::Ui) -> Paint {
 fn reveal_window(ctx: &egui::Context, reason: &str) {
     crate::traywatch::ack();
     crate::winshow::note_user_open();
+    // Put the taskbar button back before the restore looks the window up.
+    crate::winshow::reveal_on_taskbar("PJDesk Server");
     ctx.request_repaint();
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -51,7 +53,8 @@ fn reveal_window(ctx: &egui::Context, reason: &str) {
     crate::winshow::activate(reason, "PJDesk Server", crate::tray::holds_window());
 }
 
-/// `--tray` starts minimized instead of hidden, so the window keeps running.
+/// `--tray` starts minimized. A hidden window that is not minimized is painted,
+/// and that paint waits forever.
 static PARK_ON_START: AtomicBool = AtomicBool::new(false);
 
 pub fn run(data_dir: PathBuf, port: u16, start_hidden: bool) -> Result<()> {
@@ -67,7 +70,6 @@ pub fn run(data_dir: PathBuf, port: u16, start_hidden: bool) -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([880.0, 820.0])
             .with_min_inner_size([760.0, 640.0])
-            .with_visible(!start_hidden)
             .with_title("PJDesk Server")
             .with_app_id("pjdesk-server")
             .with_icon(std::sync::Arc::new(egui::IconData {
@@ -104,6 +106,10 @@ struct App {
     tray: Option<crate::tray::Tray>,
     really_quit: bool,
     told_tray: bool,
+    /// Close (X), or `--tray`, parked the window in the tray. The minimize button does not.
+    in_tray: bool,
+    /// The taskbar button has been removed for this hide.
+    tray_hidden: bool,
     /// Started from `--tray`. The first frame minimizes instead of hiding.
     parked: bool,
     update_start: String,
@@ -294,6 +300,8 @@ impl App {
             tray: crate::tray::Tray::new(&cc.egui_ctx),
             really_quit: false,
             told_tray: false,
+            in_tray: false,
+            tray_hidden: false,
             parked: PARK_ON_START.swap(false, Ordering::SeqCst),
             update_start: String::new(),
             update_end: String::new(),
@@ -369,6 +377,10 @@ impl App {
             ak_rx: None,
             ak_busy: false,
         };
+        if app.parked {
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            crate::winshow::minimize_now("PJDesk Server");
+        }
         crate::public_addr::remember_port(&app.data_dir, port);
         if spawn_probe {
             // The first paint must not wait on the data folder, the control pipe,
@@ -604,10 +616,20 @@ impl App {
     fn on_tray(&mut self, ctx: &egui::Context) {
         let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
         let has_tray = self.tray.is_some();
+        if self.parked {
+            self.parked = false;
+            if !crate::winshow::user_just_opened() {
+                self.in_tray = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                tracing::info!("PJDesk Server started in the tray. The window stays there so it can open again.");
+            }
+        }
         for action in tray_actions {
             match action {
                 crate::tray::Action::Show => {
                     tracing::info!("Tray click reached PJDesk Server. Showing the window. The PIN lock is shown when one is set.");
+                    self.in_tray = false;
+                    self.tray_hidden = false;
                     reveal_window(ctx, "Open");
                     self.gate.engage();
                 }
@@ -623,6 +645,8 @@ impl App {
                 crate::tray::Action::OpenLog => crate::tray::open_log_folder(&self.data_dir),
                 crate::tray::Action::CheckUpdates => {
                     tracing::info!("Tray click: Check for updates. Showing the window.");
+                    self.in_tray = false;
+                    self.tray_hidden = false;
                     reveal_window(ctx, "Check for updates");
                     self.gate.engage();
                     if self.via_service() {
@@ -640,6 +664,8 @@ impl App {
                 }
                 crate::tray::Action::Promote => {
                     tracing::info!("Tray click: Make this the primary. Showing the window.");
+                    self.in_tray = false;
+                    self.tray_hidden = false;
                     reveal_window(ctx, "Make this the primary");
                     self.gate.engage();
                     self.cloud_form.confirm_promote = true;
@@ -647,6 +673,8 @@ impl App {
                 }
                 crate::tray::Action::Demote => {
                     tracing::info!("Tray click: Step down to standby. Showing the window.");
+                    self.in_tray = false;
+                    self.tray_hidden = false;
                     reveal_window(ctx, "Step down to standby");
                     self.gate.engage();
                     self.cloud_form.confirm_demote = true;
@@ -669,21 +697,26 @@ impl App {
                 }
             }
         }
-        if self.parked {
-            self.parked = false;
-            if !crate::winshow::user_just_opened() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                tracing::info!("PJDesk Server started in the tray. The window stays minimized so it can open again.");
-            }
-        }
         let closing = ctx.input(|i| i.viewport().close_requested());
         if closing && pjdesk_proto::trayshow::minimize_on_close(has_tray, self.really_quit, crate::winshow::user_just_opened()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.in_tray = true;
             if !self.told_tray {
                 self.told_tray = true;
-                tracing::info!("The window was closed. PJDesk Server stays minimized in the tray. A click or double-click opens it again.");
+                tracing::info!("The window was closed. PJDesk Server stays in the tray. A click or double-click opens it again.");
                 self.status = "PJDesk Server is still running in the tray — right-click it to Quit.".into();
+            }
+        }
+        // The minimize button leaves the taskbar button. Only X, or --tray, removes it,
+        // and only once the window is already minimized so this frame is not painted.
+        if self.in_tray && !self.really_quit && !crate::winshow::user_just_opened() {
+            let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
+            if minimized {
+                if crate::winshow::conceal_from_taskbar("PJDesk Server") && !self.tray_hidden {
+                    self.tray_hidden = true;
+                    tracing::info!("The taskbar button is removed. PJDesk Server is only in the tray.");
+                }
             }
         }
     }
@@ -696,10 +729,11 @@ impl eframe::App for App {
         self.on_tray(ctx);
         // Windows does not redraw a minimized window. Keep waking so a tray
         // click is still noticed and the window thread is not left idle.
-        let parked = ctx.input(|i| {
-            let view = i.viewport();
-            view.minimized == Some(true) || view.visible() == Some(false)
-        });
+        let parked = self.in_tray
+            || ctx.input(|i| {
+                let view = i.viewport();
+                view.minimized == Some(true) || view.visible() == Some(false)
+            });
         if parked {
             ctx.request_repaint_after(Duration::from_millis(100));
         }

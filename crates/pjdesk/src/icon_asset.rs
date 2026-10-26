@@ -1,4 +1,5 @@
-//! Checks the generated PJDesk icon. The artwork is produced by tools/make_icon.py.
+//! Checks the PJDesk icons. The client artwork comes from tools/make_icon.py.
+//! The server mark is the dark stack from 2026-10-16 (tools/make_server_icon.py).
 
 #[cfg(test)]
 mod tests {
@@ -92,30 +93,42 @@ mod tests {
 
     #[test]
     fn server_icon_is_its_own_mark() {
+        // The 2026-10-16 server mark: a dark stack with green status lights.
+        // It is not the client monitor, and it is not the later white server box.
         let client = include_bytes!("../assets/icon_256.rgba");
         let server = include_bytes!("../../pjdesk-server/assets/icon_server_256.rgba");
         assert_ne!(client as &[u8], server as &[u8]);
         corners_clear(server, 256);
+        let dark = server
+            .chunks(4)
+            .filter(|p| p[3] > 200 && p[0] < 40 && p[1] < 50 && p[2] < 70)
+            .count();
         let white = server
             .chunks(4)
             .filter(|p| p[3] > 200 && p[0] > 210 && p[1] > 210 && p[2] > 210)
             .count();
-        let blue = server
+        let green = server
             .chunks(4)
-            .filter(|p| p[3] > 200 && p[2] > 160 && p[2] > p[0].saturating_add(40))
+            .filter(|p| p[3] > 200 && p[1] > 140 && p[1] > p[0].saturating_add(40) && p[1] > p[2])
             .count();
-        assert!(white > 4_000, "the server box should be the large white shape");
-        assert!(blue > 400, "the server bars should be blue");
+        assert!(dark > 40_000, "the server mark is a dark stack");
+        assert!(white < 100, "the server mark is not the white box");
+        assert!(green > 100, "the status lights are green");
         assert_ne!(
             include_bytes!("../assets/pjdesk.ico") as &[u8],
             include_bytes!("../../pjdesk-server/assets/pjdesk-server.ico") as &[u8]
         );
         let tray = include_bytes!("../../pjdesk-server/assets/icon_server_32.rgba");
         corners_clear(tray, 32);
-        let tray_blue = tray
+        let tray_dark = tray
             .chunks(4)
-            .filter(|p| p[3] > 180 && p[2] > 140 && p[2] > p[0].saturating_add(30))
+            .filter(|p| p[3] > 180 && p[0] < 50 && p[1] < 60 && p[2] < 80)
             .count();
-        assert!(tray_blue > 20, "the server tray mark should keep the blue bars");
+        let tray_green = tray
+            .chunks(4)
+            .filter(|p| p[3] > 180 && p[1] > 100 && p[1] > p[0].saturating_add(20))
+            .count();
+        assert!(tray_dark > 400, "the server tray mark stays dark");
+        assert!(tray_green > 4, "the server tray mark keeps a green light");
     }
 }

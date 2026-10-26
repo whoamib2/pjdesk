@@ -76,9 +76,9 @@ pub fn hide_because_minimized(minimized: bool, opening: bool) -> bool {
     minimized && !opening
 }
 
-/// The close button minimizes the window into the tray. It does not
-/// destroy the window, and it does not hide it. Quit still closes.
-/// An open that just happened is left alone.
+/// The close button parks the window in the tray. It does not destroy
+/// the window. Quit still closes. An open that just happened is left
+/// alone. The minimize button is a different path and keeps the taskbar button.
 pub fn minimize_on_close(has_tray: bool, really_quit: bool, just_opened: bool) -> bool {
     has_tray && !really_quit && !just_opened
 }
