@@ -33,6 +33,11 @@ pub const TUNNEL: u32 = 1 << 10;
 /// as something the person allowed.
 pub const LAYOUT: u32 = 1 << 11;
 
+/// Not a permission. A 0.6.8 controller sets this on Hello so the host knows
+/// it can ask who is connecting. Absent from [`ALL`], so [`grant`] clears it
+/// and an older host never treats it as something the person allowed.
+pub const VISITOR: u32 = 1 << 12;
+
 /// Every permission bit this version defines. Unknown high bits are ignored.
 pub const ALL: u32 =
     KEYBOARD | MOUSE | CLIPBOARD | FILE | AUDIO | RESTART | PRIVACY | BLOCK_INPUT | CHAT | RECORD | TUNNEL;

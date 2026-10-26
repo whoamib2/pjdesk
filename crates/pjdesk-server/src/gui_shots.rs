@@ -25,6 +25,121 @@ fn server_shots() {
         image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
         eprintln!("wrote {}", path.display());
     }
+    for (name, theme) in [("server-network-dark", egui::Theme::Dark), ("server-network-light", egui::Theme::Light)] {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(960.0, 720.0))
+            .with_pixels_per_point(1.0)
+            .with_theme(theme)
+            .wgpu()
+            .build_eframe(move |cc| {
+                let mut app = preview(cc, false, false);
+                app.preview_network = true;
+                let theme_name = match theme {
+                    egui::Theme::Light => "light",
+                    egui::Theme::Dark => "dark",
+                };
+                crate::ui_theme::apply(&cc.egui_ctx, theme_name);
+                std::fs::write(
+                    app.data_dir.join(crate::access::FILE_NAME),
+                    r#"{"require_accounts":true,"public_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","fingerprint":"cd","allowed_accounts":["ben@spader.us","ada@example.com"],"revoked_devices":[]}"#,
+                )
+                .unwrap();
+                std::fs::write(
+                    app.data_dir.join("devices.json"),
+                    r#"{"devices":{"123456789":{"secret_sha256":"hidden","hostname":"Office","app_version":"0.5.1","first_seen":1,"last_seen":2,"signed_in":true},"555666777":{"secret_sha256":"hidden","hostname":"Laptop","app_version":"0.5.2","first_seen":1,"last_seen":2,"signed_in":false},"902488771":{"secret_sha256":"hidden","hostname":"This PC","app_version":"0.6.0","first_seen":1,"last_seen":2,"signed_in":true}}}"#,
+                )
+                .unwrap();
+                app.refresh();
+                app.pub_addr = "pjdesk.spader.us:21200".into();
+                app.pub_addr_ready = true;
+                app.pub_addr_confirmed = true;
+                app.pub_addr_needs_confirm = false;
+                app.pub_addr_note = "Published as the active server.".into();
+                app
+            });
+        harness.step();
+        let image = harness.render().unwrap_or_else(|e| panic!("render {name}: {e}"));
+        let path = dir.join(format!("{name}.png"));
+        image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
+        eprintln!("wrote {}", path.display());
+    }
+    for (name, theme) in [("server-netkey-dark", egui::Theme::Dark), ("server-netkey-light", egui::Theme::Light)] {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(960.0, 720.0))
+            .with_pixels_per_point(1.0)
+            .with_theme(theme)
+            .wgpu()
+            .build_eframe(move |cc| {
+                let mut app = preview(cc, false, false);
+                app.preview_netkey = true;
+                let theme_name = match theme {
+                    egui::Theme::Light => "light",
+                    egui::Theme::Dark => "dark",
+                };
+                crate::ui_theme::apply(&cc.egui_ctx, theme_name);
+                let secret = [0x11u8; 32];
+                let contents = pjdesk_proto::netkey::Contents {
+                    network_id: "net_office",
+                    active: "office.example:21200",
+                    active_fingerprint: "abcd",
+                    standby: "cabin.example:21200",
+                    standby_fingerprint: "00112233",
+                };
+                app.nk_blob = pjdesk_proto::netkey::seal_embedded(&contents, &secret).unwrap_or_default();
+                app.nk_embedded = true;
+                app.nk_open = true;
+                app.nk_loaded = true;
+                app.nk_invites = vec![crate::cloud::NetworkInvite {
+                    id: "ink_office".into(),
+                    mode: "passphrase".into(),
+                    bound_email: String::new(),
+                    max_uses: Some(5),
+                    uses: 1,
+                    expires_at: None,
+                    revoked_at: None,
+                    history: vec![crate::cloud::InviteUse {
+                        device_name: "Laptop".into(),
+                        email: "ben@spader.us".into(),
+                        used_at: 1_728_100_000,
+                    }],
+                }];
+                app
+            });
+        harness.step();
+        let image = harness.render().unwrap_or_else(|e| panic!("render {name}: {e}"));
+        let path = dir.join(format!("{name}.png"));
+        image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
+        eprintln!("wrote {}", path.display());
+    }
+    for (name, theme) in [("server-account-dark", egui::Theme::Dark), ("server-account-light", egui::Theme::Light)] {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(960.0, 320.0))
+            .with_pixels_per_point(1.0)
+            .with_theme(theme)
+            .wgpu()
+            .build_eframe(move |cc| {
+                let mut app = preview(cc, false, false);
+                app.preview_account = true;
+                let theme_name = match theme {
+                    egui::Theme::Light => "light",
+                    egui::Theme::Dark => "dark",
+                };
+                crate::ui_theme::apply(&cc.egui_ctx, theme_name);
+                if let Some(cloud) = app.cloud.as_mut() {
+                    cloud.account = "ben@spader.us".into();
+                    cloud.role = "active".into();
+                    cloud.active_name = "BENLENOVODESK".into();
+                    cloud.peer_name.clear();
+                    cloud.peer_role = "standby".into();
+                }
+                app
+            });
+        harness.step();
+        let image = harness.render().unwrap_or_else(|e| panic!("render {name}: {e}"));
+        let path = dir.join(format!("{name}.png"));
+        image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
+        eprintln!("wrote {}", path.display());
+    }
 }
 
 fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -> App {
@@ -45,7 +160,10 @@ fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -
         .unwrap();
         std::fs::write(
             dir.join("server-update-status.json"),
-            format!(r#"{{"last_check_at":{},"last_result":"Up to date","available":"","error":""}}"#, now.saturating_sub(120)),
+            format!(
+                r#"{{"last_check_at":{},"last_result":"Up to date","available":"","error":""}}"#,
+                now.saturating_sub(120)
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -85,7 +203,8 @@ fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -
             version: env!("CARGO_PKG_VERSION").into(),
             port: 21200,
             service_running: true,
-            fingerprint: "7f:3a:9c:11:b2:44:e0:8d:6c:15:aa:90:33:de:71:04:58:c6:2b:f9:17:ab:63:d0:4e:88:21:5c:b7:0a:66:d4".into(),
+            fingerprint:
+                "7f:3a:9c:11:b2:44:e0:8d:6c:15:aa:90:33:de:71:04:58:c6:2b:f9:17:ab:63:d0:4e:88:21:5c:b7:0a:66:d4".into(),
             fingerprint_known: true,
             update_auto: true,
             update_known: true,
@@ -108,12 +227,16 @@ fn preview(cc: &eframe::CreationContext<'_>, locked: bool, devices_only: bool) -
                     hostname: "Office".into(),
                     version: "0.5.1".into(),
                     online: true,
+                    signed_in: true,
+                    ..Default::default()
                 },
                 crate::status_view::ListedDevice {
                     id: "444555666".into(),
                     hostname: "Old laptop".into(),
                     version: String::new(),
                     online: false,
+                    signed_in: false,
+                    ..Default::default()
                 },
             ],
             ..Snapshot::default()

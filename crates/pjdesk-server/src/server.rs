@@ -11,20 +11,35 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use pjdesk_proto::framing::{read_msg, write_msg, MAX_SIGNAL_FRAME};
 use pjdesk_proto::signal::{ClientMsg, ErrorCode, ServerMsg, SessionId};
+use pjdesk_proto::signal::{DeviceBrief, Role as AccountRole};
 use pjdesk_proto::tls::{self, TlsIdentity};
 use pjdesk_proto::udp::Role;
-use pjdesk_proto::signal::{DeviceBrief, Role as AccountRole};
-use pjdesk_proto::{format_id, normalize_id, protocol_ok, ALPN_SIGNAL, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SIGNAL_SERVER_NAME};
+use pjdesk_proto::{
+    format_id, normalize_id, protocol_ok, ALPN_SIGNAL, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SIGNAL_SERVER_NAME,
+};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::registry::Registry;
 use crate::ServerOpts;
 
-/// Clients must send something (hosts ping every 25 s) within this time.
+/// Clients must send something within this time. Current hosts ping every 10 s
+/// and reconnect after 30 s of silence. 0.6.26 hosts still ping every 25 s, so
+/// this stays at 90 s and does not drop them.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long Connect waits when the computer was registered recently but is
+/// missing from the live table. It is usually reconnecting.
+const CONNECT_WAIT: Duration = Duration::from_secs(12);
+const CONNECT_POLL: Duration = Duration::from_millis(250);
+/// A last-seen time inside this window is recent enough to wait.
+const CONNECT_RECENT_SECS: u64 = 120;
+
+/// True when `last_seen` is non-zero and no older than [`CONNECT_RECENT_SECS`].
+fn host_was_seen_recently(last_seen: u64, now: u64) -> bool {
+    last_seen > 0 && now.saturating_sub(last_seen) <= CONNECT_RECENT_SECS
+}
 /// Sessions that never complete are forgotten after this long.
 const SESSION_TTL: Duration = Duration::from_secs(600);
 /// Open sessions one address may have at once. Past this, further connection
@@ -72,6 +87,12 @@ pub struct OnlineHost {
     pub addr: SocketAddr,
     /// Protocol the host registered with. New server messages go only to version 3.
     pub proto: u16,
+    /// When this connection became the active registration.
+    pub since: Instant,
+    /// Wakes the connection task so a removed computer drops immediately.
+    pub close: Arc<Notify>,
+    /// Access key this registration presented. Empty when it used an account or grace.
+    pub access_key_id: String,
 }
 
 /// A connection attempt between a controller and a host.
@@ -192,7 +213,12 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     // or leak its key. Harmless if the service path already did it.
     #[cfg(windows)]
     crate::service::repair_data_dir(&data_dir);
+    crate::public_addr::remember_port(&data_dir, opts.port);
     let identity = load_identity(&data_dir)?;
+    crate::access::remember_fingerprint(&data_dir, &identity.fingerprint());
+    if crate::access::restore_grace(&data_dir) {
+        info!("Require signed-in accounts was on without being chosen. Grace mode is on again, so existing computers can connect.");
+    }
     let registry = Registry::load(data_dir.join("devices.json"))?;
     let device_count = registry.len();
     let accounts = crate::accounts::Accounts::load(&data_dir)?;
@@ -210,7 +236,11 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     info!("  Rendezvous/relay (UDP)   : {}:{}", opts.bind, opts.port);
     info!("  Data folder              : {}", data_dir.display());
     info!("  Registered devices       : {device_count}");
-    info!("  User accounts            : {account_count}");
+    if account_count == 0 {
+        info!("  Local accounts           : none (a PJDesk account is the server sign-in)");
+    } else {
+        info!("  Local accounts (legacy)  : {account_count}");
+    }
     info!("  Server key fingerprint   : {}", tls::format_fingerprint(&identity.fingerprint()));
     info!("Clients trust this key on first connect; compare it with what they print.");
 
@@ -227,10 +257,18 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     // Swappable, so a standby server can take on the key it syncs from the cloud.
     let acceptor = Arc::new(RwLock::new(TlsAcceptor::from(Arc::new(tls::server_config(&identity, ALPN_SIGNAL)?))));
 
+    let beacon_port = opts.port;
+    let beacon_fp = identity.fingerprint();
+    let beacon_dir = data_dir.clone();
+    let _ = std::thread::Builder::new().name("lan-beacon".into()).spawn(move || {
+        crate::public_addr::announce_lan(beacon_port, beacon_fp, beacon_dir);
+    });
+
     let relay = tokio::spawn(crate::relay::run(Arc::new(udp), state.clone()));
     let janitor = tokio::spawn(janitor(state.clone()));
     let fleet = tokio::spawn(fleet_sync(state.clone()));
     let cloud = tokio::spawn(cloud_sync(state.clone(), acceptor.clone()));
+    let failover = tokio::spawn(failover_watch(state.clone(), acceptor.clone()));
     let updates = tokio::spawn(server_updates(data_dir.clone()));
     // The management window reads this when it cannot open the data folder.
     {
@@ -238,6 +276,10 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         let pipe_port = opts.port;
         let _ = std::thread::Builder::new().name("status-pipe".into()).spawn(move || {
             crate::status_pipe::serve(pipe_dir, pipe_port);
+        });
+        let control_dir = data_dir.clone();
+        let _ = std::thread::Builder::new().name("control-pipe".into()).spawn(move || {
+            crate::control::serve(control_dir);
         });
     }
     crate::self_update::retire_legacy_task_if_disabled(&data_dir);
@@ -276,6 +318,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
     janitor.abort();
     fleet.abort();
     cloud.abort();
+    failover.abort();
     updates.abort();
     Ok(())
 }
@@ -329,6 +372,10 @@ struct Conn {
     host_id: Option<String>,
     /// Highest protocol version this connection has offered.
     proto: u16,
+    /// Network access token from [`ClientMsg::PresentAccess`], if this peer sent one.
+    access_token: String,
+    /// Set when this computer is removed. The read loop ends on the next wait.
+    close: Arc<Notify>,
 }
 
 impl Conn {
@@ -351,6 +398,7 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
     // Outgoing messages go through a channel so other tasks (e.g. the UDP
     // relay, or the other side of a session) can push messages to this client.
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let close = Arc::new(Notify::new());
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if write_msg(&mut writer, &msg).await.is_err() {
@@ -359,17 +407,33 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
         }
     });
 
-    let mut conn = Conn { id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed), addr, tx, host_id: None, proto: 0 };
+    let mut conn = Conn {
+        id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
+        addr,
+        tx,
+        host_id: None,
+        proto: 0,
+        access_token: String::new(),
+        close,
+    };
     debug!("{addr}: connected (conn {})", conn.id);
 
     let result: Result<()> = async {
         let mut burst_start = Instant::now();
         let mut burst = 0u32;
         loop {
-            let msg: ClientMsg = match tokio::time::timeout(IDLE_TIMEOUT, read_msg(&mut reader, MAX_SIGNAL_FRAME)).await
-            {
-                Ok(msg) => msg?,
-                Err(_) => bail!("idle timeout"),
+            let close = Arc::clone(&conn.close);
+            let closed = close.notified();
+            let closed = std::pin::pin!(closed);
+            let msg: ClientMsg = tokio::select! {
+                biased;
+                _ = closed => bail!("removed from this server"),
+                msg = tokio::time::timeout(IDLE_TIMEOUT, read_msg(&mut reader, MAX_SIGNAL_FRAME)) => {
+                    match msg {
+                        Ok(msg) => msg?,
+                        Err(_) => bail!("idle timeout"),
+                    }
+                }
             };
             // A single connection that sprays messages holds the process-wide
             // lock on every one of them. Drop it instead of queuing forever.
@@ -393,6 +457,7 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
         let mut guard = state.lock().unwrap();
         let st = &mut *guard;
         if st.online.get(id).map(|h| h.conn_id) == Some(conn.id) {
+            let held = st.online.get(id).map(|h| h.since.elapsed().as_secs()).unwrap_or(0);
             st.online.remove(id);
             let mut replacement = None;
             if let Some(list) = st.standby.get_mut(id) {
@@ -405,11 +470,18 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
             }
             match replacement {
                 Some(h) => {
+                    info!(
+                        "Host {} dropped its connection after {held}s; another PJDesk process on this computer took over",
+                        format_id(id)
+                    );
                     st.online.insert(id.clone(), h);
                 }
-                None => info!("Host {} is offline", format_id(id)),
+                None => info!("Host {} is offline after {held}s", format_id(id)),
             }
         } else if let Some(list) = st.standby.get_mut(id) {
+            if list.iter().any(|h| h.conn_id == conn.id) {
+                info!("Host {} closed a standby connection from {}", format_id(id), conn.addr.ip());
+            }
             list.retain(|h| h.conn_id != conn.id);
         }
         if st.standby.get(id).is_some_and(|l| l.is_empty()) {
@@ -469,7 +541,11 @@ fn handle_login(
                     });
                     let user = session.as_ref().map(|s| s.username.clone()).unwrap_or_else(|_| username.clone());
                     drop(guard);
-                    crate::audit::AuditLog::open(&data_dir).record("login", &user, "password accepted; weaker than the current policy");
+                    crate::audit::AuditLog::open(&data_dir).record(
+                        "login",
+                        &user,
+                        "password accepted; weaker than the current policy",
+                    );
                     info!("Account \"{user}\" signed in with a password that no longer meets policy");
                     return;
                 }
@@ -513,6 +589,179 @@ fn handle_login(
     }
 }
 
+/// How this connection was admitted.
+enum Admitted {
+    /// Grace: no token, and signed-in accounts are not required yet.
+    Open,
+    Signed(pjdesk_proto::access::Claims),
+    Key(crate::access_keys::LiveKey),
+}
+
+/// Loads the policy and checks this connection's token.
+/// An access key that is unknown, revoked, or expired is refused even during grace.
+/// `Err` is "Sign in required". The computer limit is checked by the caller on Register.
+fn gate(st: &State, conn: &Conn) -> Result<Admitted, ()> {
+    let token = conn.access_token.trim();
+    if pjdesk_proto::access::is_access_key(token) {
+        return match crate::access_keys::Store::check(&st.data_dir, token, crate::access::now_unix()) {
+            Ok(key) => Ok(Admitted::Key(key)),
+            Err(reason) => {
+                warn!("{}: access key refused ({reason})", conn.addr);
+                Err(())
+            }
+        };
+    }
+    let policy = crate::access::Policy::load(&st.data_dir);
+    match crate::access::admit(&policy, token, crate::access::now_unix()) {
+        Ok(crate::access::Decision::Open) => Ok(Admitted::Open),
+        Ok(crate::access::Decision::Signed(claims)) => Ok(Admitted::Signed(claims)),
+        Err(reason) => {
+            warn!("{}: network access refused ({reason})", conn.addr);
+            Err(())
+        }
+    }
+}
+
+fn manage_access_keys(
+    st: &mut State,
+    conn: &Conn,
+    token: &str,
+    op: &str,
+    label: &str,
+    expires_secs: u64,
+    computer_limit: u32,
+    key_id: &str,
+) {
+    let actor = match owner_email(st, token) {
+        Ok(email) => email,
+        Err(message) => {
+            conn.send(ServerMsg::AccessKeys { ok: false, message, secret: String::new(), keys: Vec::new() });
+            return;
+        }
+    };
+    let op = op.trim();
+    let outcome = match op {
+        "list" => Ok((String::new(), crate::access_keys::Store::public_list(&st.data_dir))),
+        "create" => match crate::access_keys::Store::create(&st.data_dir, label, expires_secs, computer_limit) {
+            Ok(secret) => Ok((secret, crate::access_keys::Store::public_list(&st.data_dir))),
+            Err(message) => Err(message),
+        },
+        "revoke" => match crate::access_keys::Store::revoke(&st.data_dir, key_id) {
+            Ok(()) => {
+                let _ = drop_access_key(st, key_id.trim());
+                crate::audit::AuditLog::open(&st.data_dir).record("access_key", &actor, "revoked");
+                Ok((String::new(), crate::access_keys::Store::public_list(&st.data_dir)))
+            }
+            Err(message) => Err(message),
+        },
+        _ => Err("That was not understood.".into()),
+    };
+    match outcome {
+        Ok((secret, keys)) => {
+            if op == "create" {
+                crate::audit::AuditLog::open(&st.data_dir).record("access_key", &actor, &format!("created {label}"));
+            }
+            let message = if secret.is_empty() {
+                String::new()
+            } else {
+                "Copy this key now. It is shown once.".into()
+            };
+            conn.send(ServerMsg::AccessKeys { ok: true, message, secret, keys });
+        }
+        Err(message) => conn.send(ServerMsg::AccessKeys { ok: false, message, secret: String::new(), keys: Vec::new() }),
+    }
+}
+
+/// The presented network token must name the account this server is signed in to.
+fn owner_email(st: &State, token: &str) -> Result<String, String> {
+    let token = token.trim();
+    if token.is_empty() || pjdesk_proto::access::is_access_key(token) {
+        return Err("Sign in on this computer as the owner of this server.".into());
+    }
+    let policy = crate::access::Policy::load(&st.data_dir);
+    let key = hex::decode(policy.public_key.trim()).unwrap_or_default();
+    if key.len() != 32 {
+        return Err("This server has not checked in with pjdesk.com yet, so it cannot confirm the owner.".into());
+    }
+    let claims = pjdesk_proto::access::verify(&key, token, crate::access::now_unix(), &policy.fingerprint)
+        .map_err(|_| "Sign in again. This server could not confirm the account.".to_string())?;
+    let Some(cfg) = crate::cloud::CloudConfig::load(&st.data_dir) else {
+        return Err("This server is not signed in to a PJDesk account.".into());
+    };
+    if !cfg.is_account() || cfg.email.trim().is_empty() {
+        return Err("This server is not signed in to a PJDesk account.".into());
+    }
+    if !cfg.email.trim().eq_ignore_ascii_case(claims.email.trim()) {
+        return Err("Only the account this server is signed in to can manage access keys.".into());
+    }
+    Ok(claims.email)
+}
+
+struct ControllerSide {
+    conn_id: u64,
+    addr: SocketAddr,
+    tx: mpsc::UnboundedSender<ServerMsg>,
+}
+
+fn offline_message(target: &str) -> String {
+    format!("device {} is not online", format_id(target))
+}
+
+fn send_error(tx: &mpsc::UnboundedSender<ServerMsg>, code: ErrorCode, message: impl Into<String>) {
+    let _ = tx.send(ServerMsg::Error { code, message: message.into() });
+}
+
+/// Opens a session when `target` is in the live table. The caller has already
+/// checked the network-access gate and the connect rate limit.
+fn start_session(st: &mut State, ctrl: &ControllerSide, target: &str, controller_name: &str) {
+    let Some(host) = st.online.get(target) else {
+        send_error(&ctrl.tx, ErrorCode::HostOffline, offline_message(target));
+        return;
+    };
+    if host.conn_id == ctrl.conn_id {
+        send_error(&ctrl.tx, ErrorCode::BadRequest, "a device cannot connect to itself on the same connection");
+        return;
+    }
+    let from_here = st.sessions.values().filter(|s| s.controller_ip == ctrl.addr.ip()).count();
+    if from_here >= MAX_SESSIONS_PER_IP || st.sessions.len() >= MAX_SESSIONS {
+        send_error(&ctrl.tx, ErrorCode::RateLimited, "too many connection attempts, wait a minute");
+        return;
+    }
+    let session_id = pjdesk_proto::random_u64();
+    let host_token = pjdesk_proto::random_bytes::<16>();
+    let controller_token = pjdesk_proto::random_bytes::<16>();
+    let _ = host.tx.send(ServerMsg::IncomingSession {
+        session_id,
+        token: host_token,
+        udp_port: st.udp_port,
+        controller_name: controller_name.to_string(),
+        controller_ip: ctrl.addr.ip().to_string(),
+    });
+    let session = Session {
+        host_token,
+        controller_token,
+        host_id: target.to_string(),
+        host_name: host.hostname.clone(),
+        host_conn: host.conn_id,
+        host_tx: host.tx.clone(),
+        controller_conn: ctrl.conn_id,
+        controller_ip: ctrl.addr.ip(),
+        controller_tx: ctrl.tx.clone(),
+        accepted: false,
+        host: PeerSlot::default(),
+        controller: PeerSlot::default(),
+        info_sent: false,
+        created: Instant::now(),
+    };
+    st.sessions.insert(session_id, session);
+    crate::audit::AuditLog::open(&st.data_dir).record(
+        "connect",
+        controller_name,
+        &format!("to {} from {}", format_id(target), ctrl.addr.ip()),
+    );
+    info!("Session {session_id:016x}: \"{controller_name}\" ({}) → host {}", ctrl.addr.ip(), format_id(target));
+}
+
 fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
     // Password checks are slow (Argon2). Do them off the process-wide lock so
     // one sign-in attempt cannot stall every other connection.
@@ -528,7 +777,37 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
 
         ClientMsg::Ping => conn.send(ServerMsg::Pong),
 
+        ClientMsg::PresentAccess { token } => {
+            conn.access_token = token.chars().take(4096).collect();
+        }
+
+        ClientMsg::ManageAccessKey { token, op, label, expires_secs, computer_limit, key_id } => {
+            manage_access_keys(st, conn, &token, &op, &label, expires_secs, computer_limit, &key_id);
+        }
+
         ClientMsg::Register { proto, device_id, device_secret, hostname, app_version } => {
+            if !crate::cloud::accepts_host_registrations(&st.data_dir) {
+                info!(
+                    "Refused host registration from {}: this server is the standby and is not the live table",
+                    conn.addr
+                );
+                conn.error(ErrorCode::Unauthorized, pjdesk_proto::signal::STANDBY_REGISTRATION);
+                return;
+            }
+            let admitted = match gate(st, conn) {
+                Ok(admitted) => admitted,
+                Err(()) => {
+                    conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
+                    return;
+                }
+            };
+            if let Admitted::Key(key) = &admitted {
+                if !st.registry.key_has_room(&key.id, &device_secret, key.computer_limit) {
+                    warn!("{}: access key {} is at its computer limit", conn.addr, key.label);
+                    conn.error(ErrorCode::Unauthorized, crate::access_keys::LIMIT_MESSAGE);
+                    return;
+                }
+            }
             if !note_proto(conn, proto) {
                 return;
             }
@@ -540,6 +819,10 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             let app_version: String = app_version.chars().take(32).collect();
             match st.registry.register(device_id.as_deref(), &device_secret, &hostname, &app_version) {
                 Ok(id) => {
+                    let access_key_id = match &admitted {
+                        Admitted::Key(key) => key.id.clone(),
+                        Admitted::Open | Admitted::Signed(_) => String::new(),
+                    };
                     let host = OnlineHost {
                         conn_id: conn.id,
                         tx: conn.tx.clone(),
@@ -547,31 +830,56 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                         app_version: app_version.clone(),
                         addr: conn.addr,
                         proto: conn.proto,
+                        since: Instant::now(),
+                        close: Arc::clone(&conn.close),
+                        access_key_id: access_key_id.clone(),
                     };
                     if let Some(prev) = st.online.insert(id.clone(), host) {
-                        if prev.conn_id != conn.id && prev.addr.ip() != conn.addr.ip() {
-                            warn!(
-                                "Host {} is now registered from {} (it was {}). The device secret is known to both.",
-                                format_id(&id),
-                                conn.addr.ip(),
-                                prev.addr.ip()
-                            );
-                        }
-                        if prev.conn_id != conn.id && !prev.tx.is_closed() {
-                            st.standby.entry(id.clone()).or_default().push(prev);
+                        if prev.conn_id != conn.id {
+                            let held = prev.since.elapsed().as_secs();
+                            if prev.addr.ip() != conn.addr.ip() {
+                                warn!(
+                                    "Host {} is now registered from {} (it was {}, held {held}s). The device secret is known to both.",
+                                    format_id(&id),
+                                    conn.addr.ip(),
+                                    prev.addr.ip()
+                                );
+                            } else {
+                                info!(
+                                    "Host {} registered again from {} (another PJDesk process on this computer, previous connection held {held}s)",
+                                    format_id(&id),
+                                    conn.addr.ip()
+                                );
+                            }
+                            if !prev.tx.is_closed() {
+                                info!("Host {} kept the previous connection on standby", format_id(&id));
+                                st.standby.entry(id.clone()).or_default().push(prev);
+                            }
                         }
                     }
                     conn.host_id = Some(id.clone());
+                    st.registry.note_address(&id, &conn.addr.ip().to_string());
+                    let signed_in = matches!(admitted, Admitted::Signed(_));
+                    st.registry.note_access_key(&id, &access_key_id);
+                    st.registry.mark_signed_in(&id, signed_in);
                     conn.send(ServerMsg::Registered { device_id: id.clone() });
                     if conn.proto >= 3 {
                         conn.send(ServerMsg::Policy(st.accounts.policy()));
+                    }
+                    let os = st.registry.os_family(&id);
+                    if crate::registry::supports_host_report_for(&app_version, &os) {
+                        conn.send(ServerMsg::WantHostReport);
                     }
                     crate::audit::AuditLog::open(&st.data_dir).record(
                         "register",
                         &hostname,
                         &format!("{} from {}", format_id(&id), conn.addr.ip()),
                     );
-                    info!("Host {} \"{hostname}\" online from {} (v{app_version})", format_id(&id), conn.addr.ip());
+                    info!(
+                        "Host {} \"{hostname}\" online from {} (v{app_version}); this server is the primary",
+                        format_id(&id),
+                        conn.addr.ip()
+                    );
                     // One record per computer: drop its old, offline records.
                     let online: HashSet<String> = st.online.keys().cloned().collect();
                     let removed = st.registry.remove_stale_duplicates(&id, &online);
@@ -581,12 +889,26 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 }
                 Err(e) => {
                     warn!("{}: registration refused: {e}", conn.addr);
-                    conn.error(ErrorCode::IdConflict, e.to_string());
+                    if matches!(e, crate::registry::RegisterError::Blocked(_)) {
+                        conn.error(ErrorCode::Unauthorized, "This computer is blocked.");
+                    } else {
+                        conn.error(ErrorCode::IdConflict, e.to_string());
+                    }
                 }
             }
         }
 
         ClientMsg::Connect { proto, target_id, controller_name } => {
+            if !crate::cloud::accepts_host_registrations(&st.data_dir) {
+                info!("Refused a connection from {}: this server is the standby and is not the live table", conn.addr);
+                conn.error(ErrorCode::Unauthorized, pjdesk_proto::signal::STANDBY_REGISTRATION);
+                return;
+            }
+            // Before any ID lookup, so a refused peer learns nothing about the target.
+            if gate(st, conn).is_err() {
+                conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
+                return;
+            }
             if !note_proto(conn, proto) {
                 return;
             }
@@ -596,57 +918,58 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 return;
             }
             let target = normalize_id(&target_id);
-            let Some(host) = st.online.get(&target) else {
+            let controller_name: String = controller_name.chars().take(64).collect();
+            let side = ControllerSide { conn_id: conn.id, addr: conn.addr, tx: conn.tx.clone() };
+            if st.online.contains_key(&target) {
+                start_session(st, &side, &target, &controller_name);
+                return;
+            }
+            let seen = st.registry.last_seen_of(&target);
+            let now = crate::registry::unix_now();
+            if !host_was_seen_recently(seen, now) {
+                let when = if seen == 0 { "never".to_string() } else { format!("{}s ago", now.saturating_sub(seen)) };
+                info!("Connect to {} refused; it is not online (last seen {when})", format_id(&target));
                 conn.error(ErrorCode::HostOffline, format!("device {} is not online", format_id(&target)));
                 return;
-            };
-            if host.conn_id == conn.id {
-                conn.error(ErrorCode::BadRequest, "a device cannot connect to itself on the same connection");
-                return;
             }
-            let from_here = st.sessions.values().filter(|s| s.controller_ip == conn.addr.ip()).count();
-            if from_here >= MAX_SESSIONS_PER_IP || st.sessions.len() >= MAX_SESSIONS {
-                conn.error(ErrorCode::RateLimited, "too many connection attempts, wait a minute");
-                return;
-            }
-            let session_id = pjdesk_proto::random_u64();
-            let host_token = pjdesk_proto::random_bytes::<16>();
-            let controller_token = pjdesk_proto::random_bytes::<16>();
-            let controller_name: String = controller_name.chars().take(64).collect();
-            let _ = host.tx.send(ServerMsg::IncomingSession {
-                session_id,
-                token: host_token,
-                udp_port: st.udp_port,
-                controller_name: controller_name.clone(),
-                controller_ip: conn.addr.ip().to_string(),
-            });
-            let session = Session {
-                host_token,
-                controller_token,
-                host_id: target.clone(),
-                host_name: host.hostname.clone(),
-                host_conn: host.conn_id,
-                host_tx: host.tx.clone(),
-                controller_conn: conn.id,
-                controller_ip: conn.addr.ip(),
-                controller_tx: conn.tx.clone(),
-                accepted: false,
-                host: PeerSlot::default(),
-                controller: PeerSlot::default(),
-                info_sent: false,
-                created: Instant::now(),
-            };
-            st.sessions.insert(session_id, session);
-            crate::audit::AuditLog::open(&st.data_dir).record(
-                "connect",
-                &controller_name,
-                &format!("to {} from {}", format_id(&target), conn.addr.ip()),
-            );
+            let age = now.saturating_sub(seen);
             info!(
-                "Session {session_id:016x}: \"{controller_name}\" ({}) → host {}",
-                conn.addr.ip(),
-                format_id(&target)
+                "Connect to {} is waiting up to {}s; it was seen {age}s ago and is not registered right now",
+                format_id(&target),
+                CONNECT_WAIT.as_secs()
             );
+            let state = Arc::clone(state);
+            let target_for_wait = target.clone();
+            let name_for_wait = controller_name.clone();
+            tokio::spawn(async move {
+                let deadline = Instant::now() + CONNECT_WAIT;
+                loop {
+                    {
+                        let mut guard = state.lock().unwrap();
+                        if guard.online.contains_key(&target_for_wait) {
+                            info!(
+                                "Connect to {} is going ahead; it registered during the wait",
+                                format_id(&target_for_wait)
+                            );
+                            start_session(&mut guard, &side, &target_for_wait, &name_for_wait);
+                            return;
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        info!(
+                            "Connect to {} gave up after {}s; it did not register",
+                            format_id(&target_for_wait),
+                            CONNECT_WAIT.as_secs()
+                        );
+                        let _ = side.tx.send(ServerMsg::Error {
+                            code: ErrorCode::HostOffline,
+                            message: format!("device {} is not online", format_id(&target_for_wait)),
+                        });
+                        return;
+                    }
+                    tokio::time::sleep(CONNECT_POLL).await;
+                }
+            });
         }
 
         ClientMsg::SessionResponse { session_id, accept, reason } => {
@@ -675,6 +998,12 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::UdpReady { session_id, local_addrs, cert_fingerprint } => {
+            // The UDP bind that follows is authorized by the session token issued
+            // here, so refusing this message refuses punch and relay as well.
+            if gate(st, conn).is_err() {
+                conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
+                return;
+            }
             let Some(session) = st.sessions.get_mut(&session_id) else { return };
             let role = if session.host_conn == conn.id {
                 Role::Host
@@ -798,6 +1127,28 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
         },
 
+        ClientMsg::ReportDisplayName { name } => {
+            let Some(id) = conn.host_id.clone() else { return };
+            let name = name.chars().filter(|c| !c.is_control()).take(64).collect::<String>();
+            st.registry.note_display_name(&id, &name);
+        }
+
+        ClientMsg::ReportHost { hostname, os_family, os_version, console_user } => {
+            let Some(id) = conn.host_id.clone() else { return };
+            let hostname = hostname.chars().filter(|c| !c.is_control()).take(64).collect::<String>();
+            st.registry.note_report(&id, &hostname, &os_family, &os_version, &console_user);
+            if !hostname.is_empty() {
+                if let Some(host) = st.online.get_mut(&id) {
+                    host.hostname = hostname.clone();
+                }
+            }
+            info!(
+                "Host {} reported {}",
+                format_id(&id),
+                if hostname.is_empty() { "its system".into() } else { hostname }
+            );
+        }
+
         ClientMsg::ChangePassword { token, new_password } => match st.accounts.user_for_token(&token) {
             Some(username) => match st.accounts.set_password(&username, &new_password) {
                 Ok(()) => {
@@ -824,7 +1175,9 @@ fn note_proto(conn: &mut Conn, proto: u16) -> bool {
     if !protocol_ok(proto) {
         conn.error(
             ErrorCode::VersionMismatch,
-            format!("version mismatch (server speaks protocol {MIN_PROTOCOL_VERSION}-{PROTOCOL_VERSION}, client {proto})"),
+            format!(
+                "version mismatch (server speaks protocol {MIN_PROTOCOL_VERSION}-{PROTOCOL_VERSION}, client {proto})"
+            ),
         );
         return false;
     }
@@ -868,12 +1221,87 @@ async fn janitor(state: Shared) {
     }
 }
 
+/// Removes every computer that used this key and disconnects the ones that are online.
+/// Returns true when a computer was removed or disconnected.
+fn drop_access_key(st: &mut State, key_id: &str) -> bool {
+    if !crate::access_keys::is_key_id(key_id) {
+        return false;
+    }
+    let removed = st.registry.take_access_key(key_id);
+    let mut live: Vec<String> = st
+        .online
+        .iter()
+        .filter(|(_, host)| host.access_key_id == key_id)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for (id, hosts) in &st.standby {
+        if hosts.iter().any(|host| host.access_key_id == key_id) && !live.contains(id) {
+            live.push(id.clone());
+        }
+    }
+    let any = !removed.is_empty() || !live.is_empty();
+    for id in removed.iter().chain(live.iter()) {
+        disconnect_device(st, id, "This access key is no longer valid.");
+    }
+    any
+}
+
+/// Closes live registrations so those computers connect to the new primary.
+/// A direct or hole-punched session does not use this socket for its picture.
+fn release_hosts_for_failover(state: &Shared) {
+    let ids: Vec<String> = {
+        let st = state.lock().unwrap();
+        st.online.keys().cloned().chain(st.standby.keys().cloned()).collect()
+    };
+    let mut st = state.lock().unwrap();
+    let n = ids.len();
+    for id in ids {
+        disconnect_device(&mut st, &id, pjdesk_proto::signal::STANDBY_REGISTRATION);
+    }
+    if n > 0 {
+        info!("failover: released {n} computers so they register with the new primary");
+    }
+}
+
+/// Drops a computer's live connections and any session it is hosting.
+fn disconnect_device(st: &mut State, id: &str, message: &str) {
+    let mut notify = Vec::new();
+    if let Some(host) = st.online.remove(id) {
+        let _ = host.tx.send(ServerMsg::Error { code: ErrorCode::Unauthorized, message: message.to_string() });
+        notify.push(host.close);
+    }
+    if let Some(list) = st.standby.remove(id) {
+        for host in list {
+            let _ = host.tx.send(ServerMsg::Error { code: ErrorCode::Unauthorized, message: message.into() });
+            notify.push(host.close);
+        }
+    }
+    let ended: Vec<SessionId> = st.sessions.iter().filter(|(_, session)| session.host_id == id).map(|(sid, _)| *sid).collect();
+    for sid in ended {
+        if let Some(session) = st.sessions.remove(&sid) {
+            let _ = session.host_tx.send(ServerMsg::Error {
+                code: ErrorCode::Unauthorized,
+                message: message.into(),
+            });
+            let _ = session.controller_tx.send(ServerMsg::Error {
+                code: ErrorCode::HostOffline,
+                message: "That computer was removed from the server.".into(),
+            });
+        }
+    }
+    for close in notify {
+        close.notify_one();
+    }
+}
+
 /// One online device, published to `online.json` for the management window.
+/// `at` is unix seconds. Readers use it when the file's modification time stalls.
 #[derive(serde::Serialize)]
 struct OnlineInfo {
     id: String,
     hostname: String,
     version: String,
+    at: u64,
 }
 
 /// Publishes the live set of online devices to `online.json`, carries out the
@@ -893,8 +1321,14 @@ async fn fleet_sync(state: Shared) {
             let st = &mut *guard;
             if ticks % TOUCH_EVERY == 0 {
                 let ids: Vec<String> = st.online.keys().cloned().collect();
+                let ips: Vec<(String, String)> =
+                    st.online.iter().map(|(id, host)| (id.clone(), host.addr.ip().to_string())).collect();
                 st.registry.touch(&ids);
+                for (id, ip) in ips {
+                    st.registry.note_address(&id, &ip);
+                }
             }
+            let at = crate::registry::unix_now();
             let snapshot: Vec<OnlineInfo> = st
                 .online
                 .iter()
@@ -902,6 +1336,7 @@ async fn fleet_sync(state: Shared) {
                     id: id.clone(),
                     hostname: h.hostname.clone(),
                     version: h.app_version.clone(),
+                    at,
                 })
                 .collect();
             (st.data_dir.clone(), snapshot)
@@ -909,25 +1344,61 @@ async fn fleet_sync(state: Shared) {
         let online_path = data_dir.join("online.json");
         if let Ok(bytes) = serde_json::to_vec(&snapshot) {
             let tmp = online_path.with_extension("json.tmp");
-            if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &online_path).is_ok() {
-                crate::cloud::protect(&online_path);
+            let created = !online_path.exists();
+            let replaced = std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &online_path).is_ok();
+            if replaced {
+                if created {
+                    crate::cloud::protect(&online_path);
+                }
+            } else {
+                warn!("could not replace online.json; writing it in place");
+                match std::fs::write(&online_path, &bytes) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        if created {
+                            crate::cloud::protect(&online_path);
+                        }
+                    }
+                    Err(e) => warn!("could not write online.json: {e}"),
+                }
             }
         }
 
         let updates = take(&data_dir, UPDATE_FILE);
         let forgets = take(&data_dir, FORGET_FILE);
+        let blocks = take(&data_dir, crate::requests::BLOCK_FILE);
+        let unblocks = take(&data_dir, crate::requests::UNBLOCK_FILE);
         let groups = take(&data_dir, crate::requests::GROUP_FILE);
-        if updates.is_empty() && forgets.is_empty() && groups.is_empty() {
+        let revokes = take(&data_dir, crate::requests::REVOKE_KEY_FILE);
+        let require_now = take(&data_dir, crate::requests::REQUIRE_DISCONNECT_FILE);
+        let dead = crate::access_keys::Store::dead_ids(&data_dir, crate::registry::unix_now());
+        if updates.is_empty()
+            && forgets.is_empty()
+            && groups.is_empty()
+            && blocks.is_empty()
+            && unblocks.is_empty()
+            && revokes.is_empty()
+            && require_now.is_empty()
+            && dead.is_empty()
+        {
             continue;
         }
         let mut st = state.lock().unwrap();
         for req in &updates {
             if req == "*" {
-                for h in st.online.values() {
+                info!(
+                    "Update all online computers: asking {} client(s) to install the latest release",
+                    st.online.len()
+                );
+                for (id, h) in &st.online {
+                    info!("Asking {} \"{}\" (v{}) to update now", format_id(id), h.hostname, h.app_version);
                     let _ = h.tx.send(ServerMsg::UpdateNow);
                 }
             } else if let Some(h) = st.online.get(req) {
+                info!("Asking {} \"{}\" (v{}) to update now", format_id(req), h.hostname, h.app_version);
                 let _ = h.tx.send(ServerMsg::UpdateNow);
+            } else {
+                info!("Update request for {} was not sent; that computer is not online", format_id(req));
             }
         }
         for id in &forgets {
@@ -938,15 +1409,112 @@ async fn fleet_sync(state: Shared) {
                 crate::audit::AuditLog::open(&st.data_dir).record("forget", "server", &format_id(id));
             }
         }
+        for id in &blocks {
+            match st.registry.block(id) {
+                Ok(true) => {
+                    info!("Blocked {} and dropped its connection", format_id(id));
+                    disconnect_device(&mut st, id, "This computer was removed from PJDesk Server.");
+                    crate::audit::AuditLog::open(&st.data_dir).record("block", "server", &format_id(id));
+                }
+                Ok(false) => info!("Block request for {} did not match a computer", format_id(id)),
+                Err(e) => warn!("could not block {}: {e}", format_id(id)),
+            }
+        }
+        for id in &unblocks {
+            match st.registry.unblock(id) {
+                Ok(true) => {
+                    info!("Unblocked {}", format_id(id));
+                    crate::audit::AuditLog::open(&st.data_dir).record("unblock", "server", &format_id(id));
+                }
+                Ok(false) => info!("Unblock request for {} did not match a blocked computer", format_id(id)),
+                Err(e) => warn!("could not unblock {}: {e}", format_id(id)),
+            }
+        }
+        if !require_now.is_empty() && crate::access::Policy::load(&data_dir).require_accounts {
+            let ids = st.registry.grace_ids();
+            for id in &ids {
+                info!("Require signed-in accounts dropped {}", format_id(id));
+                disconnect_device(&mut st, id, "This server now requires a signed-in PJDesk account.");
+            }
+        }
+        let mut dropped_keys = revokes;
+        for id in dead {
+            if !dropped_keys.iter().any(|have| have == &id) {
+                dropped_keys.push(id);
+            }
+        }
+        for key_id in &dropped_keys {
+            if drop_access_key(&mut st, key_id) {
+                info!("Removed the computers that used access key {key_id}");
+                crate::audit::AuditLog::open(&st.data_dir).record("access_key", "server", "removed computers");
+            }
+        }
         for target in &groups {
             if let Some((id, group)) = crate::requests::parse_group_target(target) {
                 match st.registry.set_group(&id, &group) {
                     Ok(()) => {
                         info!("Device {} is now in group \"{group}\"", format_id(&id));
-                        crate::audit::AuditLog::open(&st.data_dir).record("group", "server", &format!("{} -> {group}", format_id(&id)));
+                        crate::audit::AuditLog::open(&st.data_dir).record(
+                            "group",
+                            "server",
+                            &format!("{} -> {group}", format_id(&id)),
+                        );
                     }
                     Err(e) => warn!("could not set a group on {}: {e}", format_id(&id)),
                 }
+            }
+        }
+    }
+}
+
+/// Probes the primary every few seconds while this server is the standby,
+/// and steps down when another server publishes a higher generation.
+async fn failover_watch(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
+    let data_dir = state.lock().unwrap().data_dir.clone();
+    let mut tick = tokio::time::interval(Duration::from_secs(pjdesk_proto::failover::BEAT_SECS));
+    let mut misses = 0u32;
+    let mut last_log = String::new();
+    loop {
+        tick.tick().await;
+        let dir = data_dir.clone();
+        let seen = misses;
+        let step = match tokio::task::spawn_blocking(move || crate::failover::watch_once(&dir, seen)).await {
+            Ok(step) => step,
+            Err(e) => {
+                warn!("failover watch stopped: {e}");
+                continue;
+            }
+        };
+        match step {
+            crate::failover::Step::Stay { misses: next, log } => {
+                misses = next;
+                if !log.is_empty() && log != last_log {
+                    info!("{log}");
+                    last_log = log;
+                }
+            }
+            crate::failover::Step::Promote { from, misses: next } => {
+                misses = 0;
+                last_log.clear();
+                warn!(
+                    "failover: primary {from} missed {next} heartbeats and its cloud health is stale; taking over"
+                );
+                let dir = data_dir.clone();
+                match tokio::task::spawn_blocking(move || crate::cloud::promote(&dir)).await {
+                    Ok(Ok(())) => {
+                        info!("failover: this server is now the primary");
+                        reload_from_disk(&state, &acceptor, &data_dir);
+                    }
+                    Ok(Err(e)) => warn!("failover: could not take over: {e:#}"),
+                    Err(e) => warn!("failover: could not take over: {e}"),
+                }
+            }
+            crate::failover::Step::Yielded { epoch, name } => {
+                misses = 0;
+                last_log.clear();
+                warn!("failover: generation {epoch} belongs to {name}; this server is now the standby");
+                release_hosts_for_failover(&state);
+                reload_from_disk(&state, &acceptor, &data_dir);
             }
         }
     }
@@ -991,7 +1559,11 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
         if !promote_now && !forced && ticks % PASS_EVERY != 1 {
             continue;
         }
-        let role = if state.lock().unwrap().online.is_empty() { Role::Standby } else { Role::Active };
+        // An empty table after a restart is not a demotion. Treating it as
+        // standby wrote cloud-status.json as standby, and that file then
+        // refused every registration, so every computer stayed offline.
+        let accepts = crate::cloud::accepts_host_registrations(&data_dir);
+        let role = if accepts { Role::Active } else { Role::Standby };
         let dir = data_dir.clone();
         let applied = tokio::task::spawn_blocking(move || sync_once(&dir, role, forced)).await.unwrap_or(false);
         if applied {
@@ -1063,6 +1635,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn presence_host_was_seen_recently() {
+        assert!(!host_was_seen_recently(0, 1_000));
+        assert!(host_was_seen_recently(1_000, 1_000));
+        assert!(host_was_seen_recently(1_000, 1_120));
+        assert!(!host_was_seen_recently(1_000, 1_121));
+        assert!(host_was_seen_recently(2_000, 1_000), "a clock ahead of the server is still recent");
+    }
+
+    #[test]
     fn rate_limiter_blocks_after_limit() {
         let mut limiter = RateLimiter::default();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -1071,5 +1652,99 @@ mod tests {
         }
         assert!(!limiter.allow(ip, "x", 5));
         assert!(limiter.allow(ip, "y", 5));
+    }
+
+    fn state_in(dir: &std::path::Path) -> Shared {
+        let _ = std::fs::create_dir_all(dir);
+        Arc::new(Mutex::new(State {
+            registry: Registry::load(dir.join("devices.json")).unwrap(),
+            accounts: crate::accounts::Accounts::load(dir).unwrap(),
+            online: HashMap::new(),
+            standby: HashMap::new(),
+            sessions: HashMap::new(),
+            limiter: RateLimiter::default(),
+            udp_port: 21200,
+            data_dir: dir.to_path_buf(),
+        }))
+    }
+
+    fn conn_pair() -> (Conn, mpsc::UnboundedReceiver<ServerMsg>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let conn = Conn {
+            id: 1,
+            addr: "192.0.2.10:40000".parse().unwrap(),
+            tx,
+            host_id: None,
+            proto: 0,
+            access_token: String::new(),
+            close: Arc::new(Notify::new()),
+        };
+        (conn, rx)
+    }
+
+    #[test]
+    fn connect_without_a_token_does_not_confirm_the_id_when_accounts_are_required() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::access::Policy { require_accounts: true, ..crate::access::Policy::default() }.save(&dir).unwrap();
+        let state = state_in(&dir);
+        let (mut conn, mut rx) = conn_pair();
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::Connect { proto: 3, target_id: "123456789".into(), controller_name: "laptop".into() },
+        );
+        match rx.try_recv().unwrap() {
+            ServerMsg::Error { code, message } => {
+                assert_eq!(code, ErrorCode::Unauthorized);
+                assert_eq!(message, "Sign in required");
+                assert!(!message.contains("123"));
+            }
+            other => panic!("{other:?}"),
+        }
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::Register {
+                proto: 3,
+                device_id: Some("123456789".into()),
+                device_secret: [1u8; 32],
+                hostname: "Office".into(),
+                app_version: "0.6.0".into(),
+            },
+        );
+        match rx.try_recv().unwrap() {
+            ServerMsg::Error { message, .. } => assert_eq!(message, "Sign in required"),
+            other => panic!("{other:?}"),
+        }
+        assert!(state.lock().unwrap().registry.list().is_empty(), "a refused register must not create a record");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grace_still_registers_a_computer_that_has_not_signed_in() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-grace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = state_in(&dir);
+        let (mut conn, mut rx) = conn_pair();
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::Register {
+                proto: 3,
+                device_id: None,
+                device_secret: [2u8; 32],
+                hostname: "Office".into(),
+                app_version: "0.6.0".into(),
+            },
+        );
+        let id = match rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => device_id,
+            other => panic!("{other:?}"),
+        };
+        let row = state.lock().unwrap().registry.list().into_iter().find(|d| d.id == id).unwrap();
+        assert!(!row.signed_in);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

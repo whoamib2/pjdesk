@@ -23,14 +23,18 @@ object AppLog {
     }
 
     fun i(message: String) {
-        Log.i(TAG, message)
+        // A release build on current Android drops INFO. logd's isLoggable check
+        // and R8's Log.i removal both do that. WARN is the lowest priority those
+        // devices still keep. ERROR is used when WARN is refused too. The file
+        // keeps the I mark, and Share logs sends the file.
         write("I", message)
+        if (Log.isLoggable(TAG, Log.WARN)) Log.w(TAG, message) else Log.e(TAG, message)
     }
 
     fun e(message: String, error: Throwable? = null) {
-        Log.e(TAG, message, error)
         val detail = error?.message?.let { ": $it" }.orEmpty()
         write("E", message + detail)
+        Log.e(TAG, message, error)
     }
 
     fun logFile(): File? = if (::file.isInitialized && file.exists()) file else null

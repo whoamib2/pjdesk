@@ -33,7 +33,7 @@ a { color: var(--accent); }
 header { border-bottom: 1px solid var(--line); }
 .nav { display: flex; align-items: center; gap: 18px; height: 62px; }
 .brand { display: inline-flex; align-items: center; gap: 9px; font-weight: 700; font-size: 1.08rem; color: var(--fg); text-decoration: none; }
-.brand .dot { width: 10px; height: 10px; border-radius: 3px; background: var(--accent); box-shadow: 0 0 14px rgba(77,155,255,0.7); }
+.brand .logo { width: 26px; height: 26px; display: block; }
 .spacer { flex: 1; }
 .nav a.link { color: var(--muted); text-decoration: none; font-size: 0.95rem; }
 .nav a.link:hover, .nav a.link.on { color: var(--fg); }
@@ -90,3 +90,31 @@ details summary { cursor: pointer; color: var(--accent); font-weight: 600; }
 footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 0.88rem; }
 footer .wrap { display: flex; gap: 14px; padding-block: 24px 36px; flex-wrap: wrap; }
 footer a { color: var(--muted); text-decoration: none; }
+
+body.light {
+  color-scheme: light;
+  --bg: #f3f5f8;
+  --surface: #ffffff;
+  --surface-2: #eef2f6;
+  --line: #d5dbe3;
+  --fg: #1c2330;
+  --muted: #5c6778;
+  --accent: #2f6fed;
+  --accent-ink: #ffffff;
+  --green: #1c8a4c;
+  --warn: #9a6200;
+  --red: #b42318;
+  background:
+    radial-gradient(1100px 520px at 78% -8%, rgba(47, 111, 237, 0.1), transparent 60%),
+    var(--bg);
+}
+body.light input[type=email],
+body.light input[type=password],
+body.light input[type=text],
+body.light select,
+body.light textarea {
+  background: #fff;
+  color: var(--fg);
+}
+body.shot #signed-in > .card,
+body.shot #signed-in > .actions { display: none !important; }

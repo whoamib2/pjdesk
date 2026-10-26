@@ -14,6 +14,11 @@
 //!   between controller and host, either direct or through the relay. The
 //!   password is checked with SPAKE2 ([`auth`]) so it never crosses the wire.
 
+pub mod access;
+pub mod applock;
+pub mod failover;
+pub mod netkey;
+pub mod vault;
 pub mod auth;
 pub mod discover;
 pub mod filesafe;
@@ -27,6 +32,8 @@ pub mod quality;
 pub mod record;
 pub mod signal;
 pub mod tls;
+pub mod trayshow;
+pub mod traywatch;
 pub mod udp;
 pub mod update;
 
@@ -65,10 +72,35 @@ pub const DISCOVERY_PORT: u16 = 21202;
 /// Default port of the server, used for TCP (signaling) and UDP (rendezvous/relay).
 pub const DEFAULT_PORT: u16 = 21200;
 
-/// The server a fresh install points at until the user sets their own in
-/// Settings. Baking this in means the app gets an ID and is reachable out of the
-/// box, without a sign-in — the way a self-hosted RustDesk points at its server.
-pub const DEFAULT_SERVER: &str = "pjdesk.spader.us:21200";
+/// A fresh install has no server until the user signs in to their PJDesk account.
+/// The account supplies the address and the pinned key. Nothing is baked in.
+pub const DEFAULT_SERVER: &str = "";
+
+/// Address an install that already registered (it has a device id) keeps using
+/// when its saved server is empty. This is only so an update does not take an
+/// existing computer offline. A fresh install has no device id and does not use it.
+/// Do not show this name in the client, the website, or the installer.
+pub const LEGACY_REGISTERED_SERVER: &str = "pjdesk.spader.us:21200";
+
+/// This computer is online only when the server it registered with has answered
+/// within this many seconds. A ping goes out every 10 seconds.
+pub const REGISTRATION_ACK_SECS: u64 = 25;
+
+/// An offline computer older than this is left out of the saved list.
+/// One day still shows. A replaced phone from several days ago does not.
+pub const PRESENCE_OFFLINE_KEEP_SECS: u64 = 3 * 24 * 3600;
+
+/// True when `online` was confirmed by a server ack at `acked_unix`.
+pub fn registration_acked(online: bool, acked_unix: u64, now: u64) -> bool {
+    online && acked_unix > 0 && now.saturating_sub(acked_unix) <= REGISTRATION_ACK_SECS
+}
+
+/// True when an offline computer is too old to keep showing.
+/// `last_seen` of 0, and any stamp from before 2020, is not stale: that row
+/// was saved without a real account time.
+pub fn presence_stale(last_seen: u64, online: bool, now: u64) -> bool {
+    !online && last_seen >= 1_600_000_000 && now.saturating_sub(last_seen) > PRESENCE_OFFLINE_KEEP_SECS
+}
 
 /// ALPN protocol id for the signaling TLS connection.
 pub const ALPN_SIGNAL: &[u8] = b"pjdesk-signal/1";
@@ -102,6 +134,17 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 /// A random `u64` from the operating system's secure RNG.
 pub fn random_u64() -> u64 {
     u64::from_le_bytes(random_bytes::<8>())
+}
+
+/// `count` decimal digits from the operating system's secure RNG.
+pub fn random_digits(count: usize) -> String {
+    (0..count).map(|_| char::from(b'0' + random_below(10) as u8)).collect()
+}
+
+/// Lowercase hex SHA-256. Invite and support codes are stored as this, never as digits.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// A random integer in `0..bound` (rejection sampling, no modulo bias).
@@ -149,6 +192,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn support_codes_are_eight_digits() {
+        let code = random_digits(8);
+        assert_eq!(code.len(), 8);
+        assert!(code.bytes().all(|b| b.is_ascii_digit()));
+        assert_eq!(
+            sha256_hex(b"12345678"),
+            "ef797c8118f02dfb649607dd5d3f8c7623048c9c063d532cc95c5ed7a898a64f"
+        );
+    }
+
+    #[test]
     fn ids_format_and_validate() {
         assert_eq!(format_id("123456789"), "123 456 789");
         assert_eq!(normalize_id(" 123-456 789 "), "123456789");
@@ -165,6 +219,20 @@ mod tests {
         assert!(protocol_ok(PROTOCOL_VERSION));
         assert!(!protocol_ok(1));
         assert!(!protocol_ok(PROTOCOL_VERSION + 1));
+    }
+
+    #[test]
+    fn registration_needs_a_recent_ack_and_a_week_old_phone_is_stale() {
+        let now = 1_700_000_000u64;
+        assert!(registration_acked(true, now - 10, now));
+        assert!(!registration_acked(true, now - 60, now), "an ack from a minute ago is not recent");
+        assert!(!registration_acked(false, now, now), "a fresh stamp does not count when registration is down");
+        assert!(!registration_acked(true, 0, now));
+        assert!(!presence_stale(now - 7 * 3600, false, now), "7 hours offline still shows");
+        assert!(!presence_stale(now - 24 * 3600, false, now), "1 day offline still shows");
+        assert!(presence_stale(now - 6 * 24 * 3600, false, now), "6 days offline is a leftover");
+        assert!(!presence_stale(now - 6 * 24 * 3600, true, now), "online is kept");
+        assert!(!presence_stale(0, false, now));
     }
 
     #[test]

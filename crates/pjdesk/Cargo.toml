@@ -14,6 +14,7 @@ path = "src/main.rs"
 pjdesk-proto = { path = "../pjdesk-proto" }
 pjdesk-link = { path = "../pjdesk-link" }
 anyhow.workspace = true
+ureq = { version = "2.10", default-features = false, features = ["tls"] }
 clap.workspace = true
 hex.workspace = true
 postcard.workspace = true
@@ -35,6 +36,7 @@ softbuffer = "0.4"
 rpassword = "7"
 # Main window + settings GUI.
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
+glow = "0.17"
 arboard = { version = "3", default-features = false }
 # Viewer toolbar text (font bytes are already in the tree via egui).
 ab_glyph = "0.2"
@@ -51,6 +53,7 @@ ui-shots = ["dep:egui_kittest"]
 version = "0.62"
 features = [
     "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
@@ -67,6 +70,8 @@ features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
     "Win32_System_Power",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -76,6 +81,7 @@ features = [
     "Win32_System_SystemInformation",
     "Wdk_System_SystemServices",
     "Win32_System_Com",
+    "Win32_System_Ole",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_Media_Audio",
@@ -85,6 +91,8 @@ features = [
 windows-service = "0.8"
 # System-tray icon + menu (minimize-to-tray, Show/Quit).
 tray-icon = "0.26"
+# UI Automation so a password manager can see the account email and password fields.
+eframe = { version = "0.36", default-features = false, features = ["accesskit"] }
 
 [build-dependencies]
 # Embeds the app icon + version metadata into the Windows .exe.

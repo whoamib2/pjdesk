@@ -48,7 +48,7 @@ button, input, select { font: inherit; color: inherit; }
   gap: 18px;
 }
 .brand { color: var(--text); text-decoration: none; font-weight: 700; font-size: 18px; display: flex; align-items: center; gap: 8px; }
-.dot { width: 10px; height: 10px; border-radius: 99px; background: var(--accent); display: inline-block; }
+.brand .logo { width: 26px; height: 26px; display: block; }
 nav { display: flex; flex-direction: column; gap: 4px; }
 nav button {
   text-align: left;
@@ -95,13 +95,15 @@ main { flex: 1; min-width: 0; padding: 28px 32px 48px; }
 .stat-label { color: var(--muted); font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.04em; }
 .panel { margin-top: 14px; }
 .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-input[type="search"], input[type="text"], input[type="date"], select {
+input[type="search"], input[type="text"], input[type="email"], input[type="date"], select {
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 8px 10px;
   min-width: 0;
 }
+.panel > label { display: flex; flex-direction: column; gap: 4px; margin: 10px 0; font-size: 13px; color: var(--muted); }
+.panel > label input { width: min(420px, 100%); }
 input[type="search"] { width: min(320px, 100%); }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
@@ -141,6 +143,18 @@ th { color: var(--muted); font-size: 12px; font-weight: 600; }
   justify-content: center;
   padding: 24px;
 }
+.dialog.wide { width: min(520px, 100%); }
+.dialog textarea, #invite-pass {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: ui-monospace, "Cascadia Mono", monospace;
+  font-size: 12px;
+}
+#invite-qr { background: white; border-radius: 8px; padding: 8px; align-self: flex-start; }
+.key-row { display: flex; flex-direction: column; gap: 4px; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .dialog {
   width: min(440px, 100%);
   background: var(--panel);

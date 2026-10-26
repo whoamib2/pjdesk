@@ -115,7 +115,7 @@ impl Settings {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateStatus {
     #[serde(default)]
     pub last_check_at: u64,
@@ -133,7 +133,7 @@ fn fresh_jitter() -> u64 {
 }
 
 impl UpdateStatus {
-    pub fn read(data_dir: &Path) -> Loaded<Self> {
+    fn read_raw(data_dir: &Path) -> Loaded<Self> {
         match std::fs::read(data_dir.join(STATUS_FILE)) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(s) => Loaded::Present(s),
@@ -144,10 +144,62 @@ impl UpdateStatus {
         }
     }
 
+    pub fn read(data_dir: &Path) -> Loaded<Self> {
+        match Self::read_raw(data_dir) {
+            Loaded::Present(s) => Loaded::Present(s.settled(env!("CARGO_PKG_VERSION"))),
+            other => other,
+        }
+    }
+
     pub fn load(data_dir: &Path) -> Self {
         match Self::read(data_dir) {
             Loaded::Present(s) => s,
             Loaded::Absent | Loaded::Unreadable => Self::default(),
+        }
+    }
+
+    /// The installer leaves `Installing 0.6.32` in the data folder, then opens
+    /// this window. When that version is this copy, the line is already done.
+    /// Compared locally: no network check and no service pipe.
+    pub fn settled(self, current: &str) -> Self {
+        let Some(offered) = self.offered_version() else {
+            return self;
+        };
+        if pjdesk_proto::update::is_newer(current, &offered) {
+            return self;
+        }
+        if self.last_result == "Up to date" && self.available.is_empty() && self.error.is_empty() {
+            return self;
+        }
+        Self { last_check_at: self.last_check_at, last_result: "Up to date".into(), available: String::new(), error: String::new() }
+    }
+
+    /// Version named by the status file. The available field wins. Otherwise
+    /// `Installing 0.6.32` or `Version 0.6.32 is available`.
+    fn offered_version(&self) -> Option<String> {
+        let available = self.available.trim().trim_start_matches('v');
+        if pjdesk_proto::update::parse_version(available).is_some() {
+            return Some(available.to_string());
+        }
+        if !(self.last_result.starts_with("Installing ") || self.last_result.contains(" is available")) {
+            return None;
+        }
+        self.last_result.split_whitespace().find_map(|token| {
+            let token = token.trim_matches(|c: char| matches!(c, '.' | ',' | ')' | '(')).trim_start_matches('v');
+            pjdesk_proto::update::parse_version(token).map(|_| token.to_string())
+        })
+    }
+
+    /// Rewrites a finished install so the next open does not read it again.
+    /// A folder this process cannot write is left as it is; [`Self::read`]
+    /// still reports the settled line.
+    pub fn reconcile(data_dir: &Path) {
+        let Loaded::Present(raw) = Self::read_raw(data_dir) else {
+            return;
+        };
+        let settled = raw.clone().settled(env!("CARGO_PKG_VERSION"));
+        if settled != raw {
+            settled.save(data_dir);
         }
     }
 
@@ -387,6 +439,7 @@ pub fn install_if_planned(data_dir: &Path, manual: bool) -> Result<String> {
         }
         Plan::Install => {
             tracing::info!("server update: installing {}", update.version);
+            crate::cloud::announce_maintenance(data_dir);
             match pjdesk_proto::update::install_available(&update) {
                 Ok(()) => {
                     record(data_dir, &format!("Installing {}", update.version), &update.version, "");
@@ -411,6 +464,7 @@ fn plan_for(data_dir: &Path, settings: &Settings, available: Option<String>, man
 /// Called about once a minute by the running server. Does the network check
 /// only when the saved interval has elapsed.
 pub fn service_tick(data_dir: &Path) {
+    UpdateStatus::reconcile(data_dir);
     let settings = Settings::load(data_dir);
     if !settings.auto {
         return;
@@ -426,51 +480,16 @@ pub fn service_tick(data_dir: &Path) {
     }
 }
 
-/// Removes the always-on task an older installer registered, when automatic
-/// updates are off. The new task is created only by `update-task`.
-pub fn retire_legacy_task_if_disabled(data_dir: &Path) {
-    if Settings::load(data_dir).auto {
-        return;
-    }
+/// Removes the scheduled task older installs registered. The service checks
+/// on its own. A task that launches from svchost is what Defender was matching.
+pub fn retire_legacy_task_if_disabled(_data_dir: &Path) {
     let _ = delete_task();
 }
 
-/// Creates or removes the scheduled task and stores the setting.
+/// Stores the setting and deletes any leftover scheduled task.
 pub fn set_task(data_dir: &Path, enable: bool) -> Result<()> {
     set_auto(data_dir, enable);
-    if enable {
-        create_task()
-    } else {
-        delete_task()
-    }
-}
-
-#[cfg(windows)]
-fn create_task() -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let tr = format!("{} update --auto", exe.display());
-    let status = std::process::Command::new("schtasks")
-        .args([
-            "/Create",
-            "/TN",
-            UPDATE_TASK,
-            "/TR",
-            &tr,
-            "/SC",
-            "MINUTE",
-            "/MO",
-            "30",
-            "/RU",
-            "SYSTEM",
-            "/RL",
-            "HIGHEST",
-            "/F",
-        ])
-        .status()
-        .context("running schtasks")?;
-    if !status.success() {
-        bail!("schtasks could not create the update task (run as Administrator). The service will still check while it is running.");
-    }
+    delete_task()?;
     Ok(())
 }
 
@@ -478,11 +497,6 @@ fn create_task() -> Result<()> {
 fn delete_task() -> Result<()> {
     let _ = std::process::Command::new("schtasks").args(["/Delete", "/TN", UPDATE_TASK, "/F"]).status();
     Ok(())
-}
-
-#[cfg(not(windows))]
-fn create_task() -> Result<()> {
-    bail!("the scheduled update task is only available on Windows; the service checks on its own while it is running")
 }
 
 #[cfg(not(windows))]
@@ -521,6 +535,7 @@ mod tests {
             epoch,
             healthy: true,
             at,
+            maintenance_until: 0,
         }
     }
 
@@ -587,6 +602,15 @@ mod tests {
         let mut s = base();
         s.available = Some("0.3.9".into());
         assert_eq!(decide(&s), Plan::Skip { reason: "not newer" });
+        // The public feed still names 0.5.2. Neither an automatic nor a manual
+        // check on 0.6.0 may install it.
+        s.current = "0.6.0".into();
+        s.available = Some("0.5.2".into());
+        s.manual = true;
+        assert_eq!(decide(&s), Plan::Skip { reason: "not newer" });
+        s.manual = false;
+        assert_eq!(decide(&s), Plan::Skip { reason: "not newer" });
+        s.current = "0.4.0".into();
         s.available = Some("0.9.0-rc1".into());
         assert_eq!(decide(&s), Plan::Skip { reason: "pre-release" });
         s.available = Some("0.5.0".into());
@@ -612,5 +636,62 @@ mod tests {
         assert!(parse_hhmm("").unwrap().is_none());
         assert_eq!(parse_hhmm("02:05").unwrap(), Some(125));
         assert!(parse_hhmm("24:00").is_err());
+    }
+
+    #[test]
+    fn a_finished_install_reads_as_up_to_date_without_a_check() {
+        let stale = UpdateStatus {
+            last_check_at: 1_700_000_000,
+            last_result: "Installing 0.6.32".into(),
+            available: "0.6.32".into(),
+            error: String::new(),
+        };
+        let settled = stale.settled("0.6.32");
+        assert_eq!(settled.last_result, "Up to date");
+        assert!(settled.available.is_empty());
+        assert!(settled.error.is_empty());
+        assert_eq!(settled.last_check_at, 1_700_000_000);
+
+        let named_only = UpdateStatus {
+            last_check_at: 9,
+            last_result: "Installing 0.6.32".into(),
+            available: String::new(),
+            error: "left from the installer".into(),
+        };
+        let settled = named_only.settled("0.6.33");
+        assert_eq!(settled.last_result, "Up to date");
+        assert!(settled.error.is_empty());
+
+        let newer = UpdateStatus {
+            last_check_at: 1,
+            last_result: "Installing 0.6.34".into(),
+            available: "0.6.34".into(),
+            error: String::new(),
+        };
+        assert_eq!(newer.clone().settled("0.6.33"), newer);
+
+        let failed = UpdateStatus {
+            last_check_at: 2,
+            last_result: "Check failed".into(),
+            available: String::new(),
+            error: "network".into(),
+        };
+        assert_eq!(failed.clone().settled("0.6.33"), failed);
+
+        let dir = std::env::temp_dir().join(format!("pjdesk-update-settle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let current = env!("CARGO_PKG_VERSION");
+        let path = dir.join("server-update-status.json");
+        std::fs::write(&path, format!(r#"{{"last_check_at":1700000000,"last_result":"Installing {current}","available":"{current}","error":""}}"#)).unwrap();
+        UpdateStatus::reconcile(&dir);
+        let loaded = UpdateStatus::load(&dir);
+        assert_eq!(loaded.last_result, "Up to date");
+        assert!(loaded.available.is_empty());
+        assert_eq!(loaded.last_check_at, 1_700_000_000);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("Up to date"), "{text}");
+        assert!(!text.contains("Installing"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

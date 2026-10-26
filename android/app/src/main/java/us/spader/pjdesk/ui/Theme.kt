@@ -48,6 +48,8 @@ private val DarkColors = darkColorScheme(
     onSurface = TextDark,
     surfaceVariant = ElevDark,
     onSurfaceVariant = MutedDark,
+    secondaryContainer = Color(0xFF243044),
+    onSecondaryContainer = TextDark,
     outline = LineDark,
     error = WarnDark,
 )
@@ -62,6 +64,8 @@ private val LightColors = lightColorScheme(
     onSurface = TextLight,
     surfaceVariant = ElevLight,
     onSurfaceVariant = MutedLight,
+    secondaryContainer = Color(0xFFD9E6FF),
+    onSecondaryContainer = TextLight,
     outline = LineLight,
     error = WarnLight,
 )
@@ -72,8 +76,10 @@ private val Type = Typography(
     titleMedium = TextStyle(fontFamily = Inter, fontWeight = FontWeight.SemiBold, fontSize = 16.sp),
     bodyLarge = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 16.sp),
     bodyMedium = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 14.5.sp),
+    bodySmall = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 13.sp),
     labelLarge = TextStyle(fontFamily = Inter, fontWeight = FontWeight.SemiBold, fontSize = 14.5.sp),
     labelMedium = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 12.5.sp),
+    labelSmall = TextStyle(fontFamily = Inter, fontWeight = FontWeight.SemiBold, fontSize = 11.sp),
 )
 
 @Composable
@@ -95,3 +101,6 @@ fun pjMuted(): Color = MaterialTheme.colorScheme.onSurfaceVariant
 
 @Composable
 fun pjOk(): Color = if (isSystemInDarkTheme()) OkDark else OkLight
+
+@Composable
+fun pjWarn(): Color = if (isSystemInDarkTheme()) WarnDark else WarnLight

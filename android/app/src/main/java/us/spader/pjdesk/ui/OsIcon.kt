@@ -8,64 +8,121 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 
-/** Same shapes as the Windows client's OS icons. Android is a phone outline. */
+/**
+ * White platform mark drawn on a colored tile. [cutout] is the tile color, so a
+ * screen reads as a hole in the white shape. Windows is four panes. Unknown is
+ * a monitor.
+ */
 @Composable
-fun OsIcon(family: String, modifier: Modifier = Modifier, tint: Color = Color.Unspecified) {
-    val color = if (tint == Color.Unspecified) androidx.compose.material3.MaterialTheme.colorScheme.onSurface else tint
+fun OsIcon(
+    family: String,
+    modifier: Modifier = Modifier,
+    tint: Color = Color.White,
+    cutout: Color = Color.Black,
+) {
     Canvas(modifier.size(24.dp)) {
         val s = size.minDimension
         val c = Offset(size.width / 2f, size.height / 2f)
-        val stroke = Stroke(width = s * 0.08f)
-        when (family) {
+        when (family.lowercase()) {
             "windows" -> {
-                val w = s * 0.34f
-                val h = s * 0.28f
-                val gap = s * 0.06f
-                fun pane(dx: Float, dy: Float) {
-                    drawRect(color, topLeft = c + Offset(dx, dy), size = Size(w, h), style = stroke)
+                val gap = s * 0.08f
+                val pane = (s * 0.82f - gap) / 2f
+                val left = (size.width - (pane * 2f + gap)) / 2f
+                val top = (size.height - (pane * 2f + gap)) / 2f
+                val radius = CornerRadius(s * 0.08f)
+                for (row in 0..1) {
+                    for (col in 0..1) {
+                        drawRoundRect(
+                            tint,
+                            topLeft = Offset(left + col * (pane + gap), top + row * (pane + gap)),
+                            size = Size(pane, pane),
+                            cornerRadius = radius,
+                        )
+                    }
                 }
-                pane(-w - gap / 2, -h - gap / 2)
-                pane(gap / 2, -h - gap / 2)
-                pane(-w - gap / 2, gap / 2)
-                pane(gap / 2, gap / 2)
             }
             "macos" -> {
-                val w = s * 0.74f
-                val h = s * 0.56f
+                val sw = s * 0.70f
+                val sh = s * 0.42f
+                val left = c.x - sw / 2f
+                val top = c.y - s * 0.36f
+                drawRoundRect(tint, Offset(left, top), Size(sw, sh), CornerRadius(s * 0.08f))
+                val inset = s * 0.07f
                 drawRoundRect(
-                    color,
-                    topLeft = Offset(c.x - w / 2, c.y - h / 2 + s * 0.04f),
-                    size = Size(w, h),
-                    cornerRadius = CornerRadius(s * 0.08f),
-                    style = stroke,
+                    cutout,
+                    Offset(left + inset, top + inset),
+                    Size(sw - inset * 2f, sh - inset * 2.2f),
+                    CornerRadius(s * 0.04f),
+                )
+                drawLine(
+                    tint,
+                    Offset(c.x - s * 0.40f, top + sh + s * 0.08f),
+                    Offset(c.x + s * 0.40f, top + sh + s * 0.08f),
+                    strokeWidth = s * 0.09f,
+                    cap = StrokeCap.Round,
                 )
             }
             "linux" -> {
-                drawLine(color, Offset(c.x - s * 0.28f, c.y - s * 0.16f), Offset(c.x - s * 0.28f, c.y), stroke.width)
-                drawLine(color, Offset(c.x - s * 0.28f, c.y), Offset(c.x - s * 0.12f, c.y + s * 0.14f), stroke.width)
-                drawLine(color, Offset(c.x + s * 0.02f, c.y + s * 0.14f), Offset(c.x + s * 0.28f, c.y + s * 0.14f), stroke.width)
+                val sw = s * 0.78f
+                val sh = s * 0.58f
+                val left = c.x - sw / 2f
+                val top = c.y - sh / 2f
+                drawRoundRect(tint, Offset(left, top), Size(sw, sh), CornerRadius(s * 0.1f))
+                val inset = s * 0.08f
+                drawRoundRect(
+                    cutout,
+                    Offset(left + inset, top + inset),
+                    Size(sw - inset * 2f, sh - inset * 2f),
+                    CornerRadius(s * 0.05f),
+                )
+                val stroke = Stroke(width = s * 0.07f, cap = StrokeCap.Round)
+                val ox = left + inset * 2f
+                val oy = c.y
+                drawLine(tint, Offset(ox, oy - s * 0.1f), Offset(ox + s * 0.12f, oy), stroke.width, cap = StrokeCap.Round)
+                drawLine(tint, Offset(ox + s * 0.12f, oy), Offset(ox, oy + s * 0.1f), stroke.width, cap = StrokeCap.Round)
+                drawLine(tint, Offset(ox + s * 0.2f, oy + s * 0.1f), Offset(ox + s * 0.38f, oy + s * 0.1f), stroke.width, cap = StrokeCap.Round)
             }
             "android" -> {
-                val w = s * 0.42f
-                val h = s * 0.68f
-                val left = c.x - w / 2
-                val top = c.y - h / 2 + s * 0.04f
+                val w = s * 0.46f
+                val h = s * 0.78f
+                val left = c.x - w / 2f
+                val top = c.y - h / 2f
+                drawRoundRect(tint, Offset(left, top), Size(w, h), CornerRadius(s * 0.12f))
+                val inset = s * 0.07f
                 drawRoundRect(
-                    color,
-                    topLeft = Offset(left, top),
-                    size = Size(w, h),
-                    cornerRadius = CornerRadius(s * 0.08f),
-                    style = stroke,
+                    cutout,
+                    Offset(left + inset, top + inset * 1.7f),
+                    Size(w - inset * 2f, h - inset * 3.4f),
+                    CornerRadius(s * 0.04f),
                 )
-                drawLine(color, Offset(left + s * 0.08f, top + s * 0.16f), Offset(left + w - s * 0.08f, top + s * 0.16f), stroke.width)
+                drawCircle(tint, radius = s * 0.035f, center = Offset(c.x, top + h - inset * 1.05f))
             }
             else -> {
-                drawCircle(color, radius = s * 0.28f, center = c, style = stroke)
-                drawLine(color, c + Offset(0f, -s * 0.08f), c + Offset(0f, s * 0.02f), stroke.width)
-                drawCircle(color, radius = s * 0.04f, center = c + Offset(0f, s * 0.12f))
+                val sw = s * 0.78f
+                val sh = s * 0.50f
+                val left = c.x - sw / 2f
+                val top = c.y - s * 0.40f
+                drawRoundRect(tint, Offset(left, top), Size(sw, sh), CornerRadius(s * 0.1f))
+                val inset = s * 0.08f
+                drawRoundRect(
+                    cutout,
+                    Offset(left + inset, top + inset),
+                    Size(sw - inset * 2f, sh - inset * 2f),
+                    CornerRadius(s * 0.04f),
+                )
+                val neck = top + sh
+                drawLine(tint, Offset(c.x, neck), Offset(c.x, neck + s * 0.14f), strokeWidth = s * 0.08f, cap = StrokeCap.Round)
+                drawLine(
+                    tint,
+                    Offset(c.x - s * 0.2f, neck + s * 0.14f),
+                    Offset(c.x + s * 0.2f, neck + s * 0.14f),
+                    strokeWidth = s * 0.08f,
+                    cap = StrokeCap.Round,
+                )
             }
         }
     }

@@ -51,7 +51,14 @@ const FORMAT: u32 = 1;
 
 /// The server's state files (relative to the data folder), plus every
 /// `addressbook/<user>.json`.
-const STATE_FILES: [&str; 4] = ["server-cert.pem", "server-key.pem", "accounts.json", "devices.json"];
+const STATE_FILES: [&str; 6] = [
+    "server-cert.pem",
+    "server-key.pem",
+    "accounts.json",
+    "devices.json",
+    "access-keys.json",
+    "network-access.json",
+];
 /// Upload a changed computer list at most this often (accounts and the key go
 /// up straight away).
 const DEVICES_PUSH_INTERVAL: u64 = 300;
@@ -67,6 +74,11 @@ fn hostname() -> String {
         .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "server".into())
+}
+
+/// This computer's name, for the peer line and for ignoring our own health rows.
+pub fn computer_name() -> String {
+    hostname()
 }
 
 fn b64() -> base64::engine::GeneralPurpose {
@@ -131,20 +143,7 @@ pub struct AccountKeys {
 }
 
 pub fn derive_account_keys(email: &str, password: &str) -> AccountKeys {
-    let email = email.trim().to_lowercase();
-    let salt = Sha256::digest(format!("pjdesk-cloud-v1\0{email}").as_bytes());
-    let mut master = [0u8; 32];
-    ring::pbkdf2::derive(
-        ring::pbkdf2::PBKDF2_HMAC_SHA256,
-        std::num::NonZeroU32::new(600_000).expect("non-zero"),
-        &salt,
-        password.as_bytes(),
-        &mut master,
-    );
-    let mut auth = [0u8; 32];
-    let mut sync = [0u8; 32];
-    auth.copy_from_slice(&hmac(&master, "pjdesk-cloud-auth"));
-    sync.copy_from_slice(&hmac(&master, "pjdesk-cloud-sync-key"));
+    let (auth, sync) = pjdesk_proto::access::derive_account_keys(email, password);
     AccountKeys { auth, sync }
 }
 
@@ -157,11 +156,7 @@ pub fn sign_in(api: &str, email: &str, password: &str) -> Result<CloudConfig> {
     }
     let api = api.trim().trim_end_matches('/').to_string();
     let keys = derive_account_keys(&email, password);
-    let body = serde_json::json!({
-        "email": email,
-        "auth_key": hex::encode(keys.auth),
-        "device": format!("PJDesk Server on {}", hostname()),
-    });
+    let body = login_body(&email, &hex::encode(keys.auth), &format!("PJDesk Server on {}", hostname()));
     #[derive(Deserialize)]
     struct LoginReply {
         token: String,
@@ -174,7 +169,10 @@ pub fn sign_in(api: &str, email: &str, password: &str) -> Result<CloudConfig> {
         .send_string(&body.to_string())
     {
         Ok(resp) => serde_json::from_str(&resp.into_string()?).context("unexpected reply from PJDesk Cloud")?,
-        Err(ureq::Error::Status(401, _)) => bail!("wrong email or password"),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            bail!("{}", cloud_error_text(code, &text))
+        }
         Err(e) => return Err(api_error(&api, &email, e)),
     };
     let cfg = CloudConfig {
@@ -430,7 +428,7 @@ fn authorization(
     )
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build()
 }
 
@@ -463,7 +461,13 @@ fn signed(cfg: &CloudConfig, method: &str, payload: &[u8]) -> (String, String, S
 /// Like [`signed`], for `object`, with extra signed headers (lower-case names).
 /// Conditional uploads sign `if-match` / `if-none-match`; leaving them out of
 /// the signature makes R2 reject the request.
-fn signed_for(cfg: &CloudConfig, object: &str, method: &str, payload: &[u8], extra: &[(&str, &str)]) -> (String, String, String) {
+fn signed_for(
+    cfg: &CloudConfig,
+    object: &str,
+    method: &str,
+    payload: &[u8],
+    extra: &[(&str, &str)],
+) -> (String, String, String) {
     let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let payload_sha256 = hex::encode(Sha256::digest(payload));
     let mut headers = vec![
@@ -611,6 +615,56 @@ use std::io::Read as _;
 // ---------------------------------------------------------------------------
 // PJDesk Cloud client
 
+/// POST /api/login body. pjdesk.com expects `auth_key`, the hex HMAC derived
+/// from the password. A `password` field is rejected with
+/// "Enter your email and password."
+pub fn login_body(email: &str, auth_key_hex: &str, device: &str) -> serde_json::Value {
+    serde_json::json!({
+        "email": email,
+        "auth_key": auth_key_hex,
+        "device": device,
+    })
+}
+
+/// The `error` string from a PJDesk Cloud HTTP response, unchanged.
+/// A 400 from login is "Enter your email and password." A 401 is
+/// "Wrong email or password."
+pub fn cloud_error_text(status: u16, body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(msg) = v.get("error").and_then(|m| m.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            return msg.to_string();
+        }
+    }
+    if status == 401 {
+        "Wrong email or password.".into()
+    } else if body.trim().is_empty() {
+        format!("PJDesk Cloud error (HTTP {status})")
+    } else {
+        body.trim().to_string()
+    }
+}
+
+/// Email stored in `cloud-sync.json`, when that file is an account sign-in.
+/// The token stays in the file. Callers that show this to the window must not
+/// copy the token out with it.
+pub fn saved_account_email(data_dir: &Path) -> String {
+    let Ok(bytes) = std::fs::read(data_dir.join(CONFIG_FILE)) else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return String::new();
+    };
+    if value.get("mode").and_then(|m| m.as_str()) == Some("r2") {
+        return String::new();
+    }
+    let email = value.get("email").and_then(|e| e.as_str()).unwrap_or("").trim();
+    let token = value.get("token").and_then(|t| t.as_str()).unwrap_or("").trim();
+    if email.is_empty() || token.is_empty() {
+        return String::new();
+    }
+    email.to_string()
+}
+
 /// A readable error from PJDesk Cloud.
 fn api_error(api: &str, email: &str, e: ureq::Error) -> anyhow::Error {
     match e {
@@ -688,11 +742,7 @@ pub fn discard_sign_in(cfg: &CloudConfig) {
 /// How many computers are connected to the running server (0 if it isn't running).
 pub fn computers_online(data_dir: &Path) -> usize {
     let path = data_dir.join("online.json");
-    let fresh = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map(|e| e.as_secs() <= 15).unwrap_or(false))
-        .unwrap_or(false);
-    if !fresh {
+    if !online_file_is_fresh(&path) {
         return 0;
     }
     std::fs::read(&path)
@@ -950,6 +1000,13 @@ struct SyncState {
     /// Shown in the window until the next role change replaces it.
     #[serde(default)]
     notice: String,
+    /// Generation that made this server step down. Higher than `epoch` until
+    /// this server accepts that copy or promotes past it.
+    #[serde(default)]
+    fenced_epoch: u64,
+    /// Instance that owns `fenced_epoch`.
+    #[serde(default)]
+    fenced_instance: String,
 }
 
 impl SyncState {
@@ -965,6 +1022,18 @@ impl SyncState {
 }
 
 /// A random ID for this data folder, made once.
+pub fn instance_of(data_dir: &Path) -> String {
+    instance_id(data_dir)
+}
+
+pub fn local_epoch(data_dir: &Path) -> u64 {
+    SyncState::load(data_dir).epoch
+}
+
+pub fn unix_now() -> u64 {
+    now()
+}
+
 fn instance_id(data_dir: &Path) -> String {
     let path = data_dir.join(INSTANCE_FILE);
     if let Ok(text) = std::fs::read_to_string(&path) {
@@ -1102,12 +1171,46 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
-fn effective_role(st: &SyncState, heuristic: Role) -> Role {
-    match st.desired.as_str() {
-        "active" => Role::Active,
-        "standby" => Role::Standby,
-        _ => heuristic,
+fn effective_role(st: &SyncState, mine: &str, heuristic: Role) -> Role {
+    if pjdesk_proto::failover::generation_is_primary(
+        &st.desired,
+        st.epoch,
+        &st.active_instance,
+        mine,
+        st.fenced_epoch,
+        &st.fenced_instance,
+        heuristic == Role::Active,
+    ) {
+        Role::Active
+    } else {
+        Role::Standby
     }
+}
+
+/// True when this process may keep the live computer table.
+/// A server with no cloud sync is the only server. A cloud standby, including
+/// one whose desired role is standby or whose epoch belongs to another
+/// instance, must not accept host registrations as authoritative.
+///
+/// `cloud-status.json` saying standby is not enough to refuse. After a
+/// restart the live table is empty, and an older sync wrote that file from
+/// the empty table. The server that owns the cloud copy, and a server with
+/// no owner recorded yet, still accepts hosts so the table can fill again.
+pub fn accepts_host_registrations(data_dir: &Path) -> bool {
+    if CloudConfig::load(data_dir).is_none() {
+        return true;
+    }
+    let st = SyncState::load(data_dir);
+    let mine = instance_id(data_dir);
+    pjdesk_proto::failover::generation_is_primary(
+        &st.desired,
+        st.epoch,
+        &st.active_instance,
+        &mine,
+        st.fenced_epoch,
+        &st.fenced_instance,
+        true,
+    )
 }
 
 /// True when the running server wrote `cloud-status.json` recently.
@@ -1123,11 +1226,17 @@ pub fn status_is_fresh(data_dir: &Path) -> bool {
 /// promote or demote, and a newer cloud epoch, override it.
 pub fn sync_once(data_dir: &Path, role: Role, force_push: bool) -> bool {
     let Some(cfg) = CloudConfig::load(data_dir) else {
-        let _ = std::fs::remove_file(data_dir.join(STATUS_FILE));
+        // Sign-out removes the file. An upgrade, a reinstall, and a bad read
+        // leave it in place. Do not clear the status the window uses to show
+        // the account while that file is still there.
+        if !data_dir.join(CONFIG_FILE).exists() {
+            let _ = std::fs::remove_file(data_dir.join(STATUS_FILE));
+        }
         return false;
     };
     let mut applied = false;
-    let mut effective = effective_role(&SyncState::load(data_dir), role);
+    let mine = instance_id(data_dir);
+    let mut effective = effective_role(&SyncState::load(data_dir), &mine, role);
     let result = (|| -> Result<()> {
         match absorb(data_dir, &cfg)? {
             Fence::Superseded => {
@@ -1141,7 +1250,7 @@ pub fn sync_once(data_dir: &Path, role: Role, force_push: bool) -> bool {
                 }
             }
             Fence::MayUpload => {
-                effective = effective_role(&SyncState::load(data_dir), role);
+                effective = effective_role(&SyncState::load(data_dir), &mine, role);
                 match effective {
                     Role::Standby => {
                         if pull(data_dir, &cfg, false)? {
@@ -1170,6 +1279,11 @@ pub fn sync_once(data_dir: &Path, role: Role, force_push: bool) -> bool {
     status.notice = st.notice.clone();
     status.last_check_at = now();
     status.updated_at = now();
+    if let Some((peer_name, peer_version, peer_role)) = other_peer(data_dir) {
+        status.peer_name = peer_name;
+        status.peer_version = peer_version;
+        status.peer_role = peer_role;
+    }
     match result {
         Ok(()) => status.error.clear(),
         Err(e) => {
@@ -1198,11 +1312,13 @@ fn absorb(data_dir: &Path, cfg: &CloudConfig) -> Result<Fence> {
             apply_bundle(data_dir, &bundle, etag)?;
             let mut st = SyncState::load(data_dir);
             st.desired = "standby".into();
+            st.fenced_epoch = epoch;
+            st.fenced_instance = bundle.instance.clone();
             st.notice = format!(
-                "{name} is now the primary (generation {epoch}). This server switched to standby and will apply updates from the cloud."
+                "{name} is now the primary (generation {epoch}). This server switched to standby and will not take the primary back on its own."
             );
             st.save(data_dir);
-            tracing::warn!("{}", st.notice);
+            tracing::warn!("failover: {}", st.notice);
             Ok(Fence::Superseded)
         }
         Fence::Held => {
@@ -1336,10 +1452,15 @@ pub fn promote(data_dir: &Path) -> Result<()> {
     }
     let mut st = SyncState::load(data_dir);
     st.desired = "active".into();
-    st.notice = "This server is now the primary. The other server will switch to standby the next time it checks.".into();
+    st.fenced_epoch = 0;
+    st.fenced_instance.clear();
+    st.notice =
+        "This server is now the primary. The other server will switch to standby the next time it checks.".into();
     st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Active);
-    tracing::info!("{}", st.notice);
+    tracing::info!("failover: {}", st.notice);
+    register_network(data_dir, Role::Active, true);
+    publish_heartbeat(data_dir);
     Ok(())
 }
 
@@ -1357,6 +1478,7 @@ pub fn demote(data_dir: &Path) -> Result<()> {
     st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Standby);
     tracing::info!("{}", st.notice);
+    register_network(data_dir, Role::Standby, false);
     Ok(())
 }
 
@@ -1563,7 +1685,7 @@ pub fn join(data_dir: &Path, cfg: &CloudConfig) -> Result<String> {
 fn sync_status_now(data_dir: &Path, role: Role) -> Option<()> {
     let cfg = CloudConfig::load(data_dir)?;
     let st = SyncState::load(data_dir);
-    let (peer_name, peer_version, peer_role) = other_peer(data_dir);
+    let (peer_name, peer_version, peer_role) = other_peer(data_dir).unwrap_or_default();
     CloudStatus {
         enabled: true,
         role: if role == Role::Active { "active" } else { "standby" }.into(),
@@ -1588,15 +1710,24 @@ fn sync_status_now(data_dir: &Path, role: Role) -> Option<()> {
 }
 
 /// Name, version, and role of a different server that published health.
-fn other_peer(data_dir: &Path) -> (String, String, String) {
-    let mine = instance_id(data_dir);
-    let mut peers = peer_health(data_dir);
-    peers.retain(|p| p.instance != mine && !p.version.is_empty());
-    peers.sort_by_key(|p| std::cmp::Reverse(p.at));
-    match peers.into_iter().next() {
-        Some(p) => (p.name, p.version, p.role),
-        None => (String::new(), String::new(), String::new()),
+/// An older instance of this computer is not the peer. The role word follows
+/// this server's generation, not a stale health label.
+fn other_peer(data_dir: &Path) -> Option<(String, String, String)> {
+    let (ok, mut peers) = peer_health_result(data_dir);
+    if !ok {
+        return None;
     }
+    let mine = instance_id(data_dir);
+    let mine_name = hostname();
+    peers.retain(|p| {
+        pjdesk_proto::failover::counts_as_other_server(&p.instance, &p.name, &p.version, &mine, &mine_name)
+    });
+    peers.sort_by_key(|p| std::cmp::Reverse(p.at));
+    let role = pjdesk_proto::failover::peer_role_label(accepts_host_registrations(data_dir));
+    Some(match peers.into_iter().next() {
+        Some(p) => (p.name, p.version, role.into()),
+        None => (String::new(), String::new(), role.into()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,6 +1744,9 @@ pub struct PeerHealth {
     pub epoch: u64,
     pub healthy: bool,
     pub at: u64,
+    /// Unix seconds until which a standby must not promote. Missing on older reports.
+    #[serde(default)]
+    pub maintenance_until: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -1621,20 +1755,767 @@ struct HealthDoc {
     peers: BTreeMap<String, PeerHealth>,
 }
 
-fn publish_health(data_dir: &Path, role: Role) {
+/// Health only, every few seconds. The full sync still publishes presence
+/// and the network address on its own pass.
+pub fn publish_heartbeat(data_dir: &Path) {
     let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    let role = if accepts_host_registrations(data_dir) { Role::Active } else { Role::Standby };
+    let me = health_report(data_dir, role);
+    if let Err(e) = write_health(&cfg, &me) {
+        tracing::debug!("failover heartbeat: {e:#}");
+    }
+    stamp_live_peer(data_dir, role);
+}
+
+const MAINT_FILE: &str = "maintenance-until.txt";
+const SEEN_FILE: &str = "maintenance-seen.txt";
+
+fn maintenance_deadline(data_dir: &Path) -> u64 {
+    std::fs::read_to_string(data_dir.join(MAINT_FILE)).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0)
+}
+
+fn health_report(data_dir: &Path, role: Role) -> PeerHealth {
     let st = SyncState::load(data_dir);
-    let me = PeerHealth {
+    let until = maintenance_deadline(data_dir);
+    let holding = until > now();
+    PeerHealth {
         instance: instance_id(data_dir),
         name: hostname(),
         version: env!("CARGO_PKG_VERSION").into(),
         role: role_name(role).into(),
         epoch: st.epoch,
-        healthy: true,
+        healthy: !holding,
+        maintenance_until: if holding { until } else { 0 },
         at: now(),
+    }
+}
+
+/// Asks the standby not to promote during a planned update or restart.
+/// A standby, and a server with no account, does not announce.
+pub fn announce_maintenance(data_dir: &Path) {
+    if CloudConfig::load(data_dir).is_none() || !accepts_host_registrations(data_dir) {
+        return;
+    }
+    let until = now().saturating_add(pjdesk_proto::failover::MAINTENANCE_HOLD_SECS);
+    if std::fs::write(data_dir.join(MAINT_FILE), until.to_string()).is_err() {
+        return;
+    }
+    tracing::info!(
+        "failover: planned restart; this primary announced maintenance so the standby does not take over"
+    );
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    let me = health_report(data_dir, Role::Active);
+    if let Err(e) = write_health(&cfg, &me) {
+        tracing::debug!("failover maintenance: {e:#}");
+    }
+}
+
+/// Remembers a maintenance sighting so a later unread cloud does not forget it.
+/// `clear` drops it because the primary is healthy again. Returns the deadline still in force.
+pub fn note_peer_maintenance(data_dir: &Path, observed_until: u64, clear: bool) -> u64 {
+    let path = data_dir.join(SEEN_FILE);
+    if clear {
+        let _ = std::fs::remove_file(&path);
+        return 0;
+    }
+    let now = now();
+    if observed_until > now {
+        let _ = std::fs::write(&path, observed_until.to_string());
+        return observed_until;
+    }
+    std::fs::read_to_string(&path).ok().and_then(|text| text.trim().parse().ok()).filter(|until: &u64| *until > now).unwrap_or(0)
+}
+
+/// Rewrites the window's peer line from the latest health, and republishes
+/// the network slot when the saved "Published as" sentence disagrees.
+fn stamp_live_peer(data_dir: &Path, role: Role) {
+    let mut status = CloudStatus::load(data_dir).unwrap_or_default();
+    let fresh_peer = other_peer(data_dir);
+    let st = SyncState::load(data_dir);
+    let role_text = role_name(role);
+    status.role = role_text.into();
+    status.epoch = st.epoch;
+    status.active_instance = st.active_instance;
+    status.active_name = st.active_name;
+    status.notice = st.notice;
+    if let Some((name, version, peer_role)) = fresh_peer {
+        status.peer_name = name;
+        status.peer_version = version;
+        status.peer_role = peer_role;
+    }
+    status.updated_at = now();
+    status.enabled = true;
+    if let Some(cfg) = CloudConfig::load(data_dir) {
+        if status.account.is_empty() && cfg.is_account() {
+            status.account = cfg.email.clone();
+        }
+        if status.bucket.is_empty() {
+            status.bucket = cfg.describe();
+        }
+    }
+    status.save(data_dir);
+    if note_says_other_role(data_dir, role) {
+        let _ = std::fs::remove_file(data_dir.join("network-publish.json"));
+        register_network(data_dir, role, false);
+    }
+}
+
+fn note_says_other_role(data_dir: &Path, role: Role) -> bool {
+    let Some(record) = crate::public_addr::load(data_dir) else { return false };
+    let other = if role == Role::Active {
+        "Published as the standby server."
+    } else {
+        "Published as the active server."
     };
+    record.note == other
+}
+
+/// Steps down because another server holds a newer generation.
+/// Returns false when this server already recorded that generation.
+pub fn yield_to_epoch(data_dir: &Path, remote_epoch: u64, remote_instance: &str, remote_name: &str) -> bool {
+    let mut st = SyncState::load(data_dir);
+    if st.desired == "standby" && st.fenced_epoch == remote_epoch && st.fenced_instance == remote_instance {
+        return false;
+    }
+    let name = if remote_name.trim().is_empty() { "The other server" } else { remote_name.trim() };
+    st.desired = "standby".into();
+    st.fenced_epoch = remote_epoch;
+    st.fenced_instance = remote_instance.to_string();
+    st.notice = format!(
+        "{name} is now the primary (generation {remote_epoch}). This server switched to standby and will not take the primary back on its own."
+    );
+    st.save(data_dir);
+    tracing::warn!("failover: {}", st.notice);
+    let _ = sync_status_now(data_dir, Role::Standby);
+    register_network(data_dir, Role::Standby, false);
+    true
+}
+
+const PEER_FILE: &str = "failover-peer.txt";
+
+/// Address of the account's active server, when it is not this server.
+/// A failed lookup keeps the last address this server learned.
+pub fn peer_target(data_dir: &Path) -> Option<String> {
+    let cached = std::fs::read_to_string(data_dir.join(PEER_FILE))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let Some(cfg) = CloudConfig::load(data_dir) else {
+        return cached;
+    };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return cached;
+    }
+    let mine = crate::public_addr::load(data_dir).map(|record| record.address).unwrap_or_default();
+    match network_addresses(&cfg) {
+        Ok((active, standby)) => match pjdesk_proto::failover::choose_peer(&mine, &active, &standby) {
+            Some(addr) => {
+                let _ = std::fs::write(data_dir.join(PEER_FILE), &addr);
+                Some(addr)
+            }
+            None => cached,
+        },
+        Err(e) => {
+            tracing::debug!("failover: could not read the account server list: {e:#}");
+            cached
+        }
+    }
+}
+
+fn network_addresses(cfg: &CloudConfig) -> Result<(String, String)> {
+    #[derive(Deserialize)]
+    struct Net {
+        #[serde(default)]
+        active_address: String,
+        #[serde(default)]
+        standby_address: String,
+    }
+    #[derive(Deserialize)]
+    struct Doc {
+        #[serde(default)]
+        network: Option<Net>,
+    }
+    let text = match agent()
+        .get(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(resp) => resp.into_string().unwrap_or_default(),
+        Err(e) => return Err(api_error(&cfg.api, &cfg.email, e)),
+    };
+    let doc: Doc = serde_json::from_str(&text).context("unexpected network reply")?;
+    let net = doc.network.unwrap_or(Net { active_address: String::new(), standby_address: String::new() });
+    Ok((net.active_address, net.standby_address))
+}
+
+/// `(read succeeded, peers)`. A failed read is not an empty fleet.
+pub fn peer_health_result(data_dir: &Path) -> (bool, Vec<PeerHealth>) {
+    let Some(cfg) = CloudConfig::load(data_dir) else {
+        return (false, Vec::new());
+    };
+    match read_health(&cfg) {
+        Ok(doc) => (true, doc.peers.into_values().collect()),
+        Err(e) => {
+            tracing::debug!("failover: cloud health: {e:#}");
+            (false, Vec::new())
+        }
+    }
+}
+
+fn publish_health(data_dir: &Path, role: Role) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    let me = health_report(data_dir, role);
     if let Err(e) = write_health(&cfg, &me) {
         tracing::debug!("cloud health: {e:#}");
+    }
+    if let Err(e) = pull_network_policy(data_dir, &cfg) {
+        tracing::debug!("network policy: {e:#}");
+    }
+    let _ = crate::public_addr::poll_public_ip(data_dir, now());
+    register_network(data_dir, role, false);
+    publish_presence(data_dir);
+}
+
+/// Uploads this server's computer list to the owner's account. The user name
+/// is in the body the account API stores; it is not written to the log.
+fn publish_presence(data_dir: &Path) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return;
+    }
+    if !accepts_host_registrations(data_dir) {
+        tracing::info!("presence: this server is the standby and did not publish the computer list");
+        return;
+    }
+    let Ok(reg) = crate::registry::Registry::load(data_dir.join("devices.json")) else { return };
+    let Some(online) = online_ids(data_dir) else { return };
+    let online_path = data_dir.join("online.json");
+    let snapshot_stale = online_path.exists() && !online_file_is_fresh(&online_path);
+    let now = now();
+    let mut devices = Vec::new();
+    for row in reg.presence() {
+        if row.last_seen == 0 || now.saturating_sub(row.last_seen) > 90 * 24 * 3600 {
+            continue;
+        }
+        let live = online.contains(&row.id);
+        if pjdesk_proto::presence_stale(row.last_seen, live, now) {
+            continue;
+        }
+        devices.push(serde_json::json!({
+            "id": row.id,
+            "hostname": row.hostname,
+            "os_family": row.os_family,
+            "os_version": row.os_version,
+            "console_user": row.console_user,
+            "display_name": row.display_name,
+            "last_seen": row.last_seen,
+            "online": live,
+            "signed_in": row.signed_in,
+            "app_version": row.app_version,
+        }));
+        if devices.len() >= 500 {
+            break;
+        }
+    }
+    let body = serde_json::json!({ "devices": devices });
+    let stamp = data_dir.join("presence-publish.json");
+    let previous =
+        std::fs::read(&stamp).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    if previous.as_ref() == Some(&body) {
+        return;
+    }
+    if snapshot_stale {
+        tracing::warn!("online.json is older than {ONLINE_FRESH_SECS}s; publishing every computer offline");
+    }
+    if let Some(prev) = previous.as_ref() {
+        log_presence_changes(prev, &body);
+    }
+    let result = agent()
+        .post(&format!("{}/api/network/presence", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string());
+    match result {
+        Ok(_) => {
+            if let Ok(bytes) = serde_json::to_vec(&body) {
+                let _ = std::fs::write(&stamp, bytes);
+            }
+            let online_names: Vec<String> = devices
+                .iter()
+                .filter(|row| row.get("online").and_then(|v| v.as_bool()).unwrap_or(false))
+                .filter_map(|row| row.get("id").and_then(|v| v.as_str()))
+                .map(pjdesk_proto::format_id)
+                .collect();
+            let listed = if online_names.is_empty() { "none".to_string() } else { online_names.join(", ") };
+            tracing::info!(
+                "presence: published {} computers from this primary, online: {listed}",
+                devices.len()
+            );
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            tracing::debug!("presence: the account did not accept the list ({code})");
+        }
+        Err(_) => tracing::debug!("presence: could not reach the account"),
+    }
+}
+
+/// How long `online.json` may sit before it no longer counts as the live set.
+/// The server rewrites it about every 2 seconds. 45 seconds still rejects a
+/// dead process, and it leaves room for a slow rename or a stalled permission
+/// update on Windows.
+pub const ONLINE_FRESH_SECS: u64 = 45;
+
+/// Ids in a fresh `online.json`. `None` means the file was there but could not
+/// be read, so the caller must leave the published list alone. An empty set
+/// means nothing is online. `last_seen` in the registry is not read.
+fn online_ids(data_dir: &Path) -> Option<std::collections::HashSet<String>> {
+    let path = data_dir.join("online.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(std::collections::HashSet::new()),
+        Err(e) => {
+            tracing::warn!("online.json could not be read ({e}); presence was not changed");
+            return None;
+        }
+    };
+    if !online_file_is_fresh(&path) {
+        return Some(std::collections::HashSet::new());
+    }
+    match serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+        Ok(rows) => Some(
+            rows.into_iter()
+                .filter_map(|row| row.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+                .collect(),
+        ),
+        Err(e) => {
+            tracing::warn!("online.json could not be read ({e}); presence was not changed");
+            None
+        }
+    }
+}
+
+/// True when `online.json` was written recently. The file time counts, and so
+/// does the newest `at` stamp inside the file, so a stalled modification time
+/// does not mark every computer offline.
+pub fn online_file_is_fresh(path: &Path) -> bool {
+    if online_mtime_age(path).is_some_and(|age| age <= ONLINE_FRESH_SECS) {
+        return true;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    embedded_at_is_fresh(&bytes)
+}
+
+fn online_mtime_age(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(modified.elapsed().map(|e| e.as_secs()).unwrap_or(u64::MAX))
+}
+
+fn embedded_at_is_fresh(bytes: &[u8]) -> bool {
+    let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) else {
+        return false;
+    };
+    let Some(at) = rows.iter().filter_map(|row| row.get("at").and_then(|v| v.as_u64())).max() else {
+        return false;
+    };
+    now().saturating_sub(at) <= ONLINE_FRESH_SECS
+}
+
+fn presence_flags(body: &serde_json::Value) -> std::collections::BTreeMap<String, bool> {
+    let mut flags = std::collections::BTreeMap::new();
+    let Some(devices) = body.get("devices").and_then(|d| d.as_array()) else {
+        return flags;
+    };
+    for row in devices {
+        let Some(id) = row.get("id").and_then(|v| v.as_str()) else { continue };
+        flags.insert(id.to_string(), row.get("online").and_then(|v| v.as_bool()).unwrap_or(false));
+    }
+    flags
+}
+
+fn log_presence_changes(previous: &serde_json::Value, next: &serde_json::Value) {
+    let before = presence_flags(previous);
+    let after = presence_flags(next);
+    let mut ids: Vec<String> = before.keys().chain(after.keys()).cloned().collect();
+    ids.sort();
+    ids.dedup();
+    for id in ids {
+        let was = before.get(&id).copied();
+        let now_online = after.get(&id).copied();
+        if was == now_online {
+            continue;
+        }
+        let label = pjdesk_proto::format_id(&id);
+        match now_online {
+            Some(true) => tracing::info!("presence: {label} is online"),
+            Some(false) => tracing::info!("presence: {label} is offline"),
+            None => tracing::info!("presence: {label} left the list"),
+        }
+    }
+}
+
+fn online_ids_from(bytes: &[u8]) -> std::collections::HashSet<String> {
+    let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) else {
+        return std::collections::HashSet::new();
+    };
+    rows.into_iter().filter_map(|row| row.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())).collect()
+}
+
+/// Copies the account's network policy into `network-access.json`. The local
+/// certificate fingerprint is kept. Failure leaves the current file alone.
+fn pull_network_policy(data_dir: &Path, cfg: &CloudConfig) -> Result<()> {
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return Ok(());
+    }
+    #[derive(Deserialize)]
+    struct Reply {
+        #[serde(default)]
+        require_accounts: bool,
+        #[serde(default)]
+        public_key: String,
+        #[serde(default)]
+        allowed_accounts: Vec<String>,
+        #[serde(default)]
+        revoked_devices: Vec<String>,
+    }
+    let reply = match agent()
+        .get(&format!("{}/api/network/policy", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            serde_json::from_str::<Reply>(&text).context("unexpected network policy")?
+        }
+        Err(ureq::Error::Status(404, _)) => return Ok(()),
+        Err(e) => return Err(api_error(&cfg.api, &cfg.email, e)),
+    };
+    let mut policy = crate::access::Policy::load(data_dir);
+    let cloud_on = reply.require_accounts;
+    let push_off = cloud_on && !policy.require_chosen;
+    policy.require_accounts = crate::access::adopt_cloud_require(policy.require_chosen, cloud_on);
+    if reply.public_key.len() == 64 {
+        policy.public_key = reply.public_key;
+    }
+    policy.allowed_accounts = reply.allowed_accounts;
+    policy.revoked_devices = reply.revoked_devices;
+    policy.save(data_dir).context("saving network policy")?;
+    if push_off {
+        push_require_accounts(data_dir, false);
+    }
+    Ok(())
+}
+
+/// Publishes this server into the owner's network using the role it has now.
+/// `online` is how many computers are connected, used only when no role has
+/// been chosen yet. `replace` is the owner's confirmation that a different
+/// server already listed there should be overwritten.
+pub fn publish_network(data_dir: &Path, online: usize, replace: bool) {
+    let hint = if online > 0 { Role::Active } else { Role::Standby };
+    let role = effective_role(&SyncState::load(data_dir), &instance_id(data_dir), hint);
+    register_network(data_dir, role, replace);
+}
+
+/// Registers this server's fingerprint and public address in the slot for
+/// `role`. A missing cloud sign-in, a private address that has not been
+/// confirmed, and a network error leave the local note for the Server window.
+fn register_network(data_dir: &Path, role: Role, replace: bool) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return;
+    }
+    let Some(identity) = crate::server::read_identity(data_dir) else { return };
+    let fingerprint = pjdesk_proto::tls::format_fingerprint(&identity.fingerprint());
+    let port = crate::public_addr::remembered_port(data_dir);
+    let mut record = crate::public_addr::ensure(data_dir, port);
+    if record.address.trim().is_empty() {
+        record.note = "Type the public address computers use to reach this server.".into();
+        crate::public_addr::save(data_dir, &record);
+        return;
+    }
+    if crate::public_addr::is_private_address(&record.address) && !record.confirmed {
+        record.needs_confirm = false;
+        record.note =
+            "This is a local network address. Confirm it before it is published. It is not sent until you do.".into();
+        crate::public_addr::save(data_dir, &record);
+        return;
+    }
+    let watch = crate::public_addr::IpWatch::load(data_dir);
+    let lan = crate::public_addr::lan_endpoints(port);
+    let publication = serde_json::json!({
+        "role": role_name(role),
+        "address": record.address.trim(),
+        "fingerprint": fingerprint,
+        "instance": instance_id(data_dir),
+        "lan": lan,
+        "public_ip": watch.observed,
+        "checked_at": watch.checked_at,
+        "replace": replace,
+    });
+    let stamp = data_dir.join("network-publish.json");
+    if !replace {
+        if let Ok(prev) = std::fs::read(&stamp) {
+            if serde_json::from_slice::<serde_json::Value>(&prev).ok().as_ref() == Some(&publication) {
+                return;
+            }
+        }
+    }
+    let body = serde_json::json!({
+        "role": role_name(role),
+        "address": record.address.trim(),
+        "fingerprint": fingerprint,
+        "instance": instance_id(data_dir),
+        "lan": lan,
+        "public_ip": watch.observed,
+        "checked_at": watch.checked_at,
+        "confirm": record.confirmed || !crate::public_addr::is_private_address(&record.address),
+        "replace": replace,
+    });
+    let result = agent()
+        .post(&format!("{}/api/network/register", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string());
+    match result {
+        Ok(resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            let needs = value.get("needs_confirm").and_then(|v| v.as_bool()).unwrap_or(false);
+            record.needs_confirm = needs;
+            record.note = if needs {
+                value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("My network already lists a different server. Confirm in the PJDesk Server window to replace it.")
+                    .to_string()
+            } else if role == Role::Active {
+                "Published as the active server.".into()
+            } else {
+                "Published as the standby server.".into()
+            };
+            crate::public_addr::save(data_dir, &record);
+            if !needs {
+                let changed = value.get("changed").and_then(|v| v.as_bool()).unwrap_or(true);
+                if changed {
+                    tracing::info!("network: published this server as {}", role_name(role));
+                }
+                if let Ok(bytes) = serde_json::to_vec(&publication) {
+                    let _ = std::fs::write(&stamp, bytes);
+                }
+            }
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            let message =
+                value.get("error").and_then(|v| v.as_str()).unwrap_or("Could not publish this server.").to_string();
+            record.needs_confirm = value.get("needs_confirm").and_then(|v| v.as_bool()).unwrap_or(code == 409);
+            record.note = message;
+            crate::public_addr::save(data_dir, &record);
+            tracing::debug!("network register: {code}");
+        }
+        Err(e) => {
+            record.note = "Could not reach pjdesk.com to publish this server.".into();
+            crate::public_addr::save(data_dir, &record);
+            tracing::debug!("network register: {e}");
+        }
+    }
+}
+
+/// Tells pjdesk.com that this server now requires (or no longer requires) a
+/// signed-in account. The local file is already updated by the caller.
+pub fn push_require_accounts(data_dir: &Path, require: bool) {
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return;
+    }
+    let body = serde_json::json!({ "require_accounts": require }).to_string();
+    let result = agent()
+        .put(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body);
+    if let Err(e) = result {
+        tracing::debug!("could not publish the signed-in-accounts switch: {e}");
+    }
+}
+
+/// A network key the owner created. The blob itself is not stored.
+#[derive(Clone, Deserialize)]
+pub struct NetworkInvite {
+    pub id: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub bound_email: String,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub uses: u32,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    #[serde(default)]
+    pub revoked_at: Option<u64>,
+    #[serde(default)]
+    pub history: Vec<InviteUse>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct InviteUse {
+    #[serde(default)]
+    pub device_name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub used_at: u64,
+}
+
+pub struct CreatedKey {
+    pub blob: String,
+    pub embedded: bool,
+}
+
+fn account_cfg(data_dir: &Path) -> Result<CloudConfig> {
+    let cfg = CloudConfig::load(data_dir)
+        .context("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → Account → My network.")?;
+    if !cfg.is_account() || cfg.token.is_empty() {
+        bail!("Sign in to PJDesk Cloud on this server, or create the key on pjdesk.com → Account → My network.");
+    }
+    Ok(cfg)
+}
+
+fn cloud_api_error(err: ureq::Error) -> anyhow::Error {
+    match err {
+        ureq::Error::Status(_, resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            let message = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                .unwrap_or_else(|| "PJDesk could not update the network key.".into());
+            anyhow::anyhow!(message)
+        }
+        ureq::Error::Transport(_) => anyhow::anyhow!("Could not reach pjdesk.com."),
+    }
+}
+
+/// Creates a network key. The blob is returned once and is not written to disk.
+/// Call this off the UI thread: a passphrase key runs Argon2id.
+pub fn create_network_key(
+    data_dir: &Path,
+    passphrase: Option<&str>,
+    days: Option<u64>,
+    max_uses: Option<u32>,
+    bound_email: &str,
+) -> Result<CreatedKey> {
+    let cfg = account_cfg(data_dir)?;
+    #[derive(Deserialize)]
+    struct Net {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        active_address: String,
+        #[serde(default)]
+        active_fingerprint: String,
+        #[serde(default)]
+        standby_address: String,
+        #[serde(default)]
+        standby_fingerprint: String,
+    }
+    #[derive(Deserialize)]
+    struct Doc {
+        #[serde(default)]
+        network: Option<Net>,
+    }
+    let doc: Doc = match agent()
+        .get(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(resp) => {
+            serde_json::from_str(&resp.into_string().unwrap_or_default()).context("unexpected reply from PJDesk")?
+        }
+        Err(e) => return Err(cloud_api_error(e)),
+    };
+    let net = doc.network.context(
+        "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network.",
+    )?;
+    if net.active_address.trim().is_empty() || net.active_fingerprint.trim().is_empty() {
+        bail!(
+            "Your network has no server yet. Sign in to PJDesk Server on your server computer, or set it on pjdesk.com → Account → My network."
+        );
+    }
+    let secret = pjdesk_proto::random_bytes::<32>();
+    let secret_hex = hex::encode(secret);
+    let hash = pjdesk_proto::netkey::secret_hash(&secret_hex);
+    let expires_at = days.map(|d| {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_secs()).unwrap_or(0)
+            + d.saturating_mul(86_400)
+    });
+    let body = serde_json::json!({
+        "secret_hash": hash,
+        "mode": if passphrase.is_some() { "passphrase" } else { "embedded" },
+        "bound_email": bound_email.trim(),
+        "max_uses": max_uses,
+        "expires_at": expires_at,
+    });
+    match agent()
+        .post(&format!("{}/api/network/invites", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string())
+    {
+        Ok(_) => {}
+        Err(e) => return Err(cloud_api_error(e)),
+    }
+    let contents = pjdesk_proto::netkey::Contents {
+        network_id: &net.id,
+        active: &net.active_address,
+        active_fingerprint: &net.active_fingerprint,
+        standby: &net.standby_address,
+        standby_fingerprint: &net.standby_fingerprint,
+    };
+    let embedded = passphrase.is_none();
+    let blob = if let Some(pass) = passphrase {
+        pjdesk_proto::netkey::seal_passphrase(&contents, &secret, pass).map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        pjdesk_proto::netkey::seal_embedded(&contents, &secret).map_err(|e| anyhow::anyhow!(e.to_string()))?
+    };
+    Ok(CreatedKey { blob, embedded })
+}
+
+pub fn list_network_keys(data_dir: &Path) -> Result<Vec<NetworkInvite>> {
+    let cfg = account_cfg(data_dir)?;
+    #[derive(Deserialize)]
+    struct Doc {
+        #[serde(default)]
+        invites: Vec<NetworkInvite>,
+    }
+    match agent()
+        .get(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(resp) => {
+            let doc: Doc = serde_json::from_str(&resp.into_string().unwrap_or_default())
+                .context("unexpected reply from PJDesk")?;
+            Ok(doc.invites)
+        }
+        Err(e) => Err(cloud_api_error(e)),
+    }
+}
+
+pub fn revoke_network_key(data_dir: &Path, id: &str) -> Result<()> {
+    let cfg = account_cfg(data_dir)?;
+    let body = serde_json::json!({ "id": id }).to_string();
+    match agent()
+        .post(&format!("{}/api/network/invites/revoke", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body)
+    {
+        Ok(_) => Ok(()),
+        Err(e) => Err(cloud_api_error(e)),
     }
 }
 
@@ -1730,6 +2611,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_standby_does_not_keep_the_live_table() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-role-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(accepts_host_registrations(&dir), "a server with no cloud sync is the primary");
+        std::fs::write(dir.join(CONFIG_FILE), r#"{"mode":"account","key":"abcd","email":"ben@spader.us"}"#).unwrap();
+        std::fs::write(
+            dir.join(STATE_FILE),
+            r#"{"desired":"standby","active_instance":"other","active_name":"BENLENOVODESK"}"#,
+        )
+        .unwrap();
+        assert!(!accepts_host_registrations(&dir));
+        std::fs::write(
+            dir.join(STATE_FILE),
+            r#"{"desired":"active","active_instance":"other","active_name":"BENLENOVODESK"}"#,
+        )
+        .unwrap();
+        assert!(accepts_host_registrations(&dir));
+        std::fs::write(
+            dir.join(STATE_FILE),
+            r#"{"desired":"active","epoch":5,"active_instance":"other","active_name":"CHIP20"}"#,
+        )
+        .unwrap();
+        assert!(
+            !accepts_host_registrations(&dir),
+            "a recorded generation owned by another server is not this server's to keep"
+        );
+        std::fs::write(
+            dir.join(STATE_FILE),
+            r#"{"desired":"active","epoch":4,"fenced_epoch":5,"fenced_instance":"cccccccccccccccccccccccccccccccc","active_instance":"cccccccccccccccccccccccccccccccc"}"#,
+        )
+        .unwrap();
+        assert!(
+            !accepts_host_registrations(&dir),
+            "a higher generation demotes a server that still wants to be primary"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restarted_primary_accepts_hosts_when_the_status_file_says_standby() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-role-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = "0123456789abcdef0123456789abcdef";
+        std::fs::write(dir.join(CONFIG_FILE), r#"{"mode":"account","key":"abcd","email":"ben@spader.us"}"#).unwrap();
+        std::fs::write(dir.join(INSTANCE_FILE), mine).unwrap();
+        std::fs::write(dir.join(STATE_FILE), r#"{"desired":"","active_instance":"0123456789abcdef0123456789abcdef"}"#)
+            .unwrap();
+        std::fs::write(dir.join(STATUS_FILE), r#"{"role":"standby"}"#).unwrap();
+        assert!(
+            accepts_host_registrations(&dir),
+            "the server that owns the cloud copy still accepts hosts after a restart"
+        );
+        // No owner recorded, and the status file only says standby because the
+        // table was empty. That must not lock the only server out.
+        std::fs::write(dir.join(STATE_FILE), r#"{"desired":""}"#).unwrap();
+        assert!(accepts_host_registrations(&dir));
+        std::fs::write(dir.join(STATE_FILE), r#"{"desired":"","active_instance":"fedcba9876543210fedcba9876543210"}"#)
+            .unwrap();
+        assert!(!accepts_host_registrations(&dir), "another instance owns the copy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn sigv4_matches_the_aws_example() {
         // "GET Object" example from the AWS Signature Version 4 docs.
         let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -1754,6 +2700,59 @@ mod tests {
              SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
              Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
         );
+    }
+
+    #[test]
+    fn login_posts_auth_key_and_keeps_the_worker_error() {
+        let body = login_body("ben@spader.us", &"ab".repeat(32), "PJDesk Server on BenLenovoDesk");
+        assert!(body.get("password").is_none());
+        assert_eq!(body["email"], "ben@spader.us");
+        assert_eq!(body["auth_key"].as_str().unwrap().len(), 64);
+        assert!(body["device"].as_str().unwrap().starts_with("PJDesk Server"));
+        assert!(!body.to_string().contains("password"));
+        assert_eq!(
+            cloud_error_text(400, r#"{"error":"Enter your email and password."}"#),
+            "Enter your email and password."
+        );
+        assert_eq!(
+            cloud_error_text(401, r#"{"error":"Wrong email or password."}"#),
+            "Wrong email or password."
+        );
+    }
+
+    #[test]
+    fn a_failed_read_does_not_clear_the_saved_sign_in() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-keep-account-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(CONFIG_FILE), b"{not-json").unwrap();
+        std::fs::write(dir.join(STATUS_FILE), br#"{"enabled":true,"account":"ben@spader.us"}"#).unwrap();
+        assert!(!sync_once(&dir, Role::Standby, false));
+        assert!(dir.join(CONFIG_FILE).exists());
+        let status = std::fs::read_to_string(dir.join(STATUS_FILE)).unwrap();
+        assert!(status.contains("ben@spader.us"), "{status}");
+        assert_eq!(saved_account_email(&dir), "");
+        std::fs::write(
+            dir.join(CONFIG_FILE),
+            r#"{"mode":"account","email":"ben@spader.us","token":"SECRETTOKENVALUE1234567890"}"#,
+        )
+        .unwrap();
+        assert_eq!(saved_account_email(&dir), "ben@spader.us");
+        let _ = std::fs::remove_file(dir.join(CONFIG_FILE));
+        assert!(sync_once(&dir, Role::Standby, false) == false);
+        assert!(!dir.join(STATUS_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upgrade_code_does_not_sign_the_server_out() {
+        let handoff = include_str!("handoff.rs");
+        let update = include_str!("self_update.rs");
+        let service = include_str!("service.rs");
+        for (name, src) in [("handoff", handoff), ("update", update), ("service", service)] {
+            assert!(!src.contains("turn_off"), "{name} clears cloud sync");
+            assert!(!src.contains("sign_out"), "{name} signs out");
+        }
     }
 
     #[test]
@@ -1815,6 +2814,9 @@ mod tests {
     #[test]
     fn only_state_files_are_accepted() {
         assert!(allowed_path("accounts.json"));
+        assert!(allowed_path("devices.json"));
+        assert!(allowed_path("access-keys.json"));
+        assert!(allowed_path("network-access.json"));
         assert!(allowed_path("addressbook/ben.json"));
         assert!(!allowed_path("addressbook/../server-key.pem"));
         assert!(!allowed_path("../evil.json"));
@@ -1889,6 +2891,21 @@ mod tests {
     }
 
     #[test]
+    fn the_server_that_owns_the_cloud_copy_stays_active_with_no_computers_online() {
+        let mine = "1b401af7870a921b0629820f04e82433";
+        let st =
+            SyncState { active_instance: mine.into(), active_name: "BENLENOVODESK".into(), ..SyncState::default() };
+        assert_eq!(effective_role(&st, mine, Role::Standby), Role::Active);
+        let other = SyncState { active_instance: mine.into(), ..SyncState::default() };
+        assert_eq!(effective_role(&other, "someone-else", Role::Active), Role::Standby);
+        let stepped = SyncState { desired: "standby".into(), active_instance: mine.into(), ..SyncState::default() };
+        assert_eq!(effective_role(&stepped, mine, Role::Active), Role::Standby);
+        let fresh = SyncState::default();
+        assert_eq!(effective_role(&fresh, mine, Role::Standby), Role::Standby);
+        assert_eq!(effective_role(&fresh, mine, Role::Active), Role::Active);
+    }
+
+    #[test]
     fn old_bundle_epoch_defaults_to_zero() {
         let json = r#"{"format":1,"written_at":1,"written_by":"a","instance":"abc","version":"0.3.7","files":{}}"#;
         let bundle: Bundle = serde_json::from_str(json).unwrap();
@@ -1929,5 +2946,81 @@ mod tests {
         );
         assert!(with_match.contains("SignedHeaders=host;if-match;x-amz-content-sha256;x-amz-date"));
         assert_ne!(with_match, without);
+    }
+
+    #[test]
+    fn presence_online_is_the_live_set_not_last_seen() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-online-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("devices.json"),
+            br#"{"devices":{"902488771":{"hostname":"CABINDESK","last_seen":1700000000}}}"#,
+        )
+        .unwrap();
+        assert!(online_ids(&dir).unwrap().is_empty(), "a last_seen time is not presence");
+        std::fs::write(dir.join("online.json"), br#"[{"id":"610978221","hostname":"CHIP20","version":"0.6.27"}]"#)
+            .unwrap();
+        let live = online_ids(&dir).unwrap();
+        assert!(live.contains("610978221"));
+        assert!(!live.contains("902488771"));
+        #[cfg(unix)]
+        {
+            let path = dir.join("online.json");
+            assert!(std::process::Command::new("touch")
+                .arg("-d")
+                .arg("1 hour ago")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
+            assert!(online_ids(&dir).unwrap().is_empty(), "a stale online.json is not live presence");
+        }
+        assert!(online_ids_from(br#"[{"id":"902488771"}]"#).contains("902488771"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn presence_online_at_stamp_counts_when_mtime_is_old() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-online-at-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let at = now();
+        let path = dir.join("online.json");
+        std::fs::write(&path, format!(r#"[{{"id":"902488771","hostname":"CABINDESK","version":"0.6.28","at":{at}}}]"#))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            assert!(std::process::Command::new("touch")
+                .arg("-d")
+                .arg("1 hour ago")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
+            assert!(!online_mtime_age(&path).is_some_and(|age| age <= ONLINE_FRESH_SECS));
+        }
+        let live = online_ids(&dir).unwrap();
+        assert!(live.contains("902488771"), "a recent at stamp keeps the computer online");
+        std::fs::write(
+            &path,
+            format!(
+                r#"[{{"id":"902488771","hostname":"CABINDESK","version":"0.6.28","at":{}}}]"#,
+                at.saturating_sub(3600)
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            assert!(std::process::Command::new("touch")
+                .arg("-d")
+                .arg("1 hour ago")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
+            assert!(online_ids(&dir).unwrap().is_empty(), "an old at stamp is not live presence");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

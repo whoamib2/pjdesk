@@ -12,33 +12,41 @@
 //! Runs in a console (`pjdesk-server`) or as a Windows service
 //! (`pjdesk-server service install`).
 
+mod access;
+mod access_keys;
 mod accounts;
 mod audit;
 mod cloud;
+mod control;
+mod failover;
+mod gui;
 mod handoff;
 mod password_policy;
-mod gui;
+mod public_addr;
 mod registry;
 mod relay;
 mod requests;
 mod self_update;
-mod status_pipe;
-mod status_view;
-mod tray_tip;
-mod ui_icons;
-mod ui_theme;
-mod ui_widgets;
-#[cfg(windows)]
-mod tray;
-#[cfg(not(windows))]
-#[path = "tray_stub.rs"]
-mod tray;
 mod server;
 #[cfg(windows)]
 mod service;
 #[cfg(not(windows))]
 #[path = "service_stub.rs"]
 mod service;
+mod status_pipe;
+mod status_view;
+#[cfg(windows)]
+mod tray;
+#[cfg(not(windows))]
+#[path = "tray_stub.rs"]
+mod tray;
+mod tray_tip;
+mod ui_icons;
+mod ui_theme;
+mod ui_widgets;
+mod traywatch;
+mod window_lock;
+mod winshow;
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -51,9 +59,12 @@ use clap::{Args, Parser, Subcommand};
 struct Cli {
     #[command(flatten)]
     opts: ServerOpts,
-    /// Tray icon only, without opening the window. Windows starts this at sign-in.
+    /// Tray icon only. This process never opens a window. Windows starts this at sign-in.
     #[arg(long, hide = true)]
     tray: bool,
+    /// Window only. This process never owns the tray icon. The tray starts it.
+    #[arg(long, hide = true)]
+    window: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -107,6 +118,12 @@ enum Command {
     /// Forget a device (used by the window when it isn't elevated).
     #[command(hide = true)]
     ForgetDevice { id: String },
+    /// Remove a computer and block it from registering again.
+    #[command(hide = true)]
+    BlockDevice { id: String },
+    /// Let a blocked computer register again.
+    #[command(hide = true)]
+    UnblockDevice { id: String },
     /// Manage user accounts (sign-in for the address book and saved logins).
     #[command(subcommand)]
     Account(AccountCommand),
@@ -234,11 +251,38 @@ enum ServiceCommand {
     Run,
 }
 
+/// The tray process never draws the window. A click starts `--window`
+/// or brings the existing window forward. A double-click with nothing
+/// running starts the tray and draws the window in this process, once.
+#[cfg(windows)]
+fn launch_windows(data_dir: std::path::PathBuf, port: u16, tray: bool, window: bool) -> Result<()> {
+    if tray {
+        return tray::run_tray(data_dir, port);
+    }
+    if window || tray::gui_is_running() {
+        if !window && tray::gui_is_running() {
+            tray::signal_gui();
+            tracing::info!("PJDesk Server is already open. Asked that window to come forward.");
+            return Ok(());
+        }
+        return gui::run(data_dir, port);
+    }
+    if tray::tray_is_running() {
+        tray::signal_tray();
+        tracing::info!("Asked the PJDesk Server tray to open the window.");
+        return Ok(());
+    }
+    if !tray::spawn_tray(port, &data_dir) {
+        tracing::info!("Could not start the PJDesk Server tray. The window will still open.");
+    }
+    gui::run(data_dir, port)
+}
+
 fn main() -> Result<()> {
     // The SCM-launched `service run` has no console and sets up its own logging.
     let raw: Vec<String> = std::env::args().collect();
     let is_background = (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"))
-        || raw.iter().any(|a| a == "--tray" || a == "update-handoff");
+        || raw.iter().any(|a| a == "--tray" || a == "--window" || a == "update-handoff");
     if raw.len() > 1 && !is_background {
         ensure_console();
     }
@@ -247,12 +291,13 @@ fn main() -> Result<()> {
 
     match cli.command {
         None => {
-            // Default: the management window on Windows; the console server
-            // elsewhere (the GUI is Windows-only). `--tray` starts the same
-            // window hidden, so the icon is there after sign-in.
+            // Default: the management window on Windows, plus a tray process
+            // that never draws it. `--tray` is the icon only. `--window` is
+            // the window only. The console server is the non-Windows default.
             #[cfg(windows)]
             {
-                if let Err(e) = gui::run(data_dir, cli.opts.port, cli.tray) {
+                init_window_logging();
+                if let Err(e) = launch_windows(data_dir, cli.opts.port, cli.tray, cli.window) {
                     fatal(&format!("PJDesk Server could not start: {e:#}"));
                 }
                 Ok(())
@@ -312,6 +357,14 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&data_dir)?;
             requests::forget_device(&data_dir, &id)
         }
+        Some(Command::BlockDevice { id }) => {
+            std::fs::create_dir_all(&data_dir)?;
+            requests::block_device(&data_dir, &id)
+        }
+        Some(Command::UnblockDevice { id }) => {
+            std::fs::create_dir_all(&data_dir)?;
+            requests::unblock_device(&data_dir, &id)
+        }
         Some(Command::Account(cmd)) => account_command(cmd, &data_dir),
         Some(Command::Cloud(cmd)) => cloud_command(cmd, &data_dir),
         Some(Command::Service(cmd)) => service_command(cmd, cli.opts, data_dir),
@@ -366,7 +419,12 @@ fn account_command(cmd: AccountCommand, data_dir: &std::path::Path) -> Result<()
             };
             let existed = accounts.list().iter().any(|a| a.username == accounts::normalize_username(&username));
             accounts.create(&username, &password, admin, true)?;
-            println!("{} account \"{}\"{}.", if existed { "Updated" } else { "Created" }, accounts::normalize_username(&username), if admin { " (administrator)" } else { "" });
+            println!(
+                "{} account \"{}\"{}.",
+                if existed { "Updated" } else { "Created" },
+                accounts::normalize_username(&username),
+                if admin { " (administrator)" } else { "" }
+            );
         }
         AccountCommand::List => {
             let list = accounts.list();
@@ -447,7 +505,10 @@ fn cloud_command(cmd: CloudCommand, data_dir: &std::path::Path) -> Result<()> {
             match cloud::connect_account(data_dir, &cfg, online, choice)? {
                 cloud::Connected::Uploaded => {
                     let _ = requests::push(data_dir, requests::SYNC_FILE, "now");
-                    println!("Signed in as {}. This is the main server; its data is uploaded to PJDesk Cloud.", cfg.email);
+                    println!(
+                        "Signed in as {}. This is the main server; its data is uploaded to PJDesk Cloud.",
+                        cfg.email
+                    );
                 }
                 cloud::Connected::Resumed => println!("Signed in as {}; syncing as before.", cfg.email),
                 cloud::Connected::Joined { from } => {
@@ -585,6 +646,46 @@ fn confirm(yes: bool, prompt: &str) -> Result<bool> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+#[cfg(test)]
+mod cli_lock {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    #[test]
+    fn no_flag_skips_the_window_lock() {
+        let help = Cli::command().render_long_help().to_string().to_lowercase();
+        assert!(!help.contains("no-pin"), "{help}");
+        assert!(!help.contains("skip-lock"), "{help}");
+        assert!(!help.contains("--unlocked"), "{help}");
+    }
+}
+
+/// The tray has no console. Activation is written next to the client log.
+#[cfg(windows)]
+fn init_window_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,wgpu=warn,naga=warn,eframe=warn,egui_wgpu=warn"));
+    let dir = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = dir.join("PJDesk");
+    let _ = std::fs::create_dir_all(&dir);
+    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).with_ansi(false);
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("pjdesk-server.log")) {
+        let _ = builder.with_writer(std::sync::Mutex::new(file)).try_init();
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .try_init();
 }
 
 fn init_console_logging() {

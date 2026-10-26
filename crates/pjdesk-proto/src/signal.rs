@@ -19,6 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Identifies one connection attempt between a controller and a host.
 pub type SessionId = u64;
@@ -29,41 +30,130 @@ pub enum ClientMsg {
     /// Host: register this device (or reclaim its ID) and go online.
     ///
     /// The secret proves ownership of the ID; the server stores only its hash.
-    Register { proto: u16, device_id: Option<String>, device_secret: [u8; 32], hostname: String, app_version: String },
+    Register {
+        proto: u16,
+        device_id: Option<String>,
+        device_secret: [u8; 32],
+        hostname: String,
+        app_version: String,
+    },
     /// Controller: ask for a session with the device `target_id`.
-    Connect { proto: u16, target_id: String, controller_name: String },
+    Connect {
+        proto: u16,
+        target_id: String,
+        controller_name: String,
+    },
     /// Host: answer to [`ServerMsg::IncomingSession`].
-    SessionResponse { session_id: SessionId, accept: bool, reason: String },
+    SessionResponse {
+        session_id: SessionId,
+        accept: bool,
+        reason: String,
+    },
     /// Either peer: my UDP socket is bound (see [`crate::udp`]); here are my
     /// LAN candidate addresses. Hosts also send their QUIC certificate
     /// fingerprint so the controller can pin it.
-    UdpReady { session_id: SessionId, local_addrs: Vec<SocketAddr>, cert_fingerprint: Option<[u8; 32]> },
+    UdpReady {
+        session_id: SessionId,
+        local_addrs: Vec<SocketAddr>,
+        cert_fingerprint: Option<[u8; 32]>,
+    },
     /// Sign in to an account on the server, with a password or a saved token
     /// (see [`Credential`]). The reply is [`ServerMsg::LoginResult`].
-    Login { proto: u16, username: String, credential: Credential, device_name: String },
+    Login {
+        proto: u16,
+        username: String,
+        credential: Credential,
+        device_name: String,
+    },
     /// Invalidate the saved token in [`Credential::Token`] (sign out everywhere
     /// is a server setting; this just drops the current one).
-    Logout { token: String },
+    Logout {
+        token: String,
+    },
     /// Fetch the signed-in account's address book ([`ServerMsg::AddressBook`]).
-    GetAddressBook { token: String },
+    GetAddressBook {
+        token: String,
+    },
     /// Replace the signed-in account's address book.
-    SaveAddressBook { token: String, entries: Vec<AddressEntry> },
+    SaveAddressBook {
+        token: String,
+        entries: Vec<AddressEntry>,
+    },
     /// Keep-alive.
     Ping,
     /// Version 3. Operator or admin: the registered computers.
-    ListDevices { token: String },
+    ListDevices {
+        token: String,
+    },
     /// Version 3. Operator or admin: set or clear a computer's group.
-    SetDeviceGroup { token: String, device_id: String, group: String },
+    SetDeviceGroup {
+        token: String,
+        device_id: String,
+        group: String,
+    },
     /// Version 3. Any signed-in user may read the policy; only an admin may change it.
-    GetPolicy { token: String },
-    SetPolicy { token: String, policy: Policy },
+    GetPolicy {
+        token: String,
+    },
+    SetPolicy {
+        token: String,
+        policy: Policy,
+    },
     /// Version 3. Operator or admin: recent audit events.
-    GetAudit { token: String, limit: u32 },
+    GetAudit {
+        token: String,
+        limit: u32,
+    },
     /// Version 3. Admin: change an account's role.
-    SetRole { token: String, username: String, role: Role },
+    SetRole {
+        token: String,
+        username: String,
+        role: Role,
+    },
     /// Version 3. The signed-in user replaces their own password. The server
     /// drops saved tokens, so the client signs in again.
-    ChangePassword { token: String, new_password: String },
+    ChangePassword {
+        token: String,
+        new_password: String,
+    },
+    /// Presents a pjdesk.com network access token. Sent only by 0.6.0+ clients
+    /// that have one, before Register or Connect. Older servers cannot decode
+    /// this variant and drop the connection; those clients retry once without it.
+    PresentAccess {
+        token: String,
+    },
+    /// 0.6.2+. Hostname, operating system, and the last interactive user.
+    /// Sent only after [`ServerMsg::WantHostReport`]. The user name is stored
+    /// for the account owner. It is not forwarded to other peers.
+    ReportHost {
+        hostname: String,
+        os_family: String,
+        os_version: String,
+        console_user: String,
+    },
+    /// 0.6.2+. Friendly name for this computer. Sent only after
+    /// [`ServerMsg::WantHostReport`]. An empty name clears the stored one
+    /// so other computers show the hostname.
+    ReportDisplayName {
+        name: String,
+    },
+    /// 0.6.33+. The account this server is signed in to lists, creates, or
+    /// revokes a server access key. A guest does not send this. An older
+    /// server cannot decode it and drops the connection.
+    ManageAccessKey {
+        token: String,
+        /// `list`, `create`, or `revoke`.
+        op: String,
+        #[serde(default)]
+        label: String,
+        /// `0`, one day, 7 days, or 30 days. `0` does not expire.
+        #[serde(default)]
+        expires_secs: u64,
+        #[serde(default)]
+        computer_limit: u32,
+        #[serde(default)]
+        key_id: String,
+    },
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -242,6 +332,41 @@ pub enum ServerMsg {
     DeviceList { devices: Vec<DeviceBrief> },
     /// Version 3. Reply to [`ClientMsg::GetAudit`].
     Audit { events: Vec<AuditEvent> },
+    /// 0.6.2+. Asks a host that understands it to send [`ClientMsg::ReportHost`].
+    /// A server sends this only when the host's app version can decode it.
+    WantHostReport,
+    /// 0.6.33+. Reply to [`ClientMsg::ManageAccessKey`]. `secret` is set only
+    /// on create, and only in this reply. It is not stored.
+    AccessKeys {
+        ok: bool,
+        message: String,
+        #[serde(default)]
+        secret: String,
+        #[serde(default)]
+        keys: Vec<AccessKeyBrief>,
+    },
+}
+
+/// One server access key, safe to list. The secret and its hash are not here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessKeyBrief {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub created_at: u64,
+    /// Unix time, or 0 when the key does not expire.
+    #[serde(default)]
+    pub expires_at: u64,
+    #[serde(default)]
+    pub computer_limit: u32,
+    /// Unix time, or 0 while the key is still active.
+    #[serde(default)]
+    pub revoked_at: u64,
+    #[serde(default)]
+    pub computers: u32,
+    #[serde(default)]
+    pub names: Vec<String>,
 }
 
 /// Machine-readable error categories.
@@ -259,6 +384,40 @@ pub enum ErrorCode {
     Internal,
 }
 
+/// Sent when a standby is asked to register a computer or start a session.
+/// The standby does not keep its own live table. A 0.6.31 client connects to
+/// the primary instead. The text stays on the existing error message so an
+/// older client can still decode it.
+pub const STANDBY_REGISTRATION: &str = "This server is the standby. Connect to the primary.";
+
+pub fn is_standby_refusal(message: &str) -> bool {
+    message.contains("This server is the standby")
+}
+
+/// Backoff after a refused signaling connection: 1s, 2s, 4s, 8s, then 10s.
+pub fn next_reconnect_delay(current: Duration) -> Duration {
+    let next = current.saturating_mul(2);
+    if next < Duration::from_secs(1) {
+        Duration::from_secs(1)
+    } else if next > Duration::from_secs(10) {
+        Duration::from_secs(10)
+    } else {
+        next
+    }
+}
+
+/// Spreads reconnects so every computer does not dial on the same second.
+pub fn jitter_reconnect(base: Duration) -> Duration {
+    let ms = base.as_millis() as u64;
+    let swing = ms / 5;
+    if swing == 0 {
+        return base;
+    }
+    let tick = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos() as u64).unwrap_or(0);
+    let delta = (tick % (swing * 2 + 1)) as i64 - swing as i64;
+    Duration::from_millis((ms as i64 + delta).clamp(200, 10_000) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,8 +428,44 @@ mod tests {
         assert_eq!(ping[0], 8);
         let update = postcard::to_stdvec(&ServerMsg::UpdateNow).unwrap();
         assert_eq!(update[0], 8);
+        let access = postcard::to_stdvec(&ClientMsg::PresentAccess { token: "t".into() }).unwrap();
+        assert_eq!(access[0], 16, "PresentAccess is appended after ChangePassword");
+        let report = postcard::to_stdvec(&ClientMsg::ReportHost {
+            hostname: "PC".into(),
+            os_family: "windows".into(),
+            os_version: "11".into(),
+            console_user: "BEN".into(),
+        })
+        .unwrap();
+        assert_eq!(report[0], 17, "ReportHost is appended after PresentAccess");
+        let named = postcard::to_stdvec(&ClientMsg::ReportDisplayName { name: "Cabin".into() }).unwrap();
+        assert_eq!(named[0], 18, "ReportDisplayName is appended after ReportHost");
+        let ask = postcard::to_stdvec(&ServerMsg::WantHostReport).unwrap();
+        assert_eq!(ask[0], 12, "WantHostReport is appended after Audit");
+        let manage = postcard::to_stdvec(&ClientMsg::ManageAccessKey {
+            token: "t".into(),
+            op: "list".into(),
+            label: String::new(),
+            expires_secs: 0,
+            computer_limit: 1,
+            key_id: String::new(),
+        })
+        .unwrap();
+        assert_eq!(manage[0], 19, "ManageAccessKey is appended after ReportDisplayName");
+        let keys = postcard::to_stdvec(&ServerMsg::AccessKeys {
+            ok: true,
+            message: String::new(),
+            secret: String::new(),
+            keys: vec![AccessKeyBrief { id: "ab".into(), label: "Ada".into(), computer_limit: 1, ..AccessKeyBrief::default() }],
+        })
+        .unwrap();
+        assert_eq!(keys[0], 13, "AccessKeys is appended after WantHostReport");
         let back: ClientMsg = postcard::from_bytes(&ping).unwrap();
         assert!(matches!(back, ClientMsg::Ping));
+        match postcard::from_bytes::<ServerMsg>(&keys).unwrap() {
+            ServerMsg::AccessKeys { keys, .. } => assert_eq!(keys[0].label, "Ada"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -296,5 +491,31 @@ mod tests {
         assert_eq!(p.max_permissions, crate::perms::ALL);
         assert!(!p.force_prompt);
         assert!(p.tunnel_ports.is_empty());
+    }
+
+    #[test]
+    fn reconnect_backoff_caps_at_ten_seconds() {
+        assert!(is_standby_refusal(STANDBY_REGISTRATION));
+        assert!(!is_standby_refusal("device 902 488 771 is not online"));
+        let mut delay = Duration::from_secs(1);
+        let mut seen = vec![delay];
+        for _ in 0..6 {
+            delay = next_reconnect_delay(delay);
+            seen.push(delay);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            ]
+        );
+        let paused = jitter_reconnect(Duration::from_secs(4));
+        assert!(paused >= Duration::from_millis(3200) && paused <= Duration::from_millis(4800), "{paused:?}");
     }
 }

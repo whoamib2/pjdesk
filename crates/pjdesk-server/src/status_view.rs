@@ -27,6 +27,7 @@ pub const PRESERVED: &[&str] = &[
     "cloud-status.json",
     "cloud-state.json",
     "cloud-instance.txt",
+    "access-keys.json",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +85,36 @@ pub struct Snapshot {
     /// Registered computers, without secrets. Filled when the data folder is readable.
     #[serde(default)]
     pub devices: Vec<ListedDevice>,
+    /// Computers removed from Not signed in yet. No secrets.
+    #[serde(default)]
+    pub blocked: Vec<ListedBlock>,
+    /// True when register, lookup, and relay require a network access token.
+    #[serde(default)]
+    pub require_accounts: bool,
+    /// Address computers use to reach this server. Not a secret.
+    #[serde(default)]
+    pub public_address: String,
+    #[serde(default)]
+    pub public_note: String,
+    #[serde(default)]
+    pub public_needs_confirm: bool,
+    #[serde(default)]
+    pub public_confirmed: bool,
+    /// Whether the public-IP watch setting was read.
+    #[serde(default)]
+    pub public_watch_known: bool,
+    /// True when this server updates a raw IP address on its own.
+    #[serde(default)]
+    pub public_watch: bool,
+    #[serde(default)]
+    pub public_ip_line: String,
+    /// Server access keys, without the secret or its hash.
+    #[serde(default)]
+    pub access_keys: Vec<pjdesk_proto::signal::AccessKeyBrief>,
+    /// Last lines of server.log, with passwords and tokens removed.
+    /// An unelevated window can copy this. The data folder stays locked.
+    #[serde(default)]
+    pub log_tail: String,
 }
 
 /// One computer, safe to put on the status pipe. No password, secret, or key.
@@ -96,17 +127,40 @@ pub struct ListedDevice {
     pub version: String,
     #[serde(default)]
     pub online: bool,
+    /// False when this computer has not registered with a network access token.
+    #[serde(default)]
+    pub signed_in: bool,
+    #[serde(default)]
+    pub last_ip: String,
+    #[serde(default)]
+    pub first_seen: u64,
+    #[serde(default)]
+    pub last_seen: u64,
+    /// Label of the access key this computer used. Empty when it did not.
+    #[serde(default)]
+    pub access_label: String,
+}
+
+/// A blocked computer, safe to put on the status pipe. The secret hash stays in the file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedBlock {
+    pub id: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub last_ip: String,
+    #[serde(default)]
+    pub first_seen: u64,
+    #[serde(default)]
+    pub last_seen: u64,
+    #[serde(default)]
+    pub blocked_at: u64,
 }
 
 impl Snapshot {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn from_disk(dir: &Path, port: u16, service_running: bool) -> Self {
-        let mut snap = Self {
-            version: env!("CARGO_PKG_VERSION").into(),
-            port,
-            service_running,
-            ..Self::default()
-        };
+        let mut snap = Self { version: env!("CARGO_PKG_VERSION").into(), port, service_running, ..Self::default() };
         if access(dir) != Access::Readable {
             return snap;
         }
@@ -126,6 +180,7 @@ impl Snapshot {
             Loaded::Absent => snap.update_known = true,
             Loaded::Unreadable => snap.update_known = false,
         }
+        self_update::UpdateStatus::reconcile(dir);
         match self_update::UpdateStatus::read(dir) {
             Loaded::Present(s) => {
                 snap.last_check_at = s.last_check_at;
@@ -138,10 +193,11 @@ impl Snapshot {
         }
         let status = CloudStatus::load(dir);
         let config_exists = dir.join(cloud::CONFIG_FILE).exists();
+        let saved_email = cloud::saved_account_email(dir);
         if let Some(s) = status {
             snap.cloud_known = true;
             snap.cloud_on = s.enabled || config_exists;
-            snap.account = s.account;
+            snap.account = if s.account.trim().is_empty() { saved_email.clone() } else { s.account };
             snap.role = s.role;
             snap.epoch = s.epoch;
             snap.active_name = s.active_name;
@@ -155,11 +211,91 @@ impl Snapshot {
             snap.peer_role = s.peer_role;
         } else if !dir.join(cloud::STATUS_FILE).exists() {
             snap.cloud_known = true;
-            snap.cloud_on = config_exists;
+            snap.cloud_on = config_exists || !saved_email.is_empty();
+            snap.account = saved_email;
+        } else if !saved_email.is_empty() {
+            snap.cloud_known = true;
+            snap.cloud_on = true;
+            snap.account = saved_email;
         }
         snap.devices = listed_devices(dir);
+        snap.blocked = listed_blocked(dir);
+        let policy = crate::access::Policy::load(dir);
+        snap.require_accounts = policy.require_accounts;
+        if let Some(address) = crate::public_addr::load(dir) {
+            snap.public_address = address.address;
+            snap.public_note = address.note;
+            snap.public_needs_confirm = address.needs_confirm;
+            snap.public_confirmed = address.confirmed;
+        }
+        let watch = crate::public_addr::IpWatch::load(dir);
+        snap.public_watch_known = true;
+        snap.public_watch = watch.enabled(&snap.public_address);
+        snap.public_ip_line = watch.line();
+        snap.log_tail = redacted_log_tail(&dir.join("server.log"));
+        snap.access_keys = crate::access_keys::Store::public_list(dir);
         snap
     }
+}
+
+/// Last lines of a log, safe to put on the clipboard or the status pipe.
+pub(crate) fn redacted_log_tail(path: &Path) -> String {
+    let Ok(bytes) = std::fs::read(path) else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(80);
+    let joined = lines[start..].join("\n");
+    let redacted = redact_secrets(&joined);
+    let max = 16_000;
+    if redacted.chars().count() <= max {
+        redacted
+    } else {
+        let skip = redacted.chars().count() - max;
+        redacted.chars().skip(skip).collect()
+    }
+}
+
+/// Drops passwords, tokens, and key material. Host names, IDs, and addresses stay.
+pub(crate) fn redact_secrets(text: &str) -> String {
+    text.lines().map(redact_line).collect::<Vec<_>>().join("\n")
+}
+
+fn redact_line(line: &str) -> String {
+    let upper = line.to_ascii_uppercase();
+    if upper.contains("PRIVATE KEY") || upper.contains("BEGIN CERTIFICATE") || upper.contains("BEGIN RSA") {
+        return "[redacted]".into();
+    }
+    line.split_inclusive(char::is_whitespace).map(redact_word).collect()
+}
+
+fn redact_word(word: &str) -> String {
+    let lower = word.to_ascii_lowercase();
+    for key in ["password=", "token=", "secret=", "refresh_token=", "authorization=", "pin="] {
+        if let Some(at) = lower.find(key) {
+            let end = at + key.len();
+            let value = word[end..].trim_end_matches(|c: char| c.is_whitespace());
+            let ws = &word[end + value.len()..];
+            if value.is_empty() {
+                return word.to_string();
+            }
+            return format!("{}[redacted]{ws}", &word[..end]);
+        }
+    }
+    let trimmed = word.trim_end_matches(|c: char| c.is_whitespace());
+    let ws = &word[trimmed.len()..];
+    if trimmed.starts_with("eyJ") && trimmed.len() >= 20 {
+        return format!("[redacted]{ws}");
+    }
+    if trimmed.contains("pjdesk-key1.") {
+        return format!("[redacted]{ws}");
+    }
+    let alnum = trimmed.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+    if alnum >= 40 && !trimmed.contains('.') && !trimmed.contains(':') {
+        return format!("[redacted]{ws}");
+    }
+    word.to_string()
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -175,6 +311,16 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
         hostname: String,
         #[serde(default)]
         app_version: String,
+        #[serde(default)]
+        signed_in: bool,
+        #[serde(default)]
+        last_ip: String,
+        #[serde(default)]
+        first_seen: u64,
+        #[serde(default)]
+        last_seen: u64,
+        #[serde(default)]
+        access_key_id: String,
     }
     #[derive(Deserialize)]
     struct Online {
@@ -188,10 +334,7 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
     let Ok(file) = serde_json::from_slice::<File>(&bytes) else {
         return Vec::new();
     };
-    let online_fresh = std::fs::metadata(dir.join("online.json"))
-        .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map(|e| e.as_secs() <= 15).unwrap_or(false))
-        .unwrap_or(false);
+    let online_fresh = crate::cloud::online_file_is_fresh(&dir.join("online.json"));
     let online: std::collections::BTreeMap<String, String> = if online_fresh {
         std::fs::read(dir.join("online.json"))
             .ok()
@@ -201,20 +344,72 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
     } else {
         std::collections::BTreeMap::new()
     };
+    let labels: std::collections::HashMap<String, String> = crate::access_keys::Store::public_list(dir)
+        .into_iter()
+        .map(|key| (key.id, key.label))
+        .collect();
     let mut rows: Vec<ListedDevice> = file
         .devices
         .into_iter()
         .map(|(id, rec)| {
             let live = online.get(&id);
+            let access_label = labels.get(&rec.access_key_id).cloned().unwrap_or_default();
             ListedDevice {
                 id,
                 hostname: rec.hostname,
                 version: live.cloned().unwrap_or(rec.app_version),
                 online: live.is_some(),
+                signed_in: rec.signed_in,
+                last_ip: rec.last_ip,
+                first_seen: rec.first_seen,
+                last_seen: rec.last_seen,
+                access_label,
             }
         })
         .collect();
     rows.sort_by(|a, b| a.hostname.cmp(&b.hostname).then(a.id.cmp(&b.id)));
+    rows
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn listed_blocked(dir: &Path) -> Vec<ListedBlock> {
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        blocked: std::collections::BTreeMap<String, Rec>,
+    }
+    #[derive(Deserialize)]
+    struct Rec {
+        #[serde(default)]
+        hostname: String,
+        #[serde(default)]
+        last_ip: String,
+        #[serde(default)]
+        first_seen: u64,
+        #[serde(default)]
+        last_seen: u64,
+        #[serde(default)]
+        blocked_at: u64,
+    }
+    let Ok(bytes) = std::fs::read(dir.join("devices.json")) else {
+        return Vec::new();
+    };
+    let Ok(file) = serde_json::from_slice::<File>(&bytes) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<ListedBlock> = file
+        .blocked
+        .into_iter()
+        .map(|(id, rec)| ListedBlock {
+            id,
+            hostname: rec.hostname,
+            last_ip: rec.last_ip,
+            first_seen: rec.first_seen,
+            last_seen: rec.last_seen,
+            blocked_at: rec.blocked_at,
+        })
+        .collect();
+    rows.sort_by(|a, b| b.blocked_at.cmp(&a.blocked_at).then(a.id.cmp(&b.id)));
     rows
 }
 
@@ -279,6 +474,17 @@ mod tests {
         assert_eq!(snap.devices.len(), 1);
         assert_eq!(snap.devices[0].version, "0.5.1");
         assert_eq!(snap.devices[0].hostname, "office");
+        std::fs::write(
+            dir.join("server.log"),
+            "host 902488771 registered via LAN (10.0.0.20:21200)\npassword=hunter2 token=SUPERSECRETTOKENVALUE1234567890ABCDEF\n-----BEGIN PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let snap = Snapshot::from_disk(&dir, 21200, true);
+        assert!(snap.log_tail.contains("902488771"), "{}", snap.log_tail);
+        assert!(snap.log_tail.contains("10.0.0.20"), "{}", snap.log_tail);
+        assert!(!snap.log_tail.contains("hunter2"), "{}", snap.log_tail);
+        assert!(!snap.log_tail.contains("SUPERSECRETTOKENVALUE"), "{}", snap.log_tail);
+        assert!(!snap.log_tail.contains("PRIVATE KEY"), "{}", snap.log_tail);
 
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("DEVICESECRETSHA"));
@@ -286,6 +492,45 @@ mod tests {
         assert!(!json.contains("SUPERSECRETKEY"));
         assert!(!json.contains("BEGIN"));
         assert!(!json.contains(&key_pem));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_saved_account_shows_when_status_was_cleared() {
+        let dir = dir("account-kept");
+        std::fs::write(
+            dir.join("cloud-sync.json"),
+            r#"{"mode":"account","email":"ben@spader.us","token":"SECRETTOKENVALUE1234567890"}"#,
+        )
+        .unwrap();
+        let snap = Snapshot::from_disk(&dir, 21200, true);
+        assert_eq!(snap.account, "ben@spader.us");
+        assert!(snap.cloud_on);
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("SECRETTOKEN"), "{json}");
+        std::fs::write(dir.join("cloud-status.json"), b"not json").unwrap();
+        let snap = Snapshot::from_disk(&dir, 21200, true);
+        assert_eq!(snap.account, "ben@spader.us");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_installing_line_for_this_version_is_up_to_date() {
+        let dir = dir("installing");
+        let current = env!("CARGO_PKG_VERSION");
+        std::fs::write(
+            dir.join("server-update-status.json"),
+            format!(r#"{{"last_check_at":1700000000,"last_result":"Installing {current}","available":"{current}","error":""}}"#),
+        )
+        .unwrap();
+        let snap = Snapshot::from_disk(&dir, 21200, true);
+        assert_eq!(snap.last_result, "Up to date");
+        assert!(snap.update_available.is_empty(), "{}", snap.update_available);
+        assert!(snap.update_error.is_empty());
+        assert_eq!(snap.last_check_at, 1_700_000_000);
+        let text = std::fs::read_to_string(dir.join("server-update-status.json")).unwrap();
+        assert!(text.contains("Up to date"), "{text}");
+        assert!(!text.contains("Installing"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

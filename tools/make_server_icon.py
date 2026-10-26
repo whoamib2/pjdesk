@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Generates a distinct PJDesk *Server* icon: a green server stack on a dark
-rounded base (clearly different from the client's blue monitor)."""
+rounded base (clearly different from the client's blue monitor).
+
+The bytes shipped in the app are the ones committed from this drawing on
+2026-10-16 (51d6fc1). tools/make_icon.py does not overwrite them.
+"""
 import os
 from PIL import Image, ImageDraw
 

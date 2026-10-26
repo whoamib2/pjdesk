@@ -18,6 +18,10 @@ use sha2::{Digest, Sha256};
 #[derive(Default, Serialize, Deserialize)]
 struct RegistryFile {
     devices: BTreeMap<String, DeviceRecord>,
+    /// Computers Ben removed. The ID and the secret hash stay here so the same
+    /// computer cannot register again, including under a new ID.
+    #[serde(default)]
+    blocked: BTreeMap<String, BlockedRecord>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -32,9 +36,66 @@ struct DeviceRecord {
     /// Missing in files written before 0.4.0.
     #[serde(default)]
     group: String,
+    /// True after a registration that presented a valid network access token.
+    /// Missing in files written before 0.6.0, which means not signed in.
+    #[serde(default)]
+    signed_in: bool,
+    /// "windows", "android", or empty until the host reports it. Missing before 0.6.2.
+    #[serde(default)]
+    os_family: String,
+    #[serde(default)]
+    os_version: String,
+    /// Last interactive user. Empty is not a replacement for a name already stored.
+    /// Missing before 0.6.2. Shown only to the account owner, not to other peers.
+    #[serde(default)]
+    console_user: String,
+    /// Friendly name chosen on the computer. Empty means show the hostname.
+    /// An empty report clears it. Missing before the display-name report.
+    #[serde(default)]
+    display_name: String,
+    /// Last address this computer registered or stayed connected from.
+    /// Missing before 0.6.33.
+    #[serde(default)]
+    last_ip: String,
+    /// Server access key that admitted this computer. Empty when it used an
+    /// account or grace. Missing before 0.6.33. Not a secret.
+    #[serde(default)]
+    access_key_id: String,
+}
+
+/// A computer that was removed and must not register again.
+#[derive(Clone, Serialize, Deserialize)]
+struct BlockedRecord {
+    #[serde(default)]
+    hostname: String,
+    #[serde(default)]
+    secret_sha256: String,
+    #[serde(default)]
+    last_ip: String,
+    #[serde(default)]
+    first_seen: u64,
+    #[serde(default)]
+    last_seen: u64,
+    #[serde(default)]
+    blocked_at: u64,
+}
+
+/// One computer for the account's saved list. The user name stays on this server
+/// and is uploaded only to the owner's account.
+pub struct PresenceRow {
+    pub id: String,
+    pub hostname: String,
+    pub os_family: String,
+    pub os_version: String,
+    pub console_user: String,
+    pub display_name: String,
+    pub last_seen: u64,
+    pub signed_in: bool,
+    pub app_version: String,
 }
 
 /// A registered device, for the management window.
+#[derive(Clone)]
 pub struct DeviceRow {
     pub id: String,
     pub hostname: String,
@@ -43,6 +104,23 @@ pub struct DeviceRow {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub first_seen: u64,
     pub last_seen: u64,
+    /// False until this computer registers with a network access token.
+    pub signed_in: bool,
+    /// Empty until this computer has connected once on 0.6.33 or later.
+    pub last_ip: String,
+    /// Set when this computer registered with a server access key.
+    pub access_key_id: String,
+}
+
+/// A removed computer, for the Blocked computers list. No secret.
+#[derive(Clone)]
+pub struct BlockedRow {
+    pub id: String,
+    pub hostname: String,
+    pub last_ip: String,
+    pub first_seen: u64,
+    pub last_seen: u64,
+    pub blocked_at: u64,
 }
 
 pub struct Registry {
@@ -54,6 +132,8 @@ pub struct Registry {
 pub enum RegisterError {
     /// The ID exists and the secret does not match.
     Conflict(String),
+    /// This computer was removed. The ID and the secret stay blocked.
+    Blocked(String),
     Io(String),
 }
 
@@ -61,6 +141,13 @@ impl std::fmt::Display for RegisterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RegisterError::Conflict(id) => write!(f, "ID {} belongs to another device", format_id(id)),
+            RegisterError::Blocked(id) => {
+                if id.is_empty() {
+                    write!(f, "this computer is blocked")
+                } else {
+                    write!(f, "this computer ({}) is blocked", format_id(id))
+                }
+            }
             RegisterError::Io(e) => write!(f, "could not save the device registry: {e}"),
         }
     }
@@ -69,7 +156,49 @@ impl std::fmt::Display for RegisterError {
 impl std::error::Error for RegisterError {}
 
 fn now() -> u64 {
+    unix_now()
+}
+
+/// Unix seconds. Used by the signaling server as well as the registry.
+pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn clip(text: &str, max: usize) -> String {
+    text.trim().chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
+/// True when this app version can decode [`pjdesk_proto::signal::ServerMsg::WantHostReport`].
+///
+/// Desktop 0.6.2 can. Android 0.6.3 cannot. A desktop that updated from 0.6.2
+/// to 0.6.3 already has an operating system on its record, and that record is
+/// not Android, so it is asked. A 0.6.3 with no operating system, or Android,
+/// is not asked. Android 0.6.4 and every later build can.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn supports_host_report(app_version: &str) -> bool {
+    supports_host_report_for(app_version, "")
+}
+
+pub fn supports_host_report_for(app_version: &str, os_family: &str) -> bool {
+    let v = parse_version(app_version);
+    if v == (0, 6, 2) || v >= (0, 6, 4) {
+        return true;
+    }
+    v == (0, 6, 3) && !os_family.is_empty() && !os_family.eq_ignore_ascii_case("android")
+}
+
+fn parse_version(text: &str) -> (u32, u32, u32) {
+    let text = text.trim().trim_start_matches('v');
+    let mut parts = text.split('.');
+    let major = parts.next().and_then(|s| leading_u32(s)).unwrap_or(0);
+    let minor = parts.next().and_then(|s| leading_u32(s)).unwrap_or(0);
+    let patch = parts.next().and_then(|s| leading_u32(s)).unwrap_or(0);
+    (major, minor, patch)
+}
+
+fn leading_u32(text: &str) -> Option<u32> {
+    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() { None } else { digits.parse().ok() }
 }
 
 impl Registry {
@@ -113,6 +242,9 @@ impl Registry {
                 group: d.group.clone(),
                 first_seen: d.first_seen,
                 last_seen: d.last_seen,
+                signed_in: d.signed_in,
+                last_ip: d.last_ip.clone(),
+                access_key_id: d.access_key_id.clone(),
             })
             .collect();
         rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
@@ -139,11 +271,166 @@ impl Registry {
         self.data.devices.get(id).map(|d| d.group.clone())
     }
 
+    /// Operating system last reported by this computer. Empty until a host report.
+    pub fn os_family(&self, id: &str) -> String {
+        self.data.devices.get(id).map(|d| d.os_family.clone()).unwrap_or_default()
+    }
+
+    /// How many computers are using this key, and whether `secret` is already one of them.
+    pub fn key_has_room(&self, key_id: &str, secret: &[u8; 32], limit: u32) -> bool {
+        let hash = hex::encode(Sha256::digest(secret));
+        let limit = limit.max(1) as usize;
+        let mut count = 0usize;
+        let mut same = false;
+        for record in self.data.devices.values() {
+            if record.access_key_id == key_id {
+                count += 1;
+                if record.secret_sha256 == hash {
+                    same = true;
+                }
+            }
+        }
+        if same { count <= limit } else { count + 1 <= limit }
+    }
+
+    /// Remembers or clears the access key on a registration. An empty id clears it.
+    pub fn note_access_key(&mut self, id: &str, key_id: &str) {
+        let Some(record) = self.data.devices.get_mut(id) else { return };
+        if record.access_key_id == key_id {
+            return;
+        }
+        record.access_key_id = key_id.to_string();
+        if let Err(e) = self.save() {
+            tracing::warn!("could not save the access key for {id}: {e}");
+        }
+    }
+
+    /// Removes every computer that registered with this key. Does not block them.
+    pub fn take_access_key(&mut self, key_id: &str) -> Vec<String> {
+        let ids: Vec<String> = self
+            .data
+            .devices
+            .iter()
+            .filter(|(_, record)| record.access_key_id == key_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if ids.is_empty() {
+            return ids;
+        }
+        for id in &ids {
+            self.data.devices.remove(id);
+        }
+        if let Err(e) = self.save() {
+            tracing::warn!("could not remove computers for an access key: {e}");
+        }
+        ids
+    }
+
+    /// Marks whether the latest registration presented a valid network token.
+    pub fn mark_signed_in(&mut self, id: &str, signed_in: bool) {
+        let Some(record) = self.data.devices.get_mut(id) else { return };
+        if record.signed_in == signed_in {
+            return;
+        }
+        record.signed_in = signed_in;
+        if let Err(e) = self.save() {
+            tracing::warn!("could not record sign-in state for {id}: {e}");
+        }
+    }
+
     pub fn remove(&mut self, id: &str) -> Result<()> {
         if self.data.devices.remove(id).is_some() {
             self.save()?;
         }
         Ok(())
+    }
+
+    /// Rows for Blocked computers, most recently blocked first.
+    pub fn blocked(&self) -> Vec<BlockedRow> {
+        let mut rows: Vec<BlockedRow> = self
+            .data
+            .blocked
+            .iter()
+            .map(|(id, d)| BlockedRow {
+                id: id.clone(),
+                hostname: d.hostname.clone(),
+                last_ip: d.last_ip.clone(),
+                first_seen: d.first_seen,
+                last_seen: d.last_seen,
+                blocked_at: d.blocked_at,
+            })
+            .collect();
+        rows.sort_by(|a, b| b.blocked_at.cmp(&a.blocked_at).then(a.id.cmp(&b.id)));
+        rows
+    }
+
+    /// Disconnect is the caller's job. This deletes the registration and keeps
+    /// the ID and the secret hash so the same computer cannot come back.
+    pub fn block(&mut self, id: &str) -> Result<bool> {
+        if !is_valid_id(id) {
+            anyhow::bail!("that is not a PJDesk computer ID");
+        }
+        if let Some(device) = self.data.devices.remove(id) {
+            self.data.blocked.insert(
+                id.to_string(),
+                BlockedRecord {
+                    hostname: device.hostname,
+                    secret_sha256: device.secret_sha256,
+                    last_ip: device.last_ip,
+                    first_seen: device.first_seen,
+                    last_seen: device.last_seen,
+                    blocked_at: now(),
+                },
+            );
+            self.save()?;
+            return Ok(true);
+        }
+        Ok(self.data.blocked.contains_key(id))
+    }
+
+    /// Computers that registered with neither a PJDesk account nor a server access key.
+    /// Turning Require signed-in accounts on disconnects these if they are online.
+    /// An access key stays connected.
+    pub fn grace_ids(&self) -> Vec<String> {
+        self.data
+            .devices
+            .iter()
+            .filter(|(_, device)| !device.signed_in && device.access_key_id.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Lets that computer register again. It is not put back on the list until it connects.
+    pub fn unblock(&mut self, id: &str) -> Result<bool> {
+        if !is_valid_id(id) {
+            anyhow::bail!("that is not a PJDesk computer ID");
+        }
+        if self.data.blocked.remove(id).is_some() {
+            self.save()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Remembers the address a live computer is using. A repeat of the same address does not write.
+    pub fn note_address(&mut self, id: &str, ip: &str) {
+        let ip = ip.trim();
+        if ip.is_empty() {
+            return;
+        }
+        let Some(record) = self.data.devices.get_mut(id) else { return };
+        if record.last_ip == ip {
+            return;
+        }
+        record.last_ip = ip.to_string();
+        if let Err(e) = self.save() {
+            tracing::warn!("could not save the last address for {id}: {e}");
+        }
+    }
+
+    fn secret_is_blocked(&self, secret_sha256: &str) -> bool {
+        !secret_sha256.is_empty()
+            && self.data.blocked.values().any(|row| !row.secret_sha256.is_empty() && row.secret_sha256 == secret_sha256)
     }
 
     /// Registers a device. Returns its ID.
@@ -167,6 +454,12 @@ impl Registry {
     ) -> Result<String, RegisterError> {
         let secret_sha256 = hex::encode(Sha256::digest(secret));
         let now = now();
+        if self.secret_is_blocked(&secret_sha256) {
+            return Err(RegisterError::Blocked(requested.unwrap_or("").to_string()));
+        }
+        if requested.is_some_and(|id| self.data.blocked.contains_key(id)) {
+            return Err(RegisterError::Blocked(requested.unwrap_or("").to_string()));
+        }
 
         let mut owned: Vec<(String, u64)> = self
             .data
@@ -206,7 +499,7 @@ impl Registry {
             }
             None => loop {
                 let candidate = generate_id();
-                if !self.data.devices.contains_key(&candidate) {
+                if !self.data.devices.contains_key(&candidate) && !self.data.blocked.contains_key(&candidate) {
                     break candidate;
                 }
             },
@@ -221,6 +514,13 @@ impl Registry {
                 first_seen: now,
                 last_seen: now,
                 group: String::new(),
+                signed_in: false,
+                os_family: String::new(),
+                os_version: String::new(),
+                console_user: String::new(),
+                display_name: String::new(),
+                last_ip: String::new(),
+                access_key_id: String::new(),
             },
         );
         self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
@@ -255,6 +555,65 @@ impl Registry {
             }
         }
         stale.len()
+    }
+
+    /// Stores a host report. An empty hostname or user leaves the previous value.
+    pub fn note_report(&mut self, id: &str, hostname: &str, os_family: &str, os_version: &str, console_user: &str) {
+        let Some(record) = self.data.devices.get_mut(id) else { return };
+        let hostname = clip(hostname, 64);
+        if !hostname.is_empty() {
+            record.hostname = hostname;
+        }
+        let os_family = clip(os_family, 32);
+        if !os_family.is_empty() {
+            record.os_family = os_family;
+        }
+        let os_version = clip(os_version, 40);
+        if !os_version.is_empty() {
+            record.os_version = os_version;
+        }
+        let console_user = clip(console_user, 80);
+        if !console_user.is_empty() {
+            record.console_user = console_user;
+        }
+        record.last_seen = now();
+        if let Err(e) = self.save() {
+            tracing::warn!("could not save a host report: {e}");
+        }
+    }
+
+    /// Stores the friendly name. Unlike the hostname, an empty name clears it.
+    pub fn note_display_name(&mut self, id: &str, name: &str) {
+        let Some(record) = self.data.devices.get_mut(id) else { return };
+        record.display_name = clip(name, 64);
+        record.last_seen = now();
+        if let Err(e) = self.save() {
+            tracing::warn!("could not save a display name: {e}");
+        }
+    }
+
+    /// Last time this id registered or was touched, or 0 when it is unknown.
+    pub fn last_seen_of(&self, id: &str) -> u64 {
+        self.data.devices.get(id).map(|d| d.last_seen).unwrap_or(0)
+    }
+
+    /// Every registered computer, for the account list. Online is decided by the caller.
+    pub fn presence(&self) -> Vec<PresenceRow> {
+        self.data
+            .devices
+            .iter()
+            .map(|(id, d)| PresenceRow {
+                id: id.clone(),
+                hostname: d.hostname.clone(),
+                os_family: d.os_family.clone(),
+                os_version: d.os_version.clone(),
+                console_user: d.console_user.clone(),
+                display_name: d.display_name.clone(),
+                last_seen: d.last_seen,
+                signed_in: d.signed_in,
+                app_version: d.app_version.clone(),
+            })
+            .collect()
     }
 
     /// Records that these devices are connected right now (their last-seen
@@ -403,5 +762,91 @@ mod tests {
         let reg = Registry::load(path.clone()).unwrap();
         assert_eq!(reg.list()[0].group, "Office");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_blank_report_does_not_erase_the_user_or_the_name() {
+        let (path, mut reg) = fresh("report");
+        let id = reg.register(None, &[6u8; 32], "BENLENOVODESK", "0.6.2").unwrap();
+        reg.note_report(&id, "BENLENOVODESK", "windows", "11 24H2", "SPADER\\Ben");
+        reg.note_report(&id, "", "", "", "");
+        let row = reg.presence().into_iter().find(|r| r.id == id).unwrap();
+        assert_eq!(row.hostname, "BENLENOVODESK");
+        assert_eq!(row.os_family, "windows");
+        assert_eq!(row.console_user, "SPADER\\Ben");
+        let reg = Registry::load(path.clone()).unwrap();
+        assert_eq!(reg.presence()[0].console_user, "SPADER\\Ben");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn only_builds_that_understand_the_ask_are_asked() {
+        assert!(!supports_host_report("0.6.1"));
+        assert!(supports_host_report("0.6.2"));
+        assert!(!supports_host_report("0.6.3"));
+        assert!(!supports_host_report_for("0.6.3", ""));
+        assert!(!supports_host_report_for("0.6.3", "android"));
+        assert!(supports_host_report_for("0.6.3", "windows"));
+        assert!(supports_host_report("0.6.4"));
+        assert!(supports_host_report("0.7.0"));
+    }
+
+    #[test]
+    fn a_removed_computer_stays_blocked_until_it_is_unblocked() {
+        let (path, mut reg) = fresh("block");
+        let secret = [4u8; 32];
+        let id = reg.register(None, &secret, "UNKNOWN-PC", "0.6.32").unwrap();
+        reg.note_address(&id, "203.0.113.9");
+        assert!(reg.block(&id).unwrap());
+        assert!(reg.list().is_empty());
+        let blocked = reg.blocked();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].id, id);
+        assert_eq!(blocked[0].hostname, "UNKNOWN-PC");
+        assert_eq!(blocked[0].last_ip, "203.0.113.9");
+        assert!(blocked[0].first_seen > 0 && blocked[0].last_seen > 0);
+        assert!(matches!(reg.register(Some(&id), &secret, "UNKNOWN-PC", "0.6.33"), Err(RegisterError::Blocked(_))));
+        assert!(matches!(reg.register(None, &secret, "UNKNOWN-PC", "0.6.33"), Err(RegisterError::Blocked(_))));
+        assert!(matches!(reg.register(Some(&id), &[9u8; 32], "other", "0.6.33"), Err(RegisterError::Blocked(_))));
+        let fresh_id = reg.register(None, &[9u8; 32], "other", "0.6.33").unwrap();
+        assert_ne!(fresh_id, id);
+        assert!(reg.unblock(&id).unwrap());
+        assert!(reg.blocked().is_empty());
+        assert_eq!(reg.register(Some(&id), &secret, "UNKNOWN-PC", "0.6.33").unwrap(), id);
+        let reg = Registry::load(path.clone()).unwrap();
+        assert_eq!(reg.list().iter().find(|row| row.id == id).unwrap().last_ip, "");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn grace_ids_skip_signed_in_computers_and_access_keys() {
+        let (path, mut reg) = fresh("grace");
+        let grace = reg.register(None, &[1u8; 32], "DESKTOP-D7E4AOR", "0.6.33").unwrap();
+        let signed = reg.register(None, &[2u8; 32], "Office", "0.6.33").unwrap();
+        reg.mark_signed_in(&signed, true);
+        let keyed = reg.register(None, &[3u8; 32], "Ada-PC", "0.6.33").unwrap();
+        reg.note_access_key(&keyed, "key-ada");
+        let ids = reg.grace_ids();
+        assert_eq!(ids, vec![grace]);
+        assert!(!ids.contains(&signed));
+        assert!(!ids.contains(&keyed));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_pre_060_registry_loads_as_not_signed_in() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-reg-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("devices.json");
+        std::fs::write(
+            &path,
+            r#"{"devices":{"123456789":{"secret_sha256":"aa","hostname":"Office","app_version":"0.5.2","first_seen":1,"last_seen":2,"group":""}}}"#,
+        )
+        .unwrap();
+        let reg = Registry::load(path).unwrap();
+        assert!(!reg.list()[0].signed_in);
+        assert!(reg.list()[0].access_key_id.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

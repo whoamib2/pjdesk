@@ -350,6 +350,10 @@ impl Session {
             }
             ControlMsg::Tunnel(msg) => self.tunnel(msg, send).await?,
             ControlMsg::Audio { enabled } => self.audio(enabled, send).await?,
+            ControlMsg::Visitor { account, computer, user, id } => {
+                info!("Connected: account={account:?} computer={computer:?} user={user:?} id={id}");
+                super::notice::update(&account, &computer, &user, &id);
+            }
         }
         Ok(false)
     }
@@ -384,6 +388,9 @@ impl Session {
         let monitors = super::capture::monitor_infos();
         info!("{} granted: {}", self.peer_name, perms::describe(granted));
         write_msg(send, &HostMsg::Welcome { permissions: granted, monitors, proto: PROTOCOL_VERSION }).await?;
+        if requested & pjdesk_proto::perms::VISITOR != 0 {
+            write_msg(send, &HostMsg::AskVisitor).await?;
+        }
         if wants_layout {
             self.publish_layout(send, true).await?;
         }
@@ -440,7 +447,8 @@ impl Session {
             | SpecialCommand::Recents
             | SpecialCommand::VolumeUp
             | SpecialCommand::VolumeDown
-            | SpecialCommand::Power => {
+            | SpecialCommand::Power
+            | SpecialCommand::Notifications => {
                 self.deny(send, "android", "this computer is not running Android").await?;
             }
         }
@@ -734,6 +742,13 @@ impl Session {
         if let Some(shared) = &self.shared {
             shared.note_transfer(text);
         }
+    }
+
+    /// Tells the controller what this computer is doing. Shown in the viewer
+    /// and written to the client log.
+    pub fn notify(&self, text: &str) {
+        info!("{text}");
+        let _ = self.host_tx.send(HostMsg::Notice(text.to_string()));
     }
 
     pub fn spawn_side_loops(self: &Arc<Self>) {

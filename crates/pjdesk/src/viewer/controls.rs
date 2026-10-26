@@ -20,8 +20,28 @@ use pjdesk_proto::peer::{
 use pjdesk_proto::perms::{self, has};
 use pjdesk_proto::quality;
 use quinn::Connection;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
+
+/// The viewer window runs on the winit thread, which is not inside the Tokio
+/// runtime. `tokio::spawn` from that thread panics ("there is no reactor
+/// running"). Tasks go through the handle captured when the session starts.
+static VIEWER_RT: std::sync::OnceLock<Handle> = std::sync::OnceLock::new();
+
+fn spawn_viewer<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = Handle::try_current() {
+        handle.spawn(fut);
+        return;
+    }
+    VIEWER_RT
+        .get()
+        .expect("viewer task started before the session runtime was set")
+        .spawn(fut);
+}
 
 use crate::audio::Player;
 use crate::clip;
@@ -57,7 +77,13 @@ pub struct Live {
     pub block_host: bool,
     pub recording: bool,
     pub restart: bool,
+    /// The QUIC path is the server relay.
+    pub relayed: bool,
+    /// That relay path dropped. The window reconnects without asking again.
+    pub resume_relay: bool,
     pub closed: Option<String>,
+    /// The phone's accessibility service is off, so clicks do not land.
+    pub control_off: bool,
     paths: HashMap<u64, PathBuf>,
     wanted: HashSet<String>,
     next_id: u64,
@@ -87,7 +113,10 @@ impl Live {
             block_host: false,
             recording: false,
             restart: false,
+            relayed: false,
+            resume_relay: false,
             closed: None,
+            control_off: false,
             paths: HashMap::new(),
             wanted: HashSet::new(),
             next_id: 1,
@@ -127,7 +156,10 @@ impl Live {
             block_host: self.block_host,
             recording: self.recording,
             restart: self.restart,
+            relayed: self.relayed,
+            resume_relay: self.resume_relay,
             closed: self.closed.clone(),
+            control_off: self.control_off,
             paths: HashMap::new(),
             wanted: HashSet::new(),
             next_id: 0,
@@ -163,15 +195,20 @@ struct PendingTunnel {
 
 /// Starts the host-message loop and the side-stream reader.
 pub fn start(
+    rt: Handle,
     connection: Connection,
     control_recv: quinn::RecvStream,
     control: mpsc::UnboundedSender<ControlMsg>,
     frames: std::sync::mpsc::Sender<(VideoHeader, Vec<u8>)>,
     peer_proto: u16,
     host_id: String,
+    relayed: bool,
     wake: impl Fn() + Send + Sync + 'static,
 ) -> (Arc<Mutex<Live>>, mpsc::UnboundedSender<Cmd>, Arc<Mutex<RecorderSlot>>) {
-    let live = Arc::new(Mutex::new(Live::new(peer_proto >= 3)));
+    let _ = VIEWER_RT.set(rt);
+    let mut session = Live::new(peer_proto >= 3);
+    session.relayed = relayed;
+    let live = Arc::new(Mutex::new(session));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let recorder = Arc::new(Mutex::new(RecorderSlot::new()));
     let wake = Arc::new(wake);
@@ -181,7 +218,7 @@ pub fn start(
     if peer_proto >= 3 {
         let saved_display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0u8);
         let _ = control.send(ControlMsg::Hello {
-            permissions: perms::ALL | perms::LAYOUT,
+            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR,
             monitor: saved_display,
             quality: quality::preset("balanced").unwrap_or_default(),
         });
@@ -190,7 +227,7 @@ pub fn start(
     let conn = connection.clone();
     let live_uni = live.clone();
     let player_uni = player.clone();
-    tokio::spawn(async move {
+    spawn_viewer(async move {
         dispatch_uni(conn, frames, live_uni, player_uni).await;
     });
 
@@ -199,7 +236,7 @@ pub fn start(
     let conn_loop = connection.clone();
     let wake_loop = wake.clone();
     let recorder_loop = recorder.clone();
-        tokio::spawn(async move {
+    spawn_viewer(async move {
             run_loop(
                 conn_loop,
                 control_recv,
@@ -217,11 +254,18 @@ pub fn start(
     let live_clip = live.clone();
     let control_clip = control;
     let wake_clip = wake;
-    tokio::spawn(async move {
+    spawn_viewer(async move {
         clip_watch(live_clip, control_clip, wake_clip).await;
     });
 
     (live, cmd_tx, recorder)
+}
+
+fn note_relay_resume(live: &mut Live) {
+    live.resume_relay = true;
+    live.closed = Some(pjdesk_proto::failover::RELAY_RESUME.into());
+    live.note("Reconnecting…");
+    tracing::info!("{}", pjdesk_proto::failover::RELAY_RESUME);
 }
 
 async fn run_loop(
@@ -240,10 +284,17 @@ async fn run_loop(
             msg = read_msg::<_, HostMsg>(&mut control_recv, MAX_CONTROL_FRAME) => {
                 match msg {
                     Ok(msg) => on_host(msg, &connection, &control, &live, &tunnels, &wake, &host_id),
-                    Err(_) => {
+                    Err(e) => {
                         let mut g = live.lock().unwrap();
                         if g.closed.is_none() && !g.restart {
-                            g.closed = Some("the host closed the session".into());
+                            if g.relayed {
+                                note_relay_resume(&mut g);
+                            } else {
+                                let text = format!("The host closed the session: {e:#}");
+                                tracing::error!("{text}");
+                                crate::note_failure(&text);
+                                g.closed = Some(text);
+                            }
                         }
                         wake();
                         break;
@@ -257,7 +308,18 @@ async fn run_loop(
             _ = connection.closed() => {
                 let mut g = live.lock().unwrap();
                 if g.closed.is_none() && !g.restart {
-                    g.closed = Some("the connection ended".into());
+                    if g.relayed {
+                        note_relay_resume(&mut g);
+                    } else {
+                        let why = connection
+                            .close_reason()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "the connection ended".into());
+                        let text = session_end_message(&why);
+                        tracing::error!("{text}");
+                        crate::note_failure(&text);
+                        g.closed = Some(text);
+                    }
                 }
                 wake();
                 break;
@@ -278,6 +340,7 @@ fn on_host(
     let mut g = live.lock().unwrap();
     match msg {
         HostMsg::Welcome { permissions, monitors, .. } => {
+            tracing::info!("Host granted {}", perms::describe(permissions));
             g.perms = permissions;
             g.monitors = monitors;
             g.note(format!("This session can {}", perms::describe(permissions)));
@@ -319,7 +382,27 @@ fn on_host(
             g.platform_version = version.clone();
             remember_platform(host_id, &family, &version);
         }
-        HostMsg::Notice(text) => g.note(text),
+        HostMsg::Notice(text) => {
+            tracing::info!("Host says: {text}");
+            if text == CONTROL_OFF {
+                g.control_off = true;
+                crate::note_status(&text);
+                g.note(text);
+            } else if text == CONTROL_ON {
+                g.control_off = false;
+                crate::note_status(&text);
+                g.note(text);
+            } else if screen_share_failure_text(&text) || phone_stopped_sharing(&text) {
+                crate::note_failure(&text);
+                g.closed = Some(text);
+            } else if screen_share_waiting(&text) {
+                crate::note_status(&text);
+                g.note(text);
+            } else {
+                crate::note_status(&format!("Host: {text}"));
+                g.note(text);
+            }
+        }
         HostMsg::Denied { what, reason } => g.note(format!("{what}: {reason}")),
         HostMsg::Chat { text } => g.chat.push((false, text)),
         HostMsg::Privacy { enabled } => g.privacy = enabled,
@@ -349,7 +432,7 @@ fn on_host(
                 let live = std::sync::Arc::clone(live);
                 let wake = std::sync::Arc::clone(wake);
                 let control = control.clone();
-                tokio::spawn(async move {
+                spawn_viewer(async move {
                     if let Err(e) = send_bytes(conn, id, &path, resume, &live).await {
                         if let Some(t) = live.lock().unwrap().transfer_mut(id) {
                             t.state = format!("{e:#}");
@@ -371,10 +454,31 @@ fn on_host(
                 let _ = control.send(ControlMsg::File(FileMsg::Accept { id, resume_from: resume }));
             }
         }
+        HostMsg::AskVisitor => {
+            let _ = control.send(this_visitor());
+        }
         HostMsg::Pong { .. } | HostMsg::Tunnel(TunnelMsg::Open { .. }) => {}
     }
     drop(g);
     wake();
+}
+
+/// Account email when this computer is signed in to pjdesk.com, otherwise blank.
+/// The computer name, the person at this computer, and this computer's ID travel with it.
+fn this_visitor() -> ControlMsg {
+    let cfg = crate::config::Config::load().unwrap_or_default();
+    let from_parent = std::env::var("PJDESK_ACCOUNT").unwrap_or_default();
+    let email = if !from_parent.trim().is_empty() { from_parent } else { cfg.network_email.clone().unwrap_or_default() };
+    let signed_in = !email.trim().is_empty()
+        || !cfg.network_refresh_token().trim().is_empty()
+        || !std::env::var("PJDESK_ACCESS").unwrap_or_default().trim().is_empty();
+    let account = if signed_in { email.trim().chars().filter(|c| !c.is_control()).take(80).collect() } else { String::new() };
+    ControlMsg::Visitor {
+        account,
+        computer: crate::hostname(),
+        user: crate::hostfacts::console_user(),
+        id: cfg.device_id.clone().unwrap_or_default(),
+    }
 }
 
 fn remember_platform(host_id: &str, family: &str, version: &str) {
@@ -547,7 +651,7 @@ async fn on_cmd(
                 let tunnels = tunnels.clone();
                 let live = live.clone();
                 let wake = wake.clone();
-                tokio::spawn(async move {
+                spawn_viewer(async move {
                     if let Err(e) = listen_tunnel(conn, control, tunnels, local, host, port).await {
                         live.lock().unwrap().note(format!("Port forward: {e:#}"));
                         wake();
@@ -671,17 +775,125 @@ async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &
     Ok(())
 }
 
+/// The phone's accessibility service is not connected.
+pub(crate) const CONTROL_OFF: &str = "Control not enabled on phone";
+/// The accessibility service connected while the session was open.
+pub(crate) const CONTROL_ON: &str = "Control is on";
+
+/// The phone ended screen sharing. The session closes on this sentence.
+pub(crate) fn phone_stopped_sharing(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("stopped sharing")
+}
+
+/// A connection close from the phone, as a sentence on the PC.
+pub(crate) fn session_end_message(why: &str) -> String {
+    if phone_stopped_sharing(why) {
+        "The phone stopped sharing".into()
+    } else if screen_share_failure_text(why) {
+        why.to_string()
+    } else {
+        format!("Session stopped: {why}")
+    }
+}
+
+/// The phone asked the person to allow screen sharing. Keep waiting.
+pub(crate) fn screen_share_waiting(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("allow screen sharing")
+}
+
+/// A specific reason from the phone, shown instead of the generic picture timeout.
+pub(crate) fn screen_share_failure_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("screen sharing not allowed")
+        || text.contains("mediaprojection")
+        || text.contains("foreground service is not running")
+}
+
+/// How long to wait for the first frame. A phone that is asking for screen
+/// sharing gets a minute. Anything else stays at 15 seconds.
+pub(crate) fn picture_limit_secs(notices: &[String]) -> u64 {
+    if notices.iter().any(|note| screen_share_waiting(note)) {
+        60
+    } else {
+        15
+    }
+}
+
+/// How long to wait for the host to open the video stream. QUIC does not tell
+/// the viewer the stream exists until the host writes a frame, and the phone
+/// writes that frame only after screen-share consent. A phone that is still
+/// asking gets the same minute. Anything else stays at 20 seconds.
+pub(crate) fn video_open_limit_secs(notices: &[String]) -> u64 {
+    if notices.iter().any(|note| screen_share_waiting(note)) {
+        60
+    } else {
+        20
+    }
+}
+
+/// The line the main window shows when no frame arrived.
+pub(crate) fn picture_gave_up(host: &str, notices: &[String]) -> String {
+    if let Some(reason) = notices.iter().rev().find(|note| screen_share_failure_text(note)) {
+        return reason.clone();
+    }
+    if notices.iter().any(|note| screen_share_waiting(note)) {
+        return "Timed out. No one at that phone allowed screen sharing.".into();
+    }
+    format!(
+        "No picture arrived from {host}. The password was accepted, but that computer did not start sending its screen. {}",
+        crate::host_log_hint()
+    )
+}
+
+/// Wait until the host writes on a uni stream, or until the consent minute ends.
+/// The limit is re-read so "Waiting for the phone to allow screen sharing"
+/// extends a wait that started at 20 seconds.
+async fn await_video_stream(connection: &Connection, live: &Arc<Mutex<Live>>) -> Result<quinn::RecvStream, String> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let notices = live.lock().unwrap().notices.clone();
+        let limit = Duration::from_secs(video_open_limit_secs(&notices));
+        let elapsed = started.elapsed();
+        if elapsed >= limit {
+            if notices.iter().any(|note| screen_share_waiting(note)) {
+                return Err(picture_gave_up("the phone", &notices));
+            }
+            let why = connection
+                .close_reason()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "the host never opened the video stream".into());
+            return Err(format!("No picture from the host: {why}"));
+        }
+        let slice = (limit - elapsed).min(Duration::from_millis(250));
+        match tokio::time::timeout(slice, connection.accept_uni()).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => return Err(format!("The host did not open the video stream: {e}")),
+            Err(_) => {
+                if let Some(reason) = connection.close_reason() {
+                    return Err(format!("No picture from the host: {reason}"));
+                }
+            }
+        }
+    }
+}
+
 async fn dispatch_uni(
     connection: Connection,
     frames: std::sync::mpsc::Sender<(VideoHeader, Vec<u8>)>,
     live: Arc<Mutex<Live>>,
     player: Arc<Mutex<Option<Player>>>,
 ) {
-    let video = match tokio::time::timeout(Duration::from_secs(20), connection.accept_uni()).await {
-        Ok(Ok(s)) => s,
-        _ => return,
+    let video = match await_video_stream(&connection, &live).await {
+        Ok(stream) => stream,
+        Err(text) => {
+            tracing::error!("{text}");
+            crate::note_failure(&text);
+            live.lock().unwrap().closed = Some(text);
+            return;
+        }
     };
-    tokio::spawn(async move {
+    tracing::info!("Video stream received from the host");
+    spawn_viewer(async move {
         let mut video = video;
         loop {
             let mut data = Vec::new();
@@ -698,7 +910,7 @@ async fn dispatch_uni(
     while let Ok(mut stream) = connection.accept_uni().await {
         let live = live.clone();
         let player = player.clone();
-        tokio::spawn(async move {
+        spawn_viewer(async move {
             let _ = read_side(&mut stream, &live, &player).await;
         });
     }
@@ -783,7 +995,7 @@ async fn listen_tunnel(
         let _ = control.send(ControlMsg::Tunnel(TunnelMsg::Open { id, remote_host: host.clone(), remote_port: port }));
         let connection = connection.clone();
         let pending = tunnels.clone();
-        tokio::spawn(async move {
+        spawn_viewer(async move {
             let ready = matches!(tokio::time::timeout(Duration::from_secs(8), rx).await, Ok(Ok(Ok(()))));
             if !ready {
                 pending.lock().unwrap().waiters.remove(&id);
@@ -848,7 +1060,7 @@ pub fn send_clipboard_image(control: &mpsc::UnboundedSender<ControlMsg>, connect
         }));
     } else {
         let conn = connection.clone();
-        tokio::spawn(async move {
+        spawn_viewer(async move {
             if let Ok(mut uni) = conn.open_uni().await {
                 let _ = write_side_header(&mut uni, CLIP_MAGIC, &SideHeader { id: 0, offset: 0, a: w as u32, b: h as u32 }).await;
                 let _ = write_side_chunk(&mut uni, &png).await;
@@ -856,5 +1068,67 @@ pub fn send_clipboard_image(control: &mpsc::UnboundedSender<ControlMsg>, connect
                 let _ = uni.finish();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    #[test]
+    fn a_phone_that_is_asking_for_the_screen_waits_a_minute_and_names_the_reason() {
+        assert_eq!(picture_limit_secs(&[]), 15);
+        let waiting = "Waiting for the phone to allow screen sharing".to_string();
+        assert_eq!(picture_limit_secs(&[waiting.clone()]), 60);
+        assert_eq!(video_open_limit_secs(&[]), 20);
+        assert_eq!(video_open_limit_secs(&[waiting.clone()]), 60);
+        assert_eq!(
+            picture_gave_up("Pixel", &[waiting]),
+            "Timed out. No one at that phone allowed screen sharing."
+        );
+        let denied = "screen sharing not allowed on the phone: Screen capture permission denied".to_string();
+        assert_eq!(picture_gave_up("Pixel", &[denied.clone()]), denied);
+        assert!(picture_gave_up("Pixel", &[]).contains("No picture arrived from Pixel"));
+        assert!(phone_stopped_sharing("The phone stopped sharing"));
+        assert_eq!(session_end_message("The phone stopped sharing"), "The phone stopped sharing");
+        assert_eq!(CONTROL_OFF, "Control not enabled on phone");
+    }
+
+    /// The window thread calls `start` after `block_on` has returned, so there
+    /// is no current reactor. 0.6.6 panicked here.
+    #[test]
+    fn start_outside_the_runtime_does_not_panic() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (connection, recv) = rt.block_on(session_pair());
+        assert!(Handle::try_current().is_err(), "this thread must be outside the Tokio runtime");
+        let (control, _rx) = mpsc::unbounded_channel();
+        let (frames, _frames_rx) = std::sync::mpsc::channel();
+        let _ = start(rt.handle().clone(), connection.clone(), recv, control, frames, 3, "100000001".into(), false, || {});
+        connection.close(0u32.into(), b"test");
+        rt.shutdown_timeout(Duration::from_secs(3));
+    }
+
+    async fn session_pair() -> (Connection, quinn::RecvStream) {
+        let identity = pjdesk_proto::tls::TlsIdentity::generate("pjdesk-host").unwrap();
+        let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        host_sock.set_nonblocking(true).unwrap();
+        let addr = host_sock.local_addr().unwrap();
+        let host = crate::p2p::host_endpoint(host_sock, &identity).unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_sock.set_nonblocking(true).unwrap();
+        let client = crate::p2p::controller_endpoint(client_sock, identity.fingerprint()).unwrap();
+        let connecting = client.connect(addr, pjdesk_proto::PEER_SERVER_NAME).unwrap();
+        let incoming = host.accept().await.expect("host accept").await.expect("host handshake");
+        let connection = connecting.await.expect("client handshake");
+        let mut send = incoming.open_uni().await.expect("open uni");
+        send.write_all(&[0]).await.unwrap();
+        let recv = connection.accept_uni().await.expect("accept uni");
+        // The QUIC driver lives in the endpoints. Keep them for the rest of the test.
+        std::mem::forget(host);
+        std::mem::forget(client);
+        std::mem::forget(send);
+        (connection, recv)
     }
 }

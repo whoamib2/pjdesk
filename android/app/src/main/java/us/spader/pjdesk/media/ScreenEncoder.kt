@@ -10,13 +10,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
-import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
+import us.spader.pjdesk.AppLog
 
 /**
- * Hardware H.264 encoder. Output is Annex-B, with SPS and PPS repeated on
- * every keyframe, which is what the Windows OpenH264 decoder already reads.
+ * Hardware H.264 encoder. Output is Annex-B. Every IDR repeats SPS and PPS,
+ * which is what the Windows OpenH264 decoder reads. A decoder error asks for
+ * another IDR; that access unit is not replaced by a later delta.
  *
  * Constrained Baseline is requested when the device lists it. If the encoder
  * rejects that profile, the same call is retried with the device default,
@@ -39,6 +40,8 @@ class ScreenEncoder(
     private var fps = 30
     private var bitrate = 6_000_000
     @Volatile private var running = true
+    /** Log the next IDR. Set at start and whenever the viewer asks for one. */
+    private var logNextIdr = true
 
     /**
      * The codec starts on the encoder thread. The virtual display is created
@@ -74,16 +77,17 @@ class ScreenEncoder(
                             onFailed("Screen capture did not start")
                             return@post
                         }
-                        Log.i(TAG, "encoder started ${width}x$height")
+                        AppLog.i("encoder started ${width}x$height")
+                        requestKeyframe()
                         onReady()
                         handler.post { drain() }
                     } catch (e: Exception) {
-                        Log.e(TAG, "virtual display failed", e)
+                        AppLog.e("virtual display failed", e)
                         onFailed(e.message ?: "Screen capture failed")
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "encoder failed", e)
+                AppLog.e("encoder failed", e)
                 main.post { onFailed(e.message ?: "Screen capture failed") }
             }
         }
@@ -98,6 +102,8 @@ class ScreenEncoder(
     }
 
     fun requestKeyframe() {
+        logNextIdr = true
+        AppLog.i("encoder requesting an IDR")
         val bundle = Bundle()
         bundle.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
         handler.post { runCatching { codec?.setParameters(bundle) } }
@@ -124,7 +130,7 @@ class ScreenEncoder(
             encoder.configure(constrained, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             return encoder
         } catch (e: Exception) {
-            Log.w(TAG, "Constrained Baseline was refused; using the device AVC profile", e)
+            AppLog.e("Constrained Baseline was refused; using the device AVC profile", e)
             encoder.configure(format(constrained = false), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             return encoder
         }
@@ -137,13 +143,19 @@ class ScreenEncoder(
         format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
         format.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+        // API 29+. The codec itself puts SPS and PPS in front of each sync frame.
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            format.setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
+        }
         if (android.os.Build.VERSION.SDK_INT >= 30) {
             format.setInteger(MediaFormat.KEY_LATENCY, 0)
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
         }
         if (constrained) {
             format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedBaseline)
-            format.setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+            // Level 3.1 is only 720p. A phone picture is taller than that, and
+            // OpenH264 rejects a stream whose SPS level cannot hold the frame.
+            format.setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel5)
         }
         return format
     }
@@ -155,7 +167,7 @@ class ScreenEncoder(
             val index = try {
                 encoder.dequeueOutputBuffer(buffer, 20_000)
             } catch (e: Exception) {
-                Log.w(TAG, "encoder stopped", e)
+                AppLog.e("encoder stopped", e)
                 break
             }
             when {
@@ -173,10 +185,15 @@ class ScreenEncoder(
                         encoded.position(buffer.offset)
                         encoded.limit(buffer.offset + buffer.size)
                         encoded.get(bytes)
-                        val key = buffer.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
+                        val flagged = buffer.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
                         val started = System.nanoTime()
-                        val access = annex.frame(bytes, key)
+                        val access = annex.frame(bytes, flagged)
+                        val key = flagged || AnnexB.containsNal(access, AnnexB.IDR)
                         val us = ((System.nanoTime() - started) / 1000L).toInt().coerceAtLeast(0)
+                        if (key && logNextIdr) {
+                            logNextIdr = false
+                            AppLog.i("encoder IDR ${access.size} bytes sps=${AnnexB.containsNal(access, AnnexB.SPS)}")
+                        }
                         onFrame(access, width, height, key, us)
                     } else if (encoded != null && buffer.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                         val bytes = ByteArray(buffer.size)
@@ -199,8 +216,6 @@ class ScreenEncoder(
     }
 
     companion object {
-        private const val TAG = "PJDesk"
-
         /** Even dimensions, capped by the quality preset's max width. */
         fun fit(srcW: Int, srcH: Int, maxWidth: Int): Pair<Int, Int> {
             if (srcW <= 1 || srcH <= 1) return 2 to 2

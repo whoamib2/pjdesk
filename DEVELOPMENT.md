@@ -17,7 +17,7 @@ Repo: `https://github.com/whoamib2/pjdesk` (public). Site: `https://pjdesk.com`.
 ### What is LIVE right now
 | Thing | Where | Notes |
 |---|---|---|
-| **PJDesk server** | `pjdesk.spader.us:21200` (TCP signaling + UDP rendezvous/relay) | Windows service **`PJDeskServer`**, `C:\Program Files\PJDesk Server\pjdesk-server.exe`, data in `C:\ProgramData\PJDesk\server`. Real clients connect through it. |
+| **PJDesk server** | the address you sign in to (TCP signaling + UDP rendezvous/relay, port 21200) | Windows service **`PJDeskServer`**, `C:\Program Files\PJDesk Server\pjdesk-server.exe`, data in `C:\ProgramData\PJDesk\server`. Real clients connect through it. |
 | **Public download site** | `https://pjdesk.com` | GitHub Pages from the **`gh-pages`** branch (has `CNAME`). Porkbun DNS A‑records → GitHub Pages IPs. Currently serves the **0.2.0** installers. |
 | **Auto‑update feed** | GitHub Releases of `whoamib2/pjdesk` | The updater (`pjdesk-proto::update`) reads `releases/latest` and **silently installs any newer version as SYSTEM**. |
 | **Deployed client** | one machine (`benlenovodesk`), device ID `326 135 922` | Running "Build 1" (`pjdesk.exe` + two bundled MinGW DLLs — see §3). End‑to‑end connect to the live server is confirmed working. |
@@ -116,15 +116,15 @@ pjdesk/
 │   ├── main.rs                        # CLI (run | service | account | update | fingerprint)
 │   ├── server.rs                      # run(): TCP signaling + UDP rendezvous/relay; load_identity / read_identity; calls repair_data_dir
 │   ├── service.rs                     # Windows service "PJDeskServer" + repair_data_dir (icacls /reset)
-│   ├── gui.rs                         # management window (eframe): service control, fingerprint (read-only), accounts, registered computers, log
-│   ├── accounts.rs                    # user accounts (sign-in for address book)
+│   ├── gui.rs                         # management window (eframe): PJDesk account sign-in, service, fingerprint, devices, log
+│   ├── accounts.rs                    # older local accounts (optional). The server sign-in is the PJDesk account
 │   └── registry.rs                    # devices.json; Registry::load self-heals (empty on unreadable/corrupt)
 │
 ├── crates/pjdesk/src/                 # the client (bin: pjdesk) — host + controller + GUI
 │   ├── main.rs                        # CLI (default=GUI; host|connect|config|login|service|__session-host); ensure_console()
 │   ├── config.rs                      # client.json: server, server_fingerprint, device_id/secret, Settings, Account, saved passwords
 │   ├── secure.rs                      # DPAPI encrypt/decrypt (user-scoped) for secrets
-│   ├── service.rs                     # Windows service "PJDesk"; session-host via WTSQueryUserToken; UPDATE_TASK "PJDesk Update" (schtasks)
+│   ├── service.rs                     # Windows service "PJDesk"; session-host via WTSQueryUserToken; updates from the service (no schtasks)
 │   ├── platform.rs  syspaths.rs       # elevation (run_elevated), paths, service status file
 │   ├── p2p.rs  signaling.rs  session.rs  account.rs   # connection setup, signaling client, session auth, account login
 │   ├── gui/
@@ -142,7 +142,7 @@ pjdesk/
 │
 └── installer/
     ├── build.sh                       # builds both NSIS installers: installer/build.sh <version>
-    ├── pjdesk-client.nsi              # → PJDesk-Setup-<ver>.exe  (installs to C:\Program Files\PJDesk)
+    ├── pjdesk-client.nsi              # → PJDesk-Client-Setup-<ver>.exe (also copied to PJDesk-Setup-<ver>.exe)
     └── pjdesk-server.nsi              # → PJDesk-Server-Setup-<ver>.exe (installs to C:\Program Files\PJDesk Server)
 ```
 
@@ -154,8 +154,8 @@ pjdesk/
 | Data dir | `C:\ProgramData\PJDesk\service` (service `client.json`) | `C:\ProgramData\PJDesk\server` |
 | GUI config | `%APPDATA%\PJDesk\client.json` | — |
 | Data files | `client.json` | `server-cert.pem`, `server-key.pem`, `devices.json`, `accounts.json`, `server.log` |
-| Firewall rule | `PJDesk` | `PJDesk Server` (TCP+UDP 21200) |
-| Update task | schtasks `PJDesk Update` (SYSTEM) | via installer / `pjdesk-server update` |
+| Firewall rule | `PJDesk`, plus `PJDesk LAN` (UDP 21201) | `PJDesk Server` (TCP+UDP 21200) |
+| Updates | PJDesk service, every 30 minutes. No scheduled task. | PJDesk Server service. No scheduled task. |
 
 ---
 
@@ -245,10 +245,9 @@ force‑update + per‑client version display.
 4. **Publish the release (production push — test on ONE client first):**
    `gh release create v0.3.0 installer/PJDesk-Setup-0.3.0.exe installer/PJDesk-Server-Setup-0.3.0.exe installer/SHA256SUMS -t "PJDesk 0.3.0" -n "<notes>"`,
    then update the `pjdesk.com` (`gh-pages`) download page to 0.3.0.
-5. **Switch auto‑update to every 30 min:** in `crates/pjdesk/src/service.rs`
-   `set_update_task`, change the schtasks schedule from `/SC DAILY /ST 03:00` to
-   `/SC MINUTE /MO 30`; mirror for the server and in the `.nsi` installers. Confirm
-   a client actually pulls 0.3.0 from the release.
+5. **Automatic updates** are the PJDesk service, about every 30 minutes. There is
+   no scheduled task. Confirm a client pulls the release when **Check for updates now**
+   is used, or when the service's own check runs.
 
 *(After the pipeline: server‑side **force‑update** + **per‑client version** display
 in the server window; then Build 2 = clipboard sync + multi‑monitor tabs; then UI
@@ -276,8 +275,8 @@ in the server window; then Build 2 = clipboard sync + multi‑monitor tabs; then
   `whoamib2/pjdesk` (releases **and** the `gh-pages` branch).
 
 ### Networking
-- Server listens on **TCP + UDP 21200** (`DEFAULT_PORT`). The public endpoint
-  `pjdesk.spader.us:21200` must resolve to the server host and have **both** TCP
+- Server listens on **TCP + UDP 21200** (`DEFAULT_PORT`). The name you set on
+  pjdesk.com → Account → My network must resolve to the server host and have **both** TCP
   and UDP 21200 port‑forwarded/allowed (firewall rule `PJDesk Server`).
 - Clients reach GitHub directly over HTTPS for updates
   (`https://api.github.com/repos/whoamib2/pjdesk/releases/latest` + asset
@@ -293,10 +292,11 @@ in the server window; then Build 2 = clipboard sync + multi‑monitor tabs; then
 ### Release contract (what the auto‑updater requires)
 A GitHub Release whose **tag** parses to a version **higher** than installed
 (e.g. `v0.3.0`), containing assets named:
-- `PJDesk-Setup-<ver>.exe` (client installer, NSIS, supports `/S`)
+- `PJDesk-Client-Setup-<ver>.exe` (client installer, NSIS, supports `/S`)
+- `PJDesk-Setup-<ver>.exe` (the same bytes; installed 0.5.x and 0.6.x clients look up this name)
 - `PJDesk-Server-Setup-<ver>.exe` (server installer)
 - `SHA256SUMS` (lines `"<sha256>  <filename>"`; the updater verifies the installer
-  it downloads against this).
+  it downloads against this). Both client filenames are listed, with the same hash.
 Miss the naming or the checksum and auto‑update silently no‑ops or fails.
 
 ---

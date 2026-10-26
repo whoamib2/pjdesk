@@ -8,6 +8,7 @@
     servers: ["Servers & devices", "Servers that published a health record, plus account sign-ins."],
     plans: ["Plans", "Free is the default. Cloud Sync is the only paid-style switch the site offers. There is no price list."],
     audit: ["Audit log", "Who changed a plan, and what it was before."],
+    network: ["My network", "Read-only. Manage servers, keys, and members on Account."],
   };
 
   const fixture = {
@@ -32,7 +33,7 @@
       { at: 1728000000, actor: "ben@spader.us", email: "ada@example.com", old_plan: "free", new_plan: "cloud", expires_at: 1893456000, note: "Annual" },
       { at: 1727000000, actor: "expiry", email: "old@example.com", old_plan: "cloud", new_plan: "free", expires_at: 1727000000, note: "Cloud Sync grant expired" },
     ],
-    latest: "0.5.2",
+    latest: "0.5.2"
   };
 
   let accounts = [];
@@ -75,6 +76,7 @@
     if (page === "servers") renderServers();
     if (page === "plans") renderPlans();
     if (page === "audit") renderAudit();
+    if (page === "network") renderNetwork();
   }
 
   async function loadJson(path, fallback) {
@@ -464,6 +466,10 @@
     ev.preventDefault();
     if (pending) sendGrant(pending);
   });
+
+  function renderNetwork() {
+    PJNetwork.render($("network"), { preview, readonly: true });
+  }
 
   async function boot() {
     if (!preview && !PJ.token()) { location.href = "/account/"; return; }

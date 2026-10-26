@@ -214,5 +214,6 @@ mod tests {
             !server.contains("Exec '\"$INSTDIR\\${EXE}\" --tray'"),
             "the installer must not start the tray as itself"
         );
+        assert!(!client.to_ascii_lowercase().contains("appdata"), "the client installer touches the saved sign-in");
     }
 }

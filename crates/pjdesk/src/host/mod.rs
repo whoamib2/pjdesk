@@ -5,16 +5,19 @@ mod ctrl;
 pub(crate) mod direct;
 mod encoder;
 mod input;
+pub(crate) mod notice;
 mod stream;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
 use pjdesk_proto::auth::generate_password;
+use pjdesk_proto::framing::write_msg;
+use pjdesk_proto::peer::HostMsg;
 use pjdesk_proto::signal::{ClientMsg, ErrorCode, Policy, ServerMsg, SessionId};
 use pjdesk_proto::tls::TlsIdentity;
 use pjdesk_proto::udp::Role;
@@ -25,8 +28,12 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use pjdesk_link::admit::{self, Admit};
+use pjdesk_link::lockout::{self, Lockout};
+use pjdesk_link::session::{grant_auth, refuse_auth, refuse_before_password, NeedsApproval};
+
 use crate::config::Config;
-use crate::session::{self, Authenticated, WrongPassword};
+use crate::session::{self, Authenticated, LockedOut, WrongPassword};
 use crate::signaling::{ServerAddr, SignalClient};
 use crate::{p2p, HostArgs};
 
@@ -41,10 +48,22 @@ pub struct HostShared {
     pub online: AtomicBool,
     /// Round-trip of the last server ping, in milliseconds. 0 until the first reply.
     pub rtt_ms: AtomicU64,
+    /// Unix time of the last Register or Pong. 0 when this computer is not registered.
+    pub acked_unix: AtomicU64,
+    /// Server address the last registration targeted.
+    pub server: Mutex<String>,
+    /// `LAN` or `Internet` once the signaling connection is up.
+    pub reach: Mutex<String>,
     /// This device's ID once registered.
     pub id: Mutex<Option<String>>,
     /// The password a controller must enter right now.
     pub password: Mutex<String>,
+    /// Temporary 8-digit support code. Shown with [`Self::support_password`].
+    pub support_code: Mutex<String>,
+    /// Temporary password that matches the support code. Not the permanent one.
+    pub support_password: Mutex<String>,
+    /// Unix time the current support pair was created. 0 until the first pair.
+    pub support_born: AtomicU64,
     /// Name of the controller currently connected, if any.
     pub connected: Mutex<Option<String>>,
     /// Last error worth showing the user (e.g. can't reach the server).
@@ -55,6 +74,8 @@ pub struct HostShared {
     set_password: Mutex<Option<String>>,
     /// UI → host: pick a fresh random password.
     regenerate: AtomicBool,
+    /// UI → host: replace the support code and its temporary password.
+    refresh_support: AtomicBool,
     /// UI → host: stop hosting and return (e.g. the server changed).
     stop: AtomicBool,
     /// A connection waiting for the person at this computer to accept it.
@@ -92,6 +113,27 @@ pub struct ConsentReply {
     pub receive_dir: String,
 }
 
+/// `Some` when this connection landed on the account's standby instead of the
+/// server in the registration target. The caller reconnects on the public path.
+async fn landed_on_standby(config: &Config, primary: &ServerAddr, connected: SocketAddr) -> Option<String> {
+    let text = config.network_standby.clone().unwrap_or_default();
+    let Ok(standby) = ServerAddr::parse(&text) else {
+        return None;
+    };
+    let Ok(resolved) = standby.resolve().await else {
+        return None;
+    };
+    if crate::signaling::reached_standby(connected, primary, &standby, resolved) {
+        Some(format!("that address is the standby at {standby}; connecting to the primary"))
+    } else {
+        None
+    }
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 impl HostShared {
     pub fn id(&self) -> Option<String> {
         self.id.lock().unwrap().clone()
@@ -108,8 +150,25 @@ impl HostShared {
     pub fn is_online(&self) -> bool {
         self.online.load(Ordering::SeqCst)
     }
+    pub fn note_ack(&self) {
+        self.acked_unix.store(unix_secs(), Ordering::SeqCst);
+    }
+    pub fn clear_registration(&self) {
+        self.online.store(false, Ordering::SeqCst);
+        self.acked_unix.store(0, Ordering::SeqCst);
+    }
+    /// Online only when the server has acked within [`pjdesk_proto::REGISTRATION_ACK_SECS`].
+    pub fn acked_recently(&self) -> bool {
+        pjdesk_proto::registration_acked(self.is_online(), self.acked_unix.load(Ordering::SeqCst), unix_secs())
+    }
+    pub fn server(&self) -> String {
+        self.server.lock().unwrap().clone()
+    }
     pub fn rtt_ms(&self) -> u64 {
         self.rtt_ms.load(Ordering::Relaxed)
+    }
+    pub fn reach(&self) -> String {
+        self.reach.lock().unwrap().clone()
     }
     pub fn permanent_set(&self) -> bool {
         self.permanent_set.load(Ordering::SeqCst)
@@ -117,6 +176,18 @@ impl HostShared {
     /// Request a fresh random password.
     pub fn request_regenerate(&self) {
         self.regenerate.store(true, Ordering::SeqCst);
+    }
+    pub fn request_support_refresh(&self) {
+        self.refresh_support.store(true, Ordering::SeqCst);
+    }
+    pub fn support_code(&self) -> String {
+        self.support_code.lock().unwrap().clone()
+    }
+    pub fn support_password(&self) -> String {
+        self.support_password.lock().unwrap().clone()
+    }
+    pub fn support_born(&self) -> u64 {
+        self.support_born.load(Ordering::SeqCst)
     }
     /// Ask the host loop to stop (used before restarting with new settings).
     pub fn request_stop(&self) {
@@ -147,6 +218,28 @@ impl HostShared {
         if slot.as_ref().is_some_and(|c| c.id == id) {
             *slot = None;
         }
+    }
+
+    pub fn pending_consent(&self) -> Option<ConsentAsk> {
+        self.consent.lock().unwrap().clone()
+    }
+
+    /// The window's Allow or Decline. `offered` bits are granted on Allow.
+    pub fn answer_consent(&self, id: u64, accept: bool) {
+        let offered = self
+            .consent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|ask| ask.id == id)
+            .map(|ask| ask.offered)
+            .unwrap_or(pjdesk_proto::perms::KEYBOARD | pjdesk_proto::perms::MOUSE);
+        *self.consent_reply.lock().unwrap() = Some(ConsentReply {
+            id,
+            accept,
+            permissions: if accept { offered } else { 0 },
+            receive_dir: String::new(),
+        });
     }
 
     pub fn push_chat(&self, from_me: bool, text: &str) {
@@ -185,7 +278,6 @@ impl HostShared {
             lines.drain(0..n);
         }
     }
-
 }
 
 /// Connection requests that may be in setup at once. Only an authenticated
@@ -202,6 +294,12 @@ pub(crate) struct HostState {
     /// An optional permanent password that also authenticates, when the user
     /// has set one. Both this and the one-time password let a controller in.
     permanent: Mutex<Option<String>>,
+    /// Temporary 8-digit code shown as "Let someone connect".
+    support_code: Mutex<String>,
+    /// Temporary password that matches the support code. Not the permanent one.
+    support_password: Mutex<String>,
+    /// When the current support pair was created.
+    support_born: Mutex<Instant>,
     /// An authenticated controller is connected.
     streaming: AtomicBool,
     /// Sessions being set up (not yet authenticated).
@@ -210,7 +308,9 @@ pub(crate) struct HostState {
     peer_info_routes: Mutex<HashMap<SessionId, mpsc::UnboundedSender<ServerMsg>>>,
     /// Permission ceiling and receive folder chosen when the session was approved.
     ceilings: Mutex<HashMap<SessionId, (u32, String)>>,
-    failures: Mutex<Failures>,
+    lockout: Mutex<Lockout>,
+    /// Wrong passwords since the one-time password last changed.
+    otp_misses: AtomicUsize,
     args: HostArgs,
     name: String,
     /// Optional status channel to a GUI/supervisor.
@@ -221,9 +321,54 @@ pub(crate) struct HostState {
     server_proto: AtomicU16,
     /// This computer's ID, once the server has assigned it (also used by LAN beacons).
     device_id: Mutex<String>,
+    /// Refresh token and key id for the connection log. Absent when this computer
+    /// has no support key. The digits are not here.
+    support_log: Mutex<Option<SupportLog>>,
+}
+
+#[derive(Clone)]
+struct SupportLog {
+    #[allow(dead_code)]
+    key_id: String,
+    refresh: String,
+    device_id: String,
+    pjdesk_id: String,
 }
 
 impl HostState {
+    fn remember_support(&self, config: &crate::config::Config) {
+        let grant = config.support_grant.as_ref();
+        let next = grant.and_then(|grant| {
+            if grant.key_id.trim().is_empty() {
+                return None;
+            }
+            let refresh = config.network_refresh_token();
+            if refresh.is_empty() {
+                return None;
+            }
+            Some(SupportLog {
+                key_id: grant.key_id.clone(),
+                refresh,
+                device_id: config.network_device_id.clone().unwrap_or_default(),
+                pjdesk_id: config.device_id.clone().unwrap_or_default(),
+            })
+        });
+        *self.support_log.lock().unwrap() = next;
+    }
+
+    fn note_support_connection(&self, via_server: bool, from_name: &str) {
+        if !via_server {
+            return;
+        }
+        let Some(log) = self.support_log.lock().unwrap().clone() else { return };
+        let from_name = from_name.trim().to_string();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::support_keys::log_connection(&log.refresh, &log.device_id, &log.pjdesk_id, &from_name) {
+                debug!("support connection was not logged: {e}");
+            }
+        });
+    }
+
     /// Publishes the current password to the UI handle, if any.
     fn publish_password(&self) {
         if let Some(shared) = &self.shared {
@@ -232,8 +377,8 @@ impl HostState {
         }
     }
 
-    /// The passwords a controller may authenticate with: the one-time password
-    /// and, if set, the permanent one (either grants access).
+    /// The passwords a controller may authenticate with: the one-time password,
+    /// the permanent one when set, and the temporary support password.
     fn auth_passwords(&self) -> Vec<String> {
         let mut pws = vec![self.password.lock().unwrap().clone()];
         if let Some(p) = self.permanent.lock().unwrap().clone() {
@@ -241,7 +386,40 @@ impl HostState {
                 pws.push(p);
             }
         }
+        let support = self.support_password.lock().unwrap().clone();
+        if !support.trim().is_empty() && !pws.contains(&support) {
+            pws.push(support);
+        }
         pws
+    }
+
+    /// A new support code and a new temporary password. The permanent password
+    /// is left alone. The digits and the password stay in memory.
+    fn fresh_support(&self) {
+        *self.support_code.lock().unwrap() = pjdesk_proto::random_digits(8);
+        *self.support_password.lock().unwrap() = generate_password();
+        *self.support_born.lock().unwrap() = Instant::now();
+        self.publish_support();
+    }
+
+    fn publish_support(&self) {
+        let Some(shared) = &self.shared else { return };
+        *shared.support_code.lock().unwrap() = self.support_code.lock().unwrap().clone();
+        *shared.support_password.lock().unwrap() = self.support_password.lock().unwrap().clone();
+        let unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        shared.support_born.store(unix, Ordering::SeqCst);
+    }
+
+    /// Replaces a support pair that sat unused for 10 minutes. A live session
+    /// keeps the pair that opened it.
+    fn maybe_expire_support(&self) {
+        if self.streaming.load(Ordering::SeqCst) {
+            return;
+        }
+        let born = *self.support_born.lock().unwrap();
+        if born.elapsed() >= Duration::from_secs(10 * 60) {
+            self.fresh_support();
+        }
     }
 
     /// Applies any password change the UI asked for (regenerate or set).
@@ -261,17 +439,18 @@ impl HostState {
         if changed {
             self.publish_password();
         }
+        if shared.refresh_support.swap(false, Ordering::SeqCst) {
+            self.fresh_support();
+        } else {
+            self.maybe_expire_support();
+        }
     }
-}
-
-#[derive(Default)]
-struct Failures {
-    count: u32,
-    locked_until: Option<Instant>,
 }
 
 impl HostState {
     /// Why a new session can't be accepted right now, if it can't.
+    /// A password lockout is not one of these: the controller still connects
+    /// and is told how long to wait.
     fn refuse_reason(&self) -> Option<String> {
         if self.streaming.load(Ordering::SeqCst) {
             return Some("this computer is already in a remote session".into());
@@ -279,38 +458,39 @@ impl HostState {
         if self.pending.load(Ordering::SeqCst) >= MAX_PENDING {
             return Some("too many connection attempts in progress; try again shortly".into());
         }
-        let failures = self.failures.lock().unwrap();
-        match failures.locked_until {
-            Some(until) if Instant::now() < until => {
-                Some("too many wrong passwords; try again in a few minutes".into())
-            }
-            _ => None,
-        }
+        None
     }
 
-    /// Counts a wrong password. The one-time password is replaced every three
-    /// misses (so an overheard or guessed one stops working); if a permanent
-    /// password is also set, five misses lock out new sessions for five
-    /// minutes to slow brute-forcing it.
-    fn record_failure(&self) {
-        let has_permanent = self.permanent.lock().unwrap().is_some();
-        let mut failures = self.failures.lock().unwrap();
-        failures.count += 1;
-        let rotate = failures.count % 3 == 0;
-        if has_permanent && failures.count >= 5 {
-            failures.count = 0;
-            failures.locked_until = Some(Instant::now() + Duration::from_secs(5 * 60));
-            warn!("Too many wrong passwords; refusing connections for five minutes");
-        }
-        drop(failures);
-        if rotate {
+    /// Counts a wrong password. Returns the text to send the controller.
+    fn note_wrong_password(&self, source: &str) -> String {
+        let status = self.lockout.lock().unwrap().fail(source, Instant::now());
+        let misses = self.otp_misses.fetch_add(1, Ordering::SeqCst) + 1;
+        if misses % 3 == 0 {
             *self.password.lock().unwrap() = generate_password();
             self.publish_password();
         }
+        if status.locked {
+            self.log_lock(source, &status);
+            lockout::message(status.minutes)
+        } else {
+            "wrong password".into()
+        }
     }
 
-    fn reset_failures(&self) {
-        self.failures.lock().unwrap().count = 0;
+    fn note_success(&self, source: &str) {
+        self.lockout.lock().unwrap().succeed(source);
+        self.otp_misses.store(0, Ordering::SeqCst);
+    }
+
+    fn log_lock(&self, source: &str, status: &lockout::Status) {
+        if !status.fresh {
+            return;
+        }
+        if status.global {
+            warn!("Locked out all connections for {} minutes after repeated wrong passwords", status.minutes);
+        } else {
+            warn!("Locked out {source} for {} minutes after repeated wrong passwords", status.minutes);
+        }
     }
 }
 
@@ -322,7 +502,7 @@ pub fn run(server: ServerAddr, config: Config, args: HostArgs) -> Result<()> {
 /// Like [`run`], but reports status to (and takes password changes from) a GUI.
 pub fn run_with(server: ServerAddr, config: Config, args: HostArgs, shared: Option<Arc<HostShared>>) -> Result<()> {
     platform_init();
-    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     runtime.block_on(host_main(server, config, args, shared))
 }
 
@@ -336,17 +516,22 @@ async fn host_main(
         identity: TlsIdentity::generate(PEER_SERVER_NAME)?,
         password: Mutex::new(generate_password()),
         permanent: Mutex::new(args.permanent_password.clone().filter(|p| !p.trim().is_empty())),
+        support_code: Mutex::new(String::new()),
+        support_password: Mutex::new(String::new()),
+        support_born: Mutex::new(Instant::now()),
         streaming: AtomicBool::new(false),
         pending: AtomicUsize::new(0),
         peer_info_routes: Mutex::new(HashMap::new()),
         ceilings: Mutex::new(HashMap::new()),
-        failures: Mutex::new(Failures::default()),
+        lockout: Mutex::new(Lockout::default()),
+        otp_misses: AtomicUsize::new(0),
         name: crate::hostname(),
         args: args.clone(),
         shared: shared.clone(),
         policy: Mutex::new(Policy::default()),
         server_proto: AtomicU16::new(pjdesk_proto::PROTOCOL_VERSION),
         device_id: Mutex::new(String::new()),
+        support_log: Mutex::new(None),
     });
     if args.allow_direct {
         let direct = state.clone();
@@ -357,56 +542,221 @@ async fn host_main(
         });
     }
     state.publish_password();
+    state.fresh_support();
 
-    let mut delay = Duration::from_secs(2);
+    let mut delay = Duration::from_secs(1);
+    let mut force_refresh = false;
+    let mut public_only = false;
+    let mut use_standby = false;
+    let mut fast_tries = 0u32;
+    let role = if args.service_host { "service" } else { "window" };
     loop {
         if state.shared.as_ref().is_some_and(|s| s.stopping()) {
             return Ok(());
         }
-        let outcome = signaling_loop(&server, &mut config, &state).await;
-        if let Some(shared) = &state.shared {
-            shared.online.store(false, Ordering::SeqCst);
-            *shared.connected.lock().unwrap() = None;
-            if shared.stopping() {
+        let outcome = signaling_loop(&server, &mut config, &state, force_refresh, public_only, use_standby).await;
+        force_refresh = true;
+        if state.shared.as_ref().is_some_and(|s| s.stopping()) {
+            if let Some(shared) = &state.shared {
+                shared.clear_registration();
+            }
+            return Ok(());
+        }
+        let has_standby = config.network_standby.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let fail = match &outcome {
+            Ok(SignalEnd::Stop) => {
+                if let Some(shared) = &state.shared {
+                    shared.clear_registration();
+                }
                 return Ok(());
             }
-        }
-        match outcome {
-            Ok(()) => delay = Duration::from_secs(2),
+            Ok(SignalEnd::Again) => None,
+            Ok(SignalEnd::Lost) => Some(pjdesk_proto::failover::RegFail::Unreachable),
             Err(e) if format!("{e:#}").contains("SERVER KEY MISMATCH") => {
                 if let Some(shared) = &state.shared {
+                    shared.clear_registration();
                     *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
                 }
-                return Err(e);
+                info!("This computer is not registered ({role}). {e:#}");
+                return Err(anyhow::anyhow!("{e:#}"));
             }
-            Err(e) => {
-                warn!("{e:#}");
+            Err(e) if pjdesk_proto::signal::is_standby_refusal(&format!("{e:#}")) => {
+                info!("This computer is not registered ({role}). {e:#}");
                 if let Some(shared) = &state.shared {
                     *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
                 }
+                Some(pjdesk_proto::failover::RegFail::StillStandby)
             }
+            Err(e) => {
+                info!("This computer is not registered ({role}). {e:#}");
+                if let Some(shared) = &state.shared {
+                    *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
+                }
+                Some(pjdesk_proto::failover::RegFail::Unreachable)
+            }
+        };
+        let streaming = state.streaming.load(Ordering::SeqCst);
+        if streaming && matches!(fail, Some(pjdesk_proto::failover::RegFail::Unreachable)) {
+            info!(
+                "rendezvous connection lost; a direct, LAN, or hole-punched session keeps running. A relayed session reconnects on its own."
+            );
         }
-        info!("Reconnecting to the server in {} s...", delay.as_secs());
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_secs(30));
+        let mut advance = false;
+        if let Some(kind) = fail {
+            let hop = pjdesk_proto::failover::next_register(kind, use_standby, has_standby, fast_tries, delay);
+            let keep = pjdesk_proto::failover::keep_saved_status(
+                has_standby,
+                state.shared.as_ref().is_some_and(|s| s.acked_recently()),
+            );
+            if let Some(shared) = &state.shared {
+                if !keep {
+                    shared.clear_registration();
+                }
+                *shared.connected.lock().unwrap() = None;
+                *shared.reach.lock().unwrap() = String::new();
+            }
+            if !hop.log.is_empty() {
+                let where_next = if hop.use_standby {
+                    config.network_standby.clone().unwrap_or_default()
+                } else {
+                    config.effective_server()
+                };
+                info!("failover: {} {where_next}", hop.log);
+            }
+            use_standby = hop.use_standby;
+            public_only = hop.use_standby || kind == pjdesk_proto::failover::RegFail::StillStandby;
+            delay = hop.delay;
+            advance = hop.advance_backoff;
+            if advance {
+                fast_tries = pjdesk_proto::failover::FAST_REGISTER_TRIES;
+            } else {
+                fast_tries = fast_tries.saturating_add(1);
+            }
+        } else {
+            public_only = false;
+            fast_tries = 0;
+            delay = Duration::from_secs(1);
+        }
+        let pause = pjdesk_proto::signal::jitter_reconnect(delay);
+        info!("Reconnecting to the server in {:.1} s...", pause.as_secs_f32());
+        tokio::time::sleep(pause).await;
+        if advance {
+            delay = pjdesk_proto::signal::next_reconnect_delay(delay);
+        }
     }
+}
+
+enum SignalEnd {
+    Stop,
+    /// Register again with the same server. The access key changed.
+    Again,
+    /// The server stopped answering.
+    Lost,
 }
 
 /// One signaling connection: register, then handle incoming sessions.
 /// Returns `Ok` if we were registered before the connection dropped.
-async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<HostState>) -> Result<()> {
-    let mut signal = SignalClient::connect(server, config).await?;
+async fn signaling_loop(
+    server: &ServerAddr,
+    config: &mut Config,
+    state: &Arc<HostState>,
+    force_refresh: bool,
+    public_only: bool,
+    use_standby: bool,
+) -> Result<SignalEnd> {
+    tokio::task::spawn_blocking({
+        let mut copy = config.clone();
+        move || {
+            if force_refresh {
+                crate::network::refresh_config_now(&mut copy);
+            } else {
+                crate::network::refresh_config(&mut copy);
+            }
+            copy
+        }
+    })
+    .await
+    .ok()
+    .map(|refreshed| {
+        config.network_access = refreshed.network_access;
+        config.network_access_exp = refreshed.network_access_exp;
+        config.network_refresh = refreshed.network_refresh;
+        config.network_email = refreshed.network_email;
+        config.server = refreshed.server;
+        config.server_fingerprint = refreshed.server_fingerprint;
+        config.network_lan = refreshed.network_lan;
+        config.network_public_ip = refreshed.network_public_ip;
+        config.network_standby = refreshed.network_standby;
+        config.network_standby_fingerprint = refreshed.network_standby_fingerprint;
+    });
+    let _ = config.reload_access_key();
+    state.remember_support(config);
+    let standby_text = config.network_standby.clone().unwrap_or_default();
+    let server = if use_standby {
+        ServerAddr::parse(standby_text.trim()).unwrap_or_else(|_| {
+            ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone())
+        })
+    } else {
+        ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone())
+    };
+    let role = if state.args.service_host { "service" } else { "window" };
+    let key = config
+        .server_fingerprint
+        .as_deref()
+        .map(pjdesk_proto::discover::fingerprint_prefix)
+        .unwrap_or_else(|| "unpinned".into());
+    info!(
+        "Registration target ({role}): {server}, key {key}, {}",
+        if use_standby {
+            "standby address"
+        } else if public_only {
+            "public address only"
+        } else {
+            "LAN or public"
+        }
+    );
+    let token = config.presented_access();
+    let access_key = pjdesk_proto::access::is_access_key(&token);
+    let mut signal = SignalClient::connect_mode(&server, config, public_only || use_standby).await?;
+    if !use_standby {
+        if let Some(reason) = landed_on_standby(config, &server, signal.server_addr).await {
+            warn!(
+                "Registration target {server} reached {} via {} ({role}), key {key}; {reason}",
+                signal.server_addr, signal.via
+            );
+            bail!(pjdesk_proto::signal::STANDBY_REGISTRATION);
+        }
+    }
+    if !token.is_empty() {
+        let _ = signal.send(ClientMsg::PresentAccess { token: token.clone() });
+    }
     let device_secret = config.device_secret()?;
     let register_proto = state.server_proto.load(Ordering::SeqCst);
-    signal.send(ClientMsg::Register {
+    let register = ClientMsg::Register {
         proto: register_proto,
         device_id: config.device_id.clone(),
         device_secret,
         hostname: state.name.clone(),
         app_version: env!("CARGO_PKG_VERSION").into(),
-    })?;
+    };
+    signal.send(register.clone())?;
 
-    let device_id = match timeout(Duration::from_secs(10), signal.recv()).await {
+    let first = timeout(Duration::from_secs(10), signal.recv()).await;
+    let device_id = match first {
+        Ok(None) if !token.is_empty() && !access_key => {
+            // A server from before 0.6.0 cannot decode PresentAccess and drops
+            // the socket. Try once without the token so this computer stays online.
+            // An access key is not retried without: the server asked for it.
+            signal = SignalClient::connect_mode(&server, config, public_only || use_standby).await?;
+            if !use_standby && landed_on_standby(config, &server, signal.server_addr).await.is_some() {
+                bail!(pjdesk_proto::signal::STANDBY_REGISTRATION);
+            }
+            signal.send(register)?;
+            timeout(Duration::from_secs(10), signal.recv()).await
+        }
+        other => other,
+    };
+    let device_id = match device_id {
         Ok(Some(ServerMsg::Registered { device_id })) => device_id,
         Ok(Some(ServerMsg::Error { code: ErrorCode::IdConflict, message })) => {
             config.device_id = None;
@@ -414,6 +764,18 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
             bail!("{message}; a new ID will be requested");
         }
         Ok(Some(ServerMsg::Error { message, .. })) => {
+            if pjdesk_proto::signal::is_standby_refusal(&message) {
+                let key = config
+                    .server_fingerprint
+                    .as_deref()
+                    .map(pjdesk_proto::discover::fingerprint_prefix)
+                    .unwrap_or_else(|| "unpinned".into());
+                warn!(
+                    "Registration refused by the standby at {server} via {} ({}), key {key}; connecting to the primary",
+                    signal.via, signal.server_addr
+                );
+                bail!("{message}");
+            }
             if pjdesk_proto::version_rejected(&message) && register_proto > pjdesk_proto::MIN_PROTOCOL_VERSION {
                 state.server_proto.store(pjdesk_proto::MIN_PROTOCOL_VERSION, Ordering::SeqCst);
                 bail!("the server speaks an older protocol; reconnecting");
@@ -429,46 +791,80 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
         config.device_id = Some(device_id.clone());
         config.save()?;
     }
+    state.remember_support(config);
     let has_permanent = state.permanent.lock().unwrap().is_some();
-    print_banner(&device_id, &state.password.lock().unwrap(), has_permanent, server);
+    print_banner(&device_id, &state.password.lock().unwrap(), has_permanent, &server);
     crate::HOST_ONLINE.store(true, Ordering::SeqCst);
+    info!(
+        "Server ack: registered {} ({role}) with {server} via {} ({}), key {key}",
+        format_id(&device_id),
+        signal.via,
+        signal.server_addr
+    );
     if let Some(shared) = &state.shared {
         *shared.id.lock().unwrap() = Some(device_id.clone());
         *shared.last_error.lock().unwrap() = None;
+        *shared.reach.lock().unwrap() = signal.via.to_string();
+        *shared.server.lock().unwrap() = server.to_string();
         shared.online.store(true, Ordering::SeqCst);
+        shared.note_ack();
     }
     state.publish_password();
 
     let server_ip = signal.server_addr.ip();
-    let mut ping = tokio::time::interval(Duration::from_secs(25));
+    let mut ping = tokio::time::interval(Duration::from_secs(10));
     ping.tick().await;
     let mut ui_tick = tokio::time::interval(Duration::from_millis(300));
+    let mut report_host = false;
+    let mut since_report = 0u32;
     // The server answers every ping. If it goes quiet (its computer died, or
     // DNS now points to a backup server), reconnect, which looks the server's
     // name up again.
     let mut last_heard = std::time::Instant::now();
     let mut ping_at: Option<Instant> = None;
+    let mut awaiting_pong = false;
+    let mut heartbeats = 0u32;
 
     loop {
         tokio::select! {
             _ = ui_tick.tick() => {
                 if state.shared.as_ref().is_some_and(|s| s.stopping()) {
-                    return Ok(());
+                    return Ok(SignalEnd::Stop);
                 }
                 state.apply_ui_requests();
             }
             _ = ping.tick() => {
-                if last_heard.elapsed() > Duration::from_secs(70) {
-                    warn!("No reply from the server for over a minute; reconnecting");
-                    return Ok(());
+                if awaiting_pong {
+                    warn!(
+                        "Heartbeat missed ({role}) from {server} via {} ({}); no pong since the last ping. Reconnecting",
+                        signal.via, signal.server_addr
+                    );
+                    return Ok(SignalEnd::Lost);
+                }
+                if last_heard.elapsed() >= Duration::from_secs(30) {
+                    warn!("No reply from the server for 30 s ({role}); reconnecting");
+                    return Ok(SignalEnd::Lost);
+                }
+                if config.reload_access_key() {
+                    tracing::info!("The access key changed; registering again");
+                    return Ok(SignalEnd::Again);
                 }
                 signal.send(ClientMsg::Ping)?;
+                awaiting_pong = true;
                 ping_at = Some(Instant::now());
+                if report_host {
+                    since_report += 1;
+                    if since_report >= 5 {
+                        since_report = 0;
+                        signal.send(crate::hostfacts::report())?;
+                        signal.send(crate::hostfacts::display_name_report())?;
+                    }
+                }
             }
             msg = signal.recv() => {
                 let Some(msg) = msg else {
-                    warn!("Lost the connection to the server");
-                    return Ok(());
+                    warn!("Lost the connection to the server ({role}); reconnecting");
+                    return Ok(SignalEnd::Lost);
                 };
                 last_heard = std::time::Instant::now();
                 match msg {
@@ -478,21 +874,11 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                             signal.send(ClientMsg::SessionResponse { session_id, accept: false, reason })?;
                             continue;
                         }
-                        let approved = match approve(state, &controller_name, &controller_ip).await {
-                            Some(bits) => bits,
-                            None => {
-                                info!("Declined connection from \"{controller_name}\" ({controller_ip})");
-                                signal.send(ClientMsg::SessionResponse {
-                                    session_id,
-                                    accept: false,
-                                    reason: "the person at this computer declined".into(),
-                                })?;
-                                continue;
-                            }
-                        };
+                        // Accept the signaling session before any Allow prompt so the
+                        // controller can offer a password. The prompt, if one is
+                        // needed, happens after that password is checked.
                         state.pending.fetch_add(1, Ordering::SeqCst);
                         signal.send(ClientMsg::SessionResponse { session_id, accept: true, reason: String::new() })?;
-                        state.ceilings.lock().unwrap().insert(session_id, approved);
                         let (tx, rx) = mpsc::unbounded_channel();
                         state.peer_info_routes.lock().unwrap().insert(session_id, tx);
                         let server_udp = SocketAddr::new(server_ip, udp_port);
@@ -517,22 +903,33 @@ async fn signaling_loop(server: &ServerAddr, config: &mut Config, state: &Arc<Ho
                         *state.policy.lock().unwrap() = policy;
                     }
                     ServerMsg::Pong => {
-                        if let Some(sent) = ping_at.take() {
-                            if let Some(shared) = &state.shared {
-                                shared.rtt_ms.store(sent.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        awaiting_pong = false;
+                        heartbeats = heartbeats.saturating_add(1);
+                        let rtt = ping_at.take().map(|sent| sent.elapsed().as_millis() as u64).unwrap_or(0);
+                        if let Some(shared) = &state.shared {
+                            if rtt > 0 {
+                                shared.rtt_ms.store(rtt, Ordering::Relaxed);
                             }
+                            shared.note_ack();
+                        }
+                        if heartbeats == 1 || heartbeats % 6 == 0 {
+                            info!(
+                                "Heartbeat from {server} via {} ({}) ({role}), {} ms",
+                                signal.via, signal.server_addr, rtt
+                            );
                         }
                     }
                     ServerMsg::UpdateNow => {
-                        info!("Server requested an update; running the update task now");
-                        #[cfg(windows)]
-                        {
-                            use std::os::windows::process::CommandExt;
-                            let _ = std::process::Command::new("schtasks")
-                                .args(["/Run", "/TN", crate::service::UPDATE_TASK])
-                                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-                                .spawn();
+                        info!("Server asked this computer to update now");
+                        if !crate::client_update::start() {
+                            info!("An update is already running");
                         }
+                    }
+                    ServerMsg::WantHostReport => {
+                        report_host = true;
+                        since_report = 0;
+                        signal.send(crate::hostfacts::report())?;
+                        signal.send(crate::hostfacts::display_name_report())?;
                     }
                     ServerMsg::Error { message, .. } => warn!("Server: {message}"),
                     other => debug!("ignoring {other:?}"),
@@ -573,11 +970,25 @@ async fn run_session(
 ) {
     info!("Connection request from \"{controller_name}\" ({controller_ip})");
     let mut still_pending = true;
-    match session_inner(&state, signal, peer_info, session_id, token, server_udp, &mut still_pending).await {
+    match session_inner(
+        &state,
+        signal,
+        peer_info,
+        session_id,
+        token,
+        server_udp,
+        &controller_name,
+        &controller_ip,
+        &mut still_pending,
+    )
+    .await
+    {
         Ok(()) => info!("Remote session ended"),
         Err(e) if e.is::<WrongPassword>() => {
             warn!("\"{controller_name}\" ({controller_ip}) entered a wrong password");
-            state.record_failure();
+        }
+        Err(e) if e.is::<LockedOut>() => {
+            warn!("\"{controller_name}\" ({controller_ip}) is locked out: {e}");
         }
         Err(e) => warn!("Connection from \"{controller_name}\" ended: {e:#}"),
     }
@@ -595,6 +1006,8 @@ async fn session_inner(
     session_id: SessionId,
     token: [u8; 16],
     server_udp: SocketAddr,
+    controller_name: &str,
+    controller_ip: &str,
     still_pending: &mut bool,
 ) -> Result<()> {
     let binding = p2p::bind_udp(server_udp, session_id, token, Role::Host).await?;
@@ -615,32 +1028,56 @@ async fn session_inner(
     let punching = p2p::spawn_punching(binding.punch_socket, targets, session_id, Duration::from_secs(8));
 
     let passwords = state.auth_passwords();
-    let accepted = accept_authenticated(&endpoint, &passwords, &state.name, Duration::from_secs(20)).await;
+    let permanent = state.permanent.lock().unwrap().clone();
+    let accepted = accept_authenticated(
+        &endpoint,
+        state,
+        server_udp.ip(),
+        peer_public,
+        controller_ip,
+        controller_name,
+        &passwords,
+        Duration::from_secs(90),
+    )
+    .await;
     punching.abort();
-    let (connection, auth) = accepted?;
-    state.reset_failures();
+    let (connection, mut auth) = accepted?;
+    let source = source_for(&connection, server_udp.ip(), peer_public, controller_ip, controller_name);
+    if auth.password_slot != ASK_SLOT {
+        state.note_success(&source);
+    }
+    let (mut ceiling, receive_dir) =
+        open_session(state, &mut auth, &passwords, permanent.as_deref(), controller_name, controller_ip, true).await?;
 
     // Authenticated: this session takes the screen, unless another one got there first.
     state.pending.fetch_sub(1, Ordering::SeqCst);
     *still_pending = false;
     if state.streaming.swap(true, Ordering::SeqCst) {
-        connection.close(2u32.into(), b"another controller is already connected");
+        let message = "another controller is already connected";
+        warn!("Password was accepted, then the session stopped: {message}");
+        let _ = write_msg(&mut auth.send, &HostMsg::Notice(message.into())).await;
+        connection.close(2u32.into(), message.as_bytes());
         let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
-        bail!("another controller connected first");
+        bail!(message);
     }
 
-    let path = if connection.remote_address() == server_udp { "relayed via the server" } else { "direct P2P" };
-    info!("\"{}\" connected ({path}, {})", auth.peer_name, connection.remote_address());
+    let remote = connection.remote_address();
+    let path = if remote == server_udp {
+        "Internet, relayed via the server"
+    } else if p2p::is_lan_ip(remote.ip()) {
+        "LAN"
+    } else {
+        "Internet"
+    };
+    info!("Password accepted for \"{}\". Starting the picture ({path}, {})", auth.peer_name, remote);
+    if state.args.service_host {
+        info!("Host log: C:\\ProgramData\\PJDesk\\service\\service.log");
+    } else {
+        info!("Host log: %APPDATA%\\PJDesk\\pjdesk.log");
+    }
     if let Some(shared) = &state.shared {
         *shared.connected.lock().unwrap() = Some(auth.peer_name.clone());
     }
-    let (mut ceiling, receive_dir) = state
-        .ceilings
-        .lock()
-        .unwrap()
-        .get(&session_id)
-        .cloned()
-        .unwrap_or((pjdesk_proto::perms::CLASSIC, state.args.receive_dir.clone()));
     let policy = state.policy.lock().unwrap().clone();
     ceiling &= policy.max_permissions;
     if !policy.recording_allowed {
@@ -658,8 +1095,10 @@ async fn session_inner(
         tunnel_ports: ports,
         receive_dir,
     };
-    let result = stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
+    let result =
+        stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
     state.streaming.store(false, Ordering::SeqCst);
+    state.fresh_support();
     if let Some(shared) = &state.shared {
         *shared.connected.lock().unwrap() = None;
     }
@@ -668,18 +1107,43 @@ async fn session_inner(
     result
 }
 
+/// Password slot used when the controller asked for the person at this computer.
+const ASK_SLOT: u8 = 255;
+
+fn source_for(
+    connection: &Connection,
+    relay_ip: std::net::IpAddr,
+    peer_public: SocketAddr,
+    controller_ip: &str,
+    controller_name: &str,
+) -> String {
+    lockout::source_key(
+        connection.remote_address().ip(),
+        Some(relay_ip),
+        Some(peer_public.ip()),
+        controller_ip.parse().ok(),
+        controller_name,
+    )
+}
+
 /// Accepts QUIC connections until one authenticates. The controller may try
 /// several addresses at once, so several connections can arrive, but only
-/// one password attempt is allowed per session.
+/// one password attempt is allowed per session. A lockout is answered here,
+/// before any Allow prompt.
 async fn accept_authenticated(
     endpoint: &Endpoint,
+    state: &Arc<HostState>,
+    relay_ip: std::net::IpAddr,
+    peer_public: SocketAddr,
+    controller_ip: &str,
+    controller_name: &str,
     passwords: &[String],
-    my_name: &str,
     limit: Duration,
 ) -> Result<(Connection, Authenticated)> {
-    const MAX_CONNECTIONS: usize = 4;
+    const MAX_CONNECTIONS: usize = 8;
     let deadline = tokio::time::Instant::now() + limit;
     let attempt_used = Arc::new(AtomicBool::new(false));
+    let mut wrong = 0u32;
     let mut pending: JoinSet<Result<(Connection, Authenticated)>> = JoinSet::new();
     let mut accepted = 0;
     loop {
@@ -691,20 +1155,128 @@ async fn accept_authenticated(
                     incoming.refuse();
                     continue;
                 }
-                let (passwords, my_name, attempt_used) = (passwords.to_vec(), my_name.to_owned(), attempt_used.clone());
+                let (passwords, my_name, attempt_used) = (passwords.to_vec(), state.name.clone(), attempt_used.clone());
+                let (state, controller_ip, controller_name) = (state.clone(), controller_ip.to_string(), controller_name.to_string());
                 pending.spawn(async move {
                     let connection = incoming.await?;
-                    let auth = session::host_auth(&connection, &passwords, &my_name, &attempt_used).await?;
-                    Ok((connection, auth))
+                    let source = source_for(&connection, relay_ip, peer_public, &controller_ip, &controller_name);
+                    let locked = state.lockout.lock().unwrap().check(&source, Instant::now());
+                    if locked.locked {
+                        state.log_lock(&source, &locked);
+                        refuse_before_password(&connection, &lockout::message(locked.minutes)).await?;
+                        return Err(LockedOut { minutes: locked.minutes }.into());
+                    }
+                    let fail_state = state.clone();
+                    let fail_source = source.clone();
+                    let fail = move || fail_state.note_wrong_password(&fail_source);
+                    match session::host_auth(&connection, &passwords, &my_name, &attempt_used, &fail).await {
+                        Ok(auth) => Ok((connection, auth)),
+                        Err(e) if e.is::<NeedsApproval>() => {
+                            let wait = e.downcast::<NeedsApproval>().unwrap();
+                            Ok((connection, Authenticated {
+                                send: wait.send,
+                                recv: wait.recv,
+                                peer_name: wait.peer_name,
+                                peer_proto: wait.peer_proto,
+                                password_slot: ASK_SLOT,
+                            }))
+                        }
+                        Err(e) => Err(e),
+                    }
                 });
             }
             Some(joined) = pending.join_next(), if !pending.is_empty() => match joined {
                 Ok(Ok(done)) => return Ok(done),
-                Ok(Err(e)) if e.is::<WrongPassword>() => return Err(e),
+                Ok(Err(e)) if e.is::<LockedOut>() => return Err(e),
+                Ok(Err(e)) if e.is::<WrongPassword>() => {
+                    // The person can correct the password without asking this
+                    // computer to allow the session again.
+                    attempt_used.store(false, Ordering::SeqCst);
+                    wrong += 1;
+                    if wrong >= 8 {
+                        return Err(e);
+                    }
+                }
                 Ok(Err(e)) => debug!("a connection attempt failed: {e:#}"),
                 Err(_) => {}
             },
             _ = tokio::time::sleep_until(deadline) => bail!("the controller did not connect in time"),
+        }
+    }
+}
+
+enum Person {
+    Yes(u32, String),
+    No,
+    TimedOut,
+    Unavailable,
+}
+
+async fn open_session(
+    state: &Arc<HostState>,
+    auth: &mut Authenticated,
+    passwords: &[String],
+    permanent: Option<&str>,
+    controller_name: &str,
+    controller_ip: &str,
+    via_server: bool,
+) -> Result<(u32, String)> {
+    if auth.password_slot != ASK_SLOT {
+        let support = state.support_password.lock().unwrap().clone();
+        if admit::matched_support(passwords, auth.password_slot, Some(support.as_str())) {
+            let policy = state.policy.lock().unwrap().clone();
+            grant_auth(&mut auth.send, &state.name).await?;
+            state.note_support_connection(via_server, controller_name);
+            return Ok((
+                admit::support_open(&policy, state.args.view_only),
+                crate::resolve_receive_dir(&state.args.receive_dir),
+            ));
+        }
+        let matched = admit::matched_permanent(passwords, auth.password_slot, permanent);
+        let permanent_set = permanent.map(str::trim).is_some_and(|p| !p.is_empty());
+        let policy = state.policy.lock().unwrap().clone();
+        if let Admit::Open(bits) =
+            admit::after_password(&state.args.approval, matched, permanent_set, &policy, state.args.view_only)
+        {
+            grant_auth(&mut auth.send, &state.name).await?;
+            state.note_support_connection(via_server, controller_name);
+            return Ok((bits, crate::resolve_receive_dir(&state.args.receive_dir)));
+        }
+    }
+    if admit::support_key_admits(state.args.support_unattended, via_server) {
+        let policy = state.policy.lock().unwrap().clone();
+        grant_auth(&mut auth.send, &state.name).await?;
+        state.note_support_connection(true, controller_name);
+        return Ok((
+            admit::support_open(&policy, state.args.view_only),
+            crate::resolve_receive_dir(&state.args.receive_dir),
+        ));
+    }
+    let who = if auth.password_slot == ASK_SLOT && !auth.peer_name.trim().is_empty() {
+        auth.peer_name.as_str()
+    } else {
+        controller_name
+    };
+    match approve(state, who, controller_ip).await {
+        Person::Yes(bits, dir) => {
+            grant_auth(&mut auth.send, &state.name).await?;
+            state.note_support_connection(via_server, controller_name);
+            Ok((bits, dir))
+        }
+        Person::No => {
+            let message = "the person at this computer declined";
+            let _ = refuse_auth(&mut auth.send, message).await;
+            bail!(message)
+        }
+        Person::TimedOut => {
+            let message = "No answer";
+            let _ = refuse_auth(&mut auth.send, message).await;
+            bail!(message)
+        }
+        Person::Unavailable => {
+            let message = "No one is available to accept";
+            let _ = refuse_auth(&mut auth.send, message).await;
+            bail!(message)
         }
     }
 }
@@ -745,42 +1317,32 @@ fn platform_init() {
     }
 }
 
-/// Asks the person at this computer before a session starts. `None` declines.
-/// The tuple is the granted permission bits and the folder received files may
-/// be written into (empty unless file transfer was allowed).
-async fn approve(state: &Arc<HostState>, name: &str, ip: &str) -> Option<(u32, String)> {
-    use pjdesk_proto::perms::{self, grant};
+/// Asks the person at this computer. Called only after a password was accepted
+/// and the host's mode still requires approval, or the controller chose
+/// "Ask the person instead". A timeout is not a decline.
+async fn approve(state: &Arc<HostState>, name: &str, ip: &str) -> Person {
     let policy = state.policy.lock().unwrap().clone();
-    let prompt = state.args.approval != "unattended" || policy.force_prompt;
-    let restricted = grant(perms::UNATTENDED_DEFAULT, policy.max_permissions, state.args.view_only) & !perms::FILE;
-    let permanent = state.permanent.lock().unwrap().is_some();
-    let unattended_ok = permanent && policy.unattended_allowed && !policy.force_prompt;
-
-    if !prompt {
-        return unattended_ok.then_some((restricted, String::new()));
-    }
-
     if let Some(shared) = &state.shared {
-        let id = shared.begin_consent(name, ip, policy.max_permissions);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-        loop {
-            if let Some(reply) = shared.take_reply(id) {
-                shared.clear_consent(id);
-                return consent_grant(&policy, reply);
+        if !state.args.service_host {
+            let id = shared.begin_consent(name, ip, policy.max_permissions);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Some(reply) = shared.take_reply(id) {
+                    shared.clear_consent(id);
+                    return match consent_grant(&policy, reply) {
+                        Some(answer) => Person::Yes(answer.0, answer.1),
+                        None => Person::No,
+                    };
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    shared.clear_consent(id);
+                    return Person::TimedOut;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            if tokio::time::Instant::now() >= deadline {
-                shared.clear_consent(id);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    } else if state.args.service_host {
-        if let Some(answer) = service_consent(state, name, ip, policy.max_permissions).await {
-            return Some(answer);
         }
     }
-
-    unattended_ok.then_some((restricted, String::new()))
+    service_consent(state, name, ip, policy.max_permissions).await
 }
 
 fn consent_grant(policy: &Policy, reply: ConsentReply) -> Option<(u32, String)> {
@@ -789,7 +1351,16 @@ fn consent_grant(policy: &Policy, reply: ConsentReply) -> Option<(u32, String)> 
         return None;
     }
     let mut bits = reply.permissions & policy.max_permissions;
-    let dir = if bits & perms::FILE != 0 { reply.receive_dir } else { String::new() };
+    let dir = if bits & perms::FILE != 0 {
+        let chosen = reply.receive_dir.trim();
+        if chosen.is_empty() {
+            crate::resolve_receive_dir("")
+        } else {
+            chosen.to_string()
+        }
+    } else {
+        String::new()
+    };
     if dir.is_empty() {
         bits &= !perms::FILE;
     }
@@ -798,15 +1369,34 @@ fn consent_grant(policy: &Policy, reply: ConsentReply) -> Option<(u32, String)> 
 
 /// The service host has no window. It leaves `consent.json` for the signed-in
 /// user's PJDesk window and waits for `consent-reply.json`.
-async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) -> Option<(u32, String)> {
+fn someone_can_answer() -> bool {
+    #[cfg(windows)]
+    {
+        if unsafe { windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId() } == 0xFFFF_FFFF {
+            return false;
+        }
+    }
+    notice::client_alive()
+}
+
+async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) -> Person {
+    if !someone_can_answer() {
+        return Person::Unavailable;
+    }
     let dir = crate::syspaths::service_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Person::Unavailable;
+    }
     let ask_path = dir.join("consent.json");
     let reply_path = dir.join("consent-reply.json");
     let _ = std::fs::remove_file(&reply_path);
-    let ask = serde_json::json!({ "from": name, "ip": ip, "offered": offered });
-    std::fs::write(&ask_path, ask.to_string()).ok()?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let id =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1);
+    let ask = serde_json::json!({ "id": id, "from": name, "ip": ip, "offered": offered });
+    if std::fs::write(&ask_path, ask.to_string()).is_err() {
+        return Person::Unavailable;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let reply = loop {
         if let Ok(bytes) = std::fs::read(&reply_path) {
             if let Ok(reply) = serde_json::from_slice::<ConsentReply>(&bytes) {
@@ -820,5 +1410,11 @@ async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) 
     };
     let _ = std::fs::remove_file(&ask_path);
     let _ = std::fs::remove_file(&reply_path);
-    consent_grant(&state.policy.lock().unwrap(), reply?)
+    let Some(reply) = reply else {
+        return Person::TimedOut;
+    };
+    match consent_grant(&state.policy.lock().unwrap(), reply) {
+        Some(answer) => Person::Yes(answer.0, answer.1),
+        None => Person::No,
+    }
 }

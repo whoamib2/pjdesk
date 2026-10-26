@@ -8,12 +8,17 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="/site.css">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/network.css">
 </head>
 <body>
 <header>
   <div class="wrap nav">
-    <a class="brand" href="/"><span class="dot"></span>PJDesk</a>
+    <a class="brand" href="/"><img class="logo" src="/logo.png" alt="" width="26" height="26">PJDesk</a>
     <span class="spacer"></span>
+    <button type="button" id="theme" class="btn btn-small">Light</button>
     <a class="link" href="/#download">Download</a>
     <a class="link on" href="/account/">Account</a>
   </div>
@@ -53,11 +58,15 @@
         <p class="note" id="pw-note">Your password never leaves your browser or your server; PJDesk only receives a key made from it, and your server backups are encrypted with another key only your servers have. That also means PJDesk can't recover a forgotten password, so keep it in your password manager.</p>
       </div>
     </section>
+  </div>
 
+  <div class="wrap">
     <!-- Signed in -->
     <section id="signed-in" class="hidden">
       <h1>Your PJDesk account</h1>
       <p class="sub" id="me-email"></p>
+
+      <div id="my-network"></div>
 
       <div class="card">
         <h2>Cloud Sync</h2>
@@ -116,6 +125,8 @@
 <footer><div class="wrap"><a href="/">pjdesk.com</a><a href="https://github.com/whoamib2/pjdesk">GitHub</a></div></footer>
 
 <script src="/app.js"></script>
+<script src="/admin/netkey.js"></script>
+<script src="/network-page.js"></script>
 <script src="/account/account.js"></script>
 </body>
 </html>

@@ -9,17 +9,21 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="/admin/admin.css">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="stylesheet" href="/network.css">
 </head>
 <body class="dark">
 <div class="shell">
   <aside class="side">
-    <a class="brand" href="/"><span class="dot"></span>PJDesk</a>
+    <a class="brand" href="/"><img class="logo" src="/logo.png" alt="" width="26" height="26">PJDesk</a>
     <nav>
       <button type="button" data-page="overview" class="on">Overview</button>
       <button type="button" data-page="accounts">Accounts</button>
       <button type="button" data-page="servers">Servers &amp; devices</button>
       <button type="button" data-page="plans">Plans</button>
       <button type="button" data-page="audit">Audit log</button>
+      <button type="button" data-page="network">My network</button>
     </nav>
     <div class="side-foot">
       <button type="button" id="theme" class="ghost">Light</button>
@@ -36,6 +40,7 @@
     <section id="servers" class="page hidden"></section>
     <section id="plans" class="page hidden"></section>
     <section id="audit" class="page hidden"></section>
+    <section id="network" class="page hidden"></section>
   </main>
 </div>
 
@@ -77,6 +82,7 @@
 </div>
 
 <script src="/app.js"></script>
+<script src="/network-page.js"></script>
 <script src="/admin/admin.js"></script>
 </body>
 </html>

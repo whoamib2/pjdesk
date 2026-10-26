@@ -111,6 +111,7 @@ pub async fn run(
 
     let (frame_tx, mut frame_rx) = mpsc::channel::<EncodedFrame>(MAX_IN_FLIGHT as usize + 1);
     let (host_tx, mut host_rx) = mpsc::unbounded_channel::<HostMsg>();
+    let peer_name = grant.peer_name.clone();
     let session = Session::new(
         args.fps,
         args.bitrate,
@@ -124,7 +125,13 @@ pub async fn run(
         ui,
     );
     session.spawn_side_loops();
+    let _notice = if args.service_host {
+        super::notice::Guard::begin_service(&peer_name)
+    } else {
+        super::notice::Guard::begin(&peer_name)
+    };
 
+    let (cap_err_tx, mut cap_err_rx) = mpsc::channel::<String>(1);
     let capture_thread = {
         let shared = shared.clone();
         let session = session.clone();
@@ -132,11 +139,14 @@ pub async fn run(
         std::thread::Builder::new().name("capture".into()).spawn(move || {
             if let Err(e) = capture_loop(&args, &shared, &session, &frame_tx) {
                 warn!("Screen capture stopped: {e:#}");
+                let _ = cap_err_tx.blocking_send(format!("{e:#}"));
             }
         })?
     };
 
-    let mut video = connection.open_uni().await?;
+    info!("Opening the video stream to the controller");
+    let mut video = connection.open_uni().await.context("could not open the video stream")?;
+    info!("Video stream is open");
     // Input and acks on the control stream go before video bytes.
     let _ = video.set_priority(-1);
     let mut video_task = tokio::spawn(async move {
@@ -173,6 +183,11 @@ pub async fn run(
                 }
             }
             _ = tick.tick() => {
+                if super::notice::disconnect_requested() {
+                    info!("The person at this computer disconnected the session");
+                    let _ = write_msg(&mut control_send, &HostMsg::Notice("The person at this computer disconnected".into())).await;
+                    break Ok(());
+                }
                 if let Err(e) = session.poll_local(&mut control_send).await {
                     break Err(e);
                 }
@@ -182,6 +197,12 @@ pub async fn run(
                 Ok(Err(e)) => Err(e).context("sending video"),
                 Err(e) => Err(e.into()),
             },
+            Some(err) = cap_err_rx.recv() => {
+                let message = format!("Screen capture failed: {err}");
+                warn!("{message}");
+                let _ = write_msg(&mut control_send, &HostMsg::Notice(message.clone())).await;
+                break Err(anyhow::anyhow!(message));
+            }
             _ = connection.closed() => break Ok(()),
         }
     };
@@ -211,12 +232,24 @@ fn scale_factor(width: usize, height: usize, max_width: usize) -> usize {
 /// Capture → convert → encode loop (runs on its own thread).
 fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mpsc::Sender<EncodedFrame>) -> Result<()> {
     let _awake = KeepAwake::new();
+    match crate::platform::session_id() {
+        Some(0) => warn!(
+            "Screen capture is running in Windows session 0, which has no desktop. The PJDesk service launches a helper in the signed-in session; this process is not that helper."
+        ),
+        Some(id) => info!("Screen capture is in Windows session {id}"),
+        None => {}
+    }
     // Service helper: attach this capture thread to the input desktop so it can
     // see UAC prompts, the lock screen and the sign-in screen.
     let mut desktop = String::new();
     if args.follow_desktop {
-        crate::platform::attach_thread_to_input_desktop();
-        desktop = crate::platform::input_desktop_name().unwrap_or_default();
+        if crate::platform::attach_thread_to_input_desktop() {
+            desktop = crate::platform::input_desktop_name().unwrap_or_default();
+            info!("Capture thread is on the input desktop \"{desktop}\"");
+        } else {
+            warn!("Could not attach capture to the input desktop. The picture may stay black.");
+            session.notify("Could not attach to the desktop that is on screen. The picture may stay black.");
+        }
     }
     let mut capturer = capture::open(args)?;
     info!("Capturing {} with {}", describe(capturer.display_rect()), capturer.name());
@@ -230,6 +263,7 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
     let mut seq = 0u32;
     let mut picture = I420Buffer::default();
     let mut errors = 0u32;
+    let mut idle_misses = 0u32;
     // The newest image in `picture` hasn't reached the controller yet
     // (the encoder dropped it to hold the bitrate).
     let mut undelivered = false;
@@ -362,15 +396,39 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
 
         // Grab a new image (waits up to 100 ms for the screen to change).
         let mut have_picture = false;
+        let mut switch_to_gdi = false;
         let failure = match capturer.capture(Duration::from_millis(100)) {
             Ok(Some(frame)) => {
                 to_i420(frame, &mut picture);
                 have_picture = true;
+                idle_misses = 0;
                 None
             }
-            Ok(None) => None,
+            Ok(None) => {
+                // DXGI often returns nothing until the desktop changes, so a
+                // still screen never sent a first frame and the controller
+                // sat on "Opening" after the password was accepted.
+                idle_misses += 1;
+                if picture.width == 0 && idle_misses >= 5 && capturer.name().contains("DXGI") {
+                    switch_to_gdi = true;
+                }
+                None
+            }
             Err(e) => Some(e),
         };
+        if switch_to_gdi {
+            info!("No frame from {} yet; taking the first picture with GDI", capturer.name());
+            session.notify("Waiting for the first picture from this computer.");
+            match capture::open_gdi_fallback(args.display) {
+                Ok(next) => {
+                    capturer = next;
+                    idle_misses = 0;
+                    info!("Capturing {} with {}", describe(capturer.display_rect()), capturer.name());
+                    *shared.display.lock().unwrap() = capturer.display_rect();
+                }
+                Err(e) => warn!("GDI capture failed: {e:#}"),
+            }
+        }
         if let Some(e) = failure {
             errors += 1;
             if want_keyframe {

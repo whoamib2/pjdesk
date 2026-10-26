@@ -11,23 +11,37 @@
 //! Double-clicking `pjdesk.exe` does both: it hosts in the background and
 //! lets you type a partner ID to control another machine.
 
+#[cfg(test)]
+mod icon_asset;
+
 mod account;
+mod access_keys;
 mod audio;
+mod client_update;
 mod clip;
 mod color;
 mod config;
 mod gui;
 mod handoff;
 mod host;
+mod hostfacts;
 mod identity;
+mod idfmt;
+mod network;
 mod p2p;
 mod platform;
 mod secure;
 mod service;
 mod session;
+mod support_keys;
 mod signaling;
 mod syspaths;
+mod temp_sign;
+mod update_pipe;
+mod vault;
 mod viewer;
+mod traywatch;
+mod winshow;
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +64,16 @@ struct Cli {
     /// Server address as host[:port] (overrides the saved setting).
     #[arg(long, global = true)]
     server: Option<String>,
+    /// Apply an encrypted network key (`pjdesk-net1:…`). The same blob is read
+    /// from a renamed installer, `PJDesk-Setup-<version>--<blob>.exe`.
+    #[arg(long = "config", global = true, value_name = "BLOB")]
+    import_config: Option<String>,
+    /// Tray icon only. This process never opens a window.
+    #[arg(long, hide = true)]
+    tray: bool,
+    /// Window only. This process never owns the tray icon. The tray starts it.
+    #[arg(long, hide = true)]
+    window: bool,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -69,13 +93,13 @@ enum Cmd {
     /// After a silent install: restart the service and the signed-in user's window.
     #[command(name = "update-handoff", hide = true)]
     UpdateHandoff,
-    /// Check for a newer PJDesk and install it (the daily task runs this).
+    /// Check for a newer PJDesk and install it. The service does this; there is no scheduled task.
     Update {
         /// Only report whether an update is available; don't install.
         #[arg(long)]
         check: bool,
     },
-    /// Internal: turn the daily auto-update task on or off.
+    /// Internal: turn automatic updates on or off. The service does the check.
     #[command(name = "update-task", hide = true)]
     UpdateTask {
         #[arg(long)]
@@ -187,12 +211,19 @@ pub struct HostArgs {
     /// Listen for direct IP / LAN connections.
     #[arg(skip)]
     pub allow_direct: bool,
+    /// Answer LAN discovery. Off when the person opts out in Settings.
+    #[arg(skip)]
+    pub discover_lan: bool,
     /// Ports a tunnel may open on this computer (loopback).
     #[arg(skip)]
     pub tunnel_ports: Vec<u16>,
     /// True when this process is the background service helper (runs as SYSTEM).
     #[arg(skip)]
     pub service_host: bool,
+    /// This computer accepted an unattended support key. Signaling sessions open
+    /// without Allow. Direct connections still ask.
+    #[arg(skip)]
+    pub support_unattended: bool,
 }
 
 impl Default for HostArgs {
@@ -210,9 +241,31 @@ impl Default for HostArgs {
             approval: "prompt".into(),
             receive_dir: String::new(),
             allow_direct: true,
+            discover_lan: true,
             tunnel_ports: Vec::new(),
             service_host: false,
+            support_unattended: false,
         }
+    }
+}
+
+/// Empty, or the word Desktop, is this user's Desktop. The word Downloads is that folder.
+pub fn resolve_receive_dir(configured: &str) -> String {
+    let text = configured.trim();
+    if text.eq_ignore_ascii_case("downloads") {
+        return home_folder("Downloads");
+    }
+    if !text.is_empty() && !text.eq_ignore_ascii_case("desktop") {
+        return text.to_string();
+    }
+    home_folder("Desktop")
+}
+
+fn home_folder(name: &str) -> String {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    match home {
+        Some(home) => std::path::PathBuf::from(home).join(name).to_string_lossy().into_owned(),
+        None => String::new(),
     }
 }
 
@@ -231,10 +284,12 @@ impl HostArgs {
             view_only: settings.view_only,
             follow_desktop: false,
             approval: if settings.approval == "unattended" { "unattended".into() } else { "prompt".into() },
-            receive_dir: settings.receive_dir.clone(),
+            receive_dir: resolve_receive_dir(&settings.receive_dir),
             allow_direct: settings.allow_direct,
+            discover_lan: settings.discover_lan,
             tunnel_ports: settings.tunnel_ports.clone(),
             service_host: false,
+            support_unattended: false,
         }
     }
 }
@@ -282,10 +337,26 @@ struct ConfigArgs {
 }
 
 fn main() {
+    // The service relaunches this window with no console. Std handles are then
+    // null, and the first read or write returns "The handle is invalid."
+    #[cfg(windows)]
+    repair_stdio_handles();
     // The service and its helper run with no console and set up their own
     // (file) logging, so route them before touching the console.
     let raw: Vec<String> = std::env::args().collect();
-    let is_background = raw.iter().any(|a| a == "__session-host" || a == "update-handoff")
+    let is_connect = raw.iter().any(|a| a == "connect");
+    if is_connect {
+        // An elevated viewer cannot take a file drop from Explorer. Open the
+        // same command again at medium integrity, then leave this process.
+        if platform::relaunch_medium_if_elevated() {
+            return;
+        }
+        // The viewer window needs the main thread in the STA apartment before
+        // DPAPI or QUIC touch COM. Doing that later made create_window fail
+        // with no log line and no window after the password was accepted.
+        init_viewer_com();
+    }
+    let is_background = raw.iter().any(|a| a == "__session-host" || a == "update-handoff" || a == "--tray" || a == "--window")
         || (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"));
 
     // With any other argument, attach a console so output and clap errors show.
@@ -296,9 +367,18 @@ fn main() {
 
     match &cli.command {
         None => {
-            // Default: the graphical app.
+            // Default: the window, plus a tray process that never draws it.
+            // `--tray` is the icon only. `--window` is the window only.
             init_gui_logging();
-            if let Err(e) = gui::run(cli.server.clone()) {
+            let started = if cli.tray {
+                gui::run_tray();
+                Ok(())
+            } else if cli.window {
+                gui::run(cli.server.clone(), cli.import_config.clone())
+            } else {
+                gui::open_or_forward(cli.server.clone(), cli.import_config.clone())
+            };
+            if let Err(e) = started {
                 fatal(&format!("PJDesk could not start: {e:#}"));
             }
         }
@@ -321,6 +401,9 @@ fn main() {
         }
         Some(_) => {
             init_logging();
+            if is_connect {
+                install_session_panic_hook();
+            }
             if let Err(e) = run(cli) {
                 let text = format!("{e:#}");
                 note_failure(&text);
@@ -404,18 +487,72 @@ fn fatal(message: &str) -> ! {
     std::process::exit(1);
 }
 
-/// Attaches to the parent console if there is one, otherwise allocates a new
-/// console, so a `windows_subsystem = "windows"` build still works as a CLI.
+/// Attaches to the parent console if there is one, so a
+/// `windows_subsystem = "windows"` build still works as a CLI.
+///
+/// Never AllocConsole: the app spawns the viewer (`connect`) as a child, and
+/// allocating a console there popped up a command window for every session.
+/// A failed attach is normal when the service relaunched this process. It must
+/// not leave the std handles invalid.
 #[cfg(windows)]
 fn ensure_console() {
     unsafe {
         use windows::Win32::System::Console::{AttachConsole, GetConsoleWindow, ATTACH_PARENT_PROCESS};
         if GetConsoleWindow().0.is_null() {
-            // Attach to the launching terminal if there is one, but never
-            // AllocConsole: the app spawns the viewer (`connect`) as a child
-            // process, and allocating a console there popped up a stray command
-            // window every time you started a remote session.
             let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+    repair_stdio_handles();
+}
+
+/// Point a missing stdin, stdout, or stderr at NUL.
+///
+/// `GetStdHandle` is null or `INVALID_HANDLE_VALUE` when this process was
+/// started by the service (`CreateProcessAsUser`, no inherited console). Rust
+/// then reports os error 6 for a console read, a log line, or a child spawn
+/// that tries to inherit the handle.
+#[cfg(windows)]
+fn repair_stdio_handles() {
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+
+    unsafe {
+        let nul = windows::core::HSTRING::from("NUL");
+        for (id, access) in [
+            (STD_INPUT_HANDLE, GENERIC_READ.0),
+            (STD_OUTPUT_HANDLE, GENERIC_WRITE.0),
+            (STD_ERROR_HANDLE, GENERIC_WRITE.0),
+        ] {
+            if stdio_handle_ok(id) {
+                continue;
+            }
+            let Ok(handle) = CreateFileW(
+                &nul,
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            ) else {
+                continue;
+            };
+            if SetStdHandle(id, handle).is_err() {
+                let _ = CloseHandle(handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn stdio_handle_ok(id: windows::Win32::System::Console::STD_HANDLE) -> bool {
+    unsafe {
+        match windows::Win32::System::Console::GetStdHandle(id) {
+            Ok(handle) => !handle.is_invalid() && handle != windows::Win32::Foundation::HANDLE::default(),
+            Err(_) => false,
         }
     }
 }
@@ -452,7 +589,27 @@ fn login_command(config: &mut Config, args: LoginArgs, server_flag: Option<Strin
 
 fn update_command(check: bool) -> Result<()> {
     use pjdesk_proto::update::Outcome;
-    match pjdesk_proto::update::perform(pjdesk_proto::UPDATE_REPO, env!("CARGO_PKG_VERSION"), "PJDesk-Setup", check)? {
+    if !check {
+        // This process is the administrator prompt (or an elevated console).
+        // It may lock down the update folder. The normal window does not.
+        return match pjdesk_proto::update::install_client_as_service(env!("CARGO_PKG_VERSION"), &|line| {
+            println!("{line}");
+        })? {
+            Outcome::UpToDate(v) => {
+                println!("PJDesk {v} is up to date.");
+                Ok(())
+            }
+            Outcome::Found(v) => {
+                println!("PJDesk {v} is available.");
+                Ok(())
+            }
+            Outcome::Installing(v) => {
+                println!("Installing PJDesk {v}...");
+                Ok(())
+            }
+        };
+    }
+    match pjdesk_proto::update::perform_client(pjdesk_proto::UPDATE_REPO, env!("CARGO_PKG_VERSION"), true)? {
         Outcome::UpToDate(v) => println!("PJDesk {v} is up to date."),
         Outcome::Found(v) => println!("PJDesk {v} is available (run `pjdesk update` to install it)."),
         Outcome::Installing(v) => println!("Installing PJDesk {v}..."),
@@ -620,15 +777,89 @@ fn init_log_file(default_filter: &str) {
             return;
         }
     }
+    // A missing console makes stderr itself os error 6. Drop the line rather
+    // than failing the session while trying to record why it failed.
+    #[cfg(windows)]
+    if !stdio_handle_ok(windows::Win32::System::Console::STD_ERROR_HANDLE) {
+        let _ = builder.with_writer(std::sync::Mutex::new(std::io::sink())).try_init();
+        return;
+    }
     let _ = builder.with_writer(std::io::stderr).try_init();
 }
 
+/// Where to look on the computer that is sharing its screen.
+pub fn host_log_hint() -> &'static str {
+    "On that computer, check %APPDATA%\\PJDesk\\pjdesk.log. If the PJDesk service is hosting, also check C:\\ProgramData\\PJDesk\\service\\service.log."
+}
+
+/// The viewer thread has to be STA before anything else initializes COM.
+#[cfg(windows)]
+fn init_viewer_com() {
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+}
+
+#[cfg(not(windows))]
+fn init_viewer_com() {}
+
+fn install_session_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        note_failure(&format!("The viewer stopped unexpectedly: {info}"));
+        default(info);
+    }));
+}
+
 /// Writes the reason a viewer or connect command stopped, next to pjdesk.log.
+/// The main window reads this when the viewer process exits.
 fn note_failure(text: &str) {
-    tracing::error!("session failed: {text}");
+    let text = phone_view_failure(text);
+    let connect = std::env::args().any(|a| a == "connect");
+    if connect {
+        tracing::error!("session failed: {text}");
+    } else {
+        tracing::error!("{text}");
+    }
     if let Some(dir) = Config::path().parent() {
         let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(dir.join("last-session.txt"), text);
+        let _ = std::fs::write(dir.join("last-session.txt"), &text);
+        let _ = std::fs::write(dir.join("session-status.txt"), &text);
+    }
+}
+
+/// Clear sentences for a Windows-to-phone view. Other connections keep their own text.
+fn phone_view_failure(text: &str) -> String {
+    if std::env::var("PJDESK_ASK_VIEW").ok().as_deref() != Some("1") {
+        return text.to_string();
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("declin") || lower.contains("not allowed to view") {
+        "Phone declined".into()
+    } else if lower.contains("screen sharing") || lower.contains("screen capture") || lower.contains("mediaprojection")
+    {
+        "Screen sharing not allowed on the phone".into()
+    } else if lower.contains("timed out")
+        || lower.contains("did not answer")
+        || lower.contains("no answer")
+        || lower.contains("offline")
+        || lower.contains("closed")
+        || lower.contains("asleep")
+        || lower.contains("did not finish")
+    {
+        "Phone app is closed or asleep".into()
+    } else {
+        text.to_string()
+    }
+}
+
+/// A step the main window can show while the viewer is still running.
+pub fn note_status(text: &str) {
+    tracing::info!("{text}");
+    if let Some(dir) = Config::path().parent() {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(dir.join("session-status.txt"), text);
     }
 }
 
@@ -646,4 +877,19 @@ pub fn hostname() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "pjdesk".into())
+}
+
+#[cfg(test)]
+mod cli_lock {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    #[test]
+    fn no_flag_skips_the_window_lock() {
+        let help = Cli::command().render_long_help().to_string().to_lowercase();
+        assert!(!help.contains("no-pin"), "{help}");
+        assert!(!help.contains("skip-lock"), "{help}");
+        assert!(!help.contains("--unlocked"), "{help}");
+    }
 }

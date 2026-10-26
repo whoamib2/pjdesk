@@ -20,13 +20,27 @@ Unicode true
 !endif
 
 Name "${APPNAME}"
-OutFile "PJDesk-Setup-${VERSION}.exe"
+OutFile "PJDesk-Client-Setup-${VERSION}.exe"
 InstallDir "$PROGRAMFILES64\${APPNAME}"
 InstallDirRegKey HKLM "Software\${APPNAME}" "InstallDir"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 
+!ifndef VERQUAD
+  !define VERQUAD "${VERSION}.0"
+!endif
+VIProductVersion "${VERQUAD}"
+VIAddVersionKey "ProductName" "PJDesk"
+VIAddVersionKey "CompanyName" "PJDesk"
+VIAddVersionKey "FileDescription" "PJDesk remote desktop installer"
+VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "ProductVersion" "${VERSION}"
+VIAddVersionKey "LegalCopyright" "PJDesk"
+VIAddVersionKey "OriginalFilename" "PJDesk-Client-Setup-${VERSION}.exe"
+
 !include "MUI2.nsh"
+!include "StrFunc.nsh"
+${Using:StrFunc} StrStr
 
 !define MUI_ICON "pjdesk.ico"
 !define MUI_UNICON "pjdesk.ico"
@@ -80,13 +94,26 @@ Section "PJDesk (required)" SecCore
   WriteRegStr HKLM "Software\${APPNAME}" "InstallDir" "$INSTDIR"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  ; Auto-update check every 30 minutes, as SYSTEM (short path avoids quoting the spaces).
-  GetFullPathName /SHORT $0 "$INSTDIR\${EXE}"
-  nsExec::Exec 'schtasks /Create /TN "PJDesk Update" /TR "$0 update" /SC MINUTE /MO 30 /RU SYSTEM /RL HIGHEST /F'
+  ; No scheduled task. The service installs updates itself. A task that
+  ; Task Scheduler (svchost) launched was being flagged by Defender.
+  nsExec::Exec 'schtasks /Delete /TN "PJDesk Update" /F'
+  ; UDP 21201 is the direct LAN port. A program rule whose path contains
+  ; spaces often does not apply, so the port rule is explicit.
+  nsExec::Exec 'netsh advfirewall firewall delete rule name="PJDesk LAN"'
+  nsExec::Exec 'netsh advfirewall firewall add rule name="PJDesk LAN" dir=in action=allow protocol=UDP localport=21201 profile=any'
+  nsExec::Exec 'netsh advfirewall firewall delete rule name="PJDesk"'
+  nsExec::Exec 'netsh advfirewall firewall add rule name="PJDesk" dir=in action=allow program="$INSTDIR\${EXE}" enable=yes profile=any'
+  ; Unattended access is the service. Every install, including a silent update,
+  ; installs and starts it. An existing computer-name.txt is left alone; a
+  ; fresh install uses the Windows name until someone renames it in the app.
+  DetailPrint "Installing the PJDesk background service..."
+  ExecWait '"$INSTDIR\${EXE}" service install --firewall'
   ; The new exe restarts the service (several tries) and opens PJDesk in the
   ; signed-in user's session. net start is the fallback if that command is absent.
   nsExec::ExecToLog '"$INSTDIR\${EXE}" update-handoff'
   nsExec::Exec 'net start ${APPNAME}'
+
+  Call RememberNetworkKey
 
   CreateDirectory "$SMPROGRAMS\${APPNAME}"
   CreateShortcut "$SMPROGRAMS\${APPNAME}\PJDesk.lnk" "$INSTDIR\${EXE}"
@@ -108,16 +135,24 @@ Section "Desktop shortcut" SecDesktop
   CreateShortcut "$DESKTOP\PJDesk.lnk" "$INSTDIR\${EXE}"
 SectionEnd
 
-Section /o "Background service (reach this PC at the sign-in screen)" SecService
-  DetailPrint "Installing the PJDesk background service..."
-  ExecWait '"$INSTDIR\${EXE}" service install --firewall'
-SectionEnd
-
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecCore} "The PJDesk app and Start-menu shortcut."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecCore} "The PJDesk app, Start-menu shortcut, and background service (so this PC can be reached at the sign-in screen)."
   !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} "Add a shortcut on the desktop."
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecService} "Run PJDesk from startup as a background service, so you can connect before anyone signs in and during UAC prompts. Needs Administrator rights; a one-time password is shown during setup."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
+
+; If the setup file was renamed to PJDesk-Client-Setup-<version>--pjdesk-net1:<blob>.exe,
+; remember that name beside the installed exe. The blob stays encrypted.
+; The passphrase is not written. The path is not printed.
+Function RememberNetworkKey
+  ${StrStr} $0 $EXEPATH "pjdesk-net1:"
+  StrCmp $0 "" network_key_done
+  ClearErrors
+  FileOpen $1 "$INSTDIR\network-key.name" w
+  IfErrors network_key_done
+  FileWrite $1 $EXEPATH
+  FileClose $1
+  network_key_done:
+FunctionEnd
 
 Section "Uninstall"
   nsExec::Exec 'schtasks /Delete /TN "PJDesk Update" /F'
@@ -129,6 +164,7 @@ Section "Uninstall"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\QUICKSTART.txt"
   Delete "$INSTDIR\uninstall.exe"
+  Delete "$INSTDIR\network-key.name"
   RMDir "$INSTDIR"
 
   Delete "$SMPROGRAMS\${APPNAME}\PJDesk.lnk"

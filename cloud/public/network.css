@@ -1,0 +1,125 @@
+/* My network, on the Account page and the read-only Admin view. */
+#my-network { max-width: 760px; }
+.net-title { font-size: 1.25rem; margin: 4px 0 0; letter-spacing: -0.01em; }
+.net-lead { color: var(--muted); margin: 4px 0 0; }
+.net-card {
+  background: var(--surface, var(--panel));
+  color: inherit;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 20px 22px;
+  margin-top: 16px;
+}
+.net-card h2 { font-size: 1.05rem; margin: 0 0 8px; }
+.net-card h3 { font-size: 0.95rem; margin: 16px 0 8px; }
+.net-card p { margin: 0 0 10px; }
+.net-card label {
+  display: block;
+  font-size: 0.88rem;
+  color: var(--muted);
+  margin: 14px 0 6px;
+}
+.net-card input[type="text"],
+.net-card input[type="email"],
+.net-card input[type="password"],
+.net-card select,
+.net-card textarea,
+.net-dialog input[type="text"],
+.net-dialog input[type="email"],
+.net-dialog input[type="password"],
+.net-dialog select,
+.net-dialog textarea {
+  width: 100%;
+  max-width: 520px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: inherit;
+  font: inherit;
+  padding: 10px 12px;
+  border-radius: 9px;
+  outline: none;
+}
+.net-card input:focus,
+.net-dialog input:focus,
+.net-dialog select:focus,
+.net-dialog textarea:focus { border-color: var(--accent); }
+.net-card .btn,
+.net-dialog .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.95rem;
+  padding: 8px 14px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--surface-2, transparent);
+  color: inherit;
+  cursor: pointer;
+  text-decoration: none;
+}
+.net-card .btn-primary,
+.net-dialog .btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink, var(--on, #fff));
+}
+.net-card .btn-small,
+.net-dialog .btn-small { padding: 6px 10px; font-size: 0.85rem; }
+.net-card .btn-danger,
+.net-dialog .btn-danger { background: #c43b3b; border-color: #c43b3b; color: #fff; }
+.net-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+.net-invite { margin-top: 14px; }
+.net-invite input { flex: 1; width: auto; min-width: 180px; }
+.net-check { display: flex; align-items: center; gap: 10px; color: inherit; margin-top: 16px; }
+.net-switch { position: relative; width: 40px; height: 22px; flex: none; }
+.net-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+.net-switch span {
+  position: absolute; inset: 0; background: #2a313d; border-radius: 22px; cursor: pointer;
+}
+.net-switch span::before {
+  content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
+  background: #fff; border-radius: 50%; transition: transform 0.15s;
+}
+.net-switch input:checked + span { background: var(--green, var(--ok, #3fcf6b)); }
+.net-switch input:checked + span::before { transform: translateX(18px); }
+body.light .net-switch span { background: #c5ced8; }
+.net-kv { display: grid; grid-template-columns: max-content 1fr; gap: 8px 18px; margin: 8px 0 0; }
+.net-kv dt { color: var(--muted); }
+.net-kv dd { margin: 0; overflow-wrap: anywhere; }
+.net-mono { font-family: var(--font-mono, ui-monospace, monospace); font-size: 0.88em; }
+.net-msg { min-height: 1.2em; margin: 8px 0 0; }
+.net-msg.err { color: var(--red, var(--danger)); }
+.net-msg.ok { color: var(--green, var(--ok)); }
+.net-muted { color: var(--muted); }
+.net-key { display: flex; flex-direction: column; gap: 4px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.net-card table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+.net-card th, .net-card td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.net-card th { color: var(--muted); font-weight: 600; font-size: 0.82rem; }
+.net-modal {
+  position: fixed; inset: 0; z-index: 30;
+  background: rgba(8, 10, 14, 0.55);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.net-dialog {
+  width: min(520px, 100%);
+  max-height: min(90vh, 720px);
+  overflow: auto;
+  background: var(--surface, var(--panel));
+  color: var(--fg, var(--text));
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+.net-dialog h2 { margin: 0; font-size: 1.15rem; }
+.net-dialog label { display: flex; flex-direction: column; gap: 4px; font-size: 0.88rem; color: var(--muted); }
+.net-dialog .net-row input { flex: 1; width: auto; max-width: none; }
+#nk-qr { background: #fff; border-radius: 8px; padding: 8px; align-self: flex-start; }
+.net-dialog textarea { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; max-width: none; }

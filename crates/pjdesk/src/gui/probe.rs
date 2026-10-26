@@ -77,6 +77,56 @@ fn sample(update_task: Option<bool>) -> ProbeSnap {
     ProbeSnap { installed, running, update_task, svc }
 }
 
+/// Missed service checks required before the window registers, after the
+/// service has been seen running. One miss must not start a second registrar.
+pub const SERVICE_DOWN_POLLS: u32 = 2;
+
+/// Who should register this computer after one service-status sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostDuty {
+    pub service_running: bool,
+    pub down_polls: u32,
+    /// The window should have its own host after this sample.
+    pub window_hosts: bool,
+}
+
+/// The service keeps the registration only when its status is fresh and online,
+/// and the server it registered with is the one this window is using.
+/// An empty server name is an older status file and still counts.
+pub fn service_holds_registration(hosting: bool, status_server: &str, expected_server: &str) -> bool {
+    if !hosting {
+        return false;
+    }
+    let got = status_server.trim();
+    if got.is_empty() {
+        return true;
+    }
+    got.eq_ignore_ascii_case(expected_server.trim())
+}
+
+/// The first sample starts the window immediately when the service is not
+/// registered. After the service has been seen hosting, [`SERVICE_DOWN_POLLS`]
+/// consecutive misses are required. `sample_hosting` is true only when the
+/// service status file is fresh and says this computer is online. Service
+/// Control Manager "Running" is not enough.
+pub fn host_duty(ready: bool, service_running: bool, down_polls: u32, sample_hosting: bool) -> HostDuty {
+    if !ready {
+        return HostDuty { service_running: sample_hosting, down_polls: 0, window_hosts: !sample_hosting };
+    }
+    if sample_hosting {
+        return HostDuty { service_running: true, down_polls: 0, window_hosts: false };
+    }
+    if !service_running {
+        return HostDuty { service_running: false, down_polls: 0, window_hosts: true };
+    }
+    let polls = down_polls.saturating_add(1);
+    if polls >= SERVICE_DOWN_POLLS {
+        HostDuty { service_running: false, down_polls: polls, window_hosts: true }
+    } else {
+        HostDuty { service_running: true, down_polls: polls, window_hosts: false }
+    }
+}
+
 fn probe_loop(cmd: Receiver<ProbeCmd>, tx: Sender<ProbeSnap>, ctx: egui::Context) {
     let mut update_task = None;
     loop {
@@ -100,5 +150,59 @@ fn probe_loop(cmd: Receiver<ProbeCmd>, tx: Sender<ProbeSnap>, ctx: egui::Context
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_down_starts_window() {
+        let first_down = host_duty(false, false, 0, false);
+        assert!(first_down.window_hosts, "the first sample starts the window when the service is down");
+        assert!(!first_down.service_running);
+
+        let first_up = host_duty(false, false, 0, true);
+        assert!(!first_up.window_hosts);
+        assert!(first_up.service_running);
+
+        let one_miss = host_duty(true, true, 0, false);
+        assert_eq!(one_miss.down_polls, 1);
+        assert!(one_miss.service_running);
+        assert!(!one_miss.window_hosts, "one missed check must not start a second registrar");
+
+        let two_miss = host_duty(true, true, one_miss.down_polls, false);
+        assert_eq!(two_miss.down_polls, SERVICE_DOWN_POLLS);
+        assert!(!two_miss.service_running);
+        assert!(two_miss.window_hosts);
+
+        let back = host_duty(true, false, two_miss.down_polls, true);
+        assert!(back.service_running);
+        assert_eq!(back.down_polls, 0);
+        assert!(!back.window_hosts);
+    }
+
+    #[test]
+    fn the_window_yields_only_when_the_service_is_actually_online() {
+        let mut stale = ServiceStatus::default();
+        stale.online = true;
+        assert!(!stale.is_hosting());
+        let still = host_duty(true, false, 0, stale.is_hosting());
+        assert!(still.window_hosts, "a service process with no fresh registration does not take over");
+
+        let fresh = ServiceStatus::now(Some("692996394".into()), true, None, None, false);
+        assert!(fresh.is_hosting());
+        let yielded = host_duty(true, false, 0, fresh.is_hosting());
+        assert!(!yielded.window_hosts);
+        assert!(yielded.service_running);
+    }
+
+    #[test]
+    fn the_window_takes_over_when_the_service_registered_somewhere_else() {
+        assert!(service_holds_registration(true, "", "pjdesk.spader.us:21200"));
+        assert!(service_holds_registration(true, "pjdesk.spader.us:21200", "PJDESK.SPADER.US:21200"));
+        assert!(!service_holds_registration(true, "192.168.1.50:21200", "pjdesk.spader.us:21200"));
+        assert!(!service_holds_registration(false, "pjdesk.spader.us:21200", "pjdesk.spader.us:21200"));
     }
 }

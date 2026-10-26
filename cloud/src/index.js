@@ -5,6 +5,9 @@
 //   auth_key = HMAC-SHA256(master, "pjdesk-cloud-auth")      → sent to sign in
 //   sync_key = HMAC-SHA256(master, "pjdesk-cloud-sync-key")  → stays on the server,
 //              seals the server copy (ChaCha20-Poly1305) before upload
+//   vault_key = HMAC-SHA256(master, "pjdesk-cloud-password-vault") → stays on the
+//              device. It seals saved computer passwords. The service stores
+//              only that ciphertext, never the key.
 // The service stores a salted PBKDF2 hash of auth_key and the sealed bytes.
 //
 // Routes:
@@ -31,6 +34,7 @@
 // Everything else is the static website in ./public.
 
 import { effectivePlan, isPlan } from "./plans.js";
+import { route as networkRoute } from "./network.js";
 
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 const AUTH_HASH_ITERATIONS = 100000; // the Workers PBKDF2 maximum
@@ -207,6 +211,9 @@ async function api(request, env, url, ctx) {
   const p = url.pathname;
   const m = request.method;
   if (p === "/api/health") return json({ ok: true });
+  if (p === "/api/ip" && (m === "GET" || m === "HEAD")) {
+    return json({ ip: request.headers.get("cf-connecting-ip") || "" });
+  }
   if (p === "/api/signup" && m === "POST") return signup(request, env);
   if (p === "/api/login" && m === "POST") return login(request, env);
   if (p === "/api/logout" && m === "POST") return logout(request, env);
@@ -222,6 +229,11 @@ async function api(request, env, url, ctx) {
   if (p === "/api/admin/audit" && m === "GET") return adminAudit(request, env);
   if (p === "/api/admin/plan" && m === "POST") return adminSetPlan(request, env);
   if (p === "/api/admin/sync" && m === "POST") return adminSetSync(request, env);
+  // Signed-in account, then the network owner. Not a site-admin check.
+  if (p.startsWith("/api/network") || p.startsWith("/api/support")) {
+    const handled = await networkRoute(request, env, url);
+    if (handled) return handled;
+  }
   if (p === "/api/release" && m === "GET") {
     return json(await latestRelease(env), 200, { "cache-control": "public, max-age=300" });
   }
@@ -447,6 +459,7 @@ async function syncHealthPut(request, env) {
     epoch: Number.isFinite(body.epoch) ? body.epoch : 0,
     healthy: !!body.healthy,
     at: now(),
+    maintenance_until: Number.isFinite(body.maintenance_until) ? body.maintenance_until : 0,
   };
   await env.SYNC.put(healthKey(s.accountId, record.instance), JSON.stringify(record), {
     httpMetadata: { contentType: "application/json" },
@@ -674,12 +687,27 @@ async function adminSetSync(request, env) {
 const RELEASE_TTL_MS = 10 * 60 * 1000;
 let releaseMemo = null; // { info, at } — kept for the life of this Worker instance
 
-function releaseInfo(repo, tag) {
+async function assetExists(url) {
+  try {
+    const res = await fetch(url, { method: "HEAD", redirect: "manual", headers: { "user-agent": "pjdesk-cloud" } });
+    return res.status === 200 || res.status === 301 || res.status === 302;
+  } catch {
+    return false;
+  }
+}
+
+async function releaseInfo(repo, tag) {
   const version = tag.replace(/^v/, "");
   const base = `https://github.com/${repo}/releases/download/${tag}`;
+  const clientNew = `${base}/PJDesk-Client-Setup-${version}.exe`;
+  const clientOld = `${base}/PJDesk-Setup-${version}.exe`;
+  // HEAD the release asset. Do not call the GitHub API: that limit is shared
+  // by every Worker on this Cloudflare address. 200 or 302 means the file is there.
+  let client = clientNew;
+  if (!(await assetExists(clientNew)) && (await assetExists(clientOld))) client = clientOld;
   return {
     version,
-    client: `${base}/PJDesk-Setup-${version}.exe`,
+    client,
     server: `${base}/PJDesk-Server-Setup-${version}.exe`,
     sums: `${base}/SHA256SUMS`,
     notes: `https://github.com/${repo}/releases/tag/${tag}`,
@@ -727,7 +755,7 @@ async function latestRelease(env) {
     if (releaseMemo) return releaseMemo.info; // stale is better than nothing
     throw new HttpError(502, "Couldn't reach GitHub for the latest release.");
   }
-  const info = releaseInfo(env.RELEASE_REPO, tag);
+  const info = await releaseInfo(env.RELEASE_REPO, tag);
   releaseMemo = { info, at: Date.now() };
   return info;
 }

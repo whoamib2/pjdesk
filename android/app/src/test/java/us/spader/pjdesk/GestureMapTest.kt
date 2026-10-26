@@ -5,6 +5,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import us.spader.pjdesk.input.GestureMap
+import us.spader.pjdesk.input.PictureView
 import us.spader.pjdesk.input.PointerSession
 import us.spader.pjdesk.input.StrokeTracker
 
@@ -96,15 +97,75 @@ class GestureMapTest {
         val desktop = PointerSession(android = false)
         desktop.down(0, listOf(1000 to 1000))
         val moved = desktop.move(listOf((1000 + GestureMap.MOVE_THRESHOLD + 5) to 1000))
-        assertTrue(moved.any { it is PointerSession.Out.Mouse && it.kind == "down" })
+        assertTrue(moved.none { it is PointerSession.Out.Mouse && it.kind == "down" })
         assertTrue(moved.any { it is PointerSession.Out.Mouse && it.kind == "move" })
-        val release = desktop.up(300)
-        assertEquals("up", (release.single() as PointerSession.Out.Mouse).kind)
+        assertTrue(desktop.up(300).none { it is PointerSession.Out.Mouse && it.kind == "down" })
+
+        val locked = PointerSession(android = false)
+        locked.dragLock = true
+        locked.down(0, listOf(1000 to 1000))
+        val held = locked.move(listOf((1000 + GestureMap.MOVE_THRESHOLD + 5) to 1000))
+        assertTrue(held.any { it is PointerSession.Out.Mouse && it.kind == "down" })
+        assertEquals("up", (locked.up(300).single() as PointerSession.Out.Mouse).kind)
+
+        val armed = PointerSession(android = false)
+        armed.armDrag()
+        armed.down(0, listOf(1000 to 1000))
+        val armedMove = armed.move(listOf((1000 + GestureMap.MOVE_THRESHOLD + 5) to 1000))
+        assertTrue(armedMove.any { it is PointerSession.Out.Mouse && it.kind == "down" })
+
+        val touch = PointerSession(android = false, trackpad = false)
+        touch.down(0, listOf(1000 to 1000))
+        val touched = touch.move(listOf((1000 + GestureMap.MOVE_THRESHOLD + 5) to 1000))
+        assertTrue(touched.any { it is PointerSession.Out.Mouse && it.kind == "down" })
 
         val click = PointerSession(android = false)
         click.down(0, listOf(4000 to 4000))
         val pressed = click.up(40)
         assertEquals(listOf("down", "up"), pressed.map { (it as PointerSession.Out.Mouse).kind })
+    }
+
+    @Test
+    fun twoFingerTapIsALongPressAndThreeFingersAreMiddle() {
+        val phone = PointerSession(android = true)
+        phone.down(0, listOf(1000 to 1000, 1200 to 1200))
+        val right = phone.up(80).filterIsInstance<PointerSession.Out.Gesture>().single()
+        assertEquals(GestureMap.LONG_PRESS, right.gesture.kind)
+
+        val pad = PointerSession(android = false)
+        pad.down(0, listOf(1 to 1, 2 to 2, 3 to 3))
+        val middle = pad.up(40).filterIsInstance<PointerSession.Out.Mouse>()
+        assertEquals(listOf("down", "up"), middle.map { it.kind })
+        assertTrue(middle.all { it.button == "middle" })
+    }
+
+    @Test
+    fun fitScaleMapsTheCenterAndZoomKeepsItUnderTheFinger() {
+        val center = PictureView.screenToNorm(1920, 1080, 1920, 1080, PictureView.fit(), 960f, 540f)
+        assertTrue(center!!.first in 32000..33500)
+        val zoomed = PictureView.zoomAbout(1920, 1080, 1920, 1080, PictureView.fit(), 960f, 540f, 2f)
+        assertTrue(zoomed.scale > 1.5f)
+        val again = PictureView.screenToNorm(1920, 1080, 1920, 1080, zoomed, 960f, 540f)
+        assertTrue(again!!.first in 32000..33500)
+        assertEquals(1f, PictureView.fit().scale, 0.01f)
+        assertTrue(PictureView.oneToOne(1920, 480) > 3f)
+    }
+
+    @Test
+    fun fasterScrollSendsALargerWheelAndInvertFlipsIt() {
+        val pointer = PointerSession(android = false, trackpad = true)
+        pointer.scrollSpeed = 2f
+        pointer.down(0, listOf(100 to 1000, 120 to 1000))
+        val wheel = pointer.move(listOf(100 to 3000, 120 to 3000))
+            .filterIsInstance<PointerSession.Out.Mouse>()
+            .first { it.kind == "wheel" }
+        assertEquals(-240, wheel.dy)
+        pointer.invertScroll = true
+        pointer.down(10, listOf(100 to 1000, 120 to 1000))
+        val flipped = pointer.move(listOf(100 to 3000, 120 to 3000))
+            .filterIsInstance<PointerSession.Out.Mouse>()
+            .first { it.kind == "wheel" }
+        assertEquals(240, flipped.dy)
     }
 
     @Test
@@ -128,5 +189,24 @@ class GestureMapTest {
         assertEquals("Use at least 8 characters.", us.spader.pjdesk.core.permanentIssue("short", "short"))
         assertEquals("Those passwords do not match.", us.spader.pjdesk.core.permanentIssue("12345678", "12345679"))
         assertNull(us.spader.pjdesk.core.permanentIssue("12345678", "12345678"))
+        assertEquals(
+            "At least 8 characters. This is not your PJDesk account password.",
+            us.spader.pjdesk.core.permanentHint(""),
+        )
+        assertEquals("Use at least 8 characters.", us.spader.pjdesk.core.permanentHint("short"))
+        assertEquals("Long enough. A longer password is harder to guess.", us.spader.pjdesk.core.permanentHint("12345678"))
+        assertEquals("That is a strong length.", us.spader.pjdesk.core.permanentHint("123456789012"))
+        assertEquals(
+            "Off. Open Accessibility and turn PJDesk on.",
+            us.spader.pjdesk.core.controlStatus(false, false),
+        )
+        assertEquals(
+            "Listed in Accessibility, but not running. Turn PJDesk off and on again.",
+            us.spader.pjdesk.core.controlStatus(true, false),
+        )
+        assertEquals(
+            "On. A computer can tap, type, and use the buttons.",
+            us.spader.pjdesk.core.controlStatus(true, true),
+        )
     }
 }

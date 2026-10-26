@@ -6,17 +6,20 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use pjdesk_proto::discover::{self, LanBeacon};
 use pjdesk_proto::{DIRECT_PORT, DISCOVERY_PORT, PROTOCOL_VERSION};
 use tracing::{info, warn};
 
-use super::{approve, ctrl, stream, HostState};
+use pjdesk_link::session::{LockedOut, NeedsApproval};
+
+use super::{ctrl, stream, HostState, ASK_SLOT};
 use crate::p2p;
-use crate::session::{self, WrongPassword};
+use crate::session::{self, Authenticated, WrongPassword};
 
 pub async fn serve(state: Arc<HostState>) -> Result<()> {
     let socket = std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], DIRECT_PORT)))?;
@@ -36,6 +39,8 @@ pub async fn serve(state: Arc<HostState>) -> Result<()> {
             if let Err(e) = one(state, incoming).await {
                 if e.is::<WrongPassword>() {
                     warn!("Direct connection used a wrong password");
+                } else if e.is::<LockedOut>() {
+                    warn!("Direct connection locked out: {e}");
                 } else {
                     warn!("Direct connection ended: {e:#}");
                 }
@@ -49,15 +54,44 @@ async fn one(state: Arc<HostState>, incoming: quinn::Incoming) -> Result<()> {
     let connection = incoming.await?;
     let attempt = Arc::new(AtomicBool::new(false));
     let passwords = state.auth_passwords();
-    let auth = session::host_auth(&connection, &passwords, &state.name, &attempt).await?;
-    state.reset_failures();
+    let permanent = state.permanent.lock().unwrap().clone();
     let ip = connection.remote_address().to_string();
-    let Some((mut ceiling, receive_dir)) = approve(&state, &auth.peer_name, &ip).await else {
-        connection.close(3u32.into(), b"declined");
-        return Ok(());
+    let source = pjdesk_link::lockout::source_key(connection.remote_address().ip(), None, None, None, &ip);
+    let locked = state.lockout.lock().unwrap().check(&source, std::time::Instant::now());
+    if locked.locked {
+        state.log_lock(&source, &locked);
+        session::refuse_before_password(&connection, &pjdesk_link::lockout::message(locked.minutes)).await?;
+        anyhow::bail!("{}", pjdesk_link::lockout::message(locked.minutes));
+    }
+    let fail_state = state.clone();
+    let fail_source = source.clone();
+    let fail = move || fail_state.note_wrong_password(&fail_source);
+    let mut auth = match session::host_auth(&connection, &passwords, &state.name, &attempt, &fail).await {
+        Ok(auth) => auth,
+        Err(e) if e.is::<NeedsApproval>() => {
+            let wait = e.downcast::<NeedsApproval>().unwrap();
+            Authenticated {
+                send: wait.send,
+                recv: wait.recv,
+                peer_name: wait.peer_name,
+                peer_proto: wait.peer_proto,
+                password_slot: ASK_SLOT,
+            }
+        }
+        Err(e) => return Err(e),
     };
+    if auth.password_slot != ASK_SLOT {
+        state.note_success(&source);
+    }
+    let peer_name = auth.peer_name.clone();
+    let (mut ceiling, receive_dir) =
+        super::open_session(&state, &mut auth, &passwords, permanent.as_deref(), &peer_name, &ip, false).await?;
     if state.streaming.swap(true, Ordering::SeqCst) {
-        connection.close(2u32.into(), b"another controller is already connected");
+        let message = "another controller is already connected";
+        warn!("Password was accepted, then the direct session stopped: {message}");
+        let _ = pjdesk_proto::framing::write_msg(&mut auth.send, &pjdesk_proto::peer::HostMsg::Notice(message.into()))
+            .await;
+        connection.close(2u32.into(), message.as_bytes());
         return Ok(());
     }
     if let Some(shared) = &state.shared {
@@ -80,13 +114,44 @@ async fn one(state: Arc<HostState>, incoming: quinn::Incoming) -> Result<()> {
         tunnel_ports: ports,
         receive_dir,
     };
-    let result = stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
+    info!("Password accepted for \"{}\" on UDP {}. Starting the picture.", grant.peer_name, pjdesk_proto::DIRECT_PORT);
+    if state.args.service_host {
+        info!("Host log: C:\\ProgramData\\PJDesk\\service\\service.log");
+    } else {
+        info!("Host log: %APPDATA%\\PJDesk\\pjdesk.log");
+    }
+    let result =
+        stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
     state.streaming.store(false, Ordering::SeqCst);
+    state.fresh_support();
     if let Some(shared) = &state.shared {
         *shared.connected.lock().unwrap() = None;
     }
     connection.close(0u32.into(), b"session over");
     result
+}
+
+/// File the window writes when LAN discovery is turned off.
+/// The service host reads it, so announcing stops without a service restart.
+pub fn lan_opt_out_path() -> std::path::PathBuf {
+    crate::syspaths::service_dir().join("lan-discovery.off")
+}
+
+/// Writes or removes the opt-out flag. `on` means this computer may be found.
+pub fn set_lan_discovery(on: bool) {
+    let path = lan_opt_out_path();
+    if on {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, b"off\n");
+}
+
+fn discovery_opted_out() -> bool {
+    lan_opt_out_path().is_file()
 }
 
 async fn announce(state: Arc<HostState>) {
@@ -95,6 +160,10 @@ async fn announce(state: Arc<HostState>) {
     let dest = SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT));
     loop {
         tokio::time::sleep(Duration::from_secs(3)).await;
+        // Name, id, port, and certificate fingerprint only. Never a password.
+        if !discover::announce_now(discovery_opted_out(), state.args.discover_lan, &discover::private_ipv4s()) {
+            continue;
+        }
         let id = state.device_id.lock().unwrap().clone();
         if id.is_empty() {
             continue;
@@ -112,7 +181,9 @@ async fn announce(state: Arc<HostState>) {
     }
 }
 
-/// Listens for LAN beacons for a few seconds. Used by the connect screen.
+/// Listens for LAN beacons for a few seconds.
+/// The window uses [`listen_discovered`] instead, so this stays for a short scan.
+#[allow(dead_code)]
 pub fn discover_for(limit: Duration) -> Vec<(LanBeacon, SocketAddr)> {
     let socket = match std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], DISCOVERY_PORT))) {
         Ok(s) => s,
@@ -126,9 +197,13 @@ pub fn discover_for(limit: Duration) -> Vec<(LanBeacon, SocketAddr)> {
     while std::time::Instant::now() < deadline {
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => {
+                if !discover::accept_lan_ip(src.ip()) {
+                    continue;
+                }
                 if let Ok(beacon) = discover::decode(&buf[..n]) {
-                    if !found.iter().any(|(b, _): &(LanBeacon, SocketAddr)| b.id == beacon.id && b.fingerprint == beacon.fingerprint)
-                    {
+                    if !found.iter().any(|(b, _): &(LanBeacon, SocketAddr)| {
+                        b.id == beacon.id && b.fingerprint == beacon.fingerprint
+                    }) {
                         found.push((beacon, src));
                     }
                 }
@@ -138,4 +213,91 @@ pub fn discover_for(limit: Duration) -> Vec<(LanBeacon, SocketAddr)> {
         }
     }
     found
+}
+
+struct SeenPeer {
+    name: String,
+    id: String,
+    addr: String,
+    seen: Instant,
+}
+
+/// Listens on the discovery port until `stop` is set.
+/// Sends the current list when it changes. Public senders are dropped.
+/// The packets are not logged.
+pub fn listen_discovered(stop: Arc<AtomicBool>, tx: Sender<Vec<(String, String, String)>>) {
+    while !stop.load(Ordering::Relaxed) {
+        let socket = match std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], DISCOVERY_PORT))) {
+            Ok(socket) => socket,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+        if !collect_beacons(&socket, &stop, &tx) && stop.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+}
+
+fn collect_beacons(
+    socket: &std::net::UdpSocket,
+    stop: &AtomicBool,
+    tx: &Sender<Vec<(String, String, String)>>,
+) -> bool {
+    let mut peers: Vec<SeenPeer> = Vec::new();
+    let mut buf = [0u8; 512];
+    while !stop.load(Ordering::Relaxed) {
+        let mut changed = false;
+        match socket.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                if !discover::accept_lan_ip(src.ip()) {
+                    continue;
+                }
+                if n >= 8 && &buf[..8] == pjdesk_proto::discover::SERVER_MAGIC {
+                    if let Ok(server) = discover::decode_server(&buf[..n]) {
+                        if let std::net::IpAddr::V4(ip) = src.ip() {
+                            discover::note_server_beacon(
+                                std::net::SocketAddr::from((ip, server.port)),
+                                server.fingerprint,
+                                server.role,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                let Ok(beacon) = discover::decode(&buf[..n]) else { continue };
+                let mut addr = src;
+                addr.set_port(beacon.port);
+                let name = if beacon.name.is_empty() { "Computer".to_string() } else { beacon.name };
+                let addr = addr.to_string();
+                if let Some(have) = peers.iter_mut().find(|peer| peer.id == beacon.id) {
+                    have.seen = Instant::now();
+                    if have.name != name || have.addr != addr {
+                        have.name = name;
+                        have.addr = addr;
+                        changed = true;
+                    }
+                } else {
+                    peers.push(SeenPeer { name, id: beacon.id, addr, seen: Instant::now() });
+                    changed = true;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return true,
+        }
+        let before = peers.len();
+        peers.retain(|peer| peer.seen.elapsed() < Duration::from_secs(12));
+        if peers.len() != before {
+            changed = true;
+        }
+        if changed {
+            let rows = peers.iter().map(|peer| (peer.name.clone(), peer.id.clone(), peer.addr.clone())).collect();
+            if tx.send(rows).is_err() {
+                return false;
+            }
+        }
+    }
+    false
 }

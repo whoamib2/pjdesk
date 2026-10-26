@@ -51,8 +51,27 @@ pub struct ServiceStatus {
     /// Last measured round-trip to the server, in milliseconds. 0 means unknown.
     #[serde(default)]
     pub rtt_ms: u64,
+    /// `LAN` or `Internet` once the service has reached the server.
+    #[serde(default)]
+    pub reach: String,
     #[serde(default)]
     pub updated_unix: u64,
+    /// Temporary 8-digit support code. Empty until the service has made one.
+    #[serde(default)]
+    pub support_code: String,
+    /// Temporary password that matches the support code. Not the permanent one.
+    #[serde(default)]
+    pub support_password: String,
+    /// Unix time the support pair was created. 0 until the first pair.
+    #[serde(default)]
+    pub support_born_unix: u64,
+    /// Unix time of the last Register or Pong from the server. 0 if this file
+    /// was written by an older service.
+    #[serde(default)]
+    pub acked_unix: u64,
+    /// Server address the service registered with. Empty on an older file.
+    #[serde(default)]
+    pub server: String,
 }
 
 impl ServiceStatus {
@@ -70,8 +89,31 @@ impl ServiceStatus {
             password,
             permanent_set,
             rtt_ms: 0,
+            reach: String::new(),
             updated_unix: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            support_code: String::new(),
+            support_password: String::new(),
+            support_born_unix: 0,
+            acked_unix: 0,
+            server: String::new(),
         }
+    }
+
+    /// The ack time to show. An older service file has no ack stamp; its
+    /// rewrite time is used only while it still says online and names no server.
+    pub fn ack_stamp(&self) -> u64 {
+        if self.acked_unix > 0 {
+            self.acked_unix
+        } else if self.online && self.server.trim().is_empty() {
+            self.updated_unix
+        } else {
+            0
+        }
+    }
+
+    /// The service has a recent server ack and the status file is still fresh.
+    pub fn registration_fresh(&self, now: u64) -> bool {
+        self.is_fresh() && pjdesk_proto::registration_acked(self.online, self.ack_stamp(), now)
     }
 
     pub fn load() -> Option<Self> {
@@ -95,5 +137,42 @@ impl ServiceStatus {
     pub fn is_fresh(&self) -> bool {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         now.saturating_sub(self.updated_unix) < 10
+    }
+
+    /// The service process is up and this computer is registered through it.
+    /// Service Control Manager "Running" is not enough: the helper can be
+    /// alive while its host thread has stopped.
+    pub fn is_hosting(&self) -> bool {
+        self.is_fresh() && self.online
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosting_requires_a_fresh_online_status() {
+        let mut status = ServiceStatus::now(Some("692996394".into()), true, None, None, false);
+        assert!(status.is_hosting());
+        status.online = false;
+        assert!(!status.is_hosting(), "a fresh file that is not online is not hosting");
+        status.online = true;
+        status.updated_unix = 0;
+        assert!(!status.is_hosting(), "a stale file is not hosting");
+    }
+
+    #[test]
+    fn an_old_online_file_counts_and_a_named_server_needs_an_ack() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut old = ServiceStatus::now(Some("902488771".into()), true, None, None, false);
+        assert!(old.registration_fresh(now), "a fresh online file from an older service still counts");
+        old.server = "pjdesk.spader.us:21200".into();
+        old.acked_unix = 0;
+        assert!(!old.registration_fresh(now), "a named server with no ack is not online");
+        old.acked_unix = now;
+        assert!(old.registration_fresh(now));
+        old.acked_unix = now.saturating_sub(120);
+        assert!(!old.registration_fresh(now));
     }
 }
