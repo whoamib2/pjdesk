@@ -274,6 +274,106 @@ pub fn keep_saved_status(has_standby: bool, acked_recently: bool) -> bool {
     has_standby && acked_recently
 }
 
+/// How long a planned update or restart asks the standby to keep waiting.
+pub const MAINTENANCE_HOLD_SECS: u64 = 15 * 60;
+
+/// This server is the primary for the current generation.
+///
+/// A server that stepped down stays standby. Once a generation is recorded,
+/// a server that still wants to be primary does not accept hosts when a
+/// different instance owns that generation. A generation of zero keeps the
+/// older desired-role rule so a server that has not fenced yet is not locked out.
+pub fn generation_is_primary(
+    desired: &str,
+    epoch: u64,
+    active_instance: &str,
+    mine: &str,
+    fenced_epoch: u64,
+    fenced_instance: &str,
+    connected: bool,
+) -> bool {
+    if epoch_fences(epoch, fenced_epoch, fenced_instance, mine) {
+        return false;
+    }
+    if desired == "standby" {
+        return false;
+    }
+    if epoch > 0 && !active_instance.is_empty() && active_instance != mine {
+        return false;
+    }
+    if desired == "active" {
+        return true;
+    }
+    if !active_instance.is_empty() && active_instance == mine {
+        return true;
+    }
+    if !active_instance.is_empty() {
+        return false;
+    }
+    connected
+}
+
+pub fn same_computer_name(a: &str, b: &str) -> bool {
+    let a = a.trim();
+    let b = b.trim();
+    !a.is_empty() && a.eq_ignore_ascii_case(b)
+}
+
+/// True when a health row is this computer, including an older instance id.
+pub fn is_same_party(instance: &str, name: &str, mine_instance: &str, mine_name: &str) -> bool {
+    (!instance.is_empty() && instance == mine_instance) || same_computer_name(name, mine_name)
+}
+
+/// A different computer that published a version. An old row for this computer
+/// is not the peer, and a row with no version is not shown.
+pub fn counts_as_other_server(instance: &str, name: &str, version: &str, mine_instance: &str, mine_name: &str) -> bool {
+    !is_same_party(instance, name, mine_instance, mine_name) && !version.trim().is_empty()
+}
+
+/// Role word for the other server, from this server's generation.
+pub fn peer_role_label(we_are_primary: bool) -> &'static str {
+    if we_are_primary { "standby" } else { "active" }
+}
+
+/// Cloud health plus a maintenance hold. A primary that announced a planned
+/// restart stays "fresh" until that deadline, even when its last stamp is old.
+pub fn confirming_path(read_ok: bool, newest_other_at: Option<u64>, maintenance_until: u64, now: u64) -> SecondPath {
+    if maintenance_until > now {
+        return SecondPath::Fresh;
+    }
+    second_path(read_ok, newest_other_at, now)
+}
+
+/// Remember an unhealthy primary until this instant.
+pub fn unhealthy_hold_until(at: u64) -> u64 {
+    at.saturating_add(MAINTENANCE_HOLD_SECS)
+}
+
+/// This computer's row is online when it is registered, or when the current
+/// primary says it is.
+pub fn own_row_online(registered: bool, primary_says_online: bool) -> bool {
+    registered || primary_says_online
+}
+
+/// The account's published primary replaces a saved hostname when it names a
+/// different server. The same endpoint keeps a hostname over a raw IP.
+pub fn follow_primary(current: &str, published: &str) -> String {
+    let published = published.trim();
+    let current = current.trim();
+    if published.is_empty() {
+        return current.to_string();
+    }
+    if same_server(current, published) && host_is_name(current) && !host_is_name(published) {
+        return current.to_string();
+    }
+    published.to_string()
+}
+
+fn host_is_name(address: &str) -> bool {
+    let (host, _) = host_port(address);
+    !host.is_empty() && host.parse::<std::net::IpAddr>().is_err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +489,42 @@ mod tests {
         assert!(keep_saved_status(true, true));
         assert!(!keep_saved_status(true, false));
         assert!(!keep_saved_status(false, true));
+    }
+
+    #[test]
+    fn the_generation_owner_is_primary_and_a_stepped_down_server_stays_standby() {
+        assert!(generation_is_primary("active", 0, "other", "mine", 0, "", false));
+        assert!(!generation_is_primary("active", 5, "other", "mine", 0, "", true));
+        assert!(generation_is_primary("active", 5, "mine", "mine", 0, "", false));
+        assert!(!generation_is_primary("standby", 5, "mine", "mine", 0, "", true));
+        assert!(generation_is_primary("", 4, "mine", "mine", 0, "", false));
+        assert!(!generation_is_primary("", 0, "other", "mine", 0, "", true));
+        assert!(generation_is_primary("", 0, "", "mine", 0, "", true));
+        assert!(!generation_is_primary("", 0, "", "mine", 0, "", false));
+        assert!(!generation_is_primary("active", 4, "mine", "mine", 5, "other", true));
+    }
+
+    #[test]
+    fn the_peer_is_a_different_computer_and_a_planned_restart_stays_fresh() {
+        assert!(same_computer_name("CHIP20", "chip20"));
+        assert!(is_same_party("old-instance", "BENLENOVODESK", "new-instance", "benlenovodesk"));
+        assert!(!counts_as_other_server("old", "CHIP20", "0.6.40", "new", "CHIP20"));
+        assert!(!counts_as_other_server("other", "LENOVO", "", "mine", "CHIP20"));
+        assert!(counts_as_other_server("other", "BENLENOVODESK", "0.6.44", "mine", "CHIP20"));
+        assert_eq!(peer_role_label(true), "standby");
+        assert_eq!(peer_role_label(false), "active");
+        assert_eq!(confirming_path(true, Some(1_000), 2_000, 1_050), SecondPath::Fresh);
+        assert_eq!(confirming_path(true, Some(1_000), 0, 1_020), SecondPath::Stale);
+        assert_eq!(unhealthy_hold_until(1_000), 1_000 + MAINTENANCE_HOLD_SECS);
+    }
+
+    #[test]
+    fn a_new_primary_address_replaces_the_old_name_and_this_computer_is_online_when_registered() {
+        assert_eq!(follow_primary("pjdesk.spader.us:21200", "204.248.122.44:21200"), "204.248.122.44:21200");
+        assert_eq!(follow_primary("pjdesk.spader.us:21200", ""), "pjdesk.spader.us:21200");
+        assert_eq!(follow_primary("pjdesk.spader.us:21200", "pjdesk.spader.us"), "pjdesk.spader.us");
+        assert!(own_row_online(true, false));
+        assert!(own_row_online(false, true));
+        assert!(!own_row_online(false, false));
     }
 }

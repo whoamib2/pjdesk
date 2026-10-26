@@ -439,6 +439,7 @@ pub fn install_if_planned(data_dir: &Path, manual: bool) -> Result<String> {
         }
         Plan::Install => {
             tracing::info!("server update: installing {}", update.version);
+            crate::cloud::announce_maintenance(data_dir);
             match pjdesk_proto::update::install_available(&update) {
                 Ok(()) => {
                     record(data_dir, &format!("Installing {}", update.version), &update.version, "");
@@ -534,6 +535,7 @@ mod tests {
             epoch,
             healthy: true,
             at,
+            maintenance_until: 0,
         }
     }
 

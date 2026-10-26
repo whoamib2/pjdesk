@@ -32,16 +32,52 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.computerTitle
 import us.spader.pjdesk.core.savedSubtitle
+import us.spader.pjdesk.core.shownAppVersion
+import us.spader.pjdesk.core.versionBehind
 import us.spader.pjdesk.core.tileCaption
 import us.spader.pjdesk.core.tileKey
 import us.spader.pjdesk.core.tileRgb
+
+private fun versioned(computer: SavedComputer, mine: Boolean, selfVersion: String): SavedComputer {
+    if (!mine || computer.appVersion.isNotBlank() || selfVersion.isBlank()) return computer
+    return computer.copy(appVersion = selfVersion)
+}
+
+@Composable
+private fun VersionSubtitle(computer: SavedComputer, mine: Boolean, latestRelease: String) {
+    val text = savedSubtitle(computer, mine = mine)
+    val version = shownAppVersion(computer.appVersion)
+    val behind = versionBehind(computer.appVersion, latestRelease)
+    if (!behind || !text.endsWith(version)) {
+        Text(
+            text,
+            color = pjMuted(),
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        return
+    }
+    Text(
+        buildAnnotatedString {
+            withStyle(SpanStyle(color = pjMuted())) { append(text.removeSuffix(version)) }
+            withStyle(SpanStyle(color = pjWarn())) { append(version) }
+        },
+        style = MaterialTheme.typography.bodySmall,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
 
 fun computerTileColor(computer: SavedComputer): Color {
     val rgb = tileRgb(tileKey(computer.id, computer.hostname))
@@ -156,8 +192,11 @@ fun ComputerRow(
     onRename: () -> Unit = {},
     onRemovePassword: () -> Unit = {},
     onForget: () -> Unit = {},
+    latestRelease: String = "",
+    selfVersion: String = "",
 ) {
     val title = computerTitle(computer)
+    val shown = versioned(computer, mine, selfVersion)
     Row(
         Modifier
             .fillMaxWidth()
@@ -183,13 +222,7 @@ fun ComputerRow(
                 )
                 if (mine) ThisPhoneChip()
             }
-            Text(
-                savedSubtitle(computer),
-                color = pjMuted(),
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            VersionSubtitle(shown, mine, latestRelease)
         }
         if (!mine) ConnectButton(onConnect)
         if (showMenu) {
@@ -207,8 +240,11 @@ fun ComputerCard(
     onRename: () -> Unit = {},
     onRemovePassword: () -> Unit = {},
     onForget: () -> Unit = {},
+    latestRelease: String = "",
+    selfVersion: String = "",
 ) {
     val color = computerTileColor(computer)
+    val shown = versioned(computer, mine, selfVersion)
     val title = computerTitle(computer)
     Surface(
         modifier = Modifier
@@ -243,6 +279,12 @@ fun ComputerCard(
                             textAlign = TextAlign.Center,
                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                         )
+                        Text(
+                            shownAppVersion(shown.appVersion),
+                            color = if (versionBehind(shown.appVersion, latestRelease)) pjWarn() else Color.White,
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                        )
                     }
                 }
                 StatusBadge(
@@ -259,14 +301,21 @@ fun ComputerCard(
                     .padding(start = 10.dp, end = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    title,
-                    style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                    color = if (title == "No name yet") pjMuted() else MaterialTheme.colorScheme.onSurface,
-                )
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        color = if (title == "No name yet") pjMuted() else MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        shownAppVersion(shown.appVersion),
+                        color = if (versionBehind(shown.appVersion, latestRelease)) pjWarn() else pjMuted(),
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                    )
+                }
                 if (mine) {
                     ThisPhoneChip()
                 } else {

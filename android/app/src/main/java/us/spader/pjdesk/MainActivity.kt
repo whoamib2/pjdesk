@@ -1939,6 +1939,8 @@ class MainActivity : FragmentActivity() {
                                 )
                                 1 -> SavedScreen(
                                     signedIn = account.isNotEmpty(),
+                                    latestRelease = state.latestRelease,
+                                    selfVersion = state.selfVersion,
                                     computers = liveSaved,
                                     refreshing = presenceBusy,
                                     onRefresh = { pullPresence() },

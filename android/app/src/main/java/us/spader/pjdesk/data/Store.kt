@@ -233,6 +233,7 @@ class Store(context: Context) {
                             lastSeen = us.spader.pjdesk.core.seenSeconds(o.optLong("lastSeen")),
                             online = o.optBoolean("online"),
                             displayName = o.optString("displayName"),
+                            appVersion = o.optString("appVersion"),
                         ),
                     )
                 }
@@ -277,6 +278,7 @@ class Store(context: Context) {
                     cur.online
                 },
                 displayName = incoming.displayName.ifBlank { cur.displayName },
+                appVersion = incoming.appVersion.ifBlank { cur.appVersion },
             )
         }
         writeSaved(local)
@@ -320,7 +322,8 @@ class Store(context: Context) {
                     .put("consoleUser", c.consoleUser)
                     .put("lastSeen", c.lastSeen)
                     .put("online", c.online)
-                    .put("displayName", c.displayName),
+                    .put("displayName", c.displayName)
+                    .put("appVersion", c.appVersion),
             )
         }
         savedFile.writeText(array.toString())

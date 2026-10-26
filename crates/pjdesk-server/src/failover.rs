@@ -6,7 +6,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use pjdesk_proto::failover::{
-    next_misses, on_return, second_path, takeover, Probe, SecondPath, Takeover, Watch, Yield, MISSES_TO_PROMOTE,
+    confirming_path, is_same_party, next_misses, on_return, takeover, unhealthy_hold_until, Probe, SecondPath, Takeover,
+    Watch, Yield, MISSES_TO_PROMOTE,
 };
 use pjdesk_proto::udp::{self, UdpMsg};
 
@@ -87,8 +88,24 @@ pub fn watch_once(data_dir: &Path, misses: u32) -> Step {
     };
     let probe = probe_primary(addr);
     let counted = next_misses(misses, probe);
-    let other_at = newest_other(&peers, &mine).map(|p| p.at);
-    let second = if read_ok { second_path(true, other_at, cloud::unix_now()) } else { SecondPath::Unknown };
+    let now = cloud::unix_now();
+    let mine_name = cloud::computer_name();
+    let other = newest_other(&peers, &mine, &mine_name);
+    let observed = match other {
+        Some(peer) if peer.maintenance_until > now => peer.maintenance_until,
+        Some(peer) if !peer.healthy => unhealthy_hold_until(peer.at),
+        _ => 0,
+    };
+    let clear = read_ok && other.is_some_and(|peer| peer.healthy && peer.maintenance_until <= now);
+    let until = if !read_ok {
+        cloud::note_peer_maintenance(data_dir, 0, false)
+    } else if clear {
+        cloud::note_peer_maintenance(data_dir, 0, true)
+    } else {
+        cloud::note_peer_maintenance(data_dir, observed, false)
+    };
+    let other_at = other.map(|peer| peer.at);
+    let second = confirming_path(read_ok, other_at, until, now);
     let decision = takeover(&Watch {
         misses: counted,
         probe,
@@ -103,6 +120,9 @@ pub fn watch_once(data_dir: &Path, misses: u32) -> Step {
             let log = match (probe, second) {
                 (Probe::Silent, _) if counted > 0 && counted < MISSES_TO_PROMOTE => {
                     format!("failover: missed heartbeat {counted}/{MISSES_TO_PROMOTE} to {address}")
+                }
+                (Probe::Silent, SecondPath::Fresh) if until > cloud::unix_now() => {
+                    format!("failover: primary announced maintenance; not taking over")
                 }
                 (Probe::Silent, SecondPath::Fresh) => format!(
                     "failover: primary still alive via cloud health ({} s old); not taking over",
@@ -123,11 +143,15 @@ pub fn watch_once(data_dir: &Path, misses: u32) -> Step {
 }
 
 fn higher_peer<'a>(peers: &'a [PeerHealth], mine: &str, local_epoch: u64) -> Option<&'a PeerHealth> {
-    peers.iter().filter(|p| p.instance != mine && p.epoch > local_epoch).max_by_key(|p| p.epoch)
+    let mine_name = cloud::computer_name();
+    peers
+        .iter()
+        .filter(|p| !is_same_party(&p.instance, &p.name, mine, &mine_name) && p.epoch > local_epoch)
+        .max_by_key(|p| p.epoch)
 }
 
-fn newest_other<'a>(peers: &'a [PeerHealth], mine: &str) -> Option<&'a PeerHealth> {
-    peers.iter().filter(|p| p.instance != mine).max_by_key(|p| p.at)
+fn newest_other<'a>(peers: &'a [PeerHealth], mine: &str, mine_name: &str) -> Option<&'a PeerHealth> {
+    peers.iter().filter(|p| !is_same_party(&p.instance, &p.name, mine, mine_name)).max_by_key(|p| p.at)
 }
 
 fn resolve_probe(address: &str) -> Result<SocketAddr, ()> {

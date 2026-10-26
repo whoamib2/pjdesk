@@ -87,6 +87,25 @@ pub fn is_newer(current: &str, candidate: &str) -> bool {
     }
 }
 
+/// Text for a version column. Unparseable and empty reports are unknown.
+pub fn shown_version(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() || parse_version(raw).is_none() {
+        "—".into()
+    } else {
+        raw.trim_start_matches('v').to_string()
+    }
+}
+
+/// True when both versions parse and `installed` is older than `latest`.
+/// Unknown on either side is not behind.
+pub fn version_is_behind(installed: &str, latest: &str) -> bool {
+    if shown_version(installed) == "—" || shown_version(latest) == "—" {
+        return false;
+    }
+    is_newer(installed, latest)
+}
+
 /// True when `have` is a final release at least as new as `need`.
 pub fn version_at_least(have: &str, need: &str) -> bool {
     if is_prerelease(have) {
@@ -600,6 +619,12 @@ mod tests {
         // pjdesk.com/api/release still serves 0.5.2. A 0.6.0 install must not take it.
         assert!(!is_newer("0.6.0", "0.5.2"));
         assert!(!is_newer("0.6.0", "v0.5.2"));
+        assert_eq!(shown_version(""), "—");
+        assert_eq!(shown_version("nope"), "—");
+        assert_eq!(shown_version("v0.6.43"), "0.6.43");
+        assert!(version_is_behind("0.6.43", "0.6.44"));
+        assert!(!version_is_behind("0.6.44", "0.6.44"));
+        assert!(!version_is_behind("0.6.43", ""));
         assert!(is_newer("0.5.2", "0.6.0"));
         assert!(version_at_least("0.4.1", "0.4.0"));
         assert!(version_at_least("0.4.0", "0.4.0"));

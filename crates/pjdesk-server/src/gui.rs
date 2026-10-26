@@ -1501,16 +1501,9 @@ impl App {
             }
             ui.horizontal(|ui| {
                 let (color, text) = if snap.role == "active" {
-                    let who =
-                        if snap.active_name.is_empty() { "this server".to_string() } else { snap.active_name.clone() };
-                    (p(ui).ok, format!("Role: Primary. {who} uploads to the cloud (generation {}).", snap.epoch))
+                    (p(ui).ok, primary_role_text(snap.epoch))
                 } else {
-                    let who = if snap.active_name.is_empty() {
-                        "the other server".to_string()
-                    } else {
-                        snap.active_name.clone()
-                    };
-                    (p(ui).accent, format!("Role: Standby. Primary: {who} (generation {}).", snap.epoch))
+                    (p(ui).accent, standby_role_text(&snap.active_name, snap.epoch))
                 };
                 ui_widgets::dot(ui, color);
                 ui.label(text);
@@ -1676,16 +1669,15 @@ impl App {
             return String::new();
         }
         if role == "standby" {
-            let who = if active_name.is_empty() { "the other server".to_string() } else { active_name };
+            let who = other_server_name(&active_name);
             return format!("Standby of this account. Primary: {who}. Same account, no join code.");
         }
-        let who = if active_name.is_empty() { "this server".to_string() } else { active_name };
-        if peer_name.is_empty() {
-            format!(
-                "Primary: {who}. A second server that signs in with this account becomes the standby. No join code."
-            )
+        let peer = if peer_name.is_empty() || same_as_this_computer(&peer_name) { String::new() } else { peer_name };
+        if peer.is_empty() {
+            "Primary: this server. A second server that signs in with this account becomes the standby. No join code."
+                .to_string()
         } else {
-            format!("Primary: {who}. Standby: {peer_name}. Same account, no join code.")
+            format!("Primary: this server. Standby: {peer}. Same account, no join code.")
         }
     }
 
@@ -1990,17 +1982,10 @@ impl App {
                         ui.label("Sync is on, but the server isn't running, so nothing is syncing.");
                     } else if s.role == "active" {
                         ui_widgets::dot(ui, p(ui).ok);
-                        let who =
-                            if s.active_name.is_empty() { "this server".to_string() } else { s.active_name.clone() };
-                        ui.label(format!("Role: Primary. {who} uploads to the cloud (generation {}).", s.epoch));
+                        ui.label(primary_role_text(s.epoch));
                     } else {
                         ui_widgets::dot(ui, p(ui).accent);
-                        let who = if s.active_name.is_empty() {
-                            "the other server".to_string()
-                        } else {
-                            s.active_name.clone()
-                        };
-                        ui.label(format!("Role: Standby. Primary: {who} (generation {}).", s.epoch));
+                        ui.label(standby_role_text(&s.active_name, s.epoch));
                     }
                 });
                 if let Some(peer) = self.peer_version_line() {
@@ -3683,7 +3668,7 @@ impl App {
         } else {
             return None;
         };
-        if version.is_empty() {
+        if version.is_empty() || same_as_this_computer(&name) {
             return None;
         }
         let who = if name.is_empty() { "Other server".to_string() } else { name };
@@ -4365,6 +4350,33 @@ fn svc_status() -> (bool, bool) {
 #[cfg(not(windows))]
 fn svc_status() -> (bool, bool) {
     (false, false)
+}
+
+fn this_computer_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|text| text.trim().to_string()))
+        .unwrap_or_default()
+}
+
+fn same_as_this_computer(name: &str) -> bool {
+    pjdesk_proto::failover::same_computer_name(name, &this_computer_name())
+}
+
+fn other_server_name(active_name: &str) -> String {
+    if active_name.trim().is_empty() || same_as_this_computer(active_name) {
+        "the other server".into()
+    } else {
+        active_name.trim().to_string()
+    }
+}
+
+fn primary_role_text(epoch: u64) -> String {
+    format!("Role: Primary. This server uploads to the cloud (generation {epoch}).")
+}
+
+fn standby_role_text(active_name: &str, epoch: u64) -> String {
+    format!("Role: Standby. Primary: {} (generation {epoch}).", other_server_name(active_name))
 }
 
 #[cfg(test)]

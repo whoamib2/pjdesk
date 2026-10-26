@@ -270,6 +270,9 @@ pub struct PeerNote {
     /// True when the account's server says this computer is connected.
     #[serde(default)]
     pub reported_online: bool,
+    /// PJDesk version reported for this computer. Empty until the account list has one.
+    #[serde(default)]
+    pub app_version: String,
     /// 0 = one display, 1 = all displays, 2 = a window per display.
     #[serde(default)]
     pub view_mode: u8,
@@ -730,7 +733,7 @@ impl Config {
             });
         }
         if !session.address.trim().is_empty() {
-            let next = crate::network::keep_hostname(self.server.as_deref().unwrap_or(""), session.address.trim());
+            let next = pjdesk_proto::failover::follow_primary(self.server.as_deref().unwrap_or(""), session.address.trim());
             if !next.is_empty() {
                 self.server = Some(next);
             }
@@ -925,6 +928,9 @@ impl Config {
             }
             if row.last_seen > note.last_seen {
                 note.last_seen = row.last_seen;
+            }
+            if !row.app_version.trim().is_empty() {
+                note.app_version = row.app_version.trim().to_string();
             }
             note.reported_online = row.online;
             if self.is_saved_hidden(&id) || self.account_removed.iter().any(|h| h == &id) {
@@ -1360,6 +1366,7 @@ mod tests {
             display_name: None,
             last_seen: 50,
             online: false,
+            app_version: String::new(),
         }]);
         assert!(c.address_book.iter().all(|e| e.id != "692996394"));
         assert!(c.settings.peers.get("692996394").is_none());
@@ -1384,6 +1391,7 @@ mod tests {
                 display_name: Some("Pocket".into()),
                 last_seen: 20,
                 online: true,
+                app_version: String::new(),
             },
             crate::network::HostPresence {
                 id: "692996394".into(),
@@ -1394,6 +1402,7 @@ mod tests {
                 display_name: None,
                 last_seen: 50,
                 online: false,
+                app_version: "0.6.43".into(),
             },
         ]);
         assert_eq!(c.address_book.iter().find(|e| e.id == "386626882").unwrap().alias, "Pixel");
@@ -1406,6 +1415,7 @@ mod tests {
         let desk = c.settings.peers.get("692996394").unwrap();
         assert_eq!(desk.hostname, "BENLENOVODESK");
         assert_eq!(desk.console_user, "SPADER\\Ben");
+        assert_eq!(desk.app_version, "0.6.43");
         assert!(c.address_book.iter().any(|e| e.id == "692996394" && e.alias.is_empty()));
     }
 
@@ -1430,6 +1440,7 @@ mod tests {
             display_name: None,
             last_seen: 100,
             online: false,
+            app_version: String::new(),
         }]);
         let note = c.settings.peers.get("902488771").unwrap();
         assert!(!note.reported_online);
@@ -1444,6 +1455,7 @@ mod tests {
             display_name: None,
             last_seen: 40,
             online: true,
+            app_version: String::new(),
         }]);
         let chip = c.settings.peers.get("610978221").unwrap();
         assert!(chip.reported_online);

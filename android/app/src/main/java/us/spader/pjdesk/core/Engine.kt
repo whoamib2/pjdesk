@@ -585,6 +585,7 @@ class Engine(context: Context) : EngineListener {
         }
         when (kind) {
             "log" -> AppLog.i(event.optString("text"))
+            "release" -> update { it.copy(latestRelease = event.optString("version").ifBlank { it.latestRelease }) }
             "registered" -> {
                 // The Keystore is the source of truth. A registration that
                 // races ahead of setPermanent must not clear a password that
@@ -610,6 +611,7 @@ class Engine(context: Context) : EngineListener {
                         fingerprint = event.optString("fingerprint"),
                         server = event.optString("server", it.server),
                         approval = store.approval,
+                        selfVersion = event.optString("appVersion").ifBlank { it.selfVersion },
                         status = if (ready) "Ready" else it.status,
                     )
                 }

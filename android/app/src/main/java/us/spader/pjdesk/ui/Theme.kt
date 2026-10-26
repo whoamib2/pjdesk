@@ -101,3 +101,6 @@ fun pjMuted(): Color = MaterialTheme.colorScheme.onSurfaceVariant
 
 @Composable
 fun pjOk(): Color = if (isSystemInDarkTheme()) OkDark else OkLight
+
+@Composable
+fun pjWarn(): Color = if (isSystemInDarkTheme()) WarnDark else WarnLight

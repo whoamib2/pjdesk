@@ -405,6 +405,8 @@ object CloudAuth {
                         consoleUser = o.optString("console_user"),
                         lastSeen = o.optLong("last_seen"),
                         online = presenceOnlineFlag(if (o.has("online") && !o.isNull("online")) o.get("online") else null),
+                        displayName = o.optString("display_name"),
+                        appVersion = o.optString("app_version"),
                     ),
                 )
             }
@@ -439,6 +441,7 @@ object CloudAuth {
                     displayName = it.displayName,
                     lastSeen = it.lastSeen,
                     online = it.online,
+                    appVersion = it.appVersion,
                 )
             },
         )

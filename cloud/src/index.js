@@ -459,6 +459,7 @@ async function syncHealthPut(request, env) {
     epoch: Number.isFinite(body.epoch) ? body.epoch : 0,
     healthy: !!body.healthy,
     at: now(),
+    maintenance_until: Number.isFinite(body.maintenance_until) ? body.maintenance_until : 0,
   };
   await env.SYNC.put(healthKey(s.accountId, record.instance), JSON.stringify(record), {
     httpMetadata: { contentType: "application/json" },

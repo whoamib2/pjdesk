@@ -822,6 +822,7 @@ export function applyPresence(prev, next) {
     last_seen: Math.max(Number(prev.last_seen) || 0, last),
     online: next.online ? 1 : 0,
     signed_in: next.signed_in ? 1 : 0,
+    app_version: cleanLabel(next.app_version, 32) || prev.app_version || "",
   };
 }
 
@@ -837,6 +838,7 @@ export function presenceView(row, role) {
     last_seen: Number(row.last_seen) || 0,
     online: !!row.online,
     signed_in: !!row.signed_in,
+    app_version: row.app_version || "",
   };
 }
 
@@ -850,6 +852,11 @@ function missingDisplay(err) {
   return /no such column: display_name/i.test(message);
 }
 
+function missingAppVersion(err) {
+  const message = String(err?.message || err);
+  return /no such column: app_version/i.test(message);
+}
+
 async function presenceFor(env, networkId, role) {
   const rows = await presenceForStored(env, networkId, role);
   return keepListed(rows, await removedFor(env, networkId));
@@ -858,12 +865,25 @@ async function presenceFor(env, networkId, role) {
 async function presenceForStored(env, networkId, role) {
   try {
     const cutoff = now() - 90 * 24 * 3600;
-    const { results } = await env.DB.prepare(
-      `SELECT pjdesk_id, hostname, os_family, os_version, console_user, display_name, last_seen, online, signed_in
-         FROM network_presence WHERE network_id = ? AND last_seen >= ? ORDER BY last_seen DESC LIMIT 500`,
-    )
-      .bind(networkId, cutoff)
-      .all();
+    let results;
+    try {
+      ({ results } = await env.DB
+        .prepare(
+          `SELECT pjdesk_id, hostname, os_family, os_version, console_user, display_name, last_seen, online, signed_in, app_version
+             FROM network_presence WHERE network_id = ? AND last_seen >= ? ORDER BY last_seen DESC LIMIT 500`,
+        )
+        .bind(networkId, cutoff)
+        .all());
+    } catch (err) {
+      if (!missingAppVersion(err)) throw err;
+      ({ results } = await env.DB
+        .prepare(
+          `SELECT pjdesk_id, hostname, os_family, os_version, console_user, display_name, last_seen, online, signed_in
+             FROM network_presence WHERE network_id = ? AND last_seen >= ? ORDER BY last_seen DESC LIMIT 500`,
+        )
+        .bind(networkId, cutoff)
+        .all());
+    }
     return (results || []).map((row) =>
       presenceView(
         {
@@ -876,6 +896,7 @@ async function presenceForStored(env, networkId, role) {
           last_seen: row.last_seen,
           online: row.online,
           signed_in: row.signed_in,
+          app_version: row.app_version || "",
         },
         role,
       ),
@@ -1620,6 +1641,7 @@ async function postPresence(request, env, account) {
   const removed = new Set(await removedFor(env, found.network.id));
   const cutoff = now() - 90 * 24 * 3600;
   const stmts = [];
+  const legacy = [];
   for (const raw of devices) {
     const id = String(raw.id || "").replace(/\D/g, "");
     if (!/^\d{9}$/.test(id) || removed.has(id)) continue;
@@ -1627,11 +1649,49 @@ async function postPresence(request, env, account) {
     if (last < cutoff) continue;
     const next = applyPresence({}, raw);
     next.last_seen = last;
-    stmts.push(
-      env.DB.prepare(
-        `INSERT INTO network_presence
-           (network_id, pjdesk_id, hostname, os_family, os_version, console_user, display_name, last_seen, online, signed_in)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    const values = [
+      found.network.id,
+      id,
+      next.hostname,
+      next.os_family,
+      next.os_version,
+      next.console_user,
+      next.display_name,
+      next.last_seen,
+      next.online,
+      next.signed_in,
+    ];
+    stmts.push(env.DB.prepare(presenceInsert(true)).bind(...values, next.app_version));
+    legacy.push(env.DB.prepare(presenceInsert(false)).bind(...values));
+  }
+  if (!stmts.length) return json({ ok: true, count: 0 });
+  try {
+    await env.DB.batch(stmts);
+  } catch (err) {
+    if (missingAppVersion(err)) {
+      try {
+        await env.DB.batch(legacy);
+      } catch (again) {
+        if (missingDisplay(again) || missingPresence(again)) return json({ ok: false, count: 0 });
+        throw again;
+      }
+      return json({ ok: true, count: legacy.length });
+    }
+    if (missingDisplay(err) || missingPresence(err)) return json({ ok: false, count: 0 });
+    throw err;
+  }
+  return json({ ok: true, count: stmts.length });
+}
+
+function presenceInsert(withVersion) {
+  const column = withVersion ? ", app_version" : "";
+  const mark = withVersion ? ", ?" : "";
+  const keep = withVersion
+    ? ",\n           app_version = CASE WHEN excluded.app_version != '' THEN excluded.app_version ELSE network_presence.app_version END"
+    : "";
+  return `INSERT INTO network_presence
+           (network_id, pjdesk_id, hostname, os_family, os_version, console_user, display_name, last_seen, online, signed_in${column})
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?${mark})
          ON CONFLICT(network_id, pjdesk_id) DO UPDATE SET
            hostname = CASE WHEN excluded.hostname != '' THEN excluded.hostname ELSE network_presence.hostname END,
            os_family = CASE WHEN excluded.os_family != '' THEN excluded.os_family ELSE network_presence.os_family END,
@@ -1640,29 +1700,7 @@ async function postPresence(request, env, account) {
            display_name = excluded.display_name,
            last_seen = CASE WHEN excluded.last_seen > network_presence.last_seen THEN excluded.last_seen ELSE network_presence.last_seen END,
            online = excluded.online,
-           signed_in = excluded.signed_in`,
-      ).bind(
-        found.network.id,
-        id,
-        next.hostname,
-        next.os_family,
-        next.os_version,
-        next.console_user,
-        next.display_name,
-        next.last_seen,
-        next.online,
-        next.signed_in,
-      ),
-    );
-  }
-  if (!stmts.length) return json({ ok: true, count: 0 });
-  try {
-    await env.DB.batch(stmts);
-  } catch (err) {
-    if (missingDisplay(err) || missingPresence(err)) return json({ ok: false, count: 0 });
-    throw err;
-  }
-  return json({ ok: true, count: stmts.length });
+           signed_in = excluded.signed_in${keep}`;
 }
 
 async function listComputers(env, account) {

@@ -76,6 +76,11 @@ fn hostname() -> String {
         .unwrap_or_else(|| "server".into())
 }
 
+/// This computer's name, for the peer line and for ignoring our own health rows.
+pub fn computer_name() -> String {
+    hostname()
+}
+
 fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
 }
@@ -1166,20 +1171,19 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
-fn yielded(st: &SyncState, mine: &str) -> bool {
-    pjdesk_proto::failover::epoch_fences(st.epoch, st.fenced_epoch, &st.fenced_instance, mine)
-}
-
 fn effective_role(st: &SyncState, mine: &str, heuristic: Role) -> Role {
-    if yielded(st, mine) {
-        return Role::Standby;
-    }
-    match st.desired.as_str() {
-        "active" => Role::Active,
-        "standby" => Role::Standby,
-        _ if !st.active_instance.is_empty() && st.active_instance == mine => Role::Active,
-        _ if !st.active_instance.is_empty() => Role::Standby,
-        _ => heuristic,
+    if pjdesk_proto::failover::generation_is_primary(
+        &st.desired,
+        st.epoch,
+        &st.active_instance,
+        mine,
+        st.fenced_epoch,
+        &st.fenced_instance,
+        heuristic == Role::Active,
+    ) {
+        Role::Active
+    } else {
+        Role::Standby
     }
 }
 
@@ -1198,22 +1202,15 @@ pub fn accepts_host_registrations(data_dir: &Path) -> bool {
     }
     let st = SyncState::load(data_dir);
     let mine = instance_id(data_dir);
-    if yielded(&st, &mine) {
-        return false;
-    }
-    if st.desired == "standby" {
-        return false;
-    }
-    if st.desired == "active" {
-        return true;
-    }
-    if !st.active_instance.is_empty() && st.active_instance == mine {
-        return true;
-    }
-    if !st.active_instance.is_empty() {
-        return false;
-    }
-    true
+    pjdesk_proto::failover::generation_is_primary(
+        &st.desired,
+        st.epoch,
+        &st.active_instance,
+        &mine,
+        st.fenced_epoch,
+        &st.fenced_instance,
+        true,
+    )
 }
 
 /// True when the running server wrote `cloud-status.json` recently.
@@ -1282,6 +1279,11 @@ pub fn sync_once(data_dir: &Path, role: Role, force_push: bool) -> bool {
     status.notice = st.notice.clone();
     status.last_check_at = now();
     status.updated_at = now();
+    if let Some((peer_name, peer_version, peer_role)) = other_peer(data_dir) {
+        status.peer_name = peer_name;
+        status.peer_version = peer_version;
+        status.peer_role = peer_role;
+    }
     match result {
         Ok(()) => status.error.clear(),
         Err(e) => {
@@ -1683,7 +1685,7 @@ pub fn join(data_dir: &Path, cfg: &CloudConfig) -> Result<String> {
 fn sync_status_now(data_dir: &Path, role: Role) -> Option<()> {
     let cfg = CloudConfig::load(data_dir)?;
     let st = SyncState::load(data_dir);
-    let (peer_name, peer_version, peer_role) = other_peer(data_dir);
+    let (peer_name, peer_version, peer_role) = other_peer(data_dir).unwrap_or_default();
     CloudStatus {
         enabled: true,
         role: if role == Role::Active { "active" } else { "standby" }.into(),
@@ -1708,15 +1710,24 @@ fn sync_status_now(data_dir: &Path, role: Role) -> Option<()> {
 }
 
 /// Name, version, and role of a different server that published health.
-fn other_peer(data_dir: &Path) -> (String, String, String) {
-    let mine = instance_id(data_dir);
-    let mut peers = peer_health(data_dir);
-    peers.retain(|p| p.instance != mine && !p.version.is_empty());
-    peers.sort_by_key(|p| std::cmp::Reverse(p.at));
-    match peers.into_iter().next() {
-        Some(p) => (p.name, p.version, p.role),
-        None => (String::new(), String::new(), String::new()),
+/// An older instance of this computer is not the peer. The role word follows
+/// this server's generation, not a stale health label.
+fn other_peer(data_dir: &Path) -> Option<(String, String, String)> {
+    let (ok, mut peers) = peer_health_result(data_dir);
+    if !ok {
+        return None;
     }
+    let mine = instance_id(data_dir);
+    let mine_name = hostname();
+    peers.retain(|p| {
+        pjdesk_proto::failover::counts_as_other_server(&p.instance, &p.name, &p.version, &mine, &mine_name)
+    });
+    peers.sort_by_key(|p| std::cmp::Reverse(p.at));
+    let role = pjdesk_proto::failover::peer_role_label(accepts_host_registrations(data_dir));
+    Some(match peers.into_iter().next() {
+        Some(p) => (p.name, p.version, role.into()),
+        None => (String::new(), String::new(), role.into()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,6 +1744,9 @@ pub struct PeerHealth {
     pub epoch: u64,
     pub healthy: bool,
     pub at: u64,
+    /// Unix seconds until which a standby must not promote. Missing on older reports.
+    #[serde(default)]
+    pub maintenance_until: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -1746,19 +1760,114 @@ struct HealthDoc {
 pub fn publish_heartbeat(data_dir: &Path) {
     let Some(cfg) = CloudConfig::load(data_dir) else { return };
     let role = if accepts_host_registrations(data_dir) { Role::Active } else { Role::Standby };
+    let me = health_report(data_dir, role);
+    if let Err(e) = write_health(&cfg, &me) {
+        tracing::debug!("failover heartbeat: {e:#}");
+    }
+    stamp_live_peer(data_dir, role);
+}
+
+const MAINT_FILE: &str = "maintenance-until.txt";
+const SEEN_FILE: &str = "maintenance-seen.txt";
+
+fn maintenance_deadline(data_dir: &Path) -> u64 {
+    std::fs::read_to_string(data_dir.join(MAINT_FILE)).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0)
+}
+
+fn health_report(data_dir: &Path, role: Role) -> PeerHealth {
     let st = SyncState::load(data_dir);
-    let me = PeerHealth {
+    let until = maintenance_deadline(data_dir);
+    let holding = until > now();
+    PeerHealth {
         instance: instance_id(data_dir),
         name: hostname(),
         version: env!("CARGO_PKG_VERSION").into(),
         role: role_name(role).into(),
         epoch: st.epoch,
-        healthy: true,
+        healthy: !holding,
+        maintenance_until: if holding { until } else { 0 },
         at: now(),
-    };
-    if let Err(e) = write_health(&cfg, &me) {
-        tracing::debug!("failover heartbeat: {e:#}");
     }
+}
+
+/// Asks the standby not to promote during a planned update or restart.
+/// A standby, and a server with no account, does not announce.
+pub fn announce_maintenance(data_dir: &Path) {
+    if CloudConfig::load(data_dir).is_none() || !accepts_host_registrations(data_dir) {
+        return;
+    }
+    let until = now().saturating_add(pjdesk_proto::failover::MAINTENANCE_HOLD_SECS);
+    if std::fs::write(data_dir.join(MAINT_FILE), until.to_string()).is_err() {
+        return;
+    }
+    tracing::info!(
+        "failover: planned restart; this primary announced maintenance so the standby does not take over"
+    );
+    let Some(cfg) = CloudConfig::load(data_dir) else { return };
+    let me = health_report(data_dir, Role::Active);
+    if let Err(e) = write_health(&cfg, &me) {
+        tracing::debug!("failover maintenance: {e:#}");
+    }
+}
+
+/// Remembers a maintenance sighting so a later unread cloud does not forget it.
+/// `clear` drops it because the primary is healthy again. Returns the deadline still in force.
+pub fn note_peer_maintenance(data_dir: &Path, observed_until: u64, clear: bool) -> u64 {
+    let path = data_dir.join(SEEN_FILE);
+    if clear {
+        let _ = std::fs::remove_file(&path);
+        return 0;
+    }
+    let now = now();
+    if observed_until > now {
+        let _ = std::fs::write(&path, observed_until.to_string());
+        return observed_until;
+    }
+    std::fs::read_to_string(&path).ok().and_then(|text| text.trim().parse().ok()).filter(|until: &u64| *until > now).unwrap_or(0)
+}
+
+/// Rewrites the window's peer line from the latest health, and republishes
+/// the network slot when the saved "Published as" sentence disagrees.
+fn stamp_live_peer(data_dir: &Path, role: Role) {
+    let mut status = CloudStatus::load(data_dir).unwrap_or_default();
+    let fresh_peer = other_peer(data_dir);
+    let st = SyncState::load(data_dir);
+    let role_text = role_name(role);
+    status.role = role_text.into();
+    status.epoch = st.epoch;
+    status.active_instance = st.active_instance;
+    status.active_name = st.active_name;
+    status.notice = st.notice;
+    if let Some((name, version, peer_role)) = fresh_peer {
+        status.peer_name = name;
+        status.peer_version = version;
+        status.peer_role = peer_role;
+    }
+    status.updated_at = now();
+    status.enabled = true;
+    if let Some(cfg) = CloudConfig::load(data_dir) {
+        if status.account.is_empty() && cfg.is_account() {
+            status.account = cfg.email.clone();
+        }
+        if status.bucket.is_empty() {
+            status.bucket = cfg.describe();
+        }
+    }
+    status.save(data_dir);
+    if note_says_other_role(data_dir, role) {
+        let _ = std::fs::remove_file(data_dir.join("network-publish.json"));
+        register_network(data_dir, role, false);
+    }
+}
+
+fn note_says_other_role(data_dir: &Path, role: Role) -> bool {
+    let Some(record) = crate::public_addr::load(data_dir) else { return false };
+    let other = if role == Role::Active {
+        "Published as the standby server."
+    } else {
+        "Published as the active server."
+    };
+    record.note == other
 }
 
 /// Steps down because another server holds a newer generation.
@@ -1855,16 +1964,7 @@ pub fn peer_health_result(data_dir: &Path) -> (bool, Vec<PeerHealth>) {
 
 fn publish_health(data_dir: &Path, role: Role) {
     let Some(cfg) = CloudConfig::load(data_dir) else { return };
-    let st = SyncState::load(data_dir);
-    let me = PeerHealth {
-        instance: instance_id(data_dir),
-        name: hostname(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        role: role_name(role).into(),
-        epoch: st.epoch,
-        healthy: true,
-        at: now(),
-    };
+    let me = health_report(data_dir, role);
     if let Err(e) = write_health(&cfg, &me) {
         tracing::debug!("cloud health: {e:#}");
     }
@@ -1911,6 +2011,7 @@ fn publish_presence(data_dir: &Path) {
             "last_seen": row.last_seen,
             "online": live,
             "signed_in": row.signed_in,
+            "app_version": row.app_version,
         }));
         if devices.len() >= 500 {
             break;
@@ -2528,6 +2629,15 @@ mod tests {
         )
         .unwrap();
         assert!(accepts_host_registrations(&dir));
+        std::fs::write(
+            dir.join(STATE_FILE),
+            r#"{"desired":"active","epoch":5,"active_instance":"other","active_name":"CHIP20"}"#,
+        )
+        .unwrap();
+        assert!(
+            !accepts_host_registrations(&dir),
+            "a recorded generation owned by another server is not this server's to keep"
+        );
         std::fs::write(
             dir.join(STATE_FILE),
             r#"{"desired":"active","epoch":4,"fenced_epoch":5,"fenced_instance":"cccccccccccccccccccccccccccccccc","active_instance":"cccccccccccccccccccccccccccccccc"}"#,

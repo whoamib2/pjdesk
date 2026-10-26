@@ -275,6 +275,8 @@ pub fn stop() -> Result<()> {
 
 /// Stops the service if it is running, then starts it. One elevation covers both.
 pub fn restart() -> Result<()> {
+    let dir = crate::server::resolve_data_dir(None);
+    crate::cloud::announce_maintenance(&dir);
     let _ = stop();
     start()
 }

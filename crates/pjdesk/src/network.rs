@@ -75,6 +75,8 @@ pub struct HostPresence {
     pub display_name: Option<String>,
     pub last_seen: u64,
     pub online: bool,
+    /// PJDesk version that computer last registered. Empty when the account has not reported one.
+    pub app_version: String,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +114,9 @@ pub struct SupportInfo {
 }
 
 /// A hostname is kept when a later update only has the raw IP it points at.
+/// The account primary uses [`pjdesk_proto::failover::follow_primary`] instead,
+/// so a different server's address replaces the saved name.
+#[allow(dead_code)]
 pub fn keep_hostname(current: &str, incoming: &str) -> String {
     let incoming = incoming.trim();
     if incoming.is_empty() {
@@ -123,6 +128,7 @@ pub fn keep_hostname(current: &str, incoming: &str) -> String {
     incoming.to_string()
 }
 
+#[allow(dead_code)]
 pub fn is_hostname_address(address: &str) -> bool {
     let text = address.trim();
     if text.is_empty() {
@@ -235,6 +241,8 @@ struct PresenceBody {
     last_seen: u64,
     #[serde(default)]
     online: bool,
+    #[serde(default)]
+    app_version: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -461,6 +469,7 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
                 display_name: c.display_name,
                 last_seen: c.last_seen,
                 online: c.online,
+                app_version: c.app_version,
             })
             .collect(),
         removed: reply.removed.into_iter().map(|id| pjdesk_proto::normalize_id(&id)).filter(|id| pjdesk_proto::is_valid_id(id)).collect(),

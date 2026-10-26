@@ -114,6 +114,7 @@ data class PresenceReport(
     val displayName: String = "",
     val lastSeen: Long = 0,
     val online: Boolean = false,
+    val appVersion: String = "",
 )
 
 /**
@@ -139,6 +140,7 @@ fun applyPresence(computers: List<SavedComputer>, presence: List<PresenceReport>
                     displayName = row.displayName,
                     lastSeen = seen,
                     online = row.online,
+                    appVersion = row.appVersion,
                 ),
             )
             continue
@@ -152,6 +154,7 @@ fun applyPresence(computers: List<SavedComputer>, presence: List<PresenceReport>
             displayName = row.displayName.ifBlank { cur.displayName },
             lastSeen = maxOf(seenSeconds(cur.lastSeen), seen),
             online = row.online,
+            appVersion = row.appVersion.ifBlank { cur.appVersion },
         )
     }
     return merged
@@ -179,10 +182,36 @@ fun agoShort(lastSeen: Long, nowMs: Long): String {
     }
 }
 
-/** Second line of a compact Saved row: ID, short OS, and when it was last seen. */
-fun savedSubtitle(computer: SavedComputer, nowMs: Long = System.currentTimeMillis()): String {
-    val whenText = if (computer.online) "now" else agoShort(computer.lastSeen, nowMs)
-    return listOf(formatSavedId(computer.id), osShort(computer), whenText)
+/** A version column. Unparseable and empty reports are unknown. */
+fun shownAppVersion(raw: String): String {
+    val core = raw.trim().removePrefix("v").substringBefore('-').substringBefore('+')
+    val parts = core.split('.')
+    if (parts.size < 2 || parts.any { it.toIntOrNull() == null }) return "—"
+    return core
+}
+
+/** True when both versions parse and the installed one is older. */
+fun versionBehind(installed: String, latest: String): Boolean {
+    fun parse(raw: String): IntArray? {
+        val shown = shownAppVersion(raw)
+        if (shown == "—") return null
+        val parts = shown.split('.')
+        return intArrayOf(
+            parts.getOrNull(0)?.toIntOrNull() ?: return null,
+            parts.getOrNull(1)?.toIntOrNull() ?: 0,
+            parts.getOrNull(2)?.toIntOrNull() ?: 0,
+        )
+    }
+    val have = parse(installed) ?: return false
+    val need = parse(latest) ?: return false
+    val index = (0..2).firstOrNull { have[it] != need[it] } ?: return false
+    return have[index] < need[index]
+}
+
+/** Second line of a compact Saved row: ID, short OS, when it was last seen, and its PJDesk version. */
+fun savedSubtitle(computer: SavedComputer, nowMs: Long = System.currentTimeMillis(), mine: Boolean = false): String {
+    val whenText = if (mine || computer.online) "now" else agoShort(computer.lastSeen, nowMs)
+    return listOf(formatSavedId(computer.id), osShort(computer), whenText, shownAppVersion(computer.appVersion))
         .filter { it.isNotBlank() }
         .joinToString(" · ")
 }

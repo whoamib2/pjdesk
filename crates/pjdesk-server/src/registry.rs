@@ -91,6 +91,7 @@ pub struct PresenceRow {
     pub display_name: String,
     pub last_seen: u64,
     pub signed_in: bool,
+    pub app_version: String,
 }
 
 /// A registered device, for the management window.
@@ -610,6 +611,7 @@ impl Registry {
                 display_name: d.display_name.clone(),
                 last_seen: d.last_seen,
                 signed_in: d.signed_in,
+                app_version: d.app_version.clone(),
             })
             .collect()
     }

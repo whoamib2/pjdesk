@@ -42,6 +42,8 @@ pub struct SavedRow {
     pub clients: bool,
     /// Direct LAN address (`host:port`). Set only for a computer found on this network.
     pub direct: Option<String>,
+    /// PJDesk version that computer registered. Empty when it has not been reported.
+    pub app_version: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -459,9 +461,19 @@ impl App {
             let this_computer = self.is_this_computer(&id);
             let last_seen = note.map(|n| n.last_seen).unwrap_or(0);
             let reported = note.is_some_and(|n| n.reported_online);
-            // This computer is online only after the server it registers with
-            // has acked. The account flag and a LAN beacon do not count.
-            let online = if this_computer { self.registrar_acked() } else { presence_online(reported, on_lan) };
+            // This computer is online when it is registered, or when the
+            // current primary says so. Other rows use that primary's flag.
+            let online = if this_computer {
+                pjdesk_proto::failover::own_row_online(self.registrar_acked(), reported)
+            } else {
+                presence_online(reported, on_lan)
+            };
+            let reported_version = note.map(|n| n.app_version.clone()).unwrap_or_default();
+            let app_version = if this_computer && reported_version.trim().is_empty() {
+                env!("CARGO_PKG_VERSION").to_string()
+            } else {
+                reported_version
+            };
             if !this_computer && pjdesk_proto::presence_stale(last_seen, online, now) {
                 continue;
             }
@@ -483,6 +495,7 @@ impl App {
                 in_book: entry.is_some(),
                 clients,
                 direct: None,
+                app_version,
             });
         }
         rows
@@ -520,6 +533,14 @@ impl App {
                 in_book: entry.is_some() && !self.cfg.is_saved_hidden(&id),
                 clients: entry.is_some_and(|e| crate::support_keys::is_clients(&e.tags)),
                 direct: Some(addr.clone()),
+                app_version: {
+                    let reported = note.map(|n| n.app_version.clone()).unwrap_or_default();
+                    if self.is_this_computer(&id) && reported.trim().is_empty() {
+                        env!("CARGO_PKG_VERSION").to_string()
+                    } else {
+                        reported
+                    }
+                },
             });
         }
         rows
@@ -621,6 +642,13 @@ impl App {
             let os = system_label(&row.os_family, &row.os_version);
             in_rect(ui, r, (&id, "sys"), |ui| {
                 ui.add(egui::Label::new(RichText::new(os).color(p.muted).size(12.5)).truncate());
+            });
+        }
+        if let Some(r) = slots.version {
+            let text = pjdesk_proto::update::shown_version(&row.app_version);
+            let color = version_color(ui, &row.app_version);
+            in_rect(ui, r, (&id, "ver"), |ui| {
+                ui.add(egui::Label::new(RichText::new(text).color(color).size(12.5)).truncate());
             });
         }
         in_rect(ui, slots.lock, (&id, "lock"), |ui| {
@@ -806,6 +834,11 @@ impl App {
                     egui::Label::new(RichText::new(caption).color(egui::Color32::WHITE).size(if big { 14.0 } else { 12.0 }))
                         .truncate(),
                 );
+                if big {
+                    let text = pjdesk_proto::update::shown_version(&row.app_version);
+                    let color = version_on_tile(ui, &row.app_version);
+                    ui.add(egui::Label::new(RichText::new(text).color(color).size(12.0)).truncate());
+                }
             });
         });
 
@@ -828,7 +861,12 @@ impl App {
             in_rect(ui, name_rect, (&id, "tile-name"), |ui| {
                 ui.set_max_width(name_rect.width().max(0.0));
                 let color = if placeholder { p.muted } else { p.text };
-                ui.add(egui::Label::new(RichText::new(primary).color(color).size(13.0)).truncate());
+                ui.vertical(|ui| {
+                    ui.add(egui::Label::new(RichText::new(primary).color(color).size(13.0)).truncate());
+                    let text = pjdesk_proto::update::shown_version(&row.app_version);
+                    let ver = version_color(ui, &row.app_version);
+                    ui.add(egui::Label::new(RichText::new(text).color(ver).size(11.0)).truncate());
+                });
             });
         }
         let android = row.os_family.eq_ignore_ascii_case("android");
@@ -1246,6 +1284,8 @@ const LAST_PREF: f32 = 104.0;
 const LAST_MIN: f32 = 80.0;
 const SYS_PREF: f32 = 96.0;
 const SYS_MIN: f32 = 72.0;
+const VER_PREF: f32 = 72.0;
+const VER_MIN: f32 = 52.0;
 const ID_PREF: f32 = 118.0;
 const ID_MIN: f32 = 108.0;
 const STATUS_PREF: f32 = 128.0;
@@ -1324,6 +1364,7 @@ struct SavedLayout {
     show_user: bool,
     show_last: bool,
     show_system_text: bool,
+    show_version: bool,
     show_id: bool,
     status_in_name: bool,
     compact_connect: bool,
@@ -1331,6 +1372,7 @@ struct SavedLayout {
     user: f32,
     last: f32,
     system_text: f32,
+    version: f32,
     id: f32,
     status: f32,
     actions: f32,
@@ -1365,6 +1407,9 @@ impl SavedLayout {
         if self.show_system_text {
             add(self.system_text);
         }
+        if self.show_version {
+            add(self.version);
+        }
         add(W_LOCK);
         if !self.status_in_name {
             add(self.status);
@@ -1384,29 +1429,31 @@ struct Flex {
 }
 
 /// Columns for one list width. Actions stay a fixed width on the right.
-/// User, Last connected, the system text, then the ID column drop in that
-/// order. The ID then sits under the name. The status dot folds into the
-/// name after that. Connect becomes an icon below [`COMPACT_BELOW`].
+/// User, Last connected, the system text, the version, then the ID column
+/// drop in that order. The ID then sits under the name. The status dot folds
+/// into the name after that. Connect becomes an icon below [`COMPACT_BELOW`].
 fn saved_layout(available: f32) -> SavedLayout {
     let available = if available.is_finite() { available.max(0.0) } else { 800.0 };
     let compact = available < COMPACT_BELOW;
     let stages = [
-        (true, true, true, true, true),
-        (false, true, true, true, true),
-        (false, false, true, true, true),
-        (false, false, false, true, true),
-        (false, false, false, false, true),
-        (false, false, false, false, false),
+        (true, true, true, true, true, true),
+        (false, true, true, true, true, true),
+        (false, false, true, true, true, true),
+        (false, false, false, true, true, true),
+        (false, false, false, false, true, true),
+        (false, false, false, false, false, true),
+        (false, false, false, false, false, false),
     ];
-    for (user, last, sys, id, status_beside) in stages {
-        if let Some(layout) = fit(available, user, last, sys, id, status_beside, compact) {
+    for (user, last, sys, version, id, status_beside) in stages {
+        if let Some(layout) = fit(available, user, last, sys, version, id, status_beside, compact) {
             return layout;
         }
     }
-    fit(available, false, false, false, false, false, true).unwrap_or(SavedLayout {
+    fit(available, false, false, false, false, false, false, true).unwrap_or(SavedLayout {
         show_user: false,
         show_last: false,
         show_system_text: false,
+        show_version: false,
         show_id: false,
         status_in_name: true,
         compact_connect: true,
@@ -1414,6 +1461,7 @@ fn saved_layout(available: f32) -> SavedLayout {
         user: 0.0,
         last: 0.0,
         system_text: 0.0,
+        version: 0.0,
         id: 0.0,
         status: 0.0,
         actions: SavedLayout::actions_width(true),
@@ -1425,6 +1473,7 @@ fn fit(
     user: bool,
     last: bool,
     sys: bool,
+    version: bool,
     id: bool,
     status_beside: bool,
     compact: bool,
@@ -1445,6 +1494,9 @@ fn fit(
     if sys {
         n += 1.0;
     }
+    if version {
+        n += 1.0;
+    }
     if status_beside {
         n += 1.0;
     }
@@ -1458,6 +1510,9 @@ fn fit(
     }
     if sys {
         cols.push(Flex { pref: SYS_PREF, min: SYS_MIN });
+    }
+    if version {
+        cols.push(Flex { pref: VER_PREF, min: VER_MIN });
     }
     if id {
         cols.push(Flex { pref: ID_PREF, min: ID_MIN });
@@ -1489,6 +1544,7 @@ fn fit(
     let user_w = user.then(|| next.next().unwrap_or(0.0)).unwrap_or(0.0);
     let last_w = last.then(|| next.next().unwrap_or(0.0)).unwrap_or(0.0);
     let sys_w = sys.then(|| next.next().unwrap_or(0.0)).unwrap_or(0.0);
+    let version_w = version.then(|| next.next().unwrap_or(0.0)).unwrap_or(0.0);
     let id_w = id.then(|| next.next().unwrap_or(0.0)).unwrap_or(0.0);
     let status_w = status_beside.then(|| next.next().unwrap_or(0.0)).unwrap_or(0.0);
     let name = next.next().unwrap_or(NAME_MIN);
@@ -1496,6 +1552,7 @@ fn fit(
         show_user: user,
         show_last: last,
         show_system_text: sys,
+        show_version: version,
         show_id: id,
         status_in_name: !status_beside,
         compact_connect: compact,
@@ -1503,6 +1560,7 @@ fn fit(
         user: user_w,
         last: last_w,
         system_text: sys_w,
+        version: version_w,
         id: id_w,
         status: status_w,
         actions,
@@ -1526,6 +1584,7 @@ struct Slots {
     last: Option<Rect>,
     os: Rect,
     system_text: Option<Rect>,
+    version: Option<Rect>,
     lock: Rect,
     status: Option<Rect>,
     connect: Rect,
@@ -1546,6 +1605,7 @@ fn column_slots(row: Rect, layout: &SavedLayout) -> Slots {
     };
     let status = if layout.status_in_name { None } else { Some(take(layout.status)) };
     let lock = take(W_LOCK);
+    let version = if layout.show_version { Some(take(layout.version)) } else { None };
     let system_text = if layout.show_system_text { Some(take(layout.system_text)) } else { None };
     let os = take(W_OS);
     let last = if layout.show_last { Some(take(layout.last)) } else { None };
@@ -1555,7 +1615,7 @@ fn column_slots(row: Rect, layout: &SavedLayout) -> Slots {
     let icon = Rect::from_min_size(content.left_top(), Vec2::new(W_ICON, content.height()));
     let name_left = icon.right() + GAP;
     let name = Rect::from_min_max(Pos2::new(name_left, content.top()), Pos2::new(edge.max(name_left), content.bottom()));
-    Slots { icon, name, id, copy, user, last, os, system_text, lock, status, connect, menu }
+    Slots { icon, name, id, copy, user, last, os, system_text, version, lock, status, connect, menu }
 }
 
 fn in_rect(ui: &mut egui::Ui, rect: Rect, salt: impl std::hash::Hash + std::fmt::Debug, add: impl FnOnce(&mut egui::Ui)) {
@@ -1591,6 +1651,41 @@ fn status_text(row: &SavedRow) -> String {
     }
 }
 
+fn version_color(ui: &egui::Ui, version: &str) -> egui::Color32 {
+    let p = theme::paint(ui);
+    match cached_latest() {
+        Some(latest) if pjdesk_proto::update::version_is_behind(version, &latest) => p.warn,
+        _ => p.muted,
+    }
+}
+
+/// Amber on a colored tile when the version is behind. White when it is current or unknown.
+fn version_on_tile(ui: &egui::Ui, version: &str) -> egui::Color32 {
+    match cached_latest() {
+        Some(latest) if pjdesk_proto::update::version_is_behind(version, &latest) => theme::paint(ui).warn,
+        _ => egui::Color32::WHITE,
+    }
+}
+
+fn cached_latest() -> Option<String> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    static STARTED: OnceLock<()> = OnceLock::new();
+    let slot = CACHE.get_or_init(|| Mutex::new(None));
+    STARTED.get_or_init(|| {
+        std::thread::spawn(|| {
+            if let Ok(version) = pjdesk_proto::update::site_version() {
+                if let Some(lock) = CACHE.get() {
+                    if let Ok(mut guard) = lock.lock() {
+                        *guard = Some(version);
+                    }
+                }
+            }
+        });
+    });
+    slot.lock().ok().and_then(|guard| guard.clone())
+}
+
 fn status_color(ui: &egui::Ui, row: &SavedRow) -> egui::Color32 {
     let p = theme::paint(ui);
     match status_tone(row.online, row.this_computer) {
@@ -1624,6 +1719,9 @@ fn saved_header(ui: &mut egui::Ui, width: f32, layout: &SavedLayout) {
     if layout.show_system_text {
         let system = Rect::from_min_max(slots.os.left_top(), slots.system_text.unwrap_or(slots.os).right_bottom());
         label(ui, system, "sys", "System");
+    }
+    if let Some(r) = slots.version {
+        label(ui, r, "ver", "Version");
     }
     if let Some(r) = slots.status {
         label(ui, r, "status", "Status");
@@ -1743,6 +1841,7 @@ mod tests {
                 in_book: true,
                 clients: false,
                 direct: None,
+                app_version: String::new(),
             },
             SavedRow {
                 id: "111111111".into(),
@@ -1762,6 +1861,7 @@ mod tests {
                 in_book: true,
                 clients: false,
                 direct: None,
+                app_version: String::new(),
             },
         ];
         sort_rows(&mut rows, SavedSort::Name);
@@ -1792,6 +1892,7 @@ mod tests {
             in_book: true,
             clients: false,
             direct: None,
+            app_version: String::new(),
         };
         assert_eq!(status_text(&row), "Offline");
         assert!(!presence_online(false, false));
@@ -1836,11 +1937,12 @@ mod tests {
     #[test]
     fn lower_priority_columns_hide_first_and_stay_hidden() {
         let mut prev = saved_layout(1400.0);
-        assert!(prev.show_user && prev.show_last && prev.show_system_text && prev.show_id);
+        assert!(prev.show_user && prev.show_last && prev.show_system_text && prev.show_version && prev.show_id);
         assert!(!prev.status_in_name && !prev.compact_connect);
         let mut dropped_user = None;
         let mut dropped_last = None;
         let mut dropped_sys = None;
+        let mut dropped_version = None;
         let mut dropped_id = None;
         let mut merged_status = None;
         let mut w = 1400.0;
@@ -1853,6 +1955,7 @@ mod tests {
                 assert!(prev.show_user || !layout.show_user, "user came back at {w}");
                 assert!(prev.show_last || !layout.show_last, "last came back at {w}");
                 assert!(prev.show_system_text || !layout.show_system_text, "system text came back at {w}");
+                assert!(prev.show_version || !layout.show_version, "version came back at {w}");
                 assert!(prev.show_id || !layout.show_id, "id column came back at {w}");
                 assert!(!prev.status_in_name || layout.status_in_name, "status left the name at {w}");
             }
@@ -1864,6 +1967,9 @@ mod tests {
             }
             if dropped_sys.is_none() && !layout.show_system_text {
                 dropped_sys = Some(w);
+            }
+            if dropped_version.is_none() && !layout.show_version {
+                dropped_version = Some(w);
             }
             if dropped_id.is_none() && !layout.show_id {
                 dropped_id = Some(w);
@@ -1880,9 +1986,13 @@ mod tests {
         let user = dropped_user.expect("user hides");
         let last = dropped_last.expect("last hides");
         let sys = dropped_sys.expect("system text hides");
+        let version = dropped_version.expect("version hides");
         let id = dropped_id.expect("id column hides");
         let status = merged_status.expect("status merges into the name");
-        assert!(user > last && last > sys && sys > id && id > status, "hide order user {user} last {last} sys {sys} id {id} status {status}");
+        assert!(
+            user > last && last > sys && sys > version && version > id && id > status,
+            "hide order user {user} last {last} sys {sys} version {version} id {id} status {status}"
+        );
         assert!(!saved_layout(COMPACT_BELOW).compact_connect);
         assert!(saved_layout(COMPACT_BELOW - 1.0).compact_connect);
     }
@@ -1980,6 +2090,7 @@ mod tests {
             in_book: false,
             clients: false,
             direct: direct.map(str::to_string),
+            app_version: String::new(),
         }
     }
 }

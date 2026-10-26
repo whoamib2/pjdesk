@@ -19,6 +19,7 @@ import us.spader.pjdesk.core.PresenceReport
 import us.spader.pjdesk.core.presenceOnlineFlag
 import us.spader.pjdesk.core.presenceStale
 import us.spader.pjdesk.core.savedSubtitle
+import us.spader.pjdesk.core.versionBehind
 
 class SavedOrderTest {
     private val cabin = SavedComputer(
@@ -175,8 +176,11 @@ class SavedOrderTest {
         val threeDaysMs = 3L * 24 * 60 * 60 * 1000
         val seen = (1_700_000_000_000L - threeDaysMs) / 1000
         val row = cabin.copy(online = false, lastSeen = seen)
-        assertEquals("902 488 771 · Win 11 · 3d ago", savedSubtitle(row, nowMs = 1_700_000_000_000L))
-        assertEquals("902 488 771 · Win 11 · now", savedSubtitle(cabin, nowMs = 1_700_000_000_000L))
+        assertEquals("902 488 771 · Win 11 · 3d ago · —", savedSubtitle(row, nowMs = 1_700_000_000_000L))
+        assertEquals("902 488 771 · Win 11 · now · —", savedSubtitle(cabin, nowMs = 1_700_000_000_000L))
+        assertEquals("902 488 771 · Win 11 · now · 0.6.43", savedSubtitle(row.copy(appVersion = "0.6.43"), nowMs = 1_700_000_000_000L, mine = true))
+        assertTrue(versionBehind("0.6.43", "0.6.44"))
+        assertFalse(versionBehind("0.6.44", ""))
     }
 
     @Test

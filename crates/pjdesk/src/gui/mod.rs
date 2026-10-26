@@ -1177,14 +1177,13 @@ impl App {
         self.note_self_status();
     }
 
-    /// Online only when the registrar's server ack is recent.
+    /// Online when either the service or this window has a recent server ack.
+    /// A fresh service ack counts even when the service's saved address is not
+    /// the account's current primary. The window still hosts only when that
+    /// address matches.
     fn registrar_acked(&self) -> bool {
         let now = unix_now();
-        if self.engine.service_running {
-            self.svc_status.registration_fresh(now)
-        } else {
-            self.engine.ready && self.engine.shared.acked_recently()
-        }
+        self.svc_status.registration_fresh(now) || (self.engine.ready && self.engine.shared.acked_recently())
     }
 
     fn note_self_status(&mut self) {

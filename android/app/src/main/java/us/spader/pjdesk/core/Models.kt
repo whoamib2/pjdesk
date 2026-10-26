@@ -68,6 +68,10 @@ data class DeskState(
     val signalReached: String = "",
     val signalError: String = "",
     val serverLan: String = "",
+    /** Newest release from pjdesk.com. Empty until the check returns. */
+    val latestRelease: String = "",
+    /** This phone's PJDesk version. Empty until the engine reports it. */
+    val selfVersion: String = "",
 )
 
 data class SavedComputer(
@@ -85,6 +89,8 @@ data class SavedComputer(
     val online: Boolean = false,
     /** Name chosen on that computer. Empty means show the hostname. */
     val displayName: String = "",
+    /** PJDesk version that computer registered. Empty when the account has not reported one. */
+    val appVersion: String = "",
 )
 
 fun compactId(text: String): String = text.filter { !it.isWhitespace() }

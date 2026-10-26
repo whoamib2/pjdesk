@@ -41,7 +41,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.43";
+pub const APP_VERSION: &str = "0.6.44";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -388,6 +388,15 @@ fn persist(state: &State) {
 
 async fn run(state: Arc<State>, mut cmds: mpsc::UnboundedReceiver<Value>, cb: Arc<dyn Callbacks>) {
     publish(&state, &cb);
+    let cb_release = cb.clone();
+    tokio::spawn(async move {
+        let version = tokio::task::spawn_blocking(|| pjdesk_proto::update::site_version().unwrap_or_default())
+            .await
+            .unwrap_or_default();
+        if !version.is_empty() {
+            emit(&cb_release, &json!({"event":"release","version": version}));
+        }
+    });
     let state_h = state.clone();
     let cb_h = cb.clone();
     let host = tokio::spawn(async move { host_loop(state_h, cb_h).await });
@@ -421,6 +430,7 @@ fn publish(state: &State, cb: &Arc<dyn Callbacks>) {
             "fingerprint": fp,
             "server": server,
             "approval": state.approval.lock().unwrap().clone(),
+            "appVersion": APP_VERSION,
         }),
     );
 }

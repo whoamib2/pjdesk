@@ -78,6 +78,8 @@ fun SavedScreen(
     view: SavedView = SavedView.List,
     onView: (SavedView) -> Unit = {},
     discovered: List<SavedComputer> = emptyList(),
+    latestRelease: String = "",
+    selfVersion: String = "",
     initialPage: Int = 0,
     refreshing: Boolean = false,
     onRefresh: () -> Unit = {},
@@ -180,6 +182,8 @@ fun SavedScreen(
                             },
                             onRemovePassword = { onRemovePassword(computer) },
                             onForget = { onForget(computer) },
+                            latestRelease = latestRelease,
+                            selfVersion = selfVersion,
                         )
                     }
                 }
@@ -206,6 +210,8 @@ fun SavedScreen(
                             },
                             onRemovePassword = { onRemovePassword(computer) },
                             onForget = { onForget(computer) },
+                            latestRelease = latestRelease,
+                            selfVersion = selfVersion,
                         )
                     }
                 }
