@@ -57,22 +57,160 @@ fn handle(raw: usize) -> HANDLE {
 
 static HELD: Mutex<Option<Singleton>> = Mutex::new(None);
 static MENU_TX: Mutex<Option<std::sync::mpsc::Sender<Action>>> = Mutex::new(None);
+static MENU_RX: Mutex<Option<std::sync::mpsc::Receiver<Action>>> = Mutex::new(None);
+static DEFERRED: Mutex<Vec<Action>> = Mutex::new(Vec::new());
 static ICON_CLICKED: AtomicBool = AtomicBool::new(false);
+static REOPEN: AtomicBool = AtomicBool::new(false);
+static QUIT: AtomicBool = AtomicBool::new(false);
+static WINDOW_OPEN: AtomicBool = AtomicBool::new(false);
+static ICON_READY: AtomicBool = AtomicBool::new(false);
+static ICON_THREAD: AtomicBool = AtomicBool::new(false);
 static TOOLTIP: Mutex<Option<String>> = Mutex::new(None);
+static WAKE: Mutex<Option<egui::Context>> = Mutex::new(None);
 
-/// Restores the window from this thread and returns. `ShowWindowAsync` does
-/// not call the window procedure, so the click thread is not waiting on it.
-fn ask_open(reason: &str, ctx: &egui::Context) {
+fn window_is_open() -> bool {
+    WINDOW_OPEN.load(Ordering::SeqCst)
+}
+
+/// The window thread sets this while eframe is running. Clearing it drops
+/// the context, so a click after the window is gone does not repaint it.
+pub fn set_window_open(open: bool) {
+    WINDOW_OPEN.store(open, Ordering::SeqCst);
+    if !open {
+        if let Ok(mut slot) = WAKE.lock() {
+            *slot = None;
+        }
+    }
+}
+
+pub fn process_should_exit() -> bool {
+    QUIT.load(Ordering::SeqCst)
+}
+
+pub fn request_quit() {
+    QUIT.store(true, Ordering::SeqCst);
+}
+
+pub fn icon_running() -> bool {
+    ICON_READY.load(Ordering::SeqCst)
+}
+
+fn set_wake(ctx: &egui::Context) {
+    if let Ok(mut slot) = WAKE.lock() {
+        *slot = Some(ctx.clone());
+    }
+}
+
+fn wake() {
+    let ctx = WAKE.lock().ok().and_then(|slot| slot.clone());
+    if let Some(ctx) = ctx {
+        ctx.request_repaint();
+    }
+}
+
+fn ensure_channel() {
+    let mut rx = MENU_RX.lock().unwrap();
+    if rx.is_none() {
+        let (tx, recv) = std::sync::mpsc::channel();
+        if let Ok(mut slot) = MENU_TX.lock() {
+            *slot = Some(tx);
+        }
+        *rx = Some(recv);
+    }
+}
+
+/// Starts the tray icon before any window exists. `--tray` uses this so the
+/// first thing drawn is a click, not a hidden surface.
+pub fn start_without_window() -> bool {
+    ensure_channel();
+    spawn_icon_thread()
+}
+
+fn spawn_icon_thread() -> bool {
+    if ICON_THREAD.swap(true, Ordering::SeqCst) {
+        return ICON_READY.load(Ordering::SeqCst);
+    }
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new().name("pjdesk-server-tray".into()).spawn(move || {
+        let Some(icon) = build_icon() else {
+            let _ = ready_tx.send(false);
+            ICON_THREAD.store(false, Ordering::SeqCst);
+            return;
+        };
+        let _ = ready_tx.send(true);
+        tracing::info!("The PJDesk Server tray icon is on its own thread. A click does not wait for the window.");
+        pump(icon);
+    });
+    if spawned.is_err() {
+        ICON_THREAD.store(false, Ordering::SeqCst);
+        return false;
+    }
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(true) => {
+            ICON_READY.store(true, Ordering::SeqCst);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Blocks on this thread until a tray click should open a window, or Quit.
+/// Logs on a timer so a closed window can be told apart from a stuck one.
+pub fn wait_for_reopen(name: &str) -> bool {
+    let mut logged_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    loop {
+        if process_should_exit() {
+            return false;
+        }
+        if REOPEN.swap(false, Ordering::SeqCst) {
+            return true;
+        }
+        let mut open = false;
+        if let Ok(mut slot) = MENU_RX.lock() {
+            if let Some(rx) = slot.as_mut() {
+                while let Ok(action) = rx.try_recv() {
+                    if matches!(action, Action::Quit) {
+                        request_quit();
+                        return false;
+                    }
+                    if let Ok(mut deferred) = DEFERRED.lock() {
+                        deferred.push(action);
+                    }
+                    open = true;
+                }
+            }
+        }
+        if open {
+            return true;
+        }
+        let elapsed = logged_at.elapsed().as_millis() as u64;
+        if pjdesk_proto::trayshow::parked_alive_due(elapsed) {
+            tracing::info!("The tray loop is alive. The {name} window is closed and is not being drawn.");
+            logged_at = std::time::Instant::now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Restores a live window, or asks the main thread to create one. This
+/// returns without waiting. There is no surface to present into while the
+/// window is closed, so the click does not replace the process.
+fn ask_open(reason: &str) {
     unsafe {
         let _ = AllowSetForegroundWindow(0xFFFF_FFFF);
     }
-    ICON_CLICKED.store(true, Ordering::SeqCst);
-    crate::winshow::show_from_tray("PJDesk Server");
-    crate::traywatch::arm();
-    ctx.request_repaint();
-    tracing::info!(
-        "Tray: {reason}. Asked the PJDesk Server window to come forward. The tray thread restored it and did not wait."
-    );
+    if window_is_open() {
+        ICON_CLICKED.store(true, Ordering::SeqCst);
+        crate::winshow::show_from_tray("PJDesk Server");
+        crate::traywatch::arm();
+        wake();
+        tracing::info!(
+            "Tray: {reason}. Asked the PJDesk Server window to come forward. The tray thread restored it and did not wait."
+        );
+    } else {
+        REOPEN.store(true, Ordering::SeqCst);
+        tracing::info!("Tray: {reason}. The window is closed. Opening a new one. Nothing is drawn until it is open.");
+    }
 }
 
 fn push_menu(action: Action) {
@@ -176,35 +314,14 @@ pub fn ensure_login_default() {
     }
 }
 
-pub struct Tray {
-    menu_rx: std::sync::mpsc::Receiver<Action>,
-}
+pub struct Tray;
 
 impl Tray {
     /// Builds the tray icon on its own thread, or returns `None` if that fails.
+    /// A second window reuses the icon that stayed up while this one was closed.
     pub fn new(ctx: &egui::Context) -> Option<Self> {
-        let (menu_tx, menu_rx) = std::sync::mpsc::channel();
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let ctx = ctx.clone();
-        let spawned = std::thread::Builder::new().name("pjdesk-server-tray".into()).spawn(move || {
-            if let Ok(mut slot) = MENU_TX.lock() {
-                *slot = Some(menu_tx);
-            }
-            let Some(icon) = build_icon(&ctx) else {
-                let _ = ready_tx.send(false);
-                return;
-            };
-            let _ = ready_tx.send(true);
-            tracing::info!("The PJDesk Server tray icon is on its own thread. A click does not wait for the window.");
-            pump(icon);
-        });
-        if spawned.is_err() {
-            return None;
-        }
-        match ready_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-            Ok(true) => Some(Self { menu_rx }),
-            _ => None,
-        }
+        set_wake(ctx);
+        if start_without_window() { Some(Self) } else { None }
     }
 
     pub fn set_tooltip(&self, text: &str) {
@@ -217,19 +334,27 @@ impl Tray {
 
     pub fn poll(&self) -> Vec<Action> {
         let mut out = Vec::new();
+        if let Ok(mut deferred) = DEFERRED.lock() {
+            out.append(&mut deferred);
+        }
         let clicked = ICON_CLICKED.swap(false, Ordering::SeqCst);
+        let reopen = REOPEN.swap(false, Ordering::SeqCst);
         let second = show_requested();
-        if clicked || second {
+        if clicked || reopen || second {
             out.push(Action::Show);
         }
-        while let Ok(action) = self.menu_rx.try_recv() {
-            out.push(action);
+        if let Ok(mut slot) = MENU_RX.lock() {
+            if let Some(rx) = slot.as_mut() {
+                while let Ok(action) = rx.try_recv() {
+                    out.push(action);
+                }
+            }
         }
         out
     }
 }
 
-fn build_icon(ctx: &egui::Context) -> Option<TrayIcon> {
+fn build_icon() -> Option<TrayIcon> {
         let icon = Icon::from_rgba(include_bytes!("../assets/icon_server_32.rgba").to_vec(), 32, 32).ok()?;
 
         let menu = Menu::new();
@@ -274,10 +399,9 @@ fn build_icon(ctx: &egui::Context) -> Option<TrayIcon> {
         let demote_now = demote_id.clone();
         let sync_now = sync_id.clone();
         let quit_now = quit_id.clone();
-        let c1 = ctx.clone();
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
             if e.id.0 == show_now {
-                ask_open("Open", &c1);
+                ask_open("Open");
                 return;
             }
             let action = if e.id.0 == start_now {
@@ -302,9 +426,8 @@ fn build_icon(ctx: &egui::Context) -> Option<TrayIcon> {
                 return;
             };
             push_menu(action);
-            c1.request_repaint();
+            wake();
         }));
-        let c2 = ctx.clone();
         TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
             let click = match e {
                 TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } => {
@@ -318,7 +441,7 @@ fn build_icon(ctx: &egui::Context) -> Option<TrayIcon> {
                 return;
             }
             let reason = if click == pjdesk_proto::trayshow::Click::LeftDouble { "double-click" } else { "left click" };
-            ask_open(reason, &c2);
+            ask_open(reason);
         }));
 
         TrayIconBuilder::new()
@@ -342,11 +465,17 @@ fn pump(icon: TrayIcon) {
         if let Some(tip) = tip {
             let _ = icon.set_tooltip(Some(tip));
         }
-        // A second launch sets this event. Restore here so a parked window
-        // does not have to be awake before the window appears.
+        // A second launch sets this event. A live window is restored here.
+        // A closed window is created by the main thread, which is not inside
+        // a present while it waits.
         if show_requested() {
-            crate::winshow::show_from_tray("PJDesk Server");
-            ICON_CLICKED.store(true, Ordering::SeqCst);
+            if window_is_open() {
+                crate::winshow::show_from_tray("PJDesk Server");
+                ICON_CLICKED.store(true, Ordering::SeqCst);
+            } else {
+                REOPEN.store(true, Ordering::SeqCst);
+                tracing::info!("A second launch asked for PJDesk Server. The window was closed, so it will be opened again.");
+            }
         }
         let wait = unsafe { MsgWaitForMultipleObjects(None, false, 200, QS_ALLINPUT) };
     if wait != WAIT_OBJECT_0 {

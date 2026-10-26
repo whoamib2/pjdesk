@@ -168,15 +168,24 @@ pub fn scrub_abandoned() {
 }
 
 /// Tells the window when Windows locks, signs out, or shuts down.
+/// One hidden window for the process. A reopened PJDesk window gets the
+/// next signal; the old receiver is dropped with the window it belonged to.
 #[cfg(windows)]
 pub fn watch_session_end() -> std::sync::mpsc::Receiver<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("session-end".into())
-        .spawn(move || session_window(tx))
-        .ok();
+    if let Ok(mut slot) = SESSION_TX.lock() {
+        *slot = Some(tx);
+    }
+    if !SESSION_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        std::thread::Builder::new().name("session-end".into()).spawn(session_window).ok();
+    }
     rx
 }
+
+#[cfg(windows)]
+static SESSION_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> = std::sync::Mutex::new(None);
+#[cfg(windows)]
+static SESSION_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(not(windows))]
 pub fn watch_session_end() -> std::sync::mpsc::Receiver<()> {
@@ -185,8 +194,7 @@ pub fn watch_session_end() -> std::sync::mpsc::Receiver<()> {
 }
 
 #[cfg(windows)]
-fn session_window(tx: std::sync::mpsc::Sender<()>) {
-    use std::sync::Mutex;
+fn session_window() {
     use windows::core::w;
     use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
@@ -194,9 +202,6 @@ fn session_window(tx: std::sync::mpsc::Sender<()>) {
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE,
         WM_ENDSESSION, WM_QUERYENDSESSION, WM_WTSSESSION_CHANGE, WNDCLASSW, WTS_SESSION_LOCK, WTS_SESSION_LOGOFF,
     };
-
-    static TX: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
-    *TX.lock().unwrap() = Some(tx);
 
     unsafe extern "system" fn proc(
         hwnd: windows::Win32::Foundation::HWND,
@@ -208,7 +213,7 @@ fn session_window(tx: std::sync::mpsc::Sender<()>) {
             || msg == WM_QUERYENDSESSION
             || (msg == WM_WTSSESSION_CHANGE && (wparam.0 as u32 == WTS_SESSION_LOCK || wparam.0 as u32 == WTS_SESSION_LOGOFF));
         if end {
-            if let Some(tx) = TX.lock().unwrap().as_ref() {
+            if let Some(tx) = SESSION_TX.lock().unwrap().as_ref() {
                 let _ = tx.send(());
             }
         }

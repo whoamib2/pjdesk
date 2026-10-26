@@ -50,7 +50,30 @@ enum DeskTab {
     Lan,
 }
 
-/// Launches the app and blocks until the window is closed.
+fn client_window_options() -> eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1360.0, 840.0])
+            .with_min_inner_size([saved::MIN_INNER_WIDTH, 680.0])
+            .with_title("PJDesk")
+            .with_app_id("pjdesk")
+            .with_icon(std::sync::Arc::new(app_icon())),
+        renderer: preferred_renderer(),
+        // Closing the window returns here. The process keeps the tray.
+        run_and_return: true,
+        ..Default::default()
+    };
+    // Presenting into a minimized window waits on vsync, and that wait is
+    // what makes the process stop answering Windows. The close button
+    // destroys the window instead. The minimize button still has a surface,
+    // so that present does not wait.
+    options.wgpu_options.surface.present_mode = eframe::wgpu::PresentMode::AutoNoVsync;
+    options.wgpu_options.surface.desired_maximum_frame_latency = Some(1);
+    options
+}
+
+/// Launches the app and blocks until Quit. Closing the window destroys it
+/// and leaves this process in the tray, with no surface to present into.
 pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result<()> {
     // A replacement waits for the frozen window to leave before taking the lock.
     crate::traywatch::wait_for_replaced_process();
@@ -68,27 +91,37 @@ pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result
         }
     }
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1360.0, 840.0])
-            .with_min_inner_size([saved::MIN_INNER_WIDTH, 680.0])
-            .with_title("PJDesk")
-            .with_app_id("pjdesk")
-            .with_icon(std::sync::Arc::new(app_icon())),
-        renderer: preferred_renderer(),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "PJDesk",
-        options,
-        Box::new(move |cc| {
-            let mut app = App::new(cc, config);
-            app.take_installer_key(import_config);
-            Ok(Box::new(app))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    let mut import_once = import_config;
+    loop {
+        let cfg = config.clone();
+        let import = import_once.take();
+        let built = eframe::run_native(
+            "PJDesk",
+            client_window_options(),
+            Box::new(move |cc| {
+                let mut app = App::new(cc, cfg);
+                app.take_installer_key(import);
+                Ok(Box::new(app))
+            }),
+        );
+        tray::set_window_open(false);
+        if let Err(e) = built {
+            discard_parked();
+            return Err(anyhow::anyhow!("{e}"));
+        }
+        if tray::process_should_exit() || !tray::icon_running() {
+            discard_parked();
+            tracing::info!("PJDesk left the tray.");
+            return Ok(());
+        }
+        tracing::info!("The window was closed. PJDesk stays in the tray. The window is destroyed, so it is not drawn.");
+        if !tray::wait_for_reopen("PJDesk") {
+            discard_parked();
+            tracing::info!("PJDesk left the tray.");
+            return Ok(());
+        }
+        tracing::info!("Opening the PJDesk window again. The sign-in from before it was closed is still here.");
+    }
 }
 
 fn app_icon() -> egui::IconData {
@@ -356,10 +389,8 @@ pub struct App {
     logo: Option<egui::TextureHandle>,
     really_quit: bool,
     told_tray: bool,
-    /// Close (X) parked the window in the tray. The minimize button does not.
-    in_tray: bool,
-    /// The taskbar button has been removed for this hide.
-    tray_hidden: bool,
+    /// Last time a minimized frame said the loop was alive.
+    hidden_log: Option<Instant>,
     /// Show toggle for the support password. Separate from the one-time password.
     show_support_password: bool,
     support_code_in: String,
@@ -426,12 +457,71 @@ enum InviteMsg {
     Failed(String),
 }
 
+/// What has to survive destroying the window. The host thread keeps
+/// running because this still holds it. Quit is what stops it.
+struct ParkedGui {
+    cfg: Config,
+    temp: Option<TempHold>,
+    engine: Engine,
+    published_code: String,
+    published_id: String,
+}
+
+fn parked_slot() -> &'static std::sync::Mutex<Option<ParkedGui>> {
+    static PARKED: std::sync::OnceLock<std::sync::Mutex<Option<ParkedGui>>> = std::sync::OnceLock::new();
+    PARKED.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn take_parked() -> Option<ParkedGui> {
+    parked_slot().lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Quit while the window is already closed. Ends a temporary sign-in and
+/// stops the host. The saved sign-in on disk stays.
+fn discard_parked() {
+    let Some(parked) = take_parked() else { return };
+    if parked.engine.service_running {
+        let path = crate::syspaths::service_dir().join("support.refresh");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, b"1\n");
+    } else {
+        parked.engine.shared.request_support_refresh();
+    }
+    if parked.published_code.len() == 8 {
+        let _ = crate::network::revoke_support(&parked.published_code, &parked.published_id);
+    }
+    if let Some(temp) = parked.temp {
+        let (passwords, recents) = crate::temp_sign::marker_ids();
+        let mut disk = Config::load().unwrap_or_else(|_| temp.snapshot.clone());
+        crate::temp_sign::restore_after_temporary(&mut disk, &temp.snapshot, &passwords, &recents);
+        disk.ephemeral_network = false;
+        let _ = disk.save();
+        crate::network::copy_to_service(&disk);
+        crate::temp_sign::clear_marker();
+        crate::vault::clear_session_key();
+    }
+    parked.engine.shared.request_stop();
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, cfg: Config) -> Self {
+        if let Some(parked) = take_parked() {
+            let mut app = Self::create(cc, parked.cfg, false);
+            app.engine = parked.engine;
+            app.temp = parked.temp;
+            app.published_code = parked.published_code;
+            app.published_id = parked.published_id;
+            app.net_email = app.cfg.network_email.clone().unwrap_or_default();
+            tracing::info!("The window is open again. The sign-in is the one from before it was closed.");
+            return app;
+        }
         Self::create(cc, cfg, false)
     }
 
     fn create(cc: &eframe::CreationContext<'_>, cfg: Config, preview: bool) -> Self {
+        tray::set_window_open(true);
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, &cfg.settings.theme);
         let engine = Engine::idle(&cfg);
@@ -553,8 +643,7 @@ impl App {
             )),
             really_quit: false,
             told_tray: false,
-            in_tray: false,
-            tray_hidden: false,
+            hidden_log: None,
             show_support_password: false,
             support_code_in: String::new(),
             support_pass_in: String::new(),
@@ -2774,8 +2863,9 @@ impl App {
         }
     }
 
-    /// Tray clicks and the window close button. `logic` calls this so it still
-    /// runs after the window has been hidden.
+    /// Tray clicks and the window close button. Close destroys this window.
+    /// The process stays. The next click creates a new one. Minimizing would
+    /// leave a surface, and presenting into that surface stops this thread.
     fn on_tray(&mut self, ctx: &egui::Context) {
         let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
         let has_tray = self.tray.is_some();
@@ -2783,15 +2873,11 @@ impl App {
             match action {
                 tray::Action::Show => {
                     tracing::info!("Tray click reached PJDesk. Showing the window. The PIN lock is shown when one is set.");
-                    self.in_tray = false;
-                    self.tray_hidden = false;
                     reveal_window(ctx, "Open");
                     self.lock_from_tray();
                 }
                 tray::Action::Update => {
                     tracing::info!("Tray click: Check for updates. Showing the window.");
-                    self.in_tray = false;
-                    self.tray_hidden = false;
                     reveal_window(ctx, "Check for updates");
                     if self.signed_in() {
                         self.lock_from_tray();
@@ -2804,6 +2890,7 @@ impl App {
                 tray::Action::Revoke => self.revoke_support_access(),
                 tray::Action::Quit => {
                     tracing::info!("Tray click: Quit PJDesk.");
+                    tray::request_quit();
                     self.really_quit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -2813,26 +2900,39 @@ impl App {
         if closing && (self.really_quit || !has_tray) && self.temp.is_some() {
             self.end_temporary_sign_in();
         }
-        if closing && pjdesk_proto::trayshow::minimize_on_close(has_tray, self.really_quit, crate::winshow::user_just_opened()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            self.in_tray = true;
+        // Do not cancel the close and do not minimize. The window is destroyed.
+        // The saved sign-in stays with this process until Quit.
+        if closing && pjdesk_proto::trayshow::destroy_window_on_close(has_tray, self.really_quit) {
+            // Clicks from here on create a new window. They do not restore
+            // this one, and they do not start the hung-window watchdog.
+            tray::set_window_open(false);
             if !self.told_tray {
                 self.told_tray = true;
-                tracing::info!("The window was closed. PJDesk stays in the tray. A click or double-click opens it again.");
+                tracing::info!("The window was closed. PJDesk stays in the tray. The window is destroyed, so it is not drawn.");
                 self.toast.show("PJDesk is still running — click the tray icon, or right-click it to Quit");
             }
         }
-        // The minimize button leaves the taskbar button. Only X (in_tray) removes it,
-        // and only once the window is already minimized so this frame is not painted.
-        if self.in_tray && !self.really_quit && !crate::winshow::user_just_opened() {
-            let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
-            if minimized {
-                if crate::winshow::conceal_from_taskbar("PJDesk") && !self.tray_hidden {
-                    self.tray_hidden = true;
-                    tracing::info!("The taskbar button is removed. PJDesk is only in the tray.");
-                }
-            }
+        self.note_if_minimized(ctx);
+    }
+
+    /// A minimized window can still be asked to present. Say so, and do not
+    /// schedule another present from here.
+    fn note_if_minimized(&mut self, ctx: &egui::Context) {
+        let hidden = ctx.input(|i| {
+            let view = i.viewport();
+            view.minimized == Some(true) || view.visible() == Some(false)
+        });
+        if !hidden {
+            self.hidden_log = None;
+            return;
+        }
+        let due = self
+            .hidden_log
+            .map(|at| pjdesk_proto::trayshow::parked_alive_due(at.elapsed().as_millis() as u64))
+            .unwrap_or(true);
+        if due {
+            self.hidden_log = Some(Instant::now());
+            tracing::info!("The window is minimized. This frame ran, so the loop is alive. It is not being drawn again until it is restored.");
         }
     }
 }
@@ -2845,6 +2945,20 @@ enum InviteKind {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
+        // X destroys the window and leaves the process. The sign-in, a
+        // temporary visit, and the host thread stay until Quit.
+        if self.tray.is_some() && !self.really_quit {
+            let engine = std::mem::replace(&mut self.engine, Engine::idle(&Config::default()));
+            let cfg = std::mem::take(&mut self.cfg);
+            let temp = self.temp.take();
+            let published_code = std::mem::take(&mut self.published_code);
+            let published_id = std::mem::take(&mut self.published_id);
+            if let Ok(mut slot) = parked_slot().lock() {
+                *slot = Some(ParkedGui { cfg, temp, engine, published_code, published_id });
+            }
+            tracing::info!("The window was closed. PJDesk stays in the tray. The window is destroyed, so it is not drawn. The saved sign-in stays.");
+            return;
+        }
         if self.engine.service_running {
             let path = crate::syspaths::service_dir().join("support.refresh");
             if let Some(dir) = path.parent() {
@@ -2859,20 +2973,10 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // eframe does not call `ui` while the window is minimized. A tray
-        // click has to be handled here, or the window stays down.
+        // A closed window is not in this loop. eframe has returned, and the
+        // process is waiting without a surface.
         self.ctx = ctx.clone();
         self.on_tray(ctx);
-        // Windows does not redraw a minimized window. Keep waking so a tray
-        // click is still noticed and the window thread is not left idle.
-        let parked = self.in_tray
-            || ctx.input(|i| {
-                let view = i.viewport();
-                view.minimized == Some(true) || view.visible() == Some(false)
-            });
-        if parked {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2927,7 +3031,12 @@ impl eframe::App for App {
             || !self.viewer_rx.is_empty()
             || !self.engine.ready
             || self.lock_busy;
-        ctx.request_repaint_after(Duration::from_millis(if pending { 50 } else { 400 }));
+        let hidden = ctx.input(|i| i.viewport().minimized == Some(true) || i.viewport().visible() == Some(false));
+        // A minimized window is not asked to present again. That present is
+        // what stopped the message loop. A restore from the taskbar wakes it.
+        if !hidden {
+            ctx.request_repaint_after(Duration::from_millis(if pending { 50 } else { 400 }));
+        }
 
         if self.lock_ui && self.signed_in() {
             if self.lock_resetting || self.cfg.app_lock_for(&self.account_email()).is_none() {

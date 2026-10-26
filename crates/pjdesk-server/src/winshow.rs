@@ -17,6 +17,7 @@ pub fn note_user_open() {
 }
 
 /// True for a short time after a tray open, so hide-to-tray does not undo it.
+#[allow(dead_code)]
 pub fn user_just_opened() -> bool {
     OPENED.lock().ok().and_then(|opened| *opened).is_some_and(|at| at.elapsed() < Duration::from_millis(1500))
 }
@@ -33,6 +34,8 @@ pub fn activate(reason: &str, title: &str, owns_gui: bool) {
 
 /// Minimize before the first paint. A window that is hidden but not
 /// minimized still gets painted, and that paint waits forever.
+/// 0.6.42 does not call this. Closing the window destroys it instead.
+#[allow(dead_code)]
 pub fn minimize_now(title: &str) {
     #[cfg(windows)]
     imp::minimize_now(title);
@@ -45,6 +48,8 @@ pub fn minimize_now(title: &str) {
 /// Take the taskbar button off a window that is already minimized.
 /// Returns false when the window is not iconic yet, so the caller waits.
 /// The window thread calls this. The tray thread does not.
+/// 0.6.42 does not call this. Closing the window destroys it instead.
+#[allow(dead_code)]
 pub fn conceal_from_taskbar(title: &str) -> bool {
     #[cfg(windows)]
     {

@@ -35,6 +35,26 @@ pub fn login_enabled() -> bool {
 
 pub fn set_login(_enable: bool) {}
 
+pub fn set_window_open(_open: bool) {}
+
+pub fn process_should_exit() -> bool {
+    false
+}
+
+pub fn request_quit() {}
+
+pub fn icon_running() -> bool {
+    false
+}
+
+pub fn start_without_window() -> bool {
+    false
+}
+
+pub fn wait_for_reopen(_name: &str) -> bool {
+    false
+}
+
 pub struct Tray;
 
 impl Tray {

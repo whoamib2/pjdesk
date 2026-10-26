@@ -76,11 +76,26 @@ pub fn hide_because_minimized(minimized: bool, opening: bool) -> bool {
     minimized && !opening
 }
 
-/// The close button parks the window in the tray. It does not destroy
-/// the window. Quit still closes. An open that just happened is left
-/// alone. The minimize button is a different path and keeps the taskbar button.
+/// Older decision: cancel the close and minimize. The apps no longer do
+/// that. A minimized window is still a surface, and presenting into it
+/// stops the message loop. [`destroy_window_on_close`] is the close button.
 pub fn minimize_on_close(has_tray: bool, really_quit: bool, just_opened: bool) -> bool {
     has_tray && !really_quit && !just_opened
+}
+
+/// The close button destroys the eframe window and leaves the process in
+/// the tray. Quit ends the process. With no tray icon, the close ends it.
+/// The window is not minimized, so nothing is presented while it is parked.
+pub fn destroy_window_on_close(has_tray: bool, really_quit: bool) -> bool {
+    has_tray && !really_quit
+}
+
+/// How often a parked process says the loop is still alive.
+pub const PARKED_ALIVE_MS: u64 = 2_000;
+
+/// True when the last alive line is old enough to write another.
+pub fn parked_alive_due(elapsed_ms: u64) -> bool {
+    elapsed_ms >= PARKED_ALIVE_MS
 }
 
 /// No live window means the tray starts the program. A destroyed window
@@ -186,6 +201,12 @@ mod tests {
         assert!(!minimize_on_close(true, true, false));
         assert!(!minimize_on_close(true, false, true));
         assert!(!minimize_on_close(false, false, false));
+        assert!(destroy_window_on_close(true, false));
+        assert!(!destroy_window_on_close(true, true));
+        assert!(!destroy_window_on_close(false, false));
+        assert!(!parked_alive_due(0));
+        assert!(!parked_alive_due(PARKED_ALIVE_MS - 1));
+        assert!(parked_alive_due(PARKED_ALIVE_MS));
         assert!(should_launch(false));
         assert!(!should_launch(true));
     }
