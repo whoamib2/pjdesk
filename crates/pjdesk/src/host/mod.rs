@@ -113,23 +113,6 @@ pub struct ConsentReply {
     pub receive_dir: String,
 }
 
-/// `Some` when this connection landed on the account's standby instead of the
-/// server in the registration target. The caller reconnects on the public path.
-async fn landed_on_standby(config: &Config, primary: &ServerAddr, connected: SocketAddr) -> Option<String> {
-    let text = config.network_standby.clone().unwrap_or_default();
-    let Ok(standby) = ServerAddr::parse(&text) else {
-        return None;
-    };
-    let Ok(resolved) = standby.resolve().await else {
-        return None;
-    };
-    if crate::signaling::reached_standby(connected, primary, &standby, resolved) {
-        Some(format!("that address is the standby at {standby}; connecting to the primary"))
-    } else {
-        None
-    }
-}
-
 fn unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -654,6 +637,92 @@ enum SignalEnd {
     Lost,
 }
 
+/// Dials the fresh advertised IPs, then a saved hostname, and registers.
+/// A standby redirect is followed at once.
+async fn register_catalog(
+    config: &mut Config,
+    state: &Arc<HostState>,
+    role: &str,
+    key: &str,
+) -> Result<(SignalClient, ServerAddr, String)> {
+    let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
+    let token = config.presented_access();
+    let access_key = pjdesk_proto::access::is_access_key(&token);
+    let device_secret = config.device_secret()?;
+    let mut without_token = false;
+    let mut redirects = 0u8;
+    let mut signal = SignalClient::connect_catalog(config, &mine).await.map_err(|err| {
+        anyhow::anyhow!("could not reach the primary or the standby; retrying. {err:#}")
+    })?;
+    loop {
+        let register_proto = state.server_proto.load(Ordering::SeqCst);
+        let server = ServerAddr { host: signal.server_addr.ip().to_string(), port: signal.server_addr.port() };
+        info!("Registration target ({role}): {server} via {} ({}), key {key}", signal.via, signal.server_addr);
+        let presented = if without_token { String::new() } else { token.clone() };
+        if !presented.is_empty() {
+            let _ = signal.send(ClientMsg::PresentAccess { token: presented });
+        }
+        signal.send(ClientMsg::Register {
+            proto: register_proto,
+            device_id: config.device_id.clone(),
+            device_secret,
+            hostname: state.name.clone(),
+            app_version: env!("CARGO_PKG_VERSION").into(),
+        })?;
+        loop {
+            match timeout(Duration::from_secs(10), signal.recv()).await {
+                Ok(Some(ServerMsg::Registered { device_id })) => return Ok((signal, server, device_id)),
+                Ok(Some(ServerMsg::Routes(routes))) => {
+                    if !routes.is_empty() {
+                        config.network_routes = routes;
+                        let _ = config.save();
+                    }
+                }
+                Ok(Some(ServerMsg::Error { code: ErrorCode::IdConflict, message })) => {
+                    config.device_id = None;
+                    config.save()?;
+                    bail!("{message}; a new ID will be requested");
+                }
+                Ok(Some(ServerMsg::Error { message, .. }))
+                    if pjdesk_proto::signal::is_standby_refusal(&message) && redirects < 1 =>
+                {
+                    redirects += 1;
+                    let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) else {
+                        bail!("could not reach the primary after the standby redirect; retrying");
+                    };
+                    if !routes.is_empty() {
+                        config.network_routes = routes;
+                        let _ = config.save();
+                    }
+                    if addr.is_empty() {
+                        bail!("could not reach the primary after the standby redirect; retrying");
+                    }
+                    info!("Standby redirected registration to {addr}");
+                    signal = SignalClient::connect_endpoint(&addr, config, pjdesk_proto::routes::dial_budget(&addr)).await.map_err(|err| {
+                        anyhow::anyhow!("could not reach the primary at {addr}; retrying. {err:#}")
+                    })?;
+                    break;
+                }
+                Ok(Some(ServerMsg::Error { message, .. })) => {
+                    if pjdesk_proto::version_rejected(&message) && register_proto > pjdesk_proto::MIN_PROTOCOL_VERSION {
+                        state.server_proto.store(pjdesk_proto::MIN_PROTOCOL_VERSION, Ordering::SeqCst);
+                        bail!("the server speaks an older protocol; reconnecting");
+                    }
+                    bail!("the server refused registration: {message}");
+                }
+                Ok(Some(other)) => bail!("unexpected reply from the server: {other:?}"),
+                Ok(None) if !token.is_empty() && !access_key && !without_token => {
+                    without_token = true;
+                    signal = SignalClient::connect_catalog(config, &mine).await?;
+                    break;
+                }
+                Ok(None) => bail!("the server closed the connection"),
+                Err(_) => bail!("the server did not answer"),
+            }
+        }
+    }
+}
+
 /// One signaling connection: register, then handle incoming sessions.
 /// Returns `Ok` if we were registered before the connection dropped.
 async fn signaling_loop(
@@ -664,14 +733,11 @@ async fn signaling_loop(
     public_only: bool,
     use_standby: bool,
 ) -> Result<SignalEnd> {
+    let _ = (server, force_refresh, public_only, use_standby);
     tokio::task::spawn_blocking({
         let mut copy = config.clone();
         move || {
-            if force_refresh {
-                crate::network::refresh_config_now(&mut copy);
-            } else {
-                crate::network::refresh_config(&mut copy);
-            }
+            crate::network::refresh_config_now(&mut copy);
             copy
         }
     })
@@ -688,104 +754,17 @@ async fn signaling_loop(
         config.network_public_ip = refreshed.network_public_ip;
         config.network_standby = refreshed.network_standby;
         config.network_standby_fingerprint = refreshed.network_standby_fingerprint;
+        config.network_routes = refreshed.network_routes;
     });
     let _ = config.reload_access_key();
     state.remember_support(config);
-    let standby_text = config.network_standby.clone().unwrap_or_default();
-    let server = if use_standby {
-        ServerAddr::parse(standby_text.trim()).unwrap_or_else(|_| {
-            ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone())
-        })
-    } else {
-        ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone())
-    };
     let role = if state.args.service_host { "service" } else { "window" };
     let key = config
         .server_fingerprint
         .as_deref()
         .map(pjdesk_proto::discover::fingerprint_prefix)
         .unwrap_or_else(|| "unpinned".into());
-    info!(
-        "Registration target ({role}): {server}, key {key}, {}",
-        if use_standby {
-            "standby address"
-        } else if public_only {
-            "public address only"
-        } else {
-            "LAN or public"
-        }
-    );
-    let token = config.presented_access();
-    let access_key = pjdesk_proto::access::is_access_key(&token);
-    let mut signal = SignalClient::connect_mode(&server, config, public_only || use_standby).await?;
-    if !use_standby {
-        if let Some(reason) = landed_on_standby(config, &server, signal.server_addr).await {
-            warn!(
-                "Registration target {server} reached {} via {} ({role}), key {key}; {reason}",
-                signal.server_addr, signal.via
-            );
-            bail!(pjdesk_proto::signal::STANDBY_REGISTRATION);
-        }
-    }
-    if !token.is_empty() {
-        let _ = signal.send(ClientMsg::PresentAccess { token: token.clone() });
-    }
-    let device_secret = config.device_secret()?;
-    let register_proto = state.server_proto.load(Ordering::SeqCst);
-    let register = ClientMsg::Register {
-        proto: register_proto,
-        device_id: config.device_id.clone(),
-        device_secret,
-        hostname: state.name.clone(),
-        app_version: env!("CARGO_PKG_VERSION").into(),
-    };
-    signal.send(register.clone())?;
-
-    let first = timeout(Duration::from_secs(10), signal.recv()).await;
-    let device_id = match first {
-        Ok(None) if !token.is_empty() && !access_key => {
-            // A server from before 0.6.0 cannot decode PresentAccess and drops
-            // the socket. Try once without the token so this computer stays online.
-            // An access key is not retried without: the server asked for it.
-            signal = SignalClient::connect_mode(&server, config, public_only || use_standby).await?;
-            if !use_standby && landed_on_standby(config, &server, signal.server_addr).await.is_some() {
-                bail!(pjdesk_proto::signal::STANDBY_REGISTRATION);
-            }
-            signal.send(register)?;
-            timeout(Duration::from_secs(10), signal.recv()).await
-        }
-        other => other,
-    };
-    let device_id = match device_id {
-        Ok(Some(ServerMsg::Registered { device_id })) => device_id,
-        Ok(Some(ServerMsg::Error { code: ErrorCode::IdConflict, message })) => {
-            config.device_id = None;
-            config.save()?;
-            bail!("{message}; a new ID will be requested");
-        }
-        Ok(Some(ServerMsg::Error { message, .. })) => {
-            if pjdesk_proto::signal::is_standby_refusal(&message) {
-                let key = config
-                    .server_fingerprint
-                    .as_deref()
-                    .map(pjdesk_proto::discover::fingerprint_prefix)
-                    .unwrap_or_else(|| "unpinned".into());
-                warn!(
-                    "Registration refused by the standby at {server} via {} ({}), key {key}; connecting to the primary",
-                    signal.via, signal.server_addr
-                );
-                bail!("{message}");
-            }
-            if pjdesk_proto::version_rejected(&message) && register_proto > pjdesk_proto::MIN_PROTOCOL_VERSION {
-                state.server_proto.store(pjdesk_proto::MIN_PROTOCOL_VERSION, Ordering::SeqCst);
-                bail!("the server speaks an older protocol; reconnecting");
-            }
-            bail!("the server refused registration: {message}");
-        }
-        Ok(Some(other)) => bail!("unexpected reply from the server: {other:?}"),
-        Ok(None) => bail!("the server closed the connection"),
-        Err(_) => bail!("the server did not answer"),
-    };
+    let (mut signal, server, device_id) = register_catalog(config, state, role, &key).await?;
     *state.device_id.lock().unwrap() = device_id.clone();
     if config.device_id.as_deref() != Some(device_id.as_str()) {
         config.device_id = Some(device_id.clone());
@@ -923,6 +902,13 @@ async fn signaling_loop(
                         info!("Server asked this computer to update now");
                         if !crate::client_update::start() {
                             info!("An update is already running");
+                        }
+                    }
+                    ServerMsg::Routes(routes) => {
+                        if !routes.is_empty() {
+                            config.network_routes = routes;
+                            let _ = config.save();
+                            info!("Updated server addresses from the primary");
                         }
                     }
                     ServerMsg::WantHostReport => {

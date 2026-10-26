@@ -345,6 +345,10 @@ pub enum ServerMsg {
         #[serde(default)]
         keys: Vec<AccessKeyBrief>,
     },
+    /// 0.6.45+. The public and LAN addresses of both servers. Sent after
+    /// registration, and again when an address changes. Older clients are not
+    /// sent this variant.
+    Routes(crate::routes::ServerRoutes),
 }
 
 /// One server access key, safe to list. The secret and its hash are not here.
@@ -392,6 +396,95 @@ pub const STANDBY_REGISTRATION: &str = "This server is the standby. Connect to t
 
 pub fn is_standby_refusal(message: &str) -> bool {
     message.contains("This server is the standby")
+}
+
+/// A standby tells the client where the primary is, and sends the full catalog.
+/// The first sentence stays recognizable to an older client. The `routes` line
+/// is for 0.6.45.
+pub fn standby_redirect(primary: &str, routes: &crate::routes::ServerRoutes) -> String {
+    let primary = crate::routes::canonical(primary);
+    let head = if primary.is_empty() {
+        STANDBY_REGISTRATION.to_string()
+    } else {
+        format!("This server is the standby. Connect to the primary at {primary}.")
+    };
+    let line = routes_line(routes);
+    if line.is_empty() {
+        head
+    } else {
+        format!("{head}\n{line}")
+    }
+}
+
+/// The primary address from a standby reply, plus the catalog when one was sent.
+pub fn parse_standby_redirect(message: &str) -> Option<(String, crate::routes::ServerRoutes)> {
+    if !is_standby_refusal(message) {
+        return None;
+    }
+    let mut primary = String::new();
+    if let Some(rest) = message.split("Connect to the primary at ").nth(1) {
+        let addr = rest.split([' ', '\n', '\r']).next().unwrap_or("").trim().trim_end_matches('.');
+        if !addr.is_empty() {
+            primary = crate::routes::canonical(addr);
+        }
+    }
+    let mut routes = crate::routes::ServerRoutes::default();
+    for line in message.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("routes ") {
+            routes = parse_routes_line(rest);
+        }
+    }
+    if primary.is_empty() {
+        primary = routes.primary_public.first().cloned().or_else(|| routes.primary_lan.first().cloned()).unwrap_or_default();
+    }
+    Some((primary, routes))
+}
+
+fn routes_line(routes: &crate::routes::ServerRoutes) -> String {
+    if routes.is_empty() {
+        return String::new();
+    }
+    format!(
+        "routes primary_lan={} primary_public={} standby_lan={} standby_public={} names={}",
+        join_endpoints(&routes.primary_lan),
+        join_endpoints(&routes.primary_public),
+        join_endpoints(&routes.standby_lan),
+        join_endpoints(&routes.standby_public),
+        join_endpoints(&routes.names),
+    )
+}
+
+fn join_endpoints(list: &[String]) -> String {
+    if list.is_empty() {
+        "-".into()
+    } else {
+        list.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(",")
+    }
+}
+
+fn parse_routes_line(rest: &str) -> crate::routes::ServerRoutes {
+    let mut routes = crate::routes::ServerRoutes::default();
+    for part in rest.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else { continue };
+        let list = split_endpoints(value);
+        match key {
+            "primary_lan" => routes.primary_lan = list,
+            "primary_public" => routes.primary_public = list,
+            "standby_lan" => routes.standby_lan = list,
+            "standby_public" => routes.standby_public = list,
+            "names" => routes.names = list,
+            _ => {}
+        }
+    }
+    routes
+}
+
+fn split_endpoints(value: &str) -> Vec<String> {
+    if value == "-" {
+        return Vec::new();
+    }
+    value.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
 }
 
 /// Backoff after a refused signaling connection: 1s, 2s, 4s, 8s, then 10s.
@@ -460,6 +553,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(keys[0], 13, "AccessKeys is appended after WantHostReport");
+        let routes = postcard::to_stdvec(&ServerMsg::Routes(crate::routes::ServerRoutes::default())).unwrap();
+        assert_eq!(routes[0], 14, "Routes is appended after AccessKeys");
         let back: ClientMsg = postcard::from_bytes(&ping).unwrap();
         assert!(matches!(back, ClientMsg::Ping));
         match postcard::from_bytes::<ServerMsg>(&keys).unwrap() {
@@ -497,6 +592,20 @@ mod tests {
     fn reconnect_backoff_caps_at_ten_seconds() {
         assert!(is_standby_refusal(STANDBY_REGISTRATION));
         assert!(!is_standby_refusal("device 902 488 771 is not online"));
+        let routes = crate::routes::ServerRoutes {
+            primary_public: vec!["204.248.122.44:21200".into()],
+            primary_lan: vec!["192.168.0.20:21200".into()],
+            standby_public: vec!["198.51.100.8:21200".into()],
+            ..crate::routes::ServerRoutes::default()
+        };
+        let text = standby_redirect("204.248.122.44:21200", &routes);
+        assert!(is_standby_refusal(&text));
+        let (addr, parsed) = parse_standby_redirect(&text).unwrap();
+        assert_eq!(addr, "204.248.122.44:21200");
+        assert_eq!(parsed.primary_lan, vec!["192.168.0.20:21200".to_string()]);
+        let (old, empty) = parse_standby_redirect(STANDBY_REGISTRATION).unwrap();
+        assert!(old.is_empty());
+        assert!(empty.is_empty());
         let mut delay = Duration::from_secs(1);
         let mut seen = vec![delay];
         for _ in 0..6 {

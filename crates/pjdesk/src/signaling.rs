@@ -241,6 +241,80 @@ impl SignalClient {
     pub async fn recv(&mut self) -> Option<ServerMsg> {
         self.rx.recv().await
     }
+
+    /// Dials one address. An IP is not looked up in DNS or the hosts file.
+    pub async fn connect_endpoint(target: &str, config: &mut Config, budget: Duration) -> Result<Self> {
+        let server = ServerAddr::parse(target)?;
+        let label = server.to_string();
+        let resolved = if let Some(ip) = target.trim().parse::<std::net::Ipv4Addr>().ok().filter(|_| !target.contains(':')) {
+            SocketAddr::new(IpAddr::V4(ip), server.port)
+        } else if pjdesk_proto::routes::is_ip_endpoint(target) {
+            let ip = pjdesk_proto::routes::endpoint_v4(target).context("missing IP")?;
+            SocketAddr::new(IpAddr::V4(ip), server.port)
+        } else {
+            timeout(Duration::from_secs(2), server.resolve()).await.map_err(|_| anyhow!("timed out resolving {label}"))??
+        };
+        let pinned = config.pinned_fingerprint();
+        let expected = config.server_fingerprint.clone();
+        let ready = handshake(resolved, path_label(resolved), budget, &label, pinned, expected.as_deref()).await?;
+        finish_client(ready, config, &label)
+    }
+
+    /// Tries the fresh advertised IPs, then a saved hostname.
+    pub async fn connect_catalog(config: &mut Config, mine: &[std::net::Ipv4Addr]) -> Result<Self> {
+        let saved = config.effective_server();
+        let targets = pjdesk_proto::routes::dial_targets(&config.network_routes, mine, &saved);
+        if targets.is_empty() {
+            bail!("the server address is empty");
+        }
+        let mut last = None;
+        for target in &targets {
+            let budget = pjdesk_proto::routes::dial_budget(target);
+            info!("Dialing {target}");
+            match Self::connect_endpoint(target, config, budget).await {
+                Ok(signal) => {
+                    info!("Server answered at {target} via {} ({})", signal.via, signal.server_addr);
+                    return Ok(signal);
+                }
+                Err(err) => {
+                    info!("Dial {target} failed: {err:#}");
+                    last = Some(err);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow!("could not reach a PJDesk server")))
+    }
+}
+
+fn finish_client(ready: Ready, config: &mut Config, label: &str) -> Result<SignalClient> {
+    if config.pinned_fingerprint().is_none() {
+        if let Some(fp) = ready.verifier.observed() {
+            let text = tls::format_fingerprint(&fp);
+            info!("First connection to {label}: trusting its key {text}");
+            config.server_fingerprint = Some(text);
+            config.save()?;
+        }
+    }
+    let addr = ready.addr;
+    let via = ready.via;
+    let (mut reader, mut writer) = tokio::io::split(ready.stream);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ClientMsg>();
+    let (in_tx, in_rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let writer_task = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if write_msg(&mut writer, &msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    let reader_task = tokio::spawn(async move {
+        while let Ok(msg) = read_msg::<_, ServerMsg>(&mut reader, MAX_SIGNAL_FRAME).await {
+            if in_tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(SignalClient { tx: out_tx, rx: in_rx, server_addr: addr, via, tasks: vec![writer_task, reader_task] })
 }
 
 impl Drop for SignalClient {

@@ -108,6 +108,12 @@ pub struct Snapshot {
     pub public_watch: bool,
     #[serde(default)]
     pub public_ip_line: String,
+    /// Set when the published name resolves to an address that is not this server.
+    #[serde(default)]
+    pub address_warn: String,
+    /// Public and LAN addresses of both servers.
+    #[serde(default)]
+    pub routes_line: String,
     /// Server access keys, without the secret or its hash.
     #[serde(default)]
     pub access_keys: Vec<pjdesk_proto::signal::AccessKeyBrief>,
@@ -232,6 +238,8 @@ impl Snapshot {
         snap.public_watch_known = true;
         snap.public_watch = watch.enabled(&snap.public_address);
         snap.public_ip_line = watch.line();
+        snap.address_warn = crate::public_addr::stored_address_warning(dir);
+        snap.routes_line = crate::cloud::routes_line(dir);
         snap.log_tail = redacted_log_tail(&dir.join("server.log"));
         snap.access_keys = crate::access_keys::Store::public_list(dir);
         snap

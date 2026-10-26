@@ -107,6 +107,40 @@ impl SignalClient {
         Self::connect_reaching(server, pinned, &[], "", "", false).await
     }
 
+    /// Dials one address. An IP is used as written and is not looked up in DNS.
+    pub async fn connect_endpoint(target: &str, pinned: Option<Fingerprint>, budget: Duration) -> Result<Self> {
+        let server = ServerAddr::parse(target)?;
+        let label = server.to_string();
+        let resolved = if pjdesk_proto::routes::is_ip_endpoint(target) {
+            let ip = pjdesk_proto::routes::endpoint_v4(target).context("missing IP")?;
+            SocketAddr::new(std::net::IpAddr::V4(ip), server.port)
+        } else {
+            timeout(Duration::from_secs(2), server.resolve()).await.map_err(|_| anyhow!("timed out resolving {label}"))??
+        };
+        let via = if crate::p2p::is_lan_ip(resolved.ip()) { "LAN" } else { "Internet" };
+        let ready = handshake(resolved, via, budget, &label, pinned).await?;
+        let observed = pinned.is_none().then(|| ready.verifier.observed()).flatten();
+        let addr = ready.addr;
+        let (mut reader, mut writer) = tokio::io::split(ready.stream);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<ServerMsg>();
+        let writer_task = tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                if write_msg(&mut writer, &msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let reader_task = tokio::spawn(async move {
+            while let Ok(msg) = read_msg::<_, ServerMsg>(&mut reader, MAX_SIGNAL_FRAME).await {
+                if in_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self { tx: out_tx, rx: in_rx, server_addr: addr, via, observed, tasks: vec![writer_task, reader_task] })
+    }
+
     /// Same handshake as [`Self::connect`]. A LAN address is dialed only when it
     /// is the current primary and this device is on that server's public network.
     /// A standby beacon, a role-less beacon, localhost, and this device's own

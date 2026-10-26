@@ -130,6 +130,55 @@ function lanText(lan) {
     .slice(0, 500);
 }
 
+function emptyHalf() {
+  return { public: [], lan: [], names: [] };
+}
+
+function endpointList(value) {
+  const parts = Array.isArray(value) ? value : String(value || "").split(",");
+  return parts
+    .map((part) => String(part || "").trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function routeHalf(value) {
+  const src = value && typeof value === "object" ? value : {};
+  return { public: endpointList(src.public), lan: endpointList(src.lan), names: endpointList(src.names) };
+}
+
+export function parseRoutesDoc(text) {
+  try {
+    const value = JSON.parse(String(text || ""));
+    if (!value || typeof value !== "object") return { primary: emptyHalf(), standby: emptyHalf() };
+    return { primary: routeHalf(value.primary), standby: routeHalf(value.standby) };
+  } catch {
+    return { primary: emptyHalf(), standby: emptyHalf() };
+  }
+}
+
+/// Replaces one server's half. `clearOther` drops the opposite half when this
+/// machine changes role. A missing `endpoints` leaves that half as it was.
+export function mergeRoutes(stored, slot, endpoints, clearOther) {
+  const doc = parseRoutesDoc(stored);
+  const key = slot === "standby" ? "standby" : "primary";
+  const other = key === "primary" ? "standby" : "primary";
+  if (clearOther) doc[other] = emptyHalf();
+  if (endpoints) doc[key] = routeHalf(endpoints);
+  return JSON.stringify(doc);
+}
+
+export function flattenRoutes(stored) {
+  const doc = parseRoutesDoc(stored);
+  return {
+    primary_public: doc.primary.public,
+    primary_lan: doc.primary.lan,
+    standby_public: doc.standby.public,
+    standby_lan: doc.standby.lan,
+    names: [...doc.primary.names, ...doc.standby.names],
+  };
+}
+
 /**
  * What an owner's server may write. A non-owner never writes. A different
  * fingerprint is kept unless `replace` is set. A different address is kept
@@ -160,6 +209,8 @@ export function planRegistration({
   standbyInstance,
   activeCheckedAt,
   standbyCheckedAt,
+  endpoints,
+  serverRoutes,
 }) {
   const slot = role === "standby" ? "standby" : role === "active" ? "active" : "";
   if (!slot) return { status: 400, error: "Say whether this server is active or on standby." };
@@ -188,7 +239,10 @@ export function planRegistration({
     standbyInstance: String(standbyInstance || ""),
     activeCheckedAt: Number(activeCheckedAt) || 0,
     standbyCheckedAt: Number(standbyCheckedAt) || 0,
+    serverRoutes: String(serverRoutes || ""),
   };
+  const clearOther = id !== "" && current[`${slot === "active" ? "standby" : "active"}Instance`] === id;
+  const nextRoutes = endpoints || clearOther ? mergeRoutes(current.serverRoutes, slot, endpoints || null, clearOther) : current.serverRoutes;
   const next = { ...current };
   const slotAddr = current[`${slot}Address`].trim();
   const slotFp = current[`${slot}Fingerprint`];
@@ -227,11 +281,13 @@ export function planRegistration({
     current[`${slot}Lan`] === nextLan &&
     (nextIp === "" || current[`${slot}PublicIp`] === nextIp) &&
     (id === "" || slotInstance === id) &&
+    current.serverRoutes === nextRoutes &&
     changes.length === 0;
   if (unchanged) return { status: 200, changed: false, next: current, changes: [] };
   next[`${slot}Address`] = nextAddress;
   next[`${slot}Fingerprint`] = fp;
   next[`${slot}Lan`] = nextLan;
+  next.serverRoutes = nextRoutes;
   if (nextIp) next[`${slot}PublicIp`] = nextIp;
   if (id) next[`${slot}Instance`] = id;
   if (nextChecked) next[`${slot}CheckedAt`] = nextChecked;
@@ -340,6 +396,7 @@ function networkView(row) {
     standby_public_ip: row.standby_public_ip || "",
     active_ip_checked_at: row.active_ip_checked_at || 0,
     standby_ip_checked_at: row.standby_ip_checked_at || 0,
+    routes: flattenRoutes(row.server_routes),
   };
 }
 
@@ -1332,6 +1389,8 @@ async function registerServer(request, env, account) {
     standbyInstance: row.standby_instance,
     activeCheckedAt: row.active_ip_checked_at,
     standbyCheckedAt: row.standby_ip_checked_at,
+    endpoints: body.endpoints,
+    serverRoutes: row.server_routes,
   });
   if (plan.changed) {
     await writeSlots(env, row, plan.next);
@@ -1438,28 +1497,41 @@ async function changesFor(env, networkId) {
 }
 
 async function writeSlots(env, row, next) {
-  await env.DB.prepare(
-    `UPDATE networks SET active_address = ?, active_fingerprint = ?, standby_address = ?, standby_fingerprint = ?,
-        active_lan = ?, standby_lan = ?, active_public_ip = ?, standby_public_ip = ?,
-        active_instance = ?, standby_instance = ?, active_ip_checked_at = ?, standby_ip_checked_at = ?
-      WHERE id = ?`,
-  )
-    .bind(
-      next.activeAddress,
-      next.activeFingerprint,
-      next.standbyAddress,
-      next.standbyFingerprint,
-      next.activeLan || "",
-      next.standbyLan || "",
-      next.activePublicIp || "",
-      next.standbyPublicIp || "",
-      next.activeInstance || "",
-      next.standbyInstance || "",
-      next.activeCheckedAt || 0,
-      next.standbyCheckedAt || 0,
-      row.id,
+  const values = [
+    next.activeAddress,
+    next.activeFingerprint,
+    next.standbyAddress,
+    next.standbyFingerprint,
+    next.activeLan || "",
+    next.standbyLan || "",
+    next.activePublicIp || "",
+    next.standbyPublicIp || "",
+    next.activeInstance || "",
+    next.standbyInstance || "",
+    next.activeCheckedAt || 0,
+    next.standbyCheckedAt || 0,
+  ];
+  try {
+    await env.DB.prepare(
+      `UPDATE networks SET active_address = ?, active_fingerprint = ?, standby_address = ?, standby_fingerprint = ?,
+          active_lan = ?, standby_lan = ?, active_public_ip = ?, standby_public_ip = ?,
+          active_instance = ?, standby_instance = ?, active_ip_checked_at = ?, standby_ip_checked_at = ?,
+          server_routes = ?
+        WHERE id = ?`,
     )
-    .run();
+      .bind(...values, next.serverRoutes || "", row.id)
+      .run();
+  } catch (err) {
+    if (!/no such column/i.test(String(err?.message || err))) throw err;
+    await env.DB.prepare(
+      `UPDATE networks SET active_address = ?, active_fingerprint = ?, standby_address = ?, standby_fingerprint = ?,
+          active_lan = ?, standby_lan = ?, active_public_ip = ?, standby_public_ip = ?,
+          active_instance = ?, standby_instance = ?, active_ip_checked_at = ?, standby_ip_checked_at = ?
+        WHERE id = ?`,
+    )
+      .bind(...values, row.id)
+      .run();
+  }
 }
 
 async function openedDevice(env, body) {

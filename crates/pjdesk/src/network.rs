@@ -92,6 +92,15 @@ pub struct Session {
     pub standby_fingerprint: String,
     pub lan: Vec<String>,
     pub public_ip: String,
+    /// Standby LAN addresses from the account. Empty when the service omitted them.
+    /// The dial catalog is `routes`; these stay so a caller can read the standby half.
+    #[allow(dead_code)]
+    pub standby_lan: Vec<String>,
+    /// Standby public IP, without requiring the standby address to be that IP.
+    #[allow(dead_code)]
+    pub standby_public_ip: String,
+    /// Fresh catalog. Hostnames are last when a client dials.
+    pub routes: pjdesk_proto::routes::ServerRoutes,
     pub computers: Vec<SavedComputer>,
     pub presence: Vec<HostPresence>,
     /// PJDesk IDs deleted from the account. Empty when the service is older.
@@ -185,6 +194,26 @@ struct NetworkBody {
     active_lan: String,
     #[serde(default)]
     active_public_ip: String,
+    #[serde(default)]
+    standby_lan: String,
+    #[serde(default)]
+    standby_public_ip: String,
+    #[serde(default)]
+    routes: Option<RoutesBody>,
+}
+
+#[derive(Deserialize, Default)]
+struct RoutesBody {
+    #[serde(default)]
+    primary_lan: Vec<String>,
+    #[serde(default)]
+    primary_public: Vec<String>,
+    #[serde(default)]
+    standby_lan: Vec<String>,
+    #[serde(default)]
+    standby_public: Vec<String>,
+    #[serde(default)]
+    names: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -424,11 +453,39 @@ struct LockReply {
     updated_at: u64,
 }
 
+fn split_list(text: &str) -> Vec<String> {
+    text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+}
+
+fn session_routes(network: &NetworkBody) -> pjdesk_proto::routes::ServerRoutes {
+    if let Some(routes) = &network.routes {
+        let parsed = pjdesk_proto::routes::ServerRoutes {
+            primary_lan: routes.primary_lan.clone(),
+            primary_public: routes.primary_public.clone(),
+            standby_lan: routes.standby_lan.clone(),
+            standby_public: routes.standby_public.clone(),
+            names: routes.names.clone(),
+        };
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    pjdesk_proto::routes::ServerRoutes::from_legacy(
+        &network.active_address,
+        &split_list(&network.active_lan),
+        &network.active_public_ip,
+        &network.standby_address,
+        &split_list(&network.standby_lan),
+        &network.standby_public_ip,
+    )
+}
+
 fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Session> {
     let network = reply.network.context("the account has no network")?;
     if network.active_address.trim().is_empty() {
         bail!(NO_SERVER);
     }
+    let routes = session_routes(&network);
     Ok(Session {
         email: email.to_string(),
         access: reply.access,
@@ -439,8 +496,11 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
         fingerprint: network.active_fingerprint,
         standby_address: network.standby_address,
         standby_fingerprint: network.standby_fingerprint,
-        lan: network.active_lan.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-        public_ip: network.active_public_ip,
+        lan: split_list(&network.active_lan),
+        public_ip: network.active_public_ip.clone(),
+        standby_lan: split_list(&network.standby_lan),
+        standby_public_ip: network.standby_public_ip.clone(),
+        routes,
         computers: reply
             .computers
             .into_iter()
@@ -874,6 +934,9 @@ pub fn enroll_known(
         standby_fingerprint: String::new(),
         lan: Vec::new(),
         public_ip: String::new(),
+        standby_lan: Vec::new(),
+        standby_public_ip: String::new(),
+        routes: pjdesk_proto::routes::ServerRoutes::default(),
         computers: account.to_vec(),
         presence: Vec::new(),
         removed: Vec::new(),

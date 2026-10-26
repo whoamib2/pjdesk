@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyPresence, canonical, decide, inviteError, isPrivateAddress, joinAuthMode, normalizeFingerprint, planRegistration, presenceView, relayAccessParts, requireAccountsOn, savedShape } from "../src/network.js";
+import { applyPresence, canonical, decide, flattenRoutes, inviteError, isPrivateAddress, joinAuthMode, mergeRoutes, normalizeFingerprint, planRegistration, presenceView, relayAccessParts, requireAccountsOn, savedShape } from "../src/network.js";
 
 test("canonical matches the shared fixture", () => {
   const text = canonical({
@@ -318,6 +318,41 @@ test("an invite uses the saved sign-in, and a relay token is not a website sessi
     ),
     true,
   );
+});
+
+test("a server publishes its own addresses without erasing the other server", () => {
+  const first = mergeRoutes("", "active", {
+    public: ["204.248.122.44:21200"],
+    lan: ["192.168.0.20:21200"],
+    names: ["pjdesk.spader.us:21200"],
+  }, false);
+  const both = mergeRoutes(first, "standby", {
+    public: ["198.51.100.8:21200"],
+    lan: ["192.168.1.40:21200"],
+    names: ["backup.example:21200"],
+  }, false);
+  const flat = flattenRoutes(both);
+  assert.deepEqual(flat.primary_public, ["204.248.122.44:21200"]);
+  assert.deepEqual(flat.standby_lan, ["192.168.1.40:21200"]);
+  assert.deepEqual(flat.names, ["pjdesk.spader.us:21200", "backup.example:21200"]);
+  const planned = planRegistration({
+    owner: true,
+    role: "active",
+    address: "pjdesk.spader.us:21200",
+    fingerprint: "abcd",
+    instance: "chip",
+    lan: ["192.168.0.20:21200"],
+    publicIp: "204.248.122.44",
+    endpoints: { public: ["204.248.122.44:21200"], lan: ["192.168.0.20:21200"], names: ["pjdesk.spader.us:21200"] },
+    activeAddress: "pjdesk.spader.us:21200",
+    activeFingerprint: "abcd",
+    activeInstance: "chip",
+    activeLan: "192.168.0.20:21200",
+    activePublicIp: "204.248.122.44",
+    serverRoutes: both,
+  });
+  assert.equal(planned.status, 200);
+  assert.equal(planned.changed, false);
 });
 
 test("an empty display name clears, and a missing one does not", () => {

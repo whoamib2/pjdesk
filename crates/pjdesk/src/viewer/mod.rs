@@ -209,30 +209,20 @@ async fn connect(
     waiting_retry: bool,
     prefer_standby: bool,
 ) -> Result<Link> {
-    tracing::info!("Connecting to {} through {server}", format_id(target));
-    if waiting_retry {
-        crate::network::refresh_config_now(config);
-    } else {
-        crate::network::refresh_config(config);
-    }
-    let standby_target = if prefer_standby {
-        config.network_standby.clone().filter(|s| !s.trim().is_empty()).and_then(|s| {
-            tracing::info!("failover: reconnecting the session through the standby {s}");
-            ServerAddr::parse(&s).ok()
-        })
-    } else {
-        None
-    };
-    let server = standby_target
-        .or_else(|| ServerAddr::parse(&config.effective_server()).ok())
-        .unwrap_or_else(|| server.clone());
+    tracing::info!("Connecting to {} through the advertised servers", format_id(target));
+    let _ = (server, prefer_standby);
+    crate::network::refresh_config_now(config);
+    let _ = waiting_retry;
     let mut access = config.presented_access();
     if access.is_empty() {
         // A temporary sign-in keeps the access token in this process only.
         access = std::env::var("PJDESK_ACCESS").unwrap_or_default();
     }
     let access_key = pjdesk_proto::access::is_access_key(&access);
-    let mut signal = SignalClient::connect(&server, config).await?;
+    let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s);
+    let mine = mine.await.unwrap_or_default();
+    let mut signal = SignalClient::connect_catalog(config, &mine).await?;
+    let mut followed_redirect = false;
     tracing::info!("Reached the server via {}", signal.via);
     if !access.is_empty() {
         let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
@@ -250,7 +240,29 @@ async fn connect(
         match timeout(Duration::from_secs(90), signal.recv()).await {
             Ok(None) if !access.is_empty() && !access_key && !retried_without_token => {
                 retried_without_token = true;
-                signal = SignalClient::connect(&server, config).await?;
+                signal = SignalClient::connect_catalog(config, &mine).await?;
+                signal.send(connect.clone())?;
+                continue;
+            }
+            Ok(Some(ServerMsg::Error { message, .. }))
+                if !followed_redirect && pjdesk_proto::signal::is_standby_refusal(&message) =>
+            {
+                followed_redirect = true;
+                let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) else {
+                    bail!("{message}");
+                };
+                if !routes.is_empty() {
+                    config.network_routes = routes;
+                    let _ = config.save();
+                }
+                if addr.is_empty() {
+                    bail!("{message}");
+                }
+                tracing::info!("Standby redirected the session to {addr}");
+                signal = SignalClient::connect_endpoint(&addr, config, pjdesk_proto::routes::dial_budget(&addr)).await?;
+                if !access.is_empty() {
+                    let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
+                }
                 signal.send(connect.clone())?;
                 continue;
             }
@@ -261,6 +273,12 @@ async fn connect(
                     let _ = std::fs::write(path, format!("ready\n{host_name}\n"));
                 }
                 break (session_id, token, udp_port, host_name);
+            }
+            Ok(Some(ServerMsg::Routes(routes))) => {
+                if !routes.is_empty() {
+                    config.network_routes = routes;
+                    let _ = config.save();
+                }
             }
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
             Ok(Some(_)) => continue,
