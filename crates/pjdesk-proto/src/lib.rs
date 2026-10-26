@@ -32,6 +32,7 @@ pub mod record;
 pub mod signal;
 pub mod tls;
 pub mod trayshow;
+pub mod traywatch;
 pub mod udp;
 pub mod update;
 

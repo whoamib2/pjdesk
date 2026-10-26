@@ -43,6 +43,7 @@ mod tray_tip;
 mod ui_icons;
 mod ui_theme;
 mod ui_widgets;
+mod traywatch;
 mod window_lock;
 mod winshow;
 

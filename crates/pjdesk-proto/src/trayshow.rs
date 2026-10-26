@@ -76,6 +76,13 @@ pub fn hide_because_minimized(minimized: bool, opening: bool) -> bool {
     minimized && !opening
 }
 
+/// The close button minimizes the window into the tray. It does not
+/// destroy the window, and it does not hide it. Quit still closes.
+/// An open that just happened is left alone.
+pub fn minimize_on_close(has_tray: bool, really_quit: bool, just_opened: bool) -> bool {
+    has_tray && !really_quit && !just_opened
+}
+
 /// No live window means the tray starts the program. A destroyed window
 /// (a handle that is no longer a window) is not live.
 pub fn should_launch(window_alive: bool) -> bool {
@@ -175,6 +182,10 @@ mod tests {
         assert!(!hide_because_minimized(true, true));
         assert!(hide_because_minimized(true, false));
         assert!(!hide_because_minimized(false, false));
+        assert!(minimize_on_close(true, false, false));
+        assert!(!minimize_on_close(true, true, false));
+        assert!(!minimize_on_close(true, false, true));
+        assert!(!minimize_on_close(false, false, false));
         assert!(should_launch(false));
         assert!(!should_launch(true));
     }

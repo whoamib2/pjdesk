@@ -56,8 +56,38 @@ fn handle(raw: usize) -> HANDLE {
 }
 
 static HELD: Mutex<Option<Singleton>> = Mutex::new(None);
-static MENU_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static MENU_TX: Mutex<Option<std::sync::mpsc::Sender<Action>>> = Mutex::new(None);
 static ICON_CLICKED: AtomicBool = AtomicBool::new(false);
+static TOOLTIP: Mutex<Option<String>> = Mutex::new(None);
+
+/// Records an open and returns. `AllowSetForegroundWindow` does not send a
+/// message to the window, so the click thread is not waiting on the window.
+fn ask_open(reason: &str, ctx: &egui::Context) {
+    unsafe {
+        let _ = AllowSetForegroundWindow(0xFFFF_FFFF);
+    }
+    ICON_CLICKED.store(true, Ordering::SeqCst);
+    crate::traywatch::arm();
+    ctx.request_repaint();
+    tracing::info!(
+        "Tray: {reason}. Asked the PJDesk Server window to come forward. This click does not call ShowWindow."
+    );
+}
+
+fn push_menu(action: Action) {
+    // The window thread never holds this mutex. Two tries, then drop the
+    // click, rather than waiting on the window.
+    for _ in 0..2 {
+        if let Ok(slot) = MENU_TX.try_lock() {
+            if let Some(tx) = slot.as_ref() {
+                let _ = tx.send(action);
+            }
+            return;
+        }
+        std::thread::yield_now();
+    }
+    tracing::info!("Tray menu click was not delivered because the menu queue was busy.");
+}
 
 /// Takes the per-user tray, or asks the owner to show its window and returns false.
 pub fn acquire_or_signal() -> bool {
@@ -146,21 +176,59 @@ pub fn ensure_login_default() {
 }
 
 pub struct Tray {
-    icon: TrayIcon,
-    show_id: String,
-    start_id: String,
-    stop_id: String,
-    restart_id: String,
-    updates_id: String,
-    log_id: String,
-    promote_id: String,
-    demote_id: String,
-    sync_id: String,
-    quit_id: String,
+    menu_rx: std::sync::mpsc::Receiver<Action>,
 }
 
 impl Tray {
+    /// Builds the tray icon on its own thread, or returns `None` if that fails.
     pub fn new(ctx: &egui::Context) -> Option<Self> {
+        let (menu_tx, menu_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new().name("pjdesk-server-tray".into()).spawn(move || {
+            if let Ok(mut slot) = MENU_TX.lock() {
+                *slot = Some(menu_tx);
+            }
+            let Some(icon) = build_icon(&ctx) else {
+                let _ = ready_tx.send(false);
+                return;
+            };
+            let _ = ready_tx.send(true);
+            tracing::info!("The PJDesk Server tray icon is on its own thread. A click does not wait for the window.");
+            pump(icon);
+        });
+        if spawned.is_err() {
+            return None;
+        }
+        match ready_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(true) => Some(Self { menu_rx }),
+            _ => None,
+        }
+    }
+
+    pub fn set_tooltip(&self, text: &str) {
+        // The window thread does not call into the tray window. The tray
+        // thread picks this up on its own loop.
+        if let Ok(mut slot) = TOOLTIP.try_lock() {
+            *slot = Some(text.to_string());
+        }
+    }
+
+    pub fn poll(&self) -> Vec<Action> {
+        let mut out = Vec::new();
+        let clicked = ICON_CLICKED.swap(false, Ordering::SeqCst);
+        let second = show_requested();
+        if clicked || second {
+            out.push(Action::Show);
+        }
+        while let Ok(action) = self.menu_rx.try_recv() {
+            out.push(action);
+        }
+        out
+    }
+}
+
+fn build_icon(ctx: &egui::Context) -> Option<TrayIcon> {
         let icon = Icon::from_rgba(include_bytes!("../assets/icon_server_32.rgba").to_vec(), 32, 32).ok()?;
 
         let menu = Menu::new();
@@ -196,12 +264,43 @@ impl Tray {
         let quit_id = quit.id().0.clone();
 
         let show_now = show_id.clone();
+        let start_now = start_id.clone();
+        let stop_now = stop_id.clone();
+        let restart_now = restart_id.clone();
+        let updates_now = updates_id.clone();
+        let log_now = log_id.clone();
+        let promote_now = promote_id.clone();
+        let demote_now = demote_id.clone();
+        let sync_now = sync_id.clone();
+        let quit_now = quit_id.clone();
         let c1 = ctx.clone();
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
             if e.id.0 == show_now {
-                crate::winshow::activate("Open", "PJDesk Server", holds_window());
+                ask_open("Open", &c1);
+                return;
             }
-            MENU_IDS.lock().unwrap().push(e.id.0.clone());
+            let action = if e.id.0 == start_now {
+                Action::ServiceStart
+            } else if e.id.0 == stop_now {
+                Action::ServiceStop
+            } else if e.id.0 == restart_now {
+                Action::ServiceRestart
+            } else if e.id.0 == updates_now {
+                Action::CheckUpdates
+            } else if e.id.0 == log_now {
+                Action::OpenLog
+            } else if e.id.0 == promote_now {
+                Action::Promote
+            } else if e.id.0 == demote_now {
+                Action::Demote
+            } else if e.id.0 == sync_now {
+                Action::SyncNow
+            } else if e.id.0 == quit_now {
+                Action::Quit
+            } else {
+                return;
+            };
+            push_menu(action);
             c1.request_repaint();
         }));
         let c2 = ctx.clone();
@@ -218,72 +317,53 @@ impl Tray {
                 return;
             }
             let reason = if click == pjdesk_proto::trayshow::Click::LeftDouble { "double-click" } else { "left click" };
-            crate::winshow::activate(reason, "PJDesk Server", holds_window());
-            ICON_CLICKED.store(true, Ordering::SeqCst);
-            c2.request_repaint();
+            ask_open(reason, &c2);
         }));
 
-        let icon = TrayIconBuilder::new()
+        TrayIconBuilder::new()
             .with_tooltip("PJDesk Server")
             .with_icon(icon)
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
             .build()
-            .ok()?;
-        Some(Self {
-            icon,
-            show_id,
-            start_id,
-            stop_id,
-            restart_id,
-            updates_id,
-            log_id,
-            promote_id,
-            demote_id,
-            sync_id,
-            quit_id,
-        })
-    }
+            .ok()
+}
 
-    pub fn set_tooltip(&self, text: &str) {
-        let _ = self.icon.set_tooltip(Some(text));
+/// Pumps the tray window. This thread is not the window thread, so a stuck
+/// window cannot hide a click.
+fn pump(icon: TrayIcon) {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT, WM_QUIT,
+    };
+    loop {
+        let tip = TOOLTIP.try_lock().ok().and_then(|mut slot| slot.take());
+        if let Some(tip) = tip {
+            let _ = icon.set_tooltip(Some(tip));
+        }
+        let wait = unsafe { MsgWaitForMultipleObjects(None, false, 200, QS_ALLINPUT) };
+    if wait != WAIT_OBJECT_0 {
+        continue;
     }
-
-    pub fn poll(&self) -> Vec<Action> {
-        let mut out = Vec::new();
-        let clicked = ICON_CLICKED.swap(false, Ordering::SeqCst);
-        let second = show_requested();
-        if second {
-            crate::winshow::activate("second launch", "PJDesk Server", holds_window());
+    let mut saw = false;
+    loop {
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        if !unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+            break;
         }
-        if clicked || second {
-            out.push(Action::Show);
+        saw = true;
+        if msg.message == WM_QUIT {
+            return;
         }
-        for id in MENU_IDS.lock().unwrap().drain(..) {
-            if id == self.show_id {
-                out.push(Action::Show);
-            } else if id == self.start_id {
-                out.push(Action::ServiceStart);
-            } else if id == self.stop_id {
-                out.push(Action::ServiceStop);
-            } else if id == self.restart_id {
-                out.push(Action::ServiceRestart);
-            } else if id == self.updates_id {
-                out.push(Action::CheckUpdates);
-            } else if id == self.log_id {
-                out.push(Action::OpenLog);
-            } else if id == self.promote_id {
-                out.push(Action::Promote);
-            } else if id == self.demote_id {
-                out.push(Action::Demote);
-            } else if id == self.sync_id {
-                out.push(Action::SyncNow);
-            } else if id == self.quit_id {
-                out.push(Action::Quit);
-            }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
-        out
     }
+    if !saw {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 }
 
 pub fn open_log_folder(dir: &Path) {

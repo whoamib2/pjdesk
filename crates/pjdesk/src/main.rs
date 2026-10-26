@@ -40,6 +40,7 @@ mod temp_sign;
 mod update_pipe;
 mod vault;
 mod viewer;
+mod traywatch;
 mod winshow;
 
 use std::io::{BufRead, Write};

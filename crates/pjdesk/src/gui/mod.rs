@@ -52,6 +52,8 @@ enum DeskTab {
 
 /// Launches the app and blocks until the window is closed.
 pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result<()> {
+    // A replacement waits for the frozen window to leave before taking the lock.
+    crate::traywatch::wait_for_replaced_process();
     // No flag skips the lock. A second launch wakes the window that is already open.
     if pjdesk_proto::applock::second_window_should_exit(instance::acquire_or_signal()) {
         return Ok(());
@@ -2434,16 +2436,17 @@ impl App {
     }
 }
 
-/// Show the window from the tray. A click restores it immediately. This
-/// also clears minimize and asks for focus, so a later frame does not leave
-/// the window hidden. The PIN lock, when there is one, is drawn inside it.
+/// Show the window from the tray. This runs on the window thread. It answers
+/// the tray watch first, then asks for the window to be visible and focused,
+/// then restores it. The PIN lock, when there is one, is drawn inside it.
 fn reveal_window(ctx: &egui::Context, reason: &str) {
+    crate::traywatch::ack();
     crate::winshow::note_user_open();
+    ctx.request_repaint();
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-    // Win32 restore after the viewport show. A click also restores immediately,
-    // before this frame, so the foreground lock from that click is used.
+    // ShowWindow runs on this thread. The tray thread does not call it.
     crate::winshow::activate(reason, "PJDesk", instance::holds_window());
 }
 
@@ -2744,12 +2747,12 @@ impl App {
         if closing && (self.really_quit || !has_tray) && self.temp.is_some() {
             self.end_temporary_sign_in();
         }
-        if has_tray && !self.really_quit && closing && !crate::winshow::user_just_opened() {
+        if closing && pjdesk_proto::trayshow::minimize_on_close(has_tray, self.really_quit, crate::winshow::user_just_opened()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             if !self.told_tray {
                 self.told_tray = true;
-                tracing::info!("The window was closed. PJDesk stays in the tray. A click or double-click opens it again.");
+                tracing::info!("The window was closed. PJDesk stays minimized in the tray. A click or double-click opens it again.");
                 self.toast.show("PJDesk is still running — click the tray icon, or right-click it to Quit");
             }
         }
@@ -2778,14 +2781,18 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // eframe does not call `ui` while the window is hidden. A tray click
-        // has to be handled here, or Visible(true) is never sent.
+        // eframe does not call `ui` while the window is minimized. A tray
+        // click has to be handled here, or the window stays down.
         self.ctx = ctx.clone();
         self.on_tray(ctx);
-        // Minimized or covered windows skip `ui`. Keep waking so a tray click
-        // or a second launch is still noticed.
-        if ctx.input(|i| i.viewport().visible() == Some(false)) {
-            ctx.request_repaint_after(Duration::from_millis(400));
+        // Windows does not redraw a minimized window. Keep waking so a tray
+        // click is still noticed and the window thread is not left idle.
+        let parked = ctx.input(|i| {
+            let view = i.viewport();
+            view.minimized == Some(true) || view.visible() == Some(false)
+        });
+        if parked {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 
