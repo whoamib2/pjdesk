@@ -43,7 +43,7 @@ mod imp {
             let icon = Icon::from_rgba(include_bytes!("../../assets/icon_32.rgba").to_vec(), 32, 32).ok()?;
 
             let menu = Menu::new();
-            let show = MenuItem::new("Show PJDesk", true, None);
+            let show = MenuItem::new("Open PJDesk", true, None);
             let update = MenuItem::new("Check for updates now", true, None);
             let revoke = MenuItem::new("Revoke access", true, None);
             let quit = MenuItem::new("Quit PJDesk", true, None);

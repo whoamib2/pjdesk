@@ -54,10 +54,11 @@ mod imp {
     static LAST_LAUNCH: Mutex<Option<Instant>> = Mutex::new(None);
 
     struct Query {
-        title: Vec<u16>,
+        title: String,
         ours: u32,
-        ours_hwnd: Option<HWND>,
-        other_hwnd: Option<HWND>,
+        exact_ours: Option<HWND>,
+        exact_other: Option<HWND>,
+        prefix_ours: Option<HWND>,
     }
 
     struct Area {
@@ -68,31 +69,33 @@ mod imp {
 
     pub fn activate(reason: &str, title: &str, owns_gui: bool) {
         note_user_open();
-        tracing::info!("Tray: {reason}. Looking up {title} by its title.");
-        match find(title) {
-            Some((hwnd, pid)) if unsafe { IsWindow(Some(hwnd)) }.as_bool() => {
-                let ours = unsafe { GetCurrentProcessId() };
-                tracing::info!("Tray: {title} window is process {pid} (this process is {ours}).");
-                restore(title, hwnd);
-            }
+        let found = find(title);
+        let alive = match found {
+            Some((hwnd, pid)) if unsafe { IsWindow(Some(hwnd)) }.as_bool() => Some((hwnd, pid)),
             Some(_) => {
                 tracing::info!("Tray: the {title} window handle is stale. It was closed while the tray stayed.");
-                start_or_show(title, owns_gui);
+                None
             }
-            None => {
-                tracing::info!("Tray: no {title} window is open.");
-                start_or_show(title, owns_gui);
+            None => None,
+        };
+        let action = pjdesk_proto::trayshow::open_action(alive.is_some(), owns_gui);
+        tracing::info!("Tray click: {reason}. Action: {}.", action.as_log());
+        match action {
+            pjdesk_proto::trayshow::OpenAction::Restore => {
+                if let Some((hwnd, pid)) = alive {
+                    let ours = unsafe { GetCurrentProcessId() };
+                    tracing::info!("Tray: {title} window is process {pid} (this process is {ours}).");
+                    restore(title, hwnd);
+                }
             }
+            pjdesk_proto::trayshow::OpenAction::ShowThisProcess => {
+                tracing::info!("Tray: this process is {title}. Showing its window. A second copy is not started.");
+            }
+            pjdesk_proto::trayshow::OpenAction::Launch => launch(title),
         }
     }
 
-    fn start_or_show(title: &str, owns_gui: bool) {
-        // No live window: a different process starts the program. This process
-        // already is the program, so it shows the window it still owns.
-        if owns_gui {
-            tracing::info!("Tray: this process is {title}. The window will be shown again.");
-            return;
-        }
+    fn launch(title: &str) {
         let recently = LAST_LAUNCH.lock().ok().and_then(|at| *at).is_some_and(|at| at.elapsed() < Duration::from_secs(2));
         if recently {
             tracing::info!("Tray: {title} was already started.");
@@ -116,15 +119,16 @@ mod imp {
 
     fn find(title: &str) -> Option<(HWND, u32)> {
         let mut query = Query {
-            title: title.encode_utf16().collect(),
+            title: title.to_string(),
             ours: unsafe { GetCurrentProcessId() },
-            ours_hwnd: None,
-            other_hwnd: None,
+            exact_ours: None,
+            exact_other: None,
+            prefix_ours: None,
         };
         unsafe {
             let _ = EnumWindows(Some(enum_window), LPARAM(&mut query as *mut Query as isize));
         }
-        let hwnd = query.ours_hwnd.or(query.other_hwnd)?;
+        let hwnd = query.exact_ours.or(query.prefix_ours).or(query.exact_other)?;
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
         Some((hwnd, pid))
@@ -141,15 +145,23 @@ mod imp {
         }
         let mut buf = [0u16; 256];
         let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
-        if n <= 0 || buf[..n as usize] != query.title {
+        if n <= 0 {
+            return BOOL(1);
+        }
+        let text = String::from_utf16_lossy(&buf[..n as usize]);
+        let exact = text == query.title;
+        let prefix = !exact && pjdesk_proto::trayshow::title_matches(&text, &query.title);
+        if !exact && !prefix {
             return BOOL(1);
         }
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-        if pid == query.ours {
-            query.ours_hwnd = Some(hwnd);
-        } else if query.other_hwnd.is_none() {
-            query.other_hwnd = Some(hwnd);
+        if exact && pid == query.ours {
+            query.exact_ours = Some(hwnd);
+        } else if exact && query.exact_other.is_none() {
+            query.exact_other = Some(hwnd);
+        } else if prefix && pid == query.ours && query.prefix_ours.is_none() {
+            query.prefix_ours = Some(hwnd);
         }
         BOOL(1)
     }

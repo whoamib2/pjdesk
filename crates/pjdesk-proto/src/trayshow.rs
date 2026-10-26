@@ -82,6 +82,62 @@ pub fn should_launch(window_alive: bool) -> bool {
     !window_alive
 }
 
+/// What a tray click does with the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenAction {
+    /// The window is still there. Restore it and bring it forward.
+    Restore,
+    /// This process still owns the single window. Show that window.
+    /// Starting another copy would hit the same lock and exit.
+    ShowThisProcess,
+    /// The window process is gone. Start the program.
+    Launch,
+}
+
+impl OpenAction {
+    /// Short text for the tray log. No secrets.
+    pub fn as_log(self) -> &'static str {
+        match self {
+            OpenAction::Restore => "restore",
+            OpenAction::ShowThisProcess => "show the window this process owns",
+            OpenAction::Launch => "start because the window process is not running",
+        }
+    }
+}
+
+/// A live window is restored. The process that holds the single-instance
+/// lock shows its own window. Only a process that does not hold that lock
+/// starts a new one.
+pub fn open_action(window_alive: bool, owns_gui: bool) -> OpenAction {
+    if window_alive {
+        OpenAction::Restore
+    } else if owns_gui {
+        OpenAction::ShowThisProcess
+    } else {
+        OpenAction::Launch
+    }
+}
+
+/// Exact title, or a longer title that starts with `expected` and a separator.
+/// "PJDesk Server" is not a match for "PJDesk".
+pub fn title_matches(window_title: &str, expected: &str) -> bool {
+    let window_title = window_title.trim_matches('\0').trim();
+    let expected = expected.trim();
+    if expected.is_empty() || window_title.is_empty() {
+        return false;
+    }
+    if window_title == expected {
+        return true;
+    }
+    let Some(rest) = window_title.strip_prefix(expected) else {
+        return false;
+    };
+    if expected == "PJDesk" && rest.trim_start().starts_with("Server") {
+        return false;
+    }
+    matches!(rest.chars().next(), Some(' ' | '-' | '—' | ':' | '·' | '('))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +177,30 @@ mod tests {
         assert!(!hide_because_minimized(false, false));
         assert!(should_launch(false));
         assert!(!should_launch(true));
+    }
+
+    #[test]
+    fn a_hidden_window_is_restored_and_a_dead_owner_is_not_started_twice() {
+        assert_eq!(open_action(true, true), OpenAction::Restore);
+        assert_eq!(open_action(true, false), OpenAction::Restore);
+        assert_eq!(open_action(false, true), OpenAction::ShowThisProcess);
+        assert_eq!(open_action(false, false), OpenAction::Launch);
+        assert!(should_launch(false));
+        assert!(!should_launch(true));
+        assert_eq!(OpenAction::Restore.as_log(), "restore");
+        assert_eq!(OpenAction::ShowThisProcess.as_log(), "show the window this process owns");
+        assert_eq!(OpenAction::Launch.as_log(), "start because the window process is not running");
+    }
+
+    #[test]
+    fn the_client_title_does_not_match_the_server_window() {
+        assert!(title_matches("PJDesk", "PJDesk"));
+        assert!(title_matches("PJDesk - locked", "PJDesk"));
+        assert!(!title_matches("PJDesk Server", "PJDesk"));
+        assert!(!title_matches("PJDeskServer", "PJDesk"));
+        assert!(title_matches("PJDesk Server", "PJDesk Server"));
+        assert!(title_matches("PJDesk Server - status", "PJDesk Server"));
+        assert!(!title_matches("", "PJDesk"));
+        assert!(!title_matches("PJDesk", ""));
     }
 }

@@ -2438,13 +2438,13 @@ impl App {
 /// also clears minimize and asks for focus, so a later frame does not leave
 /// the window hidden. The PIN lock, when there is one, is drawn inside it.
 fn reveal_window(ctx: &egui::Context, reason: &str) {
-    if !crate::winshow::user_just_opened() {
-        crate::winshow::activate(reason, "PJDesk", instance::holds_window());
-    }
     crate::winshow::note_user_open();
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    // Win32 restore after the viewport show. A click also restores immediately,
+    // before this frame, so the foreground lock from that click is used.
+    crate::winshow::activate(reason, "PJDesk", instance::holds_window());
 }
 
 /// Lets the viewer process bring its window in front of this one.
@@ -2708,6 +2708,52 @@ impl App {
             }
         }
     }
+
+    /// Tray clicks and the window close button. `logic` calls this so it still
+    /// runs after the window has been hidden.
+    fn on_tray(&mut self, ctx: &egui::Context) {
+        let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        let has_tray = self.tray.is_some();
+        for action in tray_actions {
+            match action {
+                tray::Action::Show => {
+                    tracing::info!("Tray click reached PJDesk. Showing the window. The PIN lock is shown when one is set.");
+                    reveal_window(ctx, "Open");
+                    self.lock_from_tray();
+                }
+                tray::Action::Update => {
+                    tracing::info!("Tray click: Check for updates. Showing the window.");
+                    reveal_window(ctx, "Check for updates");
+                    if self.signed_in() {
+                        self.lock_from_tray();
+                    } else {
+                        self.show_settings = true;
+                        self.settings.show_about();
+                    }
+                    crate::client_update::start();
+                }
+                tray::Action::Revoke => self.revoke_support_access(),
+                tray::Action::Quit => {
+                    tracing::info!("Tray click: Quit PJDesk.");
+                    self.really_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        let closing = ctx.input(|i| i.viewport().close_requested());
+        if closing && (self.really_quit || !has_tray) && self.temp.is_some() {
+            self.end_temporary_sign_in();
+        }
+        if has_tray && !self.really_quit && closing && !crate::winshow::user_just_opened() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if !self.told_tray {
+                self.told_tray = true;
+                tracing::info!("The window was closed. PJDesk stays in the tray. A click or double-click opens it again.");
+                self.toast.show("PJDesk is still running — click the tray icon, or right-click it to Quit");
+            }
+        }
+    }
 }
 
 enum InviteKind {
@@ -2729,6 +2775,18 @@ impl eframe::App for App {
         }
         self.revoke_published_support();
         self.end_temporary_sign_in();
+    }
+
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe does not call `ui` while the window is hidden. A tray click
+        // has to be handled here, or Visible(true) is never sent.
+        self.ctx = ctx.clone();
+        self.on_tray(ctx);
+        // Minimized or covered windows skip `ui`. Keep waking so a tray click
+        // or a second launch is still noticed.
+        if ctx.input(|i| i.viewport().visible() == Some(false)) {
+            ctx.request_repaint_after(Duration::from_millis(400));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2765,32 +2823,6 @@ impl eframe::App for App {
             self.open_settings();
         }
 
-        let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
-        let has_tray = self.tray.is_some();
-        for action in tray_actions {
-            match action {
-                tray::Action::Show => {
-                    tracing::info!("Opening the window from the tray or a second launch");
-                    reveal_window(&ctx, "Open");
-                    self.lock_from_tray();
-                }
-                tray::Action::Update => {
-                    reveal_window(&ctx, "Check for updates");
-                    if self.signed_in() {
-                        self.lock_from_tray();
-                    } else {
-                        self.show_settings = true;
-                        self.settings.show_about();
-                    }
-                    crate::client_update::start();
-                }
-                tray::Action::Revoke => self.revoke_support_access(),
-                tray::Action::Quit => {
-                    self.really_quit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
         let banner = self.cfg.support_banner();
         let tip = if banner.is_empty() { "PJDesk".to_string() } else { banner };
         if tip != self.support_tip {
@@ -2799,19 +2831,6 @@ impl eframe::App for App {
                 tray.set_tooltip(&tip);
             }
         }
-        let closing = ctx.input(|i| i.viewport().close_requested());
-        if closing && (self.really_quit || !has_tray) && self.temp.is_some() {
-            self.end_temporary_sign_in();
-        }
-        if has_tray && !self.really_quit && closing {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            if !self.told_tray {
-                self.told_tray = true;
-                self.toast.show("PJDesk is still running — click the tray icon, or right-click it to Quit");
-            }
-        }
-
         let pending = crate::client_update::running()
             || self.login_rx.is_some()
             || self.change_rx.is_some()

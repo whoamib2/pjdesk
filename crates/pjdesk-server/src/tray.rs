@@ -64,7 +64,7 @@ pub fn acquire_or_signal() -> bool {
             Ok(h) => h,
             Err(_) => return false,
         };
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        if GetLastError() == ERROR_ALREADY_EXISTS && !abandoned_or_free(mutex) {
             let _ = CloseHandle(mutex);
             // The new process is in front. Let the open window take the foreground.
             let _ = AllowSetForegroundWindow(0xFFFF_FFFF);
@@ -85,6 +85,22 @@ pub fn acquire_or_signal() -> bool {
         };
         *HELD.lock().unwrap() = Some(Singleton { _mutex: raw(mutex), event: raw(event) });
         true
+    }
+}
+
+/// `ERROR_ALREADY_EXISTS` does not grant ownership. A dead owner leaves
+/// the mutex abandoned, and this wait takes it. A living owner still
+/// holds it, so the wait times out and the caller signals that window.
+fn abandoned_or_free(mutex: HANDLE) -> bool {
+    const WAIT_ABANDONED: u32 = 0x80;
+    let wait = unsafe { WaitForSingleObject(mutex, 0) };
+    if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+        tracing::info!(
+            "The previous PJDesk Server window is not running. This launch is opening the window. The single-instance lock did not block it."
+        );
+        true
+    } else {
+        false
     }
 }
 

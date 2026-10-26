@@ -40,13 +40,13 @@ fn p(ui: &egui::Ui) -> Paint {
 /// also clears minimize and asks for focus, so hide-to-tray does not undo
 /// the open. The PIN lock, when there is one, is drawn inside the window.
 fn reveal_window(ctx: &egui::Context, reason: &str) {
-    if !crate::winshow::user_just_opened() {
-        crate::winshow::activate(reason, "PJDesk Server", crate::tray::holds_window());
-    }
     crate::winshow::note_user_open();
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    // Win32 restore after the viewport show. A click also restores immediately,
+    // before this frame, so the foreground lock from that click is used.
+    crate::winshow::activate(reason, "PJDesk Server", crate::tray::holds_window());
 }
 
 pub fn run(data_dir: PathBuf, port: u16, start_hidden: bool) -> Result<()> {
@@ -587,9 +587,108 @@ impl App {
             }
         }
     }
+
+    /// Tray clicks, minimize-to-tray, and the window close button. `logic`
+    /// calls this so it still runs after the window has been hidden.
+    fn on_tray(&mut self, ctx: &egui::Context) {
+        let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        let has_tray = self.tray.is_some();
+        for action in tray_actions {
+            match action {
+                crate::tray::Action::Show => {
+                    tracing::info!("Tray click reached PJDesk Server. Showing the window. The PIN lock is shown when one is set.");
+                    reveal_window(ctx, "Open");
+                    self.gate.engage();
+                }
+                crate::tray::Action::ServiceStart => self.elevate_service(&["service", "start"]),
+                crate::tray::Action::ServiceStop => self.elevate_service(&["service", "stop"]),
+                crate::tray::Action::ServiceRestart => {
+                    if self.control_ready {
+                        self.ask_service(crate::control::Request { cmd: "restart".into(), ..Default::default() });
+                    } else {
+                        self.elevate_service(&["service", "restart"]);
+                    }
+                }
+                crate::tray::Action::OpenLog => crate::tray::open_log_folder(&self.data_dir),
+                crate::tray::Action::CheckUpdates => {
+                    tracing::info!("Tray click: Check for updates. Showing the window.");
+                    reveal_window(ctx, "Check for updates");
+                    self.gate.engage();
+                    if self.via_service() {
+                        self.status = "Checking for updates…".into();
+                        self.spawn_cloud_job(|| {
+                            service_job(crate::control::Request { cmd: "check".into(), ..Default::default() })
+                        });
+                    } else {
+                        let dir = self.data_dir.clone();
+                        self.status = "Checking for updates…".into();
+                        std::thread::spawn(move || {
+                            let _ = crate::self_update::check_now(&dir);
+                        });
+                    }
+                }
+                crate::tray::Action::Promote => {
+                    tracing::info!("Tray click: Make this the primary. Showing the window.");
+                    reveal_window(ctx, "Make this the primary");
+                    self.gate.engage();
+                    self.cloud_form.confirm_promote = true;
+                    self.cloud_form.confirm_demote = false;
+                }
+                crate::tray::Action::Demote => {
+                    tracing::info!("Tray click: Step down to standby. Showing the window.");
+                    reveal_window(ctx, "Step down to standby");
+                    self.gate.engage();
+                    self.cloud_form.confirm_demote = true;
+                    self.cloud_form.confirm_promote = false;
+                }
+                crate::tray::Action::SyncNow => {
+                    if self.via_service() {
+                        self.ask_service(crate::control::Request { cmd: "sync".into(), ..Default::default() });
+                    } else {
+                        self.status = match crate::requests::push(&self.data_dir, crate::requests::SYNC_FILE, "now") {
+                            Ok(()) => "Syncing now.".into(),
+                            Err(e) => format!("Could not ask the server to sync: {e}"),
+                        };
+                    }
+                }
+                crate::tray::Action::Quit => {
+                    tracing::info!("Tray click: Exit tray.");
+                    self.really_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if has_tray
+            && ctx.input(|i| i.viewport().minimized == Some(true))
+            && pjdesk_proto::trayshow::hide_because_minimized(true, crate::winshow::user_just_opened())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        if has_tray && !self.really_quit && ctx.input(|i| i.viewport().close_requested()) && !crate::winshow::user_just_opened() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if !self.told_tray {
+                self.told_tray = true;
+                tracing::info!("The window was closed. PJDesk Server stays in the tray. A click or double-click opens it again.");
+                self.status = "PJDesk Server is still running in the tray — right-click it to Quit.".into();
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe does not call `ui` while the window is hidden. A tray click
+        // has to be handled here, or Visible(true) is never sent.
+        self.on_tray(ctx);
+        // Minimized or covered windows skip `ui`. Keep waking so a tray click
+        // or a second launch is still noticed.
+        if ctx.input(|i| i.viewport().visible() == Some(false)) {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.last_refresh.elapsed() > Duration::from_secs(3) {
             self.last_refresh = Instant::now();
@@ -617,86 +716,6 @@ impl eframe::App for App {
         self.poll_cloud_job();
         self.poll_netkey();
         self.poll_release();
-
-        // System tray: Show/Quit, and hide-to-tray when the window is closed.
-        let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
-        let has_tray = self.tray.is_some();
-        for action in tray_actions {
-            match action {
-                crate::tray::Action::Show => {
-                    tracing::info!("Opening PJDesk Server from the tray or a second launch");
-                    reveal_window(&ctx, "Open");
-                    self.gate.engage();
-                }
-                crate::tray::Action::ServiceStart => self.elevate_service(&["service", "start"]),
-                crate::tray::Action::ServiceStop => self.elevate_service(&["service", "stop"]),
-                crate::tray::Action::ServiceRestart => {
-                    if self.control_ready {
-                        self.ask_service(crate::control::Request { cmd: "restart".into(), ..Default::default() });
-                    } else {
-                        self.elevate_service(&["service", "restart"]);
-                    }
-                }
-                crate::tray::Action::OpenLog => crate::tray::open_log_folder(&self.data_dir),
-                crate::tray::Action::CheckUpdates => {
-                    reveal_window(&ctx, "Check for updates");
-                    self.gate.engage();
-                    if self.via_service() {
-                        self.status = "Checking for updates…".into();
-                        self.spawn_cloud_job(|| {
-                            service_job(crate::control::Request { cmd: "check".into(), ..Default::default() })
-                        });
-                    } else {
-                        let dir = self.data_dir.clone();
-                        self.status = "Checking for updates…".into();
-                        std::thread::spawn(move || {
-                            let _ = crate::self_update::check_now(&dir);
-                        });
-                    }
-                }
-                crate::tray::Action::Promote => {
-                    reveal_window(&ctx, "Make this the primary");
-                    self.gate.engage();
-                    self.cloud_form.confirm_promote = true;
-                    self.cloud_form.confirm_demote = false;
-                }
-                crate::tray::Action::Demote => {
-                    reveal_window(&ctx, "Step down to standby");
-                    self.gate.engage();
-                    self.cloud_form.confirm_demote = true;
-                    self.cloud_form.confirm_promote = false;
-                }
-                crate::tray::Action::SyncNow => {
-                    if self.via_service() {
-                        self.ask_service(crate::control::Request { cmd: "sync".into(), ..Default::default() });
-                    } else {
-                        self.status = match crate::requests::push(&self.data_dir, crate::requests::SYNC_FILE, "now") {
-                            Ok(()) => "Syncing now.".into(),
-                            Err(e) => format!("Could not ask the server to sync: {e}"),
-                        };
-                    }
-                }
-                crate::tray::Action::Quit => {
-                    self.really_quit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
-        if has_tray
-            && ctx.input(|i| i.viewport().minimized == Some(true))
-            && pjdesk_proto::trayshow::hide_because_minimized(true, crate::winshow::user_just_opened())
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-        if has_tray && !self.really_quit && ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            if !self.told_tray {
-                self.told_tray = true;
-                self.status = "PJDesk Server is still running in the tray — right-click it to Quit.".into();
-            }
-        }
 
         if let Some(tray) = &self.tray {
             let (installed, running) = self.service_state();
