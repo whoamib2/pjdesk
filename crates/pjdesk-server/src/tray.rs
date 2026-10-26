@@ -13,7 +13,9 @@ use eframe::egui;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::w;
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
+};
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
 };
@@ -92,7 +94,6 @@ pub fn acquire_or_signal() -> bool {
 /// the mutex abandoned, and this wait takes it. A living owner still
 /// holds it, so the wait times out and the caller signals that window.
 fn abandoned_or_free(mutex: HANDLE) -> bool {
-    const WAIT_ABANDONED: u32 = 0x80;
     let wait = unsafe { WaitForSingleObject(mutex, 0) };
     if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
         tracing::info!(

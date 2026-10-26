@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Builds the PJDesk client and server installers with NSIS.
 #
-# Prerequisites: the Windows release binaries have been built
-#   cargo build --release --target x86_64-pc-windows-gnu
-# and `makensis` is on PATH (Linux: apt install nsis; Windows: NSIS).
+# This script builds the Windows release first. A failed cargo build stops
+# here and does not pack whatever binaries were left in target/.
+# `makensis` must be on PATH (Linux: apt install nsis; Windows: NSIS).
 #
 # Usage: installer/build.sh [version]
 #
@@ -27,6 +27,19 @@ else
   fi
 fi
 WORK="$HERE/build"
+
+# Build before packing. `set -e` exits on a bare failed command, and the exit
+# code is still checked so a failed build never reaches makensis. A previous
+# successful exe in target/ is not packed.
+cd "$ROOT"
+set +e
+cargo build --release --target x86_64-pc-windows-gnu -p pjdesk -p pjdesk-server
+cargo_status=$?
+set -e
+if [ "$cargo_status" -ne 0 ]; then
+  echo "The Windows build failed (cargo exit ${cargo_status}). The installers were not packed." >&2
+  exit "$cargo_status"
+fi
 
 for exe in pjdesk.exe pjdesk-server.exe; do
   if [ ! -f "$TARGET/$exe" ]; then

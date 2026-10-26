@@ -8,6 +8,7 @@ Windows is 0.6.36. Android is 0.6.36 (versionCode 63105). The installer reads th
 * A hidden window is restored with ShowWindow (SW_RESTORE, then SW_SHOW if it is still hidden), brought forward with AllowSetForegroundWindow and AttachThreadInput, and moved onto the primary monitor when it is off-screen. The click is handled while the window is hidden, which is when the window would otherwise stay down.
 * The client and the server each keep one window with a single-instance lock. A second launch asks the open window to show itself. If that window process has exited and left the lock abandoned, the new launch takes the window instead of exiting. A second copy is not started while this process still owns the window.
 * The client writes the click and the action (restore, show the window this process owns, or start because the window process is not running) to %APPDATA%\PJDesk\pjdesk.log. PJDesk Server writes the same lines to %APPDATA%\PJDesk\pjdesk-server.log.
+* The Windows build compares the mutex wait with WAIT_ABANDONED as a WAIT_EVENT. installer/build.sh builds the Windows release and does not pack installers when that build fails.
 
 ## 0.6.35
 
