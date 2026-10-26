@@ -1,6 +1,8 @@
 package us.spader.pjdesk
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import us.spader.pjdesk.core.ENGINE_LIBRARY_MISSING
 import us.spader.pjdesk.core.Native
@@ -15,6 +17,7 @@ import us.spader.pjdesk.core.liveOnline
 import us.spader.pjdesk.core.osDetail
 import us.spader.pjdesk.core.PresenceReport
 import us.spader.pjdesk.core.presenceOnlineFlag
+import us.spader.pjdesk.core.presenceStale
 import us.spader.pjdesk.core.savedSubtitle
 
 class SavedOrderTest {
@@ -146,6 +149,25 @@ class SavedOrderTest {
         val onLan = applyLan(live, setOf("622775091"))
         assertEquals(true, onLan[2].online)
         assertEquals(false, applyLan(listOf(cached[0]), emptySet())[0].online)
+    }
+
+    @Test
+    fun aReplacedPhoneDropsAfterThreeDaysAndADayOfflineStays() {
+        val now = 1_700_000_000_000L
+        val day = SavedComputer(id = "610978221", hostname = "CHIP20", online = false, lastSeen = now / 1000 - 24 * 3600)
+        val week = SavedComputer(id = "386626882", hostname = "Pixel 11 Pro XL", online = false, lastSeen = now / 1000 - 6 * 24 * 3600)
+        val shown = arrangeSaved(
+            listOf(day, week, cabin),
+            recentIds = emptyList(),
+            sort = SavedSort.Name,
+            filter = SavedFilter.All,
+            query = "",
+            recentOnly = false,
+            nowMs = now,
+        )
+        assertEquals(listOf("902488771", "610978221"), shown.map { it.id })
+        assertFalse(presenceStale(day, now))
+        assertTrue(presenceStale(week, now))
     }
 
     @Test

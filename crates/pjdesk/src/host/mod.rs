@@ -48,6 +48,10 @@ pub struct HostShared {
     pub online: AtomicBool,
     /// Round-trip of the last server ping, in milliseconds. 0 until the first reply.
     pub rtt_ms: AtomicU64,
+    /// Unix time of the last Register or Pong. 0 when this computer is not registered.
+    pub acked_unix: AtomicU64,
+    /// Server address the last registration targeted.
+    pub server: Mutex<String>,
     /// `LAN` or `Internet` once the signaling connection is up.
     pub reach: Mutex<String>,
     /// This device's ID once registered.
@@ -109,6 +113,27 @@ pub struct ConsentReply {
     pub receive_dir: String,
 }
 
+/// `Some` when this connection landed on the account's standby instead of the
+/// server in the registration target. The caller reconnects on the public path.
+async fn landed_on_standby(config: &Config, primary: &ServerAddr, connected: SocketAddr) -> Option<String> {
+    let text = config.network_standby.clone().unwrap_or_default();
+    let Ok(standby) = ServerAddr::parse(&text) else {
+        return None;
+    };
+    let Ok(resolved) = standby.resolve().await else {
+        return None;
+    };
+    if crate::signaling::reached_standby(connected, primary, &standby, resolved) {
+        Some(format!("that address is the standby at {standby}; connecting to the primary"))
+    } else {
+        None
+    }
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 impl HostShared {
     pub fn id(&self) -> Option<String> {
         self.id.lock().unwrap().clone()
@@ -124,6 +149,20 @@ impl HostShared {
     }
     pub fn is_online(&self) -> bool {
         self.online.load(Ordering::SeqCst)
+    }
+    pub fn note_ack(&self) {
+        self.acked_unix.store(unix_secs(), Ordering::SeqCst);
+    }
+    pub fn clear_registration(&self) {
+        self.online.store(false, Ordering::SeqCst);
+        self.acked_unix.store(0, Ordering::SeqCst);
+    }
+    /// Online only when the server has acked within [`pjdesk_proto::REGISTRATION_ACK_SECS`].
+    pub fn acked_recently(&self) -> bool {
+        pjdesk_proto::registration_acked(self.is_online(), self.acked_unix.load(Ordering::SeqCst), unix_secs())
+    }
+    pub fn server(&self) -> String {
+        self.server.lock().unwrap().clone()
     }
     pub fn rtt_ms(&self) -> u64 {
         self.rtt_ms.load(Ordering::Relaxed)
@@ -516,7 +555,7 @@ async fn host_main(
         let outcome = signaling_loop(&server, &mut config, &state, force_refresh, public_only).await;
         force_refresh = true;
         if let Some(shared) = &state.shared {
-            shared.online.store(false, Ordering::SeqCst);
+            shared.clear_registration();
             *shared.connected.lock().unwrap() = None;
             *shared.reach.lock().unwrap() = String::new();
             if shared.stopping() {
@@ -592,13 +631,32 @@ async fn signaling_loop(
         config.server_fingerprint = refreshed.server_fingerprint;
         config.network_lan = refreshed.network_lan;
         config.network_public_ip = refreshed.network_public_ip;
+        config.network_standby = refreshed.network_standby;
+        config.network_standby_fingerprint = refreshed.network_standby_fingerprint;
     });
     let _ = config.reload_access_key();
     state.remember_support(config);
     let server = ServerAddr::parse(&config.effective_server()).unwrap_or_else(|_| server.clone());
+    let role = if state.args.service_host { "service" } else { "window" };
+    let key = config
+        .server_fingerprint
+        .as_deref()
+        .map(pjdesk_proto::discover::fingerprint_prefix)
+        .unwrap_or_else(|| "unpinned".into());
+    info!(
+        "Registration target ({role}): {server}, key {key}, {}",
+        if public_only { "public address only" } else { "LAN or public" }
+    );
     let token = config.presented_access();
     let access_key = pjdesk_proto::access::is_access_key(&token);
     let mut signal = SignalClient::connect_mode(&server, config, public_only).await?;
+    if let Some(reason) = landed_on_standby(config, &server, signal.server_addr).await {
+        warn!(
+            "Registration target {server} reached {} via {} ({role}), key {key}; {reason}",
+            signal.server_addr, signal.via
+        );
+        bail!(pjdesk_proto::signal::STANDBY_REGISTRATION);
+    }
     if !token.is_empty() {
         let _ = signal.send(ClientMsg::PresentAccess { token: token.clone() });
     }
@@ -620,6 +678,9 @@ async fn signaling_loop(
             // the socket. Try once without the token so this computer stays online.
             // An access key is not retried without: the server asked for it.
             signal = SignalClient::connect_mode(&server, config, public_only).await?;
+            if landed_on_standby(config, &server, signal.server_addr).await.is_some() {
+                bail!(pjdesk_proto::signal::STANDBY_REGISTRATION);
+            }
             signal.send(register)?;
             timeout(Duration::from_secs(10), signal.recv()).await
         }
@@ -664,14 +725,8 @@ async fn signaling_loop(
     let has_permanent = state.permanent.lock().unwrap().is_some();
     print_banner(&device_id, &state.password.lock().unwrap(), has_permanent, &server);
     crate::HOST_ONLINE.store(true, Ordering::SeqCst);
-    let role = if state.args.service_host { "service" } else { "window" };
-    let key = config
-        .server_fingerprint
-        .as_deref()
-        .map(pjdesk_proto::discover::fingerprint_prefix)
-        .unwrap_or_else(|| "unpinned".into());
     info!(
-        "Registered {} ({role}) with {server} via {} ({}), key {key}, role primary",
+        "Server ack: registered {} ({role}) with {server} via {} ({}), key {key}",
         format_id(&device_id),
         signal.via,
         signal.server_addr
@@ -680,7 +735,9 @@ async fn signaling_loop(
         *shared.id.lock().unwrap() = Some(device_id.clone());
         *shared.last_error.lock().unwrap() = None;
         *shared.reach.lock().unwrap() = signal.via.to_string();
+        *shared.server.lock().unwrap() = server.to_string();
         shared.online.store(true, Ordering::SeqCst);
+        shared.note_ack();
     }
     state.publish_password();
 
@@ -695,6 +752,8 @@ async fn signaling_loop(
     // name up again.
     let mut last_heard = std::time::Instant::now();
     let mut ping_at: Option<Instant> = None;
+    let mut awaiting_pong = false;
+    let mut heartbeats = 0u32;
 
     loop {
         tokio::select! {
@@ -705,8 +764,21 @@ async fn signaling_loop(
                 state.apply_ui_requests();
             }
             _ = ping.tick() => {
+                if awaiting_pong {
+                    warn!(
+                        "Heartbeat missed ({role}) from {server} via {} ({}); no pong since the last ping. Reconnecting",
+                        signal.via, signal.server_addr
+                    );
+                    if let Some(shared) = &state.shared {
+                        shared.clear_registration();
+                    }
+                    return Ok(());
+                }
                 if last_heard.elapsed() >= Duration::from_secs(30) {
                     warn!("No reply from the server for 30 s ({role}); reconnecting");
+                    if let Some(shared) = &state.shared {
+                        shared.clear_registration();
+                    }
                     return Ok(());
                 }
                 if config.reload_access_key() {
@@ -714,6 +786,7 @@ async fn signaling_loop(
                     return Ok(());
                 }
                 signal.send(ClientMsg::Ping)?;
+                awaiting_pong = true;
                 ping_at = Some(Instant::now());
                 if report_host {
                     since_report += 1;
@@ -766,10 +839,20 @@ async fn signaling_loop(
                         *state.policy.lock().unwrap() = policy;
                     }
                     ServerMsg::Pong => {
-                        if let Some(sent) = ping_at.take() {
-                            if let Some(shared) = &state.shared {
-                                shared.rtt_ms.store(sent.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        awaiting_pong = false;
+                        heartbeats = heartbeats.saturating_add(1);
+                        let rtt = ping_at.take().map(|sent| sent.elapsed().as_millis() as u64).unwrap_or(0);
+                        if let Some(shared) = &state.shared {
+                            if rtt > 0 {
+                                shared.rtt_ms.store(rtt, Ordering::Relaxed);
                             }
+                            shared.note_ack();
+                        }
+                        if heartbeats == 1 || heartbeats % 6 == 0 {
+                            info!(
+                                "Heartbeat from {server} via {} ({}) ({role}), {} ms",
+                                signal.via, signal.server_addr, rtt
+                            );
                         }
                     }
                     ServerMsg::UpdateNow => {

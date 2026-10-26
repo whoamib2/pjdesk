@@ -1730,6 +1730,10 @@ fn publish_presence(data_dir: &Path) {
     if !cfg.is_account() || cfg.token.is_empty() {
         return;
     }
+    if !accepts_host_registrations(data_dir) {
+        tracing::info!("presence: this server is the standby and did not publish the computer list");
+        return;
+    }
     let Ok(reg) = crate::registry::Registry::load(data_dir.join("devices.json")) else { return };
     let Some(online) = online_ids(data_dir) else { return };
     let online_path = data_dir.join("online.json");
@@ -1740,6 +1744,10 @@ fn publish_presence(data_dir: &Path) {
         if row.last_seen == 0 || now.saturating_sub(row.last_seen) > 90 * 24 * 3600 {
             continue;
         }
+        let live = online.contains(&row.id);
+        if pjdesk_proto::presence_stale(row.last_seen, live, now) {
+            continue;
+        }
         devices.push(serde_json::json!({
             "id": row.id,
             "hostname": row.hostname,
@@ -1748,7 +1756,7 @@ fn publish_presence(data_dir: &Path) {
             "console_user": row.console_user,
             "display_name": row.display_name,
             "last_seen": row.last_seen,
-            "online": online.contains(&row.id),
+            "online": live,
             "signed_in": row.signed_in,
         }));
         if devices.len() >= 500 {
@@ -1778,7 +1786,17 @@ fn publish_presence(data_dir: &Path) {
             if let Ok(bytes) = serde_json::to_vec(&body) {
                 let _ = std::fs::write(&stamp, bytes);
             }
-            tracing::info!("presence: published {} computers", devices.len());
+            let online_names: Vec<String> = devices
+                .iter()
+                .filter(|row| row.get("online").and_then(|v| v.as_bool()).unwrap_or(false))
+                .filter_map(|row| row.get("id").and_then(|v| v.as_str()))
+                .map(pjdesk_proto::format_id)
+                .collect();
+            let listed = if online_names.is_empty() { "none".to_string() } else { online_names.join(", ") };
+            tracing::info!(
+                "presence: published {} computers from this primary, online: {listed}",
+                devices.len()
+            );
         }
         Err(ureq::Error::Status(code, _)) => {
             tracing::debug!("presence: the account did not accept the list ({code})");

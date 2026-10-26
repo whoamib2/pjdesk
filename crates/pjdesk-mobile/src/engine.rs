@@ -41,7 +41,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.38";
+pub const APP_VERSION: &str = "0.6.39";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -1004,6 +1004,13 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool)
         bail!("Sign in required");
     }
     let server = ServerAddr::parse(&server_text)?;
+    log_line(
+        &cb,
+        format!(
+            "registration target (phone): {server}, {}",
+            if public_only { "public address only" } else { "LAN or public" }
+        ),
+    );
     let pinned = state.fingerprint.lock().unwrap().clone().and_then(|s| pjdesk_proto::tls::parse_fingerprint(&s).ok());
     let mut signal = open_signal(&state, &cb, &server, pinned, public_only).await?;
     if let Some(fp) = signal.observed {
@@ -1045,6 +1052,8 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool)
     let mut ping = tokio::time::interval(Duration::from_secs(10));
     ping.tick().await;
     let mut last_heard = Instant::now();
+    let mut awaiting_pong = false;
+    let mut heartbeats = 0u32;
     let mut routes: HashMap<u64, mpsc::UnboundedSender<ServerMsg>> = HashMap::new();
     let mut saw_registered = false;
     let mut report_host = false;
@@ -1058,8 +1067,20 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool)
                 if state.access_epoch.load(Ordering::SeqCst) != epoch {
                     return Ok(());
                 }
+                if awaiting_pong {
+                    log_line(
+                        &cb,
+                        format!(
+                            "heartbeat missed (phone) from {server} via {} ({}); no pong since the last ping. Reconnecting",
+                            signal.via, signal.server_addr
+                        ),
+                    );
+                    emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
+                    return Ok(());
+                }
                 if last_heard.elapsed() >= Duration::from_secs(30) {
                     warn!("No reply from the server for 30 s (phone); reconnecting");
+                    emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
                     return Ok(());
                 }
                 if state.host_live.load(Ordering::SeqCst) == 0 {
@@ -1070,6 +1091,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool)
                     }
                 }
                 signal.send(ClientMsg::Ping)?;
+                awaiting_pong = true;
                 if report_host {
                     since_report += 1;
                     if since_report >= 5 {
@@ -1099,7 +1121,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool)
                         log_line(
                             &cb,
                             format!(
-                                "registered {} (phone) with {} via {} ({}), key {key}, role primary",
+                                "server ack: registered {} (phone) with {} via {} ({}), key {key}",
                                 format_id(&device_id),
                                 server,
                                 signal.via,
@@ -1179,7 +1201,16 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool)
                         let _ = signal.send(host_report(&state));
                         let _ = signal.send(display_name_report(&state));
                     }
-                    ServerMsg::Pong => {}
+                    ServerMsg::Pong => {
+                        awaiting_pong = false;
+                        heartbeats = heartbeats.saturating_add(1);
+                        if heartbeats == 1 || heartbeats % 6 == 0 {
+                            log_line(
+                                &cb,
+                                format!("heartbeat from {server} via {} ({}) (phone)", signal.via, signal.server_addr),
+                            );
+                        }
+                    }
                     ServerMsg::UpdateNow => {
                         log_line(&cb, "the server asked this phone to update");
                         let cb = cb.clone();

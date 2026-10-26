@@ -138,7 +138,10 @@ impl Engine {
         if !was_ready {
             self.service_running = duty.service_running;
             if duty.window_hosts {
-                tracing::info!("The background service is not registered; this window will register this computer");
+                tracing::info!(
+                    "The background service is not registered; this window will register this computer with {}",
+                    self.server.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "no server".into())
+                );
                 self.spawn(config);
             }
             return;
@@ -180,7 +183,10 @@ impl Engine {
 
     fn spawn(&mut self, config: &Config) {
         if let Some(server) = self.server.clone() {
+            tracing::info!("Registration target (window): {server}");
             spawn_host(server, config.clone(), self.shared.clone());
+        } else {
+            tracing::warn!("This window did not register; no server address is set");
         }
     }
 
@@ -266,6 +272,8 @@ pub struct App {
     confirm_delete: Option<String>,
     delete_rx: Option<Receiver<Result<String, String>>>,
     next_account_pull: u64,
+    /// Last self-online value written to the log, so a refresh does not repeat it.
+    logged_self_online: Option<bool>,
     prompt_open: bool,
     prompt_id: String,
     prompt_password: String,
@@ -477,6 +485,7 @@ impl App {
             confirm_delete: None,
             delete_rx: None,
             next_account_pull: 0,
+            logged_self_online: None,
             prompt_open: false,
             prompt_id: String::new(),
             prompt_password: String::new(),
@@ -630,6 +639,8 @@ impl App {
             support_code: "12345678".into(),
             support_password: "temp-pass".into(),
             support_born_unix: unix_now(),
+            acked_unix: unix_now(),
+            server: "office.example:21200".into(),
         };
         self.connect_id = "123 456 789".into();
         self.cfg.server = Some("office.example:21200".into());
@@ -1114,7 +1125,39 @@ impl App {
         let cfg = self.cfg.clone();
         // SCM "Running" only means the service process is up. The window keeps
         // this computer registered until status.json is fresh and online.
-        self.engine.on_service(&cfg, self.svc_status.is_hosting());
+        let hosting = probe::service_holds_registration(
+            self.svc_status.is_hosting(),
+            &self.svc_status.server,
+            &cfg.effective_server(),
+        );
+        self.engine.on_service(&cfg, hosting);
+        self.note_self_status();
+    }
+
+    /// Online only when the registrar's server ack is recent.
+    fn registrar_acked(&self) -> bool {
+        let now = unix_now();
+        if self.engine.service_running {
+            self.svc_status.registration_fresh(now)
+        } else {
+            self.engine.ready && self.engine.shared.acked_recently()
+        }
+    }
+
+    fn note_self_status(&mut self) {
+        let acked = self.registrar_acked();
+        if self.logged_self_online == Some(acked) {
+            return;
+        }
+        let id = self.cfg.device_id.clone().unwrap_or_default();
+        let account = self.cfg.settings.peers.get(&id).is_some_and(|n| n.reported_online);
+        let source = if self.engine.service_running { "the background service" } else { "this window" };
+        tracing::info!(
+            "This computer is {} according to {source}. The account list says it is {}.",
+            if acked { "online" } else { "not registered" },
+            if account { "online" } else { "offline" }
+        );
+        self.logged_self_online = Some(acked);
     }
 
     fn share_rtt(&self) -> u64 {
@@ -1747,11 +1790,21 @@ impl App {
                     self.engine.retarget(&self.cfg);
                     return;
                 }
+                let before = self.cfg.effective_server();
                 self.cfg.apply_network_session(&session);
+                let after = self.cfg.effective_server();
+                tracing::info!("{}", saved::presence_refresh_line(&session.presence));
+                if before != after {
+                    tracing::info!("The account server is {after}; registering with it again");
+                    let cfg = self.cfg.clone();
+                    self.engine.retarget(&cfg);
+                }
                 let _ = self.cfg.save();
+                self.note_self_status();
             }
             Ok(Err(message)) => {
                 self.saved_rx = None;
+                tracing::info!("Status refresh from the account failed: {message}");
                 if message.contains("Sign in required") || message.to_ascii_lowercase().contains("revoked") {
                     self.cfg.leave_network_sign_in();
                     let _ = self.cfg.save();

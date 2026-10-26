@@ -81,6 +81,26 @@ pub const DEFAULT_SERVER: &str = "";
 /// Do not show this name in the client, the website, or the installer.
 pub const LEGACY_REGISTERED_SERVER: &str = "pjdesk.spader.us:21200";
 
+/// This computer is online only when the server it registered with has answered
+/// within this many seconds. A ping goes out every 10 seconds.
+pub const REGISTRATION_ACK_SECS: u64 = 25;
+
+/// An offline computer older than this is left out of the saved list.
+/// One day still shows. A replaced phone from several days ago does not.
+pub const PRESENCE_OFFLINE_KEEP_SECS: u64 = 3 * 24 * 3600;
+
+/// True when `online` was confirmed by a server ack at `acked_unix`.
+pub fn registration_acked(online: bool, acked_unix: u64, now: u64) -> bool {
+    online && acked_unix > 0 && now.saturating_sub(acked_unix) <= REGISTRATION_ACK_SECS
+}
+
+/// True when an offline computer is too old to keep showing.
+/// `last_seen` of 0, and any stamp from before 2020, is not stale: that row
+/// was saved without a real account time.
+pub fn presence_stale(last_seen: u64, online: bool, now: u64) -> bool {
+    !online && last_seen >= 1_600_000_000 && now.saturating_sub(last_seen) > PRESENCE_OFFLINE_KEEP_SECS
+}
+
 /// ALPN protocol id for the signaling TLS connection.
 pub const ALPN_SIGNAL: &[u8] = b"pjdesk-signal/1";
 /// ALPN protocol id for the peer-to-peer QUIC connection.
@@ -198,6 +218,20 @@ mod tests {
         assert!(protocol_ok(PROTOCOL_VERSION));
         assert!(!protocol_ok(1));
         assert!(!protocol_ok(PROTOCOL_VERSION + 1));
+    }
+
+    #[test]
+    fn registration_needs_a_recent_ack_and_a_week_old_phone_is_stale() {
+        let now = 1_700_000_000u64;
+        assert!(registration_acked(true, now - 10, now));
+        assert!(!registration_acked(true, now - 60, now), "an ack from a minute ago is not recent");
+        assert!(!registration_acked(false, now, now), "a fresh stamp does not count when registration is down");
+        assert!(!registration_acked(true, 0, now));
+        assert!(!presence_stale(now - 7 * 3600, false, now), "7 hours offline still shows");
+        assert!(!presence_stale(now - 24 * 3600, false, now), "1 day offline still shows");
+        assert!(presence_stale(now - 6 * 24 * 3600, false, now), "6 days offline is a leftover");
+        assert!(!presence_stale(now - 6 * 24 * 3600, true, now), "online is kept");
+        assert!(!presence_stale(0, false, now));
     }
 
     #[test]

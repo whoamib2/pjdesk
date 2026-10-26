@@ -90,6 +90,20 @@ pub struct HostDuty {
     pub window_hosts: bool,
 }
 
+/// The service keeps the registration only when its status is fresh and online,
+/// and the server it registered with is the one this window is using.
+/// An empty server name is an older status file and still counts.
+pub fn service_holds_registration(hosting: bool, status_server: &str, expected_server: &str) -> bool {
+    if !hosting {
+        return false;
+    }
+    let got = status_server.trim();
+    if got.is_empty() {
+        return true;
+    }
+    got.eq_ignore_ascii_case(expected_server.trim())
+}
+
 /// The first sample starts the window immediately when the service is not
 /// registered. After the service has been seen hosting, [`SERVICE_DOWN_POLLS`]
 /// consecutive misses are required. `sample_hosting` is true only when the
@@ -182,5 +196,13 @@ mod tests {
         let yielded = host_duty(true, false, 0, fresh.is_hosting());
         assert!(!yielded.window_hosts);
         assert!(yielded.service_running);
+    }
+
+    #[test]
+    fn the_window_takes_over_when_the_service_registered_somewhere_else() {
+        assert!(service_holds_registration(true, "", "pjdesk.spader.us:21200"));
+        assert!(service_holds_registration(true, "pjdesk.spader.us:21200", "PJDESK.SPADER.US:21200"));
+        assert!(!service_holds_registration(true, "192.168.1.50:21200", "pjdesk.spader.us:21200"));
+        assert!(!service_holds_registration(false, "pjdesk.spader.us:21200", "pjdesk.spader.us:21200"));
     }
 }

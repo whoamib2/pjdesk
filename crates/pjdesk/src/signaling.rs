@@ -69,6 +69,18 @@ impl ServerAddr {
     }
 }
 
+/// True when `connected` is the account's standby, and that standby is not the
+/// server this computer was told to use. The same address is not a standby hit.
+pub fn reached_standby(connected: SocketAddr, primary: &ServerAddr, standby: &ServerAddr, standby_addr: SocketAddr) -> bool {
+    if standby.host.trim().is_empty() {
+        return false;
+    }
+    if standby.host.eq_ignore_ascii_case(primary.host.trim()) && standby.port == primary.port {
+        return false;
+    }
+    connected.ip() == standby_addr.ip() && connected.port() == standby_addr.port()
+}
+
 impl fmt::Display for ServerAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.host.contains(':') {
@@ -412,6 +424,18 @@ async fn handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_standby_address_is_not_a_successful_registration() {
+        let primary = ServerAddr::parse("pjdesk.spader.us:21200").unwrap();
+        let standby = ServerAddr::parse("chip20.example:21200").unwrap();
+        let chip: SocketAddr = "192.168.1.50:21200".parse().unwrap();
+        let lenovo: SocketAddr = "192.168.1.20:21200".parse().unwrap();
+        assert!(reached_standby(chip, &primary, &standby, chip));
+        assert!(!reached_standby(lenovo, &primary, &standby, chip));
+        let same = ServerAddr::parse("pjdesk.spader.us:21200").unwrap();
+        assert!(!reached_standby(chip, &primary, &same, chip), "the configured server is not its own standby");
+    }
 
     #[test]
     fn parses_server_addresses() {

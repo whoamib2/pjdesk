@@ -512,19 +512,23 @@ impl App {
             ui.spacing_mut().item_spacing.x = 8.0;
             if self.engine.service_running {
                 let fresh = self.svc_status.is_fresh();
-                if self.svc_status.connected.is_some() && fresh {
+                if self.svc_status.connected.is_some() && fresh && self.registrar_acked() {
                     widgets::status_dot(ui, p.accent, "In a session");
-                } else if fresh && self.svc_status.online {
+                } else if self.registrar_acked() {
                     widgets::status_dot(ui, p.ok, "Service ready");
+                } else if fresh && self.svc_status.online {
+                    widgets::status_dot(ui, p.warn, "Reconnecting");
                 } else {
                     widgets::status_dot(ui, p.muted, "Service starting");
                 }
             } else if self.cfg.server.is_none() && self.cfg.effective_server().is_empty() {
                 widgets::status_dot(ui, p.warn, "No server set");
-            } else if let Some(peer) = self.engine.shared.connected_peer() {
+            } else if let Some(peer) = self.engine.shared.connected_peer().filter(|_| self.registrar_acked()) {
                 widgets::status_dot(ui, p.accent, &format!("In a session · {peer}"));
-            } else if self.engine.shared.is_online() {
+            } else if self.registrar_acked() {
                 widgets::status_dot(ui, p.ok, "Ready");
+            } else if self.engine.shared.is_online() {
+                widgets::status_dot(ui, p.warn, "Reconnecting");
             } else if let Some(err) = self.engine.shared.error() {
                 widgets::status_dot(ui, p.warn, &short(&err));
             } else {

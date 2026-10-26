@@ -573,6 +573,8 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
         );
         status.rtt_ms = shared.rtt_ms();
         status.reach = shared.reach();
+        status.acked_unix = shared.acked_unix.load(std::sync::atomic::Ordering::SeqCst);
+        status.server = shared.server();
         status.support_code = shared.support_code();
         status.support_password = shared.support_password();
         status.support_born_unix = shared.support_born();

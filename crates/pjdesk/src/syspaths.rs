@@ -65,6 +65,13 @@ pub struct ServiceStatus {
     /// Unix time the support pair was created. 0 until the first pair.
     #[serde(default)]
     pub support_born_unix: u64,
+    /// Unix time of the last Register or Pong from the server. 0 if this file
+    /// was written by an older service.
+    #[serde(default)]
+    pub acked_unix: u64,
+    /// Server address the service registered with. Empty on an older file.
+    #[serde(default)]
+    pub server: String,
 }
 
 impl ServiceStatus {
@@ -87,7 +94,26 @@ impl ServiceStatus {
             support_code: String::new(),
             support_password: String::new(),
             support_born_unix: 0,
+            acked_unix: 0,
+            server: String::new(),
         }
+    }
+
+    /// The ack time to show. An older service file has no ack stamp; its
+    /// rewrite time is used only while it still says online and names no server.
+    pub fn ack_stamp(&self) -> u64 {
+        if self.acked_unix > 0 {
+            self.acked_unix
+        } else if self.online && self.server.trim().is_empty() {
+            self.updated_unix
+        } else {
+            0
+        }
+    }
+
+    /// The service has a recent server ack and the status file is still fresh.
+    pub fn registration_fresh(&self, now: u64) -> bool {
+        self.is_fresh() && pjdesk_proto::registration_acked(self.online, self.ack_stamp(), now)
     }
 
     pub fn load() -> Option<Self> {
@@ -134,5 +160,19 @@ mod tests {
         status.online = true;
         status.updated_unix = 0;
         assert!(!status.is_hosting(), "a stale file is not hosting");
+    }
+
+    #[test]
+    fn an_old_online_file_counts_and_a_named_server_needs_an_ack() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut old = ServiceStatus::now(Some("902488771".into()), true, None, None, false);
+        assert!(old.registration_fresh(now), "a fresh online file from an older service still counts");
+        old.server = "pjdesk.spader.us:21200".into();
+        old.acked_unix = 0;
+        assert!(!old.registration_fresh(now), "a named server with no ack is not online");
+        old.acked_unix = now;
+        assert!(old.registration_fresh(now));
+        old.acked_unix = now.saturating_sub(120);
+        assert!(!old.registration_fresh(now));
     }
 }

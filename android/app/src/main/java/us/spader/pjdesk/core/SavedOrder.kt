@@ -78,6 +78,17 @@ fun seenSeconds(stamp: Long): Long {
     return if (stamp >= 10_000_000_000L) stamp / 1000 else stamp
 }
 
+/** Offline computers older than this are left out of the saved list. */
+const val PRESENCE_OFFLINE_KEEP_SECS = 3 * 24 * 3600
+
+/** A replaced phone from several days ago. One day offline still shows. A missing time does not. */
+fun presenceStale(computer: SavedComputer, nowMs: Long): Boolean {
+    if (computer.online) return false
+    val seen = seenSeconds(computer.lastSeen)
+    if (seen < 1_600_000_000L) return false
+    return nowMs / 1000 - seen > PRESENCE_OFFLINE_KEEP_SECS
+}
+
 /** The account's online flag, or a 1/0 that some JSON readers leave as a number. */
 fun presenceOnlineFlag(value: Any?): Boolean = when (value) {
     is Boolean -> value
@@ -204,13 +215,17 @@ fun arrangeSaved(
     query: String,
     recentOnly: Boolean,
     selfId: String = "",
+    nowMs: Long = System.currentTimeMillis(),
 ): List<SavedComputer> {
+    val self = selfId.filter { it.isDigit() }
     val source = if (recentOnly) {
         recentIds.map { id -> computers.find { it.id == id } ?: SavedComputer(id = id) }
     } else {
         computers
     }
     val filtered = source.filter { computer ->
+        val digits = computer.id.filter { it.isDigit() }
+        if (presenceStale(computer, nowMs) && digits != self) return@filter false
         val keep = when (filter) {
             SavedFilter.All -> true
             SavedFilter.Online -> computer.online
@@ -231,7 +246,6 @@ fun arrangeSaved(
             }
         }
     }
-    val self = selfId.filter { it.isDigit() }
     if (self.isEmpty()) return ordered
     val (mine, others) = ordered.partition { it.id.filter { ch -> ch.isDigit() } == self }
     return others + mine

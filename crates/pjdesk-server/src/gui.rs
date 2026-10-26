@@ -573,6 +573,7 @@ impl App {
         self.accounts = view.accounts;
         self.devices = view.devices;
         self.blocked = view.blocked;
+        log_online_refresh(&self.online, &view.online);
         self.online = view.online;
         self.log_tail = view.log_tail;
         self.ak_keys = view.access_keys;
@@ -4135,6 +4136,22 @@ fn heading(ui: &mut egui::Ui, text: &str) {
 
 /// Reads the server's live online snapshot (id → reported version). Ignores a
 /// stale file, which means the server isn't running.
+fn log_online_refresh(previous: &HashMap<String, String>, next: &HashMap<String, String>) {
+    let mut before: Vec<String> = previous.keys().cloned().collect();
+    let mut after: Vec<String> = next.keys().cloned().collect();
+    before.sort();
+    after.sort();
+    if before == after {
+        return;
+    }
+    let listed = if after.is_empty() {
+        "none".to_string()
+    } else {
+        after.iter().map(|id| pjdesk_proto::format_id(id)).collect::<Vec<_>>().join(", ")
+    };
+    tracing::info!("Status refresh from online.json: online {listed}");
+}
+
 fn read_online(data_dir: &std::path::Path) -> HashMap<String, String> {
     #[derive(serde::Deserialize)]
     struct OnlineInfo {

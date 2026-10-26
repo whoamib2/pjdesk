@@ -108,7 +108,7 @@ pub fn tile_color(key: &str) -> egui::Color32 {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StatusTone {
-    /// Online, or this computer.
+    /// Online, because the server acked this computer or the account says so.
     Ok,
     /// Offline.
     Warn,
@@ -120,12 +120,29 @@ pub fn presence_online(reported_online: bool, on_lan: bool) -> bool {
     on_lan || reported_online
 }
 
-pub fn status_tone(online: bool, this_computer: bool) -> StatusTone {
-    if this_computer || online {
-        StatusTone::Ok
-    } else {
-        StatusTone::Warn
+pub fn status_tone(online: bool, _this_computer: bool) -> StatusTone {
+    if online { StatusTone::Ok } else { StatusTone::Warn }
+}
+
+/// One line for the log when the account list is applied.
+pub fn presence_refresh_line(rows: &[crate::network::HostPresence]) -> String {
+    if rows.is_empty() {
+        return "Status refresh from the account: no computers".into();
     }
+    let parts: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let state = if row.online {
+                "online".to_string()
+            } else if row.last_seen == 0 {
+                "offline".to_string()
+            } else {
+                format!("offline last_seen {}", row.last_seen)
+            };
+            format!("{} {state}", pjdesk_proto::format_id(&row.id))
+        })
+        .collect();
+    format!("Status refresh from the account: {}", parts.join(", "))
 }
 
 /// `user@host` shown on a colored tile. The host is the computer name when no hostname is known.
@@ -425,6 +442,7 @@ impl App {
         for id in self.cfg.settings.peers.keys() {
             ids.insert(id.clone());
         }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let mut rows = Vec::new();
         for id in ids {
             if !pjdesk_proto::is_valid_id(&id) || self.cfg.is_saved_hidden(&id) || self.cfg.account_removed.iter().any(|h| h == &id)
@@ -438,7 +456,15 @@ impl App {
             let clients = entry.is_some_and(|e| crate::support_keys::is_clients(&e.tags));
             let nickname = crate::config::nickname_text(&alias, &id, &hostname);
             let on_lan = self.lan.iter().any(|(_, lan_id, _)| normalize_id(lan_id) == id);
-            let online = presence_online(note.is_some_and(|n| n.reported_online), on_lan);
+            let this_computer = self.is_this_computer(&id);
+            let last_seen = note.map(|n| n.last_seen).unwrap_or(0);
+            let reported = note.is_some_and(|n| n.reported_online);
+            // This computer is online only after the server it registers with
+            // has acked. The account flag and a LAN beacon do not count.
+            let online = if this_computer { self.registrar_acked() } else { presence_online(reported, on_lan) };
+            if !this_computer && pjdesk_proto::presence_stale(last_seen, online, now) {
+                continue;
+            }
             rows.push(SavedRow {
                 id: id.clone(),
                 nickname,
@@ -450,8 +476,8 @@ impl App {
                 has_password: self.cfg.saved_password(&id).is_some(),
                 online,
                 console_user: note.map(|n| n.console_user.clone()).unwrap_or_default(),
-                last_seen: note.map(|n| n.last_seen).unwrap_or(0),
-                this_computer: self.is_this_computer(&id),
+                last_seen,
+                this_computer,
                 sort_order: note.map(|n| n.sort_order).unwrap_or(0),
                 display_name: note.map(|n| n.display_name.clone()).unwrap_or_default(),
                 in_book: entry.is_some(),
@@ -1556,9 +1582,7 @@ fn paint_icon(ui: &egui::Ui, rect: Rect, icon: Icon, color: egui::Color32) {
 }
 
 fn status_text(row: &SavedRow) -> String {
-    if row.this_computer {
-        "This computer".into()
-    } else if row.online {
+    if row.online {
         "Online".into()
     } else if row.last_seen == 0 {
         "Offline".into()
@@ -1880,8 +1904,20 @@ mod tests {
     #[test]
     fn offline_dot_is_the_warn_tone() {
         assert_eq!(status_tone(true, false), StatusTone::Ok);
-        assert_eq!(status_tone(false, true), StatusTone::Ok);
+        assert_eq!(status_tone(false, true), StatusTone::Warn, "this computer is not online without a server ack");
+        assert_eq!(status_tone(true, true), StatusTone::Ok);
         assert_eq!(status_tone(false, false), StatusTone::Warn);
+        let mut here = sample_row("902488771", None);
+        here.this_computer = true;
+        here.online = false;
+        here.last_seen = 0;
+        assert_eq!(status_text(&here), "Offline");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        here.last_seen = now.saturating_sub(120);
+        assert_eq!(status_text(&here), "Offline · 2 min ago");
+        here.online = true;
+        assert_eq!(status_text(&here), "Online");
+        assert!(presence_refresh_line(&[]).contains("no computers"));
     }
 
     #[test]
