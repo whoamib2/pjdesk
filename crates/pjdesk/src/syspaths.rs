@@ -72,6 +72,9 @@ pub struct ServiceStatus {
     /// Server address the service registered with. Empty on an older file.
     #[serde(default)]
     pub server: String,
+    /// Build the service host registered with. Empty on an older file.
+    #[serde(default)]
+    pub app_version: String,
 }
 
 impl ServiceStatus {
@@ -96,6 +99,7 @@ impl ServiceStatus {
             support_born_unix: 0,
             acked_unix: 0,
             server: String::new(),
+            app_version: String::new(),
         }
     }
 

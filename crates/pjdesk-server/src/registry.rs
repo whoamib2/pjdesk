@@ -164,6 +164,16 @@ pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Writes a non-empty version over whatever was stored, including the first one.
+fn store_version(record: &mut DeviceRecord, app_version: &str) -> bool {
+    let version = clip(app_version, 32);
+    if version.is_empty() || record.app_version == version {
+        return false;
+    }
+    record.app_version = version;
+    true
+}
+
 fn clip(text: &str, max: usize) -> String {
     text.trim().chars().filter(|c| !c.is_control()).take(max).collect()
 }
@@ -484,7 +494,8 @@ impl Registry {
             if let Some(record) = self.data.devices.get_mut(&keep) {
                 record.last_seen = now;
                 record.hostname = hostname.to_string();
-                record.app_version = app_version.to_string();
+                // A later registration replaces the version. An empty one does not.
+                store_version(record, app_version);
             }
             self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
             return Ok(keep);
@@ -555,6 +566,21 @@ impl Registry {
             }
         }
         stale.len()
+    }
+
+    /// Replaces the stored version when `app_version` is non-empty and different.
+    /// Returns true when the file changed. An empty version leaves the stored one.
+    pub fn note_app_version(&mut self, id: &str, app_version: &str) -> bool {
+        let Some(record) = self.data.devices.get_mut(id) else { return false };
+        if !store_version(record, app_version) {
+            return false;
+        }
+        record.last_seen = now();
+        if let Err(e) = self.save() {
+            tracing::warn!("could not save the version for {id}: {e}");
+            return false;
+        }
+        true
     }
 
     /// Stores a host report. An empty hostname or user leaves the previous value.
@@ -730,6 +756,22 @@ mod tests {
         assert!(!ids.contains(&old1) && !ids.contains(&old2));
         // A removed computer that is really still around gets its ID back.
         assert_eq!(reg.register(Some(&old1), &[1u8; 32], "BENLENOVODESK", "0.3.4").unwrap(), old1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_later_registration_replaces_the_stored_version() {
+        let (path, mut reg) = fresh("version");
+        let secret = [5u8; 32];
+        let id = reg.register(None, &secret, "BEN-SURFACE-9", "0.6.43").unwrap();
+        assert_eq!(reg.register(Some(&id), &secret, "BEN-SURFACE-9", "0.6.46").unwrap(), id);
+        assert_eq!(reg.presence().iter().find(|row| row.id == id).unwrap().app_version, "0.6.46");
+        assert_eq!(reg.register(Some(&id), &secret, "BEN-SURFACE-9", "").unwrap(), id);
+        assert_eq!(reg.presence().iter().find(|row| row.id == id).unwrap().app_version, "0.6.46");
+        assert!(!reg.note_app_version(&id, "0.6.46"));
+        assert!(reg.note_app_version(&id, "0.6.45"));
+        let reg = Registry::load(path.clone()).unwrap();
+        assert_eq!(reg.presence()[0].app_version, "0.6.45");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

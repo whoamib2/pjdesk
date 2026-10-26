@@ -126,6 +126,16 @@ pub fn status_tone(online: bool, _this_computer: bool) -> StatusTone {
     if online { StatusTone::Ok } else { StatusTone::Warn }
 }
 
+/// This computer's row shows the build that is running. Other rows show the
+/// version the account last stored.
+pub fn row_version(this_computer: bool, reported: &str) -> String {
+    if this_computer {
+        env!("CARGO_PKG_VERSION").to_string()
+    } else {
+        reported.trim().to_string()
+    }
+}
+
 /// One line for the log when the account list is applied.
 pub fn presence_refresh_line(rows: &[crate::network::HostPresence]) -> String {
     if rows.is_empty() {
@@ -469,11 +479,7 @@ impl App {
                 presence_online(reported, on_lan)
             };
             let reported_version = note.map(|n| n.app_version.clone()).unwrap_or_default();
-            let app_version = if this_computer && reported_version.trim().is_empty() {
-                env!("CARGO_PKG_VERSION").to_string()
-            } else {
-                reported_version
-            };
+            let app_version = row_version(this_computer, &reported_version);
             if !this_computer && pjdesk_proto::presence_stale(last_seen, online, now) {
                 continue;
             }
@@ -533,14 +539,10 @@ impl App {
                 in_book: entry.is_some() && !self.cfg.is_saved_hidden(&id),
                 clients: entry.is_some_and(|e| crate::support_keys::is_clients(&e.tags)),
                 direct: Some(addr.clone()),
-                app_version: {
-                    let reported = note.map(|n| n.app_version.clone()).unwrap_or_default();
-                    if self.is_this_computer(&id) && reported.trim().is_empty() {
-                        env!("CARGO_PKG_VERSION").to_string()
-                    } else {
-                        reported
-                    }
-                },
+                app_version: row_version(
+                    self.is_this_computer(&id),
+                    &note.map(|n| n.app_version.clone()).unwrap_or_default(),
+                ),
             });
         }
         rows
@@ -1900,6 +1902,15 @@ mod tests {
         row.last_connected = 0;
         assert_eq!(status_text(&row), "Online");
         assert!(presence_online(false, true));
+    }
+
+    #[test]
+    fn this_computer_shows_the_running_version() {
+        let local = env!("CARGO_PKG_VERSION");
+        assert_eq!(row_version(true, "0.6.43"), local);
+        assert_eq!(row_version(true, ""), local);
+        assert_eq!(row_version(false, "0.6.43"), "0.6.43");
+        assert_eq!(row_version(false, ""), "");
     }
 
     #[test]

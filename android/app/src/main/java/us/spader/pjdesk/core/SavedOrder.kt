@@ -104,6 +104,12 @@ fun presenceOnlineFlag(value: Any?): Boolean = when (value) {
  */
 fun liveOnline(reportedOnline: Boolean, seenOnLan: Boolean): Boolean = reportedOnline || seenOnLan
 
+/** This phone's own row shows the running version. Other rows show the stored one. */
+fun shownVersion(reported: String, mine: Boolean, selfVersion: String): String {
+    if (mine && selfVersion.isNotBlank()) return selfVersion
+    return reported
+}
+
 /** One row from the account presence list. `lastSeen` is unix seconds or milliseconds. */
 data class PresenceReport(
     val id: String,

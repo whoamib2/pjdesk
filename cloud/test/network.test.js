@@ -228,6 +228,8 @@ test("an empty host report does not erase the name or the user", () => {
   const versioned = applyPresence(kept, { app_version: "0.6.43", hostname: "", last_seen: 4 });
   assert.equal(versioned.app_version, "0.6.43");
   assert.equal(applyPresence(versioned, { app_version: "" }).app_version, "0.6.43");
+  const replaced = applyPresence(versioned, { app_version: "0.6.46", hostname: "BEN-SURFACE-9", last_seen: 30, online: true });
+  assert.equal(replaced.app_version, "0.6.46");
   assert.equal(kept.console_user, "SPADER\\Ben");
   assert.equal(kept.os_family, "windows");
   assert.equal(kept.last_seen, 10);

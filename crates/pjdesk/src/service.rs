@@ -497,6 +497,37 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{install, restart, run_dispatcher, start, status, stop, uninstall};
 
+/// Asks the service host to exit and start again from the exe on disk when
+/// that host is still an older build than this window. One ask per process.
+pub fn ask_registrar_relaunch(service_version: &str, reported: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ASKED: AtomicBool = AtomicBool::new(false);
+    if ASKED.load(Ordering::SeqCst) {
+        return;
+    }
+    let local = env!("CARGO_PKG_VERSION");
+    let service_version = service_version.trim();
+    let behind = if !service_version.is_empty() {
+        pjdesk_proto::update::version_is_behind(service_version, local)
+    } else {
+        let reported = reported.trim();
+        !reported.is_empty() && pjdesk_proto::update::version_is_behind(reported, local)
+    };
+    if !behind {
+        return;
+    }
+    if ASKED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let path = crate::syspaths::service_dir().join("host.relaunch");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::write(&path, local.as_bytes()).is_ok() {
+        tracing::info!("This window is {local}. Asking the registrar to register again.");
+    }
+}
+
 /// The helper that actually hosts, launched by the service into a user session.
 /// Follows the input desktop and publishes a status file for the GUI.
 ///
@@ -575,6 +606,7 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
         status.reach = shared.reach();
         status.acked_unix = shared.acked_unix.load(std::sync::atomic::Ordering::SeqCst);
         status.server = shared.server();
+        status.app_version = env!("CARGO_PKG_VERSION").into();
         status.support_code = shared.support_code();
         status.support_password = shared.support_password();
         status.support_born_unix = shared.support_born();
@@ -605,6 +637,13 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
         if reload.is_file() {
             let _ = std::fs::remove_file(&reload);
             shared.request_stop();
+        }
+        let relaunch = crate::syspaths::service_dir().join("host.relaunch");
+        if relaunch.is_file() {
+            let _ = std::fs::remove_file(&relaunch);
+            tracing::info!("Relaunching so this computer registers {}", env!("CARGO_PKG_VERSION"));
+            // The service starts this helper again from the exe on disk.
+            std::process::exit(0);
         }
         publish(&shared);
         std::thread::sleep(Duration::from_secs(2));

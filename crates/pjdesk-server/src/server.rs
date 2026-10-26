@@ -775,7 +775,16 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         // Handled before this match so the password hash does not hold `state`'s lock.
         ClientMsg::Login { .. } => unreachable!("login is handled before the server lock"),
 
-        ClientMsg::Ping => conn.send(ServerMsg::Pong),
+        ClientMsg::Ping => {
+            if let Some(id) = conn.host_id.clone() {
+                if let Some(version) = st.online.get(&id).map(|host| host.app_version.clone()) {
+                    if st.registry.note_app_version(&id, &version) {
+                        info!("Host {} version is now {version}", format_id(&id));
+                    }
+                }
+            }
+            conn.send(ServerMsg::Pong);
+        }
 
         ClientMsg::PresentAccess { token } => {
             conn.access_token = token.chars().take(4096).collect();
@@ -1613,7 +1622,13 @@ fn reload_from_disk(state: &Shared, acceptor: &RwLock<TlsAcceptor>, data_dir: &P
     }
     let mut st = state.lock().unwrap();
     match Registry::load(data_dir.join("devices.json")) {
-        Ok(reg) => st.registry = reg,
+        Ok(mut reg) => {
+            // A cloud reload must not put an older version back over a live registration.
+            for (id, host) in &st.online {
+                reg.note_app_version(id, &host.app_version);
+            }
+            st.registry = reg;
+        }
         Err(e) => warn!("could not reload the computer list: {e:#}"),
     }
     match crate::accounts::Accounts::load(data_dir) {

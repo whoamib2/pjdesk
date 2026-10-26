@@ -41,7 +41,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.45";
+pub const APP_VERSION: &str = "0.6.46";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -1277,6 +1277,18 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                         refresh_support(&state);
                         publish(&state, &cb);
                     }
+                }
+                if heartbeats == 0 {
+                    let _ = signal.send(ClientMsg::Register {
+                        proto: PROTOCOL_VERSION,
+                        device_id: state.device_id.lock().unwrap().clone().filter(|id| is_valid_id(id)),
+                        device_secret: state.secret,
+                        hostname: {
+                            let reported = state.facts.lock().unwrap().hostname.clone();
+                            if reported.trim().is_empty() { state.hostname.clone() } else { reported }
+                        },
+                        app_version: APP_VERSION.into(),
+                    });
                 }
                 signal.send(ClientMsg::Ping)?;
                 awaiting_pong = true;

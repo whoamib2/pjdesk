@@ -43,14 +43,16 @@ import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.computerTitle
 import us.spader.pjdesk.core.savedSubtitle
 import us.spader.pjdesk.core.shownAppVersion
+import us.spader.pjdesk.core.shownVersion
 import us.spader.pjdesk.core.versionBehind
 import us.spader.pjdesk.core.tileCaption
 import us.spader.pjdesk.core.tileKey
 import us.spader.pjdesk.core.tileRgb
 
 private fun versioned(computer: SavedComputer, mine: Boolean, selfVersion: String): SavedComputer {
-    if (!mine || computer.appVersion.isNotBlank() || selfVersion.isBlank()) return computer
-    return computer.copy(appVersion = selfVersion)
+    val version = shownVersion(computer.appVersion, mine, selfVersion)
+    if (version == computer.appVersion) return computer
+    return computer.copy(appVersion = version)
 }
 
 @Composable
