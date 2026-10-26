@@ -684,6 +684,7 @@ impl App {
             support_born_unix: unix_now(),
             acked_unix: unix_now(),
             server: "office.example:21200".into(),
+            app_version: env!("CARGO_PKG_VERSION").into(),
         };
         self.connect_id = "123 456 789".into();
         self.cfg.server = Some("office.example:21200".into());
@@ -1188,6 +1189,17 @@ impl App {
 
     fn note_self_status(&mut self) {
         let acked = self.registrar_acked();
+        if self.svc_status.registration_fresh(unix_now()) {
+            let id = self
+                .svc_status
+                .id
+                .clone()
+                .or_else(|| self.cfg.device_id.clone())
+                .unwrap_or_default();
+            let id = pjdesk_proto::normalize_id(&id);
+            let reported = self.cfg.settings.peers.get(&id).map(|n| n.app_version.clone()).unwrap_or_default();
+            crate::service::ask_registrar_relaunch(&self.svc_status.app_version, &reported);
+        }
         if self.logged_self_online == Some(acked) {
             return;
         }

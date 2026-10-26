@@ -19,6 +19,7 @@ import us.spader.pjdesk.core.PresenceReport
 import us.spader.pjdesk.core.presenceOnlineFlag
 import us.spader.pjdesk.core.presenceStale
 import us.spader.pjdesk.core.savedSubtitle
+import us.spader.pjdesk.core.shownVersion
 import us.spader.pjdesk.core.versionBehind
 
 class SavedOrderTest {
@@ -179,6 +180,9 @@ class SavedOrderTest {
         assertEquals("902 488 771 · Win 11 · 3d ago · —", savedSubtitle(row, nowMs = 1_700_000_000_000L))
         assertEquals("902 488 771 · Win 11 · now · —", savedSubtitle(cabin, nowMs = 1_700_000_000_000L))
         assertEquals("902 488 771 · Win 11 · now · 0.6.43", savedSubtitle(row.copy(appVersion = "0.6.43"), nowMs = 1_700_000_000_000L, mine = true))
+        assertEquals("0.6.46", shownVersion("0.6.43", mine = true, selfVersion = "0.6.46"))
+        assertEquals("0.6.43", shownVersion("0.6.43", mine = false, selfVersion = "0.6.46"))
+        assertEquals("0.6.43", shownVersion("0.6.43", mine = true, selfVersion = ""))
         assertTrue(versionBehind("0.6.43", "0.6.44"))
         assertFalse(versionBehind("0.6.44", ""))
     }

@@ -828,6 +828,19 @@ async fn signaling_loop(
                     tracing::info!("The access key changed; registering again");
                     return Ok(SignalEnd::Again);
                 }
+                if heartbeats == 0 {
+                    // The first ack also carries this build's version, so an
+                    // in-place update is stored before the next heartbeat.
+                    if let Ok(device_secret) = config.device_secret() {
+                        let _ = signal.send(ClientMsg::Register {
+                            proto: state.server_proto.load(Ordering::SeqCst),
+                            device_id: config.device_id.clone(),
+                            device_secret,
+                            hostname: state.name.clone(),
+                            app_version: env!("CARGO_PKG_VERSION").into(),
+                        });
+                    }
+                }
                 signal.send(ClientMsg::Ping)?;
                 awaiting_pong = true;
                 ping_at = Some(Instant::now());

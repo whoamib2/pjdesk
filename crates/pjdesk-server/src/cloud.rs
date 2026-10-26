@@ -1764,8 +1764,8 @@ struct HealthDoc {
     peers: BTreeMap<String, PeerHealth>,
 }
 
-/// Health only, every few seconds. The full sync still publishes presence
-/// and the network address on its own pass.
+/// Health, and the computer list, every few seconds. The full sync still
+/// publishes the network address on its own pass.
 pub fn publish_heartbeat(data_dir: &Path) {
     let changed = refresh_advertisement(data_dir);
     let Some(cfg) = CloudConfig::load(data_dir) else { return };
@@ -1778,6 +1778,8 @@ pub fn publish_heartbeat(data_dir: &Path) {
     if changed {
         register_network(data_dir, role, false);
     }
+    // A version change reaches the account on this heartbeat, not the 30 s sync.
+    publish_presence(data_dir);
 }
 
 const MAINT_FILE: &str = "maintenance-until.txt";
@@ -2129,6 +2131,7 @@ fn publish_presence(data_dir: &Path) {
     let online_path = data_dir.join("online.json");
     let snapshot_stale = online_path.exists() && !online_file_is_fresh(&online_path);
     let now = now();
+    let versions = live_versions(data_dir);
     let mut devices = Vec::new();
     for row in reg.presence() {
         if row.last_seen == 0 || now.saturating_sub(row.last_seen) > 90 * 24 * 3600 {
@@ -2138,6 +2141,8 @@ fn publish_presence(data_dir: &Path) {
         if pjdesk_proto::presence_stale(row.last_seen, live, now) {
             continue;
         }
+        // The connected process's version wins over an older row in devices.json.
+        let app_version = versions.get(&row.id).cloned().filter(|v| !v.is_empty()).unwrap_or(row.app_version);
         devices.push(serde_json::json!({
             "id": row.id,
             "hostname": row.hostname,
@@ -2148,7 +2153,7 @@ fn publish_presence(data_dir: &Path) {
             "last_seen": row.last_seen,
             "online": live,
             "signed_in": row.signed_in,
-            "app_version": row.app_version,
+            "app_version": app_version,
         }));
         if devices.len() >= 500 {
             break;
@@ -2201,6 +2206,30 @@ fn publish_presence(data_dir: &Path) {
 /// dead process, and it leaves room for a slow rename or a stalled permission
 /// update on Windows.
 pub const ONLINE_FRESH_SECS: u64 = 45;
+
+/// Versions from a fresh `online.json`. The connected process wrote these.
+/// A stale file contributes nothing, so an old version cannot win.
+fn live_versions(data_dir: &Path) -> std::collections::HashMap<String, String> {
+    let path = data_dir.join("online.json");
+    if !online_file_is_fresh(&path) {
+        return std::collections::HashMap::new();
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) else {
+        return std::collections::HashMap::new();
+    };
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let Some(id) = row.get("id").and_then(|id| id.as_str()) else { continue };
+        let Some(version) = row.get("version").and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        out.insert(id.to_string(), version.to_string());
+    }
+    out
+}
 
 /// Ids in a fresh `online.json`. `None` means the file was there but could not
 /// be read, so the caller must leave the published list alone. An empty set
