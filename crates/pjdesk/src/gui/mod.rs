@@ -59,7 +59,7 @@ fn client_window_options() -> eframe::NativeOptions {
             .with_app_id("pjdesk")
             .with_icon(std::sync::Arc::new(app_icon())),
         renderer: preferred_renderer(),
-        // Closing the window returns here. The process keeps the tray.
+        // Closing the window returns here. This process then exits.
         run_and_return: true,
         ..Default::default()
     };
@@ -72,8 +72,35 @@ fn client_window_options() -> eframe::NativeOptions {
     options
 }
 
-/// Launches the app and blocks until Quit. Closing the window destroys it
-/// and leaves this process in the tray, with no surface to present into.
+/// Tray-only process. Never calls eframe.
+pub fn run_tray() {
+    tray::run_tray();
+}
+
+/// Starts the tray when one is not running, then draws the window in this
+/// process. A later click starts `--window` from the tray.
+pub fn open_or_forward(server_flag: Option<String>, import_config: Option<String>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        if instance::gui_is_running() {
+            instance::signal_show();
+            tracing::info!("PJDesk is already open. Asked that window to come forward.");
+            return Ok(());
+        }
+        if tray::tray_is_running() {
+            tray::signal_tray();
+            tracing::info!("Asked the PJDesk tray to open the window.");
+            return Ok(());
+        }
+        if !tray::spawn_tray() {
+            tracing::info!("Could not start the PJDesk tray. The window will still open.");
+        }
+    }
+    run(server_flag, import_config)
+}
+
+/// Draws the window once. Closing it returns, and this process exits.
+/// The tray is a different process and is not started here.
 pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result<()> {
     // A replacement waits for the frozen window to leave before taking the lock.
     crate::traywatch::wait_for_replaced_process();
@@ -90,38 +117,26 @@ pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result
             let _ = config.save();
         }
     }
-
-    let mut import_once = import_config;
-    loop {
-        let cfg = config.clone();
-        let import = import_once.take();
-        let built = eframe::run_native(
-            "PJDesk",
-            client_window_options(),
-            Box::new(move |cc| {
-                let mut app = App::new(cc, cfg);
-                app.take_installer_key(import);
-                Ok(Box::new(app))
-            }),
-        );
-        tray::set_window_open(false);
-        if let Err(e) = built {
-            discard_parked();
-            return Err(anyhow::anyhow!("{e}"));
-        }
-        if tray::process_should_exit() || !tray::icon_running() {
-            discard_parked();
-            tracing::info!("PJDesk left the tray.");
-            return Ok(());
-        }
-        tracing::info!("The window was closed. PJDesk stays in the tray. The window is destroyed, so it is not drawn.");
-        if !tray::wait_for_reopen("PJDesk") {
-            discard_parked();
-            tracing::info!("PJDesk left the tray.");
-            return Ok(());
-        }
-        tracing::info!("Opening the PJDesk window again. The sign-in from before it was closed is still here.");
+    if config.settings.start_with_windows {
+        let _ = settings::set_run_at_login(true);
     }
+
+    let cfg = config.clone();
+    let import = import_config;
+    let built = eframe::run_native(
+        "PJDesk",
+        client_window_options(),
+        Box::new(move |cc| {
+            let mut app = App::new(cc, cfg);
+            app.take_installer_key(import);
+            Ok(Box::new(app))
+        }),
+    );
+    if let Err(e) = built {
+        return Err(anyhow::anyhow!("{e}"));
+    }
+    tracing::info!("The PJDesk window process is exiting. The tray is a different process and keeps running.");
+    Ok(())
 }
 
 fn app_icon() -> egui::IconData {
@@ -387,7 +402,6 @@ pub struct App {
     session_error: Option<String>,
     tray: Option<tray::Tray>,
     logo: Option<egui::TextureHandle>,
-    really_quit: bool,
     told_tray: bool,
     /// Last time a minimized frame said the loop was alive.
     hidden_log: Option<Instant>,
@@ -457,71 +471,12 @@ enum InviteMsg {
     Failed(String),
 }
 
-/// What has to survive destroying the window. The host thread keeps
-/// running because this still holds it. Quit is what stops it.
-struct ParkedGui {
-    cfg: Config,
-    temp: Option<TempHold>,
-    engine: Engine,
-    published_code: String,
-    published_id: String,
-}
-
-fn parked_slot() -> &'static std::sync::Mutex<Option<ParkedGui>> {
-    static PARKED: std::sync::OnceLock<std::sync::Mutex<Option<ParkedGui>>> = std::sync::OnceLock::new();
-    PARKED.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-fn take_parked() -> Option<ParkedGui> {
-    parked_slot().lock().ok().and_then(|mut slot| slot.take())
-}
-
-/// Quit while the window is already closed. Ends a temporary sign-in and
-/// stops the host. The saved sign-in on disk stays.
-fn discard_parked() {
-    let Some(parked) = take_parked() else { return };
-    if parked.engine.service_running {
-        let path = crate::syspaths::service_dir().join("support.refresh");
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(path, b"1\n");
-    } else {
-        parked.engine.shared.request_support_refresh();
-    }
-    if parked.published_code.len() == 8 {
-        let _ = crate::network::revoke_support(&parked.published_code, &parked.published_id);
-    }
-    if let Some(temp) = parked.temp {
-        let (passwords, recents) = crate::temp_sign::marker_ids();
-        let mut disk = Config::load().unwrap_or_else(|_| temp.snapshot.clone());
-        crate::temp_sign::restore_after_temporary(&mut disk, &temp.snapshot, &passwords, &recents);
-        disk.ephemeral_network = false;
-        let _ = disk.save();
-        crate::network::copy_to_service(&disk);
-        crate::temp_sign::clear_marker();
-        crate::vault::clear_session_key();
-    }
-    parked.engine.shared.request_stop();
-}
-
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, cfg: Config) -> Self {
-        if let Some(parked) = take_parked() {
-            let mut app = Self::create(cc, parked.cfg, false);
-            app.engine = parked.engine;
-            app.temp = parked.temp;
-            app.published_code = parked.published_code;
-            app.published_id = parked.published_id;
-            app.net_email = app.cfg.network_email.clone().unwrap_or_default();
-            tracing::info!("The window is open again. The sign-in is the one from before it was closed.");
-            return app;
-        }
         Self::create(cc, cfg, false)
     }
 
     fn create(cc: &eframe::CreationContext<'_>, cfg: Config, preview: bool) -> Self {
-        tray::set_window_open(true);
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, &cfg.settings.theme);
         let engine = Engine::idle(&cfg);
@@ -635,13 +590,12 @@ impl App {
             dismissed_paste: None,
             toast: widgets::Toast::default(),
             session_error: None,
-            tray: tray::Tray::new(&cc.egui_ctx),
+            tray: None,
             logo: Some(cc.egui_ctx.load_texture(
                 "pjdesk-logo",
                 egui::ColorImage::from_rgba_unmultiplied([256, 256], include_bytes!("../../assets/icon_256.rgba")),
                 egui::TextureOptions::LINEAR,
             )),
-            really_quit: false,
             told_tray: false,
             hidden_log: None,
             show_support_password: false,
@@ -2863,12 +2817,10 @@ impl App {
         }
     }
 
-    /// Tray clicks and the window close button. Close destroys this window.
-    /// The process stays. The next click creates a new one. Minimizing would
-    /// leave a surface, and presenting into that surface stops this thread.
+    /// Tray clicks arrive from the other process. Close exits this process.
+    /// The tray is not in this process, so nothing here calls `run_native` again.
     fn on_tray(&mut self, ctx: &egui::Context) {
-        let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
-        let has_tray = self.tray.is_some();
+        let tray_actions = tray::gui_actions();
         for action in tray_actions {
             match action {
                 tray::Action::Show => {
@@ -2889,28 +2841,19 @@ impl App {
                 }
                 tray::Action::Revoke => self.revoke_support_access(),
                 tray::Action::Quit => {
-                    tracing::info!("Tray click: Quit PJDesk.");
-                    tray::request_quit();
-                    self.really_quit = true;
+                    tracing::info!("The tray asked this window to exit.");
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
         }
         let closing = ctx.input(|i| i.viewport().close_requested());
-        if closing && (self.really_quit || !has_tray) && self.temp.is_some() {
+        if closing && self.temp.is_some() {
             self.end_temporary_sign_in();
         }
-        // Do not cancel the close and do not minimize. The window is destroyed.
-        // The saved sign-in stays with this process until Quit.
-        if closing && pjdesk_proto::trayshow::destroy_window_on_close(has_tray, self.really_quit) {
-            // Clicks from here on create a new window. They do not restore
-            // this one, and they do not start the hung-window watchdog.
-            tray::set_window_open(false);
-            if !self.told_tray {
-                self.told_tray = true;
-                tracing::info!("The window was closed. PJDesk stays in the tray. The window is destroyed, so it is not drawn.");
-                self.toast.show("PJDesk is still running — click the tray icon, or right-click it to Quit");
-            }
+        if closing && !self.told_tray {
+            self.told_tray = true;
+            tracing::info!("The window was closed. This process is exiting. The tray is a different process and keeps running.");
+            self.toast.show("PJDesk stays in the tray.");
         }
         self.note_if_minimized(ctx);
     }
@@ -2945,20 +2888,8 @@ enum InviteKind {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
-        // X destroys the window and leaves the process. The sign-in, a
-        // temporary visit, and the host thread stay until Quit.
-        if self.tray.is_some() && !self.really_quit {
-            let engine = std::mem::replace(&mut self.engine, Engine::idle(&Config::default()));
-            let cfg = std::mem::take(&mut self.cfg);
-            let temp = self.temp.take();
-            let published_code = std::mem::take(&mut self.published_code);
-            let published_id = std::mem::take(&mut self.published_id);
-            if let Ok(mut slot) = parked_slot().lock() {
-                *slot = Some(ParkedGui { cfg, temp, engine, published_code, published_id });
-            }
-            tracing::info!("The window was closed. PJDesk stays in the tray. The window is destroyed, so it is not drawn. The saved sign-in stays.");
-            return;
-        }
+        // X exits this process. A temporary sign-in ends. The saved account
+        // in the config file stays. The tray is a different process.
         if self.engine.service_running {
             let path = crate::syspaths::service_dir().join("support.refresh");
             if let Some(dir) = path.parent() {
@@ -2973,8 +2904,6 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // A closed window is not in this loop. eframe has returned, and the
-        // process is waiting without a surface.
         self.ctx = ctx.clone();
         self.on_tray(ctx);
     }

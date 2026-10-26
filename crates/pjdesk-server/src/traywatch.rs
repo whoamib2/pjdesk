@@ -1,3 +1,6 @@
+//! Older in-process replacement. The tray now replaces a hung window
+//! process itself and must not call `arm`, because that ends the caller.
+//!
 //! If a tray open is not answered, replace this window process.
 //!
 //! The tray thread only records the open. It does not call `ShowWindow` and
@@ -14,7 +17,10 @@ static ACK_GEN: AtomicU64 = AtomicU64::new(0);
 static REPLACING: AtomicBool = AtomicBool::new(false);
 
 /// The tray thread records an open and returns. It does not wait.
+/// The tray process does not call this: `arm` ends the current process,
+/// which would kill the tray. A hung window is replaced from the tray.
 #[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code)]
 pub fn arm() {
     let gen = OPEN_GEN.fetch_add(1, Ordering::SeqCst).saturating_add(1);
     let spawned = std::thread::Builder::new().name("tray-watch".into()).spawn(move || {
@@ -113,6 +119,7 @@ fn spawn_replacement(pid: u32) -> bool {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         // No --tray. The new process shows the window. The service is not started here.
         let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--window");
         cmd.env("PJDESK_REPLACE_PID", pid.to_string());
         cmd.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP);
         if let Ok(child) = cmd.spawn() {
@@ -122,6 +129,7 @@ fn spawn_replacement(pid: u32) -> bool {
             return true;
         }
         let mut again = std::process::Command::new(&exe);
+        again.arg("--window");
         again.env("PJDESK_REPLACE_PID", pid.to_string());
         again.creation_flags(DETACHED_PROCESS);
         match again.spawn() {

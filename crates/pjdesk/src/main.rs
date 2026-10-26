@@ -68,6 +68,12 @@ struct Cli {
     /// from a renamed installer, `PJDesk-Setup-<version>--<blob>.exe`.
     #[arg(long = "config", global = true, value_name = "BLOB")]
     import_config: Option<String>,
+    /// Tray icon only. This process never opens a window.
+    #[arg(long, hide = true)]
+    tray: bool,
+    /// Window only. This process never owns the tray icon. The tray starts it.
+    #[arg(long, hide = true)]
+    window: bool,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -350,7 +356,7 @@ fn main() {
         // with no log line and no window after the password was accepted.
         init_viewer_com();
     }
-    let is_background = raw.iter().any(|a| a == "__session-host" || a == "update-handoff")
+    let is_background = raw.iter().any(|a| a == "__session-host" || a == "update-handoff" || a == "--tray" || a == "--window")
         || (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"));
 
     // With any other argument, attach a console so output and clap errors show.
@@ -361,9 +367,18 @@ fn main() {
 
     match &cli.command {
         None => {
-            // Default: the graphical app.
+            // Default: the window, plus a tray process that never draws it.
+            // `--tray` is the icon only. `--window` is the window only.
             init_gui_logging();
-            if let Err(e) = gui::run(cli.server.clone(), cli.import_config.clone()) {
+            let started = if cli.tray {
+                gui::run_tray();
+                Ok(())
+            } else if cli.window {
+                gui::run(cli.server.clone(), cli.import_config.clone())
+            } else {
+                gui::open_or_forward(cli.server.clone(), cli.import_config.clone())
+            };
+            if let Err(e) = started {
                 fatal(&format!("PJDesk could not start: {e:#}"));
             }
         }

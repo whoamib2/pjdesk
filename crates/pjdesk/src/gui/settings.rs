@@ -1306,7 +1306,7 @@ fn parse_ports(text: &str) -> Result<Vec<u16>, String> {
 
 /// Adds or removes a per-user "Run at sign-in" entry for this executable.
 #[cfg(windows)]
-fn set_run_at_login(enable: bool) -> anyhow::Result<()> {
+pub(crate) fn set_run_at_login(enable: bool) -> anyhow::Result<()> {
     use windows::core::{w, HSTRING, PCWSTR};
     use windows::Win32::System::Registry::{
         RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
@@ -1319,7 +1319,7 @@ fn set_run_at_login(enable: bool) -> anyhow::Result<()> {
         let name = w!("PJDesk");
         let result = if enable {
             let exe = std::env::current_exe()?;
-            let value = HSTRING::from(format!("\"{}\"", exe.display()));
+            let value = HSTRING::from(format!("\"{}\" --tray", exe.display()));
             let bytes: &[u8] =
                 std::slice::from_raw_parts(value.as_ptr() as *const u8, (value.len() + 1) * std::mem::size_of::<u16>());
             RegSetValueExW(key, name, Some(0), REG_SZ, Some(bytes)).ok()
@@ -1335,6 +1335,6 @@ fn set_run_at_login(enable: bool) -> anyhow::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn set_run_at_login(_enable: bool) -> anyhow::Result<()> {
+pub(crate) fn set_run_at_login(_enable: bool) -> anyhow::Result<()> {
     Ok(())
 }

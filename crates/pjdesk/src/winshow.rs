@@ -76,6 +76,19 @@ pub fn show_from_tray(title: &str) {
     }
 }
 
+/// Process id of the top-level window with this title, when one exists.
+pub fn window_process(title: &str) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        imp::window_process(title)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+        None
+    }
+}
+
 /// True when the window is gone from Windows' point of view.
 /// A minimized window that answers `WM_NULL` is not hung.
 pub fn window_is_hung(title: &str) -> bool {
@@ -172,8 +185,9 @@ mod imp {
             tracing::info!("Tray: could not find the {title} program.");
             return;
         };
-        tracing::info!("Tray: the {title} window is not running. Starting {}.", exe.display());
+        tracing::info!("Tray: the {title} window is not running. Starting {} --window.", exe.display());
         let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--window");
         cmd.creation_flags(DETACHED_PROCESS);
         match cmd.spawn() {
             Ok(child) => tracing::info!("Tray: started {} (pid {}).", exe.display(), child.id()),
@@ -261,6 +275,10 @@ mod imp {
             let _ = BringWindowToTop(hwnd);
             tracing::info!("Tray: restored the {title} window from this thread without waiting for it.");
         }
+    }
+
+    pub fn window_process(title: &str) -> Option<u32> {
+        find(title).map(|(_, pid)| pid)
     }
 
     pub fn window_is_hung(title: &str) -> bool {

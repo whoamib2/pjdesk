@@ -69,7 +69,7 @@ fn server_window_options() -> eframe::NativeOptions {
             Ok("glow") => eframe::Renderer::Glow,
             _ => eframe::Renderer::Wgpu,
         },
-        // Closing the window returns here. The process keeps the tray.
+        // Closing the window returns here. This process then exits.
         run_and_return: true,
         ..Default::default()
     };
@@ -82,46 +82,27 @@ fn server_window_options() -> eframe::NativeOptions {
     options
 }
 
-pub fn run(data_dir: PathBuf, port: u16, start_hidden: bool) -> Result<()> {
+/// Draws the window once. Closing it returns, and this process exits.
+/// The tray is a different process and is not started here.
+pub fn run(data_dir: PathBuf, port: u16) -> Result<()> {
     // A replacement waits for the frozen window to leave before taking the lock.
     crate::traywatch::wait_for_replaced_process();
-    // One icon per user. A second launch asks the first window to show itself.
-    if !crate::tray::acquire_or_signal() {
+    if !crate::tray::acquire_window() {
         return Ok(());
     }
     crate::tray::ensure_login_default();
-    // `--tray` does not open a window. A hidden window is what the present
-    // blocks on. The icon is up, and a click creates the window.
-    if start_hidden && crate::tray::start_without_window() {
-        tracing::info!("PJDesk Server started in the tray. The window is not opened until a click, so nothing is drawn.");
-        if !crate::tray::wait_for_reopen("PJDesk Server") {
-            tracing::info!("PJDesk Server left the tray.");
-            return Ok(());
-        }
-        tracing::info!("Opening the PJDesk Server window. The account is read from the service.");
+    tracing::info!("Opening the PJDesk Server window. This process draws it once. The account is read from the service.");
+    let dir = data_dir.clone();
+    let built = eframe::run_native(
+        "PJDesk Server",
+        server_window_options(),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, dir, port)))),
+    );
+    if let Err(e) = built {
+        return Err(anyhow::anyhow!("{e}"));
     }
-    loop {
-        let dir = data_dir.clone();
-        let built = eframe::run_native(
-            "PJDesk Server",
-            server_window_options(),
-            Box::new(move |cc| Ok(Box::new(App::new(cc, dir, port)))),
-        );
-        crate::tray::set_window_open(false);
-        if let Err(e) = built {
-            return Err(anyhow::anyhow!("{e}"));
-        }
-        if crate::tray::process_should_exit() || !crate::tray::icon_running() {
-            tracing::info!("PJDesk Server left the tray.");
-            return Ok(());
-        }
-        tracing::info!("The window was closed. PJDesk Server stays in the tray. The window is destroyed, so it is not drawn.");
-        if !crate::tray::wait_for_reopen("PJDesk Server") {
-            tracing::info!("PJDesk Server left the tray.");
-            return Ok(());
-        }
-        tracing::info!("Opening the PJDesk Server window again. The account is read from the service.");
-    }
+    tracing::info!("The PJDesk Server window process is exiting. The tray is a different process and keeps running. The service account is left as it is.");
+    Ok(())
 }
 
 struct App {
@@ -141,7 +122,6 @@ struct App {
 
     last_refresh: std::time::Instant,
     tray: Option<crate::tray::Tray>,
-    really_quit: bool,
     told_tray: bool,
     /// Last time a minimized frame said the loop was alive.
     hidden_log: Option<Instant>,
@@ -339,8 +319,7 @@ impl App {
             log_tail: String::new(),
             status: String::new(),
             last_refresh: std::time::Instant::now(),
-            tray: crate::tray::Tray::new(&cc.egui_ctx),
-            really_quit: false,
+            tray: None,
             told_tray: false,
             hidden_log: None,
             update_start: String::new(),
@@ -422,7 +401,6 @@ impl App {
             ak_rx: None,
             ak_busy: false,
         };
-        crate::tray::set_window_open(true);
         crate::public_addr::remember_port(&app.data_dir, port);
         if spawn_probe {
             // The first paint must not wait on the data folder, the control pipe,
@@ -660,12 +638,10 @@ impl App {
         }
     }
 
-    /// Tray clicks and the window close button. Close destroys this window.
-    /// The process stays, and the next click creates a new one. Minimizing
-    /// would leave a surface, and presenting into that surface stops this thread.
+    /// Tray clicks arrive from the other process. Close exits this process.
+    /// The tray is not in this process, so nothing here calls `run_native` again.
     fn on_tray(&mut self, ctx: &egui::Context) {
-        let tray_actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
-        let has_tray = self.tray.is_some();
+        let tray_actions = crate::tray::gui_actions();
         for action in tray_actions {
             match action {
                 crate::tray::Action::Show => {
@@ -673,16 +649,6 @@ impl App {
                     reveal_window(ctx, "Open");
                     self.gate.engage();
                 }
-                crate::tray::Action::ServiceStart => self.elevate_service(&["service", "start"]),
-                crate::tray::Action::ServiceStop => self.elevate_service(&["service", "stop"]),
-                crate::tray::Action::ServiceRestart => {
-                    if self.control_ready {
-                        self.ask_service(crate::control::Request { cmd: "restart".into(), ..Default::default() });
-                    } else {
-                        self.elevate_service(&["service", "restart"]);
-                    }
-                }
-                crate::tray::Action::OpenLog => crate::tray::open_log_folder(&self.data_dir),
                 crate::tray::Action::CheckUpdates => {
                     tracing::info!("Tray click: Check for updates. Showing the window.");
                     reveal_window(ctx, "Check for updates");
@@ -725,25 +691,16 @@ impl App {
                     }
                 }
                 crate::tray::Action::Quit => {
-                    tracing::info!("Tray click: Exit tray.");
-                    crate::tray::request_quit();
-                    self.really_quit = true;
+                    tracing::info!("The tray asked this window to exit. The service account is left as it is.");
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
         }
         let closing = ctx.input(|i| i.viewport().close_requested());
-        // Do not cancel the close and do not minimize. The window is destroyed.
-        // The process, the tray, and the service account stay.
-        if closing && pjdesk_proto::trayshow::destroy_window_on_close(has_tray, self.really_quit) {
-            // Clicks from here on create a new window. They do not restore
-            // this one, and they do not start the hung-window watchdog.
-            crate::tray::set_window_open(false);
-            if !self.told_tray {
-                self.told_tray = true;
-                tracing::info!("The window was closed. PJDesk Server stays in the tray. The window is destroyed, so it is not drawn.");
-                self.status = "PJDesk Server is still running in the tray — right-click it to Quit.".into();
-            }
+        if closing && !self.told_tray {
+            self.told_tray = true;
+            tracing::info!("The window was closed. This process is exiting. The tray is a different process and keeps running.");
+            self.status = "PJDesk Server stays in the tray.".into();
         }
         self.note_if_minimized(ctx);
     }
@@ -773,8 +730,6 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Tray clicks are handled here. A closed window is not in this loop:
-        // eframe has returned, and the process is waiting without a surface.
         self.on_tray(ctx);
         if self.want_session() {
             self.request_session(ctx);

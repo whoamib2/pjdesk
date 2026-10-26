@@ -98,6 +98,46 @@ pub fn parked_alive_due(elapsed_ms: u64) -> bool {
     elapsed_ms >= PARKED_ALIVE_MS
 }
 
+/// One tray open per second. A double-click is two opens about 90 ms apart,
+/// and the second one must not start another window.
+pub const OPEN_DEBOUNCE_MS: u64 = 1_000;
+
+/// `last_ms` is `None` before the first open.
+pub fn open_allowed(last_ms: Option<u64>, now_ms: u64) -> bool {
+    match last_ms {
+        None => true,
+        Some(last) => now_ms.saturating_sub(last) >= OPEN_DEBOUNCE_MS,
+    }
+}
+
+/// What the tray process does with a click. The tray never draws the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayOpen {
+    /// A click already opened a window in the last second.
+    Ignore,
+    /// A GUI process is up. Bring that window forward.
+    Signal,
+    /// The GUI process is hung. End it and start another.
+    Replace,
+    /// No GUI process. Start `exe --window`.
+    Spawn,
+}
+
+/// A second click inside one second is ignored. A hung window is replaced.
+/// Otherwise an existing GUI is signaled, or a new one is started.
+pub fn tray_open(now_ms: u64, last_open_ms: Option<u64>, gui_running: bool, gui_hung: bool) -> TrayOpen {
+    if !open_allowed(last_open_ms, now_ms) {
+        return TrayOpen::Ignore;
+    }
+    if gui_hung {
+        TrayOpen::Replace
+    } else if gui_running {
+        TrayOpen::Signal
+    } else {
+        TrayOpen::Spawn
+    }
+}
+
 /// No live window means the tray starts the program. A destroyed window
 /// (a handle that is no longer a window) is not live.
 pub fn should_launch(window_alive: bool) -> bool {
@@ -209,6 +249,20 @@ mod tests {
         assert!(parked_alive_due(PARKED_ALIVE_MS));
         assert!(should_launch(false));
         assert!(!should_launch(true));
+    }
+
+    #[test]
+    fn a_second_open_inside_one_second_is_ignored() {
+        assert!(open_allowed(None, 0));
+        assert!(!open_allowed(Some(1_000), 1_090));
+        assert!(!open_allowed(Some(1_000), 1_999));
+        assert!(open_allowed(Some(1_000), 2_000));
+        assert_eq!(tray_open(1_090, Some(1_000), false, false), TrayOpen::Ignore);
+        assert_eq!(tray_open(2_000, Some(1_000), false, false), TrayOpen::Spawn);
+        assert_eq!(tray_open(2_000, Some(1_000), true, false), TrayOpen::Signal);
+        assert_eq!(tray_open(2_000, Some(1_000), true, true), TrayOpen::Replace);
+        assert_eq!(tray_open(2_000, Some(1_000), false, true), TrayOpen::Replace);
+        assert_eq!(OPEN_DEBOUNCE_MS, 1_000);
     }
 
     #[test]

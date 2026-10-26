@@ -59,9 +59,12 @@ use clap::{Args, Parser, Subcommand};
 struct Cli {
     #[command(flatten)]
     opts: ServerOpts,
-    /// Tray icon only, without opening the window. Windows starts this at sign-in.
+    /// Tray icon only. This process never opens a window. Windows starts this at sign-in.
     #[arg(long, hide = true)]
     tray: bool,
+    /// Window only. This process never owns the tray icon. The tray starts it.
+    #[arg(long, hide = true)]
+    window: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -248,11 +251,38 @@ enum ServiceCommand {
     Run,
 }
 
+/// The tray process never draws the window. A click starts `--window`
+/// or brings the existing window forward. A double-click with nothing
+/// running starts the tray and draws the window in this process, once.
+#[cfg(windows)]
+fn launch_windows(data_dir: std::path::PathBuf, port: u16, tray: bool, window: bool) -> Result<()> {
+    if tray {
+        return tray::run_tray(data_dir, port);
+    }
+    if window || tray::gui_is_running() {
+        if !window && tray::gui_is_running() {
+            tray::signal_gui();
+            tracing::info!("PJDesk Server is already open. Asked that window to come forward.");
+            return Ok(());
+        }
+        return gui::run(data_dir, port);
+    }
+    if tray::tray_is_running() {
+        tray::signal_tray();
+        tracing::info!("Asked the PJDesk Server tray to open the window.");
+        return Ok(());
+    }
+    if !tray::spawn_tray(port, &data_dir) {
+        tracing::info!("Could not start the PJDesk Server tray. The window will still open.");
+    }
+    gui::run(data_dir, port)
+}
+
 fn main() -> Result<()> {
     // The SCM-launched `service run` has no console and sets up its own logging.
     let raw: Vec<String> = std::env::args().collect();
     let is_background = (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"))
-        || raw.iter().any(|a| a == "--tray" || a == "update-handoff");
+        || raw.iter().any(|a| a == "--tray" || a == "--window" || a == "update-handoff");
     if raw.len() > 1 && !is_background {
         ensure_console();
     }
@@ -261,13 +291,13 @@ fn main() -> Result<()> {
 
     match cli.command {
         None => {
-            // Default: the management window on Windows; the console server
-            // elsewhere (the GUI is Windows-only). `--tray` starts the same
-            // window hidden, so the icon is there after sign-in.
+            // Default: the management window on Windows, plus a tray process
+            // that never draws it. `--tray` is the icon only. `--window` is
+            // the window only. The console server is the non-Windows default.
             #[cfg(windows)]
             {
                 init_window_logging();
-                if let Err(e) = gui::run(data_dir, cli.opts.port, cli.tray) {
+                if let Err(e) = launch_windows(data_dir, cli.opts.port, cli.tray, cli.window) {
                     fatal(&format!("PJDesk Server could not start: {e:#}"));
                 }
                 Ok(())

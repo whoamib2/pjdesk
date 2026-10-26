@@ -41,6 +41,42 @@ pub fn show_requested() -> bool {
     }
 }
 
+/// True when a window process already holds the single-instance lock.
+pub fn gui_is_running() -> bool {
+    #[cfg(windows)]
+    {
+        imp::gui_is_running()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Asks the running window to come forward. Does not take the lock.
+pub fn signal_show() {
+    #[cfg(windows)]
+    imp::signal_show();
+}
+
+/// Asks the running window to exit. The tray calls this on Quit.
+pub fn signal_quit() {
+    #[cfg(windows)]
+    imp::signal_quit();
+}
+
+/// True when the tray asked this window process to exit.
+pub fn quit_requested() -> bool {
+    #[cfg(windows)]
+    {
+        imp::quit_requested()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::sync::Mutex;
@@ -50,16 +86,19 @@ mod imp {
         CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
     };
     use windows::Win32::System::Threading::{
-        CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
+        CreateEventW, CreateMutexW, OpenEventW, OpenMutexW, ReleaseMutex, SetEvent, WaitForSingleObject,
+        EVENT_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE,
     };
     use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
     const MUTEX_NAME: windows::core::PCWSTR = w!("Local\\PJDeskClientWindow");
     const EVENT_NAME: windows::core::PCWSTR = w!("Local\\PJDeskClientWindowShow");
+    const QUIT_NAME: windows::core::PCWSTR = w!("Local\\PJDeskClientWindowQuit");
 
     struct Held {
         _mutex: usize,
         event: usize,
+        quit: usize,
     }
 
     fn raw(handle: HANDLE) -> usize {
@@ -80,7 +119,10 @@ mod imp {
             };
             if GetLastError() == ERROR_ALREADY_EXISTS && !abandoned_or_free(mutex) {
                 let _ = CloseHandle(mutex);
-                // The new process is in front. Let the open window take the foreground.
+                // The new process is in front. Restore the open window here,
+                // then let it take the foreground. The window process may not
+                // be painting, so the event alone would wait for a frame.
+                crate::winshow::show_from_tray("PJDesk");
                 let _ = AllowSetForegroundWindow(0xFFFF_FFFF);
                 for _ in 0..20 {
                     if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, EVENT_NAME) {
@@ -97,7 +139,8 @@ mod imp {
                 Ok(event) => event,
                 Err(_) => return true,
             };
-            *HELD.lock().unwrap() = Some(Held { _mutex: raw(mutex), event: raw(event) });
+            let quit = CreateEventW(None, false, false, QUIT_NAME).map(raw).unwrap_or(0);
+            *HELD.lock().unwrap() = Some(Held { _mutex: raw(mutex), event: raw(event), quit });
             true
         }
     }
@@ -125,5 +168,53 @@ mod imp {
         let guard = HELD.lock().unwrap();
         let Some(held) = guard.as_ref() else { return false };
         unsafe { WaitForSingleObject(handle(held.event), 0) == WAIT_OBJECT_0 }
+    }
+
+    pub fn quit_requested() -> bool {
+        let guard = HELD.lock().unwrap();
+        let Some(held) = guard.as_ref() else { return false };
+        if held.quit == 0 {
+            return false;
+        }
+        unsafe { WaitForSingleObject(handle(held.quit), 0) == WAIT_OBJECT_0 }
+    }
+
+    pub fn gui_is_running() -> bool {
+        mutex_held(MUTEX_NAME)
+    }
+
+    pub fn signal_show() {
+        crate::winshow::show_from_tray("PJDesk");
+        let _ = signal_event(EVENT_NAME);
+    }
+
+    pub fn signal_quit() {
+        let _ = signal_event(QUIT_NAME);
+    }
+
+    fn mutex_held(name: windows::core::PCWSTR) -> bool {
+        unsafe {
+            let Ok(mutex) = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, name) else {
+                return false;
+            };
+            let wait = WaitForSingleObject(mutex, 0);
+            let held = wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED;
+            if !held {
+                let _ = ReleaseMutex(mutex);
+            }
+            let _ = CloseHandle(mutex);
+            held
+        }
+    }
+
+    fn signal_event(name: windows::core::PCWSTR) -> bool {
+        unsafe {
+            let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, name) else {
+                return false;
+            };
+            let ok = SetEvent(event).is_ok();
+            let _ = CloseHandle(event);
+            ok
+        }
     }
 }
