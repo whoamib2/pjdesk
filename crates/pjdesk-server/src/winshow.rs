@@ -67,6 +67,37 @@ pub fn reveal_on_taskbar(title: &str) {
     }
 }
 
+/// The tray thread restores the top-level window and returns.
+#[cfg_attr(not(windows), allow(dead_code))]
+/// `ShowWindowAsync` posts the restore. It does not call the window
+/// procedure, so a minimized window cannot stall the tray thread.
+pub fn show_from_tray(title: &str) {
+    note_user_open();
+    #[cfg(windows)]
+    {
+        reveal_on_taskbar(title);
+        imp::show_async(title);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+    }
+}
+
+/// True when the window is gone from Windows' point of view.
+/// A minimized window that answers `WM_NULL` is not hung.
+pub fn window_is_hung(title: &str) -> bool {
+    #[cfg(windows)]
+    {
+        imp::window_is_hung(title)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+        false
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::os::windows::process::CommandExt;
@@ -74,17 +105,17 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use windows::core::BOOL;
-    use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
     use windows::Win32::UI::Shell::{ITaskbarList, TaskbarList};
     use windows::Win32::UI::WindowsAndMessaging::{
         AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
-        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MoveWindow, SetForegroundWindow,
-        SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOP, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWMINNOACTIVE, WS_EX_APPWINDOW,
-        WS_EX_TOOLWINDOW,
+        GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, MoveWindow,
+        SendMessageTimeoutW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, ShowWindowAsync, GWL_EXSTYLE,
+        HWND_TOP, SMTO_ABORTIFHUNG, SMTO_BLOCK, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SWP_SHOWWINDOW, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWMINNOACTIVE, WM_NULL, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
 
     use super::note_user_open;
@@ -225,6 +256,59 @@ mod imp {
                 let _ = list.DeleteTab(hwnd);
             }
             IsIconic(hwnd).as_bool()
+        }
+    }
+
+    pub fn show_async(title: &str) {
+        let Some((hwnd, _)) = find(title) else {
+            tracing::info!("Tray: no {title} window handle yet. The click did not wait.");
+            return;
+        };
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                tracing::info!("Tray: the {title} window handle is stale. The click did not wait.");
+                return;
+            }
+            let _ = AllowSetForegroundWindow(0xFFFF_FFFF);
+            // Posts SW_RESTORE to the window thread and returns. A parked
+            // window cannot stall this thread the way ShowWindow would.
+            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+            let _ = ShowWindowAsync(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = BringWindowToTop(hwnd);
+            tracing::info!("Tray: restored the {title} window from this thread without waiting for it.");
+        }
+    }
+
+    pub fn window_is_hung(title: &str) -> bool {
+        let Some((hwnd, _)) = find(title) else {
+            tracing::info!("Tray: no {title} window handle. A missing window is not treated as hung.");
+            return false;
+        };
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                tracing::info!("Tray: the {title} window handle is stale. That is not a hung window.");
+                return false;
+            }
+            if IsHungAppWindow(hwnd).as_bool() {
+                tracing::info!("Tray: {title} is hung (IsHungAppWindow).");
+                return true;
+            }
+            let mut result = 0usize;
+            let answered = SendMessageTimeoutW(
+                hwnd,
+                WM_NULL,
+                WPARAM(0),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                500,
+                Some(&mut result),
+            );
+            if answered.0 == 0 {
+                tracing::info!("Tray: {title} did not answer WM_NULL within 500 ms.");
+                return true;
+            }
+            false
         }
     }
 

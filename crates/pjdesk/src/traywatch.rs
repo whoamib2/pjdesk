@@ -23,7 +23,15 @@ pub fn arm() {
         std::thread::sleep(Duration::from_millis(pjdesk_proto::traywatch::ANSWER_WAIT_MS));
         let open = OPEN_GEN.load(Ordering::SeqCst);
         let ack = ACK_GEN.load(Ordering::SeqCst);
-        if !pjdesk_proto::traywatch::should_replace(gen, open, ack) {
+        if !pjdesk_proto::traywatch::should_replace_hung(gen, open, ack, crate::winshow::window_is_hung("PJDesk")) {
+            if pjdesk_proto::traywatch::should_replace(gen, open, ack) {
+                let line = format!(
+                    "The PJDesk window did not ack a tray open within 2 seconds. It is still answering Windows, so process {} stays. A minimized window is not replaced.",
+                    std::process::id()
+                );
+                tracing::info!("{line}");
+                append_log(&line);
+            }
             return;
         }
         if REPLACING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {

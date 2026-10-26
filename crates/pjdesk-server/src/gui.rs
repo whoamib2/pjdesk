@@ -49,7 +49,8 @@ fn reveal_window(ctx: &egui::Context, reason: &str) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-    // ShowWindow runs on this thread. The tray thread does not call it.
+    // The tray thread already posted the restore. This thread focuses the
+    // viewport and draws the PIN lock. It does not clear the service account.
     crate::winshow::activate(reason, "PJDesk Server", crate::tray::holds_window());
 }
 
@@ -183,6 +184,15 @@ struct App {
     cloud_email: String,
     cloud_token: String,
     cloud_api: String,
+    /// Email the service reported over the control pipe. Empty when it has no account.
+    /// This window does not read that from a file it cannot open, and startup does not clear it.
+    service_email: String,
+    /// The service has answered `session` at least once.
+    service_session_known: bool,
+    /// The last `session` ask got no answer. The saved account is left as it is.
+    service_session_failed: bool,
+    session_rx: Option<std::sync::mpsc::Receiver<Option<crate::control::Response>>>,
+    session_at: Option<Instant>,
     own_bucket: bool,
     window_log: String,
     /// Device id waiting for Remove to be confirmed.
@@ -360,6 +370,11 @@ impl App {
             cloud_email: String::new(),
             cloud_token: String::new(),
             cloud_api: crate::cloud::default_api(),
+            service_email: String::new(),
+            service_session_known: false,
+            service_session_failed: false,
+            session_rx: None,
+            session_at: None,
             own_bucket: false,
             window_log: String::new(),
             confirm_remove: None,
@@ -594,6 +609,12 @@ impl App {
     fn poll_notes(&mut self) {
         let mut refresh = false;
         while let Ok(msg) = self.bg_rx.try_recv() {
+            if msg.contains("Signed out") {
+                self.service_email.clear();
+                self.service_session_known = true;
+                self.service_session_failed = false;
+                self.session_at = Some(Instant::now());
+            }
             self.status = msg;
             refresh = true;
         }
@@ -728,6 +749,10 @@ impl eframe::App for App {
         // eframe does not call `ui` while the window is minimized. A tray
         // click has to be handled here, or the window stays down.
         self.on_tray(ctx);
+        if self.want_session() {
+            self.request_session(ctx);
+        }
+        self.poll_session();
         // Windows does not redraw a minimized window. Keep waking so a tray
         // click is still noticed and the window thread is not left idle.
         let parked = self.in_tray
@@ -747,6 +772,7 @@ impl eframe::App for App {
             self.request_service_probe();
         }
         self.poll_disk();
+        self.poll_session();
         self.poll_notes();
         self.poll_access_keys();
         self.poll_require();
@@ -1561,16 +1587,87 @@ impl App {
     }
 
     /// Email of the PJDesk account this server is signed in as.
+    /// A locked data folder is not "signed out". The service's `session`
+    /// answer is the account. Until that answer arrives, the status pipe's
+    /// email is kept so the form does not flash.
     fn signed_in_email(&self) -> String {
-        if let Some(cloud) = &self.cloud {
+        let local = if let Some(cloud) = &self.cloud {
             if !cloud.account.is_empty() {
-                return cloud.account.clone();
+                cloud.account.clone()
+            } else if self.access == Access::Readable {
+                self.cloud_email.clone()
+            } else {
+                String::new()
+            }
+        } else if self.access == Access::Readable {
+            self.cloud_email.clone()
+        } else {
+            String::new()
+        };
+        let live = self.live.as_ref().map(|s| s.account.clone()).unwrap_or_default();
+        crate::control::shown_account(
+            self.access == Access::Readable,
+            &local,
+            self.service_session_known,
+            &self.service_email,
+            &live,
+        )
+    }
+
+    fn want_session(&self) -> bool {
+        if !self.check_release || self.preview_locked || self.access == Access::Readable || self.session_rx.is_some() {
+            return false;
+        }
+        let wait = if self.service_session_known { Duration::from_secs(5) } else { Duration::from_secs(2) };
+        self.session_at.is_none_or(|at| at.elapsed() >= wait)
+    }
+
+    /// Asks the service who is signed in. Does not write `cloud-sync.json`.
+    fn request_session(&mut self, ctx: &egui::Context) {
+        if self.session_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.session_rx = Some(rx);
+        self.session_at = Some(Instant::now());
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("pjdesk-server-session".into())
+            .spawn(move || {
+                let report = crate::control::call(&crate::control::Request { cmd: "session".into(), ..Default::default() });
+                let _ = tx.send(report);
+                ctx.request_repaint();
+            })
+            .ok();
+    }
+
+    fn poll_session(&mut self) {
+        let Some(rx) = &self.session_rx else { return };
+        let report = match rx.try_recv() {
+            Ok(report) => report,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.session_rx = None;
+        self.session_at = Some(Instant::now());
+        match report {
+            Some(response) if response.ok => {
+                let email = response.email.trim().to_string();
+                if email != self.service_email || !self.service_session_known {
+                    tracing::info!(
+                        "session: the service account is {}",
+                        if email.is_empty() { "signed out".to_string() } else { email.clone() }
+                    );
+                }
+                self.service_email = email;
+                self.service_session_known = true;
+                self.service_session_failed = false;
+            }
+            _ => {
+                self.service_session_failed = true;
+                tracing::info!("session: the PJDesk service did not answer. The saved sign-in was left on the service.");
             }
         }
-        if self.access == Access::Readable && !self.cloud_email.is_empty() {
-            return self.cloud_email.clone();
-        }
-        self.live.as_ref().map(|s| s.account.clone()).filter(|s| !s.is_empty()).unwrap_or_default()
     }
 
     /// True when Cloud Sync is the advanced "your own bucket" path.
@@ -1628,11 +1725,14 @@ impl App {
         let choosing_bucket = self.cloud_form.own_bucket;
         card(ui, |ui| {
             heading(ui, "PJDESK ACCOUNT");
-            if !readable && email.is_empty() && self.waiting_for_service() {
+            if !readable && !crate::control::show_sign_in_form(false, &email, self.service_session_known) && email.is_empty() {
                 ui.horizontal(|ui| {
                     ui_widgets::spinner(ui, p(ui).accent);
                     ui.label("Reading the saved sign-in from the service…");
                 });
+                if self.service_session_failed {
+                    ui.label("The PJDesk service did not answer. The saved sign-in was left on the service. Trying again.");
+                }
                 return;
             }
             if !readable && !self.control_ready && !email.is_empty() {
@@ -2403,6 +2503,13 @@ impl App {
         self.cloud_job = None;
         match result {
             Ok(JobDone::Message(msg)) => {
+                if let Some(email) = crate::control::email_from_sign_in_message(&msg) {
+                    self.service_email = email;
+                    self.service_session_known = true;
+                    self.service_session_failed = false;
+                    self.session_at = Some(Instant::now());
+                    tracing::info!("sign-in: the window is showing {}", self.service_email);
+                }
                 self.status = msg;
                 let f = &mut self.cloud_form;
                 f.sign_error.clear();

@@ -31,17 +31,17 @@ mod imp {
     static ICON_CLICKED: AtomicBool = AtomicBool::new(false);
     static TOOLTIP: Mutex<Option<String>> = Mutex::new(None);
 
-    /// Records an open and returns. `AllowSetForegroundWindow` does not
-    /// send a message to the window, so the click thread is not waiting
-    /// on the window thread.
+    /// Restores the window from this thread and returns. `ShowWindowAsync`
+    /// does not call the window procedure, so the click thread is not waiting.
     fn ask_open(reason: &str, ctx: &egui::Context) {
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(0xFFFF_FFFF);
         }
         ICON_CLICKED.store(true, Ordering::SeqCst);
+        crate::winshow::show_from_tray("PJDesk");
         crate::traywatch::arm();
         ctx.request_repaint();
-        tracing::info!("Tray: {reason}. Asked the PJDesk window to come forward. This click does not call ShowWindow.");
+        tracing::info!("Tray: {reason}. Asked the PJDesk window to come forward. The tray thread restored it and did not wait.");
     }
 
     fn push_menu(action: Action) {
@@ -190,6 +190,12 @@ mod imp {
             let tip = TOOLTIP.try_lock().ok().and_then(|mut slot| slot.take());
             if let Some(tip) = tip {
                 let _ = icon.set_tooltip(Some(tip));
+            }
+            // A second launch sets this event. Restore here so a parked window
+            // does not have to be awake before the window appears.
+            if super::super::instance::show_requested() {
+                crate::winshow::show_from_tray("PJDesk");
+                ICON_CLICKED.store(true, Ordering::SeqCst);
             }
             let wait = unsafe { MsgWaitForMultipleObjects(None, false, 200, QS_ALLINPUT) };
             if wait != WAIT_OBJECT_0 {

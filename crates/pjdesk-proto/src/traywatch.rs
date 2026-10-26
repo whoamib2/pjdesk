@@ -17,6 +17,13 @@ pub fn should_replace(click_gen: u64, open_gen: u64, ack_gen: u64) -> bool {
     click_gen != 0 && click_gen == open_gen && unanswered(open_gen, ack_gen)
 }
 
+/// A minimized window that still answers Windows is left alone.
+/// The process is replaced only when that newest open was not acked and
+/// the window is hung (`IsHungAppWindow` or `WM_NULL` timed out).
+pub fn should_replace_hung(click_gen: u64, open_gen: u64, ack_gen: u64, hung: bool) -> bool {
+    should_replace(click_gen, open_gen, ack_gen) && hung
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,6 +40,15 @@ mod tests {
         assert!(should_replace(1, 1, 0));
         assert!(!should_replace(1, 2, 0));
         assert_eq!(ANSWER_WAIT_MS, 2_000);
+    }
+
+    #[test]
+    fn a_minimized_window_that_still_answers_is_not_replaced() {
+        assert!(should_replace(1, 1, 0));
+        assert!(!should_replace_hung(1, 1, 0, false));
+        assert!(should_replace_hung(1, 1, 0, true));
+        assert!(!should_replace_hung(1, 1, 1, true));
+        assert!(!should_replace_hung(1, 2, 0, true));
     }
 
     #[test]

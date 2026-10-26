@@ -92,6 +92,10 @@ pub struct Response {
     /// It is not written to the audit log.
     #[serde(default)]
     pub secret: String,
+    /// Account email from `session` or a sign-in that kept the saved session.
+    /// The token stays in the service. This field is not a secret.
+    #[serde(default)]
+    pub email: String,
 }
 
 fn ok(message: impl Into<String>) -> Response {
@@ -195,6 +199,7 @@ pub fn execute(data_dir: &Path, req: &Request, actor: &str) -> Response {
     let cmd = req.cmd.trim();
     let response = match cmd {
         "ping" => ok("ready"),
+        "session" => session_status(data_dir),
         "sign_in" => sign_in(data_dir, req),
         "sign_in_choose" => sign_in_choose(data_dir, req),
         "sign_in_cancel" => sign_in_cancel(req),
@@ -232,16 +237,46 @@ pub fn execute(data_dir: &Path, req: &Request, actor: &str) -> Response {
         _ => fail("That command was not understood."),
     };
     // A successful ping is the window's liveness check, about every few seconds.
+    // Session is the same kind of read: the window asks it on a timer.
     // Denied pings and every other command are written to the audit log.
-    if cmd != "ping" || !response.ok {
+    let quiet = cmd == "ping" || cmd == "session";
+    if !quiet || !response.ok {
         let outcome = if response.ok { "ok" } else { "denied" };
         audit(data_dir, actor, &format!("{cmd} {outcome}: {}", response.message));
     }
     response
 }
 
+fn same_saved_account(data_dir: &Path, email: &str) -> Option<String> {
+    let saved = crate::cloud::saved_account_email(data_dir);
+    if !saved.is_empty() && saved.eq_ignore_ascii_case(email.trim()) {
+        Some(saved)
+    } else {
+        None
+    }
+}
+
+fn session_status(data_dir: &Path) -> Response {
+    let email = crate::cloud::saved_account_email(data_dir);
+    let mut response = if email.is_empty() {
+        ok("Not signed in.")
+    } else {
+        ok(format!("Signed in as {email}."))
+    };
+    response.email = email;
+    response
+}
+
 fn sign_in(data_dir: &Path, req: &Request) -> Response {
     let email = req.email.trim().to_string();
+    // A fresh window can ask again while the service already holds this account.
+    // Keep that session. A new login would replace the token and can fail.
+    if let Some(saved) = same_saved_account(data_dir, &email) {
+        tracing::info!("sign-in: {email}: already signed in; the saved session stays");
+        let mut response = ok(format!("Signed in as {saved}. Syncing as before."));
+        response.email = saved;
+        return response;
+    }
     let password = req.password.clone();
     if email.is_empty() || password.is_empty() {
         tracing::info!("sign-in: not sent (email or password empty)");
@@ -314,6 +349,7 @@ fn finish_sign_in(data_dir: &Path, cfg: CloudConfig, choice: Option<crate::cloud
                 written_at,
                 readable,
                 secret: String::new(),
+                email: String::new(),
             }
         }
         Ok(done) => {
@@ -527,6 +563,39 @@ pub fn interactive_sign_in(cmd: &str) -> bool {
     matches!(cmd.trim(), "sign_in" | "sign_in_choose" | "sign_in_cancel")
 }
 
+/// The window may ask whether the service is signed in. The answer is the
+/// email only. The token stays in `cloud-sync.json` on the service.
+pub fn interactive_session(cmd: &str) -> bool {
+    cmd.trim() == "session"
+}
+
+/// Email in a "Signed in as …" line. The rest of the sentence is not part of it.
+pub fn email_from_sign_in_message(message: &str) -> Option<String> {
+    let rest = message.trim().strip_prefix("Signed in as ")?;
+    let email = rest.split_whitespace().next()?.trim_end_matches('.');
+    if email.contains('@') { Some(email.to_string()) } else { None }
+}
+
+/// What the account card shows. A locked folder does not mean signed out:
+/// the service's answer is the account, and until that answer arrives the
+/// last status-pipe email is kept so the form does not flash.
+pub fn shown_account(readable: bool, local: &str, service_known: bool, service_email: &str, live: &str) -> String {
+    if readable {
+        return local.to_string();
+    }
+    if service_known {
+        return service_email.to_string();
+    }
+    live.to_string()
+}
+
+/// The sign-in form is for a service that answered and has no account, or a
+/// window that can read the folder and found none. It stays hidden while the
+/// service has not answered yet.
+pub fn show_sign_in_form(readable: bool, email: &str, service_known: bool) -> bool {
+    email.is_empty() && (readable || service_known)
+}
+
 /// Applies a request after the pipe has checked the caller.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn execute_authorized(data_dir: &Path, req: &Request, windows_ok: bool, actor: &str) -> Response {
@@ -536,7 +605,7 @@ pub fn execute_authorized(data_dir: &Path, req: &Request, windows_ok: bool, acto
         return fail("Not allowed.");
     }
     let account_ok = !windows_ok && account_token_ok(data_dir, &req.account_token);
-    if !windows_ok && !account_ok && !interactive_sign_in(cmd) {
+    if !windows_ok && !account_ok && !interactive_sign_in(cmd) && !interactive_session(cmd) {
         audit(data_dir, actor, &format!("{cmd} denied: caller is not an administrator"));
         return fail(
             "This Windows user cannot manage the server. An administrator can, and so can the pjdesk.com account this server is signed in to.",
@@ -1016,7 +1085,59 @@ mod tests {
         assert!(interactive_sign_in("sign_in"));
         assert!(interactive_sign_in("sign_in_choose"));
         assert!(!interactive_sign_in("set_require"));
+        assert!(interactive_session("session"));
+        assert!(!interactive_session("sign_in"));
+        assert_eq!(email_from_sign_in_message("Signed in as ben@spader.us. Syncing as before."), Some("ben@spader.us".into()));
+        assert!(email_from_sign_in_message("Enter your email and password.").is_none());
+        assert_eq!(shown_account(false, "", true, "ben@spader.us", ""), "ben@spader.us");
+        assert_eq!(shown_account(false, "", false, "", "ben@spader.us"), "ben@spader.us");
+        assert_eq!(shown_account(false, "", true, "", "ben@spader.us"), "");
+        assert!(!show_sign_in_form(false, "", false));
+        assert!(show_sign_in_form(false, "", true));
+        assert!(!show_sign_in_form(false, "ben@spader.us", true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_window_reads_the_service_account_and_a_second_sign_in_keeps_it() {
+        let session_dir = dir("session");
+        let cfg = r#"{"mode":"account","email":"ben@spader.us","token":"tok_abcdefghijklmnopqrstuvwxyz","key":"abcd"}"#;
+        std::fs::write(session_dir.join("cloud-sync.json"), cfg).unwrap();
+        let response = execute(&session_dir, &Request { cmd: "session".into(), ..Request::default() }, "window");
+        assert!(response.ok, "{}", response.message);
+        assert_eq!(response.email, "ben@spader.us");
+        assert_eq!(std::fs::read_to_string(session_dir.join("cloud-sync.json")).unwrap(), cfg);
+        let again = execute(
+            &session_dir,
+            &Request {
+                cmd: "sign_in".into(),
+                email: "Ben@Spader.us".into(),
+                password: "not-used".into(),
+                ..Request::default()
+            },
+            "window",
+        );
+        assert!(again.ok, "{}", again.message);
+        assert!(again.message.contains("Syncing as before"), "{}", again.message);
+        assert_eq!(again.email, "ben@spader.us");
+        let kept = std::fs::read_to_string(session_dir.join("cloud-sync.json")).unwrap();
+        assert!(kept.contains("tok_abcdefghijklmnopqrstuvwxyz"), "{kept}");
+        assert!(session_dir.join("cloud-sync.json").exists());
+        let open = execute_authorized(
+            &session_dir,
+            &Request { cmd: "session".into(), ..Request::default() },
+            false,
+            "S-1-5-32-545",
+        );
+        assert!(open.ok, "{}", open.message);
+        assert_eq!(open.email, "ben@spader.us");
+        let empty = dir("session-empty");
+        let none = execute(&empty, &Request { cmd: "session".into(), ..Request::default() }, "window");
+        assert!(none.ok, "{}", none.message);
+        assert!(none.email.is_empty());
+        assert!(!empty.join("cloud-sync.json").exists());
+        let _ = std::fs::remove_dir_all(&session_dir);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     #[test]

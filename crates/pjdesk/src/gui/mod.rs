@@ -2507,7 +2507,8 @@ fn reveal_window(ctx: &egui::Context, reason: &str) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-    // ShowWindow runs on this thread. The tray thread does not call it.
+    // The tray thread already posted the restore. This thread focuses the
+    // viewport and draws the PIN lock. Opening does not sign this computer out.
     crate::winshow::activate(reason, "PJDesk", instance::holds_window());
 }
 
