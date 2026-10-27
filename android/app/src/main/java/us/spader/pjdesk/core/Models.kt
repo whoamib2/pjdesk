@@ -63,6 +63,10 @@ data class DeskState(
     val hosting: Boolean = false,
     val hostWho: String = "",
     val session: SessionInfo? = null,
+    /** The open session lost its connection and is dialing again. */
+    val reconnecting: Boolean = false,
+    /** Seconds until the next automatic try. Zero means a try is already running. */
+    val reconnectSeconds: Int = 0,
     /** The other computer speaks in-session chat (PJDesk 0.6.50). */
     val chatReady: Boolean = false,
     val chatLines: List<ChatLine> = emptyList(),

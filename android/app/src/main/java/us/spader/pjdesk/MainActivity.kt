@@ -1550,7 +1550,7 @@ class MainActivity : FragmentActivity() {
                         if (lock.isNotBlank()) {
                             val verifier = runCatching { AccountPin.open(key, lock) }.getOrNull()
                             if (verifier != null) {
-                                app.store.saveAccountPin(email, verifier, lock, app.store.appLockUpdated)
+                                app.store.saveAccountPin(email, verifier, lock, app.store.appLockUpdated, app.store.appLockPending)
                             } else if (!app.store.hasAccountPin()) {
                                 lockError = "That PIN was sealed with a different account password."
                                 return@onSuccess
@@ -1585,46 +1585,57 @@ class MainActivity : FragmentActivity() {
                 scope.launch {
                     val remote = withContext(Dispatchers.IO) {
                         if (app.store.appLockPending && app.store.appLockSealed.isNotBlank()) {
-                            runCatching { CloudAuth.putAppLock(refresh, device, app.store.appLockSealed) }.getOrNull()?.let { uploaded ->
-                                app.store.appLockPending = false
-                                app.store.appLockUpdated = uploaded
-                            }
+                            runCatching { CloudAuth.putAppLock(refresh, device, app.store.appLockSealed) }
                         }
                         runCatching { CloudAuth.fetchAppLock(refresh, device) }
                     }.getOrNull() ?: return@launch
                     val (lock, updated) = remote
-                    if (app.store.appLockPending && (lock.isBlank() || updated == 0L || updated < app.store.appLockUpdated)) {
-                        return@launch
-                    }
-                    if (updated < app.store.appLockUpdated) return@launch
-                    if (updated == app.store.appLockUpdated && lock == app.store.appLockSealed) return@launch
-                    if (lock.isBlank()) {
-                        if (updated == 0L) return@launch
-                        app.store.clearAccountPin()
-                        app.store.clearPinMaterial()
-                        BioVault.forget()
-                        pinPending = false
-                        app.markUnlocked()
-                        return@launch
-                    }
+                    val pending = app.store.appLockPending
+                    val localSealed = app.store.appLockSealed
+                    val localGen = app.store.accountPinUpdated
+                    val localHash = app.store.accountPinHash
+                    val localUpdated = app.store.appLockUpdated
                     val key = app.vaultKey
-                    if (key == null) {
-                        if (!app.store.hasAccountPin() && !app.store.hasPin()) {
+                    val opened = if (lock.isNotBlank() && key != null) {
+                        runCatching { AccountPin.open(key, lock) }.getOrNull()
+                    } else {
+                        null
+                    }
+                    val remoteGen = opened?.updated ?: 0L
+                    val remoteHash = opened?.hash.orEmpty()
+                    val sameSealed = lock.isNotBlank() && lock == localSealed
+                    val sameHash = localHash.isNotBlank() && remoteHash.isNotBlank() && localHash == remoteHash
+                    // Same rule as pjdesk_proto::applock::adopt_lock. A PIN saved on this
+                    // phone stays until the account has that same PIN or a later one.
+                    if (lock.isBlank() && remoteHash.isBlank()) {
+                        if (updated == 0L || pending) return@launch
+                        if (updated > maxOf(localUpdated, localGen)) {
+                            app.store.clearAccountPin()
+                            app.store.clearPinMaterial()
+                            BioVault.forget()
+                            pinPending = false
+                            app.markUnlocked()
+                        }
+                        return@launch
+                    }
+                    if (sameSealed || (sameHash && (pending || remoteGen <= localGen))) {
+                        if (pending && sameSealed) {
+                            app.store.appLockPending = false
+                            if (updated > app.store.appLockUpdated) app.store.appLockUpdated = updated
+                        }
+                        return@launch
+                    }
+                    if (pending && (localGen > 0L || localHash.isNotBlank())) return@launch
+                    if (opened == null) {
+                        if (localGen == 0L && localHash.isBlank() && localSealed.isBlank() && lock.isNotBlank()) {
                             app.store.notePendingAppLock(lock, updated)
                             pinPending = true
                         }
                         return@launch
                     }
-                    val verifier = runCatching { AccountPin.open(key, lock) }.getOrNull()
-                    if (verifier == null) {
-                        if (!app.store.hasAccountPin() && !app.store.hasPin()) {
-                            app.store.notePendingAppLock(lock, updated)
-                            pinPending = true
-                        }
-                        return@launch
-                    }
-                    val changed = app.store.hasAccountPin() && app.store.accountPinHash != verifier.hash
-                    app.store.saveAccountPin(account.ifBlank { netEmail }, verifier, lock, updated)
+                    if (remoteGen <= localGen) return@launch
+                    val changed = app.store.hasAccountPin() && app.store.accountPinHash != opened.hash
+                    app.store.saveAccountPin(account.ifBlank { netEmail }, opened, lock, updated.coerceAtLeast(opened.updated))
                     pinPending = false
                     if (changed) {
                         app.store.bioWrap = ""
@@ -1720,8 +1731,7 @@ class MainActivity : FragmentActivity() {
                         val (sealed, outcome) = stored
                         val (updated, note) = outcome
                         val whenSaved = updated ?: (System.currentTimeMillis() / 1000)
-                        app.store.saveAccountPin(email, verifier, sealed, whenSaved)
-                        app.store.appLockPending = updated == null
+                        app.store.saveAccountPin(email, verifier, sealed, whenSaved, updated == null)
                         val salt = PinWrap.newSalt()
                         app.store.savePinSalt(salt)
                         app.store.pinWrap = PinWrap.wrap(key, newPin, salt)
@@ -1909,6 +1919,9 @@ class MainActivity : FragmentActivity() {
                         onKeyboardMode = engine::keyboardMode,
                         onDisplay = { index -> engine.display(index, session.layout) },
                         onEnd = { engine.stopView("disconnected") },
+                        reconnecting = state.reconnecting,
+                        reconnectSeconds = state.reconnectSeconds,
+                        onReconnectNow = engine::reconnectNow,
                         remote = sessionRemote,
                         onRemote = { saveSessionRemote(it) },
                         forThisComputer = peerOnly,
@@ -2405,8 +2418,7 @@ class MainActivity : FragmentActivity() {
                                                     val sealed = AccountPin.seal(key, verifier)
                                                     val updated = runCatching { CloudAuth.putAppLock(refresh, device, sealed) }.getOrNull()
                                                     val whenSaved = updated ?: (System.currentTimeMillis() / 1000)
-                                                    app.store.saveAccountPin(email, verifier, sealed, whenSaved)
-                                                    app.store.appLockPending = updated == null
+                                                    app.store.saveAccountPin(email, verifier, sealed, whenSaved, updated == null)
                                                 }
                                             }
                                         }

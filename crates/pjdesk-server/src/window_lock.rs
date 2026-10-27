@@ -544,7 +544,8 @@ impl Gate {
                         format!("Wrong PIN. {left} left before a wait.")
                     }
                 };
-                tracing::info!("Wrong PIN on the PJDesk Server window ({fails} misses)");
+                let digits = self.verifier.as_ref().map(|v| v.len).unwrap_or(0);
+                tracing::info!("PIN rejected on the PJDesk Server window ({fails} misses, stored length {digits})");
             }
             Msg::Reauthed(key) => {
                 self.key = Some(key);
@@ -561,9 +562,10 @@ impl Gate {
                 tracing::info!("Account password accepted. Waiting for a new PIN.");
             }
             Msg::Stored { sealed, updated, verifier, key } => {
+                let digits = verifier.len;
                 self.key = Some(key);
                 self.sealed = sealed;
-                self.updated = updated;
+                self.updated = updated.max(verifier.updated);
                 self.verifier = Some(verifier);
                 self.fails = 0;
                 self.until = 0;
@@ -571,7 +573,7 @@ impl Gate {
                 self.persist();
                 self.unlock();
                 self.note = "PIN saved. This window will ask for it.".into();
-                tracing::info!("Saved the account PIN from the PJDesk Server window");
+                tracing::info!("PIN saved from the PJDesk Server window ({digits} digits)");
             }
             Msg::Failed(err) => {
                 tracing::info!("PIN was not saved: {err}");
@@ -589,39 +591,38 @@ impl Gate {
     }
 
     fn apply_remote(&mut self, remote: Remote) {
-        if remote.updated < self.updated {
-            return;
-        }
-        if remote.updated == self.updated && remote.sealed == self.sealed {
-            return;
-        }
-        if remote.sealed.trim().is_empty() {
-            if remote.updated == 0 {
-                return;
+        let local = applock::LockSide::from_verifier(&self.sealed, self.updated, self.verifier.as_ref(), false);
+        let opened = self.key.and_then(|key| applock::open(&key, remote.sealed.trim()).ok());
+        let incoming = applock::LockSide::from_verifier(remote.sealed.trim(), remote.updated, opened.as_ref(), false);
+        match applock::adopt_shared_lock(&local, &incoming) {
+            applock::LockAdopt::Keep | applock::LockAdopt::Stored => {}
+            applock::LockAdopt::Clear => {
+                self.verifier = None;
+                self.sealed.clear();
+                self.updated = remote.updated;
+                self.persist();
+                self.ui = true;
+                self.armed = true;
+                tracing::info!("The account PIN was cleared. The window is asking for a new one.");
             }
-            self.verifier = None;
-            self.sealed.clear();
-            self.updated = remote.updated;
-            self.persist();
-            self.ui = true;
-            self.armed = true;
-            tracing::info!("The account PIN was cleared. The window is asking for a new one.");
-            return;
-        }
-        self.sealed = remote.sealed;
-        self.updated = remote.updated;
-        if let Some(key) = self.key {
-            if let Ok(verifier) = applock::open(&key, self.sealed.trim()) {
+            applock::LockAdopt::Take => {
+                let Some(verifier) = opened else {
+                    return;
+                };
                 let changed = self.verifier.as_ref().map(|old| old.hash != verifier.hash).unwrap_or(true);
+                self.sealed = remote.sealed;
+                self.updated = remote.updated.max(verifier.updated);
+                let digits = verifier.len;
                 self.verifier = Some(verifier);
                 if changed {
                     self.fails = 0;
                     self.until = 0;
                     self.engage();
                 }
+                self.persist();
+                tracing::info!("Took a newer account PIN on the PJDesk Server window ({digits} digits)");
             }
         }
-        self.persist();
     }
 
     fn unlock(&mut self) {
@@ -682,22 +683,60 @@ impl Gate {
             self.fails = fails;
             self.until = until;
         }
+        if !file.email.eq_ignore_ascii_case(&self.email) {
+            return;
+        }
+        let disk_verifier = open_cached(&file);
+        let local = applock::LockSide::from_verifier(&self.sealed, self.updated, self.verifier.as_ref(), false);
+        let incoming = applock::LockSide::from_verifier(&file.sealed, file.updated, disk_verifier.as_ref(), false);
+        if !matches!(applock::adopt_shared_lock(&local, &incoming), applock::LockAdopt::Take) {
+            return;
+        }
+        let Some(verifier) = disk_verifier else {
+            return;
+        };
+        let changed = self.verifier.as_ref().map(|old| old.hash != verifier.hash).unwrap_or(true);
+        self.sealed = file.sealed;
+        self.updated = file.updated.max(verifier.updated);
+        let digits = verifier.len;
+        self.verifier = Some(verifier);
+        if changed {
+            self.fails = file.fails;
+            self.until = file.until;
+            self.engage();
+        }
+        tracing::info!("PJDesk Server window is using the newer PIN from the shared lock ({digits} digits)");
     }
 
     fn persist(&self) {
         let path = applock::window_lock_path();
-        let mut file = applock::read_window_lock(&path);
+        let disk = applock::read_window_lock(&path);
+        let disk_verifier = open_cached(&disk);
+        let disk_side = applock::LockSide::from_verifier(&disk.sealed, disk.updated, disk_verifier.as_ref(), false);
+        let memory = applock::LockSide::from_verifier(&self.sealed, self.updated, self.verifier.as_ref(), false);
+        let mut file = disk;
         if !self.email.is_empty() {
             file.email = self.email.clone();
-            file.fails = self.fails;
-            file.until = self.until;
+        }
+        let write_pin = matches!(
+            applock::adopt_shared_lock(&disk_side, &memory),
+            applock::LockAdopt::Take | applock::LockAdopt::Clear
+        );
+        if write_pin {
             file.sealed = self.sealed.clone();
             file.updated = self.updated;
+            file.fails = self.fails;
+            file.until = self.until;
             if let Some(verifier) = &self.verifier {
                 if let Ok(text) = serde_json::to_string(verifier) {
                     file.verifier = protect(&text);
                 }
+            } else {
+                file.verifier.clear();
             }
+        } else if memory.hash == disk_side.hash && !memory.hash.is_empty() {
+            file.fails = self.fails;
+            file.until = self.until;
         }
         if let Err(err) = applock::write_window_lock(&path, &file) {
             tracing::info!("Could not save the window lock: {err}");

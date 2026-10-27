@@ -770,13 +770,16 @@ fn split_endpoints(value: &str) -> Vec<String> {
     value.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
 }
 
-/// Backoff after a refused signaling connection: 1s, 2s, 4s, 8s, then 10s.
+/// Longest pause between tries. Quick retries come first; this is the 1–2 minute range.
+pub const RECONNECT_CAP: Duration = Duration::from_secs(90);
+
+/// Backoff after a lost server or a lost session: 1s, 2s, 4s, doubling until [`RECONNECT_CAP`].
 pub fn next_reconnect_delay(current: Duration) -> Duration {
     let next = current.saturating_mul(2);
     if next < Duration::from_secs(1) {
         Duration::from_secs(1)
-    } else if next > Duration::from_secs(10) {
-        Duration::from_secs(10)
+    } else if next > RECONNECT_CAP {
+        RECONNECT_CAP
     } else {
         next
     }
@@ -791,7 +794,8 @@ pub fn jitter_reconnect(base: Duration) -> Duration {
     }
     let tick = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos() as u64).unwrap_or(0);
     let delta = (tick % (swing * 2 + 1)) as i64 - swing as i64;
-    Duration::from_millis((ms as i64 + delta).clamp(200, 10_000) as u64)
+    let cap = RECONNECT_CAP.as_millis() as i64 + RECONNECT_CAP.as_millis() as i64 / 5;
+    Duration::from_millis((ms as i64 + delta).clamp(200, cap) as u64)
 }
 
 #[cfg(test)]
@@ -990,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_backoff_caps_at_ten_seconds() {
+    fn reconnect_backoff_reaches_about_a_minute_and_keeps_trying() {
         assert!(is_standby_refusal(STANDBY_REGISTRATION));
         assert!(!is_standby_refusal("device 902 488 771 is not online"));
         let routes = crate::routes::ServerRoutes {
@@ -1020,11 +1024,13 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_secs(4),
                 Duration::from_secs(8),
-                Duration::from_secs(10),
-                Duration::from_secs(10),
-                Duration::from_secs(10),
+                Duration::from_secs(16),
+                Duration::from_secs(32),
+                Duration::from_secs(64),
             ]
         );
+        assert_eq!(next_reconnect_delay(Duration::from_secs(64)), RECONNECT_CAP);
+        assert_eq!(next_reconnect_delay(RECONNECT_CAP), RECONNECT_CAP);
         let paused = jitter_reconnect(Duration::from_secs(4));
         assert!(paused >= Duration::from_millis(3200) && paused <= Duration::from_millis(4800), "{paused:?}");
     }

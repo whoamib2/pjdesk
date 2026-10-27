@@ -26,7 +26,6 @@ pub(super) enum LockMsg {
 pub(super) struct LockRemote {
     sealed: String,
     updated: u64,
-    synced: bool,
 }
 
 impl App {
@@ -194,9 +193,11 @@ impl App {
         std::thread::Builder::new()
             .name("app-lock-pull".into())
             .spawn(move || {
-                let synced = !pending.trim().is_empty() && crate::network::put_app_lock(&refresh, &device, &pending).is_ok();
+                if !pending.trim().is_empty() {
+                    let _ = crate::network::put_app_lock(&refresh, &device, &pending);
+                }
                 let result = crate::network::fetch_app_lock(&refresh, &device)
-                    .map(|(sealed, updated)| LockRemote { sealed, updated, synced })
+                    .map(|(sealed, updated)| LockRemote { sealed, updated })
                     .map_err(|e| e.to_string());
                 let _ = tx.send(result);
             })
@@ -207,47 +208,63 @@ impl App {
         if self.cfg.joined_by_code_or_key() {
             return;
         }
-        if remote.synced {
-            self.cfg.app_lock_pending = false;
-            self.save_cfg();
-        }
-        if self.cfg.app_lock_pending
-            && (remote.sealed.trim().is_empty() || remote.updated == 0 || remote.updated < self.cfg.app_lock_updated)
-        {
-            return;
-        }
-        if remote.updated < self.cfg.app_lock_updated {
-            return;
-        }
-        if remote.updated == self.cfg.app_lock_updated && remote.sealed == self.cfg.app_lock_sealed {
-            return;
-        }
-        let email = self.account_email();
-        if remote.sealed.trim().is_empty() {
-            // updated 0 is "no row yet", including a worker that has not been deployed.
-            if remote.updated == 0 {
-                return;
+        let local_verifier = self.saved_pin();
+        let local = pjdesk_proto::applock::LockSide::from_verifier(
+            &self.cfg.app_lock_sealed,
+            self.cfg.app_lock_updated,
+            local_verifier.as_ref(),
+            self.cfg.app_lock_pending,
+        );
+        let opened = crate::vault::key_from(&self.cfg).and_then(|key| pjdesk_proto::applock::open(&key, remote.sealed.trim()).ok());
+        let incoming = pjdesk_proto::applock::LockSide::from_verifier(remote.sealed.trim(), remote.updated, opened.as_ref(), false);
+        match pjdesk_proto::applock::adopt_lock(&local, &incoming) {
+            pjdesk_proto::applock::LockAdopt::Keep => {
+                if local.generation == 0
+                    && local.hash.is_empty()
+                    && self.cfg.app_lock_sealed.trim().is_empty()
+                    && !remote.sealed.trim().is_empty()
+                {
+                    self.cfg.app_lock_sealed = remote.sealed.trim().to_string();
+                    self.cfg.app_lock_updated = remote.updated;
+                    self.save_cfg();
+                    return;
+                }
+                if !remote.sealed.trim().is_empty() && remote.sealed.trim() != self.cfg.app_lock_sealed.trim() {
+                    let digits = local_verifier.as_ref().map(|v| v.len).unwrap_or(0);
+                    let waiting = if self.cfg.app_lock_pending { ", waiting to sync" } else { "" };
+                    self.note_pin_outcome(&format!(
+                        "kept the PIN saved on this computer ({digits} digits{waiting}); the account copy is not newer"
+                    ));
+                }
             }
-            self.cfg.clear_app_lock();
-            self.lock_ui = self.signed_in();
-            self.lock_armed = self.signed_in();
-            self.lock_resetting = false;
-            self.save_cfg();
-            self.publish_shared();
-            tracing::info!("The account PIN was cleared. This window is asking for a new one.");
-            return;
-        }
-        let Some(key) = crate::vault::key_from(&self.cfg) else {
-            self.cfg.app_lock_sealed = remote.sealed;
-            self.cfg.app_lock_updated = remote.updated;
-            self.save_cfg();
-            return;
-        };
-        match pjdesk_proto::applock::open(&key, remote.sealed.trim()) {
-            Ok(verifier) => {
-                let changed = self.cfg.app_lock_for(&email).map(|old| old.hash != verifier.hash).unwrap_or(true);
+            pjdesk_proto::applock::LockAdopt::Stored => {
+                self.cfg.app_lock_pending = false;
+                if remote.updated > self.cfg.app_lock_updated {
+                    self.cfg.app_lock_updated = remote.updated;
+                }
+                self.save_cfg();
+                self.publish_shared();
+                let digits = local_verifier.as_ref().map(|v| v.len).unwrap_or(0);
+                self.note_pin_outcome(&format!("account copy matches the PIN on this computer ({digits} digits)"));
+            }
+            pjdesk_proto::applock::LockAdopt::Clear => {
+                self.cfg.clear_app_lock();
+                self.lock_ui = self.signed_in();
+                self.lock_armed = self.signed_in();
+                self.lock_resetting = false;
+                self.save_cfg();
+                self.publish_shared();
+                self.note_pin_outcome("cleared from the account");
+            }
+            pjdesk_proto::applock::LockAdopt::Take => {
+                let Some(verifier) = opened else {
+                    return;
+                };
+                let email = self.account_email();
+                let changed = local_verifier.as_ref().map(|old| old.hash != verifier.hash).unwrap_or(true);
                 self.pin_idle_minutes = (verifier.idle_sec / 60).clamp(1, 24 * 60) as u32;
-                self.cfg.write_app_lock(&email, remote.sealed.trim(), remote.updated, Some(&verifier));
+                self.cfg.write_app_lock(&email, remote.sealed.trim(), remote.updated.max(verifier.updated), Some(&verifier));
+                self.cfg.app_lock_pending = false;
                 if changed {
                     self.cfg.clear_app_lock_fails();
                     self.engage_lock();
@@ -255,11 +272,7 @@ impl App {
                 }
                 self.save_cfg();
                 self.publish_shared();
-            }
-            Err(err) => {
-                if self.lock_ui {
-                    self.lock_error = err;
-                }
+                self.note_pin_outcome(&format!("took a newer account PIN ({} digits)", verifier.len));
             }
         }
     }
@@ -267,9 +280,11 @@ impl App {
     fn apply_lock_msg(&mut self, msg: LockMsg) {
         match msg {
             LockMsg::Unlocked => {
+                let digits = self.saved_pin().map(|v| v.len).unwrap_or(0);
                 self.cfg.clear_app_lock_fails();
                 self.save_cfg();
                 self.publish_shared();
+                self.note_pin_outcome(&format!("matched ({digits} digits)"));
                 self.lock_ui = false;
                 self.lock_resetting = false;
                 self.lock_error.clear();
@@ -286,7 +301,8 @@ impl App {
                 self.cfg.note_app_lock_fail(fails, until);
                 self.save_cfg();
                 self.publish_shared();
-                tracing::info!("Wrong PIN ({fails} misses)");
+                let digits = self.saved_pin().map(|v| v.len).unwrap_or(0);
+                self.note_pin_outcome(&format!("rejected ({fails} misses, stored length {digits})"));
                 self.lock_pin.clear();
                 self.lock_peeked.clear();
                 self.lock_shook = Some(Instant::now());
@@ -350,7 +366,7 @@ impl App {
                 self.last_input = Instant::now();
                 self.pin_note = "PIN saved. This window will ask for it.".into();
                 self.next_lock_pull = Instant::now() + Duration::from_secs(45);
-                tracing::info!("Saved the account PIN");
+                self.note_pin_outcome(&format!("saved and uploaded ({} digits)", verifier.len));
             }
             LockMsg::StoredLocal { sealed, verifier, key, note } => {
                 crate::vault::set_session_key(key);
@@ -372,7 +388,7 @@ impl App {
                 self.pin_note = note.clone();
                 self.toast.show(note);
                 self.next_lock_pull = Instant::now() + Duration::from_secs(45);
-                tracing::info!("Saved the PIN on this computer. The account copy will catch up later.");
+                self.note_pin_outcome(&format!("saved on this computer ({} digits, waiting to sync)", verifier.len));
             }
             LockMsg::Cleared { updated } => {
                 self.cfg.clear_app_lock();
@@ -423,6 +439,7 @@ impl App {
                 }
             }
             LockMsg::Failed(err) => {
+                self.note_pin_outcome(&format!("not saved ({err})"));
                 self.lock_error = err.clone();
                 self.pin_note = err;
                 if let Some(v) = self.cfg.app_lock_for(&self.account_email()) {
@@ -432,15 +449,44 @@ impl App {
         }
     }
 
+    fn note_pin_outcome(&self, outcome: &str) {
+        let line = format!("PIN {outcome}");
+        tracing::info!("{line}");
+        let path = crate::syspaths::service_dir().join("service.log");
+        let _ = std::fs::create_dir_all(crate::syspaths::service_dir());
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            use std::io::Write;
+            let _ = writeln!(file, "{line} (t={})", super::unix_now());
+        }
+    }
+
     fn publish_shared(&self) {
         let path = pjdesk_proto::applock::window_lock_path();
-        let mut file = pjdesk_proto::applock::read_window_lock(&path);
+        let disk = pjdesk_proto::applock::read_window_lock(&path);
+        let disk_verifier = crate::secure::reveal(&disk.verifier)
+            .and_then(|text| serde_json::from_str::<pjdesk_proto::applock::Verifier>(&text).ok());
+        let local_verifier = self.saved_pin();
+        let memory = pjdesk_proto::applock::LockSide::from_verifier(
+            &self.cfg.app_lock_sealed,
+            self.cfg.app_lock_updated,
+            local_verifier.as_ref(),
+            false,
+        );
+        let disk_side = pjdesk_proto::applock::LockSide::from_verifier(&disk.sealed, disk.updated, disk_verifier.as_ref(), false);
+        let mut file = disk;
         file.email = self.account_email();
-        file.sealed = self.cfg.app_lock_sealed.clone();
-        file.updated = self.cfg.app_lock_updated;
-        file.verifier = self.cfg.app_lock_verifier.clone().unwrap_or_default();
-        file.fails = self.cfg.app_lock_fails;
-        file.until = self.cfg.app_lock_until;
+        let decision = pjdesk_proto::applock::adopt_shared_lock(&disk_side, &memory);
+        let write_pin = matches!(decision, pjdesk_proto::applock::LockAdopt::Take | pjdesk_proto::applock::LockAdopt::Clear);
+        if write_pin {
+            file.sealed = self.cfg.app_lock_sealed.clone();
+            file.updated = self.cfg.app_lock_updated;
+            file.verifier = self.cfg.app_lock_verifier.clone().unwrap_or_default();
+            file.fails = self.cfg.app_lock_fails;
+            file.until = self.cfg.app_lock_until;
+        } else if memory.hash == disk_side.hash && !memory.hash.is_empty() {
+            file.fails = self.cfg.app_lock_fails;
+            file.until = self.cfg.app_lock_until;
+        }
         if let Err(err) = pjdesk_proto::applock::write_window_lock(&path, &file) {
             tracing::info!("Could not share the window lock: {err}");
         }
@@ -460,21 +506,45 @@ impl App {
             self.cfg.note_app_lock_fail(fails, until);
             self.save_cfg();
         }
-        if file.updated <= self.cfg.app_lock_updated || file.verifier.is_empty() {
+        let remote_verifier = crate::secure::reveal(&file.verifier)
+            .and_then(|text| serde_json::from_str::<pjdesk_proto::applock::Verifier>(&text).ok());
+        if remote_verifier.is_none() && file.sealed.trim().is_empty() {
             return;
         }
-        let Some(text) = crate::secure::reveal(&file.verifier) else {
-            return;
-        };
-        let Ok(verifier) = serde_json::from_str::<pjdesk_proto::applock::Verifier>(&text) else {
-            return;
-        };
-        self.pin_idle_minutes = (verifier.idle_sec / 60).clamp(1, 24 * 60) as u32;
-        self.cfg.write_app_lock(&email, file.sealed.trim(), file.updated, Some(&verifier));
-        self.save_cfg();
-        if self.signed_in() {
-            self.engage_lock();
-            self.lock_armed = true;
+        let local_verifier = self.saved_pin();
+        let local = pjdesk_proto::applock::LockSide::from_verifier(
+            &self.cfg.app_lock_sealed,
+            self.cfg.app_lock_updated,
+            local_verifier.as_ref(),
+            self.cfg.app_lock_pending,
+        );
+        let incoming =
+            pjdesk_proto::applock::LockSide::from_verifier(file.sealed.trim(), file.updated, remote_verifier.as_ref(), false);
+        match pjdesk_proto::applock::adopt_shared_lock(&local, &incoming) {
+            pjdesk_proto::applock::LockAdopt::Keep | pjdesk_proto::applock::LockAdopt::Stored => {}
+            pjdesk_proto::applock::LockAdopt::Clear => {
+                self.cfg.clear_app_lock();
+                self.lock_ui = self.signed_in();
+                self.lock_armed = self.signed_in();
+                self.lock_resetting = false;
+                self.save_cfg();
+                self.note_pin_outcome("cleared from the shared window lock");
+            }
+            pjdesk_proto::applock::LockAdopt::Take => {
+                let Some(verifier) = remote_verifier else {
+                    return;
+                };
+                let changed = local_verifier.as_ref().map(|old| old.hash != verifier.hash).unwrap_or(true);
+                self.pin_idle_minutes = (verifier.idle_sec / 60).clamp(1, 24 * 60) as u32;
+                self.cfg.write_app_lock(&email, file.sealed.trim(), file.updated.max(verifier.updated), Some(&verifier));
+                self.cfg.app_lock_pending = false;
+                self.save_cfg();
+                if changed && self.signed_in() {
+                    self.engage_lock();
+                    self.lock_armed = true;
+                }
+                self.note_pin_outcome(&format!("took a newer PIN from the shared window lock ({} digits)", verifier.len));
+            }
         }
     }
 

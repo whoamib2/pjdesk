@@ -228,6 +228,91 @@ pub fn write_window_lock(path: &std::path::Path, file: &WindowLockFile) -> Resul
     Ok(())
 }
 
+/// Which PIN copy the lock screen should keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockAdopt {
+    /// The PIN already on this computer stays.
+    Keep,
+    /// The account has the same sealed PIN this computer saved. The upload landed.
+    Stored,
+    /// A newer PIN copy replaces the one on this computer.
+    Take,
+    /// The account removed the PIN after this computer's copy.
+    Clear,
+}
+
+/// One side of a PIN comparison. `generation` is `Verifier.updated` (when the
+/// PIN was saved). `updated` is the row timestamp beside it, which can move
+/// without the PIN changing. `hash` is empty when that side could not be opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockSide {
+    pub sealed: String,
+    pub updated: u64,
+    pub generation: u64,
+    pub hash: String,
+    pub pending: bool,
+}
+
+impl LockSide {
+    pub fn from_verifier(sealed: &str, updated: u64, verifier: Option<&Verifier>, pending: bool) -> Self {
+        Self {
+            sealed: sealed.trim().to_string(),
+            updated,
+            generation: verifier.map(|v| v.updated).unwrap_or(0),
+            hash: verifier.map(|v| v.hash.trim().to_string()).unwrap_or_default(),
+            pending,
+        }
+    }
+}
+
+/// Whether an account copy may replace the PIN saved on this computer.
+///
+/// A PIN that is still waiting to upload stays, even when the account row is
+/// newer. That row is often the previous PIN. A copy that already uploaded is
+/// replaced only by a PIN that was saved later (`generation`).
+pub fn adopt_lock(local: &LockSide, remote: &LockSide) -> LockAdopt {
+    let remote_sealed = remote.sealed.trim();
+    let local_sealed = local.sealed.trim();
+    let remote_hash = remote.hash.trim();
+    let local_hash = local.hash.trim();
+    if remote_sealed.is_empty() && remote_hash.is_empty() {
+        if remote.updated == 0 || local.pending {
+            return LockAdopt::Keep;
+        }
+        if remote.updated > local.updated.max(local.generation) {
+            return LockAdopt::Clear;
+        }
+        return LockAdopt::Keep;
+    }
+    let same_sealed = !local_sealed.is_empty() && remote_sealed == local_sealed;
+    let same_hash = !local_hash.is_empty() && remote_hash == local_hash;
+    if same_sealed {
+        return if local.pending { LockAdopt::Stored } else { LockAdopt::Keep };
+    }
+    if same_hash && remote.generation > local.generation && !local.pending {
+        return LockAdopt::Take;
+    }
+    if same_hash {
+        return LockAdopt::Keep;
+    }
+    if local.pending && (local.generation > 0 || !local_hash.is_empty()) {
+        return LockAdopt::Keep;
+    }
+    if remote.generation > local.generation && remote.generation > 0 {
+        return LockAdopt::Take;
+    }
+    LockAdopt::Keep
+}
+
+/// The shared window file. The later PIN save wins. A pending upload does not
+/// hide a newer save already written into that file, and an older save in the
+/// file does not replace a newer one.
+pub fn adopt_shared_lock(local: &LockSide, remote: &LockSide) -> LockAdopt {
+    let mut local = local.clone();
+    local.pending = false;
+    adopt_lock(&local, remote)
+}
+
 /// Lockout for this account. A file for a different account does not count.
 pub fn lockout_for(file: &WindowLockFile, email: &str) -> (u32, u64) {
     if email.is_empty() || !file.email.eq_ignore_ascii_case(email) {
@@ -453,5 +538,53 @@ mod tests {
         assert!(!saved.contains("hello"));
         let _ = std::fs::remove_file(&path);
         assert_eq!(read_window_lock(&path), WindowLockFile::default());
+    }
+
+    #[test]
+    fn the_pin_saved_on_this_computer_wins_over_an_older_account_copy() {
+        let fresh = create("135790", 300, 2_000).unwrap();
+        assert_eq!(fresh.len, 6);
+        assert!(matches(&fresh, "135790"));
+        assert!(!matches(&fresh, "1111"));
+        assert!(pin_silent_check(fresh.len as usize, fresh.len));
+        assert!(!pin_silent_check(4, fresh.len), "auto-unlock uses the length saved with this PIN");
+
+        let old_hash = "00".repeat(32);
+        assert_ne!(fresh.hash, old_hash);
+        let local = LockSide::from_verifier("new-sealed", 2_000, Some(&fresh), true);
+        // The account still has the previous PIN, and its row timestamp is ahead.
+        let remote = LockSide {
+            sealed: "old-sealed".into(),
+            updated: 9_000,
+            generation: 1_000,
+            hash: old_hash.clone(),
+            pending: false,
+        };
+        assert_eq!(adopt_lock(&local, &remote), LockAdopt::Keep);
+        assert_eq!(adopt_shared_lock(&local, &remote), LockAdopt::Keep);
+        // The server echoed the previous row: same timestamp, different blob.
+        let echo = LockSide { updated: 2_000, ..remote.clone() };
+        assert_eq!(adopt_lock(&local, &echo), LockAdopt::Keep);
+        // A higher generation on the account does not replace a PIN still waiting to upload.
+        let skewed = LockSide { generation: 9_000, updated: 9_000, ..remote.clone() };
+        assert_eq!(adopt_lock(&local, &skewed), LockAdopt::Keep);
+        // The shared file only moves forward. A later save there is the one to check.
+        let later = LockSide { generation: 3_000, updated: 3_000, hash: "11".repeat(32), ..remote.clone() };
+        assert_eq!(adopt_shared_lock(&local, &later), LockAdopt::Take);
+        // The upload landed.
+        let echoed = LockSide::from_verifier("new-sealed", 2_500, Some(&fresh), false);
+        assert_eq!(adopt_lock(&local, &echoed), LockAdopt::Stored);
+        // A PIN that already uploaded gives way to a later different PIN.
+        let synced = LockSide::from_verifier("new-sealed", 2_000, Some(&fresh), false);
+        assert_eq!(adopt_lock(&synced, &later), LockAdopt::Take);
+        assert_eq!(adopt_lock(&synced, &remote), LockAdopt::Keep);
+        let empty = LockSide { sealed: String::new(), updated: 0, generation: 0, hash: String::new(), pending: false };
+        assert_eq!(adopt_lock(&local, &empty), LockAdopt::Keep);
+        let cleared = LockSide { updated: 4_000, ..empty };
+        assert_eq!(adopt_lock(&synced, &cleared), LockAdopt::Clear);
+        assert_eq!(adopt_lock(&local, &cleared), LockAdopt::Keep);
+        // The verifier that was kept is the one the lock screen checks.
+        assert!(matches(&fresh, "135790"));
+        assert_eq!(fresh.len, 6);
     }
 }

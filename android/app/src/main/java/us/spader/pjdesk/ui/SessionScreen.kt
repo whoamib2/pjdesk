@@ -46,6 +46,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
+import kotlinx.coroutines.delay
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -125,6 +126,9 @@ fun SessionScreen(
     chatUnread: Int = 0,
     onChat: (String) -> Unit = {},
     onChatOpen: () -> Unit = {},
+    reconnecting: Boolean = false,
+    reconnectSeconds: Int = 0,
+    onReconnectNow: () -> Unit = {},
 ) {
     val android = session.platform == "android"
     val trackpad = remote.trackpadFor(android)
@@ -159,6 +163,14 @@ fun SessionScreen(
         controller?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         controller?.hide(WindowInsetsCompat.Type.systemBars())
         onDispose { controller?.show(WindowInsetsCompat.Type.systemBars()) }
+    }
+    var retryLeft by remember(reconnecting, reconnectSeconds) { mutableIntStateOf(reconnectSeconds) }
+    LaunchedEffect(reconnecting, reconnectSeconds) {
+        retryLeft = reconnectSeconds
+        while (reconnecting && retryLeft > 0) {
+            delay(1_000)
+            retryLeft -= 1
+        }
     }
     LaunchedEffect(session.id, remote.quality, remote.customFps, remote.customBitrate) {
         if (remote.quality == "custom") onQualityCustom(remote.customFps, remote.customBitrate)
@@ -700,6 +712,30 @@ fun SessionScreen(
                     onSend = onChat,
                     onClose = { chatSheet = false },
                 )
+            }
+        }
+        if (reconnecting) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .zIndex(30f)
+                    .background(Color.Black.copy(alpha = 0.55f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    modifier = Modifier.padding(24.dp).widthIn(max = 420.dp),
+                ) {
+                    Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Connection lost, reconnecting…", style = MaterialTheme.typography.titleMedium)
+                        Text(if (retryLeft <= 0) "Trying again now…" else "Trying again in $retryLeft s.")
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            TextButton(onClick = onReconnectNow) { Text("Reconnect now") }
+                            TextButton(onClick = onEnd) { Text("Close") }
+                        }
+                    }
+                }
             }
         }
         if (confirmEnd) {

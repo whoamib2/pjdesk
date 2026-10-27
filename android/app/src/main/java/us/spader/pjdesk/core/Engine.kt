@@ -349,6 +349,8 @@ class Engine(context: Context) : EngineListener {
                 it.status.startsWith("Asking")
             it.copy(
                 session = null,
+                reconnecting = false,
+                reconnectSeconds = 0,
                 askPassword = false,
                 askNote = "",
                 status = if (active) "Ready" else it.status,
@@ -458,6 +460,9 @@ class Engine(context: Context) : EngineListener {
     fun sendFile(path: String) = command(JSONObject().put("cmd", "fileSend").put("path", path).toString())
     fun display(index: Int, layout: Boolean) =
         command(JSONObject().put("cmd", "display").put("index", index).put("layout", layout).toString())
+
+    /** Dials the open session again without waiting out the current pause. */
+    fun reconnectNow() = command("""{"cmd":"reconnectNow"}""")
 
     fun keyframe() = command("""{"cmd":"keyframe"}""")
 
@@ -773,6 +778,8 @@ class Engine(context: Context) : EngineListener {
                 }
                     it.copy(
                     askPassword = false,
+                    reconnecting = false,
+                    reconnectSeconds = 0,
                     session = SessionInfo(
                         peer = peer,
                         id = event.optString("id"),
@@ -861,6 +868,14 @@ class Engine(context: Context) : EngineListener {
             "input" -> {
                 if (!RemoteControl.handle(event)) setControl(false)
             }
+            "reconnecting" -> update {
+                it.copy(
+                    reconnecting = true,
+                    reconnectSeconds = event.optInt("after"),
+                    error = null,
+                    status = event.optString("reason").ifBlank { "Connection lost, reconnecting…" },
+                )
+            }
             "disconnected" -> {
                 us.spader.pjdesk.a11y.ProjectionConsent.reset()
                 us.spader.pjdesk.service.ViewPrompt.cancel(app)
@@ -879,6 +894,8 @@ class Engine(context: Context) : EngineListener {
                         hosting = if (role == "host" || role == "session") false else it.hosting,
                         hostWho = if (role == "host" || role == "session") "" else it.hostWho,
                         acceptedAutomatically = if (role == "host" || role == "session") false else it.acceptedAutomatically,
+                        reconnecting = if (role == "controller" || role == "session") false else it.reconnecting,
+                        reconnectSeconds = if (role == "controller" || role == "session") 0 else it.reconnectSeconds,
                         session = if (role == "controller" || role == "session") null else it.session,
                         chatReady = false,
                         chatLines = emptyList(),

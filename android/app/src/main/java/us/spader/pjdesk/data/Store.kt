@@ -508,7 +508,7 @@ class Store(context: Context) {
             && accountPinIters > 0
     }
 
-    fun saveAccountPin(email: String, verifier: us.spader.pjdesk.core.AccountPin.Verifier, sealed: String, updated: Long) {
+    fun saveAccountPin(email: String, verifier: us.spader.pjdesk.core.AccountPin.Verifier, sealed: String, updated: Long, pending: Boolean = false) {
         val idle = when (verifier.idleSec) {
             60, 900, 1800 -> verifier.idleSec
             else -> 300
@@ -523,7 +523,7 @@ class Store(context: Context) {
             .putInt("accountPinLen", verifier.len)
             .putString("appLockSealed", sealed)
             .putLong("appLockUpdated", updated)
-            .putBoolean("appLockPending", false)
+            .putBoolean("appLockPending", pending)
             .putInt("pinFails", 0)
             .putLong("pinLockedUntil", 0L)
             .putInt("autoLockSeconds", idle)

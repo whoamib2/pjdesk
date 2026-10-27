@@ -610,10 +610,20 @@ async fn host_main(
             Err(e) if format!("{e:#}").contains("SERVER KEY MISMATCH") => {
                 if let Some(shared) = &state.shared {
                     shared.clear_registration();
-                    *shared.last_error.lock().unwrap() = Some(format!("{e:#}"));
+                    *shared.last_error.lock().unwrap() =
+                        Some("The server key changed. This computer will keep trying.".into());
                 }
-                info!("This computer is not registered ({role}). {e:#}");
-                return Err(anyhow::anyhow!("{e:#}"));
+                info!("This computer is not registered ({role}). The server key changed. Trying again later.");
+                if let Ok(fresh) = crate::config::Config::load() {
+                    config.server = fresh.server;
+                    config.server_fingerprint = fresh.server_fingerprint;
+                    config.network_lan = fresh.network_lan;
+                    config.network_public_ip = fresh.network_public_ip;
+                    config.network_standby = fresh.network_standby;
+                    config.network_standby_fingerprint = fresh.network_standby_fingerprint;
+                    config.network_routes = fresh.network_routes;
+                }
+                Some(pjdesk_proto::failover::RegFail::KeyMismatch)
             }
             Err(e) if pjdesk_proto::signal::is_standby_refusal(&format!("{e:#}")) => {
                 info!("This computer is not registered ({role}). {e:#}");
@@ -662,7 +672,11 @@ async fn host_main(
             public_only = hop.use_standby || kind == pjdesk_proto::failover::RegFail::StillStandby;
             delay = hop.delay;
             advance = hop.advance_backoff;
-            if advance {
+            if kind == pjdesk_proto::failover::RegFail::KeyMismatch {
+                delay = pjdesk_proto::signal::RECONNECT_CAP;
+                fast_tries = pjdesk_proto::failover::FAST_REGISTER_TRIES;
+                advance = false;
+            } else if advance {
                 fast_tries = pjdesk_proto::failover::FAST_REGISTER_TRIES;
             } else {
                 fast_tries = fast_tries.saturating_add(1);
