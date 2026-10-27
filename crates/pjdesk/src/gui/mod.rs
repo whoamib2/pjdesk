@@ -718,6 +718,7 @@ impl App {
             acked_unix: unix_now(),
             server: "office.example:21200".into(),
             app_version: env!("CARGO_PKG_VERSION").into(),
+            error: String::new(),
         };
         self.connect_id = "123 456 789".into();
         self.cfg.server = Some("office.example:21200".into());
@@ -985,6 +986,57 @@ impl App {
         self.engine.retarget(&self.cfg);
         self.settings.set_server_text(&self.cfg.effective_server());
         self.toast.show("Signed out");
+    }
+
+    /// Writes the visit's session the same way a normal sign-in does.
+    fn stay_signed_in(&mut self) {
+        if self.temp.is_none() && !self.cfg.ephemeral_network {
+            return;
+        }
+        self.cfg.ephemeral_network = false;
+        crate::vault::store_session_key(&mut self.cfg);
+        crate::temp_sign::clear_marker();
+        self.temp = None;
+        self.temp_left = 0;
+        // Save this session directly. The usual save reloads the account that
+        // was already on disk, which is empty for this visit.
+        if let Err(e) = self.cfg.save() {
+            self.status = format!("Could not save settings: {e}");
+        }
+        crate::network::copy_to_service(&self.cfg);
+        self.sync_passwords(true);
+        self.toast.show("Signed in on this computer");
+    }
+
+    /// Keeps this visit in memory and takes the account off disk.
+    fn sign_out_when_closes(&mut self) {
+        if self.temp.is_some() || self.cfg.ephemeral_network {
+            return;
+        }
+        let mut snapshot = self.cfg.clone();
+        snapshot.ephemeral_network = false;
+        snapshot.leave_network_sign_in();
+        if let Err(e) = snapshot.save() {
+            self.status = format!("Could not save settings: {e}");
+            return;
+        }
+        self.cfg.ephemeral_network = true;
+        crate::temp_sign::begin_marker(false);
+        self.temp = Some(TempHold { snapshot, last_activity: Instant::now(), warning: false });
+        self.temp_left = 0;
+        self.toast.show("Signed in until you close PJDesk");
+    }
+
+    fn sign_in_duration_menu(&mut self, ui: &mut egui::Ui) {
+        let until_close = self.temp.is_some() || self.cfg.ephemeral_network;
+        if ui.selectable_label(!until_close, "Stay signed in on this computer").clicked() {
+            self.stay_signed_in();
+            ui.close();
+        }
+        if ui.selectable_label(until_close, "Sign out when PJDesk closes").clicked() {
+            self.sign_out_when_closes();
+            ui.close();
+        }
     }
 
     /// True when Windows locked, signed out, or is shutting down since the last check.

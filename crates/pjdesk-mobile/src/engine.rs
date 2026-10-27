@@ -1038,7 +1038,7 @@ async fn open_ordered(state: &State, cb: &Arc<dyn Callbacks>, pinned: Option<pjd
     if targets.is_empty() {
         bail!("This phone has no server address yet. Sign in again, or set the server in Settings.");
     }
-    let mut last = None;
+    let mut attempts = Vec::new();
     for target in &targets {
         log_line(cb, format!("dialing {target}"));
         match SignalClient::connect_endpoint(target, pinned, pjdesk_proto::routes::dial_budget(target)).await {
@@ -1047,12 +1047,17 @@ async fn open_ordered(state: &State, cb: &Arc<dyn Callbacks>, pinned: Option<pjd
                 return Ok(signal);
             }
             Err(err) => {
-                log_line(cb, format!("dial {target} failed: {err:#}"));
-                last = Some(err);
+                let why = err.to_string();
+                let why = why.lines().next().unwrap_or("failed").trim();
+                log_line(cb, format!("registration route {target} failed: {why}"));
+                attempts.push((target.clone(), why.to_string()));
             }
         }
     }
-    Err(last.unwrap_or_else(|| anyhow!("could not reach the primary or the standby")))
+    let pairs: Vec<(&str, &str)> = attempts.iter().map(|(addr, err)| (addr.as_str(), err.as_str())).collect();
+    let report = pjdesk_proto::routes::registration_miss(&pairs);
+    log_line(cb, report.clone());
+    Err(anyhow!(report))
 }
 
 /// TCP 21200 to the account's LAN address and the public address, the same race Windows uses.

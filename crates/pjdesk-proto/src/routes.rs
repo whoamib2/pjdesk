@@ -159,6 +159,34 @@ pub fn dial_targets(routes: &ServerRoutes, mine: &[Ipv4Addr], saved: &str) -> Ve
     order
 }
 
+/// The banner, then one `address: error` line for every dial that failed.
+pub fn registration_miss(attempts: &[(&str, &str)]) -> String {
+    let last = attempts
+        .last()
+        .map(|(_, err)| err.trim())
+        .filter(|err| !err.is_empty())
+        .unwrap_or("no address answered");
+    let mut text = format!("could not reach the primary or the standby; retrying. {last}");
+    for (addr, err) in attempts {
+        let addr = addr.trim();
+        if addr.is_empty() {
+            continue;
+        }
+        let err = err.trim();
+        let err = if err.is_empty() { "failed" } else { err };
+        text.push('\n');
+        text.push_str(addr);
+        text.push_str(": ");
+        text.push_str(err);
+    }
+    text
+}
+
+/// The per-address lines under the registration banner. The first line is the banner.
+pub fn registration_detail_lines(text: &str) -> Vec<String> {
+    text.lines().skip(1).map(str::trim).filter(|line| !line.is_empty()).map(str::to_string).collect()
+}
+
 /// The address a server named, then the advertised order.
 ///
 /// A follow address that does not answer is not the only attempt. The primary
@@ -614,6 +642,26 @@ mod tests {
         assert_eq!(from_cabin[1], "10.1.1.8:21200");
         assert!(from_cabin.iter().any(|addr| addr == "198.51.100.8:21200"));
         assert_eq!(from_cabin.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
+    }
+
+    #[test]
+    fn a_failed_registration_names_every_address_it_tried() {
+        let report = registration_miss(&[
+            ("192.168.0.20:21200", "timed out"),
+            ("204.248.122.44:21200", "connection refused"),
+            ("pjdesk.spader.us:21200", "timed out"),
+        ]);
+        assert!(report.starts_with("could not reach the primary or the standby; retrying. timed out"));
+        let lines = registration_detail_lines(&report);
+        assert_eq!(
+            lines,
+            vec![
+                "192.168.0.20:21200: timed out".to_string(),
+                "204.248.122.44:21200: connection refused".to_string(),
+                "pjdesk.spader.us:21200: timed out".to_string(),
+            ]
+        );
+        assert!(registration_detail_lines("could not reach the primary or the standby; retrying. timed out").is_empty());
     }
 
     #[test]

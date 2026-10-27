@@ -258,6 +258,19 @@ impl App {
                     self.sign_out_network();
                 }
             });
+            ui.add_space(12.0);
+            ui.label("This sign-in");
+            let until_close = self.temp.is_some() || self.cfg.ephemeral_network;
+            if ui.selectable_label(!until_close, "Stay signed in on this computer").clicked() && until_close {
+                self.stay_signed_in();
+            }
+            if ui.selectable_label(until_close, "Sign out when PJDesk closes").clicked() && !until_close {
+                self.sign_out_when_closes();
+            }
+            ui.label(widgets::muted(
+                ui,
+                "Stay signed in keeps this account on this computer. The other choice ends the sign-in when you close PJDesk.",
+            ));
         }
         ui.add_space(8.0);
         ui.label(widgets::muted(

@@ -75,6 +75,9 @@ pub struct ServiceStatus {
     /// Build the service host registered with. Empty on an older file.
     #[serde(default)]
     pub app_version: String,
+    /// Last registration failure, including one line per address that was dialed.
+    #[serde(default)]
+    pub error: String,
 }
 
 impl ServiceStatus {
@@ -100,6 +103,7 @@ impl ServiceStatus {
             acked_unix: 0,
             server: String::new(),
             app_version: String::new(),
+            error: String::new(),
         }
     }
 

@@ -57,7 +57,9 @@ impl App {
                     self.open_invite();
                 }
                 if self.temp.is_some() {
-                    ui.label(RichText::new("Signed in until you close PJDesk").color(p.warn).size(13.0));
+                    ui.menu_button(RichText::new("Signed in until you close PJDesk").color(p.warn).size(13.0), |ui| {
+                        self.sign_in_duration_menu(ui);
+                    });
                     if ui.button("Sign out").clicked() {
                         self.end_temporary_sign_in();
                     }
@@ -67,6 +69,7 @@ impl App {
                             ui.ctx().open_url(egui::OpenUrl::new_tab("https://pjdesk.com/account"));
                             ui.close();
                         }
+                        self.sign_in_duration_menu(ui);
                         if ui.button("Sign out").clicked() {
                             self.sign_out_network();
                             ui.close();
@@ -541,6 +544,14 @@ impl App {
         };
         let server = if reach.is_empty() { server } else { format!("{server} · {reach}") };
         let rtt = self.share_rtt();
+        let failure = if self.registrar_acked() {
+            None
+        } else if self.engine.service_running {
+            let err = self.svc_status.error.trim();
+            if err.is_empty() { None } else { Some(err.to_string()) }
+        } else {
+            self.engine.shared.error()
+        };
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             if self.engine.service_running {
@@ -549,6 +560,8 @@ impl App {
                     widgets::status_dot(ui, p.accent, "In a session");
                 } else if self.registrar_acked() {
                     widgets::status_dot(ui, p.ok, "Service ready");
+                } else if let Some(err) = &failure {
+                    widgets::status_dot(ui, p.warn, &short(err));
                 } else if fresh && self.svc_status.online {
                     widgets::status_dot(ui, p.warn, "Reconnecting");
                 } else {
@@ -560,10 +573,10 @@ impl App {
                 widgets::status_dot(ui, p.accent, &format!("In a session · {peer}"));
             } else if self.registrar_acked() {
                 widgets::status_dot(ui, p.ok, "Ready");
+            } else if let Some(err) = &failure {
+                widgets::status_dot(ui, p.warn, &short(err));
             } else if self.engine.shared.is_online() {
                 widgets::status_dot(ui, p.warn, "Reconnecting");
-            } else if let Some(err) = self.engine.shared.error() {
-                widgets::status_dot(ui, p.warn, &short(&err));
             } else {
                 widgets::status_dot(ui, p.muted, "Connecting");
             }
@@ -572,6 +585,16 @@ impl App {
                 widgets::status_dot(ui, p.muted, &format!("{rtt} ms"));
             }
         });
+        if let Some(err) = &failure {
+            let lines = pjdesk_proto::routes::registration_detail_lines(err);
+            if !lines.is_empty() {
+                egui::CollapsingHeader::new("Details").id_salt("registration-dial-details").show(ui, |ui| {
+                    for line in &lines {
+                        ui.label(RichText::new(line).monospace().size(12.0).color(p.muted));
+                    }
+                });
+            }
+        }
     }
 
     /// ID, one-time password, whether a permanent password is set, and whether

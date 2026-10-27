@@ -1610,6 +1610,13 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("session-token"));
         assert!(!text.contains("ben@spader.us"));
+
+        live.ephemeral_network = false;
+        live.save_to(&path).unwrap();
+        let kept = Config::load_from(&path).unwrap();
+        assert_eq!(kept.network_email.as_deref(), Some("ben@spader.us"));
+        assert_eq!(kept.network_refresh.as_deref(), Some("plain:session-token"));
+        assert_eq!(kept.network_access.as_deref(), Some("plain:access-token"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

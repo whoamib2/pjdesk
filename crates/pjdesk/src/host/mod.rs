@@ -117,6 +117,27 @@ pub struct ConsentReply {
     pub receive_dir: String,
 }
 
+/// The first line of a dial error, short enough to show next to an address.
+fn one_line(err: &anyhow::Error) -> String {
+    let text = format!("{err:#}");
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("failed");
+    let mut out = String::new();
+    for part in line.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    if out.is_empty() {
+        "failed".into()
+    } else if out.chars().count() > 180 {
+        let cut: String = out.chars().take(179).collect();
+        format!("{cut}…")
+    } else {
+        out
+    }
+}
+
 fn unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -687,10 +708,11 @@ async fn register_catalog(
         &config.effective_server(),
     );
     if targets.is_empty() {
+        info!("registration has no address to dial");
         bail!("could not reach the primary or the standby; retrying. the server address is empty");
     }
     let mut signal = None;
-    let mut last = None;
+    let mut attempts = Vec::new();
     for target in &targets {
         info!("Dialing {target}");
         match SignalClient::connect_endpoint(target, config, pjdesk_proto::routes::dial_budget(target)).await {
@@ -700,14 +722,17 @@ async fn register_catalog(
                 break;
             }
             Err(err) => {
-                info!("Dial {target} failed: {err:#}");
-                last = Some(err);
+                let why = one_line(&err);
+                info!("registration route {target} failed: {why}");
+                attempts.push((target.clone(), why));
             }
         }
     }
     let mut signal = signal.ok_or_else(|| {
-        let err = last.map(|err| format!("{err:#}")).unwrap_or_else(|| "no address answered".into());
-        anyhow::anyhow!("could not reach the primary or the standby; retrying. {err}")
+        let pairs: Vec<(&str, &str)> = attempts.iter().map(|(addr, err)| (addr.as_str(), err.as_str())).collect();
+        let report = pjdesk_proto::routes::registration_miss(&pairs);
+        info!("{report}");
+        anyhow::anyhow!("{report}")
     })?;
     loop {
         let register_proto = state.server_proto.load(Ordering::SeqCst);
@@ -751,7 +776,9 @@ async fn register_catalog(
                     }
                     info!("Standby redirected registration to {addr}");
                     signal = SignalClient::connect_endpoint(&addr, config, pjdesk_proto::routes::dial_budget(&addr)).await.map_err(|err| {
-                        anyhow::anyhow!("could not reach the primary at {addr}; retrying. {err:#}")
+                        let why = one_line(&err);
+                        info!("registration route {addr} failed: {why}");
+                        anyhow::anyhow!("{}", pjdesk_proto::routes::registration_miss(&[(&addr, why.as_str())]))
                     })?;
                     break;
                 }
