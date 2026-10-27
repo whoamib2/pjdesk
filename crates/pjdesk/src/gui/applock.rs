@@ -359,6 +359,7 @@ impl App {
                     session.email = self.pin_email.trim().to_lowercase();
                 }
                 self.note_enrolled(&session.computers);
+                self.cfg.allow_saved_merge();
                 self.cfg.apply_network_session(&session);
                 self.net_email = self.cfg.network_email.clone().unwrap_or_default();
                 self.settings.set_server_text(&self.cfg.effective_server());

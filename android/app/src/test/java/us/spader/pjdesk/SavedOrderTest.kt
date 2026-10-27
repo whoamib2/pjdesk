@@ -18,6 +18,8 @@ import us.spader.pjdesk.core.osDetail
 import us.spader.pjdesk.core.PresenceReport
 import us.spader.pjdesk.core.presenceOnlineFlag
 import us.spader.pjdesk.core.presenceStale
+import us.spader.pjdesk.core.mergeSavedFromAccount
+import us.spader.pjdesk.core.savedComputerCountLine
 import us.spader.pjdesk.core.savedSubtitle
 import us.spader.pjdesk.core.shownVersion
 import us.spader.pjdesk.core.versionBehind
@@ -185,6 +187,15 @@ class SavedOrderTest {
         assertEquals("0.6.43", shownVersion("0.6.43", mine = true, selfVersion = ""))
         assertTrue(versionBehind("0.6.43", "0.6.44"))
         assertFalse(versionBehind("0.6.44", ""))
+    }
+
+    @Test
+    fun aLocalClearStaysUntilTheNextSignIn() {
+        assertFalse(mergeSavedFromAccount(localCleared = true, preferAccount = false))
+        assertTrue(mergeSavedFromAccount(localCleared = true, preferAccount = true))
+        assertTrue(mergeSavedFromAccount(localCleared = false, preferAccount = false))
+        assertEquals("This computer has 3 saved computers.", savedComputerCountLine(3))
+        assertEquals("This computer has 1 saved computer.", savedComputerCountLine(1))
     }
 
     @Test

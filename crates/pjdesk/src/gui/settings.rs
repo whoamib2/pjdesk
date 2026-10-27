@@ -13,6 +13,7 @@ use crate::signaling::ServerAddr;
 enum Tab {
     General,
     Security,
+    Privacy,
     Network,
     Display,
     Account,
@@ -209,6 +210,7 @@ impl App {
                                                         self.scm_known,
                                                     );
                                                 }
+                                                Tab::Privacy => self.privacy_tab(ui),
                                                 Tab::Network => self.network_tab(ui),
                                                 Tab::Display => display_tab(ui, &mut self.settings),
                                                 Tab::Account => self.account_tab(ui),
@@ -235,6 +237,28 @@ impl App {
         if save && self.apply_settings() {
             self.show_settings = false;
         }
+    }
+
+    fn privacy_tab(&mut self, ui: &mut egui::Ui) {
+        widgets::heading(ui, "PRIVACY");
+        ui.label("Saved computers on this computer");
+        ui.label(widgets::muted(
+            ui,
+            "Removing them here does not delete them from your pjdesk.com account or from your other computers.",
+        ));
+        ui.add_space(8.0);
+        if ui.button("Remove all saved computers from this computer").clicked() {
+            self.confirm_clear_saved = true;
+        }
+        ui.add_space(8.0);
+        if ui.button("Sign out and remove everything from this computer").clicked() {
+            self.confirm_sign_out_clear = true;
+        }
+        ui.add_space(8.0);
+        ui.label(widgets::muted(
+            ui,
+            "Sign out and remove also ends the pjdesk.com sign-in on this computer. When Sign out when PJDesk closes is on, closing PJDesk clears the saved list, cached passwords, and recent computers.",
+        ));
     }
 
     fn account_tab(&mut self, ui: &mut egui::Ui) {
@@ -462,6 +486,7 @@ fn nav(ui: &mut egui::Ui, tab: &mut Tab) {
     for (which, label) in [
         (Tab::General, "General"),
         (Tab::Security, "Security"),
+        (Tab::Privacy, "Privacy"),
         (Tab::Network, "Network"),
         (Tab::Display, "Display"),
         (Tab::Account, "Account"),

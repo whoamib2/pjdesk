@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -55,6 +56,7 @@ import us.spader.pjdesk.core.SavedView
 import us.spader.pjdesk.core.arrangeSaved
 import us.spader.pjdesk.core.computerTitle
 import us.spader.pjdesk.core.nickname
+import us.spader.pjdesk.core.savedComputerCountLine
 import us.spader.pjdesk.core.savedMatches
 
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
@@ -83,8 +85,12 @@ fun SavedScreen(
     initialPage: Int = 0,
     refreshing: Boolean = false,
     onRefresh: () -> Unit = {},
+    onRemoveAll: () -> Unit = {},
+    onSignOutRemove: () -> Unit = {},
 ) {
     var page by remember { mutableStateOf(initialPage.coerceIn(0, 2)) }
+    var confirmClear by remember { mutableStateOf(false) }
+    var confirmSignOut by remember { mutableStateOf(false) }
     var searchOpen by remember { mutableStateOf(query.isNotBlank()) }
     var menu by remember { mutableStateOf(false) }
     val self = selfId.filter { it.isDigit() }
@@ -110,6 +116,9 @@ fun SavedScreen(
             filter = filter,
             onSort = onSort,
             onFilter = onFilter,
+            savedPage = page == 0,
+            onRemoveAll = { confirmClear = true },
+            onSignOutRemove = { confirmSignOut = true },
         )
         if (searchOpen) {
             OutlinedTextField(
@@ -218,6 +227,32 @@ fun SavedScreen(
             }
         }
     }
+    if (confirmClear) {
+        LocalSavedClearDialog(
+            title = "Remove all saved computers",
+            count = computers.size,
+            detail = "This clears the saved list, cached passwords, recent computers, and saved addresses on this computer only. Nothing is deleted from your pjdesk.com account or from your other computers.",
+            confirm = "Remove from this computer",
+            onDismiss = { confirmClear = false },
+            onConfirm = {
+                confirmClear = false
+                onRemoveAll()
+            },
+        )
+    }
+    if (confirmSignOut) {
+        LocalSavedClearDialog(
+            title = "Sign out and remove everything",
+            count = computers.size,
+            detail = "This signs out on this computer and clears the saved list, cached passwords, recent computers, and saved addresses here. Nothing is deleted from your pjdesk.com account or from your other computers.",
+            confirm = "Sign out and remove",
+            onDismiss = { confirmSignOut = false },
+            onConfirm = {
+                confirmSignOut = false
+                onSignOutRemove()
+            },
+        )
+    }
     val renaming = editing
     if (renaming != null) {
         Dialog(onDismissRequest = { editing = null }) {
@@ -258,13 +293,16 @@ private fun SavedChrome(
     filter: SavedFilter,
     onSort: (SavedSort) -> Unit,
     onFilter: (SavedFilter) -> Unit,
+    savedPage: Boolean,
+    onRemoveAll: () -> Unit,
+    onSignOutRemove: () -> Unit,
 ) {
     SubcomposeLayout(Modifier.fillMaxWidth().heightIn(min = 48.dp)) { constraints ->
         val maxHeight = constraints.maxHeight.let { if (it == Constraints.Infinity) 10_000 else it }
         val loose = Constraints(maxWidth = 10_000, maxHeight = maxHeight)
         val tabs = subcompose("tabs") { TabStrip(page, onPage) }.first().measure(loose)
         val icons = subcompose("icons") {
-            IconStrip(view, onView, searchOpen, onSearch, menu, onMenu, sort, filter, onSort, onFilter)
+            IconStrip(view, onView, searchOpen, onSearch, menu, onMenu, sort, filter, onSort, onFilter, savedPage, onRemoveAll, onSignOutRemove)
         }.first().measure(loose)
         val stacked = tabs.width + icons.width > constraints.maxWidth
         if (!stacked) {
@@ -278,7 +316,7 @@ private fun SavedChrome(
                 .first()
                 .measure(constraints.copy(minWidth = 0, minHeight = 0))
             val iconPlace = subcompose("icons-full") {
-                IconStrip(view, onView, searchOpen, onSearch, menu, onMenu, sort, filter, onSort, onFilter, Modifier.fillMaxWidth())
+                IconStrip(view, onView, searchOpen, onSearch, menu, onMenu, sort, filter, onSort, onFilter, savedPage, onRemoveAll, onSignOutRemove, Modifier.fillMaxWidth())
             }.first().measure(constraints.copy(minWidth = 0, minHeight = 0))
             val height = tabPlace.height + iconPlace.height
             layout(constraints.maxWidth, height) {
@@ -316,6 +354,9 @@ private fun IconStrip(
     filter: SavedFilter,
     onSort: (SavedSort) -> Unit,
     onFilter: (SavedFilter) -> Unit,
+    savedPage: Boolean,
+    onRemoveAll: () -> Unit,
+    onSignOutRemove: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End) {
@@ -361,9 +402,43 @@ private fun IconStrip(
                         onClick = { onMenu(false); onFilter(value) },
                     )
                 }
+                if (savedPage) {
+                    HorizontalDivider()
+                    DropdownMenuItem(
+                        text = { Text("Remove all saved computers from this computer") },
+                        onClick = { onMenu(false); onRemoveAll() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Sign out and remove everything from this computer") },
+                        onClick = { onMenu(false); onSignOutRemove() },
+                    )
+                }
             }
         }
     }
+}
+
+@Composable
+internal fun LocalSavedClearDialog(
+    title: String,
+    count: Int,
+    detail: String,
+    confirm: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(savedComputerCountLine(count))
+                Text(detail)
+            }
+        },
+        confirmButton = { TextButton(onClick = onConfirm) { Text(confirm) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable

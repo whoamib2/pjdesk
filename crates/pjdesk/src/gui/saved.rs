@@ -344,6 +344,18 @@ impl App {
                         ui.selectable_value(&mut self.saved_sort, SavedSort::Order, "Saved order");
                     });
                 widgets::checkbox(ui, &mut self.saved_favorites, "Favorites");
+                if self.desk_tab == super::DeskTab::Saved {
+                    ui.menu_button("Menu", |ui| {
+                        if ui.button("Remove all saved computers from this computer").clicked() {
+                            self.confirm_clear_saved = true;
+                            ui.close();
+                        }
+                        if ui.button("Sign out and remove everything from this computer").clicked() {
+                            self.confirm_sign_out_clear = true;
+                            ui.close();
+                        }
+                    });
+                }
             });
         });
         ui.add_space(8.0);
@@ -1049,6 +1061,63 @@ impl App {
             self.saved_sort = SavedSort::Order;
             self.save_cfg();
             self.toast.show("Removed from Saved");
+        }
+    }
+
+    pub(super) fn saved_clear_dialogs(&mut self, ctx: &egui::Context) {
+        if self.confirm_clear_saved {
+            self.clear_saved_dialog(ctx, false);
+        }
+        if self.confirm_sign_out_clear {
+            self.clear_saved_dialog(ctx, true);
+        }
+    }
+
+    fn clear_saved_dialog(&mut self, ctx: &egui::Context, sign_out: bool) {
+        let count = self.cfg.local_saved_count();
+        let noun = if count == 1 { "computer" } else { "computers" };
+        let title = if sign_out { "Sign out and remove everything" } else { "Remove all saved computers" };
+        let mut close = false;
+        let mut go = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.label(format!("This computer has {count} saved {noun}."));
+                ui.label(widgets::muted(
+                    ui,
+                    if sign_out {
+                        "This signs out on this computer and clears the saved list, cached passwords, recent computers, and saved addresses here. Nothing is deleted from your pjdesk.com account or from your other computers."
+                    } else {
+                        "This clears the saved list, cached passwords, recent computers, and saved addresses on this computer only. Nothing is deleted from your pjdesk.com account or from your other computers."
+                    },
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    let label = if sign_out { "Sign out and remove" } else { "Remove from this computer" };
+                    if widgets::danger_button(ui, label, Vec2::new(220.0, 32.0)) {
+                        go = true;
+                    }
+                });
+            });
+        if close {
+            self.confirm_clear_saved = false;
+            self.confirm_sign_out_clear = false;
+        }
+        if go {
+            self.confirm_clear_saved = false;
+            self.confirm_sign_out_clear = false;
+            if sign_out {
+                self.sign_out_and_clear_local();
+            } else {
+                self.clear_saved_on_this_computer();
+            }
         }
     }
 

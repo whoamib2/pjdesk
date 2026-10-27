@@ -319,6 +319,8 @@ pub struct App {
     rename_text: String,
     confirm_remove: Option<String>,
     confirm_delete: Option<String>,
+    confirm_clear_saved: bool,
+    confirm_sign_out_clear: bool,
     delete_rx: Option<Receiver<Result<String, String>>>,
     next_account_pull: u64,
     /// Last self-online value written to the log, so a refresh does not repeat it.
@@ -550,6 +552,8 @@ impl App {
             rename_text: String::new(),
             confirm_remove: None,
             confirm_delete: None,
+            confirm_clear_saved: false,
+            confirm_sign_out_clear: false,
             delete_rx: None,
             next_account_pull: 0,
             logged_self_online: None,
@@ -947,6 +951,7 @@ impl App {
         self.cfg.saved_hidden.clear();
         self.cfg.settings.peers.clear();
         self.cfg.ephemeral_network = true;
+        self.cfg.allow_saved_merge();
         self.cfg.apply_network_session(&session);
         self.net_email = self.cfg.network_email.clone().unwrap_or_default();
         self.settings.set_server_text(&self.cfg.effective_server());
@@ -1526,15 +1531,16 @@ impl App {
                     }
                 } else {
                     self.cfg.joined_without_password = without_password;
-                    self.note_enrolled(&session.computers);
-                    self.cfg.apply_network_session(&session);
-                    self.net_email = self.cfg.network_email.clone().unwrap_or_default();
-                    self.settings.set_server_text(&self.cfg.effective_server());
-                    self.save_cfg();
-                    crate::network::copy_to_service(&self.cfg);
-                    self.engine.retarget(&self.cfg);
-                    self.sync_passwords(true);
-                    if without_password {
+                self.note_enrolled(&session.computers);
+                self.cfg.allow_saved_merge();
+                self.cfg.apply_network_session(&session);
+                self.net_email = self.cfg.network_email.clone().unwrap_or_default();
+                self.settings.set_server_text(&self.cfg.effective_server());
+                self.save_cfg();
+                crate::network::copy_to_service(&self.cfg);
+                self.engine.retarget(&self.cfg);
+                self.sync_passwords(true);
+                if without_password {
                         self.arrive_without_password();
                     } else if imported {
                         self.toast.show("Import server configuration successfully");
@@ -2006,9 +2012,8 @@ impl App {
         }
     }
 
-    /// Leaves the PJDesk account. The server address, saved computers, and
-    /// per-computer passwords stay on this computer.
-    /// A temporary sign-in instead restores this computer to how it was.
+    /// Leaves the PJDesk account. A normal sign-out keeps the saved list.
+    /// A temporary sign-in clears the saved list, cached passwords, and recents.
     fn sign_out_network(&mut self) {
         if self.temp.is_some() {
             self.end_temporary_sign_in();
@@ -2023,6 +2028,43 @@ impl App {
             self.status = format!("Could not save settings: {e}");
         }
         self.toast.show("Signed out");
+    }
+
+    /// Clears the saved list on this computer and leaves the account signed in.
+    /// The usual save reloads peer notes from disk, which would put the list back.
+    fn clear_saved_on_this_computer(&mut self) {
+        self.cfg.clear_local_saved();
+        if let Some(temp) = &mut self.temp {
+            temp.snapshot.clear_local_saved();
+        }
+        if let Err(e) = self.cfg.save() {
+            self.status = format!("Could not save settings: {e}");
+        }
+        self.toast.show("Removed saved computers from this computer");
+    }
+
+    /// Signs out on this computer and clears the saved list, passwords, and recents.
+    /// The pjdesk.com account and other devices are left as they are.
+    fn sign_out_and_clear_local(&mut self) {
+        if self.temp.is_some() {
+            self.temp = None;
+            self.temp_left = 0;
+            crate::temp_sign::clear_marker();
+        }
+        self.cfg.ephemeral_network = false;
+        self.cfg.clear_local_saved();
+        self.cfg.leave_network_sign_in();
+        crate::vault::clear_session_key();
+        if let Err(e) = self.cfg.save() {
+            self.status = format!("Could not save settings: {e}");
+        }
+        crate::network::copy_to_service(&self.cfg);
+        self.engine.retarget(&self.cfg);
+        self.net_email.clear();
+        self.show_net_sign_in = false;
+        self.enrolled_for.clear();
+        self.account_computers.clear();
+        self.toast.show("Signed out. Saved computers were removed from this computer");
     }
 
     fn request_saved_refresh(&mut self) {
@@ -3343,6 +3385,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.body(ui));
 
         self.settings_window(&ctx);
+        self.saved_clear_dialogs(&ctx);
         self.invite_window(&ctx);
         self.support_keys_window(&ctx);
         self.session_error_dialog(&ctx);

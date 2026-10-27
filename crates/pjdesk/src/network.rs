@@ -969,7 +969,7 @@ pub fn finish_account_sign_in(session: Session, this: &ThisComputer, local: &[Sa
 
 /// The saved list this computer would upload, including nicknames and hide flags.
 pub fn saved_from_config(config: &Config) -> Vec<SavedComputer> {
-    let body = computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden);
+    let body = upload_computers_body(config);
     let Some(list) = body.get("computers").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -997,6 +997,15 @@ pub fn saved_from_config(config: &Config) -> Vec<SavedComputer> {
             })
         })
         .collect()
+}
+
+/// A local wipe uploads an empty list. The account keeps its rows when the
+/// list is empty, and nothing is sent as hidden.
+fn upload_computers_body(config: &Config) -> serde_json::Value {
+    if config.local_saved_cleared {
+        return serde_json::json!({ "computers": [] });
+    }
+    computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden)
 }
 
 /// Nickname, hostname, ID, and OS. A password is dropped. An alias that is
@@ -1055,7 +1064,7 @@ pub fn push_saved_computers_from_disk() -> Result<()> {
     if refresh_token.is_empty() || device.is_empty() {
         return Ok(());
     }
-    let body = computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden);
+    let body = upload_computers_body(&config);
     let mut session = refresh(&refresh_token, &device, Some(&body))?;
     if let Ok(disk) = Config::load() {
         config.fill_peer_facts_from(&disk);
@@ -1095,7 +1104,7 @@ fn refresh_config_inner(config: &mut Config, force: bool) {
     if !force && now < NEXT_REFRESH_AT.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let body = computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden);
+    let body = upload_computers_body(config);
     let pjdesk_id = config.device_id.clone().unwrap_or_default();
     match refresh_account(&refresh_token, &device, Some(&body), &pjdesk_id, false) {
         Ok(mut session) => {

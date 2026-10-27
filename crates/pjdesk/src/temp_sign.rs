@@ -1,9 +1,9 @@
 //! A sign-in that lasts only until this PJDesk window is done.
 //!
-//! The refresh token stays in memory. The account's saved list, passwords
-//! saved during the visit, and recent computers from the visit are removed
-//! when the window closes, the Windows session locks or ends, or the computer
-//! sits idle. The computer stays in the account's Saved list.
+//! The refresh token stays in memory. When the window closes, the Windows
+//! session locks or ends, or the computer sits idle, the saved list, cached
+//! passwords, and recent computers on this computer are cleared. The account
+//! itself is not deleted.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -88,28 +88,12 @@ pub fn clear_marker() {
     }
 }
 
-/// Puts the config back to what it was before the temporary sign-in.
-/// Passwords and recent rows from the visit are removed even if a viewer
-/// wrote them after the snapshot.
-pub fn restore_after_temporary(disk: &mut Config, snapshot: &Config, session_passwords: &[String], session_recents: &[String]) {
-    for id in disk.saved_passwords.keys().cloned().collect::<Vec<_>>() {
-        if !snapshot.saved_passwords.contains_key(&id) {
-            disk.saved_passwords.remove(&id);
-        }
-    }
-    for id in session_passwords {
-        disk.saved_passwords.remove(id);
-    }
-    for id in session_recents {
-        if let Some(note) = disk.settings.peers.get_mut(id) {
-            let before = snapshot.settings.peers.get(id).map(|n| n.last_connected).unwrap_or(0);
-            if before == 0 {
-                note.last_connected = 0;
-            }
-        }
-    }
+/// Restores the account that was on disk before the visit, then clears the
+/// saved list, cached passwords, and recents on this computer.
+/// `session_passwords` and `session_recents` are the ids noted during the visit.
+/// The clear covers those and anything that was already saved here.
+pub fn restore_after_temporary(disk: &mut Config, snapshot: &Config, _session_passwords: &[String], _session_recents: &[String]) {
     let learned = disk.account_removed.clone();
-    disk.address_book = snapshot.address_book.clone();
     disk.saved_hidden = snapshot.saved_hidden.clone();
     disk.account_removed = snapshot.account_removed.clone();
     for id in learned {
@@ -128,17 +112,12 @@ pub fn restore_after_temporary(disk: &mut Config, snapshot: &Config, session_pas
     disk.network_public_ip = snapshot.network_public_ip.clone();
     disk.server = snapshot.server.clone();
     disk.server_fingerprint = snapshot.server_fingerprint.clone();
-    disk.settings.peers = snapshot.settings.peers.clone();
-    let gone = disk.account_removed.clone();
-    disk.address_book.retain(|e| !gone.iter().any(|h| h == &e.id));
-    for id in &gone {
-        disk.settings.peers.remove(id);
-        disk.saved_passwords.remove(id);
-    }
+    disk.clear_local_saved();
 }
 
-/// A killed temporary sign-in left a marker. Drop the passwords and recents it
-/// names. The refresh token was never written.
+/// A killed temporary sign-in left a marker. Clear the saved list, cached
+/// passwords, and recents. Drop the refresh token when this visit was not
+/// already signed in. The token from the visit was never written.
 pub fn scrub_abandoned() {
     if !marker_active() {
         return;
@@ -148,19 +127,13 @@ pub fn scrub_abandoned() {
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
     if let Ok(mut disk) = Config::load() {
-        for id in &marker.passwords {
-            disk.saved_passwords.remove(id);
-        }
-        for id in &marker.recents {
-            if let Some(note) = disk.settings.peers.get_mut(id) {
-                note.last_connected = 0;
-            }
-        }
+        disk.clear_local_saved();
         if !marker.had_sign_in {
             disk.network_email = None;
             disk.network_refresh = None;
             disk.network_access = None;
             disk.network_access_exp = 0;
+            disk.network_list_merged = false;
         }
         let _ = disk.save();
     }
@@ -273,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_drops_the_visit_and_keeps_the_earlier_list() {
+    fn restore_clears_the_saved_list_passwords_and_recents() {
         let mut snapshot = Config::default();
         snapshot.address_book = vec![pjdesk_proto::signal::AddressEntry {
             id: "111111111".into(),
@@ -296,12 +269,11 @@ mod tests {
             crate::config::PeerNote { last_connected: 9, ..Default::default() },
         );
         restore_after_temporary(&mut disk, &snapshot, &["222222222".into()], &["222222222".into()]);
-        assert_eq!(disk.address_book.len(), 1);
-        assert_eq!(disk.address_book[0].id, "111111111");
+        assert!(disk.address_book.is_empty());
         assert!(disk.network_email.is_none());
         assert!(disk.network_refresh.is_none());
-        assert!(disk.saved_passwords.contains_key("111111111"));
-        assert!(!disk.saved_passwords.contains_key("222222222"));
-        assert_eq!(disk.settings.peers.get("222222222").map(|n| n.last_connected).unwrap_or(0), 0);
+        assert!(disk.saved_passwords.is_empty());
+        assert!(disk.settings.peers.is_empty());
+        assert!(disk.local_saved_cleared);
     }
 }

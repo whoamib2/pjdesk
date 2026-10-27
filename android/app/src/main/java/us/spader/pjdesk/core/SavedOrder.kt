@@ -222,6 +222,16 @@ fun savedSubtitle(computer: SavedComputer, nowMs: Long = System.currentTimeMilli
         .joinToString(" · ")
 }
 
+/** A local wipe stays empty until the next explicit sign-in (`preferAccount`). */
+fun mergeSavedFromAccount(localCleared: Boolean, preferAccount: Boolean): Boolean =
+    !localCleared || preferAccount
+
+/** Confirm-dialog sentence. `count` is the saved list on this device. */
+fun savedComputerCountLine(count: Int): String {
+    val noun = if (count == 1) "computer" else "computers"
+    return "This computer has $count saved $noun."
+}
+
 fun savedMatches(computer: SavedComputer, query: String): Boolean {
     if (query.isBlank()) return true
     val q = query.lowercase()

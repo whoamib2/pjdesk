@@ -303,6 +303,34 @@ class MainActivity : FragmentActivity() {
                 engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", "").toString())
                 account = ""
                 saved = app.store.saved()
+                recentIds = app.store.recentIds()
+                tempWarn = false
+                enrolledFor = ""
+                accountComputers = emptyList()
+            }
+            fun signOutAndClearSaved() {
+                tempFlag.set(false)
+                temporarySession = false
+                visitWithoutPassword = false
+                memoryRefresh = ""
+                if (app.store.temporaryActive()) {
+                    app.store.endTemporaryVisit()
+                } else {
+                    app.store.clearLocalSaved()
+                    app.store.networkEmail = ""
+                    app.store.joinedWithoutPassword = false
+                    app.store.saveNetworkRefresh("")
+                }
+                app.clearVaultKey()
+                cloudAccess = ""
+                inviteCode = ""
+                inviteId = ""
+                inviteExpires = 0
+                inviteListed = false
+                engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", "").toString())
+                account = ""
+                saved = app.store.saved()
+                recentIds = app.store.recentIds()
                 tempWarn = false
                 enrolledFor = ""
                 accountComputers = emptyList()
@@ -512,9 +540,11 @@ class MainActivity : FragmentActivity() {
                             temporarySession = true
                             memoryRefresh = enrolled.refresh
                             lastActivity = android.os.SystemClock.elapsedRealtime()
+                            app.store.allowSavedMerge()
                             app.store.mergeCloud(enrolled.computers)
                         } else {
                             val first = app.store.networkEmail.isBlank()
+                            app.store.allowSavedMerge()
                             app.store.mergeCloud(enrolled.computers, preferAccount = first)
                             app.store.networkEmail = who
                             app.store.saveNetworkRefresh(enrolled.refresh)
@@ -2064,6 +2094,16 @@ class MainActivity : FragmentActivity() {
                                         syncPasswords(true)
                                     },
                                     selfId = state.id,
+                                    onRemoveAll = {
+                                        app.store.clearLocalSaved()
+                                        saved = app.store.saved()
+                                        recentIds = app.store.recentIds()
+                                        scope.launch { snackbar.showSnackbar("Removed saved computers from this computer") }
+                                    },
+                                    onSignOutRemove = {
+                                        signOutAndClearSaved()
+                                        scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
+                                    },
                                     onRename = { computer, nickname ->
                                         app.store.rename(computer.id, nickname)
                                         saved = app.store.saved()
@@ -2191,6 +2231,17 @@ class MainActivity : FragmentActivity() {
                                     },
                                     engineDetail = readiness.detail,
                                     accountEmail = account,
+                                    savedCount = saved.size,
+                                    onRemoveAllSaved = {
+                                        app.store.clearLocalSaved()
+                                        saved = app.store.saved()
+                                        recentIds = app.store.recentIds()
+                                        scope.launch { snackbar.showSnackbar("Removed saved computers from this computer") }
+                                    },
+                                    onSignOutAndRemove = {
+                                        signOutAndClearSaved()
+                                        scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
+                                    },
                                     onSignOut = if (account.isEmpty()) {
                                         null
                                     } else {

@@ -89,6 +89,9 @@ fun SettingsScreen(
     engineDetail: String = "",
     accountEmail: String = "",
     onSignOut: (() -> Unit)? = null,
+    savedCount: Int = 0,
+    onRemoveAllSaved: () -> Unit = {},
+    onSignOutAndRemove: () -> Unit = {},
     remote: us.spader.pjdesk.core.RemoteOptions = us.spader.pjdesk.core.RemoteOptions(),
     onRemote: (us.spader.pjdesk.core.RemoteOptions) -> Unit = {},
     savedAccessKey: String = "",
@@ -98,6 +101,8 @@ fun SettingsScreen(
     var accessKey by rememberSaveable(savedAccessKey) { mutableStateOf(savedAccessKey) }
     var showAccessKey by rememberSaveable { mutableStateOf(false) }
     var name by rememberSaveable(computerName) { mutableStateOf(computerName) }
+    var confirmClear by remember { mutableStateOf(false) }
+    var confirmSignOut by remember { mutableStateOf(false) }
     Column(
         Modifier
             .fillMaxSize()
@@ -321,6 +326,48 @@ fun SettingsScreen(
                 },
                 singleLine = true,
                 label = { Text("Idle minutes") },
+            )
+        }
+        Section("Privacy") {
+            Text(
+                "Removing saved computers here does not delete them from your pjdesk.com account or from your other computers.",
+                color = pjMuted(),
+            )
+            OutlinedButton(onClick = { confirmClear = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("Remove all saved computers from this computer")
+            }
+            OutlinedButton(onClick = { confirmSignOut = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("Sign out and remove everything from this computer")
+            }
+            Text(
+                "Sign out and remove also ends the pjdesk.com sign-in on this computer. When Sign me out when I'm done is on, closing PJDesk clears the saved list, cached passwords, and recent computers.",
+                color = pjMuted(),
+            )
+        }
+        if (confirmClear) {
+            LocalSavedClearDialog(
+                title = "Remove all saved computers",
+                count = savedCount,
+                detail = "This clears the saved list, cached passwords, recent computers, and saved addresses on this computer only. Nothing is deleted from your pjdesk.com account or from your other computers.",
+                confirm = "Remove from this computer",
+                onDismiss = { confirmClear = false },
+                onConfirm = {
+                    confirmClear = false
+                    onRemoveAllSaved()
+                },
+            )
+        }
+        if (confirmSignOut) {
+            LocalSavedClearDialog(
+                title = "Sign out and remove everything",
+                count = savedCount,
+                detail = "This signs out on this computer and clears the saved list, cached passwords, recent computers, and saved addresses here. Nothing is deleted from your pjdesk.com account or from your other computers.",
+                confirm = "Sign out and remove",
+                onDismiss = { confirmSignOut = false },
+                onConfirm = {
+                    confirmSignOut = false
+                    onSignOutAndRemove()
+                },
             )
         }
         Section("About") {
