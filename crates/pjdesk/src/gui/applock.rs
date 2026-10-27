@@ -475,44 +475,49 @@ impl App {
         let raw_id = id.as_deref().unwrap_or("");
         let raw_pw = password.as_deref().unwrap_or("");
         let help = lock_help(raw_id, raw_pw, one_time_withheld(raw_pw, permanent, false));
-        ui.label(RichText::new("Get help").strong().size(16.0).color(p.text));
-        ui.add_space(6.0);
-        ui.label(RichText::new("Your ID").color(p.muted).size(12.5));
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            let shown = if help.id.is_empty() { "— — —".into() } else { help.id.clone() };
-            ui.label(RichText::new(shown).size(28.0).strong().color(p.text));
-            if !help.id.is_empty()
-                && widgets::icon_button(ui, super::icons::Icon::Copy, "Copy ID").clicked()
-                && widgets::copy_to_clipboard(&pjdesk_proto::normalize_id(&help.id))
-            {
-                self.toast.show("ID copied");
-            }
-        });
-        if help.password.is_none() && !help.refresh {
-            return;
-        }
-        ui.add_space(8.0);
-        ui.label(RichText::new("One-time password").color(p.muted).size(12.5));
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            match &help.password {
-                Some(pw) => {
-                    ui.label(RichText::new(pw).size(20.0).monospace().color(p.text));
-                    if widgets::icon_button(ui, super::icons::Icon::Copy, "Copy password").clicked()
-                        && widgets::copy_to_clipboard(pw)
+        theme::card(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("Get help").strong().size(16.0).color(p.text));
+                ui.add_space(8.0);
+                ui.label(RichText::new("Your ID").color(p.muted).size(12.5));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let shown = if help.id.is_empty() { "— — —".into() } else { help.id.clone() };
+                    ui.label(RichText::new(shown).size(32.0).strong().color(p.text));
+                    if !help.id.is_empty()
+                        && widgets::icon_button(ui, super::icons::Icon::Copy, "Copy ID").clicked()
+                        && widgets::copy_to_clipboard(&pjdesk_proto::normalize_id(&help.id))
                     {
-                        self.toast.show("Password copied");
+                        self.toast.show("ID copied");
                     }
+                });
+                if help.password.is_none() && !help.refresh {
+                    return;
                 }
-                None => {
-                    widgets::spinner(ui, p.muted);
-                    ui.label(RichText::new("Waiting for a password").color(p.muted));
-                }
-            }
-            if help.refresh && widgets::icon_button(ui, super::icons::Icon::Refresh, "New one-time password").clicked() {
-                self.refresh_one_time_password();
-            }
+                ui.add_space(10.0);
+                ui.label(RichText::new("One-time password").color(p.muted).size(12.5));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    match &help.password {
+                        Some(pw) => {
+                            ui.label(RichText::new(pw).size(24.0).strong().monospace().color(p.text));
+                            if widgets::icon_button(ui, super::icons::Icon::Copy, "Copy password").clicked()
+                                && widgets::copy_to_clipboard(pw)
+                            {
+                                self.toast.show("Password copied");
+                            }
+                        }
+                        None => {
+                            widgets::spinner(ui, p.muted);
+                            ui.label(RichText::new("Waiting for a password").color(p.muted));
+                        }
+                    }
+                    if help.refresh && widgets::icon_button(ui, super::icons::Icon::Refresh, "New one-time password").clicked()
+                    {
+                        self.refresh_one_time_password();
+                    }
+                });
+            });
         });
     }
 
@@ -540,7 +545,7 @@ impl App {
                     }
                     ui.label(RichText::new("PJDesk").strong().size(18.0).color(p.text));
                     ui.add_space(8.0);
-                    ui.label(RichText::new("Enter your PIN").strong().size(22.0));
+                    ui.label(RichText::new("Enter your PIN").strong().size(22.0).color(p.text));
                     ui.add_space(6.0);
                     ui.label(widgets::muted(
                         ui,
@@ -562,6 +567,7 @@ impl App {
                     self.lock_pin = digits_only(&pin);
                     if self.lock_pin != prior && !waiting {
                         self.lock_error.clear();
+                        self.consider_pin_entry();
                     }
                     let ready = !self.lock_busy && !waiting && !self.lock_pin.is_empty();
                     let can = ready && pjdesk_proto::applock::pin_acceptable(&self.lock_pin);
@@ -706,11 +712,9 @@ impl App {
         self.lock_error = "Wrong PIN.".into();
     }
 
-    /// Hash the current PIN in the background. A match unlocks. Anything else
-    /// is ignored: it is not a wrong attempt and it does not show an error.
-    /// The lock screen does not call this. Enter and Continue use [`Self::start_unlock`],
-    /// so reaching a length does not submit.
-    #[allow(dead_code)]
+    /// Hash the current PIN in the background. A match unlocks. A miss is not
+    /// shown and is not counted, unless eight digits are in. Continue and Enter
+    /// still use [`Self::start_unlock`].
     fn peek_pin(&mut self) {
         if self.lock_busy || self.lock_resetting || !self.lock_ui {
             return;
@@ -744,12 +748,17 @@ impl App {
 
     fn poll_pin_peek(&mut self) {
         let mut matched = false;
+        let mut miss_at_max = false;
         let mut dead = false;
         if let Some(rx) = &self.lock_peek_rx {
             loop {
                 match rx.try_recv() {
                     Ok(true) => matched = true,
-                    Ok(false) => {}
+                    Ok(false) => {
+                        if self.lock_pin.chars().count() == 8 && self.lock_pin == self.lock_peeked {
+                            miss_at_max = true;
+                        }
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         dead = true;
@@ -764,10 +773,35 @@ impl App {
         }
         if matched && self.lock_ui && !self.lock_resetting {
             self.apply_lock_msg(LockMsg::Unlocked);
+            return;
+        }
+        if miss_at_max {
+            self.start_unlock();
+        }
+    }
+
+    /// After a digit. A stored length is checked only at that length. Eight
+    /// digits that are not a silent check are a counted try.
+    fn consider_pin_entry(&mut self) {
+        if self.lock_busy || self.lock_resetting || !self.lock_ui {
+            return;
+        }
+        if self.cfg.app_lock_until > super::unix_now() {
+            return;
+        }
+        let n = self.lock_pin.chars().count();
+        let known = self.saved_pin().map(|v| v.len).unwrap_or(0);
+        if pjdesk_proto::applock::pin_silent_check(n, known) {
+            self.peek_pin();
+        } else if pjdesk_proto::applock::pin_miss_counts(n, false) {
+            self.start_unlock();
         }
     }
 
     fn start_unlock(&mut self) {
+        if self.lock_busy {
+            return;
+        }
         let Some(verifier) = self.saved_pin() else {
             self.lock_error = "No PIN is set for this account.".into();
             return;

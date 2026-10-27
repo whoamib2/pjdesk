@@ -461,6 +461,16 @@ class Store(context: Context) {
         get() = prefs.getInt("accountPinIdle", 300)
         set(value) { prefs.edit().putInt("accountPinIdle", value).commit() }
 
+    /** Digit count stored with the account PIN. 0 means it was not recorded. Not shown. */
+    var accountPinLen: Int
+        get() = prefs.getInt("accountPinLen", 0)
+        set(value) { prefs.edit().putInt("accountPinLen", value).commit() }
+
+    /** Digit count of a PIN that is only on this phone. 0 means it was not recorded. Not shown. */
+    var localPinLen: Int
+        get() = prefs.getInt("localPinLen", 0)
+        set(value) { prefs.edit().putInt("localPinLen", value).commit() }
+
     var appLockSealed: String
         get() = prefs.getString("appLockSealed", "") ?: ""
         set(value) { prefs.edit().putString("appLockSealed", value).commit() }
@@ -505,6 +515,7 @@ class Store(context: Context) {
             .putInt("accountPinIters", verifier.iterations)
             .putLong("accountPinUpdated", verifier.updated)
             .putInt("accountPinIdle", verifier.idleSec)
+            .putInt("accountPinLen", verifier.len)
             .putString("appLockSealed", sealed)
             .putLong("appLockUpdated", updated)
             .putInt("pinFails", 0)
@@ -530,6 +541,7 @@ class Store(context: Context) {
             .putLong("accountPinUpdated", 0L)
             .putString("appLockSealed", "")
             .putLong("appLockUpdated", 0L)
+            .putInt("accountPinLen", 0)
             .putLong("bioForUpdated", 0L)
             .putInt("pinFails", 0)
             .putLong("pinLockedUntil", 0L)
@@ -549,6 +561,7 @@ class Store(context: Context) {
             .putString("pinWrap", "")
             .putString("pinSalt", "")
             .putString("bioWrap", "")
+            .putInt("localPinLen", 0)
             .putInt("pinFails", 0)
             .putBoolean("biometricsOn", false)
             .commit()

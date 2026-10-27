@@ -283,7 +283,10 @@ impl Gate {
                 ui.label(RichText::new("Enter your PIN").strong().size(22.0).color(p.text));
                 ui.add_space(6.0);
                 ui.label(
-                    "Your account stays signed in. This server stays online for incoming connections and updates.",
+                    RichText::new(
+                        "Your account stays signed in. This server stays online for incoming connections and updates.",
+                    )
+                    .color(p.muted),
                 );
                 ui.add_space(12.0);
                 let mut pin = self.pin.clone();
@@ -296,8 +299,8 @@ impl Gate {
                 self.pin = digits(&pin);
                 if self.pin != prior && !waiting {
                     self.error.clear();
+                    self.consider_pin();
                 }
-                self.peek_pin();
                 let can = !self.busy && !waiting && applock::pin_acceptable(&self.pin);
                 if submitted(ui, &pin_box) && can {
                     self.start_unlock();
@@ -310,7 +313,10 @@ impl Gate {
                 }
                 if self.forgot {
                     ui.add_space(8.0);
-                    ui.label("This is your pjdesk.com password. After it is accepted you choose a new PIN.");
+                    ui.label(
+                        RichText::new("This is your pjdesk.com password. After it is accepted you choose a new PIN.")
+                            .color(p.muted),
+                    );
                     let pass_box = secret_field(ui, &mut self.password, "Account password", &mut self.pass_show);
                     ui.add_space(8.0);
                     let can_reset = !self.busy && !self.password.is_empty();
@@ -353,7 +359,8 @@ impl Gate {
     }
 
     /// Hash the current PIN in the background. A match unlocks. A mismatch
-    /// while typing is not a failed attempt and shows no error.
+    /// while typing is not a failed attempt and shows no error, unless eight
+    /// digits are in.
     fn peek_pin(&mut self) {
         if self.busy || self.resetting || !self.ui {
             return;
@@ -385,12 +392,17 @@ impl Gate {
 
     fn poll_peek(&mut self) {
         let mut matched = false;
+        let mut miss_at_max = false;
         let mut dead = false;
         if let Some(rx) = &self.peek_rx {
             loop {
                 match rx.try_recv() {
                     Ok(true) => matched = true,
-                    Ok(false) => {}
+                    Ok(false) => {
+                        if self.pin.chars().count() == 8 && self.pin == self.peeked {
+                            miss_at_max = true;
+                        }
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         dead = true;
@@ -405,10 +417,30 @@ impl Gate {
         }
         if matched && self.ui && !self.resetting {
             self.unlock();
+            return;
+        }
+        if miss_at_max {
+            self.start_unlock();
+        }
+    }
+
+    fn consider_pin(&mut self) {
+        if self.busy || self.resetting || !self.ui || self.until > unix_now() {
+            return;
+        }
+        let n = self.pin.chars().count();
+        let known = self.verifier.as_ref().map(|v| v.len).unwrap_or(0);
+        if applock::pin_silent_check(n, known) {
+            self.peek_pin();
+        } else if applock::pin_miss_counts(n, false) {
+            self.start_unlock();
         }
     }
 
     fn start_unlock(&mut self) {
+        if self.busy {
+            return;
+        }
         let Some(verifier) = self.verifier.clone() else {
             self.error = "Set a PIN first.".into();
             return;

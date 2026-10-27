@@ -13,9 +13,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -26,6 +29,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -57,11 +62,28 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import us.spader.pjdesk.R
 import us.spader.pjdesk.core.AppLockPolicy
+
+/** Dark window background with theme text, below the status bar and the gesture area. */
+@Composable
+private fun LockPage(content: @Composable () -> Unit) {
+    val scheme = MaterialTheme.colorScheme
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = scheme.background,
+        contentColor = scheme.onBackground,
+    ) {
+        Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
+            content()
+        }
+    }
+}
 
 @Composable
 fun SetPinScreen(
@@ -107,6 +129,7 @@ fun SetPinScreen(
     LaunchedEffect(needPassword) {
         if (!needPassword) runCatching { focus.requestFocus() }
     }
+    LockPage {
     Column(
         Modifier
             .fillMaxSize()
@@ -197,6 +220,7 @@ fun SetPinScreen(
         }
         if (onCancel != null) TextButton(onClick = onCancel, enabled = !busy) { Text("Cancel") }
     }
+    }
 }
 
 private fun pinDigit(key: Key): Char? = when (key) {
@@ -220,7 +244,9 @@ fun UnlockScreen(
     biometrics: Boolean,
     rejectCount: Int = 0,
     lockedOut: Boolean = false,
+    knownLen: Int = 0,
     onSubmit: (String) -> Unit,
+    onSilent: (String) -> Unit = {},
     onEdit: () -> Unit = {},
     onBiometric: () -> Unit,
     onForgot: () -> Unit = {},
@@ -236,6 +262,7 @@ fun UnlockScreen(
     var localError by remember { mutableStateOf("") }
     var localShake by remember { mutableIntStateOf(0) }
     val focus = remember { FocusRequester() }
+    val ink = MaterialTheme.colorScheme.onBackground
     fun submit() {
         if (busy || lockedOut) return
         if (!AppLockPolicy.pinAcceptable(pin)) {
@@ -252,6 +279,16 @@ fun UnlockScreen(
         localError = ""
         onEdit()
     }
+    fun changePin(next: String) {
+        if (busy || lockedOut || next.length > 8) return
+        replacePin(next)
+        if (next != pin) return
+        if (AppLockPolicy.pinSilentCheck(next.length, knownLen)) {
+            onSilent(next)
+        } else if (next.length == 8) {
+            onSubmit(next)
+        }
+    }
     LaunchedEffect(rejectCount) {
         if (rejectCount > 0) {
             pin = ""
@@ -263,6 +300,7 @@ fun UnlockScreen(
     }
     val withheld = oneTimeWithheld(oneTimePassword, permanentSet, passwordHidden)
     val help = lockHelp(computerId, oneTimePassword, withheld)
+    LockPage {
     Column(
         Modifier
             .fillMaxSize()
@@ -278,35 +316,33 @@ fun UnlockScreen(
                 if (event.type != KeyEventType.KeyDown || busy || lockedOut) return@onPreviewKeyEvent false
                 val digit = pinDigit(event.key)
                 if (digit != null) {
-                    if (pin.length < 8) replacePin(pin + digit)
+                    if (pin.length < 8) changePin(pin + digit)
                     return@onPreviewKeyEvent true
                 }
                 if (event.key == Key.Backspace || event.key == Key.Delete) {
-                    if (pin.isNotEmpty()) replacePin(pin.dropLast(1))
+                    if (pin.isNotEmpty()) changePin(pin.dropLast(1))
                     return@onPreviewKeyEvent true
                 }
                 false
             }
-            .padding(horizontal = 24.dp, vertical = 32.dp),
+            .padding(horizontal = 24.dp, vertical = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Spacer(Modifier.size(8.dp))
-        LockHelpCard(
-            help = help,
-            onCopyId = onCopyId,
-            onCopyPassword = onCopyPassword,
-            onRefreshPassword = onRefreshPassword,
-        )
-        Spacer(Modifier.size(24.dp))
+        Spacer(Modifier.size(12.dp))
         LockMark()
         Spacer(Modifier.size(8.dp))
-        Text("PJDesk", style = MaterialTheme.typography.titleLarge)
+        Text("PJDesk", color = ink, style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.size(12.dp))
-        Text("Enter your PIN", style = MaterialTheme.typography.headlineMedium, textAlign = TextAlign.Center)
+        Text(
+            "Enter your PIN",
+            color = ink,
+            style = MaterialTheme.typography.headlineMedium,
+            textAlign = TextAlign.Center,
+        )
         Spacer(Modifier.size(8.dp))
         Text(
             "Your account stays signed in.",
-            color = pjMuted(),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodyMedium,
             textAlign = TextAlign.Center,
         )
@@ -323,9 +359,9 @@ fun UnlockScreen(
             showBiometric = biometrics && !lockedOut,
             onDigit = { digit ->
                 if (pin.length >= 8) return@PinKeypad
-                replacePin(pin + digit)
+                changePin(pin + digit)
             },
-            onBackspace = { if (pin.isNotEmpty()) replacePin(pin.dropLast(1)) },
+            onBackspace = { if (pin.isNotEmpty()) changePin(pin.dropLast(1)) },
             onBiometric = onBiometric,
         )
         Spacer(Modifier.size(20.dp))
@@ -335,6 +371,15 @@ fun UnlockScreen(
             modifier = Modifier.fillMaxWidth(),
         ) { Text(if (busy) "Checking…" else "Continue") }
         TextButton(onClick = onForgot, enabled = !busy) { Text("Forgot PIN? Sign in again") }
+        Spacer(Modifier.size(28.dp))
+        LockHelpCard(
+            help = help,
+            onCopyId = onCopyId,
+            onCopyPassword = onCopyPassword,
+            onRefreshPassword = onRefreshPassword,
+        )
+        Spacer(Modifier.size(12.dp))
+    }
     }
 }
 
@@ -365,34 +410,51 @@ private fun LockHelpCard(
     onCopyPassword: () -> Unit,
     onRefreshPassword: () -> Unit,
 ) {
-    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("Get help", style = MaterialTheme.typography.titleMedium)
-        Spacer(Modifier.size(8.dp))
-        Text("Your ID", color = pjMuted(), style = MaterialTheme.typography.labelMedium)
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                help.id.ifBlank { "— — —" },
-                style = MaterialTheme.typography.headlineSmall,
-                fontFamily = FontFamily.Monospace,
-            )
-            if (help.id.isNotBlank()) {
-                TextButton(onClick = onCopyId) { Text("Copy") }
-            }
-        }
-        if (help.password != null || help.refresh) {
-            Spacer(Modifier.size(8.dp))
-            Text("One-time password", color = pjMuted(), style = MaterialTheme.typography.labelMedium)
+    val scheme = MaterialTheme.colorScheme
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = scheme.surface,
+            contentColor = scheme.onSurface,
+        ),
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 18.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text("Get help", color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.size(10.dp))
+            Text("Your ID", color = scheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    help.password ?: "Waiting for a password",
-                    style = MaterialTheme.typography.titleLarge,
+                    help.id.ifBlank { "— — —" },
+                    color = scheme.onSurface,
                     fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 32.sp,
+                    letterSpacing = 1.sp,
                 )
-                if (help.password != null) {
-                    TextButton(onClick = onCopyPassword) { Text("Copy") }
+                if (help.id.isNotBlank()) {
+                    TextButton(onClick = onCopyId) { Text("Copy") }
                 }
-                if (help.refresh) {
-                    TextButton(onClick = onRefreshPassword) { Text("New") }
+            }
+            if (help.password != null || help.refresh) {
+                Spacer(Modifier.size(8.dp))
+                Text("One-time password", color = scheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        help.password ?: "Waiting for a password",
+                        color = if (help.password != null) scheme.onSurface else scheme.onSurfaceVariant,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 22.sp,
+                    )
+                    if (help.password != null) {
+                        TextButton(onClick = onCopyPassword) { Text("Copy") }
+                    }
+                    if (help.refresh) {
+                        TextButton(onClick = onRefreshPassword) { Text("New") }
+                    }
                 }
             }
         }
@@ -409,6 +471,7 @@ fun ReauthScreen(
     onCancel: (() -> Unit)? = null,
 ) {
     var password by remember { mutableStateOf("") }
+    LockPage {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -434,6 +497,7 @@ fun ReauthScreen(
             modifier = Modifier.fillMaxWidth(),
         ) { Text(if (busy) "Signing in…" else "Sign in with your password") }
         if (onCancel != null) TextButton(onClick = onCancel, enabled = !busy) { Text("Use PIN") }
+    }
     }
 }
 
@@ -565,6 +629,7 @@ private fun PinKey(enabled: Boolean, onClick: () -> Unit, content: @Composable (
         enabled = enabled,
         shape = CircleShape,
         color = MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = MaterialTheme.colorScheme.onSurface,
         modifier = Modifier.size(76.dp),
     ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { content() }

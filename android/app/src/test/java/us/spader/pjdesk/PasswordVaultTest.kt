@@ -74,6 +74,13 @@ class PasswordVaultTest {
         assertEquals(60, AppLockPolicy.lockoutSeconds(5))
         assertEquals(120, AppLockPolicy.lockoutSeconds(6))
         assertEquals(1800, AppLockPolicy.lockoutSeconds(9))
+        assertTrue(AppLockPolicy.pinSilentCheck(4, 4))
+        assertFalse(AppLockPolicy.pinSilentCheck(5, 4))
+        assertTrue(AppLockPolicy.pinSilentCheck(6, 0))
+        assertFalse(AppLockPolicy.pinMissCounts(4, false))
+        assertTrue(AppLockPolicy.pinMissCounts(4, true))
+        assertFalse(AppLockPolicy.pinMissCounts(3, true))
+        assertTrue(AppLockPolicy.pinMissCounts(8, false))
     }
 
     @Test
@@ -86,12 +93,14 @@ class PasswordVaultTest {
         val key = ByteArray(32) { 4 }
         val made = AccountPin.create("1234", 0, 0)
         assertEquals(AccountPin.IDLE_DEFAULT, made.idleSec)
+        assertEquals(4, made.len)
         assertTrue(AccountPin.matches("1234", made.salt, made.hash, made.iterations))
         assertFalse(AccountPin.matches("9999", made.salt, made.hash, made.iterations))
         val sealed = AccountPin.seal(key, made)
         assertTrue(sealed.startsWith("UEpMT0NLMD"))
         val opened = AccountPin.open(key, sealed)
         assertEquals(made.hash, opened.hash)
+        assertEquals(4, opened.len)
         assertTrue(AccountPin.matches("1234", opened.salt, opened.hash, opened.iterations))
     }
 }
