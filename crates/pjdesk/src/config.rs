@@ -150,9 +150,15 @@ pub struct Config {
     #[serde(default)]
     pub account_removed: Vec<String>,
     /// The saved list on this computer was cleared. Account refreshes must
-    /// not put it back. The next explicit sign-in clears this.
+    /// not put it back. Load my saved computers clears this. A sign-in clears
+    /// it only when this device already syncs the account list.
     #[serde(default)]
     pub local_saved_cleared: bool,
+    /// Whether this device downloads the account's saved computers.
+    /// `None` is a config from before the choice. Startup sets `Some(true)`
+    /// when this computer already shows a list, so an update does not wipe it.
+    #[serde(default)]
+    pub saved_sync: Option<bool>,
     /// A sign-in that must not be written. Saves keep the account, the saved
     /// list, and passwords already on disk, and write this process's device id.
     #[serde(skip)]
@@ -853,21 +859,55 @@ impl Config {
         if let Ok(fp) = parse_fingerprint(&session.standby_fingerprint) {
             self.network_standby_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         }
-        for id in &session.removed {
-            self.forget_account_computer(id);
-        }
-        for computer in &session.computers {
-            let id = pjdesk_proto::normalize_id(&computer.id);
-            let still = session.removed.iter().any(|r| pjdesk_proto::normalize_id(r) == id);
-            if !computer.hidden && !still {
-                self.account_removed.retain(|h| h != &id);
+        // A device that has not chosen to sync keeps its local list. The
+        // account's rows are not merged, and `network_list_merged` stays false
+        // so the next launch does not treat an empty list as "already syncing".
+        if self.saved_sync != Some(false) {
+            for id in &session.removed {
+                self.forget_account_computer(id);
+            }
+            for computer in &session.computers {
+                let id = pjdesk_proto::normalize_id(&computer.id);
+                let still = session.removed.iter().any(|r| pjdesk_proto::normalize_id(r) == id);
+                if !computer.hidden && !still {
+                    self.account_removed.retain(|h| h != &id);
+                }
+            }
+            let first = !self.network_list_merged;
+            self.merge_computers(&session.computers, first);
+            self.merge_presence(&session.presence);
+            if !session.email.trim().is_empty() || !session.refresh.is_empty() {
+                self.network_list_merged = true;
             }
         }
-        let first = !self.network_list_merged;
-        self.merge_computers(&session.computers, first);
-        self.merge_presence(&session.presence);
-        if !session.email.trim().is_empty() || !session.refresh.is_empty() {
-            self.network_list_merged = true;
+    }
+
+    /// This device downloads the account's saved computers and their passwords.
+    pub fn syncs_saved_computers(&self) -> bool {
+        self.saved_sync == Some(true)
+    }
+
+    /// Existing installs that already show a saved list keep syncing.
+    /// An empty computer that has never merged stays undecided.
+    /// Returns true when the caller should save.
+    pub fn decide_saved_sync_on_load(&mut self) -> bool {
+        if self.saved_sync.is_some() {
+            return false;
+        }
+        if self.local_saved_count() == 0 && !self.network_list_merged {
+            return false;
+        }
+        self.saved_sync = Some(true);
+        true
+    }
+
+    /// A sign-in downloads the account list only when this device already syncs.
+    /// Otherwise the choice is remembered as no, and the list stays as it is.
+    pub fn prepare_sign_in_saved_sync(&mut self) {
+        if self.syncs_saved_computers() {
+            self.allow_saved_merge();
+        } else {
+            self.saved_sync = Some(false);
         }
     }
 
@@ -1850,5 +1890,72 @@ mod tests {
         assert_eq!(s.permanent_password().as_deref(), Some("letmein"));
         s.set_permanent_password(None);
         assert_eq!(s.permanent_password(), None);
+    }
+
+    fn session_with(id: &str, name: &str) -> crate::network::Session {
+        crate::network::Session {
+            email: "ben@spader.us".into(),
+            access: "access".into(),
+            exp: 0,
+            refresh: "refresh".into(),
+            device_id: "dev".into(),
+            address: "pjdesk.spader.us:21200".into(),
+            fingerprint: String::new(),
+            standby_address: String::new(),
+            standby_fingerprint: String::new(),
+            lan: Vec::new(),
+            public_ip: String::new(),
+            standby_lan: Vec::new(),
+            standby_public_ip: String::new(),
+            routes: Default::default(),
+            computers: vec![crate::network::SavedComputer {
+                id: id.into(),
+                name: name.into(),
+                ..Default::default()
+            }],
+            presence: Vec::new(),
+            removed: Vec::new(),
+            vault_key: None,
+            role: String::new(),
+            support: None,
+        }
+    }
+
+    #[test]
+    fn an_existing_list_keeps_syncing_and_a_new_sign_in_does_not_download_it() {
+        let mut existing = Config::default();
+        existing.address_book = vec![AddressEntry { id: "111111111".into(), alias: "Cabin".into(), ..Default::default() }];
+        assert!(existing.decide_saved_sync_on_load());
+        assert_eq!(existing.saved_sync, Some(true));
+        assert!(!existing.decide_saved_sync_on_load());
+        assert_eq!(existing.local_saved_count(), 1);
+
+        let mut merged = Config::default();
+        merged.network_list_merged = true;
+        assert!(merged.decide_saved_sync_on_load());
+        assert_eq!(merged.saved_sync, Some(true));
+        assert!(merged.address_book.is_empty());
+
+        let mut fresh = Config::default();
+        assert!(!fresh.decide_saved_sync_on_load());
+        assert!(fresh.saved_sync.is_none());
+        fresh.prepare_sign_in_saved_sync();
+        assert_eq!(fresh.saved_sync, Some(false));
+        fresh.apply_network_session(&session_with("333333333", "Pixel"));
+        assert!(fresh.address_book.is_empty());
+        assert!(!fresh.network_list_merged);
+        assert_eq!(fresh.network_email.as_deref(), Some("ben@spader.us"));
+        assert!(!fresh.network_refresh_token().is_empty());
+
+        fresh.saved_sync = Some(true);
+        fresh.network_list_merged = false;
+        fresh.apply_network_session(&session_with("333333333", "Pixel"));
+        assert!(fresh.address_book.iter().any(|e| e.id == "333333333"));
+        assert!(fresh.network_list_merged);
+
+        fresh.saved_sync = Some(true);
+        fresh.clear_local_saved();
+        assert_eq!(fresh.saved_sync, Some(true));
+        assert!(fresh.address_book.is_empty());
     }
 }

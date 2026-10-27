@@ -226,6 +226,16 @@ fun savedSubtitle(computer: SavedComputer, nowMs: Long = System.currentTimeMilli
 fun mergeSavedFromAccount(localCleared: Boolean, preferAccount: Boolean): Boolean =
     !localCleared || preferAccount
 
+/**
+ * Existing installs that already show a saved list keep syncing.
+ * An empty list stays unset until the next sign-in chooses no.
+ * `stored` is `yes`, `no`, or empty.
+ */
+fun savedSyncChoiceOnUpdate(stored: String, savedCount: Int): String {
+    if (stored == "yes" || stored == "no") return stored
+    return if (savedCount > 0) "yes" else ""
+}
+
 /** Confirm-dialog sentence. `count` is the saved list on this device. */
 fun savedComputerCountLine(count: Int): String {
     val noun = if (count == 1) "computer" else "computers"

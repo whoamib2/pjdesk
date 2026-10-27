@@ -112,6 +112,9 @@ pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result
     crate::client_update::adopt_completed_update();
     crate::temp_sign::scrub_abandoned();
     let mut config = Config::load().unwrap_or_default();
+    if config.decide_saved_sync_on_load() {
+        let _ = config.save();
+    }
     if let Some(flag) = &server_flag {
         if let Ok(addr) = ServerAddr::parse(flag) {
             config.server = Some(addr.to_string());
@@ -372,6 +375,8 @@ pub struct App {
     net_key_account: bool,
     net_busy: bool,
     net_error: String,
+    /// When pjdesk.com paused email sign-in. Sign in stays off until this instant.
+    net_pause_until: Option<Instant>,
     show_net_sign_in: bool,
     /// The signed-in account owns an empty network and this computer already has a server.
     net_offer: bool,
@@ -594,6 +599,7 @@ impl App {
             net_key_account: false,
             net_busy: false,
             net_error: String::new(),
+            net_pause_until: None,
             show_net_sign_in: false,
             net_offer: false,
             net_login: String::new(),
@@ -945,14 +951,23 @@ impl App {
         let had = !snapshot.network_refresh_token().is_empty();
         crate::temp_sign::begin_marker(had);
         self.note_enrolled(&session.computers);
-        // Show the account's computers for this visit. The list that was already
-        // on this computer stays in the snapshot and is not uploaded.
-        self.cfg.address_book.clear();
-        self.cfg.saved_hidden.clear();
-        self.cfg.settings.peers.clear();
+        let syncing = self.cfg.syncs_saved_computers();
         self.cfg.ephemeral_network = true;
-        self.cfg.allow_saved_merge();
+        if syncing {
+            // Show the account's computers for this visit. The list that was
+            // already on this computer stays in the snapshot and is not uploaded.
+            self.cfg.address_book.clear();
+            self.cfg.saved_hidden.clear();
+            self.cfg.settings.peers.clear();
+            self.cfg.allow_saved_merge();
+        } else {
+            self.cfg.saved_sync = Some(false);
+        }
         self.cfg.apply_network_session(&session);
+        if !syncing {
+            // Remember "don't download" without writing this visit's tokens.
+            let _ = self.cfg.save();
+        }
         self.net_email = self.cfg.network_email.clone().unwrap_or_default();
         self.settings.set_server_text(&self.cfg.effective_server());
         self.temp = Some(TempHold { snapshot, last_activity: Instant::now(), warning: false });
@@ -1174,7 +1189,7 @@ impl App {
         if let Some(grant) = &support {
             crate::network::ensure_support_computer(&mut account, &id, &grant.label);
         }
-        let local = if self.temp.is_some() || support.is_some() {
+        let local = if self.temp.is_some() || support.is_some() || !self.cfg.syncs_saved_computers() {
             Vec::new()
         } else {
             crate::network::saved_from_config(&self.cfg)
@@ -1467,6 +1482,7 @@ impl App {
                 self.net_key_pass.clear();
                 self.import_pass.clear();
                 self.net_error.clear();
+                self.net_pause_until = None;
                 self.show_net_sign_in = false;
                 self.pending_temporary = false;
                 self.pending_enroll_only = false;
@@ -1503,6 +1519,7 @@ impl App {
                 self.net_key_pass.clear();
                 self.import_pass.clear();
                 self.net_error.clear();
+                self.net_pause_until = None;
                 self.show_net_sign_in = false;
                 let mut session = session;
                 if !without_password {
@@ -1532,7 +1549,7 @@ impl App {
                 } else {
                     self.cfg.joined_without_password = without_password;
                 self.note_enrolled(&session.computers);
-                self.cfg.allow_saved_merge();
+                self.cfg.prepare_sign_in_saved_sync();
                 self.cfg.apply_network_session(&session);
                 self.net_email = self.cfg.network_email.clone().unwrap_or_default();
                 self.settings.set_server_text(&self.cfg.effective_server());
@@ -1570,10 +1587,10 @@ impl App {
                     self.support_keys.enter_note = format!(
                         "{owner} needs your permission before this computer can be opened without asking."
                     );
-                    self.net_error = e;
+                    self.note_sign_in_error(e);
                 } else {
                     self.support_keys.enter_note = e.clone();
-                    self.net_error = e;
+                    self.note_sign_in_error(e);
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -1585,6 +1602,9 @@ impl App {
     }
 
     fn sync_passwords(&mut self, upload: bool) {
+        if !self.cfg.syncs_saved_computers() {
+            return;
+        }
         let Some(key) = crate::vault::key_from(&self.cfg) else { return };
         let refresh = self.cfg.network_refresh_token();
         let device = self.cfg.network_device_id.clone().unwrap_or_default();
@@ -1618,6 +1638,9 @@ impl App {
         if self.net_busy {
             return;
         }
+        if self.net_mode == 0 && self.sign_in_paused().is_some() {
+            return;
+        }
         if (self.net_mode == 2 || self.net_mode == 3) && self.route_pasted_key() {
             return;
         }
@@ -1633,7 +1656,7 @@ impl App {
         self.pending_enroll_only = enroll_only;
         self.pending_without_password = self.net_mode == 1 || self.net_mode == 2;
         let this = crate::network::ThisComputer::local(&pjdesk_id);
-        let local = if self.pending_temporary || enroll_only {
+        let local = if self.pending_temporary || enroll_only || !self.cfg.syncs_saved_computers() {
             Vec::new()
         } else {
             crate::network::saved_from_config(&self.cfg)
@@ -1810,7 +1833,7 @@ impl App {
         let name = crate::hostname();
         let enroll_only = self.pending_enroll_only;
         let this = crate::network::ThisComputer::local(&self.visible_id());
-        let local = if self.pending_temporary || enroll_only {
+        let local = if self.pending_temporary || enroll_only || !self.cfg.syncs_saved_computers() {
             Vec::new()
         } else {
             crate::network::saved_from_config(&self.cfg)
@@ -2034,8 +2057,10 @@ impl App {
     /// The usual save reloads peer notes from disk, which would put the list back.
     fn clear_saved_on_this_computer(&mut self) {
         self.cfg.clear_local_saved();
+        self.cfg.saved_sync = Some(false);
         if let Some(temp) = &mut self.temp {
             temp.snapshot.clear_local_saved();
+            temp.snapshot.saved_sync = Some(false);
         }
         if let Err(e) = self.cfg.save() {
             self.status = format!("Could not save settings: {e}");
@@ -2053,6 +2078,7 @@ impl App {
         }
         self.cfg.ephemeral_network = false;
         self.cfg.clear_local_saved();
+        self.cfg.saved_sync = Some(false);
         self.cfg.leave_network_sign_in();
         crate::vault::clear_session_key();
         if let Err(e) = self.cfg.save() {
@@ -2071,8 +2097,21 @@ impl App {
         self.next_account_pull = 0;
     }
 
+    /// Downloads the account list once and keeps syncing it on this device.
+    fn load_saved_computers(&mut self) {
+        self.cfg.saved_sync = Some(true);
+        self.cfg.local_saved_cleared = false;
+        self.cfg.network_list_merged = false;
+        if let Err(e) = self.cfg.save() {
+            self.status = format!("Could not save settings: {e}");
+        }
+        self.request_saved_refresh();
+        self.sync_passwords(false);
+        self.toast.show("Loading saved computers");
+    }
+
     fn maybe_pull_account(&mut self) {
-        if self.temp.is_some() || self.saved_rx.is_some() || self.delete_rx.is_some() {
+        if (self.temp.is_some() && !self.cfg.syncs_saved_computers()) || self.saved_rx.is_some() || self.delete_rx.is_some() {
             return;
         }
         let refresh_token = self.cfg.network_refresh_token();

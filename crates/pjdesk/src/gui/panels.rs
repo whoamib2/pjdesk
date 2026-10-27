@@ -268,6 +268,30 @@ impl App {
         });
     }
 
+    pub(super) fn note_sign_in_error(&mut self, err: String) {
+        if let Some(secs) = crate::network::sign_in_pause_seconds_from_text(&err) {
+            self.net_pause_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+        } else {
+            self.net_pause_until = None;
+        }
+        self.net_error = err;
+    }
+
+    /// Remaining seconds of a login pause. Zero re-enables Sign in and clears the sentence.
+    pub(super) fn sign_in_paused(&mut self) -> Option<u64> {
+        let until = self.net_pause_until?;
+        let left = until.saturating_duration_since(std::time::Instant::now()).as_secs();
+        if left == 0 {
+            self.net_pause_until = None;
+            if self.net_error.starts_with("Too many sign-in attempts from this computer") {
+                self.net_error.clear();
+            }
+            None
+        } else {
+            Some(left)
+        }
+    }
+
     fn sign_in_panel(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
         let mut go = false;
@@ -382,7 +406,12 @@ impl App {
                     ));
                 }
                 ui.add_space(8.0);
-                if !self.net_error.is_empty() && crate::support_keys::parse_consent(&self.net_error).is_none() {
+                let pause_left = if self.net_mode == 0 { self.sign_in_paused() } else { None };
+                if let Some(left) = pause_left {
+                    ui.colored_label(p.warn, crate::network::sign_in_pause_text(left));
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                    ui.add_space(6.0);
+                } else if !self.net_error.is_empty() && crate::support_keys::parse_consent(&self.net_error).is_none() {
                     ui.colored_label(p.warn, &self.net_error);
                     ui.add_space(6.0);
                 }
@@ -403,10 +432,16 @@ impl App {
                 } else {
                     "Sign in"
                 };
-                if widgets::accent_button(ui, label, egui::vec2(ui.available_width(), 40.0)) && !self.net_busy {
+                let sign_in_open = !self.net_busy && pause_left.is_none();
+                let clicked = ui
+                    .add_enabled_ui(sign_in_open, |ui| {
+                        widgets::accent_button(ui, label, egui::vec2(ui.available_width(), 40.0))
+                    })
+                    .inner;
+                if clicked && sign_in_open {
                     go = true;
                 }
-                if self.net_mode == 0 && !self.net_busy {
+                if self.net_mode == 0 && sign_in_open {
                     ui.add_space(4.0);
                     let link = ui.add(
                         egui::Button::new(

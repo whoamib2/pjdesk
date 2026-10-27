@@ -302,7 +302,18 @@ impl App {
             });
             ui.add_space(6.0);
             if self.desk_tab == super::DeskTab::Saved {
-                if let Some(email) = self.cfg.network_email.as_deref().filter(|s| !s.is_empty()) {
+                if self.signed_in() && !self.cfg.syncs_saved_computers() {
+                    let email = self.cfg.network_email.as_deref().unwrap_or("").trim();
+                    let line = if email.is_empty() {
+                        "Signed in. This computer has not loaded your saved computers.".to_string()
+                    } else {
+                        format!("Signed in as {email}. This computer has not loaded your saved computers.")
+                    };
+                    ui.label(widgets::muted(ui, &line));
+                    if ui.button("Load my saved computers").clicked() {
+                        self.load_saved_computers();
+                    }
+                } else if let Some(email) = self.cfg.network_email.as_deref().filter(|s| !s.is_empty()) {
                     ui.label(widgets::muted(
                         ui,
                         &format!("Signed in as {email}. This list syncs with your account. Saved passwords sync too, encrypted so the server cannot read them."),

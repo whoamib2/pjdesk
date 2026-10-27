@@ -30,7 +30,24 @@ class Store(context: Context) {
 
     init {
         movePlainPermanentIntoKeystore()
+        decideSavedSyncOnLoad()
         if (markerFile.exists()) endTemporaryVisit()
+    }
+
+    /**
+     * `yes` downloads the account's saved computers. `no` leaves this phone's
+     * list alone. Empty is a phone from before the choice.
+     */
+    var savedSyncChoice: String
+        get() = prefs.getString("savedSync", "") ?: ""
+        set(value) { prefs.edit().putString("savedSync", value).commit() }
+
+    fun syncsSavedComputers(): Boolean = savedSyncChoice == "yes"
+
+    /** An update keeps a list that is already on this phone. It does not wipe it. */
+    fun decideSavedSyncOnLoad() {
+        val next = us.spader.pjdesk.core.savedSyncChoiceOnUpdate(savedSyncChoice, saved().size)
+        if (next != savedSyncChoice) savedSyncChoice = next
     }
 
     /** Server access key. Sealed in the Android keystore. Not written to pjdesk.json. */

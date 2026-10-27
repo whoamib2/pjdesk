@@ -21,6 +21,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -87,6 +88,8 @@ fun SavedScreen(
     onRefresh: () -> Unit = {},
     onRemoveAll: () -> Unit = {},
     onSignOutRemove: () -> Unit = {},
+    showLoadSaved: Boolean = false,
+    onLoadSaved: () -> Unit = {},
 ) {
     var page by remember { mutableStateOf(initialPage.coerceIn(0, 2)) }
     var confirmClear by remember { mutableStateOf(false) }
@@ -120,6 +123,12 @@ fun SavedScreen(
             onRemoveAll = { confirmClear = true },
             onSignOutRemove = { confirmSignOut = true },
         )
+        if (page == 0 && showLoadSaved) {
+            Button(
+                onClick = onLoadSaved,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            ) { Text("Load my saved computers") }
+        }
         if (searchOpen) {
             OutlinedTextField(
                 value = query,

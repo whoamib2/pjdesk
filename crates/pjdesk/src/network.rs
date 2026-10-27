@@ -559,6 +559,84 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
     })
 }
 
+/// The account login window when pjdesk.com does not say how long to wait.
+pub const SIGN_IN_PAUSE_SECS: u64 = 15 * 60;
+
+/// Seconds to wait after a 429 from `/api/login`. `None` for any other failure.
+/// The production body is "Too many failed sign-ins. Wait 15 minutes and try again."
+/// A code-guess or PIN lock ("Too many tries") is not this pause.
+pub fn sign_in_pause_seconds(status: u16, message: &str) -> Option<u64> {
+    let limited = (status == 429 && !message.contains("Too many tries"))
+        || message.contains("Too many failed sign-ins")
+        || message.contains("Too many sign-in attempts");
+    if !limited {
+        return None;
+    }
+    Some(wait_minutes(message).unwrap_or(SIGN_IN_PAUSE_SECS / 60) * 60)
+}
+
+/// Ben's sentence, with the remaining minutes rounded up and a ticking clock.
+pub fn sign_in_pause_text(remaining_secs: u64) -> String {
+    let minutes = remaining_secs.div_ceil(60).max(1);
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    let mm = remaining_secs / 60;
+    let ss = remaining_secs % 60;
+    format!(
+        "Too many sign-in attempts from this computer, so pjdesk.com paused sign-ins for a bit. Your password may be fine. Wait {minutes} {unit}, then try once (each try restarts the wait). {mm:02}:{ss:02}"
+    )
+}
+
+/// Reads a pause out of an error string. The clock at the end wins. Otherwise
+/// "Wait N minutes", or 15 minutes when the body has no duration.
+pub fn sign_in_pause_seconds_from_text(message: &str) -> Option<u64> {
+    if !message.contains("Too many sign-in attempts from this computer") && !message.contains("Too many failed sign-ins") {
+        return None;
+    }
+    if let Some(secs) = trailing_clock(message) {
+        return Some(secs);
+    }
+    Some(wait_minutes(message).unwrap_or(SIGN_IN_PAUSE_SECS / 60) * 60)
+}
+
+fn wait_minutes(message: &str) -> Option<u64> {
+    let lower = message.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let digits = &lower[start..i];
+        let after = lower[i..].trim_start();
+        if after.starts_with("minute") {
+            return digits.parse().ok();
+        }
+    }
+    None
+}
+
+fn trailing_clock(message: &str) -> Option<u64> {
+    let token = message.trim().rsplit_once(|c: char| c.is_whitespace())?.1;
+    let (mm, ss) = token.split_once(':')?;
+    if mm.is_empty() || ss.len() != 2 || !mm.chars().all(|c| c.is_ascii_digit()) || !ss.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(mm.parse::<u64>().ok()? * 60 + ss.parse::<u64>().ok()?)
+}
+
+fn login_failure(fail: ApiFail) -> anyhow::Error {
+    if let Some(secs) = sign_in_pause_seconds(fail.status, &fail.message) {
+        anyhow::anyhow!(sign_in_pause_text(secs))
+    } else {
+        anyhow::anyhow!(fail.message)
+    }
+}
+
 /// Signs in with the PJDesk account password and fetches the private server.
 /// An empty network returns [`SignIn::NoServer`] so the owner can publish the
 /// server this computer already uses. The login token stays in memory only.
@@ -568,12 +646,9 @@ pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) 
         bail!("Enter your email and password.");
     }
     let (auth, _sync) = pjdesk_proto::access::derive_account_keys(&email, password);
-    let login: LoginReply = serde_json::from_str(&post_json(
-        &format!("{}/api/login", api_base()),
-        None,
-        &account_login_body(&email, &hex::encode(auth), &format!("PJDesk on {device_name}")),
-    )?)
-    .context("unexpected reply from PJDesk")?;
+    let login_body = account_login_body(&email, &hex::encode(auth), &format!("PJDesk on {device_name}"));
+    let login_text = post_api(&format!("{}/api/login", api_base()), None, &login_body).map_err(login_failure)?;
+    let login: LoginReply = serde_json::from_str(&login_text).context("unexpected reply from PJDesk")?;
     match post_api(
         &format!("{}/api/network/token", api_base()),
         Some(&login.token),
@@ -749,12 +824,9 @@ fn login_token(email: &str, password: &str) -> Result<String> {
         bail!("Enter the email and password for the account this network key is for.");
     }
     let (auth, _sync) = pjdesk_proto::access::derive_account_keys(&email, password);
-    let login: LoginReply = serde_json::from_str(&post_json(
-        &format!("{}/api/login", api_base()),
-        None,
-        &account_login_body(&email, &hex::encode(auth), "PJDesk"),
-    )?)
-    .context("unexpected reply from PJDesk")?;
+    let login_body = account_login_body(&email, &hex::encode(auth), "PJDesk");
+    let login_text = post_api(&format!("{}/api/login", api_base()), None, &login_body).map_err(login_failure)?;
+    let login: LoginReply = serde_json::from_str(&login_text).context("unexpected reply from PJDesk")?;
     Ok(login.token)
 }
 
@@ -1602,5 +1674,26 @@ mod tests {
         assert_eq!(invite_failure_message(401, ""), "PJDesk replied 401.");
         assert!(!invite_failure_message(401, "upstream down").contains("Wrong email"));
         assert!(invite_failure_message(502, "upstream down").contains("502"));
+    }
+
+    #[test]
+    fn a_login_429_uses_bens_sentence_and_a_clock() {
+        let production = "Too many failed sign-ins. Wait 15 minutes and try again.";
+        assert_eq!(sign_in_pause_seconds(429, production), Some(15 * 60));
+        assert_eq!(sign_in_pause_seconds(429, "PJDesk could not sign in (429)."), Some(15 * 60));
+        assert_eq!(sign_in_pause_seconds(429, "Too many tries. Try again in 2 minutes."), None);
+        assert_eq!(sign_in_pause_seconds(401, "Wrong email or password."), None);
+        let text = sign_in_pause_text(15 * 60);
+        assert_eq!(
+            text,
+            "Too many sign-in attempts from this computer, so pjdesk.com paused sign-ins for a bit. Your password may be fine. Wait 15 minutes, then try once (each try restarts the wait). 15:00"
+        );
+        assert!(sign_in_pause_text(1).contains("Wait 1 minute,"));
+        assert!(sign_in_pause_text(1).ends_with("00:01"));
+        assert!(sign_in_pause_text(61).contains("Wait 2 minutes,"));
+        assert!(sign_in_pause_text(61).ends_with("01:01"));
+        assert_eq!(sign_in_pause_seconds_from_text(&text), Some(15 * 60));
+        assert_eq!(sign_in_pause_seconds_from_text(production), Some(15 * 60));
+        assert_eq!(sign_in_pause_seconds_from_text("Wrong email or password."), None);
     }
 }

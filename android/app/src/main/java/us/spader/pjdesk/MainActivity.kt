@@ -252,6 +252,20 @@ class MainActivity : FragmentActivity() {
             var netScan by remember { mutableStateOf(false) }
             var netBusy by remember { mutableStateOf(false) }
             var netError by remember { mutableStateOf("") }
+            var signInPauseUntil by remember { mutableLongStateOf(0L) }
+            LaunchedEffect(signInPauseUntil) {
+                if (signInPauseUntil == 0L) return@LaunchedEffect
+                while (true) {
+                    val leftMs = signInPauseUntil - android.os.SystemClock.elapsedRealtime()
+                    if (leftMs <= 0L) {
+                        signInPauseUntil = 0L
+                        if (netError.startsWith("Too many sign-in attempts from this computer")) netError = ""
+                        break
+                    }
+                    netError = us.spader.pjdesk.core.signInPauseText((leftMs + 999) / 1000)
+                    kotlinx.coroutines.delay(200)
+                }
+            }
             var signingIn by remember { mutableStateOf(false) }
             var netOffer by remember { mutableStateOf(false) }
             var netLogin by remember { mutableStateOf("") }
@@ -321,6 +335,7 @@ class MainActivity : FragmentActivity() {
                     app.store.joinedWithoutPassword = false
                     app.store.saveNetworkRefresh("")
                 }
+                app.store.savedSyncChoice = "no"
                 app.clearVaultKey()
                 cloudAccess = ""
                 inviteCode = ""
@@ -352,6 +367,7 @@ class MainActivity : FragmentActivity() {
                 app.store.permanentPublished = maxOf(app.store.permanentPublished, entry.updated)
             }
             fun syncPasswords(upload: Boolean) {
+                if (!app.store.syncsSavedComputers()) return
                 val key = app.vaultKey ?: return
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                 val device = app.store.networkDeviceId
@@ -469,6 +485,33 @@ class MainActivity : FragmentActivity() {
                     syncPasswords(upload)
                 }
             }
+            fun noteSignInPause(err: Throwable): Boolean {
+                val cloud = err as? us.spader.pjdesk.core.CloudAuthException
+                val secs = us.spader.pjdesk.core.signInPauseSeconds(cloud?.status ?: 0, err.message.orEmpty()) ?: return false
+                signInPauseUntil = android.os.SystemClock.elapsedRealtime() + secs * 1000
+                netError = us.spader.pjdesk.core.signInPauseText(secs)
+                return true
+            }
+            fun loadMySavedComputers() {
+                app.store.savedSyncChoice = "yes"
+                app.store.localSavedCleared = false
+                val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
+                val device = app.store.networkDeviceId
+                if (refresh.isBlank() || device.isBlank()) return
+                scope.launch {
+                    val session = withContext(Dispatchers.IO) {
+                        runCatching { refreshAccount(refresh, device, null) }.getOrNull()
+                    } ?: return@launch
+                    app.store.mergeCloud(session.computers, preferAccount = true)
+                    saved = app.store.saved()
+                    if (session.access.isNotBlank()) {
+                        cloudAccess = session.access
+                        engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
+                    }
+                    rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
+                    syncPasswords(false)
+                }
+            }
             fun applySignedIn(
                 session: us.spader.pjdesk.core.Session,
                 emailHint: String,
@@ -485,7 +528,8 @@ class MainActivity : FragmentActivity() {
                     netError = "This computer does not have an ID yet. Wait until Your ID appears, then try again."
                     return
                 }
-                val uploadLocal = !temporaryNow && !enrollOnlyNow
+                val syncing = app.store.syncsSavedComputers()
+                val uploadLocal = syncing && !temporaryNow && !enrollOnlyNow
                 val hostname = engine.deviceLabel()
                 val display = app.store.computerName
                 val osVersion = Build.VERSION.RELEASE ?: ""
@@ -522,6 +566,7 @@ class MainActivity : FragmentActivity() {
                         netBlob = ""
                         importPass = ""
                         netError = ""
+                        signInPauseUntil = 0L
                         netOffer = false
                         netLogin = ""
                         importOffer = null
@@ -534,18 +579,23 @@ class MainActivity : FragmentActivity() {
                             return@onSuccess
                         }
                         app.store.networkDeviceId = enrolled.deviceId
+                        if (!syncing) app.store.savedSyncChoice = "no"
                         if (temporaryNow) {
                             app.store.beginTemporaryVisit()
                             tempFlag.set(true)
                             temporarySession = true
                             memoryRefresh = enrolled.refresh
                             lastActivity = android.os.SystemClock.elapsedRealtime()
-                            app.store.allowSavedMerge()
-                            app.store.mergeCloud(enrolled.computers)
+                            if (syncing) {
+                                app.store.allowSavedMerge()
+                                app.store.mergeCloud(enrolled.computers, preferAccount = true)
+                            }
                         } else {
-                            val first = app.store.networkEmail.isBlank()
-                            app.store.allowSavedMerge()
-                            app.store.mergeCloud(enrolled.computers, preferAccount = first)
+                            if (syncing) {
+                                val first = app.store.networkEmail.isBlank()
+                                app.store.allowSavedMerge()
+                                app.store.mergeCloud(enrolled.computers, preferAccount = first)
+                            }
                             app.store.networkEmail = who
                             app.store.saveNetworkRefresh(enrolled.refresh)
                             if (!keyBlob.isNullOrBlank()) {
@@ -569,7 +619,7 @@ class MainActivity : FragmentActivity() {
                         account = who
                         signingIn = false
                         saved = app.store.saved()
-                        if (!enrollOnlyNow) holdDerivedKey(who, accountPassword, upload = !temporaryNow)
+                        if (!enrollOnlyNow) holdDerivedKey(who, accountPassword, upload = syncing && !temporaryNow)
                         val connected = enrolled.email.ifBlank { enrolled.address }.ifBlank { "this network" }
                         if (withoutPassword && !enrollOnlyNow) {
                             scope.launch { snackbar.showSnackbar("You are now connected to $connected.") }
@@ -586,7 +636,7 @@ class MainActivity : FragmentActivity() {
                             state.fingerprint,
                         )
                         netLogin = if (netOffer) cloud?.loginToken.orEmpty() else ""
-                        netError = err.message ?: "Could not sign in."
+                        if (!noteSignInPause(err)) netError = err.message ?: "Could not sign in."
                     }
                 }
             }
@@ -716,8 +766,10 @@ class MainActivity : FragmentActivity() {
                             engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
                         }
                         rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
-                        app.store.mergeCloud(session.computers)
-                        saved = app.store.saved()
+                        if (app.store.syncsSavedComputers()) {
+                            app.store.mergeCloud(session.computers)
+                            saved = app.store.saved()
+                        }
                     } finally {
                         presenceBusy = false
                     }
@@ -766,7 +818,7 @@ class MainActivity : FragmentActivity() {
                         connectError = null
                         engine.showStatus("Getting your PJDesk server…")
                         AppLog.i("Connect fetching the account server")
-                        val computers = if (temporarySession) null else CloudAuth.computersJson(app.store.saved())
+                        val computers = if (temporarySession || !app.store.syncsSavedComputers()) null else CloudAuth.computersJson(app.store.saved())
                         scope.launch {
                             val fetched = withContext(Dispatchers.IO) {
                                 runCatching { refreshAccount(refresh, device, computers) }
@@ -921,7 +973,7 @@ class MainActivity : FragmentActivity() {
                 if (account.isNotBlank() && key == null) return@LaunchedEffect
                 val refresh = app.store.networkRefresh()
                 val device = app.store.networkDeviceId
-                if (key != null && refresh.isNotBlank() && device.isNotBlank()) {
+                if (key != null && refresh.isNotBlank() && device.isNotBlank() && app.store.syncsSavedComputers()) {
                     val changed = withContext(Dispatchers.IO) {
                         runCatching { PasswordSync.pull(app.store, key, refresh, device, false) }.getOrDefault(false)
                     }
@@ -958,7 +1010,7 @@ class MainActivity : FragmentActivity() {
                     engine.applyAccountServer(app.store.accountServer, app.store.accountFingerprint, quiet = true)
                 }
                 if (account.isBlank() || refresh.isBlank() || device.isBlank()) return@LaunchedEffect
-                val computers = if (temporarySession) null else CloudAuth.computersJson(app.store.saved())
+                val computers = if (temporarySession || !app.store.syncsSavedComputers()) null else CloudAuth.computersJson(app.store.saved())
                 val session = withContext(Dispatchers.IO) {
                     val mine = CloudAuth.publicIp()
                     if (mine.isNotBlank()) app.store.myPublicIp = mine
@@ -976,9 +1028,11 @@ class MainActivity : FragmentActivity() {
                 engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
                 if (!temporarySession) {
                     rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
-                    app.store.mergeCloud(session.computers)
-                    saved = app.store.saved()
-                    if (app.vaultKey != null) syncPasswords(true)
+                    if (app.store.syncsSavedComputers()) {
+                        app.store.mergeCloud(session.computers)
+                        saved = app.store.saved()
+                        if (app.vaultKey != null) syncPasswords(true)
+                    }
                 }
             }
             LaunchedEffect(bumps, state.session?.id) {
@@ -1009,7 +1063,7 @@ class MainActivity : FragmentActivity() {
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                 val device = app.store.networkDeviceId
                 if (refresh.isBlank() || device.isBlank()) return@LaunchedEffect
-                val uploadLocal = !temporarySession
+                val uploadLocal = !temporarySession && app.store.syncsSavedComputers()
                 val local = if (uploadLocal) app.store.saved() else emptyList()
                 val known = accountComputers
                 val hostname = engine.deviceLabel()
@@ -1200,7 +1254,7 @@ class MainActivity : FragmentActivity() {
                 recentIds = app.store.recentIds()
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                 val device = app.store.networkDeviceId
-                if (!temporarySession && refresh.isNotBlank() && device.isNotBlank()) {
+                if (!temporarySession && refresh.isNotBlank() && device.isNotBlank() && app.store.syncsSavedComputers()) {
                     withContext(Dispatchers.IO) {
                         runCatching { refreshAccount(refresh, device, CloudAuth.computersJson(app.store.saved())) }
                     }
@@ -1788,6 +1842,7 @@ class MainActivity : FragmentActivity() {
                         keyPass = netKeyPass,
                         busy = netBusy,
                         error = netError,
+                        signInPaused = signInPauseUntil > android.os.SystemClock.elapsedRealtime(),
                         onEmail = { if (!notePaste(it)) netEmail = it },
                         onPassword = { if (!notePaste(it)) netPass = it },
                         onCode = { if (!notePaste(it)) netCode = it },
@@ -1832,7 +1887,7 @@ class MainActivity : FragmentActivity() {
                                     applySignedIn(session, email, null, false, true)
                                 }.onFailure { err ->
                                     netBusy = false
-                                    netError = err.message ?: "Could not sign in."
+                                    if (!noteSignInPause(err)) netError = err.message ?: "Could not sign in."
                                 }
                             }
                         },
@@ -1914,7 +1969,7 @@ class MainActivity : FragmentActivity() {
                                         state.fingerprint,
                                     )
                                     netLogin = if (netOffer) cloud?.loginToken.orEmpty() else ""
-                                    netError = err.message ?: "Could not sign in."
+                                    if (!noteSignInPause(err)) netError = err.message ?: "Could not sign in."
                                 }
                             }
                         },
@@ -2096,6 +2151,7 @@ class MainActivity : FragmentActivity() {
                                     selfId = state.id,
                                     onRemoveAll = {
                                         app.store.clearLocalSaved()
+                                        app.store.savedSyncChoice = "no"
                                         saved = app.store.saved()
                                         recentIds = app.store.recentIds()
                                         scope.launch { snackbar.showSnackbar("Removed saved computers from this computer") }
@@ -2104,12 +2160,14 @@ class MainActivity : FragmentActivity() {
                                         signOutAndClearSaved()
                                         scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
                                     },
+                                    showLoadSaved = account.isNotBlank() && !app.store.syncsSavedComputers(),
+                                    onLoadSaved = { loadMySavedComputers() },
                                     onRename = { computer, nickname ->
                                         app.store.rename(computer.id, nickname)
                                         saved = app.store.saved()
                                         val refresh = app.store.networkRefresh()
                                         val device = app.store.networkDeviceId
-                                        if (refresh.isNotBlank() && device.isNotBlank()) {
+                                        if (refresh.isNotBlank() && device.isNotBlank() && app.store.syncsSavedComputers()) {
                                             scope.launch {
                                                 withContext(Dispatchers.IO) {
                                                     runCatching {
@@ -2234,6 +2292,7 @@ class MainActivity : FragmentActivity() {
                                     savedCount = saved.size,
                                     onRemoveAllSaved = {
                                         app.store.clearLocalSaved()
+                                        app.store.savedSyncChoice = "no"
                                         saved = app.store.saved()
                                         recentIds = app.store.recentIds()
                                         scope.launch { snackbar.showSnackbar("Removed saved computers from this computer") }
@@ -2242,6 +2301,8 @@ class MainActivity : FragmentActivity() {
                                         signOutAndClearSaved()
                                         scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
                                     },
+                                    showLoadSaved = account.isNotBlank() && !app.store.syncsSavedComputers(),
+                                    onLoadSaved = { loadMySavedComputers() },
                                     onSignOut = if (account.isEmpty()) {
                                         null
                                     } else {

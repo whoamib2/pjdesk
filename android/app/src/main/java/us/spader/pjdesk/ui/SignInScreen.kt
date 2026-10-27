@@ -56,6 +56,7 @@ fun SignInScreen(
     temporary: Boolean = false,
     onTemporary: (Boolean) -> Unit = {},
     onEnrollOnly: () -> Unit = {},
+    signInPaused: Boolean = false,
 ) {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -132,7 +133,9 @@ fun SignInScreen(
                         Text("Use this computer's current server for my network")
                     }
                 }
-                Button(onClick = onSubmit, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                val emailSignIn = !useCode && !useKey
+                val canSignIn = !busy && !(signInPaused && emailSignIn)
+                Button(onClick = onSubmit, enabled = canSignIn, modifier = Modifier.fillMaxWidth()) {
                     Text(
                         if (busy) "Signing in…"
                         else if (useKey) "Use network key"
@@ -141,7 +144,7 @@ fun SignInScreen(
                     )
                 }
                 if (!useCode && !useKey) {
-                    TextButton(onClick = onEnrollOnly, enabled = !busy) {
+                    TextButton(onClick = onEnrollOnly, enabled = canSignIn) {
                         Text("Just add this computer to my account")
                     }
                 }

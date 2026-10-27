@@ -502,6 +502,7 @@ object CloudAuth {
                 message.ifBlank { "Could not sign in ($code)." },
                 parsed?.optString("code").orEmpty(),
                 parsed?.optString("role").orEmpty(),
+                status = code,
             )
         }
         return JSONObject(text)
@@ -513,6 +514,7 @@ class CloudAuthException(
     val code: String = "",
     val role: String = "",
     val loginToken: String = "",
+    val status: Int = 0,
 ) : Exception(message)
 
 data class JoinCode(

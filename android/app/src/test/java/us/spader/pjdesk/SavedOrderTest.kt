@@ -20,6 +20,9 @@ import us.spader.pjdesk.core.presenceOnlineFlag
 import us.spader.pjdesk.core.presenceStale
 import us.spader.pjdesk.core.mergeSavedFromAccount
 import us.spader.pjdesk.core.savedComputerCountLine
+import us.spader.pjdesk.core.savedSyncChoiceOnUpdate
+import us.spader.pjdesk.core.signInPauseSeconds
+import us.spader.pjdesk.core.signInPauseText
 import us.spader.pjdesk.core.savedSubtitle
 import us.spader.pjdesk.core.shownVersion
 import us.spader.pjdesk.core.versionBehind
@@ -196,6 +199,32 @@ class SavedOrderTest {
         assertTrue(mergeSavedFromAccount(localCleared = false, preferAccount = false))
         assertEquals("This computer has 3 saved computers.", savedComputerCountLine(3))
         assertEquals("This computer has 1 saved computer.", savedComputerCountLine(1))
+    }
+
+    @Test
+    fun anExistingListKeepsSyncingAndANewPhoneDoesNot() {
+        assertEquals("yes", savedSyncChoiceOnUpdate("", 2))
+        assertEquals("", savedSyncChoiceOnUpdate("", 0))
+        assertEquals("no", savedSyncChoiceOnUpdate("no", 4))
+        assertEquals("yes", savedSyncChoiceOnUpdate("yes", 0))
+    }
+
+    @Test
+    fun aLogin429UsesBensSentenceAndAClock() {
+        val production = "Too many failed sign-ins. Wait 15 minutes and try again."
+        assertEquals(15L * 60, signInPauseSeconds(429, production))
+        assertEquals(15L * 60, signInPauseSeconds(429, "PJDesk could not sign in (429)."))
+        assertEquals(null, signInPauseSeconds(429, "Too many tries. Try again in 2 minutes."))
+        assertEquals(null, signInPauseSeconds(401, "Wrong email or password."))
+        val text = signInPauseText(15 * 60)
+        assertEquals(
+            "Too many sign-in attempts from this computer, so pjdesk.com paused sign-ins for a bit. Your password may be fine. Wait 15 minutes, then try once (each try restarts the wait). 15:00",
+            text,
+        )
+        assertTrue(signInPauseText(1).contains("Wait 1 minute,"))
+        assertTrue(signInPauseText(1).endsWith("00:01"))
+        assertTrue(signInPauseText(61).contains("Wait 2 minutes,"))
+        assertTrue(signInPauseText(61).endsWith("01:01"))
     }
 
     @Test

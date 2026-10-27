@@ -92,6 +92,8 @@ fun SettingsScreen(
     savedCount: Int = 0,
     onRemoveAllSaved: () -> Unit = {},
     onSignOutAndRemove: () -> Unit = {},
+    showLoadSaved: Boolean = false,
+    onLoadSaved: () -> Unit = {},
     remote: us.spader.pjdesk.core.RemoteOptions = us.spader.pjdesk.core.RemoteOptions(),
     onRemote: (us.spader.pjdesk.core.RemoteOptions) -> Unit = {},
     savedAccessKey: String = "",
@@ -306,9 +308,15 @@ fun SettingsScreen(
         }
         Section("Sign-in") {
             Text(
-                "Saved computers sync with your account. Saved passwords sync too, encrypted so the server cannot read them.",
+                if (showLoadSaved) "Saved computers stay on this phone until you load them."
+                else "Saved computers sync with your account. Saved passwords sync too, encrypted so the server cannot read them.",
                 color = pjMuted(),
             )
+            if (showLoadSaved) {
+                Button(onClick = onLoadSaved, modifier = Modifier.fillMaxWidth()) {
+                    Text("Load my saved computers")
+                }
+            }
             if (onSignOut != null) {
                 Button(onClick = onSignOut, modifier = Modifier.fillMaxWidth()) { Text("Sign out") }
             }
@@ -371,7 +379,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.33", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.47", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }

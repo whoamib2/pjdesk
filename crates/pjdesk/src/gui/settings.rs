@@ -296,6 +296,16 @@ impl App {
                 "Stay signed in keeps this account on this computer. The other choice ends the sign-in when you close PJDesk.",
             ));
         }
+        if self.signed_in() && !self.cfg.syncs_saved_computers() {
+            ui.add_space(8.0);
+            if ui.button("Load my saved computers").clicked() {
+                self.load_saved_computers();
+            }
+            ui.label(widgets::muted(
+                ui,
+                "This downloads your saved computers and their passwords onto this computer, then keeps them in sync.",
+            ));
+        }
         ui.add_space(8.0);
         ui.label(widgets::muted(
             ui,
