@@ -41,6 +41,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.DeskState
 import us.spader.pjdesk.core.SavedComputer
+import us.spader.pjdesk.core.accountStatusLine
 import us.spader.pjdesk.service.ControlNotice
 
 @Composable
@@ -61,6 +62,7 @@ fun HomeScreen(
     onUnattended: (Boolean) -> Unit = {},
     onSignIn: (() -> Unit)? = null,
     accountEmail: String = "",
+    accountSession: String = "",
     onSignOut: (() -> Unit)? = null,
     temporary: Boolean = false,
     recent: List<SavedComputer> = emptyList(),
@@ -106,25 +108,24 @@ fun HomeScreen(
             .padding(horizontal = 16.dp, vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    when {
-                        accountEmail.isBlank() -> "Not signed in"
-                        temporary -> "Signed in until you close PJDesk"
-                        else -> accountEmail
-                    },
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (starting) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
-                    Text(state.status, color = pjMuted(), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                accountStatusLine(accountEmail, accountSession, temporary),
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (onSignIn != null) {
+                    Button(onClick = onSignIn) { Text("Sign in") }
+                }
+                if (onSignOut != null) {
+                    OutlinedButton(onClick = onSignOut) { Text("Sign out") }
                 }
             }
-            if (onSignIn != null) {
-                Button(onClick = onSignIn) { Text("Sign in") }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (starting) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                Text(state.status, color = pjMuted(), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
         if (state.hosting) {

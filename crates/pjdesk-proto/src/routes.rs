@@ -181,7 +181,8 @@ pub fn dial_targets(routes: &ServerRoutes, mine: &[Ipv4Addr], saved: &str) -> Ve
     if !is_ip_endpoint(saved) && !order.iter().any(|have| same_endpoint(have, saved)) {
         push_unique(&mut order, canonical(saved));
     }
-    apply_route_health(order, routes)
+    let order = apply_route_health(order, routes);
+    prefer_public_off_lan(order, routes, mine)
 }
 
 /// The banner, then one `address: error` line for every dial that failed.
@@ -368,11 +369,42 @@ pub fn apply_route_health(order: Vec<String>, routes: &ServerRoutes) -> Vec<Stri
         if let Some(pos) = kept.iter().position(|addr| same_endpoint(addr, &preferred)) {
             let item = kept.remove(pos);
             kept.insert(0, item);
-        } else {
-            kept.insert(0, preferred);
         }
     }
     kept
+}
+
+/// Off the server's LAN, a public address is the path that can work.
+///
+/// A LAN address that answered at home is not put back in front. A public
+/// address that timed out on that LAN (often a hairpin that does not answer)
+/// is still tried before DNS.
+fn prefer_public_off_lan(order: Vec<String>, routes: &ServerRoutes, mine: &[Ipv4Addr]) -> Vec<String> {
+    let on_lan = routes.primary_lan.iter().chain(routes.standby_lan.iter()).any(|addr| on_subnet(addr, mine));
+    if on_lan {
+        return order;
+    }
+    let mut public = Vec::new();
+    for raw in routes.primary_public.iter().chain(routes.standby_public.iter()) {
+        let addr = canonical(raw);
+        if !is_ip_endpoint(&addr) {
+            continue;
+        }
+        if endpoint_v4(&addr).is_some_and(|ip| ip.is_private()) {
+            continue;
+        }
+        push_unique(&mut public, addr);
+    }
+    if public.is_empty() {
+        return order;
+    }
+    for addr in order {
+        if public.iter().any(|have| same_endpoint(have, &addr)) {
+            continue;
+        }
+        push_unique(&mut public, addr);
+    }
+    public
 }
 
 pub fn miss_count(routes: &ServerRoutes, addr: &str) -> u32 {
@@ -973,6 +1005,24 @@ mod tests {
         let stale = order.iter().position(|addr| addr.starts_with("204.248.122.44")).unwrap();
         assert!(stale > 1, "{order:?}");
         assert_eq!(miss_count(&routes, "pjdesk.spader.us:21200"), 0);
+    }
+
+    #[test]
+    fn off_the_local_network_the_public_address_stays_ahead_of_a_home_lan_address() {
+        let mut routes = sample();
+        note_answer(&mut routes, "192.168.0.20:21200");
+        note_timeout(&mut routes, "204.248.122.44:21200");
+        note_timeout(&mut routes, "204.248.122.44:21200");
+        note_timeout(&mut routes, "204.248.122.44:21200");
+        note_timeout(&mut routes, "204.248.122.44:21200");
+        let cellular = [v4(10, 9, 9, 9)];
+        let order = dial_targets(&routes, &cellular, "pjdesk.spader.us:21200");
+        assert_eq!(order[0], "204.248.122.44:21200", "{order:?}");
+        assert!(order.iter().any(|addr| addr == "198.51.100.8:21200"), "{order:?}");
+        assert!(!order.iter().any(|addr| addr.starts_with("192.168.0.")), "{order:?}");
+        let public = order.iter().position(|addr| addr.starts_with("204.248.122.44")).unwrap();
+        let name = order.iter().position(|addr| addr.contains("pjdesk.spader.us")).unwrap();
+        assert!(public < name, "{order:?}");
     }
 
     #[test]

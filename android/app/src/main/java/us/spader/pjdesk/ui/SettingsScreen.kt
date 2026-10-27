@@ -38,6 +38,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.AppLockPolicy
 import us.spader.pjdesk.core.DeskState
+import us.spader.pjdesk.core.accountStatusLine
 import us.spader.pjdesk.core.controlStatus
 
 @Composable
@@ -88,6 +89,9 @@ fun SettingsScreen(
     pinError: String = "",
     engineDetail: String = "",
     accountEmail: String = "",
+    accountSession: String = "",
+    temporary: Boolean = false,
+    onSignIn: (() -> Unit)? = null,
     onSignOut: (() -> Unit)? = null,
     savedCount: Int = 0,
     onRemoveAllSaved: () -> Unit = {},
@@ -112,6 +116,17 @@ fun SettingsScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        Section("Account") {
+            Text(accountStatusLine(accountEmail, accountSession, temporary))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (onSignIn != null) {
+                    Button(onClick = onSignIn) { Text("Sign in") }
+                }
+                if (onSignOut != null) {
+                    OutlinedButton(onClick = onSignOut) { Text("Sign out") }
+                }
+            }
+        }
         Section("Diagnostics") {
             DiagnosticLine("Engine", engineDetail.ifBlank { "Starting PJDesk…" })
             DiagnosticLine("Server", state.server.ifBlank { "Not set" })
@@ -126,7 +141,7 @@ fun SettingsScreen(
                 "Relay",
                 if (state.signalReached.isNotBlank()) state.signalReached else state.server.ifBlank { "Not set" },
             )
-            DiagnosticLine("Account", accountEmail.ifBlank { "Not signed in" })
+            DiagnosticLine("Account", accountStatusLine(accountEmail, accountSession, temporary))
         }
         Section("This phone") {
             OutlinedTextField(
@@ -379,7 +394,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.53", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.54", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }
