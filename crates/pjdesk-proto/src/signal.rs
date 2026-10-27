@@ -159,6 +159,15 @@ pub enum ClientMsg {
     RelayMoved {
         session_id: SessionId,
     },
+    /// 0.6.47+. The current primary asks the standby to take the next
+    /// generation. Sent only to the paired server, over the shared server
+    /// certificate. An older server cannot decode it and drops the connection;
+    /// the primary then stays primary.
+    TakePrimary {
+        epoch: u64,
+        at: u64,
+        proof: [u8; 32],
+    },
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -360,6 +369,14 @@ pub enum ServerMsg {
     MoveRelay {
         session_id: SessionId,
         primary: String,
+    },
+    /// 0.6.47+. Reply to [`ClientMsg::TakePrimary`]. Sent only to the paired
+    /// server. Hosts and phones are not sent this variant.
+    Handoff {
+        ok: bool,
+        epoch: u64,
+        name: String,
+        message: String,
     },
 }
 
@@ -567,6 +584,18 @@ mod tests {
         assert_eq!(keys[0], 13, "AccessKeys is appended after WantHostReport");
         let routes = postcard::to_stdvec(&ServerMsg::Routes(crate::routes::ServerRoutes::default())).unwrap();
         assert_eq!(routes[0], 14, "Routes is appended after AccessKeys");
+        let moved = postcard::to_stdvec(&ClientMsg::RelayMoved { session_id: 1 }).unwrap();
+        let take = postcard::to_stdvec(&ClientMsg::TakePrimary { epoch: 6, at: 1, proof: [9; 32] }).unwrap();
+        assert_eq!(take[0], moved[0] + 1, "TakePrimary is appended after RelayMoved");
+        let move_relay = postcard::to_stdvec(&ServerMsg::MoveRelay { session_id: 1, primary: "x".into() }).unwrap();
+        let handoff = postcard::to_stdvec(&ServerMsg::Handoff {
+            ok: true,
+            epoch: 7,
+            name: "CHIP20".into(),
+            message: String::new(),
+        })
+        .unwrap();
+        assert_eq!(handoff[0], move_relay[0] + 1, "Handoff is appended after MoveRelay");
         let back: ClientMsg = postcard::from_bytes(&ping).unwrap();
         assert!(matches!(back, ClientMsg::Ping));
         match postcard::from_bytes::<ServerMsg>(&keys).unwrap() {

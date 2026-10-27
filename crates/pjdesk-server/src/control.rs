@@ -111,9 +111,18 @@ fn fail(message: impl Into<String>) -> Response {
 }
 
 /// True when this Windows token should be allowed to manage the server.
-/// `linked_admin` is the full token behind a UAC filter.
+/// `linked_admin` is the full token behind a UAC filter. `admin_on_token`
+/// is also true when Administrators is present only as deny-only: UAC removed
+/// the privilege, but the account is still an administrator.
 pub fn windows_manager(elevated: bool, admin_on_token: bool, linked_admin: bool) -> bool {
     elevated || admin_on_token || linked_admin
+}
+
+/// Administrators counts when the SID is enabled, and when UAC left it deny-only.
+pub fn admin_group_counts(attributes: u32) -> bool {
+    const ENABLED: u32 = 0x4;
+    const DENY_ONLY: u32 = 0x10;
+    attributes & (ENABLED | DENY_ONLY) != 0
 }
 
 struct HeldSignIn {
@@ -377,27 +386,15 @@ fn finish_sign_in(data_dir: &Path, cfg: CloudConfig, choice: Option<crate::cloud
 }
 
 fn promote(data_dir: &Path) -> Response {
-    if crate::cloud::status_is_fresh(data_dir) {
-        return match crate::requests::push(data_dir, crate::requests::PROMOTE_FILE, "now") {
-            Ok(()) => ok("Asking the running server to become the primary."),
-            Err(e) => fail(format!("Could not ask the server to become the primary: {e}")),
-        };
-    }
-    match crate::cloud::promote(data_dir) {
-        Ok(()) => ok("This server is now the primary."),
+    match crate::role_handoff::become_primary(data_dir) {
+        Ok(message) => ok(message),
         Err(e) => fail(format!("{e:#}")),
     }
 }
 
 fn demote(data_dir: &Path) -> Response {
-    if crate::cloud::status_is_fresh(data_dir) {
-        return match crate::requests::push(data_dir, crate::requests::DEMOTE_FILE, "now") {
-            Ok(()) => ok("Asking the running server to step down to standby."),
-            Err(e) => fail(format!("Could not ask the server to step down: {e}")),
-        };
-    }
-    match crate::cloud::demote(data_dir) {
-        Ok(()) => ok("This server stepped down to standby."),
+    match crate::role_handoff::step_down(data_dir) {
+        Ok(message) => ok(message),
         Err(e) => fail(format!("{e:#}")),
     }
 }
@@ -740,9 +737,49 @@ fn inspect_caller(pipe: windows::Win32::Foundation::HANDLE) -> (bool, String) {
 #[cfg(windows)]
 fn caller_token_is_manager(token: windows::Win32::Foundation::HANDLE) -> bool {
     let elevated = token_is_elevated(token);
-    let admin = token_in_admins(token);
+    let admin = token_in_admins(token) || token_groups_include_admin(token);
     let linked = linked_token_in_admins(token);
     windows_manager(elevated, admin, linked)
+}
+
+/// Group membership, including a UAC-filtered Administrators SID.
+/// `CheckTokenMembership` is false for that deny-only SID.
+#[cfg(windows)]
+fn token_groups_include_admin(token: windows::Win32::Foundation::HANDLE) -> bool {
+    use windows::core::w;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows::Win32::Security::{EqualSid, GetTokenInformation, TokenGroups, PSID, TOKEN_GROUPS};
+    unsafe {
+        let mut admin = PSID::default();
+        if ConvertStringSidToSidW(w!("S-1-5-32-544"), &mut admin).is_err() {
+            return false;
+        }
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenGroups, None, 0, &mut needed);
+        if needed == 0 || needed > 64 * 1024 {
+            let _ = LocalFree(Some(HLOCAL(admin.0)));
+            return false;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let mut got = 0u32;
+        if GetTokenInformation(token, TokenGroups, Some(buf.as_mut_ptr() as *mut _), needed, &mut got).is_err() {
+            let _ = LocalFree(Some(HLOCAL(admin.0)));
+            return false;
+        }
+        let groups = &*(buf.as_ptr() as *const TOKEN_GROUPS);
+        let count = groups.GroupCount as usize;
+        let entries = std::slice::from_raw_parts(groups.Groups.as_ptr(), count);
+        let mut yes = false;
+        for entry in entries {
+            if EqualSid(entry.Sid, admin).as_bool() && admin_group_counts(entry.Attributes) {
+                yes = true;
+                break;
+            }
+        }
+        let _ = LocalFree(Some(HLOCAL(admin.0)));
+        yes
+    }
 }
 
 #[cfg(windows)]
@@ -842,6 +879,9 @@ fn token_label(token: windows::Win32::Foundation::HANDLE) -> String {
 
 /// How long the window waits for the service. A stuck pipe must not leave Remove spinning.
 const CALL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Promote and demote wait for the other server to take the generation.
+pub const ROLE_WAIT: Duration = Duration::from_secs(50);
 
 /// Sign-in derives the auth key (PBKDF2) and then talks to pjdesk.com.
 /// That is longer than a local file change, so it does not use [`CALL_TIMEOUT`].
@@ -968,6 +1008,9 @@ mod tests {
         assert!(windows_manager(true, false, false));
         assert!(windows_manager(false, true, false));
         assert!(!windows_manager(false, false, false));
+        assert!(admin_group_counts(0x4), "an enabled Administrators SID counts");
+        assert!(admin_group_counts(0x10), "a UAC deny-only Administrators SID still counts");
+        assert!(!admin_group_counts(0), "a SID that is not enabled is not a manager");
     }
 
     #[test]

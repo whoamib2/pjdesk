@@ -130,9 +130,9 @@ pub struct PendingMove {
     pub kind: StepKind,
 }
 
-/// Demote from the window, or yield because the other server was promoted.
+/// The other server already owns the next generation. Sessions move, then
+/// this server records standby.
 pub enum StepKind {
-    Demote,
     Yield { epoch: u64, instance: String, name: String },
 }
 
@@ -467,6 +467,24 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
             burst += 1;
             if burst > MAX_MSGS_PER_SEC {
                 bail!("too many messages");
+            }
+            if let ClientMsg::TakePrimary { epoch, at, proof } = msg {
+                let dir = state.lock().unwrap().data_dir.clone();
+                let reply = tokio::task::spawn_blocking(move || crate::role_handoff::accept_take_primary(&dir, epoch, at, &proof))
+                    .await
+                    .unwrap_or_else(|_| crate::role_handoff::TakeReply {
+                        ok: false,
+                        epoch: 0,
+                        name: String::new(),
+                        message: "This server could not take the primary.".into(),
+                    });
+                conn.send(ServerMsg::Handoff {
+                    ok: reply.ok,
+                    epoch: reply.epoch,
+                    name: reply.name,
+                    message: reply.message,
+                });
+                continue;
             }
             handle_message(&state, &mut conn, msg);
         }
@@ -1210,6 +1228,9 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 info!("failover: session {session_id:016x} is moving to the new primary");
             }
         }
+
+        // The connection task handles this before taking the server lock.
+        ClientMsg::TakePrimary { .. } => {}
     }
 }
 
@@ -1352,22 +1373,11 @@ async fn commit_step_down(state: &Shared, acceptor: &RwLock<TlsAcceptor>) {
     };
     let Some(pending) = pending else { return };
     let data_dir = state.lock().unwrap().data_dir.clone();
-    match pending.kind {
-        StepKind::Demote => {
-            let dir = data_dir.clone();
-            match tokio::task::spawn_blocking(move || crate::cloud::demote(&dir)).await {
-                Ok(Ok(())) => info!("failover: this server stepped down after its relayed sessions were told to move"),
-                Ok(Err(e)) => warn!("could not step down: {e:#}"),
-                Err(e) => warn!("could not step down: {e}"),
-            }
-        }
-        StepKind::Yield { epoch, instance, name } => {
-            let dir = data_dir.clone();
-            let label = name.clone();
-            let _ = tokio::task::spawn_blocking(move || crate::cloud::yield_to_epoch(&dir, epoch, &instance, &name)).await;
-            warn!("failover: generation {epoch} belongs to {label}; this server is now the standby");
-        }
-    }
+    let StepKind::Yield { epoch, instance, name } = pending.kind;
+    let dir = data_dir.clone();
+    let label = name.clone();
+    let _ = tokio::task::spawn_blocking(move || crate::cloud::yield_to_epoch(&dir, epoch, &instance, &name)).await;
+    warn!("failover: generation {epoch} belongs to {label}; this server is now the standby");
     drop_relayed_sessions(state);
     release_hosts_for_failover(state);
     let data_dir = state.lock().unwrap().data_dir.clone();
@@ -1714,18 +1724,46 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
             want_demote = false;
             let dir = data_dir.clone();
             match tokio::task::spawn_blocking(move || promote(&dir)).await {
-                Ok(Ok(())) => info!("This server is now the cloud primary"),
-                Ok(Err(e)) => warn!("could not become the cloud primary: {e:#}"),
-                Err(e) => warn!("could not become the cloud primary: {e}"),
+                Ok(Ok(())) => {
+                    let notice = crate::cloud::CloudStatus::load(&data_dir)
+                        .map(|status| status.notice)
+                        .filter(|notice| !notice.trim().is_empty())
+                        .unwrap_or_else(|| "This server is now the primary.".into());
+                    info!("{notice}");
+                    crate::role_handoff::write_result(&data_dir, true, &notice);
+                }
+                Ok(Err(e)) => {
+                    warn!("could not become the cloud primary: {e:#}");
+                    crate::role_handoff::write_result(&data_dir, false, &format!("{e:#}"));
+                }
+                Err(e) => {
+                    warn!("could not become the cloud primary: {e}");
+                    crate::role_handoff::write_result(&data_dir, false, "Could not become the primary.");
+                }
             }
             reload_from_disk(&state, &acceptor, &data_dir);
         } else if want_demote {
-            let dir = data_dir.clone();
-            let primary = tokio::task::spawn_blocking(move || crate::cloud::migration_target(&dir))
-                .await
-                .unwrap_or_default();
-            if step_down_ready(&state, &primary, StepKind::Demote) {
-                commit_step_down(&state, &acceptor).await;
+            let accepted = crate::role_handoff::load_accepted(&data_dir);
+            if let Some(took) = accepted {
+                if step_down_ready(
+                    &state,
+                    &took.address,
+                    StepKind::Yield { epoch: took.epoch, instance: took.instance, name: took.name.clone() },
+                ) {
+                    commit_step_down(&state, &acceptor).await;
+                    let sentence = pjdesk_proto::failover::standby_result(&took.name, took.epoch);
+                    info!("{sentence}");
+                    crate::role_handoff::write_result(&data_dir, true, &sentence);
+                    crate::role_handoff::clear_accepted(&data_dir);
+                    want_demote = false;
+                }
+            } else {
+                let epoch = crate::cloud::local_epoch(&data_dir);
+                let message = format!(
+                    "The other server has not taken the primary. This server stayed the primary (generation {epoch})."
+                );
+                warn!("{message}");
+                crate::role_handoff::write_result(&data_dir, false, &message);
                 want_demote = false;
             }
         }

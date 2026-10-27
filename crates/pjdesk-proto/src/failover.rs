@@ -499,6 +499,37 @@ pub fn peer_role_label(we_are_primary: bool) -> &'static str {
     if we_are_primary { "standby" } else { "active" }
 }
 
+/// The other server owns a strictly newer generation. Same generation, our
+/// own generation, or an empty owner is not a handoff: this server stays primary.
+pub fn peer_took_the_epoch(local_epoch: u64, remote_epoch: u64, remote_instance: &str, mine: &str) -> bool {
+    remote_epoch > local_epoch && !remote_instance.is_empty() && remote_instance != mine
+}
+
+/// Shown after a step-down that the other server confirmed.
+pub fn standby_result(peer_name: &str, epoch: u64) -> String {
+    let who = if peer_name.trim().is_empty() { "the other server" } else { peer_name.trim() };
+    format!("Now standby; {who} is primary, gen {epoch}")
+}
+
+/// Shown after this server's upload is the new generation.
+pub fn primary_result(epoch: u64, other_name: &str) -> String {
+    let other = other_name.trim();
+    if other.is_empty() {
+        format!("Now primary, gen {epoch}.")
+    } else {
+        format!("Now primary, gen {epoch}. {other} is standby.")
+    }
+}
+
+/// A handoff proof older than this is rejected. Two minutes covers a slow
+/// upload without letting a captured proof be reused later.
+pub const HANDOFF_SKEW_SECS: u64 = 120;
+
+pub fn handoff_proof_is_fresh(at: u64, now: u64) -> bool {
+    let skew = if at > now { at - now } else { now - at };
+    skew <= HANDOFF_SKEW_SECS
+}
+
 /// Cloud health plus a maintenance hold. A primary that announced a planned
 /// restart stays "fresh" until that deadline, even when its last stamp is old.
 pub fn confirming_path(read_ok: bool, newest_other_at: Option<u64>, maintenance_until: u64, now: u64) -> SecondPath {
@@ -736,5 +767,19 @@ mod tests {
             move_target(&["203.0.113.10:21200".into()], &["192.0.2.5:21200".into()], &["pjdesk.example".into()]),
             "203.0.113.10:21200"
         );
+    }
+
+    #[test]
+    fn step_down_waits_until_the_peer_owns_a_newer_generation() {
+        assert!(!peer_took_the_epoch(6, 6, "chip", "lenovo"));
+        assert!(!peer_took_the_epoch(6, 7, "lenovo", "lenovo"));
+        assert!(!peer_took_the_epoch(6, 7, "", "lenovo"));
+        assert!(peer_took_the_epoch(6, 7, "chip", "lenovo"));
+        assert_eq!(standby_result("CHIP20", 7), "Now standby; CHIP20 is primary, gen 7");
+        assert_eq!(standby_result("  ", 7), "Now standby; the other server is primary, gen 7");
+        assert_eq!(primary_result(7, "BENLENOVODESK"), "Now primary, gen 7. BENLENOVODESK is standby.");
+        assert_eq!(primary_result(7, ""), "Now primary, gen 7.");
+        assert!(handoff_proof_is_fresh(1_000, 1_100));
+        assert!(!handoff_proof_is_fresh(1_000, 1_000 + HANDOFF_SKEW_SECS + 1));
     }
 }

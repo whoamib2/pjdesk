@@ -1156,6 +1156,51 @@ impl App {
         self.ask_service_or(req, "Asking the PJDesk service…", "The PJDesk service did not answer.".into());
     }
 
+    /// The other server in this pair, for the progress line. Empty when unknown.
+    fn other_server_label(&self) -> String {
+        let mine = this_computer_name();
+        let (role, active, peer) = if let Some(status) = &self.cloud {
+            (status.role.clone(), status.active_name.clone(), status.peer_name.clone())
+        } else if let Some(snap) = &self.live {
+            (snap.role.clone(), snap.active_name.clone(), snap.peer_name.clone())
+        } else {
+            return String::new();
+        };
+        let candidate = if role == "standby" {
+            if !active.is_empty() { active } else { peer }
+        } else if !peer.is_empty() {
+            peer
+        } else {
+            active
+        };
+        if candidate.trim().is_empty() || candidate.eq_ignore_ascii_case(&mine) {
+            String::new()
+        } else {
+            candidate
+        }
+    }
+
+    /// Promote or demote through the service pipe. The buttons stay enabled when
+    /// this window cannot write the data folder. If the pipe is not there, an
+    /// unelevated window asks Windows to approve one elevated command.
+    fn start_role(&mut self, promote: bool) {
+        if self.cloud_job.is_some() {
+            return;
+        }
+        let peer = self.other_server_label();
+        self.status = if promote {
+            "Becoming the primary…".into()
+        } else if peer.is_empty() {
+            "Handing the primary to the other server…".into()
+        } else {
+            format!("Handing the primary to {peer}…")
+        };
+        let dir = self.data_dir.clone();
+        let token = self.cloud_token.clone();
+        let can_write = self.can_write;
+        self.spawn_cloud_job(move || role_through_service(promote, dir, token, can_write));
+    }
+
     /// Sends one command to the service. The account token is attached when this window has it,
     /// so the signed-in owner does not need elevation. A timeout replaces the pending line.
     fn ask_service_or(&mut self, mut req: crate::control::Request, pending: &str, unanswered: String) {
@@ -1521,25 +1566,63 @@ impl App {
             if !snap.cloud_error.is_empty() {
                 ui.colored_label(p(ui).warn, &snap.cloud_error);
             }
-            if self.control_ready {
-                ui.add_space(8.0);
+            ui.add_space(8.0);
+            let busy = self.cloud_job.is_some();
+            ui.add_enabled_ui(!busy, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Become the primary").clicked() {
-                        self.ask_service(crate::control::Request { cmd: "promote".into(), ..Default::default() });
+                    if snap.role != "active" && ui.button("Become the primary").clicked() {
+                        self.cloud_form.confirm_promote = true;
+                        self.cloud_form.confirm_demote = false;
                     }
-                    if ui.button("Step down to standby").clicked() {
-                        self.ask_service(crate::control::Request { cmd: "demote".into(), ..Default::default() });
+                    if snap.role == "active" && ui.button("Step down to standby").clicked() {
+                        self.cloud_form.confirm_demote = true;
+                        self.cloud_form.confirm_promote = false;
                     }
-                    if ui.button("Sync now").clicked() {
+                    if self.control_ready && ui.button("Sync now").clicked() {
                         self.ask_service(crate::control::Request { cmd: "sync".into(), ..Default::default() });
                     }
                 });
-            } else {
-                ui.label(
-                    RichText::new("Shown from the running service. Restart as administrator to change cloud sync.")
-                        .color(p(ui).muted)
-                        .size(12.0),
+            });
+            if self.cloud_form.confirm_promote {
+                ui.add_space(4.0);
+                ui.colored_label(
+                    p(ui).warn,
+                    "Make this server the primary? It downloads the latest copy first. The other server becomes the standby once this one owns the next generation.",
                 );
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("Become the primary").fill(p(ui).accent)).clicked() {
+                        self.cloud_form.confirm_promote = false;
+                        self.start_role(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.cloud_form.confirm_promote = false;
+                    }
+                });
+            }
+            if self.cloud_form.confirm_demote {
+                ui.add_space(4.0);
+                let peer = self.other_server_label();
+                let who = if peer.is_empty() { "the other server".to_string() } else { peer };
+                ui.colored_label(
+                    p(ui).warn,
+                    format!("Step down to standby? This server hands the primary to {who} and stays primary if {who} does not take it."),
+                );
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("Step down").fill(p(ui).accent)).clicked() {
+                        self.cloud_form.confirm_demote = false;
+                        self.start_role(false);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.cloud_form.confirm_demote = false;
+                    }
+                });
+            }
+            if busy && !self.status.is_empty() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(&self.status).color(p(ui).muted).size(12.0));
+                });
             }
         });
     }
@@ -2021,6 +2104,17 @@ impl App {
                     });
                 }
                 ui.add_space(6.0);
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.horizontal(|ui| {
+                        if s.role == "standby" && ui.button("Make this the primary").clicked() {
+                            self.cloud_form.confirm_promote = true;
+                            self.cloud_form.confirm_demote = false;
+                        } else if s.role == "active" && ui.button("Step down to standby").clicked() {
+                            self.cloud_form.confirm_demote = true;
+                            self.cloud_form.confirm_promote = false;
+                        }
+                    });
+                });
                 ui.add_enabled_ui(can_write && !busy, |ui| {
                     ui.horizontal(|ui| {
                         if signed_out && ui.add(egui::Button::new("Sign in again").fill(p(ui).accent)).clicked() {
@@ -2028,13 +2122,6 @@ impl App {
                         }
                         if ui.button("Sync now").clicked() {
                             act = Some(CloudAct::SyncNow);
-                        }
-                        if s.role == "standby" {
-                            if ui.button("Make this the primary").clicked() {
-                                self.cloud_form.confirm_promote = true;
-                            }
-                        } else if s.role == "active" && ui.button("Step down to standby").clicked() {
-                            self.cloud_form.confirm_demote = true;
                         }
                         if !is_account
                             && ui
@@ -2074,7 +2161,7 @@ impl App {
                     ui.add_space(4.0);
                     ui.colored_label(
                         p(ui).warn,
-                        "Step down to standby? This server will stop uploading. The other server stays the primary until you make it the primary there.",
+                        "Step down to standby? This server hands the primary to the other server and stays primary if that server does not take it.",
                     );
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new("Step down").fill(p(ui).accent)).clicked() {
@@ -2338,42 +2425,8 @@ impl App {
                     Err(e) => format!("Could not ask the server to sync: {e}"),
                 };
             }
-            CloudAct::Promote => {
-                if self.via_service() {
-                    self.ask_service(crate::control::Request { cmd: "promote".into(), ..Default::default() });
-                    return;
-                }
-                if crate::cloud::status_is_fresh(&dir) {
-                    self.status = match crate::requests::push(&dir, crate::requests::PROMOTE_FILE, "now") {
-                        Ok(()) => "Asking the running server to become the primary.".into(),
-                        Err(e) => format!("Could not ask the server to become the primary: {e}"),
-                    };
-                } else {
-                    self.spawn_cloud_job(move || {
-                        crate::cloud::promote(&dir)?;
-                        Ok(JobDone::Message(
-                            "This server is now the primary. The other server will switch to standby the next time it checks.".into(),
-                        ))
-                    });
-                }
-            }
-            CloudAct::Demote => {
-                if self.via_service() {
-                    self.ask_service(crate::control::Request { cmd: "demote".into(), ..Default::default() });
-                    return;
-                }
-                if crate::cloud::status_is_fresh(&dir) {
-                    self.status = match crate::requests::push(&dir, crate::requests::DEMOTE_FILE, "now") {
-                        Ok(()) => "Asking the running server to step down to standby.".into(),
-                        Err(e) => format!("Could not ask the server to step down: {e}"),
-                    };
-                } else {
-                    self.spawn_cloud_job(move || {
-                        crate::cloud::demote(&dir)?;
-                        Ok(JobDone::Message("This server stepped down to standby and will not upload.".into()))
-                    });
-                }
-            }
+            CloudAct::Promote => self.start_role(true),
+            CloudAct::Demote => self.start_role(false),
             CloudAct::CopyCode => match CloudConfig::load(&dir) {
                 Some(cfg) => {
                     copy(&cfg.join_code());
@@ -3690,12 +3743,12 @@ impl App {
         self.devices
             .iter()
             .map(|d| {
-                let live = self.online.get(&d.id);
+                let live = self.online.get(&d.id).map(|version| version.trim()).filter(|version| !version.is_empty());
                 ShownDevice {
                     id: d.id.clone(),
                     hostname: d.hostname.clone(),
-                    version: live.cloned().unwrap_or_else(|| d.version.clone()),
-                    online: live.is_some(),
+                    version: live.map(|version| version.to_string()).unwrap_or_else(|| d.version.clone()),
+                    online: self.online.contains_key(&d.id),
                     last_seen: d.last_seen,
                     first_seen: d.first_seen,
                     signed_in: d.signed_in,
@@ -4275,14 +4328,19 @@ fn read_online(data_dir: &std::path::Path) -> HashMap<String, String> {
         version: String,
     }
     let path = data_dir.join("online.json");
-    if !crate::cloud::online_file_is_fresh(&path) {
-        return HashMap::new();
+    let mut online = if crate::cloud::online_file_is_fresh(&path) {
+        std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<OnlineInfo>>(&b).ok())
+            .map(|v| v.into_iter().map(|o| (o.id, o.version)).collect())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    for id in crate::cloud::cloud_presence_online(data_dir) {
+        online.entry(id).or_insert_with(String::new);
     }
-    std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Vec<OnlineInfo>>(&b).ok())
-        .map(|v| v.into_iter().map(|o| (o.id, o.version)).collect())
-        .unwrap_or_default()
+    online
 }
 
 /// Leaves an update request the running server picks up (`"*"` = all online).
@@ -4361,6 +4419,67 @@ fn ago(unix: u64) -> String {
     } else {
         format!("{} d ago", d / 86400)
     }
+}
+
+fn role_through_service(
+    promote: bool,
+    dir: std::path::PathBuf,
+    token: String,
+    can_write: bool,
+) -> anyhow::Result<JobDone> {
+    let cmd = if promote { "promote" } else { "demote" };
+    match crate::control::call_for(
+        &crate::control::Request { cmd: cmd.into(), account_token: token, ..Default::default() },
+        crate::control::ROLE_WAIT,
+    ) {
+        Some(response) if response.code == "timeout" => Ok(JobDone::Message(
+            "The PJDesk service did not finish the role change. The role was not changed.".into(),
+        )),
+        Some(response) if response.ok => Ok(JobDone::Message(shown_role_message(&response.message))),
+        Some(response) if pipe_refused(&response.message) && !can_write => elevate_role(promote, &dir),
+        Some(response) => Ok(JobDone::Message(shown_role_message(&response.message))),
+        None if can_write => {
+            let result = if promote {
+                crate::role_handoff::become_primary(&dir)
+            } else {
+                crate::role_handoff::step_down(&dir)
+            };
+            Ok(JobDone::Message(match result {
+                Ok(message) => shown_role_message(&message),
+                Err(err) => format!("{err:#}"),
+            }))
+        }
+        None => elevate_role(promote, &dir),
+    }
+}
+
+fn shown_role_message(message: &str) -> String {
+    if message.trim().is_empty() {
+        "The role was not changed.".into()
+    } else {
+        message.to_string()
+    }
+}
+
+fn pipe_refused(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not allowed") || lower.contains("cannot manage")
+}
+
+/// The pipe is not usable. Ask Windows once. The elevated command writes the
+/// same result the window is waiting to show.
+fn elevate_role(promote: bool, dir: &std::path::Path) -> anyhow::Result<JobDone> {
+    crate::role_handoff::clear_result(dir);
+    let args: &[&str] = if promote { &["cloud", "promote", "--yes"] } else { &["cloud", "demote", "--yes"] };
+    if !run_elevated(args) {
+        return Ok(JobDone::Message(
+            "Windows did not start the elevated action. The role was not changed.".into(),
+        ));
+    }
+    if let Some(result) = crate::role_handoff::wait_result(dir, crate::control::ROLE_WAIT) {
+        return Ok(JobDone::Message(shown_role_message(&result.message)));
+    }
+    Ok(JobDone::Message("Asked Windows to approve that action. This window stays open.".into()))
 }
 
 /// Relaunches this program elevated with the given arguments.
