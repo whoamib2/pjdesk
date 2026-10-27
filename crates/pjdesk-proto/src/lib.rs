@@ -15,6 +15,7 @@
 //!   password is checked with SPAKE2 ([`auth`]) so it never crosses the wire.
 
 pub mod access;
+pub mod account_mirror;
 pub mod applock;
 pub mod failover;
 pub mod routes;

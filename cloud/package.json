@@ -8,7 +8,7 @@
     "migrate:local": "wrangler d1 migrations apply pjdesk-cloud --local",
     "migrate:remote": "wrangler d1 migrations apply pjdesk-cloud --remote",
     "deploy": "wrangler d1 migrations apply pjdesk-cloud --remote && wrangler deploy",
-    "test": "node --test test/plans.test.js test/codes.test.js test/delete-computer.test.js test/network.test.js test/login-limit.test.js"
+    "test": "node --test test/plans.test.js test/codes.test.js test/delete-computer.test.js test/network.test.js test/login-limit.test.js test/account-mirror.test.js"
   },
   "devDependencies": {
     "@noble/ciphers": "^2.4.0",

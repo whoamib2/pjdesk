@@ -458,7 +458,6 @@ async fn connect(
 ) -> Result<Link> {
     tracing::info!("Connecting to {} through the advertised servers", format_id(target));
     let _ = (server, prefer_standby);
-    crate::network::refresh_config_now(config);
     let _ = waiting_retry;
     let mut access = config.presented_access();
     if access.is_empty() {

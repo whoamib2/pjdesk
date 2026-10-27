@@ -66,6 +66,7 @@ import us.spader.pjdesk.core.AppLockPolicy
 import us.spader.pjdesk.core.BioVault
 import us.spader.pjdesk.core.CloudAuth
 import us.spader.pjdesk.core.CloudAuthException
+import us.spader.pjdesk.core.CloudGate
 import us.spader.pjdesk.core.EnginePhase
 import us.spader.pjdesk.core.NetKey
 import us.spader.pjdesk.core.PasswordSync
@@ -198,6 +199,19 @@ class MainActivity : FragmentActivity() {
         if (app.store.temporaryActive() && !tempFlag.get()) app.store.endTemporaryVisit()
         if (app.store.accountServer.isNotBlank()) {
             app.engine.applyAccountServer(app.store.accountServer, app.store.accountFingerprint, quiet = true, standby = app.store.accountStandby)
+        }
+        CloudGate.exchange = exchange@{ body ->
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) return@exchange null
+            val gen = CloudGate.accountGen.get()
+            app.engine.command(JSONObject(body.toString()).put("cmd", "accountOp").toString())
+            val deadline = System.currentTimeMillis() + 20_000
+            while (System.currentTimeMillis() < deadline) {
+                if (CloudGate.accountGen.get() != gen) {
+                    return@exchange runCatching { JSONObject(CloudGate.accountJson) }.getOrNull()
+                }
+                Thread.sleep(50)
+            }
+            null
         }
         enableEdgeToEdge()
         HostService.arm(this)
@@ -760,6 +774,9 @@ class MainActivity : FragmentActivity() {
                     presenceBusy = true
                     try {
                         if (!signed) return@launch
+                        val known = state.server.ifBlank { app.store.accountServer }
+                        if (!CloudGate.serverUp && known.isNotBlank()) return@launch
+                        if (!CloudGate.serverUp && !CloudGate.allowCloud()) return@launch
                         val session = withContext(Dispatchers.IO) {
                             runCatching { refreshAccount(refresh, device, null) }
                                 .onFailure { AppLog.e("presence refresh failed: ${it.message}") }
@@ -1419,7 +1436,7 @@ class MainActivity : FragmentActivity() {
                                 val device = app.store.networkDeviceId.ifBlank {
                                     UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
                                 }
-                                val signed = CloudAuth.signIn(email, password, device, "Android")
+                                val signed = signInAccount(email, password, device)
                                 CloudAuth.vaultKey(email, password) to signed
                             }
                         }
@@ -1517,6 +1534,7 @@ class MainActivity : FragmentActivity() {
                 tryBio()
             }
             fun pullAppLock() {
+                if (!CloudGate.serverUp) return
                 if (app.store.joinedWithoutPassword || visitWithoutPassword) return
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                 val device = app.store.networkDeviceId
@@ -1885,7 +1903,7 @@ class MainActivity : FragmentActivity() {
                             val pass = netPass
                             scope.launch {
                                 val result = withContext(Dispatchers.IO) {
-                                    runCatching { CloudAuth.signIn(email, pass, device, "Android") }
+                                    runCatching { signInAccount(email, pass, device) }
                                 }
                                 result.onSuccess { session ->
                                     applySignedIn(session, email, null, false, true)
@@ -1945,7 +1963,7 @@ class MainActivity : FragmentActivity() {
                                                 if (bound) pass else "",
                                             )
                                             useCode -> CloudAuth.enroll(code, device, "Android")
-                                            else -> CloudAuth.signIn(email, pass, device, "Android")
+                                            else -> signInAccount(email, pass, device)
                                         }
                                     }
                                 }
@@ -2645,18 +2663,68 @@ class MainActivity : FragmentActivity() {
         super.onDestroy()
     }
 
+    private fun signInAccount(email: String, password: String, device: String): us.spader.pjdesk.core.Session {
+        val known = app.engine.state.value.server.ifBlank { app.store.accountServer }
+        if (known.isNotBlank()) {
+            if (app.engine.state.value.server.isBlank()) {
+                app.engine.applyAccountServer(known, app.store.accountFingerprint, quiet = true)
+            }
+            val auth = CloudAuth.authKeyHex(email, password)
+            val reply = CloudGate.request(
+                JSONObject()
+                    .put("op", "sign-in")
+                    .put("email", email.trim().lowercase())
+                    .put("auth_key", auth)
+                    .put("device_id", device)
+                    .put("device_name", "Android"),
+            )
+            if (reply?.optBoolean("ok") == true) return CloudAuth.sessionFromServer(email, device, reply)
+            val message = reply?.optString("message").orEmpty()
+            val pause = reply?.optLong("pause") ?: 0L
+            val finalAnswer = message.contains("Wrong email or password")
+                || message.contains("Too many sign-in attempts")
+                || message.contains("does not have the account yet")
+                || message.contains("Enter your email")
+                || pause > 0L
+            if (finalAnswer) {
+                throw CloudAuthException(
+                    message.ifBlank { "Could not sign in." },
+                    status = if (pause > 0L) 429 else 401,
+                    retryAfter = pause.takeIf { it > 0L },
+                )
+            }
+            CloudGate.noteServer(false)
+        }
+        return CloudAuth.signIn(email, password, device, "Android")
+    }
+
     private fun refreshAccount(
         refresh: String,
         device: String,
         computers: org.json.JSONArray?,
     ): us.spader.pjdesk.core.Session {
+        val known = app.engine.state.value.server.ifBlank { app.store.accountServer }
+        if (CloudGate.serverUp || known.isNotBlank()) {
+            val body = JSONObject().put("op", "refresh").put("refresh", refresh).put("device_id", device)
+            if (computers != null) body.put("computers", computers)
+            val reply = CloudGate.request(body)
+            if (reply?.optBoolean("ok") == true) return CloudAuth.sessionFromServer("", device, reply)
+            val message = reply?.optString("message").orEmpty()
+            if (message.contains("Sign in required") || message.contains("Wrong email")) {
+                throw CloudAuthException(message.ifBlank { "Sign in required." })
+            }
+            if (reply == null) CloudGate.noteServer(false)
+            if (known.isNotBlank() && !CloudGate.allowCloud()) {
+                throw CloudAuthException("Waiting before asking pjdesk.com again.")
+            }
+        }
         val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
-        return us.spader.pjdesk.core.CloudAuth.refresh(
+        return CloudAuth.refresh(
             refresh,
             device,
             computers,
             pjdeskId = app.engine.state.value.id,
-            hardwareId = us.spader.pjdesk.core.CloudAuth.hardwareKey(androidId),
+            hardwareId = CloudAuth.hardwareKey(androidId),
             hostname = app.engine.deviceLabel(),
         )
     }

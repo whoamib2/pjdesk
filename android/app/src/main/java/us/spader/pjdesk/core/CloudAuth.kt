@@ -5,6 +5,7 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Mac
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
@@ -16,6 +17,47 @@ import javax.crypto.spec.SecretKeySpec
  * The password-vault key is kept on the phone and seals saved computer
  * passwords. pjdesk.com stores only that ciphertext.
  */
+/**
+ * pjdesk.com is used only when no PJDesk server is answering.
+ * The wait starts at one minute and stops at 30 minutes.
+ */
+object CloudGate {
+    @Volatile var serverUp: Boolean = false
+    @Volatile var accountJson: String = ""
+    val accountGen = AtomicInteger(0)
+    @Volatile var nextAt: Long = 0
+    @Volatile var waitMs: Long = 0
+
+    /** Set by the activity. Runs the account request on a background thread. */
+    @Volatile var exchange: ((JSONObject) -> JSONObject?)? = null
+
+    fun allowCloud(): Boolean = !serverUp && System.currentTimeMillis() >= nextAt
+
+    fun noteOk() {
+        waitMs = 0
+        nextAt = 0
+    }
+
+    fun noteFail() {
+        val next = if (waitMs <= 0L) 60_000L else (waitMs * 2).coerceAtMost(30L * 60_000)
+        waitMs = next
+        nextAt = System.currentTimeMillis() + next
+    }
+
+    fun noteServer(up: Boolean) {
+        serverUp = up
+        if (up) noteOk()
+    }
+
+    fun noteAccount(json: String) {
+        accountJson = json
+        accountGen.incrementAndGet()
+        if (runCatching { JSONObject(json).optBoolean("ok") }.getOrDefault(false)) noteOk()
+    }
+
+    fun request(body: JSONObject): JSONObject? = exchange?.invoke(body)
+}
+
 object CloudAuth {
     const val API = "https://pjdesk.com"
     const val NO_SERVER =
@@ -49,43 +91,68 @@ object CloudAuth {
     fun vaultKey(email: String, password: String): ByteArray = hmac(masterKey(email, password), "pjdesk-cloud-password-vault")
 
     fun fetchPasswordVault(refresh: String, deviceId: String): String {
-        val reply = post(
-            "$API/api/network/passwords",
-            null,
-            JSONObject().put("refresh", refresh).put("device_id", deviceId),
-        )
+        val reply = accountOnServer("vault-read", refresh, deviceId)
         return reply.optString("vault")
     }
 
     fun putPasswordVault(refresh: String, deviceId: String, vault: String) {
-        post(
-            "$API/api/network/passwords",
-            null,
-            JSONObject().put("refresh", refresh).put("device_id", deviceId).put("vault", vault),
-        )
+        accountOnServer("vault-write", refresh, deviceId, JSONObject().put("vault", vault))
     }
 
     /** Sealed app-lock blob and the account's updated time. Empty when no PIN is set. */
     fun fetchAppLock(refresh: String, deviceId: String): Pair<String, Long> {
-        val reply = post(
-            "$API/api/network/app-lock",
-            null,
-            JSONObject().put("refresh", refresh).put("device_id", deviceId),
-        )
-        return reply.optString("lock") to reply.optLong("updated_at")
+        val reply = accountOnServer("lock-read", refresh, deviceId)
+        return reply.optString("app_lock") to reply.optLong("app_lock_updated")
     }
 
     fun putAppLock(refresh: String, deviceId: String, lock: String): Long {
-        val reply = post(
-            "$API/api/network/app-lock",
-            null,
-            JSONObject().put("refresh", refresh).put("device_id", deviceId).put("lock", lock),
-        )
-        return reply.optLong("updated_at")
+        val reply = accountOnServer("lock-write", refresh, deviceId, JSONObject().put("app_lock", lock))
+        return reply.optLong("app_lock_updated").coerceAtLeast(1)
+    }
+
+    private fun accountOnServer(op: String, refresh: String, deviceId: String, extra: JSONObject = JSONObject()): JSONObject {
+        if (!CloudGate.serverUp) {
+            throw CloudAuthException("No PJDesk server answered. Saved passwords stay on this phone until a server does.")
+        }
+        val body = JSONObject().put("op", op).put("refresh", refresh).put("device_id", deviceId)
+        val keys = extra.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            body.put(key, extra.get(key))
+        }
+        val reply = CloudGate.request(body)
+            ?: throw CloudAuthException("No PJDesk server answered. Saved passwords stay on this phone until a server does.")
+        if (!reply.optBoolean("ok")) {
+            throw CloudAuthException(reply.optString("message").ifBlank { "Sign in required." })
+        }
+        return reply
     }
 
     /** Proves the account password. The short session this creates is dropped. */
     fun confirmPassword(email: String, password: String) {
+        val auth = authKeyHex(email, password)
+        val local = if (CloudGate.serverUp) {
+            CloudGate.request(
+                JSONObject().put("op", "verify").put("email", email.trim().lowercase()).put("auth_key", auth),
+            )
+        } else {
+            null
+        }
+        if (local?.optBoolean("ok") == true) return
+        if (local != null) {
+            val message = local.optString("message").ifBlank { "Could not sign in." }
+            val pause = local.optLong("pause")
+            val finalAnswer = message.contains("Wrong email or password")
+                || message.contains("Too many sign-in attempts")
+                || message.contains("does not have the account yet")
+                || message.contains("Enter your email")
+                || pause > 0
+            if (finalAnswer) {
+                throw CloudAuthException(message, status = if (pause > 0) 429 else 401, retryAfter = pause.takeIf { it > 0 })
+            }
+        }
+        if (CloudGate.serverUp) throw CloudAuthException("No PJDesk server answered.")
+        if (!CloudGate.allowCloud()) throw CloudAuthException("Waiting before asking pjdesk.com again.")
         val login = post(
             "$API/api/login",
             null,
@@ -98,6 +165,7 @@ object CloudAuth {
         if (token.isNotBlank()) {
             runCatching { post("$API/api/logout", token, JSONObject()) }
         }
+        CloudGate.noteOk()
     }
 
     private fun hmac(key: ByteArray, data: String): ByteArray {
@@ -107,12 +175,19 @@ object CloudAuth {
     }
 
     fun signIn(email: String, password: String, deviceId: String, deviceName: String): Session {
+        if (CloudGate.serverUp) throw CloudAuthException("The PJDesk server has this account.")
+        if (!CloudGate.allowCloud()) throw CloudAuthException("Waiting before asking pjdesk.com again.")
         val auth = authKeyHex(email, password)
-        val login = post(
+        val login = try {
+            post(
             "$API/api/login",
             null,
             JSONObject().put("email", email.trim().lowercase()).put("auth_key", auth).put("device", "PJDesk on $deviceName"),
         )
+        } catch (e: CloudAuthException) {
+            noteTransport(e)
+            throw e
+        }
         val token = login.getString("token")
         try {
             val reply = post(
@@ -120,10 +195,13 @@ object CloudAuth {
                 token,
                 JSONObject().put("device_id", deviceId).put("device_name", deviceName),
             )
+            CloudGate.noteOk()
             return session(email.trim().lowercase(), deviceId, reply)
         } catch (e: CloudAuthException) {
+            noteTransport(e)
             val old = e.message?.contains("Set the server address") == true
             if (e.code == "no_server" || old || e.message == NO_SERVER) {
+                CloudGate.noteOk()
                 val role = if (e.role.isBlank()) "owner" else e.role
                 throw CloudAuthException(NO_SERVER, "no_server", role, token)
             }
@@ -172,7 +250,15 @@ object CloudAuth {
         if (id.length == 9) body.put("pjdesk_id", id)
         if (hardwareId.isNotBlank()) body.put("hardware_id", hardwareId.take(64))
         if (hostname.isNotBlank()) body.put("hostname", hostname.take(64))
-        val reply = post("$API/api/network/refresh", null, body)
+        if (CloudGate.serverUp) throw CloudAuthException("The PJDesk server has this account.")
+        if (!CloudGate.allowCloud()) throw CloudAuthException("Waiting before asking pjdesk.com again.")
+        val reply = try {
+            post("$API/api/network/refresh", null, body)
+        } catch (e: CloudAuthException) {
+            noteTransport(e)
+            throw e
+        }
+        CloudGate.noteOk()
         return session("", deviceId, reply)
     }
 
@@ -204,16 +290,55 @@ object CloudAuth {
         return login.getString("token")
     }
 
-    /** This device's address as pjdesk.com sees it. Blank when the call does not answer. */
-    fun publicIp(): String = runCatching {
-        val conn = (URL("$API/api/ip").openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 3_000
-            readTimeout = 3_000
+    /** Clients do not call /api/ip. The server already knows its public address. */
+    fun publicIp(): String = ""
+
+    /** A session answered by the PJDesk server, not by pjdesk.com. */
+    fun sessionFromServer(email: String, deviceId: String, reply: JSONObject): Session {
+        val address = reply.optString("address")
+        if (address.isBlank()) {
+            throw CloudAuthException(NO_SERVER, "no_server", reply.optString("role").ifBlank { "owner" })
         }
-        val text = conn.inputStream.bufferedReader().use { it.readText() }
-        JSONObject(text).optString("ip").trim()
-    }.getOrDefault("")
+        val computers = mutableListOf<SavedComputer>()
+        val list = reply.optJSONArray("computers")
+        if (list != null) {
+            for (i in 0 until list.length()) {
+                val o = list.optJSONObject(i) ?: continue
+                computers.add(
+                    SavedComputer(
+                        id = o.optString("id"),
+                        name = o.optString("name"),
+                        osFamily = o.optString("os_family"),
+                        osVersion = o.optString("os_version"),
+                        hostname = o.optString("hostname"),
+                        displayName = o.optString("display_name"),
+                    ),
+                )
+            }
+        }
+        return Session(
+            email = reply.optString("email").ifBlank { email.trim().lowercase() },
+            access = reply.optString("access"),
+            exp = reply.optLong("exp"),
+            refresh = reply.optString("refresh"),
+            deviceId = reply.optString("device_id").ifBlank { deviceId },
+            address = address,
+            fingerprint = reply.optString("fingerprint"),
+            standbyAddress = reply.optString("standby"),
+            standbyFingerprint = reply.optString("standbyFingerprint"),
+            lan = reply.optString("lan").split(',').map { it.trim() }.filter { it.isNotEmpty() },
+            publicIp = reply.optString("publicIp"),
+            computers = computers,
+            standbyLan = reply.optString("standbyLan").split(',').map { it.trim() }.filter { it.isNotEmpty() },
+            standbyPublicIp = reply.optString("standbyPublicIp"),
+        )
+    }
+
+    private fun noteTransport(e: CloudAuthException) {
+        val message = e.message.orEmpty()
+        val edge = message.contains("temporarily unavailable") || message.contains("temporarily rate limited") || message.contains("1027")
+        if (e.status == 0 || edge || e.status >= 500) CloudGate.noteFail()
+    }
 
     fun createJoinCode(refresh: String, deviceId: String): JoinCode {
         if (refresh.isBlank() || deviceId.isBlank()) throw CloudAuthException("Sign in again.")
@@ -496,6 +621,17 @@ object CloudAuth {
         val code = conn.responseCode
         val text = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText().orEmpty()
         if (code !in 200..299) {
+            val type = conn.contentType.orEmpty()
+            val html = type.contains("text/html", ignoreCase = true)
+                || text.contains("<html", ignoreCase = true)
+                || text.contains("error 1027", ignoreCase = true)
+                || text.contains("temporarily rate limited", ignoreCase = true)
+            if (html) {
+                throw CloudAuthException(
+                    "PJDesk Cloud is temporarily unavailable. This computer keeps working on the local network.",
+                    status = code,
+                )
+            }
             val parsed = runCatching { JSONObject(text) }.getOrNull()
             val message = parsed?.optString("error").orEmpty()
             val retryAfter = conn.getHeaderField("Retry-After")?.trim()?.toLongOrNull()?.takeIf { it > 0 }

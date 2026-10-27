@@ -356,7 +356,19 @@ fn post_api(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> std::r
         Ok(resp) => Ok(resp.into_string().unwrap_or_default()),
         Err(ureq::Error::Status(code, resp)) => {
             let retry_after = resp.header("retry-after").and_then(parse_retry_after);
+            let ctype = resp.header("content-type").unwrap_or("").to_string();
             let text = resp.into_string().unwrap_or_default();
+            if pjdesk_proto::failover::cloud_edge_limited(code, &ctype, &text) {
+                return Err(ApiFail {
+                    status: code,
+                    message: pjdesk_proto::failover::CLOUD_UNAVAILABLE.into(),
+                    code: String::new(),
+                    role: String::new(),
+                    owner: String::new(),
+                    label: String::new(),
+                    retry_after: None,
+                });
+            }
             let parsed: ErrorBody = serde_json::from_str(&text).unwrap_or_default();
             let message = if !parsed.error.is_empty() {
                 parsed.error
@@ -388,6 +400,28 @@ fn post_api(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> std::r
 }
 
 pub fn fetch_password_vault(refresh: &str, device_id: &str) -> Result<String> {
+    if let Ok(pjdesk_proto::signal::ServerMsg::AccountResult { ok: true, vault, .. }) =
+        account_rpc(pjdesk_proto::signal::ClientMsg::Account {
+            op: "vault-read".into(),
+            email: String::new(),
+            auth_key: String::new(),
+            refresh: refresh.to_string(),
+            device_id: device_id.to_string(),
+            device_name: String::new(),
+            vault: String::new(),
+            app_lock: String::new(),
+            computers: Vec::new(),
+            proof: String::new(),
+        })
+    {
+        note_server_answered();
+        return Ok(vault);
+    }
+    bail!("No PJDesk server answered. Saved passwords stay on this computer until a server does.");
+}
+
+#[allow(dead_code)]
+fn fetch_password_vault_cloud(refresh: &str, device_id: &str) -> Result<String> {
     let text = post_json(
         &format!("{}/api/network/passwords", api_base()),
         None,
@@ -398,6 +432,28 @@ pub fn fetch_password_vault(refresh: &str, device_id: &str) -> Result<String> {
 }
 
 pub fn fetch_app_lock(refresh: &str, device_id: &str) -> Result<(String, u64)> {
+    if let Ok(pjdesk_proto::signal::ServerMsg::AccountResult { ok: true, app_lock, app_lock_updated, .. }) =
+        account_rpc(pjdesk_proto::signal::ClientMsg::Account {
+            op: "lock-read".into(),
+            email: String::new(),
+            auth_key: String::new(),
+            refresh: refresh.to_string(),
+            device_id: device_id.to_string(),
+            device_name: String::new(),
+            vault: String::new(),
+            app_lock: String::new(),
+            computers: Vec::new(),
+            proof: String::new(),
+        })
+    {
+        note_server_answered();
+        return Ok((app_lock, app_lock_updated));
+    }
+    bail!("No PJDesk server answered.");
+}
+
+#[allow(dead_code)]
+fn fetch_app_lock_cloud(refresh: &str, device_id: &str) -> Result<(String, u64)> {
     let text = post_json(
         &format!("{}/api/network/app-lock", api_base()),
         None,
@@ -408,13 +464,24 @@ pub fn fetch_app_lock(refresh: &str, device_id: &str) -> Result<(String, u64)> {
 }
 
 pub fn put_app_lock(refresh: &str, device_id: &str, lock: &str) -> Result<u64> {
-    let text = post_json(
-        &format!("{}/api/network/app-lock", api_base()),
-        None,
-        &serde_json::json!({ "refresh": refresh, "device_id": device_id, "lock": lock }),
-    )?;
-    let parsed: LockReply = serde_json::from_str(&text).unwrap_or(LockReply { lock: String::new(), updated_at: 0 });
-    Ok(parsed.updated_at.max(1))
+    if let Ok(pjdesk_proto::signal::ServerMsg::AccountResult { ok: true, app_lock_updated, .. }) =
+        account_rpc(pjdesk_proto::signal::ClientMsg::Account {
+            op: "lock-write".into(),
+            email: String::new(),
+            auth_key: String::new(),
+            refresh: refresh.to_string(),
+            device_id: device_id.to_string(),
+            device_name: String::new(),
+            vault: String::new(),
+            app_lock: lock.to_string(),
+            computers: Vec::new(),
+            proof: String::new(),
+        })
+    {
+        note_server_answered();
+        return Ok(app_lock_updated.max(1));
+    }
+    bail!("No PJDesk server answered.");
 }
 
 /// Checks the account password and drops the short session that check creates.
@@ -425,26 +492,73 @@ pub fn confirm_account_password(email: &str, password: &str) -> Result<[u8; 32]>
         bail!("Enter your account password.");
     }
     let (auth, _sync) = pjdesk_proto::access::derive_account_keys(&email, password);
+    let auth_hex = hex::encode(auth);
+    let vault_key = pjdesk_proto::access::derive_password_vault_key(&email, password);
+    match account_rpc(pjdesk_proto::signal::ClientMsg::Account {
+        op: "verify".into(),
+        email: email.clone(),
+        auth_key: auth_hex.clone(),
+        refresh: String::new(),
+        device_id: String::new(),
+        device_name: String::new(),
+        vault: String::new(),
+        app_lock: String::new(),
+        computers: Vec::new(),
+        proof: String::new(),
+    }) {
+        Ok(pjdesk_proto::signal::ServerMsg::AccountResult { ok: true, .. }) => {
+            note_server_answered();
+            return Ok(vault_key);
+        }
+        Ok(pjdesk_proto::signal::ServerMsg::AccountResult { ok: false, message, pause_secs, .. })
+            if pause_secs > 0 || account_answer_is_final(&message) =>
+        {
+            if pause_secs > 0 {
+                bail!(sign_in_pause_error(pause_secs));
+            }
+            bail!("{message}");
+        }
+        _ => {}
+    }
+    if !cloud_fallback_allowed() {
+        bail!("No PJDesk server answered. Waiting before asking pjdesk.com again.");
+    }
     let login: LoginReply = serde_json::from_str(
         &post_api(
             &format!("{}/api/login", api_base()),
             None,
-            &account_login_body(&email, &hex::encode(auth), "PJDesk PIN check"),
+            &account_login_body(&email, &auth_hex, "PJDesk PIN check"),
         )
-        .map_err(login_failure)?,
+        .map_err(|fail| {
+            note_cloud_transport(&fail);
+            login_failure(fail)
+        })?,
     )
     .context("unexpected reply from PJDesk")?;
+    note_cloud_ok();
     let _ = post_json(&format!("{}/api/logout", api_base()), Some(&login.token), &serde_json::json!({}));
-    Ok(pjdesk_proto::access::derive_password_vault_key(&email, password))
+    Ok(vault_key)
 }
 
 pub fn put_password_vault(refresh: &str, device_id: &str, vault: &str) -> Result<()> {
-    post_json(
-        &format!("{}/api/network/passwords", api_base()),
-        None,
-        &serde_json::json!({ "refresh": refresh, "device_id": device_id, "vault": vault }),
-    )?;
-    Ok(())
+    if let Ok(pjdesk_proto::signal::ServerMsg::AccountResult { ok: true, .. }) =
+        account_rpc(pjdesk_proto::signal::ClientMsg::Account {
+            op: "vault-write".into(),
+            email: String::new(),
+            auth_key: String::new(),
+            refresh: refresh.to_string(),
+            device_id: device_id.to_string(),
+            device_name: String::new(),
+            vault: vault.to_string(),
+            app_lock: String::new(),
+            computers: Vec::new(),
+            proof: String::new(),
+        })
+    {
+        note_server_answered();
+        return Ok(());
+    }
+    bail!("No PJDesk server answered. Saved passwords stay on this computer until a server does.");
 }
 
 #[derive(Deserialize)]
@@ -574,6 +688,9 @@ pub const SIGN_IN_PAUSE_SECS: u64 = 15 * 60;
 /// `retry_after` is the Worker's `Retry-After` delta-seconds and wins over the body.
 /// A code-guess or PIN lock ("Too many tries") is not this pause.
 pub fn sign_in_pause_seconds(status: u16, message: &str, retry_after: Option<u64>) -> Option<u64> {
+    if pjdesk_proto::failover::cloud_unavailable_message(message) {
+        return None;
+    }
     let limited = (status == 429 && !message.contains("Too many tries"))
         || message.contains("Too many failed sign-ins")
         || message.contains("Too many sign-in attempts");
@@ -621,6 +738,232 @@ pub fn sign_in_pause_seconds_from_text(message: &str) -> Option<u64> {
         return Some(secs);
     }
     Some(wait_minutes(message).unwrap_or(SIGN_IN_PAUSE_SECS / 60) * 60)
+}
+
+static CLOUD_NEXT_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLOUD_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn cloud_fallback_allowed() -> bool {
+    unix_secs() >= CLOUD_NEXT_AT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn note_cloud_ok() {
+    CLOUD_WAIT.store(0, std::sync::atomic::Ordering::Relaxed);
+    CLOUD_NEXT_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn note_cloud_fail() {
+    let wait = pjdesk_proto::failover::next_cloud_wait(CLOUD_WAIT.load(std::sync::atomic::Ordering::Relaxed));
+    CLOUD_WAIT.store(wait, std::sync::atomic::Ordering::Relaxed);
+    CLOUD_NEXT_AT.store(unix_secs().saturating_add(wait), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn note_server_answered() {
+    note_cloud_ok();
+}
+
+fn note_cloud_transport(fail: &ApiFail) {
+    let edge = pjdesk_proto::failover::cloud_unavailable_message(&fail.message)
+        || pjdesk_proto::failover::cloud_edge_limited(fail.status, "", &fail.message);
+    if fail.status == 0 || edge || fail.status >= 500 {
+        note_cloud_fail();
+    }
+}
+
+fn account_answer_is_final(message: &str) -> bool {
+    message.contains("Wrong email or password")
+        || message.contains("Too many sign-in attempts")
+        || message.contains("does not have the account yet")
+        || message.contains("Enter your email")
+}
+
+fn server_sign_in(email: &str, auth_hex: &str, device_id: &str, device_name: &str, password: &str) -> Result<SignIn> {
+    let reply = account_rpc(pjdesk_proto::signal::ClientMsg::Account {
+        op: "sign-in".into(),
+        email: email.to_string(),
+        auth_key: auth_hex.to_string(),
+        refresh: String::new(),
+        device_id: device_id.to_string(),
+        device_name: device_name.to_string(),
+        vault: String::new(),
+        app_lock: String::new(),
+        computers: Vec::new(),
+        proof: String::new(),
+    })?;
+    let pjdesk_proto::signal::ServerMsg::AccountResult { ok, message, pause_secs, .. } = &reply else {
+        bail!("the server did not answer the sign-in");
+    };
+    if !ok {
+        if *pause_secs > 0 {
+            bail!(sign_in_pause_error(*pause_secs));
+        }
+        bail!("{message}");
+    }
+    note_server_answered();
+    let mut session = session_from_account(&reply, device_id)?;
+    session.vault_key = Some(pjdesk_proto::access::derive_password_vault_key(email, password));
+    if session.address.trim().is_empty() {
+        return Ok(SignIn::NoServer { role: session.role, login_token: String::new() });
+    }
+    Ok(SignIn::Ready(session))
+}
+
+fn server_refresh(refresh: &str, device_id: &str, computers: Option<&serde_json::Value>) -> Result<Session> {
+    let reply = account_rpc(pjdesk_proto::signal::ClientMsg::Account {
+        op: "refresh".into(),
+        email: String::new(),
+        auth_key: String::new(),
+        refresh: refresh.to_string(),
+        device_id: device_id.to_string(),
+        device_name: String::new(),
+        vault: String::new(),
+        app_lock: String::new(),
+        computers: fleet_from_json(computers),
+        proof: String::new(),
+    })?;
+    if let pjdesk_proto::signal::ServerMsg::AccountResult { ok: false, message, .. } = &reply {
+        bail!("{message}");
+    }
+    note_server_answered();
+    session_from_account(&reply, device_id)
+}
+
+fn account_rpc(msg: pjdesk_proto::signal::ClientMsg) -> Result<pjdesk_proto::signal::ServerMsg> {
+    let mut config = crate::config::Config::load().unwrap_or_default();
+    if config.effective_server().trim().is_empty() && config.network_routes.is_empty() {
+        bail!("no PJDesk server is saved on this computer");
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting the account request")?;
+    runtime.block_on(async {
+        let mine = pjdesk_proto::discover::private_ipv4s();
+        let mut signal = crate::signaling::SignalClient::connect_catalog(&mut config, &mine)
+            .await
+            .context("connecting to the PJDesk server")?;
+        signal.send(msg)?;
+        match tokio::time::timeout(std::time::Duration::from_secs(20), signal.recv()).await {
+            Ok(Some(reply)) => Ok(reply),
+            Ok(None) => bail!("the server closed the connection"),
+            Err(_) => bail!("the server did not answer"),
+        }
+    })
+}
+
+fn fleet_from_json(computers: Option<&serde_json::Value>) -> Vec<pjdesk_proto::signal::FleetComputer> {
+    let Some(list) = computers.and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|row| {
+            let id = row
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect::<String>();
+            if id.len() != 9 {
+                return None;
+            }
+            Some(pjdesk_proto::signal::FleetComputer {
+                id,
+                name: row.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                hostname: row.get("hostname").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                os_family: row.get("os_family").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                os_version: row.get("os_version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                display_name: row.get("display_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                starred: row.get("starred").and_then(|v| v.as_bool()).unwrap_or(false),
+                position: row.get("position").and_then(|v| v.as_i64()).unwrap_or(0),
+                hidden: row.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
+                group: row.get("group").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            })
+        })
+        .collect()
+}
+
+fn session_from_account(reply: &pjdesk_proto::signal::ServerMsg, device_id: &str) -> Result<Session> {
+    let pjdesk_proto::signal::ServerMsg::AccountResult {
+        ok,
+        message,
+        access,
+        exp,
+        refresh,
+        email,
+        role,
+        device_id: replied,
+        computers,
+        removed,
+        active_address,
+        active_fingerprint,
+        standby_address,
+        standby_fingerprint,
+        active_lan,
+        standby_lan,
+        active_public_ip,
+        standby_public_ip,
+        ..
+    } = reply
+    else {
+        bail!("the server did not answer the account request");
+    };
+    if !ok {
+        bail!("{message}");
+    }
+    let mut routes = pjdesk_proto::routes::ServerRoutes::default();
+    if !active_lan.is_empty() {
+        routes.primary_lan = split_list(active_lan);
+    }
+    if !active_address.is_empty() {
+        routes.primary_public = vec![active_address.clone()];
+    }
+    if !standby_address.is_empty() {
+        routes.standby_public.push(standby_address.clone());
+    }
+    if !standby_lan.is_empty() {
+        routes.standby_lan = split_list(standby_lan);
+    }
+    Ok(Session {
+        email: email.clone(),
+        access: access.clone(),
+        exp: *exp,
+        refresh: refresh.clone(),
+        device_id: if replied.is_empty() { device_id.to_string() } else { replied.clone() },
+        address: active_address.clone(),
+        fingerprint: active_fingerprint.clone(),
+        standby_address: standby_address.clone(),
+        standby_fingerprint: standby_fingerprint.clone(),
+        lan: split_list(active_lan),
+        public_ip: active_public_ip.clone(),
+        standby_lan: split_list(standby_lan),
+        standby_public_ip: standby_public_ip.clone(),
+        routes,
+        computers: computers
+            .iter()
+            .map(|c| SavedComputer {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                hostname: c.hostname.clone(),
+                os_family: c.os_family.clone(),
+                os_version: c.os_version.clone(),
+                display_name: c.display_name.clone(),
+                starred: Some(c.starred),
+                position: Some(c.position.max(0) as u32),
+                hidden: c.hidden,
+                group: c.group.clone(),
+            })
+            .collect(),
+        presence: Vec::new(),
+        removed: removed.clone(),
+        vault_key: None,
+        role: role.clone(),
+        support: None,
+    })
 }
 
 fn wait_minutes(message: &str) -> Option<u64> {
@@ -676,8 +1019,20 @@ pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) 
         bail!("Enter your email and password.");
     }
     let (auth, _sync) = pjdesk_proto::access::derive_account_keys(&email, password);
-    let login_body = account_login_body(&email, &hex::encode(auth), &format!("PJDesk on {device_name}"));
-    let login_text = post_api(&format!("{}/api/login", api_base()), None, &login_body).map_err(login_failure)?;
+    let auth_hex = hex::encode(auth);
+    match server_sign_in(&email, &auth_hex, device_id, device_name, password) {
+        Ok(sign) => return Ok(sign),
+        Err(err) if account_answer_is_final(&err.to_string()) => return Err(err),
+        Err(_) => {}
+    }
+    if !cloud_fallback_allowed() {
+        bail!("No PJDesk server answered. Waiting before asking pjdesk.com again.");
+    }
+    let login_body = account_login_body(&email, &auth_hex, &format!("PJDesk on {device_name}"));
+    let login_text = post_api(&format!("{}/api/login", api_base()), None, &login_body).map_err(|fail| {
+        note_cloud_transport(&fail);
+        login_failure(fail)
+    })?;
     let login: LoginReply = serde_json::from_str(&login_text).context("unexpected reply from PJDesk")?;
     match post_api(
         &format!("{}/api/network/token", api_base()),
@@ -685,6 +1040,7 @@ pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) 
         &serde_json::json!({ "device_id": device_id, "device_name": device_name }),
     ) {
         Ok(text) => {
+            note_cloud_ok();
             let reply: NetworkReply = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
             match session_from(&email, device_id, reply) {
                 Ok(mut session) => {
@@ -699,10 +1055,14 @@ pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) 
             }
         }
         Err(fail) if fail.code == "no_server" || is_old_no_server(&fail.message) => {
+            note_cloud_ok();
             let role = if fail.role.is_empty() { "owner".into() } else { fail.role };
             Ok(SignIn::NoServer { role, login_token: login.token })
         }
-        Err(fail) => bail!(fail.message),
+        Err(fail) => {
+            note_cloud_transport(&fail);
+            bail!(fail.message)
+        }
     }
 }
 
@@ -760,9 +1120,27 @@ fn refresh_account(
             body["computers"] = list.clone();
         }
     }
+    match server_refresh(refresh_token, device_id, body.get("computers")) {
+        Ok(session) => Ok(session),
+        Err(err) => Err(RefreshError { revoked: false, message: err.to_string() }.into()),
+    }
+}
+
+/// Last-resort route lookup. Used only when no PJDesk server answered.
+pub fn cloud_route_lookup(refresh_token: &str, device_id: &str) -> Result<Session> {
+    if !cloud_fallback_allowed() {
+        bail!("Waiting before asking pjdesk.com again.");
+    }
+    let body = serde_json::json!({ "refresh": refresh_token, "device_id": device_id });
     let text = match post_api(&format!("{}/api/network/refresh", api_base()), None, &body) {
-        Ok(text) => text,
+        Ok(text) => {
+            note_cloud_ok();
+            text
+        }
         Err(fail) => {
+            if fail.status != 429 || pjdesk_proto::failover::cloud_edge_limited(fail.status, "", &fail.message) {
+                note_cloud_fail();
+            }
             return Err(RefreshError {
                 revoked: refresh_failure_revokes(fail.status, &fail.message),
                 message: fail.message,
@@ -771,8 +1149,7 @@ fn refresh_account(
         }
     };
     let reply: NetworkReply = serde_json::from_str(&text).context("unexpected reply from PJDesk")?;
-    let email = String::new();
-    session_from(&email, device_id, reply)
+    session_from("", device_id, reply)
 }
 
 /// Downloads the account list, including computers deleted since the last sync.
@@ -1716,6 +2093,7 @@ mod tests {
         assert_eq!(sign_in_pause_seconds(429, "ignored", Some(100_000)), Some(15 * 60));
         assert_eq!(sign_in_pause_seconds(429, "Too many tries. Try again in 2 minutes.", Some(120)), None);
         assert_eq!(sign_in_pause_seconds(401, "Wrong email or password.", None), None);
+        assert_eq!(sign_in_pause_seconds(429, pjdesk_proto::failover::CLOUD_UNAVAILABLE, None), None);
         assert_eq!(sign_in_pause_text(15 * 60), "Too many sign-in attempts. Try again in 15 minutes.");
         assert_eq!(sign_in_pause_text(1), "Too many sign-in attempts. Try again in 1 minute.");
         assert_eq!(sign_in_pause_text(61), "Too many sign-in attempts. Try again in 2 minutes.");

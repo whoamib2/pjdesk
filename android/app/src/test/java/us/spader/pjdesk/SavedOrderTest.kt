@@ -219,6 +219,10 @@ class SavedOrderTest {
         assertEquals(15L * 60, signInPauseSeconds(429, "ignored", 100_000))
         assertEquals(null, signInPauseSeconds(429, "Too many tries. Try again in 2 minutes.", 120))
         assertEquals(null, signInPauseSeconds(401, "Wrong email or password."))
+        assertEquals(
+            null,
+            signInPauseSeconds(429, "PJDesk Cloud is temporarily unavailable. This computer keeps working on the local network."),
+        )
         assertEquals("Too many sign-in attempts. Try again in 15 minutes.", signInPauseText(15 * 60))
         assertEquals("Too many sign-in attempts. Try again in 1 minute.", signInPauseText(1))
         assertEquals("Too many sign-in attempts. Try again in 2 minutes.", signInPauseText(61))

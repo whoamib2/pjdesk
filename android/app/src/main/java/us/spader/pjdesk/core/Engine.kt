@@ -597,6 +597,8 @@ class Engine(context: Context) : EngineListener {
         when (kind) {
             "log" -> AppLog.i(event.optString("text"))
             "release" -> update { it.copy(latestRelease = event.optString("version").ifBlank { it.latestRelease }) }
+            "serverLink" -> CloudGate.noteServer(event.optBoolean("up"))
+            "account" -> CloudGate.noteAccount(event.toString())
             "registered" -> {
                 // The Keystore is the source of truth. A registration that
                 // races ahead of setPermanent must not clear a password that

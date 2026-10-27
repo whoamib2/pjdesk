@@ -9,6 +9,7 @@ const val SIGN_IN_PAUSE_SECS = 15 * 60L
  * A code-guess or PIN lock ("Too many tries") is not this pause.
  */
 fun signInPauseSeconds(status: Int, message: String, retryAfter: Long? = null): Long? {
+    if (message.contains("temporarily unavailable") || message.contains("temporarily rate limited")) return null
     val limited = (status == 429 && !message.contains("Too many tries"))
         || message.contains("Too many failed sign-ins")
         || message.contains("Too many sign-in attempts")

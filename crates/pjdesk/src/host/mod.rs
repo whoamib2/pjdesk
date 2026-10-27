@@ -718,9 +718,13 @@ async fn pull_cloud_routes(config: &mut Config) -> bool {
         return false;
     }
     info!("Asking pjdesk.com for the current server addresses");
-    let mut copy = config.clone();
+    let refresh = config.network_refresh_token();
+    let device = config.network_device_id.clone().unwrap_or_default();
     let refreshed = match tokio::task::spawn_blocking(move || {
-        crate::network::refresh_config_now(&mut copy);
+        let mut copy = crate::config::Config::load().unwrap_or_default();
+        if let Ok(session) = crate::network::cloud_route_lookup(&refresh, &device) {
+            copy.apply_network_session(&session);
+        }
         copy
     })
     .await
@@ -936,21 +940,6 @@ async fn signaling_loop(
     use_standby: bool,
 ) -> Result<SignalEnd> {
     let _ = (server, force_refresh, public_only, use_standby);
-    tokio::task::spawn_blocking({
-        let mut copy = config.clone();
-        move || {
-            crate::network::refresh_config_now(&mut copy);
-            copy
-        }
-    })
-    .await
-    .ok()
-    .map(|refreshed| {
-        copy_refreshed(config, &refreshed);
-        if config.network_routes.has_advertised_ip() {
-            crate::routes_store::store(&config.network_routes);
-        }
-    });
     let _ = config.reload_access_key();
     state.remember_support(config);
     let role = if state.args.service_host { "service" } else { "window" };
@@ -1120,6 +1109,13 @@ async fn signaling_loop(
                             info!("Updated server addresses from the primary");
                         }
                     }
+                    ServerMsg::Fleet { .. } => {
+                        info!("Account list updated from the server");
+                    }
+                    ServerMsg::Release { version, .. } => {
+                        info!("Server says the latest PJDesk release is {version}");
+                    }
+                    ServerMsg::AccountResult { .. } | ServerMsg::Replica { .. } => {}
                     ServerMsg::MoveRelay { session_id, primary } => {
                         info!("failover: moving relayed session {session_id:016x} to the primary {primary}");
                         *state.follow.lock().unwrap() = Some(primary.clone());

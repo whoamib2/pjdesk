@@ -111,7 +111,7 @@ impl Settings {
 
     /// Seconds between automatic checks: 30 minutes plus up to 30 minutes.
     pub fn interval_secs(&self) -> u64 {
-        30 * 60 + (self.jitter_secs % (30 * 60))
+        pjdesk_proto::failover::RELEASE_CHECK_SECS + (self.jitter_secs % (60 * 60))
     }
 }
 

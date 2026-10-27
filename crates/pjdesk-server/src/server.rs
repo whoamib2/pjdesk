@@ -489,6 +489,42 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
                 });
                 continue;
             }
+            if let ClientMsg::Account { .. } = &msg {
+                let dir = state.lock().unwrap().data_dir.clone();
+                let request = msg;
+                let reply = tokio::task::spawn_blocking(move || crate::account_mirror::answer(&dir, request))
+                    .await
+                    .unwrap_or_else(|_| {
+                        ServerMsg::AccountResult {
+                            ok: false,
+                            op: String::new(),
+                            message: "This server could not check the account.".into(),
+                            access: String::new(),
+                            exp: 0,
+                            refresh: String::new(),
+                            email: String::new(),
+                            role: String::new(),
+                            device_id: String::new(),
+                            vault: String::new(),
+                            vault_updated: 0,
+                            app_lock: String::new(),
+                            app_lock_updated: 0,
+                            computers: Vec::new(),
+                            removed: Vec::new(),
+                            pause_secs: 0,
+                            active_address: String::new(),
+                            active_fingerprint: String::new(),
+                            standby_address: String::new(),
+                            standby_fingerprint: String::new(),
+                            active_lan: String::new(),
+                            standby_lan: String::new(),
+                            active_public_ip: String::new(),
+                            standby_public_ip: String::new(),
+                        }
+                    });
+                conn.send(reply);
+                continue;
+            }
             handle_message(&state, &mut conn, msg);
         }
     }
@@ -887,6 +923,14 @@ fn finish_registration(
     info!("Host {} \"{hostname}\" online from {} (v{app_version}); this server is the primary", format_id(&id), conn.addr.ip());
     if pjdesk_proto::update::version_at_least(app_version, "0.6.45") {
         conn.send(ServerMsg::Routes(crate::cloud::advertised_routes(&st.data_dir)));
+    }
+    if crate::account_mirror::client_can_account(app_version) {
+        if let Some(fleet) = crate::account_mirror::fleet_for(&st.data_dir, "") {
+            conn.send(fleet);
+        }
+        if let Some(release) = crate::account_mirror::release_message(&st.data_dir) {
+            conn.send(release);
+        }
     }
     // Same computer name, offline leftovers only. A different install key is a
     // different hostname here, and a different name is not removed.
@@ -1304,6 +1348,14 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
 
         // The connection task handles this before taking the server lock.
         ClientMsg::TakePrimary { .. } => {}
+
+        ClientMsg::PublishSaved { computers, app_lock, app_lock_set } => {
+            let _ = (computers, app_lock, app_lock_set);
+            // Saved-list edits from 0.6.48 arrive as Account. This arm exists
+            // so an older draft of that message does not stall the connection.
+        }
+
+        ClientMsg::Account { .. } => {}
     }
 }
 
@@ -1805,14 +1857,14 @@ fn push_routes(state: &Shared, routes: &pjdesk_proto::routes::ServerRoutes) {
     }
 }
 
-/// Cloud sync (see [`crate::cloud`]): every 30 s, or when the window asks,
+/// Cloud sync (see [`crate::cloud`]): every 5 minutes, or when the window asks,
 /// uploads this server's state if it is in use, or takes the newest copy from
 /// the main server if it is on standby — then reloads the key, accounts and
 /// computer list so it is ready to take over.
 async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
     use crate::cloud::{promote, sync_once, Role};
     use crate::requests::{take, DEMOTE_FILE, PROMOTE_FILE, RELOAD_FILE, SYNC_FILE};
-    const PASS_EVERY: u32 = 15; // ticks of 2 s
+    const PASS_EVERY: u32 = 150; // ticks of 2 s: one cloud batch every 5 minutes
     let data_dir = state.lock().unwrap().data_dir.clone();
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let mut ticks: u32 = 0;
@@ -1878,13 +1930,24 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
         if !promote_now && !forced && ticks % PASS_EVERY != 1 {
             continue;
         }
+        // The standby mirrors the account from the primary. It does not poll pjdesk.com.
+        if !crate::cloud::accepts_host_registrations(&data_dir) && !forced {
+            continue;
+        }
         // An empty table after a restart is not a demotion. Treating it as
         // standby wrote cloud-status.json as standby, and that file then
         // refused every registration, so every computer stayed offline.
         let accepts = crate::cloud::accepts_host_registrations(&data_dir);
         let role = if accepts { Role::Active } else { Role::Standby };
         let dir = data_dir.clone();
-        let applied = tokio::task::spawn_blocking(move || sync_once(&dir, role, forced)).await.unwrap_or(false);
+        let applied = tokio::task::spawn_blocking(move || {
+            let applied = sync_once(&dir, role, forced);
+            crate::account_mirror::batch(&dir, forced);
+            crate::account_mirror::refresh_release(&dir);
+            applied
+        })
+        .await
+        .unwrap_or(false);
         if applied {
             reload_from_disk(&state, &acceptor, &data_dir);
         }

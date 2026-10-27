@@ -1218,7 +1218,7 @@ pub fn status_is_fresh(data_dir: &Path) -> bool {
     CloudStatus::load(data_dir).is_some_and(|s| s.updated_at + 90 >= now())
 }
 
-/// One sync pass, run by the server every 30 s (blocking; call from a worker
+/// One sync pass, run by the primary every 5 minutes (blocking; call from a worker
 /// thread). Returns true if a newer copy from another server was applied, in
 /// which case the caller reloads the key, accounts and computer list.
 ///
@@ -2211,6 +2211,39 @@ fn network_addresses(cfg: &CloudConfig) -> Result<(String, String)> {
     Ok((net.active_address, net.standby_address))
 }
 
+const HEALTH_CACHE: &str = "health-cache.json";
+
+#[derive(Default, Serialize, Deserialize)]
+struct HealthCache {
+    #[serde(default)]
+    at: u64,
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    peers: Vec<PeerHealth>,
+}
+
+/// The last cloud health read. `allow_network` false never calls pjdesk.com.
+/// A cache younger than `max_age` is reused.
+pub fn peer_health_cached(data_dir: &Path, max_age: u64, allow_network: bool) -> (bool, Vec<PeerHealth>) {
+    let path = data_dir.join(HEALTH_CACHE);
+    let cached: Option<HealthCache> = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    if let Some(cache) = &cached {
+        if cache.at > 0 && now().saturating_sub(cache.at) < max_age {
+            return (cache.ok, cache.peers.clone());
+        }
+    }
+    if !allow_network {
+        return cached.map(|cache| (cache.ok, cache.peers)).unwrap_or((false, Vec::new()));
+    }
+    let result = peer_health_result(data_dir);
+    let row = HealthCache { at: now(), ok: result.0, peers: result.1.clone() };
+    if let Ok(bytes) = serde_json::to_vec(&row) {
+        let _ = std::fs::write(path, bytes);
+    }
+    result
+}
+
 /// `(read succeeded, peers)`. A failed read is not an empty fleet.
 pub fn peer_health_result(data_dir: &Path) -> (bool, Vec<PeerHealth>) {
     let Some(cfg) = CloudConfig::load(data_dir) else {
@@ -2369,7 +2402,20 @@ fn publish_presence(data_dir: &Path) {
     let stamp = data_dir.join("presence-publish.json");
     let previous =
         std::fs::read(&stamp).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    if previous.as_ref() == Some(&body) {
+    let signature = |value: &serde_json::Value| {
+        let mut copy = value.clone();
+        if let Some(rows) = copy.get_mut("devices").and_then(|v| v.as_array_mut()) {
+            for row in rows {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.remove("last_seen");
+                }
+            }
+        }
+        copy
+    };
+    let same = previous.as_ref().map(|prev| signature(prev) == signature(&body)).unwrap_or(false);
+    let posted_at = stamp.metadata().ok().and_then(|meta| meta.modified().ok()).and_then(|time| time.elapsed().ok());
+    if same && posted_at.map(|age| age.as_secs() < pjdesk_proto::failover::CLOUD_PRESENCE_REFRESH_SECS).unwrap_or(false) {
         return;
     }
     if snapshot_stale {

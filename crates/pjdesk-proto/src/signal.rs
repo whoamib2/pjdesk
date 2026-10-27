@@ -187,6 +187,45 @@ pub enum ClientMsg {
         hostname: String,
         app_version: String,
     },
+    /// 0.6.48+. Saved-list edits for the primary to upload in its next batch.
+    /// Sent only after this server has sent [`ServerMsg::Fleet`]. An older
+    /// server cannot decode it and would drop the connection.
+    PublishSaved {
+        computers: Vec<FleetComputer>,
+        #[serde(default)]
+        app_lock: String,
+        #[serde(default)]
+        app_lock_set: bool,
+    },
+    /// 0.6.48+. Ask this server to sign in, refresh a token, or read and write
+    /// the saved list from its account copy. The password is not sent.
+    /// `auth_key` is the same hex the cloud login uses, and only for
+    /// `op = "sign-in"`. An older server cannot decode this and drops the
+    /// connection; the client then uses pjdesk.com only when no server answers.
+    Account {
+        /// `sign-in`, `refresh`, `vault-read`, `vault-write`, `lock-read`,
+        /// `lock-write`, `saved-write`, or `replica`.
+        op: String,
+        #[serde(default)]
+        email: String,
+        #[serde(default)]
+        auth_key: String,
+        #[serde(default)]
+        refresh: String,
+        #[serde(default)]
+        device_id: String,
+        #[serde(default)]
+        device_name: String,
+        #[serde(default)]
+        vault: String,
+        #[serde(default)]
+        app_lock: String,
+        #[serde(default)]
+        computers: Vec<FleetComputer>,
+        /// Proves a paired server for `replica`. Empty for a person signing in.
+        #[serde(default)]
+        proof: String,
+    },
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -397,6 +436,138 @@ pub enum ServerMsg {
         name: String,
         message: String,
     },
+    /// 0.6.48+. Who is online, their versions, and the saved list the primary
+    /// last fetched. Sent only to a client whose version can decode it.
+    /// Older clients are not sent this variant.
+    Fleet {
+        presence: Vec<FleetPeer>,
+        computers: Vec<FleetComputer>,
+        #[serde(default)]
+        removed: Vec<String>,
+        #[serde(default)]
+        app_lock: String,
+        #[serde(default)]
+        app_lock_updated: u64,
+    },
+    /// 0.6.48+. Reply to [`ClientMsg::Account`]. Tokens are issued on this
+    /// server. `vault` is ciphertext.
+    AccountResult {
+        ok: bool,
+        #[serde(default)]
+        op: String,
+        #[serde(default)]
+        message: String,
+        #[serde(default)]
+        access: String,
+        #[serde(default)]
+        exp: u64,
+        #[serde(default)]
+        refresh: String,
+        #[serde(default)]
+        email: String,
+        #[serde(default)]
+        role: String,
+        #[serde(default)]
+        device_id: String,
+        #[serde(default)]
+        vault: String,
+        #[serde(default)]
+        vault_updated: u64,
+        #[serde(default)]
+        app_lock: String,
+        #[serde(default)]
+        app_lock_updated: u64,
+        #[serde(default)]
+        computers: Vec<FleetComputer>,
+        #[serde(default)]
+        removed: Vec<String>,
+        #[serde(default)]
+        pause_secs: u64,
+        #[serde(default)]
+        active_address: String,
+        #[serde(default)]
+        active_fingerprint: String,
+        #[serde(default)]
+        standby_address: String,
+        #[serde(default)]
+        standby_fingerprint: String,
+        #[serde(default)]
+        active_lan: String,
+        #[serde(default)]
+        standby_lan: String,
+        #[serde(default)]
+        active_public_ip: String,
+        #[serde(default)]
+        standby_public_ip: String,
+    },
+    /// 0.6.48+. The account copy, for the paired standby only. Not sent to
+    /// hosts or phones. `body` is JSON without failed-sign-in counters.
+    Replica {
+        revision: String,
+        body: Vec<u8>,
+    },
+    /// 0.6.48+. The release the primary last fetched, including installer URLs.
+    /// Clients do not call pjdesk.com for this.
+    Release {
+        version: String,
+        #[serde(default)]
+        client_url: String,
+        #[serde(default)]
+        server_url: String,
+        #[serde(default)]
+        sums_url: String,
+        #[serde(default)]
+        notes: String,
+        #[serde(default)]
+        checked_at: u64,
+    },
+}
+
+/// One computer the primary can see, for the Saved list.
+/// `online` is the live registration, not a cloud poll.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetPeer {
+    pub id: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub online: bool,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub last_seen: u64,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub os_family: String,
+    #[serde(default)]
+    pub os_version: String,
+    #[serde(default)]
+    pub console_user: String,
+}
+
+/// One saved-list row. Passwords are not included.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetComputer {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub os_family: String,
+    #[serde(default)]
+    pub os_version: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub starred: bool,
+    #[serde(default)]
+    pub position: i64,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub group: String,
 }
 
 /// One server access key, safe to list. The secret and its hash are not here.
@@ -625,6 +796,76 @@ mod tests {
         })
         .unwrap();
         assert_eq!(handoff[0], move_relay[0] + 1, "Handoff is appended after MoveRelay");
+        let fleet = postcard::to_stdvec(&ServerMsg::Fleet {
+            presence: Vec::new(),
+            computers: Vec::new(),
+            removed: Vec::new(),
+            app_lock: String::new(),
+            app_lock_updated: 0,
+        })
+        .unwrap();
+        assert_eq!(fleet[0], handoff[0] + 1, "Fleet is appended after Handoff");
+        let saved = postcard::to_stdvec(&ClientMsg::PublishSaved {
+            computers: Vec::new(),
+            app_lock: String::new(),
+            app_lock_set: false,
+        })
+        .unwrap();
+        assert_eq!(saved[0], install[0] + 1, "PublishSaved is appended after RegisterInstall");
+        let account = postcard::to_stdvec(&ClientMsg::Account {
+            op: "sign-in".into(),
+            email: "a@b.co".into(),
+            auth_key: String::new(),
+            refresh: String::new(),
+            device_id: "d".into(),
+            device_name: String::new(),
+            vault: String::new(),
+            app_lock: String::new(),
+            computers: Vec::new(),
+            proof: String::new(),
+        })
+        .unwrap();
+        assert_eq!(account[0], saved[0] + 1, "Account is appended after PublishSaved");
+        let release = postcard::to_stdvec(&ServerMsg::Release {
+            version: "0.6.48".into(),
+            client_url: String::new(),
+            server_url: String::new(),
+            sums_url: String::new(),
+            notes: String::new(),
+            checked_at: 1,
+        })
+        .unwrap();
+        let replica = postcard::to_stdvec(&ServerMsg::Replica { revision: "1".into(), body: Vec::new() }).unwrap();
+        let result = postcard::to_stdvec(&ServerMsg::AccountResult {
+            ok: true,
+            op: "sign-in".into(),
+            message: String::new(),
+            access: String::new(),
+            exp: 1,
+            refresh: String::new(),
+            email: String::new(),
+            role: "owner".into(),
+            device_id: String::new(),
+            vault: String::new(),
+            vault_updated: 0,
+            app_lock: String::new(),
+            app_lock_updated: 0,
+            computers: Vec::new(),
+            removed: Vec::new(),
+            pause_secs: 0,
+            active_address: String::new(),
+            active_fingerprint: String::new(),
+            standby_address: String::new(),
+            standby_fingerprint: String::new(),
+            active_lan: String::new(),
+            standby_lan: String::new(),
+            active_public_ip: String::new(),
+            standby_public_ip: String::new(),
+        })
+        .unwrap();
+        assert_eq!(result[0], fleet[0] + 1, "AccountResult is appended after Fleet");
+        assert_eq!(replica[0], result[0] + 1, "Replica is appended after AccountResult");
+        assert_eq!(release[0], replica[0] + 1, "Release is appended after Replica");
         let back: ClientMsg = postcard::from_bytes(&ping).unwrap();
         assert!(matches!(back, ClientMsg::Ping));
         match postcard::from_bytes::<ServerMsg>(&keys).unwrap() {

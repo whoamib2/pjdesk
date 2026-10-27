@@ -6,6 +6,7 @@ import us.spader.pjdesk.data.Store
 /** Pulls and, when asked, uploads the sealed saved-password vault. The key never leaves the phone. */
 object PasswordSync {
     fun pull(store: Store, key: ByteArray, refresh: String, deviceId: String, upload: Boolean): Boolean {
+        if (!CloudGate.serverUp) return false
         val remoteText = try {
             CloudAuth.fetchPasswordVault(refresh, deviceId)
         } catch (e: Exception) {

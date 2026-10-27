@@ -41,7 +41,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.47";
+pub const APP_VERSION: &str = "0.6.48";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -464,15 +464,6 @@ fn persist(state: &State) {
 
 async fn run(state: Arc<State>, mut cmds: mpsc::UnboundedReceiver<Value>, cb: Arc<dyn Callbacks>) {
     publish(&state, &cb);
-    let cb_release = cb.clone();
-    tokio::spawn(async move {
-        let version = tokio::task::spawn_blocking(|| pjdesk_proto::update::site_version().unwrap_or_default())
-            .await
-            .unwrap_or_default();
-        if !version.is_empty() {
-            emit(&cb_release, &json!({"event":"release","version": version}));
-        }
-    });
     let state_h = state.clone();
     let cb_h = cb.clone();
     let host = tokio::spawn(async move { host_loop(state_h, cb_h).await });
@@ -624,6 +615,47 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         "account" => {
             let email = cmd.get("email").and_then(|v| v.as_str()).unwrap_or("").trim();
             *state.account.lock().unwrap() = email.chars().filter(|c| !c.is_control()).take(80).collect();
+        }
+        "accountOp" => {
+            let op = cmd.get("op").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let email = cmd.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let auth_key = cmd.get("auth_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let refresh = cmd.get("refresh").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let device_id = cmd.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let device_name = cmd.get("device_name").and_then(|v| v.as_str()).unwrap_or("Android").to_string();
+            let vault = cmd.get("vault").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let app_lock = cmd.get("app_lock").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let computers = fleet_from_command(cmd.get("computers"));
+            let state = state.clone();
+            let cb = cb.clone();
+            tokio::spawn(async move {
+                let msg = ClientMsg::Account {
+                    op,
+                    email,
+                    auth_key,
+                    refresh,
+                    device_id,
+                    device_name,
+                    vault,
+                    app_lock,
+                    computers,
+                    proof: String::new(),
+                };
+                let outcome = async {
+                    let mut signal = open_ordered(&state, &cb, None).await?;
+                    signal.send(msg)?;
+                    match tokio::time::timeout(Duration::from_secs(20), signal.recv()).await {
+                        Ok(Some(reply)) => Ok(reply),
+                        Ok(None) => bail!("the server closed the connection"),
+                        Err(_) => bail!("the server did not answer"),
+                    }
+                }
+                .await;
+                match outcome {
+                    Ok(reply) => emit(&cb, &account_event(&reply)),
+                    Err(err) => emit(&cb, &json!({"event":"account","ok": false, "message": err.to_string()})),
+                }
+            });
         }
         "setTrusted" => {
             *state.trusted_accounts.lock().unwrap() = trusted_list(cmd.get("accounts"));
@@ -1153,6 +1185,7 @@ async fn open_signal(
         Err(e) => {
             let text = format!("{e:#}");
             log_line(cb, format!("signaling failed: {text}"));
+            emit(cb, &json!({"event":"serverLink","up": false}));
             emit(
                 cb,
                 &json!({
@@ -1191,6 +1224,7 @@ async fn host_loop(state: Arc<State>, cb: Arc<dyn Callbacks>) {
                 wait = Duration::from_secs(1);
             }
             Ok(PhoneHost::Lost) => {
+                emit(&cb, &json!({"event":"serverLink","up": false}));
                 if state.host_live.load(Ordering::SeqCst) != 0 {
                     log_line(
                         &cb,
@@ -1384,6 +1418,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                 last_heard = Instant::now();
                 match msg {
                     ServerMsg::Registered { device_id } => {
+                        emit(&cb, &json!({"event":"serverLink","up": true}));
                         saw_registered = true;
                         *state.device_id.lock().unwrap() = Some(device_id.clone());
                         persist(&state);
@@ -1527,6 +1562,13 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                             state.moved.notify_waiters();
                         }
                     }
+                    ServerMsg::Fleet { computers, .. } => {
+                        emit(&cb, &json!({"event":"fleet","computers": computers.len()}));
+                    }
+                    ServerMsg::Release { version, client_url, .. } => {
+                        emit(&cb, &json!({"event":"release","version": version, "url": client_url}));
+                    }
+                    reply @ ServerMsg::AccountResult { .. } => emit(&cb, &account_event(&reply)),
                     ServerMsg::UpdateNow => {
                         log_line(&cb, "the server asked this phone to update");
                         let cb = cb.clone();
@@ -1610,6 +1652,95 @@ struct ViewAsk {
     account: String,
     computer: String,
     id: String,
+}
+
+fn fleet_from_command(value: Option<&Value>) -> Vec<pjdesk_proto::signal::FleetComputer> {
+    let Some(list) = value.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|row| {
+            let id = row
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect::<String>();
+            if id.len() != 9 {
+                return None;
+            }
+            let text = |key: &str| row.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Some(pjdesk_proto::signal::FleetComputer {
+                id,
+                name: text("name"),
+                hostname: text("hostname"),
+                os_family: text("os_family"),
+                os_version: text("os_version"),
+                display_name: text("display_name"),
+                starred: row.get("starred").and_then(|v| v.as_bool()).unwrap_or(false),
+                position: row.get("position").and_then(|v| v.as_i64()).unwrap_or(0),
+                hidden: row.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
+                group: text("group"),
+            })
+        })
+        .collect()
+}
+
+fn account_event(msg: &ServerMsg) -> Value {
+    let ServerMsg::AccountResult {
+        ok,
+        message,
+        access,
+        exp,
+        refresh,
+        email,
+        role,
+        device_id,
+        vault,
+        vault_updated,
+        app_lock,
+        app_lock_updated,
+        computers,
+        pause_secs,
+        active_address,
+        active_fingerprint,
+        standby_address,
+        standby_fingerprint,
+        active_lan,
+        standby_lan,
+        active_public_ip,
+        standby_public_ip,
+        ..
+    } = msg
+    else {
+        return json!({"event":"account","ok": false, "message": "the server did not answer the sign-in"});
+    };
+    json!({
+        "event": "account",
+        "ok": ok,
+        "message": message,
+        "access": access,
+        "exp": exp,
+        "refresh": refresh,
+        "email": email,
+        "role": role,
+        "device_id": device_id,
+        "vault": vault,
+        "vault_updated": vault_updated,
+        "app_lock": app_lock,
+        "app_lock_updated": app_lock_updated,
+        "computers": computers,
+        "pause": pause_secs,
+        "address": active_address,
+        "fingerprint": active_fingerprint,
+        "standby": standby_address,
+        "standbyFingerprint": standby_fingerprint,
+        "lan": active_lan,
+        "standbyLan": standby_lan,
+        "publicIp": active_public_ip,
+        "standbyPublicIp": standby_public_ip,
+    })
 }
 
 fn trusted_list(value: Option<&serde_json::Value>) -> Vec<String> {
