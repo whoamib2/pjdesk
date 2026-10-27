@@ -32,6 +32,9 @@ pub const DEMOTE_FILE: &str = "demote-requests.json";
 pub const RELOAD_FILE: &str = "reload-requests.json";
 /// Assign a group: `deviceId=Group name` (an empty name clears it).
 pub const GROUP_FILE: &str = "group-requests.json";
+/// Turn incoming-only on or off: `deviceId=on` or `deviceId=off`.
+/// The password is checked before this file is written. It is not stored here.
+pub const INCOMING_FILE: &str = "incoming-only-requests.json";
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
@@ -44,6 +47,7 @@ pub fn acceptable_target(file: &str, target: &str) -> bool {
         REVOKE_KEY_FILE => crate::access_keys::is_key_id(target),
         SYNC_FILE | RELOAD_FILE | PROMOTE_FILE | DEMOTE_FILE | REQUIRE_DISCONNECT_FILE => target == "now",
         GROUP_FILE => parse_group_target(target).is_some(),
+        INCOMING_FILE => parse_incoming_target(target).is_some(),
         _ => false,
     }
 }
@@ -91,6 +95,47 @@ pub fn take(data_dir: &Path, file: &str) -> Vec<String> {
     let list = read_list(&taken);
     let _ = std::fs::remove_file(&taken);
     list.into_iter().filter(|t| acceptable_target(file, t)).collect()
+}
+
+/// `123456789=on` or `123456789=off`. Anything else is ignored.
+pub fn parse_incoming_target(target: &str) -> Option<(String, bool)> {
+    let (id, flag) = target.split_once('=')?;
+    if !pjdesk_proto::is_valid_id(id) {
+        return None;
+    }
+    match flag {
+        "on" => Some((id.to_string(), true)),
+        "off" => Some((id.to_string(), false)),
+        _ => None,
+    }
+}
+
+/// Checks the account password when turning incoming-only off, saves the
+/// registry, and asks the running server to tell that computer. The password
+/// is not written to the request file or the log.
+pub fn apply_incoming(data_dir: &Path, id: &str, on: bool, password: &str) -> Result<String, String> {
+    let id = id.trim();
+    if !pjdesk_proto::is_valid_id(id) {
+        return Err("That is not a PJDesk computer ID.".into());
+    }
+    if !on {
+        let email = crate::cloud::saved_account_email(data_dir);
+        if crate::account_mirror::confirm_owner(data_dir, &email, password).is_err() {
+            return Err(
+                "Enter the account owner's password to allow this computer to connect to others.".into(),
+            );
+        }
+    }
+    let mut reg = crate::registry::Registry::load(data_dir.join("devices.json")).map_err(|e| e.to_string())?;
+    reg.set_incoming_only(id, on).map_err(|e| e.to_string())?;
+    let target = format!("{id}={}", if on { "on" } else { "off" });
+    push(data_dir, INCOMING_FILE, &target).map_err(|e| e.to_string())?;
+    let shown = pjdesk_proto::format_id(id);
+    Ok(if on {
+        format!("Incoming only is on for {shown}.")
+    } else {
+        format!("{shown} can connect to other computers.")
+    })
 }
 
 /// `123456789=Office` or `123456789=` to clear. The group is a label, not a path.

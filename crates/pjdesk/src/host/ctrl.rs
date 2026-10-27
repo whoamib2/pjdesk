@@ -100,6 +100,10 @@ pub struct Session {
     conn: Connection,
     shared: Option<Arc<HostShared>>,
     peer_name: String,
+    /// Hello carried CHAT_PEER. Named lines are sent only after that.
+    chat_peer: AtomicBool,
+    /// Account or computer name of the person at the controller.
+    controller_label: Mutex<String>,
 }
 
 impl Session {
@@ -151,7 +155,9 @@ impl Session {
             atlas_key: Mutex::new(String::new()),
             conn,
             shared,
-            peer_name: grant.peer_name,
+            peer_name: grant.peer_name.clone(),
+            chat_peer: AtomicBool::new(false),
+            controller_label: Mutex::new(grant.peer_name),
         })
     }
 
@@ -255,7 +261,12 @@ impl Session {
             ControlMsg::Hello { permissions, monitor, quality } => {
                 self.hello(permissions, monitor, quality, send, injector, keyframe).await?
             }
-            ControlMsg::Chat { text } => self.chat_in(&text, send).await?,
+            ControlMsg::Chat { text } => self.chat_in(&text, "", 0, send).await?,
+            ControlMsg::ChatLine { text, name, unix } => {
+                if self.chat_peer.load(Ordering::SeqCst) {
+                    self.chat_in(&text, &name, unix, send).await?
+                }
+            }
             ControlMsg::Clipboard(clip) => self.clip_in(clip, send).await?,
             ControlMsg::SetQuality(q) => {
                 if !self.v3() {
@@ -352,6 +363,8 @@ impl Session {
             ControlMsg::Audio { enabled } => self.audio(enabled, send).await?,
             ControlMsg::Visitor { account, computer, user, id } => {
                 info!("Connected: account={account:?} computer={computer:?} user={user:?} id={id}");
+                let label = if account.trim().is_empty() { computer.clone() } else { account.clone() };
+                *self.controller_label.lock().unwrap() = pjdesk_proto::peer::chat_name(&label, &self.peer_name);
                 super::notice::update(&account, &computer, &user, &id);
             }
         }
@@ -390,6 +403,11 @@ impl Session {
         write_msg(send, &HostMsg::Welcome { permissions: granted, monitors, proto: PROTOCOL_VERSION }).await?;
         if requested & pjdesk_proto::perms::VISITOR != 0 {
             write_msg(send, &HostMsg::AskVisitor).await?;
+        }
+        if requested & pjdesk_proto::perms::CHAT_PEER != 0 && has(granted, perms::CHAT) {
+            self.chat_peer.store(true, Ordering::SeqCst);
+            write_msg(send, &HostMsg::ChatReady).await?;
+            super::chatwin::arm();
         }
         if wants_layout {
             self.publish_layout(send, true).await?;
@@ -455,18 +473,20 @@ impl Session {
         Ok(())
     }
 
-    async fn chat_in(&self, text: &str, send: &mut SendStream) -> Result<()> {
+    async fn chat_in(&self, text: &str, name: &str, unix: u64, send: &mut SendStream) -> Result<()> {
         if !self.allow(perms::CHAT) {
             return self.deny(send, "chat", "chat was not allowed").await;
         }
-        let text = clip_line(text, 2000);
-        if text.is_empty() {
-            return Ok(());
-        }
-        info!("Chat from {}: {text}", self.peer_name);
+        let Some(text) = pjdesk_proto::peer::chat_line(text) else { return Ok(()) };
+        let fallback = self.controller_label.lock().unwrap().clone();
+        let name = pjdesk_proto::peer::chat_name(name, &fallback);
+        let unix = if unix == 0 { pjdesk_proto::peer::chat_now() } else { unix };
+        info!("Chat from {name}: {text}");
+        let entry = pjdesk_proto::peer::ChatEntry { mine: false, name, text, unix };
         if let Some(shared) = &self.shared {
-            shared.push_chat(false, &text);
+            shared.push_chat(entry.clone());
         }
+        super::chatwin::incoming(entry);
         Ok(())
     }
 
@@ -657,15 +677,29 @@ impl Session {
 
     /// Local UI asked to send a file or a chat line.
     pub async fn poll_local(&self, send: &mut SendStream) -> Result<()> {
-        let Some(shared) = &self.shared else { return Ok(()) };
         if self.allow(perms::CHAT) {
-            for line in shared.take_chat_out() {
-                write_msg(send, &HostMsg::Chat { text: clip_line(&line, 2000) }).await?;
+            let mut lines = self.shared.as_ref().map(|shared| shared.take_chat_out()).unwrap_or_default();
+            for line in super::chatwin::take_outgoing() {
+                if let Some(shared) = &self.shared {
+                    shared.push_chat(line.clone());
+                }
+                super::chatwin::note_sent(line.clone());
+                lines.push(line);
+            }
+            let named = self.chat_peer.load(Ordering::SeqCst);
+            for line in lines {
+                if named {
+                    write_msg(send, &HostMsg::ChatLine { text: line.text, name: line.name, unix: line.unix }).await?;
+                } else {
+                    write_msg(send, &HostMsg::Chat { text: clip_line(&line.text, 2000) }).await?;
+                }
             }
         }
         if self.allow(perms::FILE) && self.v3() {
-            for path in shared.take_send_files() {
-                self.queue_send(send, path).await?;
+            if let Some(shared) = &self.shared {
+                for path in shared.take_send_files() {
+                    self.queue_send(send, path).await?;
+                }
             }
         }
         self.watch_clipboard(send).await?;

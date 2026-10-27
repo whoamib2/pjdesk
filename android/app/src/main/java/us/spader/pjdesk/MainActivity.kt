@@ -21,11 +21,15 @@ import androidx.activity.compose.setContent
 import androidx.fragment.app.FragmentActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.OutlinedTextField
@@ -48,6 +52,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -511,6 +518,7 @@ class MainActivity : FragmentActivity() {
                 return true
             }
             fun loadMySavedComputers() {
+                if (state.incomingOnly) return
                 app.store.savedSyncChoice = "yes"
                 app.store.localSavedCleared = false
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
@@ -723,6 +731,11 @@ class MainActivity : FragmentActivity() {
                 askPerson: Boolean = false,
                 resetNotOnline: Boolean = true,
             ) {
+                if (state.incomingOnly) {
+                    connecting = false
+                    connectError = "Incoming only is on. This computer can't connect to others."
+                    return
+                }
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (connecting && now - lastConnectMs < 700) {
                     AppLog.i("Connect ignored, already starting $id")
@@ -782,7 +795,7 @@ class MainActivity : FragmentActivity() {
                             engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
                         }
                         rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
-                        if (app.store.syncsSavedComputers()) {
+                        if (app.store.syncsSavedComputers() && !state.incomingOnly) {
                             app.store.mergeCloud(session.computers)
                             saved = app.store.saved()
                         }
@@ -800,6 +813,11 @@ class MainActivity : FragmentActivity() {
                 }
             }
             fun beginConnect(rawId: String, ignoreOffline: Boolean = false) {
+                if (state.incomingOnly) {
+                    connecting = false
+                    connectError = "Incoming only is on. This computer can't connect to others."
+                    return
+                }
                 val digits = rawId.filter { it.isDigit() }
                 val computer = liveSaved.firstOrNull { it.id == digits }
                 val name = connectComputerName(saved, digits)
@@ -931,6 +949,7 @@ class MainActivity : FragmentActivity() {
             var controlEnabled by remember { mutableStateOf(PjAccessibilityService.enabled(this@MainActivity)) }
             var controlBound by remember { mutableStateOf(RemoteControl.service != null) }
             var controlDismissed by remember { mutableStateOf(false) }
+            var hostChat by remember { mutableStateOf(false) }
             LaunchedEffect(state.supportCode, state.id) {
                 if (isFinishing) return@LaunchedEffect
                 val code = state.supportCode
@@ -978,7 +997,19 @@ class MainActivity : FragmentActivity() {
                 }
             }
             LaunchedEffect(state.hosting) {
-                if (!state.hosting) controlDismissed = false
+                if (!state.hosting) {
+                    controlDismissed = false
+                    hostChat = false
+                }
+            }
+            LaunchedEffect(state.chatSeq) {
+                if (!state.chatAlert) return@LaunchedEffect
+                val line = state.chatLines.lastOrNull() ?: return@LaunchedEffect
+                if (state.hosting) {
+                    hostChat = true
+                    us.spader.pjdesk.service.ChatNotice.show(this@MainActivity, line.name, line.text)
+                    engine.chatSeen()
+                }
             }
             LaunchedEffect(state.id, account, uiUnlocked) {
                 val digits = state.id.filter { it.isDigit() }
@@ -1330,39 +1361,6 @@ class MainActivity : FragmentActivity() {
             fun notePinEdit() {
                 if (app.store.pinLockedUntil > System.currentTimeMillis()) return
                 lockError = ""
-            }
-            fun peekPin(pin: String) {
-                if (lockBusy || app.store.pinLockedUntil > System.currentTimeMillis()) return
-                val epoch = pinEpoch
-                if (app.store.hasAccountPin()) {
-                    val salt = app.store.accountPinSalt
-                    val hash = app.store.accountPinHash
-                    val iters = app.store.accountPinIters
-                    val pinSalt = app.store.pinSaltBytes()
-                    val wrapped = app.store.pinWrap
-                    scope.launch {
-                        val ok = withContext(Dispatchers.IO) {
-                            AccountPin.matches(pin, salt, hash, iters)
-                        }
-                        if (epoch != pinEpoch || !ok) return@launch
-                        val key = if (pinSalt != null && wrapped.isNotBlank()) {
-                            withContext(Dispatchers.IO) { PinWrap.unwrap(wrapped, pin, pinSalt) }
-                        } else {
-                            null
-                        }
-                        if (epoch != pinEpoch) return@launch
-                        unlockWithPin(key)
-                    }
-                    return
-                }
-                val pinSalt = app.store.pinSaltBytes() ?: return
-                val wrapped = app.store.pinWrap
-                if (wrapped.isBlank()) return
-                scope.launch {
-                    val key = withContext(Dispatchers.IO) { PinWrap.unwrap(wrapped, pin, pinSalt) }
-                    if (epoch != pinEpoch || key == null) return@launch
-                    unlockWithPin(key)
-                }
             }
             fun submitPin(pin: String) {
                 if (app.store.pinLockedUntil > System.currentTimeMillis()) return
@@ -1764,9 +1762,14 @@ class MainActivity : FragmentActivity() {
                         rejectCount = pinRejects,
                         lockedOut = pinWait,
                         onSubmit = { submitPin(it) },
-                        onPeek = { peekPin(it) },
                         onEdit = { notePinEdit() },
                         onBiometric = { tryBio() },
+                        computerId = state.idFormatted.ifBlank { state.id },
+                        oneTimePassword = state.password,
+                        permanentSet = state.hasPermanent,
+                        onCopyId = { copy(state.id.ifBlank { state.idFormatted.filter { !it.isWhitespace() } }) },
+                        onCopyPassword = { copy(state.password) },
+                        onRefreshPassword = { engine.regenerate() },
                         onForgot = {
                             if (noPassword) {
                                 app.store.clearAccountPin()
@@ -1830,6 +1833,11 @@ class MainActivity : FragmentActivity() {
                         idleWarn = sessionIdleWarn,
                         onStay = { sessionIdleWarn = false },
                         onActivity = {},
+                        chatReady = state.chatReady,
+                        chatLines = state.chatLines,
+                        chatUnread = state.chatUnread,
+                        onChat = engine::chat,
+                        onChatOpen = engine::chatSeen,
                         onClipboard = {
                             val text = clipboardText()
                             if (text.isBlank()) {
@@ -2032,7 +2040,7 @@ class MainActivity : FragmentActivity() {
                             PjBottomBar(selected = tab, onSelect = { tab = it })
                         },
                     ) { padding ->
-                        androidx.compose.foundation.layout.Box(Modifier.padding(padding)) {
+                        androidx.compose.foundation.layout.Box(Modifier.padding(padding).fillMaxSize()) {
                             when (tab) {
                                 0 -> HomeScreen(
                                     state = state,
@@ -2064,10 +2072,14 @@ class MainActivity : FragmentActivity() {
                                     selfId = state.id,
                                     onRefreshSupport = { engine.refreshSupport() },
                                     onSupportConnect = { code, password ->
-                                        if (code.length != 8 || password.isBlank()) {
-                                            scope.launch { snackbar.showSnackbar("Enter the 8-digit code and the temporary password.") }
-                                        } else {
-                                            scope.launch {
+                                        when {
+                                            state.incomingOnly -> scope.launch {
+                                                snackbar.showSnackbar("Incoming only is on. This computer can't connect to others.")
+                                            }
+                                            code.length != 8 || password.isBlank() -> scope.launch {
+                                                snackbar.showSnackbar("Enter the 8-digit code and the temporary password.")
+                                            }
+                                            else -> scope.launch {
                                                 val found = withContext(Dispatchers.IO) {
                                                     runCatching { us.spader.pjdesk.core.CloudAuth.lookupSupport(code) }
                                                 }
@@ -2101,6 +2113,15 @@ class MainActivity : FragmentActivity() {
                                                 }.onFailure { inviteError = it.message ?: "Could not create a code." }
                                             }
                                         }
+                                    },
+                                    onIncomingOnly = { on, password ->
+                                        engine.command(
+                                            org.json.JSONObject()
+                                                .put("cmd", "incomingOnly")
+                                                .put("on", on)
+                                                .put("password", password)
+                                                .toString(),
+                                        )
                                     },
                                     onRevokeInvite = {
                                         val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
@@ -2177,8 +2198,9 @@ class MainActivity : FragmentActivity() {
                                         signOutAndClearSaved()
                                         scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
                                     },
-                                    showLoadSaved = account.isNotBlank() && !app.store.syncsSavedComputers(),
+                                    showLoadSaved = account.isNotBlank() && !app.store.syncsSavedComputers() && !state.incomingOnly,
                                     onLoadSaved = { loadMySavedComputers() },
+                                    incomingOnly = state.incomingOnly,
                                     onRename = { computer, nickname ->
                                         app.store.rename(computer.id, nickname)
                                         saved = app.store.saved()
@@ -2318,28 +2340,14 @@ class MainActivity : FragmentActivity() {
                                         signOutAndClearSaved()
                                         scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
                                     },
-                                    showLoadSaved = account.isNotBlank() && !app.store.syncsSavedComputers(),
+                                    showLoadSaved = account.isNotBlank() && !app.store.syncsSavedComputers() && !state.incomingOnly,
                                     onLoadSaved = { loadMySavedComputers() },
                                     onSignOut = if (account.isEmpty()) {
                                         null
                                     } else {
                                         {
-                                            if (temporarySession) {
-                                                signOutTemporary()
-                                                scope.launch { snackbar.showSnackbar("Signed out") }
-                                            } else {
-                                                app.store.networkEmail = ""
-                                                app.store.joinedWithoutPassword = false
-                                                app.store.saveNetworkRefresh("")
-                                                app.lockUi()
-                                                cloudAccess = ""
-                                                inviteCode = ""
-                                                inviteId = ""
-                                                inviteExpires = 0
-                                                inviteListed = false
-                                                engine.command(JSONObject().put("cmd", "accessToken").put("token", "").toString())
-                                                account = ""
-                                            }
+                                            signOutAndClearSaved()
+                                            scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
                                         }
                                     },
                                     onImportConfig = {
@@ -2376,6 +2384,42 @@ class MainActivity : FragmentActivity() {
                                     },
                                     onDismissImport = { importOffer = null; importPass = "" },
                                 )
+                            }
+                            if (state.hosting) {
+                                if (!hostChat) {
+                                    Column(
+                                        Modifier.align(Alignment.BottomEnd).padding(12.dp).widthIn(max = 240.dp),
+                                        horizontalAlignment = Alignment.End,
+                                    ) {
+                                        if (!state.chatReady) {
+                                            Text(
+                                                us.spader.pjdesk.ui.CHAT_NEEDS_TIP,
+                                                color = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant,
+                                                style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+                                                textAlign = TextAlign.End,
+                                            )
+                                        }
+                                        TextButton(
+                                            onClick = { hostChat = true },
+                                            enabled = state.chatReady,
+                                        ) { Text("Chat") }
+                                    }
+                                } else {
+                                    androidx.compose.foundation.layout.Box(
+                                        Modifier
+                                            .fillMaxSize()
+                                            .background(Color.Black.copy(alpha = 0.45f))
+                                            .clickable { hostChat = false },
+                                    )
+                                    androidx.compose.foundation.layout.Box(Modifier.align(Alignment.BottomCenter)) {
+                                        us.spader.pjdesk.ui.ChatSheet(
+                                            lines = state.chatLines,
+                                            ready = state.chatReady,
+                                            onSend = engine::chat,
+                                            onClose = { hostChat = false },
+                                        )
+                                    }
+                                }
                             }
                         }
                     }

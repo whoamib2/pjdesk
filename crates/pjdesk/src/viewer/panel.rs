@@ -67,7 +67,8 @@ impl Panel {
             3 => &mut self.local_port,
             _ => return,
         };
-        if field.len() < 240 {
+        let limit = if self.focus == 1 { pjdesk_proto::peer::MAX_CHAT_TEXT } else { 240 };
+        if field.chars().count() < limit {
             field.push_str(text);
         }
     }
@@ -236,11 +237,14 @@ impl Panel {
 
     fn draw_chat(&self, buf: &mut [u32], win_w: usize, win_h: usize, x: f32, y: f32, w: f32, h: f32, live: &Live) {
         let mut row = y + ROW + 8.0;
+        if !live.chat_ready {
+            draw_text(buf, win_w, win_h, x + 12.0, row + 16.0, pjdesk_proto::peer::CHAT_NEEDS_TIP, 0xFF_f2_b0_3a);
+            return;
+        }
         let start = live.chat.len().saturating_sub(12);
-        for (mine, line) in live.chat.iter().skip(start) {
-            let who = if *mine { "You" } else { "Them" };
-            let text = format!("{who}: {}", clip(line, 40));
-            draw_text(buf, win_w, win_h, x + 12.0, row + 16.0, &text, if *mine { 0xFF_cfe3_ff } else { 0xFF_e8_ec_f2 });
+        for line in live.chat.iter().skip(start) {
+            let text = pjdesk_proto::peer::format_chat_line(line.unix, &line.name, &line.text);
+            draw_text(buf, win_w, win_h, x + 12.0, row + 16.0, &clip(&text, 48), if line.mine { 0xFF_cf_e3_ff } else { 0xFF_e8_ec_f2 });
             row += ROW;
         }
         let input_y = y + h - 46.0;

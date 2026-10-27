@@ -130,6 +130,11 @@ pub async fn run(
     } else {
         super::notice::Guard::begin(&peer_name)
     };
+    let handed = args.service_host && super::notice::client_alive();
+    let _chat = super::chatwin::Guard::begin(handed);
+    if let Some(shared) = &ui {
+        shared.clear_chat();
+    }
 
     let (cap_err_tx, mut cap_err_rx) = mpsc::channel::<String>(1);
     let capture_thread = {

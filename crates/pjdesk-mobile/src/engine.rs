@@ -23,7 +23,8 @@ use pjdesk_proto::framing::{read_msg, write_msg, MAX_CONTROL_FRAME};
 use pjdesk_proto::gesture::{Gesture, PointerAdapter, GESTURE_LONG_PRESS, GESTURE_PINCH, GESTURE_SWIPE, GESTURE_TAP};
 use pjdesk_proto::peer::{
     read_video_frame, write_side_chunk, write_side_header, write_video_frame, ClipKind, Clipboard, ControlMsg,
-    DisplayLayout, FileMsg, HostMsg, InputEvent, KeyboardMode, MonitorInfo, SideHeader, SpecialCommand, VideoHeader,
+    ChatEntry, DisplayLayout, FileMsg, HostMsg, InputEvent, KeyboardMode, MonitorInfo, SideHeader, SpecialCommand,
+    VideoHeader,
     FILE_MAGIC, MAX_CLIP_TEXT, VIEW_SINGLE,
 };
 use pjdesk_proto::perms::{self, grant};
@@ -41,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.49";
+pub const APP_VERSION: &str = "0.6.50";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -170,6 +171,20 @@ struct State {
     moved: Notify,
     /// Set with [`State::moved`] so a notify that arrives early is not lost.
     leave_primary: AtomicBool,
+    /// The controller's Hello carried CHAT_PEER. This phone may send ChatLine.
+    host_chat_peer: AtomicBool,
+    /// The computer being controlled sent ChatReady.
+    view_chat_peer: AtomicBool,
+    /// Replies from the person at this phone, written on the host session.
+    host_chat: Mutex<Vec<ChatEntry>>,
+    /// This phone can be controlled and cannot start a session.
+    incoming_only: AtomicBool,
+    /// The server has sent IncomingOnly, so this phone may answer.
+    incoming_ready: AtomicBool,
+    /// This phone has told the server about a lock it already had.
+    incoming_told: AtomicBool,
+    /// `(on, password)` waiting for the server. The password is not logged.
+    incoming_ask: Mutex<Option<(bool, String)>>,
 }
 
 #[derive(Clone)]
@@ -204,6 +219,9 @@ struct Disk {
     access_token: String,
     #[serde(default)]
     routes: String,
+    /// This phone cannot start a session. Missing in a file from before 0.6.50.
+    #[serde(default)]
+    incoming_only: bool,
 }
 
 pub struct Engine {
@@ -335,6 +353,13 @@ impl Engine {
             relay_move: Mutex::new(None),
             moved: Notify::new(),
             leave_primary: AtomicBool::new(false),
+            host_chat_peer: AtomicBool::new(false),
+            view_chat_peer: AtomicBool::new(false),
+            host_chat: Mutex::new(Vec::new()),
+            incoming_only: AtomicBool::new(stored.incoming_only),
+            incoming_ready: AtomicBool::new(false),
+            incoming_told: AtomicBool::new(false),
+            incoming_ask: Mutex::new(None),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let engine = Self { state: state.clone(), cmds: tx };
@@ -451,6 +476,7 @@ fn persist(state: &State) {
         install_key_hex: hex::encode(state.install_key),
         access_token: state.access_token.lock().unwrap().clone(),
         routes: serde_json::to_string(&*state.routes.lock().unwrap()).unwrap_or_default(),
+        incoming_only: state.incoming_only.load(Ordering::SeqCst),
     };
     // Keep a derived secret out of the file. A random one (no Android id) is rewritten
     // only when it was already stored.
@@ -498,6 +524,7 @@ fn publish(state: &State, cb: &Arc<dyn Callbacks>) {
             "server": server,
             "approval": state.approval.lock().unwrap().clone(),
             "appVersion": APP_VERSION,
+            "incomingOnly": state.incoming_only.load(Ordering::SeqCst),
         }),
     );
 }
@@ -738,7 +765,22 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             *state.capture_deny.lock().unwrap() = reason.chars().filter(|c| !c.is_control()).take(200).collect();
             state.capturing.store(false, Ordering::SeqCst);
         }
+        "incomingOnly" => {
+            let on = cmd.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+            let password = cmd.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if on {
+                state.incoming_only.store(true, Ordering::SeqCst);
+                persist(state);
+                emit(cb, &json!({"event":"incomingOnly","on": true}));
+            }
+            *state.incoming_ask.lock().unwrap() = Some((on, password));
+            publish(state, cb);
+        }
         "connect" => {
+            if state.incoming_only.load(Ordering::SeqCst) {
+                emit(cb, &json!({"event":"error","text": pjdesk_proto::signal::INCOMING_ONLY_REFUSAL}));
+                return;
+            }
             let id = normalize_id(cmd.get("id").and_then(|v| v.as_str()).unwrap_or(""));
             let password = cmd.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let ask_now = cmd.get("ask").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -974,6 +1016,28 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             }
         }
         "keyframe" => send_control(state, ControlMsg::RequestKeyframe),
+        "chatSeen" => {
+            emit(cb, &json!({"event":"chatSeen"}));
+        }
+        "chat" => {
+            let text = cmd.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let controlling = state.control.lock().unwrap().is_some();
+            if controlling {
+                if let Some(entry) = prepare_chat_line(state, text, false) {
+                    send_control(
+                        state,
+                        ControlMsg::ChatLine { text: entry.text.clone(), name: entry.name.clone(), unix: entry.unix },
+                    );
+                    emit_chat(cb, &entry, false);
+                }
+            } else if host_attached(state) {
+                if let Some(entry) = prepare_chat_line(state, text, true) {
+                    state.host_chat.lock().unwrap().push(entry.clone());
+                    state.session_wake.notify_waiters();
+                    emit_chat(cb, &entry, false);
+                }
+            }
+        }
         "paste" => {
             let text = cmd.get("text").and_then(|v| v.as_str()).unwrap_or("");
             let bytes = clip_text(text);
@@ -1343,6 +1407,8 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
     let mut saw_registered = false;
     let mut report_host = false;
     let mut since_report = 0u32;
+    let mut incoming_ready = state.incoming_ready.load(Ordering::SeqCst);
+    let mut incoming_told = state.incoming_told.load(Ordering::SeqCst);
     loop {
         if state.app_stop.load(Ordering::SeqCst) {
             return Ok(PhoneHost::Stop);
@@ -1391,6 +1457,24 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                 }
                 if heartbeats == 0 {
                     let _ = send_host_register(&mut signal, &state);
+                }
+                if let Some((want, password)) = state.incoming_ask.lock().unwrap().clone() {
+                    if incoming_ready {
+                        state.incoming_ask.lock().unwrap().take();
+                        if want {
+                            state.incoming_only.store(true, Ordering::SeqCst);
+                            persist(&state);
+                            emit(&cb, &json!({"event":"incomingOnly","on": true}));
+                            let _ = signal.send(ClientMsg::SetIncomingOnly { on: true, password: String::new() });
+                        } else if password.is_empty() {
+                            emit(
+                                &cb,
+                                &json!({"event":"error","text": "Enter the account owner's password to allow this computer to connect to others."}),
+                            );
+                        } else {
+                            let _ = signal.send(ClientMsg::SetIncomingOnly { on: false, password });
+                        }
+                    }
                 }
                 signal.send(ClientMsg::Ping)?;
                 awaiting_pong = true;
@@ -1533,7 +1617,11 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                             );
                             bail!("{message}");
                         }
-                        emit(&cb, &json!({"event":"status","text": message}));
+                        if message.contains("account owner's password") {
+                            emit(&cb, &json!({"event":"error","text": message}));
+                        } else {
+                            emit(&cb, &json!({"event":"status","text": message}));
+                        }
                     }
                     ServerMsg::WantHostReport => {
                         report_host = true;
@@ -1569,6 +1657,21 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                         emit(&cb, &json!({"event":"release","version": version, "url": client_url}));
                     }
                     reply @ ServerMsg::AccountResult { .. } => emit(&cb, &account_event(&reply)),
+                    ServerMsg::IncomingOnly { on } => {
+                        incoming_ready = true;
+                        state.incoming_ready.store(true, Ordering::SeqCst);
+                        let local = state.incoming_only.load(Ordering::SeqCst);
+                        let (apply_on, tell) = pjdesk_proto::signal::reconcile_incoming_only(local, on, incoming_told);
+                        state.incoming_only.store(apply_on, Ordering::SeqCst);
+                        if tell {
+                            let _ = signal.send(ClientMsg::SetIncomingOnly { on: true, password: String::new() });
+                        }
+                        incoming_told = true;
+                        state.incoming_told.store(true, Ordering::SeqCst);
+                        persist(&state);
+                        emit(&cb, &json!({"event":"incomingOnly","on": apply_on}));
+                        publish(&state, &cb);
+                    }
                     ServerMsg::UpdateNow => {
                         log_line(&cb, "the server asked this phone to update");
                         let cb = cb.clone();
@@ -1970,6 +2073,8 @@ async fn host_session(
     // from here until this function ends, so a late consent cannot start a capture.
     state.support_hold.store(true, Ordering::SeqCst);
     let host_live = HostLive::enter(&state);
+    state.host_chat_peer.store(false, Ordering::SeqCst);
+    state.host_chat.lock().unwrap().clear();
     let mut share_deadline = None;
     if !state.capturing.load(Ordering::SeqCst) {
         *state.capture_deny.lock().unwrap() = String::new();
@@ -2053,6 +2158,16 @@ async fn host_session(
             let saved = state.end_reason.lock().unwrap().clone();
             let saved = if saved.is_empty() { "stopped".to_string() } else { saved };
             break Err(anyhow!("{saved}"));
+        }
+        let chat_lines = std::mem::take(&mut *state.host_chat.lock().unwrap());
+        if state.host_chat_peer.load(Ordering::SeqCst) {
+            for line in chat_lines {
+                let _ = write_msg(
+                    &mut control_send,
+                    &HostMsg::ChatLine { text: line.text, name: line.name, unix: line.unix },
+                )
+                .await;
+            }
         }
         let control_text = state.control_note.lock().unwrap().take();
         if let Some(text) = control_text {
@@ -2151,6 +2266,9 @@ async fn host_session(
             ControlMsg::RequestKeyframe => emit(&cb, &json!({"event":"keyframe"})),
             ControlMsg::Hello { permissions, quality, .. } => {
                 let _ = send_welcome(&state, &mut control_send, permissions, ceiling, true).await;
+                if state.host_chat_peer.load(Ordering::SeqCst) {
+                    emit(&cb, &json!({"event":"chatReady"}));
+                }
                 emit(
                     &cb,
                     &json!({
@@ -2171,6 +2289,14 @@ async fn host_session(
             }
             ControlMsg::Ping { t_us } => {
                 let _ = write_msg(&mut control_send, &HostMsg::Pong { t_us }).await;
+            }
+            ControlMsg::ChatLine { text, name, unix } => {
+                if state.host_chat_peer.load(Ordering::SeqCst) {
+                    if let Some(text) = pjdesk_proto::peer::chat_line(&text) {
+                        let name = pjdesk_proto::peer::chat_name(&name, "Computer");
+                        emit_chat(&cb, &ChatEntry { mine: false, name, text, unix }, true);
+                    }
+                }
             }
             ControlMsg::Visitor { account, computer, user, id } => {
                 let card = pjdesk_proto::peer::visitor_card(&account, &computer, &user, &id);
@@ -2337,12 +2463,20 @@ async fn send_welcome(
     if !v3 {
         return Ok(());
     }
-    let granted = grant(requested, ceiling & (perms::KEYBOARD | perms::MOUSE), false);
+    let mut cap = ceiling & (perms::KEYBOARD | perms::MOUSE);
+    if requested & perms::CHAT_PEER != 0 {
+        cap |= perms::CHAT;
+    }
+    let granted = grant(requested, cap, false);
     let (w, h) = *state.capture.lock().unwrap();
     let monitors = vec![MonitorInfo { index: 0, width: w, height: h, primary: true, name: "Screen".into() }];
     write_msg(send, &HostMsg::Welcome { permissions: granted, monitors, proto: PROTOCOL_VERSION }).await?;
     if requested & perms::VISITOR != 0 {
         write_msg(send, &HostMsg::AskVisitor).await?;
+    }
+    if requested & perms::CHAT_PEER != 0 && pjdesk_proto::perms::has(granted, perms::CHAT) {
+        state.host_chat_peer.store(true, Ordering::SeqCst);
+        write_msg(send, &HostMsg::ChatReady).await?;
     }
     if requested & perms::LAYOUT != 0 {
         let displays = vec![DisplayLayout {
@@ -2385,6 +2519,60 @@ fn presenter(state: &State) -> String {
     } else {
         device
     }
+}
+
+fn emit_chat(cb: &Arc<dyn Callbacks>, entry: &ChatEntry, alert: bool) {
+    emit(
+        cb,
+        &json!({
+            "event": "chat",
+            "mine": entry.mine,
+            "name": entry.name,
+            "text": entry.text,
+            "unix": entry.unix,
+            "alert": alert,
+        }),
+    );
+}
+
+/// None until the other computer has shown it speaks 0.6.50 chat, or the text is empty.
+fn prepare_chat_line(state: &State, text: &str, as_host: bool) -> Option<ChatEntry> {
+    let ready = if as_host {
+        state.host_chat_peer.load(Ordering::SeqCst)
+    } else {
+        state.view_chat_peer.load(Ordering::SeqCst)
+    };
+    if !ready {
+        return None;
+    }
+    let text = pjdesk_proto::peer::chat_line(text)?;
+    let name = if as_host { host_chat_name(state) } else { mobile_chat_name(state) };
+    Some(ChatEntry { mine: true, name, text, unix: unix_now() })
+}
+
+fn phone_computer_name(state: &State) -> String {
+    let facts = state.facts.lock().unwrap().clone();
+    if !facts.display_name.trim().is_empty() {
+        facts.display_name.trim().to_string()
+    } else if !facts.hostname.trim().is_empty() {
+        facts.hostname.trim().to_string()
+    } else {
+        state.hostname.clone()
+    }
+}
+
+/// Account when this phone is signed in, otherwise its computer name.
+fn mobile_chat_name(state: &State) -> String {
+    let account = state.account.lock().unwrap().trim().to_string();
+    let computer = phone_computer_name(state);
+    let picked = if account.contains('@') { account } else { computer.clone() };
+    pjdesk_proto::peer::chat_name(&picked, &computer)
+}
+
+/// The phone's computer name. A host chat line does not use the account email.
+fn host_chat_name(state: &State) -> String {
+    let computer = phone_computer_name(state);
+    pjdesk_proto::peer::chat_name(&computer, "Android")
 }
 
 fn android_visitor(state: &State) -> ControlMsg {
@@ -2807,9 +2995,10 @@ async fn controller_session(
             }
         }
     });
+    state.view_chat_peer.store(false, Ordering::SeqCst);
     if auth.peer_proto >= 3 {
         let _ = control_tx.send(ControlMsg::Hello {
-            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR,
+            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR | perms::CHAT_PEER,
             monitor: 0,
             quality: quality::preset("balanced").unwrap_or(StreamQuality::default()),
         });
@@ -2904,6 +3093,22 @@ async fn controller_session(
             }
             Ok(HostMsg::AskVisitor) => {
                 let _ = control_tx.send(android_visitor(&state));
+            }
+            Ok(HostMsg::ChatReady) => {
+                state.view_chat_peer.store(true, Ordering::SeqCst);
+                emit(&cb, &json!({"event":"chatReady"}));
+            }
+            Ok(HostMsg::ChatLine { text, name, unix }) => {
+                state.view_chat_peer.store(true, Ordering::SeqCst);
+                if let Some(text) = pjdesk_proto::peer::chat_line(&text) {
+                    let name = pjdesk_proto::peer::chat_name(&name, &peer);
+                    emit_chat(&cb, &ChatEntry { mine: false, name, text, unix }, true);
+                }
+            }
+            Ok(HostMsg::Chat { text }) => {
+                if let Some(text) = pjdesk_proto::peer::chat_line(&text) {
+                    emit_chat(&cb, &ChatEntry { mine: false, name: peer.clone(), text, unix: unix_now() }, true);
+                }
             }
             Ok(HostMsg::Denied { what, reason }) => {
                 emit(&cb, &json!({"event":"status","text": format!("{what}: {reason}")}))
@@ -3035,6 +3240,27 @@ mod tests {
             }
             _ => panic!("visitor"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_is_refused_until_the_other_computer_is_ready() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-chat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir);
+        state.facts.lock().unwrap().display_name = "Ben Pixel 11".into();
+        *state.account.lock().unwrap() = "ben@spader.us".into();
+        assert!(prepare_chat_line(&state, "hello", false).is_none());
+        assert!(prepare_chat_line(&state, "hello", true).is_none());
+        state.view_chat_peer.store(true, Ordering::SeqCst);
+        state.host_chat_peer.store(true, Ordering::SeqCst);
+        let controller = prepare_chat_line(&state, " hello ", false).unwrap();
+        assert_eq!(controller.name, "ben@spader.us");
+        assert_eq!(controller.text, "hello");
+        let host = prepare_chat_line(&state, "here", true).unwrap();
+        assert_eq!(host.name, "Ben Pixel 11");
+        assert_eq!(pjdesk_proto::peer::CHAT_NEEDS_TIP, "The other computer needs PJDesk 0.6.50 or newer");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3347,7 +3573,44 @@ mod tests {
             relay_move: Mutex::new(None),
             moved: Notify::new(),
             leave_primary: AtomicBool::new(false),
+            host_chat_peer: AtomicBool::new(false),
+            view_chat_peer: AtomicBool::new(false),
+            host_chat: Mutex::new(Vec::new()),
+            incoming_only: AtomicBool::new(false),
+            incoming_ready: AtomicBool::new(false),
+            incoming_told: AtomicBool::new(false),
+            incoming_ask: Mutex::new(None),
         })
+    }
+
+    #[test]
+    fn connect_is_refused_when_incoming_only_is_on() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-phone-incoming-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            struct Rec(Arc<Mutex<Vec<String>>>);
+            impl Callbacks for Rec {
+                fn on_event(&self, json: &str) {
+                    self.0.lock().unwrap().push(json.to_string());
+                }
+                fn on_video(&self, _data: &[u8], _width: u32, _height: u32, _keyframe: bool) {}
+            }
+            let state = test_state(&dir);
+            state.incoming_only.store(true, Ordering::SeqCst);
+            let cb: Arc<dyn Callbacks> = Arc::new(Rec(events.clone()));
+            apply(&state, &cb, json!({"cmd":"connect","id":"123456789","password":"secret"})).await;
+            let text = events.lock().unwrap().join("\n");
+            assert!(text.contains(pjdesk_proto::signal::INCOMING_ONLY_REFUSAL), "{text}");
+            assert!(!text.contains("secret"));
+            assert!(state.viewer.lock().unwrap().is_none());
+            apply(&state, &cb, json!({"cmd":"incomingOnly","on": false, "password":"secret"})).await;
+            assert!(state.incoming_only.load(Ordering::SeqCst), "turning it off waits for the server");
+            assert!(!events.lock().unwrap().iter().any(|line| line.contains("secret")));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The host's SPAKE2 check: the typed password has to match one slot.

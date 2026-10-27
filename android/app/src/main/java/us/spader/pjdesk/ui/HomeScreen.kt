@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -77,12 +78,15 @@ fun HomeScreen(
     inviteError: String = "",
     onCreateInvite: () -> Unit = {},
     onRevokeInvite: () -> Unit = {},
+    onIncomingOnly: (Boolean, String) -> Unit = { _, _ -> },
 ) {
     var showPassword by rememberSaveable { mutableStateOf(false) }
     var showSupport by rememberSaveable { mutableStateOf(false) }
     var helpCode by rememberSaveable { mutableStateOf("") }
     var helpPass by rememberSaveable { mutableStateOf("") }
     var helpShow by rememberSaveable { mutableStateOf(false) }
+    var ownerPass by rememberSaveable { mutableStateOf("") }
+    var ownerShow by rememberSaveable { mutableStateOf(false) }
     var inviteOpen by rememberSaveable { mutableStateOf(false) }
     var tick by remember { mutableLongStateOf(System.currentTimeMillis() / 1000) }
     LaunchedEffect(inviteOpen) {
@@ -247,6 +251,40 @@ fun HomeScreen(
                 Text("One-time password", color = pjMuted(), style = MaterialTheme.typography.labelMedium)
             }
         }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = state.incomingOnly,
+                onCheckedChange = { checked ->
+                    if (checked) onIncomingOnly(true, "")
+                },
+            )
+            Text("Incoming only (this computer can't connect to others)", style = MaterialTheme.typography.bodyMedium)
+        }
+        if (state.incomingOnly) {
+            Text(
+                "Incoming only is on. This computer can't connect to others.",
+                color = pjMuted(),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            OutlinedTextField(
+                value = ownerPass,
+                onValueChange = { ownerPass = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("Account owner's password") },
+                visualTransformation = if (ownerShow) VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(onClick = { ownerShow = !ownerShow }) { Glyph(if (ownerShow) "hide" else "show") }
+                },
+            )
+            Button(
+                onClick = {
+                    onIncomingOnly(false, ownerPass)
+                    ownerPass = ""
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Allow outgoing") }
+        } else {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(
                 value = connectId.filter { it.isDigit() }.take(9),
@@ -297,6 +335,7 @@ fun HomeScreen(
                     )
                 }
             }
+        }
         }
     }
 }

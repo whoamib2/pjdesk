@@ -404,6 +404,13 @@ class Engine(context: Context) : EngineListener {
         )
     }
 
+    fun chat(text: String) {
+        if (text.isBlank()) return
+        command(JSONObject().put("cmd", "chat").put("text", text.take(2000)).toString())
+    }
+
+    fun chatSeen() = command("""{"cmd":"chatSeen"}""")
+
     fun paste(text: String) {
         if (text.isBlank()) return
         command(JSONObject().put("cmd", "paste").put("text", text.take(48_000)).toString())
@@ -625,6 +632,7 @@ class Engine(context: Context) : EngineListener {
                         server = event.optString("server", it.server),
                         approval = store.approval,
                         selfVersion = event.optString("appVersion").ifBlank { it.selfVersion },
+                        incomingOnly = if (event.has("incomingOnly")) event.optBoolean("incomingOnly") else it.incomingOnly,
                         status = if (ready) "Ready" else it.status,
                     )
                 }
@@ -826,6 +834,22 @@ class Engine(context: Context) : EngineListener {
                 }
                 onFiles?.invoke(list)
             }
+            "incomingOnly" -> update { it.copy(incomingOnly = event.optBoolean("on")) }
+            "chatReady" -> update { it.copy(chatReady = true) }
+            "chatSeen" -> update { it.copy(chatUnread = 0, chatAlert = false) }
+            "chat" -> update {
+                val line = ChatLine(
+                    mine = event.optBoolean("mine"),
+                    name = event.optString("name"),
+                    text = event.optString("text"),
+                    unix = event.optLong("unix"),
+                )
+                if (line.text.isBlank()) return@update it
+                val lines = (it.chatLines + line).takeLast(200)
+                val alert = event.optBoolean("alert") && !line.mine
+                val unread = if (line.mine || !alert) it.chatUnread else it.chatUnread + 1
+                it.copy(chatLines = lines, chatUnread = unread, chatSeq = it.chatSeq + 1, chatAlert = alert)
+            }
             "keyframe" -> onKeyframe?.invoke()
             "input" -> {
                 if (!RemoteControl.handle(event)) setControl(false)
@@ -838,6 +862,7 @@ class Engine(context: Context) : EngineListener {
                 if (role == "controller" || role == "session") {
                     us.spader.pjdesk.service.SessionNotice.hide(app)
                 }
+                us.spader.pjdesk.service.ChatNotice.hide(app)
                 if (role == "host" || role == "session") {
                     runCatching { us.spader.pjdesk.service.HostService.release(app) }
                 }
@@ -848,6 +873,10 @@ class Engine(context: Context) : EngineListener {
                         hostWho = if (role == "host" || role == "session") "" else it.hostWho,
                         acceptedAutomatically = if (role == "host" || role == "session") false else it.acceptedAutomatically,
                         session = if (role == "controller" || role == "session") null else it.session,
+                        chatReady = false,
+                        chatLines = emptyList(),
+                        chatUnread = 0,
+                        chatAlert = false,
                         incoming = null,
                         status = "Ended: $reason",
                     )

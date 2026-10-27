@@ -286,6 +286,7 @@ mod imp {
 
         set(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, Duration::default())?;
         super::protect_service_dir();
+        let _ = crate::incoming::apply(crate::incoming::enabled());
         // Drop the scheduled task older installs registered. Defender was
         // matching svchost launching that task. The service checks itself.
         let _ = super::delete_update_task();
@@ -615,6 +616,13 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
         if refresh.is_file() {
             let _ = std::fs::remove_file(&refresh);
             shared.request_support_refresh();
+        }
+        // The lock screen can ask for a new one-time password without the
+        // password itself being written into this file.
+        let rotate = crate::syspaths::service_dir().join("password.refresh");
+        if rotate.is_file() {
+            let _ = std::fs::remove_file(&rotate);
+            shared.request_regenerate();
         }
         status.write();
     };

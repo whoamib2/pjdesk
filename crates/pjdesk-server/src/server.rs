@@ -489,6 +489,46 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
                 });
                 continue;
             }
+            if let ClientMsg::SetIncomingOnly { on, password } = &msg {
+                let (dir, host_id, currently) = {
+                    let st = state.lock().unwrap();
+                    let host_id = conn.host_id.clone();
+                    let currently = host_id.as_deref().is_some_and(|id| st.registry.incoming_only(id));
+                    (st.data_dir.clone(), host_id, currently)
+                };
+                let Some(host_id) = host_id else {
+                    conn.error(ErrorCode::Unauthorized, "This computer is not registered.");
+                    continue;
+                };
+                let allowed = if *on || !currently {
+                    true
+                } else {
+                    let dir = dir.clone();
+                    let password = password.clone();
+                    tokio::task::spawn_blocking(move || incoming_password_ok(&dir, &password))
+                        .await
+                        .unwrap_or(false)
+                };
+                if !allowed {
+                    conn.error(
+                        ErrorCode::Unauthorized,
+                        "Enter the account owner's password to allow this computer to connect to others.",
+                    );
+                    continue;
+                }
+                let mut st = state.lock().unwrap();
+                if let Err(e) = st.registry.set_incoming_only(&host_id, *on) {
+                    conn.error(ErrorCode::BadRequest, e.to_string());
+                    continue;
+                }
+                conn.send(ServerMsg::IncomingOnly { on: *on });
+                crate::audit::AuditLog::open(&st.data_dir).record(
+                    "incoming_only",
+                    &host_id,
+                    if *on { "on" } else { "off" },
+                );
+                continue;
+            }
             if let ClientMsg::Account { .. } = &msg {
                 let dir = state.lock().unwrap().data_dir.clone();
                 let request = msg;
@@ -999,6 +1039,10 @@ fn finish_registration(
             conn.send(release);
         }
     }
+    // 0.6.50 learns the lock here. An older client is not sent this message.
+    if pjdesk_proto::update::version_at_least(app_version, "0.6.50") {
+        conn.send(ServerMsg::IncomingOnly { on: st.registry.incoming_only(&id) });
+    }
     // Same computer name, offline leftovers only. A different install key is a
     // different hostname here, and a different name is not removed.
     let online: HashSet<String> = st.online.keys().cloned().collect();
@@ -1139,6 +1183,12 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::Connect { proto, target_id, controller_name } => {
+            if let Some(id) = conn.host_id.clone() {
+                if st.registry.incoming_only(&id) {
+                    conn.error(ErrorCode::Unauthorized, pjdesk_proto::signal::INCOMING_ONLY_REFUSAL);
+                    return;
+                }
+            }
             if !crate::cloud::accepts_host_registrations(&st.data_dir) {
                 info!("Redirecting a connection from {}: this server is the standby and is not the live table", conn.addr);
                 conn.error(ErrorCode::Unauthorized, crate::cloud::redirect_text(&st.data_dir));
@@ -1423,7 +1473,35 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::Account { .. } => {}
+
+        ClientMsg::SetIncomingOnly { on, password } => {
+            let Some(id) = conn.host_id.clone() else {
+                conn.error(ErrorCode::Unauthorized, "This computer is not registered.");
+                return;
+            };
+            let currently = st.registry.incoming_only(&id);
+            if !on && currently && !incoming_password_ok(&st.data_dir, &password) {
+                conn.error(
+                    ErrorCode::Unauthorized,
+                    "Enter the account owner's password to allow this computer to connect to others.",
+                );
+                return;
+            }
+            if let Err(e) = st.registry.set_incoming_only(&id, on) {
+                conn.error(ErrorCode::BadRequest, e.to_string());
+                return;
+            }
+            conn.send(ServerMsg::IncomingOnly { on });
+            crate::audit::AuditLog::open(&st.data_dir).record("incoming_only", &id, if on { "on" } else { "off" });
+        }
     }
+}
+
+/// The account password matches the copy on this server. An empty password does not.
+/// The password is not written to the log.
+fn incoming_password_ok(data_dir: &std::path::Path, password: &str) -> bool {
+    let email = crate::cloud::saved_account_email(data_dir);
+    crate::account_mirror::confirm_owner(data_dir, &email, password).is_ok()
 }
 
 /// Records the client's protocol version. False when it is too old or too new
@@ -1747,6 +1825,7 @@ async fn fleet_sync(state: Shared) {
         let blocks = take(&data_dir, crate::requests::BLOCK_FILE);
         let unblocks = take(&data_dir, crate::requests::UNBLOCK_FILE);
         let groups = take(&data_dir, crate::requests::GROUP_FILE);
+        let incoming = take(&data_dir, crate::requests::INCOMING_FILE);
         let revokes = take(&data_dir, crate::requests::REVOKE_KEY_FILE);
         let require_now = take(&data_dir, crate::requests::REQUIRE_DISCONNECT_FILE);
         let dead = crate::access_keys::Store::dead_ids(&data_dir, crate::registry::unix_now());
@@ -1758,6 +1837,7 @@ async fn fleet_sync(state: Shared) {
             && revokes.is_empty()
             && require_now.is_empty()
             && dead.is_empty()
+            && incoming.is_empty()
         {
             continue;
         }
@@ -1825,6 +1905,26 @@ async fn fleet_sync(state: Shared) {
             if drop_access_key(&mut st, key_id) {
                 info!("Removed the computers that used access key {key_id}");
                 crate::audit::AuditLog::open(&st.data_dir).record("access_key", "server", "removed computers");
+            }
+        }
+        for target in &incoming {
+            if let Some((id, on)) = crate::requests::parse_incoming_target(target) {
+                match st.registry.set_incoming_only(&id, on) {
+                    Ok(()) => {
+                        info!("Incoming only for {} is {}", format_id(&id), if on { "on" } else { "off" });
+                        if let Some(host) = st.online.get(&id) {
+                            if pjdesk_proto::update::version_at_least(&host.app_version, "0.6.50") {
+                                let _ = host.tx.send(ServerMsg::IncomingOnly { on });
+                            }
+                        }
+                        crate::audit::AuditLog::open(&st.data_dir).record(
+                            "incoming_only",
+                            "server",
+                            &format!("{} {}", format_id(&id), if on { "on" } else { "off" }),
+                        );
+                    }
+                    Err(e) => warn!("could not set incoming only on {}: {e}", format_id(&id)),
+                }
             }
         }
         for target in &groups {
@@ -2408,6 +2508,75 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows.iter().find(|row| row.id == first).unwrap().hostname, "OPAS-DESKTOP");
         assert_eq!(rows.iter().find(|row| row.id == second).unwrap().hostname, "OMAS-DESKTOP");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incoming_only_refuses_an_outgoing_connect_and_a_blank_password_does_not_clear_it() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-incoming-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = state_in(&dir);
+        let (mut conn, mut rx) = conn_pair();
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::Register {
+                proto: 3,
+                device_id: Some("123456789".into()),
+                device_secret: [8u8; 32],
+                hostname: "Office".into(),
+                app_version: "0.6.50".into(),
+            },
+        );
+        let mut saw_off = false;
+        let id = loop {
+            match rx.try_recv().unwrap() {
+                ServerMsg::Registered { device_id } => break device_id,
+                other => panic!("registration must answer with an ID first, got {other:?}"),
+            }
+        };
+        assert_eq!(id, "123456789");
+        while let Ok(msg) = rx.try_recv() {
+            if let ServerMsg::IncomingOnly { on: false } = msg {
+                saw_off = true;
+            }
+        }
+        assert!(saw_off, "a 0.6.50 computer is told the lock, including when it is off");
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::SetIncomingOnly { on: true, password: String::new() },
+        );
+        match rx.try_recv().unwrap() {
+            ServerMsg::IncomingOnly { on: true } => {}
+            other => panic!("turning incoming only on must be confirmed, got {other:?}"),
+        }
+        assert!(state.lock().unwrap().registry.incoming_only(&id));
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::Connect { proto: 3, target_id: "222222222".into(), controller_name: "Office".into() },
+        );
+        match rx.try_recv().unwrap() {
+            ServerMsg::Error { code, message } => {
+                assert_eq!(code, ErrorCode::Unauthorized);
+                assert_eq!(message, pjdesk_proto::signal::INCOMING_ONLY_REFUSAL);
+            }
+            other => panic!("an incoming-only computer must not start a session, got {other:?}"),
+        }
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::SetIncomingOnly { on: false, password: String::new() },
+        );
+        match rx.try_recv().unwrap() {
+            ServerMsg::Error { code, message } => {
+                assert_eq!(code, ErrorCode::Unauthorized);
+                assert!(message.contains("account owner's password"), "{message}");
+            }
+            other => panic!("a blank password must not turn incoming only off, got {other:?}"),
+        }
+        assert!(state.lock().unwrap().registry.incoming_only(&id));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

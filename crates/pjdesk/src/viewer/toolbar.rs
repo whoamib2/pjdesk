@@ -426,8 +426,11 @@ pub struct Toolbar {
     hovered_slot: Option<usize>,
     /// Computer names in this window. Empty keeps the older single-session strip.
     sessions: Vec<String>,
+    unread: Vec<u32>,
     active_session: usize,
     hovered_session: Option<usize>,
+    /// The other computer sent ChatReady. Until then Chat stays visible and does nothing.
+    chat_ready: bool,
     android: bool,
     /// The navigation bar under an Android picture. On until the Phone menu hides it.
     android_nav: bool,
@@ -442,7 +445,7 @@ impl Default for Toolbar {
             ("Keys", "Send special keys", Kind::Menu(1), Mark::Keys),
             ("Session", "Audio, privacy, record, restart", Kind::Menu(2), Mark::Session),
             ("Files", "Send and receive files", Kind::Act(Action::OpenPanel(0)), Mark::Files),
-            ("Chat", "Messages", Kind::Act(Action::OpenPanel(1)), Mark::Chat),
+            ("Chat", pjdesk_proto::peer::CHAT_NEEDS_TIP, Kind::Act(Action::OpenPanel(1)), Mark::Chat),
             ("End", "Disconnect", Kind::Act(Action::Disconnect), Mark::End),
             ("Hide", "Hide the toolbar", Kind::Collapse, Mark::Collapse),
         ];
@@ -472,8 +475,10 @@ impl Default for Toolbar {
             light: false,
             hovered_slot: None,
             sessions: Vec::new(),
+            unread: Vec::new(),
             active_session: 0,
             hovered_session: None,
+            chat_ready: false,
             android: false,
             android_nav: true,
         }
@@ -540,7 +545,18 @@ struct SessionSlot {
     h: f32,
     close: (f32, f32, f32, f32),
     label: String,
+    badge: String,
     active: bool,
+}
+
+fn badge_text(count: u32) -> String {
+    if count == 0 {
+        String::new()
+    } else if count > 9 {
+        "9+".into()
+    } else {
+        count.to_string()
+    }
 }
 
 fn fit_label(label: &str, max_w: f32) -> String {
@@ -604,10 +620,29 @@ impl Toolbar {
     /// An empty list leaves the strip out, so a remote with one display still
     /// has no tab row.
     pub fn set_sessions(&mut self, names: &[String], active: usize) {
+        if self.sessions != names {
+            self.unread.resize(names.len(), 0);
+        }
         self.sessions = names.to_vec();
         self.active_session = active;
         if self.hovered_session.is_some_and(|i| i >= self.sessions.len()) {
             self.hovered_session = None;
+        }
+    }
+
+    /// Unread chat counts, one per session tab. A closed chat panel keeps the badge.
+    pub fn set_unread(&mut self, counts: &[u32]) {
+        self.unread = counts.to_vec();
+        self.unread.resize(self.sessions.len(), 0);
+    }
+
+    pub fn set_chat_ready(&mut self, ready: bool) {
+        self.chat_ready = ready;
+        let tip = if ready { "Messages" } else { pjdesk_proto::peer::CHAT_NEEDS_TIP };
+        for button in &mut self.buttons {
+            if button.label == "Chat" {
+                button.tip = tip;
+            }
         }
     }
 
@@ -660,7 +695,7 @@ impl Toolbar {
         }
         spec.extend([
             ("Files", "Send and receive files", Kind::Act(Action::OpenPanel(0)), Mark::Files),
-            ("Chat", "Messages", Kind::Act(Action::OpenPanel(1)), Mark::Chat),
+            ("Chat", pjdesk_proto::peer::CHAT_NEEDS_TIP, Kind::Act(Action::OpenPanel(1)), Mark::Chat),
             ("End", "Disconnect", Kind::Act(Action::Disconnect), Mark::End),
             ("Hide", "Hide the toolbar", Kind::Collapse, Mark::Collapse),
         ]);
@@ -674,6 +709,13 @@ impl Toolbar {
         self.buttons = buttons;
         self.menus = menus;
         self.width = x + PAD;
+        if self.chat_ready {
+            for button in &mut self.buttons {
+                if button.label == "Chat" {
+                    button.tip = "Messages";
+                }
+            }
+        }
     }
 
     /// The navigation bar is drawn for an Android peer until the viewer hides it.
@@ -830,6 +872,8 @@ impl Toolbar {
         let mut slots = Vec::with_capacity(n);
         for (index, label) in self.sessions.iter().enumerate() {
             let close_w = 22.0;
+            let badge = badge_text(self.unread.get(index).copied().unwrap_or(0));
+            let badge_w = if badge.is_empty() { 0.0 } else { text_width(&badge) + 14.0 };
             let close = (x + w - close_w - 4.0, y + 4.0, close_w, h - 8.0);
             slots.push(SessionSlot {
                 index,
@@ -838,7 +882,8 @@ impl Toolbar {
                 w,
                 h,
                 close,
-                label: fit_label(label, (w - close_w - 20.0).max(24.0)),
+                label: fit_label(label, (w - close_w - 20.0 - badge_w).max(24.0)),
+                badge,
                 active: index == self.active_session,
             });
             x += w + gap;
@@ -883,6 +928,13 @@ impl Toolbar {
             }
             let color = if slot.active || hover { c.text } else { c.muted };
             draw_text(buf, win_w, win_h, slot.x + 10.0, slot.y + 19.0, &slot.label, color);
+            if !slot.badge.is_empty() {
+                let bw = text_width(&slot.badge) + 10.0;
+                let (cx, _, _, _) = slot.close;
+                let bx = (cx - bw - 4.0).max(slot.x + 4.0);
+                fill_round(buf, win_w, win_h, bx, slot.y + 5.0, bw, slot.h - 10.0, 8.0, c.accent);
+                draw_text(buf, win_w, win_h, bx + 5.0, slot.y + 19.0, &slot.badge, 0xFF_ff_ff_ff);
+            }
             let (cx, cy, cw, ch) = slot.close;
             if hover {
                 fill_round(buf, win_w, win_h, cx, cy, cw, ch, 4.0, c.elev);
@@ -1178,6 +1230,9 @@ impl Toolbar {
                 Kind::Act(a) => {
                     self.open = None;
                     self.screens_open = false;
+                    if matches!(a, Action::OpenPanel(1)) && !self.chat_ready {
+                        return None;
+                    }
                     return Some(a);
                 }
             }
@@ -1226,8 +1281,11 @@ impl Toolbar {
             } else if session && self.block_input {
                 fill_round(buf, win_w, win_h, bx + b.x + 4.0, by + 6.0, b.w - 8.0, bh - 12.0, 8.0, 0xFF_3a_32_22);
             }
+            let chat_off = b.label == "Chat" && !self.chat_ready;
             let color = if end {
                 0xFF_f0_8a_86
+            } else if chat_off {
+                0xFF_6a_73_82
             } else if (session && self.block_input) || menu_open {
                 0xFF_f2_b0_3a
             } else {
@@ -1943,6 +2001,36 @@ mod tests {
         assert_eq!(bar.click((all.x + 10.0) as f64, (all.y + 8.0) as f64, w), Some(Action::ViewAll));
         let separate = slots.iter().find(|s| matches!(s.kind, SlotKind::Separate)).unwrap();
         assert_eq!(bar.click((separate.x + 8.0) as f64, (separate.y + 8.0) as f64, w), Some(Action::ViewSeparate));
+    }
+
+    #[test]
+    fn chat_stays_disabled_until_the_other_computer_can_chat() {
+        let mut bar = Toolbar::default();
+        let w = 1100usize;
+        let chat = bar.buttons.iter().find(|b| b.label == "Chat").unwrap();
+        assert_eq!(chat.tip, pjdesk_proto::peer::CHAT_NEEDS_TIP);
+        let (bx, by, _, _) = bar.bar_rect(w);
+        let x = (bx + chat.x + 8.0) as f64;
+        let y = (by + 12.0) as f64;
+        assert_eq!(bar.click(x, y, w), None);
+        bar.set_chat_ready(true);
+        let chat = bar.buttons.iter().find(|b| b.label == "Chat").unwrap();
+        assert_eq!(chat.tip, "Messages");
+        assert_eq!(bar.click(x, y, w), Some(Action::OpenPanel(1)));
+    }
+
+    #[test]
+    fn unread_chat_shows_on_the_session_tab() {
+        let mut bar = Toolbar::default();
+        bar.set_sessions(&["Cabin Desk".into(), "CHIP20".into()], 0);
+        bar.set_unread(&[3, 0]);
+        let slots = bar.session_slots(1100);
+        assert_eq!(slots[0].badge, "3");
+        assert!(slots[1].badge.is_empty());
+        bar.set_unread(&[12, 1]);
+        let slots = bar.session_slots(1100);
+        assert_eq!(slots[0].badge, "9+");
+        assert_eq!(slots[1].badge, "1");
     }
 
     #[test]

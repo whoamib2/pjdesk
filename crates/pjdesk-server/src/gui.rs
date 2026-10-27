@@ -232,6 +232,10 @@ struct App {
     ak_confirm: Option<String>,
     ak_rx: Option<std::sync::mpsc::Receiver<AkResult>>,
     ak_busy: bool,
+    /// Computer waiting for the account password before outgoing connections are allowed.
+    incoming_for: String,
+    incoming_pass: String,
+    incoming_show: bool,
 }
 
 /// How a cloud job (network calls on a worker thread) ended.
@@ -409,6 +413,9 @@ impl App {
             ak_confirm: None,
             ak_rx: None,
             ak_busy: false,
+            incoming_for: String::new(),
+            incoming_pass: String::new(),
+            incoming_show: false,
         };
         crate::public_addr::remember_port(&app.data_dir, port);
         if spawn_probe {
@@ -3613,6 +3620,7 @@ impl App {
         let mut remove: Option<String> = None;
         let mut update: Option<String> = None;
         let mut update_all = false;
+        let mut incoming_choice: Option<(String, bool)> = None;
         let online = rows.iter().filter(|r| r.online).count();
         card(ui, |ui| {
             ui.horizontal(|ui| {
@@ -3718,6 +3726,14 @@ impl App {
                                 remove = Some(d.id.clone());
                             }
                         }
+                        let incoming_label = if d.incoming_only { "Allow outgoing" } else { "Incoming only" };
+                        if ui
+                            .small_button(incoming_label)
+                            .on_hover_text(pjdesk_proto::signal::INCOMING_ONLY_LABEL)
+                            .clicked()
+                        {
+                            incoming_choice = Some((d.id.clone(), !d.incoming_only));
+                        }
                     });
                 }
             });
@@ -3730,6 +3746,77 @@ impl App {
         }
         if let Some(id) = update {
             self.request_update(&id);
+        }
+        if let Some((id, on)) = incoming_choice {
+            if on {
+                self.set_incoming(&id, true, "");
+            } else {
+                self.incoming_for = id;
+                self.incoming_pass.clear();
+                self.incoming_show = false;
+            }
+        }
+        self.incoming_password_window(ui.ctx());
+    }
+
+    fn set_incoming(&mut self, id: &str, on: bool, password: &str) {
+        let id = id.to_string();
+        let password = password.to_string();
+        if self.can_write {
+            let dir = self.data_dir.clone();
+            self.spawn_note(move || match crate::requests::apply_incoming(&dir, &id, on, &password) {
+                Ok(message) => message,
+                Err(message) => message,
+            });
+        } else {
+            self.ask_service(crate::control::Request {
+                cmd: "set_incoming".into(),
+                device_id: id,
+                password,
+                incoming_only: Some(on),
+                ..Default::default()
+            });
+        }
+    }
+
+    fn incoming_password_window(&mut self, ctx: &egui::Context) {
+        if self.incoming_for.is_empty() {
+            return;
+        }
+        let mut open = true;
+        let mut submit = false;
+        let shown = pjdesk_proto::format_id(&self.incoming_for);
+        egui::Window::new("Allow outgoing connections")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(format!(
+                    "Enter the account owner's password to let {shown} connect to other computers."
+                ));
+                ui.add_space(8.0);
+                ui.add(egui::TextEdit::singleline(&mut self.incoming_pass).password(!self.incoming_show).hint_text("Account password"));
+                ui.checkbox(&mut self.incoming_show, "Show password");
+                if ui.button("Allow outgoing").clicked() {
+                    submit = true;
+                }
+            });
+        if !open {
+            self.incoming_for.clear();
+            self.incoming_pass.clear();
+        }
+        if submit {
+            let id = self.incoming_for.clone();
+            let password = std::mem::take(&mut self.incoming_pass);
+            self.incoming_for.clear();
+            self.incoming_show = false;
+            if password.trim().is_empty() {
+                self.status = "Enter the account owner's password to allow this computer to connect to others.".into();
+            } else {
+                self.set_incoming(&id, false, &password);
+            }
         }
     }
 
@@ -3751,6 +3838,7 @@ impl App {
                             signed_in: d.signed_in,
                             access_label: d.access_label.clone(),
                             last_ip: d.last_ip.clone(),
+                            incoming_only: d.incoming_only,
                         })
                         .collect()
                 })
@@ -3770,6 +3858,7 @@ impl App {
                     signed_in: d.signed_in,
                     access_label: self.key_label(&d.access_key_id),
                     last_ip: d.last_ip.clone(),
+                    incoming_only: d.incoming_only,
                 }
             })
             .collect()
@@ -4295,6 +4384,7 @@ struct ShownDevice {
     signed_in: bool,
     access_label: String,
     last_ip: String,
+    incoming_only: bool,
 }
 
 /// Installed version against the saved update line. Local only: a stale

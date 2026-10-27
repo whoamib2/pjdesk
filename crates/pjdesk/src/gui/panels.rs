@@ -59,6 +59,10 @@ impl App {
                 if self.temp.is_some() {
                     ui.menu_button(RichText::new("Signed in until you close PJDesk").color(p.warn).size(13.0), |ui| {
                         self.sign_in_duration_menu(ui);
+                        if ui.button("Remove all saved computers").clicked() {
+                            self.confirm_clear_saved = true;
+                            ui.close();
+                        }
                     });
                     if ui.button("Sign out").clicked() {
                         self.end_temporary_sign_in();
@@ -70,6 +74,10 @@ impl App {
                             ui.close();
                         }
                         self.sign_in_duration_menu(ui);
+                        if ui.button("Remove all saved computers").clicked() {
+                            self.confirm_clear_saved = true;
+                            ui.close();
+                        }
                         if ui.button("Sign out").clicked() {
                             self.sign_out_network();
                             ui.close();
@@ -206,6 +214,22 @@ impl App {
         let p = theme::paint(ui);
         theme::card(ui, |ui| {
             widgets::heading(ui, "YOUR DESKTOP");
+            ui.add_space(4.0);
+            let mut incoming = crate::incoming::enabled();
+            if widgets::checkbox(ui, &mut incoming, crate::incoming::INCOMING_ONLY_LABEL) {
+                if incoming {
+                    self.incoming_unlock = false;
+                    if let Err(e) = crate::incoming::queue_ask(true, "") {
+                        self.status = format!("Could not ask the service: {e}");
+                    } else {
+                        self.status = "Incoming only is on. This computer can't connect to others.".into();
+                    }
+                } else {
+                    self.incoming_pass.clear();
+                    self.incoming_show = false;
+                    self.incoming_unlock = true;
+                }
+            }
             ui.add_space(4.0);
             self.share_status(ui);
             ui.add_space(12.0);
@@ -643,7 +667,7 @@ impl App {
 
     /// ID, one-time password, whether a permanent password is set, and whether
     /// this process (rather than the background service) is hosting.
-    fn share_secrets(&self) -> (Option<String>, Option<String>, bool, bool) {
+    pub(super) fn share_secrets(&self) -> (Option<String>, Option<String>, bool, bool) {
         if self.engine.service_running {
             let pw = self.svc_status.password.clone().filter(|p| !p.is_empty());
             (self.svc_status.id.clone(), pw, self.svc_status.permanent_set, false)
@@ -698,9 +722,11 @@ impl App {
         ui.label(widgets::muted(ui, "Chat during a session"));
         let lines = self.engine.shared.chat();
         let start = lines.len().saturating_sub(4);
-        for (mine, line) in lines.iter().skip(start) {
-            let who = if *mine { "You" } else { "Them" };
-            ui.label(format!("{who}: {line}"));
+        for line in lines.iter().skip(start) {
+            ui.label(pjdesk_proto::peer::format_chat_line(line.unix, &line.name, &line.text));
+        }
+        if crate::host::chatwin::armed() && ui.button("Open chat window").clicked() {
+            crate::host::chatwin::open();
         }
         ui.horizontal(|ui| {
             let resp = ui.add(
@@ -719,6 +745,14 @@ impl App {
 
     fn remote(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
+        if crate::incoming::enabled() {
+            theme::card(ui, |ui| {
+                widgets::heading(ui, "CONTROL REMOTE DESKTOP");
+                ui.add_space(4.0);
+                ui.label(crate::incoming::REFUSAL);
+            });
+            return;
+        }
         theme::card(ui, |ui| {
             widgets::heading(ui, "CONTROL REMOTE DESKTOP");
             ui.add_space(4.0);

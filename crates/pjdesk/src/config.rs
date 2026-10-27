@@ -1047,6 +1047,15 @@ impl Config {
         self.local_saved_cleared = true;
     }
 
+    /// Signs out on this computer. Saved computers, cached passwords, saved
+    /// addresses, and recents go with the sign-in. The pjdesk.com account is
+    /// not changed, and this computer keeps its ID.
+    pub fn sign_out_on_this_computer(&mut self) {
+        self.clear_local_saved();
+        self.saved_sync = Some(false);
+        self.leave_network_sign_in();
+    }
+
     pub fn leave_network_sign_in(&mut self) {
         self.network_email = None;
         self.network_refresh = None;
@@ -1834,6 +1843,15 @@ mod tests {
         assert_eq!(c.saved_hidden, vec!["555555555".to_string()]);
         assert_eq!(c.device_id.as_deref(), Some("386626882"));
         assert_eq!(c.network_email.as_deref(), Some("ben@spader.us"));
+        c.sign_out_on_this_computer();
+        assert!(c.network_email.is_none());
+        assert!(c.network_refresh.is_none());
+        assert!(c.password_vault_key.is_none());
+        assert!(c.address_book.is_empty());
+        assert!(c.saved_passwords.is_empty());
+        assert!(c.settings.peers.is_empty());
+        assert_eq!(c.device_id.as_deref(), Some("386626882"));
+        assert_eq!(c.saved_sync, Some(false));
         c.merge_computers(
             &[crate::network::SavedComputer {
                 id: "111111111".into(),

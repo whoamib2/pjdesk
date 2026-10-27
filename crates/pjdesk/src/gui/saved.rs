@@ -257,6 +257,18 @@ pub fn client_sections(rows: Vec<SavedRow>) -> (Vec<(String, Vec<SavedRow>)>, Ve
 
 impl App {
     pub(super) fn computer_list(&mut self, ui: &mut egui::Ui) {
+        if crate::incoming::enabled() {
+            theme::card(ui, |ui| {
+                widgets::heading(ui, "SAVED COMPUTERS");
+                ui.add_space(4.0);
+                ui.label(crate::incoming::REFUSAL);
+                ui.add_space(8.0);
+                if ui.button("Remove all saved computers").clicked() {
+                    self.confirm_clear_saved = true;
+                }
+            });
+            return;
+        }
         let p = theme::paint(ui);
         let mut submitted = false;
         theme::card(ui, |ui| {
@@ -356,11 +368,10 @@ impl App {
                     });
                 widgets::checkbox(ui, &mut self.saved_favorites, "Favorites");
                 if self.desk_tab == super::DeskTab::Saved {
+                    if ui.button("Remove all saved computers").clicked() {
+                        self.confirm_clear_saved = true;
+                    }
                     ui.menu_button("Menu", |ui| {
-                        if ui.button("Remove all saved computers from this computer").clicked() {
-                            self.confirm_clear_saved = true;
-                            ui.close();
-                        }
                         if ui.button("Sign out and remove everything from this computer").clicked() {
                             self.confirm_sign_out_clear = true;
                             ui.close();

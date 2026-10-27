@@ -16,6 +16,13 @@ data class IncomingCall(
     val bypass: Boolean = false,
 )
 
+data class ChatLine(
+    val mine: Boolean,
+    val name: String,
+    val text: String,
+    val unix: Long,
+)
+
 data class SessionInfo(
     val peer: String,
     val id: String,
@@ -56,6 +63,14 @@ data class DeskState(
     val hosting: Boolean = false,
     val hostWho: String = "",
     val session: SessionInfo? = null,
+    /** The other computer speaks in-session chat (PJDesk 0.6.50). */
+    val chatReady: Boolean = false,
+    val chatLines: List<ChatLine> = emptyList(),
+    val chatUnread: Int = 0,
+    /** Bumps on every chat line so the host can open its sheet. */
+    val chatSeq: Int = 0,
+    /** The newest line is from the other computer. */
+    val chatAlert: Boolean = false,
     val error: String? = null,
     val notice: String? = null,
     val askPassword: Boolean = false,
@@ -72,6 +87,8 @@ data class DeskState(
     val latestRelease: String = "",
     /** This phone's PJDesk version. Empty until the engine reports it. */
     val selfVersion: String = "",
+    /** This phone can be controlled and cannot connect to other computers. */
+    val incomingOnly: Boolean = false,
 )
 
 data class SavedComputer(

@@ -324,6 +324,9 @@ pub struct App {
     confirm_delete: Option<String>,
     confirm_clear_saved: bool,
     confirm_sign_out_clear: bool,
+    incoming_unlock: bool,
+    incoming_pass: String,
+    incoming_show: bool,
     delete_rx: Option<Receiver<Result<String, String>>>,
     next_account_pull: u64,
     /// Last self-online value written to the log, so a refresh does not repeat it.
@@ -448,8 +451,9 @@ pub struct App {
     lock_armed: bool,
     lock_ui: bool,
     lock_pin: String,
-    lock_show: bool,
     lock_error: String,
+    /// When the last wrong PIN was rejected, so the dots can shake once.
+    lock_shook: Option<Instant>,
     lock_busy: bool,
     lock_forgot: bool,
     lock_password: String,
@@ -559,6 +563,9 @@ impl App {
             confirm_delete: None,
             confirm_clear_saved: false,
             confirm_sign_out_clear: false,
+            incoming_unlock: false,
+            incoming_pass: String::new(),
+            incoming_show: false,
             delete_rx: None,
             next_account_pull: 0,
             logged_self_online: None,
@@ -657,8 +664,8 @@ impl App {
             lock_armed: false,
             lock_ui: false,
             lock_pin: String::new(),
-            lock_show: false,
             lock_error: String::new(),
+            lock_shook: None,
             lock_busy: false,
             lock_forgot: false,
             lock_password: String::new(),
@@ -2065,22 +2072,14 @@ impl App {
         }
     }
 
-    /// Leaves the PJDesk account. A normal sign-out keeps the saved list.
-    /// A temporary sign-in clears the saved list, cached passwords, and recents.
+    /// Leaves the PJDesk account on this computer and removes the saved list,
+    /// cached passwords, and recents. The account itself is not deleted.
     fn sign_out_network(&mut self) {
         if self.temp.is_some() {
             self.end_temporary_sign_in();
             return;
         }
-        self.cfg.reload_identity_from_disk();
-        self.cfg.leave_network_sign_in();
-        crate::network::copy_to_service(&self.cfg);
-        self.engine.retarget(&self.cfg);
-        self.show_net_sign_in = false;
-        if let Err(e) = self.cfg.save() {
-            self.status = format!("Could not save settings: {e}");
-        }
-        self.toast.show("Signed out");
+        self.sign_out_and_clear_local();
     }
 
     /// Clears the saved list on this computer and leaves the account signed in.
@@ -2107,9 +2106,7 @@ impl App {
             crate::temp_sign::clear_marker();
         }
         self.cfg.ephemeral_network = false;
-        self.cfg.clear_local_saved();
-        self.cfg.saved_sync = Some(false);
-        self.cfg.leave_network_sign_in();
+        self.cfg.sign_out_on_this_computer();
         crate::vault::clear_session_key();
         if let Err(e) = self.cfg.save() {
             self.status = format!("Could not save settings: {e}");
@@ -2129,6 +2126,10 @@ impl App {
 
     /// Downloads the account list once and keeps syncing it on this device.
     fn load_saved_computers(&mut self) {
+        if crate::incoming::enabled() {
+            self.status = crate::incoming::REFUSAL.to_string();
+            return;
+        }
         self.cfg.saved_sync = Some(true);
         self.cfg.local_saved_cleared = false;
         self.cfg.network_list_merged = false;
@@ -2141,6 +2142,9 @@ impl App {
     }
 
     fn maybe_pull_account(&mut self) {
+        if crate::incoming::enabled() {
+            return;
+        }
         if (self.temp.is_some() && !self.cfg.syncs_saved_computers()) || self.saved_rx.is_some() || self.delete_rx.is_some() {
             return;
         }
@@ -2161,6 +2165,63 @@ impl App {
             let result = crate::network::pull_list(&refresh_token, &device, &pjdesk_id).map_err(|e| e.to_string());
             let _ = tx.send(result);
         });
+    }
+
+    fn poll_incoming_result(&mut self) {
+        let Some((ok, message)) = crate::incoming::take_result() else { return };
+        if ok {
+            self.incoming_unlock = false;
+            self.incoming_pass.clear();
+            self.status.clear();
+            self.toast.show(if crate::incoming::enabled() {
+                "Incoming only is on"
+            } else {
+                "This computer can connect to others"
+            });
+        } else if !message.is_empty() {
+            self.status = message;
+        }
+    }
+
+    pub(super) fn incoming_unlock_window(&mut self, ctx: &egui::Context) {
+        if !self.incoming_unlock {
+            return;
+        }
+        let mut open = true;
+        let mut submit = false;
+        egui::Window::new("Allow outgoing connections")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label("Enter the account owner's password to allow this computer to connect to others.");
+                ui.add_space(8.0);
+                let edit = egui::TextEdit::singleline(&mut self.incoming_pass).password(!self.incoming_show).hint_text("Account password");
+                let resp = ui.add(edit);
+                if ui.checkbox(&mut self.incoming_show, "Show password").changed() {}
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Allow outgoing").clicked() || enter {
+                    submit = true;
+                }
+            });
+        if !open {
+            self.incoming_unlock = false;
+            self.incoming_pass.clear();
+        }
+        if submit {
+            let password = self.incoming_pass.clone();
+            self.incoming_pass.clear();
+            self.incoming_unlock = false;
+            if password.trim().is_empty() {
+                self.status = "Enter the account owner's password to allow this computer to connect to others.".into();
+            } else if let Err(e) = crate::incoming::queue_ask(false, &password) {
+                self.status = format!("Could not ask the service: {e}");
+            } else {
+                self.status = "Checking the account password…".into();
+            }
+        }
     }
 
     fn poll_saved_refresh(&mut self) {
@@ -2275,8 +2336,20 @@ impl App {
         });
     }
 
+    fn outgoing_blocked(&mut self) -> bool {
+        if crate::incoming::enabled() {
+            self.status = crate::incoming::REFUSAL.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Asks the other computer to show a view prompt. No password is sent.
     fn request_view(&mut self, id: &str) {
+        if self.outgoing_blocked() {
+            return;
+        }
         let id = normalize_id(id);
         if !is_valid_id(&id) {
             self.status = "That isn't a 9-digit PJDesk ID.".into();
@@ -2290,6 +2363,9 @@ impl App {
     }
 
     fn connect_to(&mut self, id: &str, password: Option<String>, files: bool) {
+        if self.outgoing_blocked() {
+            return;
+        }
         let id = normalize_id(id);
         if !is_valid_id(&id) {
             self.status = "That isn't a 9-digit PJDesk ID.".into();
@@ -2322,6 +2398,9 @@ impl App {
     /// came from storage is marked `PJDESK_SAVED`; if it is rejected the viewer
     /// exits 3 and this window asks again.
     fn spawn_viewer(&mut self, id: &str, password: &str, files: bool, remember: bool, from_store: bool) {
+        if self.outgoing_blocked() {
+            return;
+        }
         if !password.is_empty() && self.offer_session_tab(id, password, files, remember, from_store, "") {
             self.ask_person_next = false;
             self.ask_view_next = false;
@@ -2633,6 +2712,9 @@ impl App {
     /// A computer found on the LAN. Always asks for its password and connects
     /// with `--direct`. No account, and the password is not in the beacon.
     fn connect_discovered(&mut self, id: &str, addr: &str) {
+        if self.outgoing_blocked() {
+            return;
+        }
         let id = normalize_id(id);
         let addr = addr.trim();
         if addr.is_empty() {
@@ -2643,6 +2725,9 @@ impl App {
     }
 
     fn connect_direct(&mut self, addr: &str) {
+        if self.outgoing_blocked() {
+            return;
+        }
         let addr = addr.trim().to_string();
         if addr.is_empty() {
             self.status = "Enter an address, such as 192.168.1.20.".into();
@@ -2652,6 +2737,9 @@ impl App {
     }
 
     fn spawn_direct_with_password(&mut self, addr: &str, password: &str) {
+        if self.outgoing_blocked() {
+            return;
+        }
         if self.offer_session_tab(addr, password, false, false, false, addr) {
             return;
         }
@@ -2708,6 +2796,9 @@ impl App {
     }
 
     fn find_on_lan(&mut self) {
+        if self.outgoing_blocked() {
+            return;
+        }
         if !self.cfg.settings.discover_lan {
             self.status = "LAN discovery is turned off in Settings.".into();
             return;
@@ -2934,6 +3025,10 @@ fn adopt_service_notice() {
     crate::host::notice::update(account, computer, user, id);
 }
 
+fn adopt_service_chat() {
+    crate::host::chatwin::adopt();
+}
+
 fn read_service_consent() -> Option<ServiceConsent> {
     let path = crate::syspaths::service_dir().join("consent.json");
     let bytes = std::fs::read(path).ok()?;
@@ -3131,6 +3226,9 @@ impl App {
     }
 
     fn start_support_connect(&mut self) {
+        if self.outgoing_blocked() {
+            return;
+        }
         if self.support_busy {
             return;
         }
@@ -3374,6 +3472,7 @@ impl eframe::App for App {
         self.poll_self_enroll();
         self.maybe_pull_account();
         self.poll_saved_refresh();
+        self.poll_incoming_result();
         self.poll_account_delete();
         self.poll_password();
         self.poll_probe();
@@ -3436,7 +3535,9 @@ impl eframe::App for App {
             self.consent_prompt(&ctx);
             poll_client_heartbeat();
             adopt_service_notice();
+            adopt_service_chat();
             self.poll_lan();
+            self.toast.render(&ctx);
             return;
         }
 
@@ -3455,6 +3556,7 @@ impl eframe::App for App {
 
         self.settings_window(&ctx);
         self.saved_clear_dialogs(&ctx);
+        self.incoming_unlock_window(&ctx);
         self.invite_window(&ctx);
         self.support_keys_window(&ctx);
         self.session_error_dialog(&ctx);
@@ -3464,6 +3566,7 @@ impl eframe::App for App {
         self.consent_prompt(&ctx);
         poll_client_heartbeat();
         adopt_service_notice();
+        adopt_service_chat();
         self.login_window(&ctx);
         self.change_password_window(&ctx);
         self.poll_lan();
