@@ -516,6 +516,7 @@ class MainActivity : FragmentActivity() {
                 return true
             }
             fun loadMySavedComputers() {
+                if (state.incomingOnly) return
                 app.store.savedSyncChoice = "yes"
                 app.store.localSavedCleared = false
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
@@ -728,6 +729,11 @@ class MainActivity : FragmentActivity() {
                 askPerson: Boolean = false,
                 resetNotOnline: Boolean = true,
             ) {
+                if (state.incomingOnly) {
+                    connecting = false
+                    connectError = "Incoming only is on. This computer can't connect to others."
+                    return
+                }
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (connecting && now - lastConnectMs < 700) {
                     AppLog.i("Connect ignored, already starting $id")
@@ -787,7 +793,7 @@ class MainActivity : FragmentActivity() {
                             engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
                         }
                         rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
-                        if (app.store.syncsSavedComputers()) {
+                        if (app.store.syncsSavedComputers() && !state.incomingOnly) {
                             app.store.mergeCloud(session.computers)
                             saved = app.store.saved()
                         }
@@ -805,6 +811,11 @@ class MainActivity : FragmentActivity() {
                 }
             }
             fun beginConnect(rawId: String, ignoreOffline: Boolean = false) {
+                if (state.incomingOnly) {
+                    connecting = false
+                    connectError = "Incoming only is on. This computer can't connect to others."
+                    return
+                }
                 val digits = rawId.filter { it.isDigit() }
                 val computer = liveSaved.firstOrNull { it.id == digits }
                 val name = connectComputerName(saved, digits)
@@ -2087,6 +2098,10 @@ class MainActivity : FragmentActivity() {
                                     selfId = state.id,
                                     onRefreshSupport = { engine.refreshSupport() },
                                     onSupportConnect = { code, password ->
+                                        if (state.incomingOnly) {
+                                            scope.launch { snackbar.showSnackbar("Incoming only is on. This computer can't connect to others.") }
+                                            return@onSupportConnect
+                                        }
                                         if (code.length != 8 || password.isBlank()) {
                                             scope.launch { snackbar.showSnackbar("Enter the 8-digit code and the temporary password.") }
                                         } else {
@@ -2124,6 +2139,15 @@ class MainActivity : FragmentActivity() {
                                                 }.onFailure { inviteError = it.message ?: "Could not create a code." }
                                             }
                                         }
+                                    },
+                                    onIncomingOnly = { on, password ->
+                                        engine.command(
+                                            org.json.JSONObject()
+                                                .put("cmd", "incomingOnly")
+                                                .put("on", on)
+                                                .put("password", password)
+                                                .toString(),
+                                        )
                                     },
                                     onRevokeInvite = {
                                         val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
@@ -2200,8 +2224,9 @@ class MainActivity : FragmentActivity() {
                                         signOutAndClearSaved()
                                         scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
                                     },
-                                    showLoadSaved = account.isNotBlank() && !app.store.syncsSavedComputers(),
+                                    showLoadSaved = account.isNotBlank() && !app.store.syncsSavedComputers() && !state.incomingOnly,
                                     onLoadSaved = { loadMySavedComputers() },
+                                    incomingOnly = state.incomingOnly,
                                     onRename = { computer, nickname ->
                                         app.store.rename(computer.id, nickname)
                                         saved = app.store.saved()
@@ -2341,28 +2366,14 @@ class MainActivity : FragmentActivity() {
                                         signOutAndClearSaved()
                                         scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
                                     },
-                                    showLoadSaved = account.isNotBlank() && !app.store.syncsSavedComputers(),
+                                    showLoadSaved = account.isNotBlank() && !app.store.syncsSavedComputers() && !state.incomingOnly,
                                     onLoadSaved = { loadMySavedComputers() },
                                     onSignOut = if (account.isEmpty()) {
                                         null
                                     } else {
                                         {
-                                            if (temporarySession) {
-                                                signOutTemporary()
-                                                scope.launch { snackbar.showSnackbar("Signed out") }
-                                            } else {
-                                                app.store.networkEmail = ""
-                                                app.store.joinedWithoutPassword = false
-                                                app.store.saveNetworkRefresh("")
-                                                app.lockUi()
-                                                cloudAccess = ""
-                                                inviteCode = ""
-                                                inviteId = ""
-                                                inviteExpires = 0
-                                                inviteListed = false
-                                                engine.command(JSONObject().put("cmd", "accessToken").put("token", "").toString())
-                                                account = ""
-                                            }
+                                            signOutAndClearSaved()
+                                            scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
                                         }
                                     },
                                     onImportConfig = {

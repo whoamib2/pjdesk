@@ -26,6 +26,7 @@ mod handoff;
 mod host;
 mod hostfacts;
 mod identity;
+mod incoming;
 mod idfmt;
 mod network;
 mod p2p;

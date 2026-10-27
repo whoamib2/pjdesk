@@ -59,6 +59,10 @@ impl App {
                 if self.temp.is_some() {
                     ui.menu_button(RichText::new("Signed in until you close PJDesk").color(p.warn).size(13.0), |ui| {
                         self.sign_in_duration_menu(ui);
+                        if ui.button("Remove all saved computers").clicked() {
+                            self.confirm_clear_saved = true;
+                            ui.close();
+                        }
                     });
                     if ui.button("Sign out").clicked() {
                         self.end_temporary_sign_in();
@@ -70,6 +74,10 @@ impl App {
                             ui.close();
                         }
                         self.sign_in_duration_menu(ui);
+                        if ui.button("Remove all saved computers").clicked() {
+                            self.confirm_clear_saved = true;
+                            ui.close();
+                        }
                         if ui.button("Sign out").clicked() {
                             self.sign_out_network();
                             ui.close();
@@ -206,6 +214,22 @@ impl App {
         let p = theme::paint(ui);
         theme::card(ui, |ui| {
             widgets::heading(ui, "YOUR DESKTOP");
+            ui.add_space(4.0);
+            let mut incoming = crate::incoming::enabled();
+            if widgets::checkbox(ui, &mut incoming, crate::incoming::INCOMING_ONLY_LABEL) {
+                if incoming {
+                    self.incoming_unlock = false;
+                    if let Err(e) = crate::incoming::queue_ask(true, "") {
+                        self.status = format!("Could not ask the service: {e}");
+                    } else {
+                        self.status = "Incoming only is on. This computer can't connect to others.".into();
+                    }
+                } else {
+                    self.incoming_pass.clear();
+                    self.incoming_show = false;
+                    self.incoming_unlock = true;
+                }
+            }
             ui.add_space(4.0);
             self.share_status(ui);
             ui.add_space(12.0);
@@ -721,6 +745,14 @@ impl App {
 
     fn remote(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
+        if crate::incoming::enabled() {
+            theme::card(ui, |ui| {
+                widgets::heading(ui, "CONTROL REMOTE DESKTOP");
+                ui.add_space(4.0);
+                ui.label(crate::incoming::REFUSAL);
+            });
+            return;
+        }
         theme::card(ui, |ui| {
             widgets::heading(ui, "CONTROL REMOTE DESKTOP");
             ui.add_space(4.0);

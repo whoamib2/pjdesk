@@ -286,6 +286,7 @@ mod imp {
 
         set(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, Duration::default())?;
         super::protect_service_dir();
+        let _ = crate::incoming::apply(crate::incoming::enabled());
         // Drop the scheduled task older installs registered. Defender was
         // matching svchost launching that task. The service checks itself.
         let _ = super::delete_update_task();

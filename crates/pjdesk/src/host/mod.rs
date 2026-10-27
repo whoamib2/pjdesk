@@ -952,6 +952,59 @@ async fn register_catalog(
 
 /// One signaling connection: register, then handle incoming sessions.
 /// Returns `Ok` if we were registered before the connection dropped.
+/// Reads a window request, checks the account password off this task when
+/// turning the lock off, and writes the ProgramData flag. The password is not logged.
+async fn poll_incoming_ask(
+    signal: &mut SignalClient,
+    config: &Config,
+    incoming_ready: bool,
+    wait_off: &mut bool,
+) -> Option<bool> {
+    let (want, password) = crate::incoming::take_ask()?;
+    let currently = crate::incoming::enabled();
+    let password_ok = if want || !currently {
+        true
+    } else if password.is_empty() {
+        false
+    } else {
+        let email = config.network_email.clone().unwrap_or_default();
+        let check = password.clone();
+        tokio::task::spawn_blocking(move || crate::network::confirm_account_password(&email, &check).is_ok())
+            .await
+            .unwrap_or(false)
+    };
+    match crate::incoming::decide_ask(currently, want, password_ok) {
+        Err(message) => {
+            crate::incoming::write_result(false, message);
+            None
+        }
+        Ok(true) => {
+            if let Err(e) = crate::incoming::apply(true) {
+                crate::incoming::write_result(false, &format!("Could not save incoming only: {e}"));
+                return None;
+            }
+            if incoming_ready {
+                let _ = signal.send(ClientMsg::SetIncomingOnly { on: true, password: String::new() });
+            }
+            crate::incoming::write_result(true, "");
+            Some(true)
+        }
+        Ok(false) => {
+            if incoming_ready {
+                *wait_off = true;
+                let _ = signal.send(ClientMsg::SetIncomingOnly { on: false, password });
+                None
+            } else if let Err(e) = crate::incoming::apply(false) {
+                crate::incoming::write_result(false, &format!("Could not save incoming only: {e}"));
+                None
+            } else {
+                crate::incoming::write_result(true, "");
+                Some(false)
+            }
+        }
+    }
+}
+
 async fn signaling_loop(
     server: &ServerAddr,
     config: &mut Config,
@@ -1008,10 +1061,22 @@ async fn signaling_loop(
     let mut ping_at: Option<Instant> = None;
     let mut awaiting_pong = false;
     let mut heartbeats = 0u32;
+    let mut incoming_held = crate::incoming::enabled();
+    let mut incoming_ready = false;
+    let mut incoming_told = false;
+    let mut incoming_wait_off = false;
 
     loop {
         tokio::select! {
             _ = ui_tick.tick() => {
+                if crate::incoming::owns_flag(state.args.service_host) {
+                    if let Some(next) = poll_incoming_ask(&mut signal, config, incoming_ready, &mut incoming_wait_off).await {
+                        incoming_held = next;
+                        incoming_told = incoming_told || incoming_ready;
+                    } else if crate::incoming::enabled() != incoming_held {
+                        let _ = crate::incoming::apply(incoming_held);
+                    }
+                }
                 if state.shared.as_ref().is_some_and(|s| s.stopping()) {
                     return Ok(SignalEnd::Stop);
                 }
@@ -1156,7 +1221,30 @@ async fn signaling_loop(
                         signal.send(crate::hostfacts::report())?;
                         signal.send(crate::hostfacts::display_name_report())?;
                     }
-                    ServerMsg::Error { message, .. } => warn!("Server: {message}"),
+                    ServerMsg::IncomingOnly { on } => {
+                        incoming_ready = true;
+                        if crate::incoming::owns_flag(state.args.service_host) {
+                            let (apply_on, tell) = pjdesk_proto::signal::reconcile_incoming_only(incoming_held, on, incoming_told);
+                            if crate::incoming::apply(apply_on).is_ok() {
+                                incoming_held = apply_on;
+                            }
+                            if tell {
+                                let _ = signal.send(ClientMsg::SetIncomingOnly { on: true, password: String::new() });
+                            }
+                            if !on && incoming_wait_off {
+                                incoming_wait_off = false;
+                                crate::incoming::write_result(true, "");
+                            }
+                        }
+                        incoming_told = true;
+                    }
+                    ServerMsg::Error { message, .. } => {
+                        if incoming_wait_off && message.contains("account owner's password") {
+                            incoming_wait_off = false;
+                            crate::incoming::write_result(false, &message);
+                        }
+                        warn!("Server: {message}");
+                    }
                     other => debug!("ignoring {other:?}"),
                 }
             }

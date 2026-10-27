@@ -87,6 +87,8 @@ data class DeskState(
     val latestRelease: String = "",
     /** This phone's PJDesk version. Empty until the engine reports it. */
     val selfVersion: String = "",
+    /** This phone can be controlled and cannot connect to other computers. */
+    val incomingOnly: Boolean = false,
 )
 
 data class SavedComputer(

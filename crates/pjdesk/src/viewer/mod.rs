@@ -49,6 +49,9 @@ pub struct Link {
 }
 
 pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<()> {
+    if let Err(message) = crate::incoming::refuse_outgoing() {
+        bail!("{message}");
+    }
     let direct = args.direct.clone();
     let typed = args.id.join(" ");
     let target = normalize_id(&typed);

@@ -151,6 +151,9 @@ pub struct ListedDevice {
     /// Label of the access key this computer used. Empty when it did not.
     #[serde(default)]
     pub access_label: String,
+    /// This computer cannot start a session. Missing before 0.6.50.
+    #[serde(default)]
+    pub incoming_only: bool,
 }
 
 /// A blocked computer, safe to put on the status pipe. The secret hash stays in the file.
@@ -335,6 +338,8 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
         last_seen: u64,
         #[serde(default)]
         access_key_id: String,
+        #[serde(default)]
+        incoming_only: bool,
     }
     #[derive(Deserialize)]
     struct Online {
@@ -379,6 +384,7 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
                 first_seen: rec.first_seen,
                 last_seen: rec.last_seen,
                 access_label,
+                incoming_only: rec.incoming_only,
             }
         })
         .collect();

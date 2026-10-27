@@ -71,6 +71,9 @@ pub struct Request {
     /// Access key id to revoke. Not a secret.
     #[serde(default)]
     pub key_id: String,
+    /// Incoming-only for `set_incoming`. `Some(true)` locks outgoing connections.
+    #[serde(default)]
+    pub incoming_only: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -251,6 +254,7 @@ pub fn execute(data_dir: &Path, req: &Request, actor: &str) -> Response {
         "set_watch" => set_watch(data_dir, req),
         "block" => block_computer(data_dir, &req.device_id),
         "unblock" => unblock_computer(data_dir, &req.device_id),
+        "set_incoming" => set_incoming(data_dir, req),
         "create_access_key" => create_access_key(data_dir, req),
         "revoke_access_key" => revoke_access_key_cmd(data_dir, &req.key_id),
         "restart" => schedule_restart(),
@@ -533,6 +537,16 @@ fn schedule_restart() -> Response {
     #[cfg(not(windows))]
     {
         fail("Restarting the service is only available on Windows.")
+    }
+}
+
+fn set_incoming(data_dir: &Path, req: &Request) -> Response {
+    let Some(on) = req.incoming_only else {
+        return fail("That command was not understood.");
+    };
+    match crate::requests::apply_incoming(data_dir, &req.device_id, on, &req.password) {
+        Ok(message) => ok(message),
+        Err(message) => fail(message),
     }
 }
 

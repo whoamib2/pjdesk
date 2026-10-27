@@ -632,6 +632,7 @@ class Engine(context: Context) : EngineListener {
                         server = event.optString("server", it.server),
                         approval = store.approval,
                         selfVersion = event.optString("appVersion").ifBlank { it.selfVersion },
+                        incomingOnly = if (event.has("incomingOnly")) event.optBoolean("incomingOnly") else it.incomingOnly,
                         status = if (ready) "Ready" else it.status,
                     )
                 }
@@ -833,6 +834,7 @@ class Engine(context: Context) : EngineListener {
                 }
                 onFiles?.invoke(list)
             }
+            "incomingOnly" -> update { it.copy(incomingOnly = event.optBoolean("on")) }
             "chatReady" -> update { it.copy(chatReady = true) }
             "chatSeen" -> update { it.copy(chatUnread = 0, chatAlert = false) }
             "chat" -> update {

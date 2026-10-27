@@ -177,6 +177,14 @@ struct State {
     view_chat_peer: AtomicBool,
     /// Replies from the person at this phone, written on the host session.
     host_chat: Mutex<Vec<ChatEntry>>,
+    /// This phone can be controlled and cannot start a session.
+    incoming_only: AtomicBool,
+    /// The server has sent IncomingOnly, so this phone may answer.
+    incoming_ready: AtomicBool,
+    /// This phone has told the server about a lock it already had.
+    incoming_told: AtomicBool,
+    /// `(on, password)` waiting for the server. The password is not logged.
+    incoming_ask: Mutex<Option<(bool, String)>>,
 }
 
 #[derive(Clone)]
@@ -211,6 +219,9 @@ struct Disk {
     access_token: String,
     #[serde(default)]
     routes: String,
+    /// This phone cannot start a session. Missing in a file from before 0.6.50.
+    #[serde(default)]
+    incoming_only: bool,
 }
 
 pub struct Engine {
@@ -345,6 +356,10 @@ impl Engine {
             host_chat_peer: AtomicBool::new(false),
             view_chat_peer: AtomicBool::new(false),
             host_chat: Mutex::new(Vec::new()),
+            incoming_only: AtomicBool::new(stored.incoming_only),
+            incoming_ready: AtomicBool::new(false),
+            incoming_told: AtomicBool::new(false),
+            incoming_ask: Mutex::new(None),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let engine = Self { state: state.clone(), cmds: tx };
@@ -461,6 +476,7 @@ fn persist(state: &State) {
         install_key_hex: hex::encode(state.install_key),
         access_token: state.access_token.lock().unwrap().clone(),
         routes: serde_json::to_string(&*state.routes.lock().unwrap()).unwrap_or_default(),
+        incoming_only: state.incoming_only.load(Ordering::SeqCst),
     };
     // Keep a derived secret out of the file. A random one (no Android id) is rewritten
     // only when it was already stored.
@@ -508,6 +524,7 @@ fn publish(state: &State, cb: &Arc<dyn Callbacks>) {
             "server": server,
             "approval": state.approval.lock().unwrap().clone(),
             "appVersion": APP_VERSION,
+            "incomingOnly": state.incoming_only.load(Ordering::SeqCst),
         }),
     );
 }
@@ -748,7 +765,22 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             *state.capture_deny.lock().unwrap() = reason.chars().filter(|c| !c.is_control()).take(200).collect();
             state.capturing.store(false, Ordering::SeqCst);
         }
+        "incomingOnly" => {
+            let on = cmd.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+            let password = cmd.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if on {
+                state.incoming_only.store(true, Ordering::SeqCst);
+                persist(state);
+                emit(cb, &json!({"event":"incomingOnly","on": true}));
+            }
+            *state.incoming_ask.lock().unwrap() = Some((on, password));
+            publish(state, cb);
+        }
         "connect" => {
+            if state.incoming_only.load(Ordering::SeqCst) {
+                emit(cb, &json!({"event":"error","text": pjdesk_proto::signal::INCOMING_ONLY_REFUSAL}));
+                return;
+            }
             let id = normalize_id(cmd.get("id").and_then(|v| v.as_str()).unwrap_or(""));
             let password = cmd.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let ask_now = cmd.get("ask").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1375,6 +1407,8 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
     let mut saw_registered = false;
     let mut report_host = false;
     let mut since_report = 0u32;
+    let mut incoming_ready = state.incoming_ready.load(Ordering::SeqCst);
+    let mut incoming_told = state.incoming_told.load(Ordering::SeqCst);
     loop {
         if state.app_stop.load(Ordering::SeqCst) {
             return Ok(PhoneHost::Stop);
@@ -1423,6 +1457,24 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                 }
                 if heartbeats == 0 {
                     let _ = send_host_register(&mut signal, &state);
+                }
+                if let Some((want, password)) = state.incoming_ask.lock().unwrap().clone() {
+                    if incoming_ready {
+                        state.incoming_ask.lock().unwrap().take();
+                        if want {
+                            state.incoming_only.store(true, Ordering::SeqCst);
+                            persist(&state);
+                            emit(&cb, &json!({"event":"incomingOnly","on": true}));
+                            let _ = signal.send(ClientMsg::SetIncomingOnly { on: true, password: String::new() });
+                        } else if password.is_empty() {
+                            emit(
+                                &cb,
+                                &json!({"event":"error","text": "Enter the account owner's password to allow this computer to connect to others."}),
+                            );
+                        } else {
+                            let _ = signal.send(ClientMsg::SetIncomingOnly { on: false, password });
+                        }
+                    }
                 }
                 signal.send(ClientMsg::Ping)?;
                 awaiting_pong = true;
@@ -1565,7 +1617,11 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                             );
                             bail!("{message}");
                         }
-                        emit(&cb, &json!({"event":"status","text": message}));
+                        if message.contains("account owner's password") {
+                            emit(&cb, &json!({"event":"error","text": message}));
+                        } else {
+                            emit(&cb, &json!({"event":"status","text": message}));
+                        }
                     }
                     ServerMsg::WantHostReport => {
                         report_host = true;
@@ -1601,6 +1657,21 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                         emit(&cb, &json!({"event":"release","version": version, "url": client_url}));
                     }
                     reply @ ServerMsg::AccountResult { .. } => emit(&cb, &account_event(&reply)),
+                    ServerMsg::IncomingOnly { on } => {
+                        incoming_ready = true;
+                        state.incoming_ready.store(true, Ordering::SeqCst);
+                        let local = state.incoming_only.load(Ordering::SeqCst);
+                        let (apply_on, tell) = pjdesk_proto::signal::reconcile_incoming_only(local, on, incoming_told);
+                        state.incoming_only.store(apply_on, Ordering::SeqCst);
+                        if tell {
+                            let _ = signal.send(ClientMsg::SetIncomingOnly { on: true, password: String::new() });
+                        }
+                        incoming_told = true;
+                        state.incoming_told.store(true, Ordering::SeqCst);
+                        persist(&state);
+                        emit(&cb, &json!({"event":"incomingOnly","on": apply_on}));
+                        publish(&state, &cb);
+                    }
                     ServerMsg::UpdateNow => {
                         log_line(&cb, "the server asked this phone to update");
                         let cb = cb.clone();
@@ -3505,7 +3576,41 @@ mod tests {
             host_chat_peer: AtomicBool::new(false),
             view_chat_peer: AtomicBool::new(false),
             host_chat: Mutex::new(Vec::new()),
+            incoming_only: AtomicBool::new(false),
+            incoming_ready: AtomicBool::new(false),
+            incoming_told: AtomicBool::new(false),
+            incoming_ask: Mutex::new(None),
         })
+    }
+
+    #[test]
+    fn connect_is_refused_when_incoming_only_is_on() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-phone-incoming-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            struct Rec(Arc<Mutex<Vec<String>>>);
+            impl Callbacks for Rec {
+                fn on_event(&self, json: &str) {
+                    self.0.lock().unwrap().push(json.to_string());
+                }
+                fn on_video(&self, _data: &[u8], _width: u32, _height: u32, _keyframe: bool) {}
+            }
+            let state = test_state(&dir);
+            state.incoming_only.store(true, Ordering::SeqCst);
+            let cb: Arc<dyn Callbacks> = Arc::new(Rec(events.clone()));
+            apply(&state, &cb, json!({"cmd":"connect","id":"123456789","password":"secret"})).await;
+            let text = events.lock().unwrap().join("\n");
+            assert!(text.contains(pjdesk_proto::signal::INCOMING_ONLY_REFUSAL), "{text}");
+            assert!(!text.contains("secret"));
+            assert!(state.viewer.lock().unwrap().is_none());
+            apply(&state, &cb, json!({"cmd":"incomingOnly","on": false, "password":"secret"})).await;
+            assert!(state.incoming_only.load(Ordering::SeqCst), "turning it off waits for the server");
+            assert!(!events.lock().unwrap().iter().any(|line| line.contains("secret")));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The host's SPAKE2 check: the typed password has to match one slot.

@@ -226,6 +226,42 @@ pub enum ClientMsg {
         #[serde(default)]
         proof: String,
     },
+    /// 0.6.50+. Turn incoming-only on or off for this computer. Sent only after
+    /// [`ServerMsg::IncomingOnly`]. `password` is the account owner's password
+    /// and is required to turn it off. It is not written to a log.
+    SetIncomingOnly {
+        on: bool,
+        password: String,
+    },
+}
+
+/// Shown when this computer is not allowed to start a session.
+pub const INCOMING_ONLY_REFUSAL: &str = "Incoming only is on. This computer can't connect to others.";
+
+/// The checkbox and the server-window button.
+pub const INCOMING_ONLY_LABEL: &str = "Incoming only (this computer can't connect to others)";
+
+/// What the server said, against what this computer already stored.
+/// The second value is true when this computer should tell the server it is on.
+/// A first `on: false` from the server does not unlock a lock this computer
+/// already has. A later `on: false`, after this computer has spoken, does.
+pub fn reconcile_incoming_only(local_on: bool, server_on: bool, told_server: bool) -> (bool, bool) {
+    if server_on {
+        (true, false)
+    } else if local_on && !told_server {
+        (true, true)
+    } else {
+        (false, false)
+    }
+}
+
+/// Turning incoming-only on does not need a password. Turning it off does.
+pub fn incoming_only_change(want_on: bool, currently_on: bool, password_ok: bool) -> Result<(), &'static str> {
+    if want_on || !currently_on || password_ok {
+        Ok(())
+    } else {
+        Err("Enter the account owner's password to allow this computer to connect to others.")
+    }
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -521,6 +557,10 @@ pub enum ServerMsg {
         #[serde(default)]
         checked_at: u64,
     },
+    /// 0.6.50+. This computer may only accept sessions, or it may connect out
+    /// again. Sent only to a client whose version can decode it. Older clients
+    /// are not sent this variant.
+    IncomingOnly { on: bool },
 }
 
 /// One computer the primary can see, for the Saved list.
@@ -866,6 +906,17 @@ mod tests {
         assert_eq!(result[0], fleet[0] + 1, "AccountResult is appended after Fleet");
         assert_eq!(replica[0], result[0] + 1, "Replica is appended after AccountResult");
         assert_eq!(release[0], replica[0] + 1, "Release is appended after Replica");
+        let set = postcard::to_stdvec(&ClientMsg::SetIncomingOnly { on: true, password: String::new() }).unwrap();
+        assert_eq!(set[0], account[0] + 1, "SetIncomingOnly is appended after Account");
+        let only = postcard::to_stdvec(&ServerMsg::IncomingOnly { on: true }).unwrap();
+        assert_eq!(only[0], release[0] + 1, "IncomingOnly is appended after Release");
+        assert_eq!(INCOMING_ONLY_REFUSAL, "Incoming only is on. This computer can't connect to others.");
+        assert_eq!(reconcile_incoming_only(true, false, false), (true, true));
+        assert_eq!(reconcile_incoming_only(true, false, true), (false, false));
+        assert_eq!(reconcile_incoming_only(false, true, false), (true, false));
+        assert!(incoming_only_change(false, true, false).is_err());
+        assert!(incoming_only_change(true, false, false).is_ok());
+        assert!(incoming_only_change(false, true, true).is_ok());
         let back: ClientMsg = postcard::from_bytes(&ping).unwrap();
         assert!(matches!(back, ClientMsg::Ping));
         match postcard::from_bytes::<ServerMsg>(&keys).unwrap() {

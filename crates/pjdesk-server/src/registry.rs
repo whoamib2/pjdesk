@@ -67,6 +67,10 @@ struct DeviceRecord {
     /// the first `RegisterInstall`. Not the key itself.
     #[serde(default)]
     install_sha256: String,
+    /// This computer may be controlled and must not start a session.
+    /// Missing before 0.6.50, which means outgoing connections are allowed.
+    #[serde(default)]
+    incoming_only: bool,
 }
 
 /// A computer that was removed and must not register again.
@@ -119,6 +123,8 @@ pub struct DeviceRow {
     pub last_ip: String,
     /// Set when this computer registered with a server access key.
     pub access_key_id: String,
+    /// True when this computer must not start a session.
+    pub incoming_only: bool,
 }
 
 /// A removed computer, for the Blocked computers list. No secret.
@@ -222,6 +228,7 @@ fn new_device(secret_sha256: String, install_sha256: String, hostname: &str, app
         display_name: String::new(),
         last_ip: String::new(),
         access_key_id: String::new(),
+        incoming_only: false,
     }
 }
 
@@ -315,14 +322,32 @@ impl Registry {
                 signed_in: d.signed_in,
                 last_ip: d.last_ip.clone(),
                 access_key_id: d.access_key_id.clone(),
+                incoming_only: d.incoming_only,
             })
             .collect();
         rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         rows
     }
 
-    /// Forgets a device (the window's "Forget"). If that computer connects
-    /// again it gets the same ID back (it still holds the ID and its secret).
+    /// True when this computer is not allowed to start a session.
+    pub fn incoming_only(&self, id: &str) -> bool {
+        self.data.devices.get(id).is_some_and(|d| d.incoming_only)
+    }
+
+    /// Turns incoming-only on or off and saves the registry.
+    pub fn set_incoming_only(&mut self, id: &str, on: bool) -> Result<()> {
+        if !is_valid_id(id) {
+            anyhow::bail!("that is not a PJDesk computer ID");
+        }
+        let record = self.data.devices.get_mut(id).context("no such computer")?;
+        if record.incoming_only == on {
+            return Ok(());
+        }
+        record.incoming_only = on;
+        self.save()?;
+        Ok(())
+    }
+
     /// Sets the group label for a computer. An empty group clears it.
     /// The name is a short label, not a path.
     pub fn set_group(&mut self, id: &str, group: &str) -> Result<()> {
@@ -1142,8 +1167,21 @@ mod tests {
         let reg = Registry::load(path).unwrap();
         assert!(!reg.list()[0].signed_in);
         assert!(reg.list()[0].access_key_id.is_empty());
+        assert!(!reg.list()[0].incoming_only);
         assert!(reg.presence()[0].install_sha256.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incoming_only_is_saved_and_an_old_file_stays_off() {
+        let (path, mut reg) = fresh("incoming");
+        let id = reg.register(None, &[6u8; 32], "Office", "0.6.50").unwrap();
+        assert!(!reg.incoming_only(&id));
+        reg.set_incoming_only(&id, true).unwrap();
+        let again = Registry::load(path.clone()).unwrap();
+        assert!(again.incoming_only(&id));
+        assert!(again.list().iter().any(|row| row.id == id && row.incoming_only));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

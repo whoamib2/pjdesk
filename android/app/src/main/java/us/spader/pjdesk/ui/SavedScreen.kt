@@ -90,6 +90,7 @@ fun SavedScreen(
     onSignOutRemove: () -> Unit = {},
     showLoadSaved: Boolean = false,
     onLoadSaved: () -> Unit = {},
+    incomingOnly: Boolean = false,
 ) {
     var page by remember { mutableStateOf(initialPage.coerceIn(0, 2)) }
     var confirmClear by remember { mutableStateOf(false) }
@@ -123,7 +124,13 @@ fun SavedScreen(
             onRemoveAll = { confirmClear = true },
             onSignOutRemove = { confirmSignOut = true },
         )
-        if (page == 0 && showLoadSaved) {
+        if (page == 0) {
+            Button(
+                onClick = { confirmClear = true },
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            ) { Text("Remove all saved computers") }
+        }
+        if (page == 0 && showLoadSaved && !incomingOnly) {
             Button(
                 onClick = onLoadSaved,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
@@ -171,7 +178,14 @@ fun SavedScreen(
             onRefresh = onRefresh,
             modifier = Modifier.weight(1f),
         ) {
-            if (shown.isEmpty()) {
+            if (incomingOnly) {
+                Text(
+                    "Incoming only is on. This computer can't connect to others.",
+                    color = pjMuted(),
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            } else if (shown.isEmpty()) {
                 Text(
                     when {
                         page == 2 && query.isBlank() -> "No PJDesk computers have answered on this network yet."
