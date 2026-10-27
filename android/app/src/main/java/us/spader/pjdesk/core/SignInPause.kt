@@ -5,26 +5,25 @@ const val SIGN_IN_PAUSE_SECS = 15 * 60L
 
 /**
  * Seconds to wait after HTTP 429 from `/api/login`. Null for any other failure.
- * The production body is "Too many failed sign-ins. Wait 15 minutes and try again."
+ * `retryAfter` is the Worker's Retry-After delta-seconds and wins over the body.
  * A code-guess or PIN lock ("Too many tries") is not this pause.
  */
-fun signInPauseSeconds(status: Int, message: String): Long? {
+fun signInPauseSeconds(status: Int, message: String, retryAfter: Long? = null): Long? {
     val limited = (status == 429 && !message.contains("Too many tries"))
         || message.contains("Too many failed sign-ins")
         || message.contains("Too many sign-in attempts")
     if (!limited) return null
+    val header = retryAfter?.takeIf { it > 0 }
+    if (header != null) return header.coerceIn(1L, SIGN_IN_PAUSE_SECS)
     return (waitMinutes(message) ?: (SIGN_IN_PAUSE_SECS / 60)) * 60
 }
 
-/** Ben's sentence, with the remaining minutes rounded up and a ticking clock. */
+/** The sentence on the Sign in screen. Minutes are the remaining time, rounded up. */
 fun signInPauseText(remainingSecs: Long): String {
     val secs = remainingSecs.coerceAtLeast(0L)
     val minutes = ((secs + 59) / 60).coerceAtLeast(1)
     val unit = if (minutes == 1L) "minute" else "minutes"
-    val mm = (secs / 60).toInt()
-    val ss = (secs % 60).toInt()
-    val clock = "%02d:%02d".format(mm, ss)
-    return "Too many sign-in attempts from this computer, so pjdesk.com paused sign-ins for a bit. Your password may be fine. Wait $minutes $unit, then try once (each try restarts the wait). $clock"
+    return "Too many sign-in attempts. Try again in $minutes $unit."
 }
 
 private fun waitMinutes(message: String): Long? {

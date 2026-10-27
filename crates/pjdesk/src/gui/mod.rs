@@ -1589,8 +1589,8 @@ impl App {
                     );
                     self.note_sign_in_error(e);
                 } else {
-                    self.support_keys.enter_note = e.clone();
                     self.note_sign_in_error(e);
+                    self.support_keys.enter_note = self.net_error.clone();
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}

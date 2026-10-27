@@ -259,7 +259,7 @@ class MainActivity : FragmentActivity() {
                     val leftMs = signInPauseUntil - android.os.SystemClock.elapsedRealtime()
                     if (leftMs <= 0L) {
                         signInPauseUntil = 0L
-                        if (netError.startsWith("Too many sign-in attempts from this computer")) netError = ""
+                        if (netError.startsWith("Too many sign-in attempts")) netError = ""
                         break
                     }
                     netError = us.spader.pjdesk.core.signInPauseText((leftMs + 999) / 1000)
@@ -487,7 +487,11 @@ class MainActivity : FragmentActivity() {
             }
             fun noteSignInPause(err: Throwable): Boolean {
                 val cloud = err as? us.spader.pjdesk.core.CloudAuthException
-                val secs = us.spader.pjdesk.core.signInPauseSeconds(cloud?.status ?: 0, err.message.orEmpty()) ?: return false
+                val secs = us.spader.pjdesk.core.signInPauseSeconds(
+                    cloud?.status ?: 0,
+                    err.message.orEmpty(),
+                    cloud?.retryAfter,
+                ) ?: return false
                 signInPauseUntil = android.os.SystemClock.elapsedRealtime() + secs * 1000
                 netError = us.spader.pjdesk.core.signInPauseText(secs)
                 return true

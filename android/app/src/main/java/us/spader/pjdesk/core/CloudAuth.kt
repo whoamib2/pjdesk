@@ -498,11 +498,13 @@ object CloudAuth {
         if (code !in 200..299) {
             val parsed = runCatching { JSONObject(text) }.getOrNull()
             val message = parsed?.optString("error").orEmpty()
+            val retryAfter = conn.getHeaderField("Retry-After")?.trim()?.toLongOrNull()?.takeIf { it > 0 }
             throw CloudAuthException(
                 message.ifBlank { "Could not sign in ($code)." },
                 parsed?.optString("code").orEmpty(),
                 parsed?.optString("role").orEmpty(),
                 status = code,
+                retryAfter = retryAfter,
             )
         }
         return JSONObject(text)
@@ -515,6 +517,7 @@ class CloudAuthException(
     val role: String = "",
     val loginToken: String = "",
     val status: Int = 0,
+    val retryAfter: Long? = null,
 ) : Exception(message)
 
 data class JoinCode(

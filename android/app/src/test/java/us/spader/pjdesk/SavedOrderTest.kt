@@ -214,17 +214,15 @@ class SavedOrderTest {
         val production = "Too many failed sign-ins. Wait 15 minutes and try again."
         assertEquals(15L * 60, signInPauseSeconds(429, production))
         assertEquals(15L * 60, signInPauseSeconds(429, "PJDesk could not sign in (429)."))
-        assertEquals(null, signInPauseSeconds(429, "Too many tries. Try again in 2 minutes."))
+        assertEquals(150L, signInPauseSeconds(429, "ignored", 150))
+        assertEquals(61L, signInPauseSeconds(429, "Wait 15 minutes", 61))
+        assertEquals(15L * 60, signInPauseSeconds(429, "ignored", 100_000))
+        assertEquals(null, signInPauseSeconds(429, "Too many tries. Try again in 2 minutes.", 120))
         assertEquals(null, signInPauseSeconds(401, "Wrong email or password."))
-        val text = signInPauseText(15 * 60)
-        assertEquals(
-            "Too many sign-in attempts from this computer, so pjdesk.com paused sign-ins for a bit. Your password may be fine. Wait 15 minutes, then try once (each try restarts the wait). 15:00",
-            text,
-        )
-        assertTrue(signInPauseText(1).contains("Wait 1 minute,"))
-        assertTrue(signInPauseText(1).endsWith("00:01"))
-        assertTrue(signInPauseText(61).contains("Wait 2 minutes,"))
-        assertTrue(signInPauseText(61).endsWith("01:01"))
+        assertEquals("Too many sign-in attempts. Try again in 15 minutes.", signInPauseText(15 * 60))
+        assertEquals("Too many sign-in attempts. Try again in 1 minute.", signInPauseText(1))
+        assertEquals("Too many sign-in attempts. Try again in 2 minutes.", signInPauseText(61))
+        assertEquals("Too many sign-in attempts. Try again in 3 minutes.", signInPauseText(150))
     }
 
     @Test

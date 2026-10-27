@@ -271,10 +271,11 @@ impl App {
     pub(super) fn note_sign_in_error(&mut self, err: String) {
         if let Some(secs) = crate::network::sign_in_pause_seconds_from_text(&err) {
             self.net_pause_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+            self.net_error = crate::network::sign_in_pause_text(secs);
         } else {
             self.net_pause_until = None;
+            self.net_error = err;
         }
-        self.net_error = err;
     }
 
     /// Remaining seconds of a login pause. Zero re-enables Sign in and clears the sentence.
@@ -283,7 +284,7 @@ impl App {
         let left = until.saturating_duration_since(std::time::Instant::now()).as_secs();
         if left == 0 {
             self.net_pause_until = None;
-            if self.net_error.starts_with("Too many sign-in attempts from this computer") {
+            if self.net_error.starts_with("Too many sign-in attempts") {
                 self.net_error.clear();
             }
             None

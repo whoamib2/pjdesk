@@ -855,7 +855,10 @@ impl App {
                     Ok(crate::network::SignIn::NoServer { .. }) => {
                         LockMsg::Failed(format!("{}. Choose Skip for now.", crate::network::NO_SERVER))
                     }
-                    Err(err) => LockMsg::Failed(format!("{err}. Choose Skip for now.")),
+                    Err(err) => {
+                        let text = crate::network::sign_in_pause_user_text(&err.to_string());
+                        LockMsg::Failed(format!("{text}. Choose Skip for now."))
+                    }
                 };
                 let _ = tx.send(msg);
             })
@@ -878,7 +881,10 @@ impl App {
             .spawn(move || {
                 let msg = match crate::network::confirm_account_password(&email, &password) {
                     Ok(key) => LockMsg::Reauthed(key),
-                    Err(err) => LockMsg::Failed(format!("{err}. Choose Skip for now.")),
+                    Err(err) => {
+                        let text = crate::network::sign_in_pause_user_text(&err.to_string());
+                        LockMsg::Failed(format!("{text}. Choose Skip for now."))
+                    }
                 };
                 let _ = tx.send(msg);
             })
