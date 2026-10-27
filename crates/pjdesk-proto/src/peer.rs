@@ -128,6 +128,16 @@ pub enum ControlMsg {
         user: String,
         id: String,
     },
+    /// 0.6.50. One chat line. Sent only after the host has sent
+    /// [`HostMsg::ChatReady`]. An older host never sends that, so it never
+    /// receives this variant. `unix` is seconds since the Unix epoch.
+    /// `name` is the controller's account, or its computer name when there is
+    /// no account.
+    ChatLine {
+        text: String,
+        name: String,
+        unix: u64,
+    },
 }
 
 /// [`ControlMsg::View`] mode: one display, the one named by `display`.
@@ -376,6 +386,100 @@ pub enum HostMsg {
     MoveRelay {
         primary: String,
     },
+    /// 0.6.50. This host can do named session chat. Sent once, only when Hello
+    /// carried [`crate::perms::CHAT_PEER`]. An older controller never sets that
+    /// bit, so it never receives this variant.
+    ChatReady,
+    /// 0.6.50. One chat line from the person at the host. Sent only after
+    /// [`HostMsg::ChatReady`]. `name` is the host computer name.
+    ChatLine {
+        text: String,
+        name: String,
+        unix: u64,
+    },
+}
+
+/// First PJDesk release that speaks named in-session chat.
+pub const CHAT_MIN_VERSION: &str = "0.6.50";
+
+/// Shown on a Chat button when the other computer is older than 0.6.50.
+pub const CHAT_NEEDS_TIP: &str = "The other computer needs PJDesk 0.6.50 or newer";
+
+/// Largest chat message accepted, in characters.
+pub const MAX_CHAT_TEXT: usize = 2000;
+/// Largest sender name stored on a chat line, in characters.
+pub const MAX_CHAT_NAME: usize = 80;
+
+/// One line kept for the current session. Nothing here is written to disk
+/// as the session log, and nothing is sent to pjdesk.com.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatEntry {
+    pub mine: bool,
+    pub name: String,
+    pub text: String,
+    pub unix: u64,
+}
+
+/// True when `version` is a final release at least 0.6.50.
+pub fn chat_supported(version: &str) -> bool {
+    crate::update::version_at_least(version, CHAT_MIN_VERSION)
+}
+
+/// Seconds since the Unix epoch, or 0 when the clock is unset.
+pub fn chat_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Plain text for a chat line. Empty and whitespace-only text is refused.
+/// Control characters other than tab and newline are dropped. The result is
+/// at most [`MAX_CHAT_TEXT`] characters.
+pub fn chat_line(text: &str) -> Option<String> {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if ch.is_control() && ch != '\n' && ch != '\t' {
+            continue;
+        }
+        out.push(ch);
+        if out.chars().count() >= MAX_CHAT_TEXT {
+            break;
+        }
+    }
+    let out = out.trim().to_string();
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// A sender name. Blank names use `fallback`, then "Computer".
+pub fn chat_name(name: &str, fallback: &str) -> String {
+    let cleaned = clean_name(name);
+    if !cleaned.is_empty() {
+        return cleaned;
+    }
+    let fallback = clean_name(fallback);
+    if fallback.is_empty() { "Computer".into() } else { fallback }
+}
+
+fn clean_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        out.push(ch);
+        if out.chars().count() >= MAX_CHAT_NAME {
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// `HH:MM:SS UTC  name  text`. The clock is UTC from `unix` so it does not
+/// depend on the computer's time zone.
+pub fn format_chat_line(unix: u64, name: &str, text: &str) -> String {
+    let secs = unix % 86_400;
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02} UTC  {name}  {text}")
 }
 
 /// Input from the controller, replayed on the host with `SendInput`.
@@ -660,6 +764,33 @@ mod tests {
         };
         let bytes = postcard::to_stdvec(&welcome).unwrap();
         assert!(matches!(postcard::from_bytes(&bytes).unwrap(), HostMsg::Welcome { proto: 3, .. }));
+    }
+
+    #[test]
+    fn chat_lines_are_appended_and_the_old_chat_index_stays() {
+        assert_eq!(postcard::to_stdvec(&ControlMsg::Chat { text: "hello".into() }).unwrap()[0], 6);
+        assert_eq!(postcard::to_stdvec(&HostMsg::Chat { text: "hello".into() }).unwrap()[0], 3);
+        assert_eq!(postcard::to_stdvec(&HostMsg::MoveRelay { primary: "a".into() }).unwrap()[0], 14);
+        let controller = ControlMsg::ChatLine { text: "hi".into(), name: "ben@spader.us".into(), unix: 1700000000 };
+        let host = HostMsg::ChatLine { text: "hi".into(), name: "OFFICE".into(), unix: 1700000000 };
+        assert_eq!(postcard::to_stdvec(&controller).unwrap()[0], 22);
+        assert_eq!(postcard::to_stdvec(&HostMsg::ChatReady).unwrap()[0], 15);
+        assert_eq!(postcard::to_stdvec(&host).unwrap()[0], 16);
+        let back: ControlMsg = postcard::from_bytes(&postcard::to_stdvec(&controller).unwrap()).unwrap();
+        assert!(matches!(back, ControlMsg::ChatLine { unix: 1700000000, .. }));
+        let back: HostMsg = postcard::from_bytes(&postcard::to_stdvec(&host).unwrap()).unwrap();
+        assert!(matches!(back, HostMsg::ChatLine { .. }));
+        assert_eq!(CHAT_NEEDS_TIP, "The other computer needs PJDesk 0.6.50 or newer");
+        assert!(!chat_supported("0.6.49"));
+        assert!(chat_supported("0.6.50"));
+        assert!(chat_supported("0.6.51"));
+        assert!(!chat_supported("0.6.50-rc1"));
+        assert!(chat_line("   ").is_none());
+        assert!(chat_line("").is_none());
+        assert_eq!(chat_line("  hello\u{0001} there  ").as_deref(), Some("hello there"));
+        assert_eq!(format_chat_line(1700000000, "OFFICE", "hello"), "22:13:20 UTC  OFFICE  hello");
+        assert_eq!(chat_name("", "OFFICE"), "OFFICE");
+        assert_eq!(chat_name("ben@spader.us", "OFFICE"), "ben@spader.us");
     }
 
     #[tokio::test]

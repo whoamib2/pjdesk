@@ -157,6 +157,7 @@ fn arm_link(
         frame_tx,
         peer_proto,
         host_id.clone(),
+        host_name.clone(),
         relayed,
         Some(view),
         Some(display),
@@ -774,6 +775,7 @@ impl App {
 
     fn redraw(&mut self) {
         self.drain_queue();
+        self.sync_chat_panel();
         self.apply_tab_strip();
         self.pump_frame();
         let confirm = self.confirm_close;
@@ -961,7 +963,9 @@ impl App {
                 }
             }
             Action::OpenPanel(tab) => {
-                if self.panel.open && self.panel.tab == tab {
+                if tab == 1 && !self.live.lock().unwrap().chat_ready {
+                    self.live.lock().unwrap().notices.push(pjdesk_proto::peer::CHAT_NEEDS_TIP.into());
+                } else if self.panel.open && self.panel.tab == tab {
                     self.panel.open = false;
                 } else {
                     self.panel.open = true;
@@ -1115,14 +1119,18 @@ impl App {
             }
             PanelCmd::Chat(text) => {
                 let mut g = self.live.lock().unwrap();
-                if !g.v3 {
-                    g.notices.push("Chat needs PJDesk 0.4 on both computers.".into());
-                } else if !g.allowed(pjdesk_proto::perms::CHAT) {
-                    g.notices.push("Chat was not allowed for this session.".into());
-                } else {
-                    g.chat.push((true, text.clone()));
+                if !g.chat_ready {
+                    g.notices.push(pjdesk_proto::peer::CHAT_NEEDS_TIP.into());
+                } else if let Some(text) = pjdesk_proto::peer::chat_line(&text) {
+                    let name = super::controls::controller_chat_name();
+                    let unix = pjdesk_proto::peer::chat_now();
+                    g.chat.push(pjdesk_proto::peer::ChatEntry { mine: true, name: name.clone(), text: text.clone(), unix });
+                    if g.chat.len() > 200 {
+                        let drop_n = g.chat.len() - 200;
+                        g.chat.drain(0..drop_n);
+                    }
                     drop(g);
-                    let _ = self.control.send(ControlMsg::Chat { text });
+                    let _ = self.control.send(ControlMsg::ChatLine { text, name, unix });
                 }
             }
             PanelCmd::Tunnel { local, host, port } => {
@@ -2090,13 +2098,35 @@ impl App {
         ids
     }
 
+    fn sync_chat_panel(&mut self) {
+        let open = self.panel.open && self.panel.tab == 1;
+        let mut g = self.live.lock().unwrap();
+        g.chat_open = open;
+        if open {
+            g.chat_unread = 0;
+        }
+        let ready = g.chat_ready;
+        drop(g);
+        self.toolbar.set_chat_ready(ready);
+    }
+
+    fn unread_of(&self, sid: u64) -> u32 {
+        if sid == self.sid {
+            return self.live.lock().unwrap().chat_unread;
+        }
+        self.others.iter().find(|held| held.sid == sid).map(|held| held.live.lock().unwrap().chat_unread).unwrap_or(0)
+    }
+
     fn apply_tab_strip(&mut self) {
         let names: Vec<String> = self.tab_order.iter().copied().map(|sid| self.tab_label(sid)).collect();
+        let unread: Vec<u32> = self.tab_order.iter().copied().map(|sid| self.unread_of(sid)).collect();
         let active = self.tab_order.iter().position(|sid| *sid == self.sid).unwrap_or(0);
         if names.is_empty() {
             self.toolbar.set_sessions(&[], 0);
+            self.toolbar.set_unread(&[]);
         } else {
             self.toolbar.set_sessions(&names, active);
+            self.toolbar.set_unread(&unread);
         }
     }
 
@@ -2170,6 +2200,7 @@ impl App {
     fn install(&mut self, next: Held) {
         hide_panes(&mut self.extra);
         let previous = self.take_active(next);
+        previous.live.lock().unwrap().chat_open = false;
         self.others.push(previous);
         show_panes(&self.extra);
         self.apply_tab_strip();
@@ -2192,6 +2223,7 @@ impl App {
         let next = self.others.remove(pos);
         hide_panes(&mut self.extra);
         let previous = self.take_active(next);
+        previous.live.lock().unwrap().chat_open = false;
         self.others.push(previous);
         show_panes(&self.extra);
         self.apply_tab_strip();
@@ -2931,6 +2963,10 @@ impl ApplicationHandler<UserEvent> for App {
                             if let Some(cmd) = self.panel.click(self.cursor_px.0, self.cursor_px.1, win_w, win_h, &snap)
                             {
                                 self.apply_panel(cmd);
+                            }
+                            if self.panel.tab == 1 && !self.live.lock().unwrap().chat_ready {
+                                self.panel.tab = 0;
+                                self.live.lock().unwrap().notices.push(pjdesk_proto::peer::CHAT_NEEDS_TIP.into());
                             }
                             if let Some(window) = &self.window {
                                 window.request_redraw();

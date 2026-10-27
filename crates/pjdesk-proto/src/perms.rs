@@ -38,6 +38,12 @@ pub const LAYOUT: u32 = 1 << 11;
 /// and an older host never treats it as something the person allowed.
 pub const VISITOR: u32 = 1 << 12;
 
+/// Not a permission. A 0.6.50 controller sets this on Hello so the host knows
+/// it can send [`crate::peer::HostMsg::ChatReady`] and named chat lines.
+/// Absent from [`ALL`], so [`grant`] clears it and an older host never treats
+/// it as something the person allowed.
+pub const CHAT_PEER: u32 = 1 << 13;
+
 /// Every permission bit this version defines. Unknown high bits are ignored.
 pub const ALL: u32 =
     KEYBOARD | MOUSE | CLIPBOARD | FILE | AUDIO | RESTART | PRIVACY | BLOCK_INPUT | CHAT | RECORD | TUNNEL;
@@ -129,5 +135,13 @@ mod tests {
         assert_eq!(grant(ALL | LAYOUT, ALL | LAYOUT, false), ALL);
         assert!(!has(ALL, LAYOUT));
         assert_eq!(name(LAYOUT), "unknown");
+    }
+
+    #[test]
+    fn chat_peer_bit_is_not_a_permission() {
+        assert_eq!(grant(ALL | CHAT_PEER, ALL | CHAT_PEER, false), ALL);
+        assert!(!has(ALL, CHAT_PEER));
+        assert_eq!(name(CHAT_PEER), "unknown");
+        assert!(has(ALL, CHAT));
     }
 }

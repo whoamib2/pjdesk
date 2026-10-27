@@ -1,4 +1,7 @@
-@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@file:OptIn(
+    androidx.compose.foundation.ExperimentalFoundationApi::class,
+    androidx.compose.material3.ExperimentalMaterial3Api::class,
+)
 
 package us.spader.pjdesk.ui
 
@@ -37,9 +40,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TooltipBox
+import androidx.compose.material3.TooltipDefaults
+import androidx.compose.material3.rememberTooltipState
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -74,6 +81,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kotlin.math.hypot
 import kotlin.math.roundToInt
+import us.spader.pjdesk.core.ChatLine
 import us.spader.pjdesk.core.ControlPad
 import us.spader.pjdesk.core.RemoteOptions
 import us.spader.pjdesk.core.SessionHit
@@ -115,6 +123,11 @@ fun SessionScreen(
     idleWarn: Boolean = false,
     onStay: () -> Unit = {},
     onActivity: () -> Unit = {},
+    chatReady: Boolean = false,
+    chatLines: List<ChatLine> = emptyList(),
+    chatUnread: Int = 0,
+    onChat: (String) -> Unit = {},
+    onChatOpen: () -> Unit = {},
 ) {
     val android = session.platform == "android"
     val trackpad = remote.trackpadFor(android)
@@ -123,12 +136,20 @@ fun SessionScreen(
     val space = remember { OverlaySpace() }
     var confirmEnd by remember { mutableStateOf(false) }
     var sheet by remember { mutableStateOf(false) }
+    var chatSheet by remember { mutableStateOf(false) }
     var shownDisplay by remember(session.id) {
         mutableIntStateOf(session.displays.firstOrNull { it.primary }?.index ?: 0)
     }
     val peerName = session.peer.ifBlank { session.id }.ifBlank { "this computer" }
     BackHandler {
-        if (sheet) sheet = false else confirmEnd = true
+        when {
+            chatSheet -> chatSheet = false
+            sheet -> sheet = false
+            else -> confirmEnd = true
+        }
+    }
+    LaunchedEffect(chatSheet, chatLines.size) {
+        if (chatSheet) onChatOpen()
     }
     var viewW by remember { mutableIntStateOf(1) }
     var viewH by remember { mutableIntStateOf(1) }
@@ -540,6 +561,41 @@ fun SessionScreen(
                     .padding(top = 8.dp, end = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                val chatTip = if (chatReady) "Chat" else CHAT_NEEDS_TIP
+                TooltipBox(
+                    positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
+                    tooltip = { PlainTooltip { Text(chatTip) } },
+                    state = rememberTooltipState(),
+                ) {
+                    Box {
+                        HitButton(
+                            description = chatTip,
+                            space = space,
+                            padId = "chat",
+                            color = if (chatReady) {
+                                MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)
+                            } else {
+                                MaterialTheme.colorScheme.surface.copy(alpha = 0.55f)
+                            },
+                            pressedColor = MaterialTheme.colorScheme.primary,
+                            onClick = { if (chatReady) chatSheet = true },
+                        ) { Text("Chat", style = MaterialTheme.typography.labelLarge) }
+                        if (chatUnread > 0) {
+                            Surface(
+                                modifier = Modifier.align(Alignment.TopEnd),
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.error,
+                            ) {
+                                Text(
+                                    if (chatUnread > 9) "9+" else chatUnread.toString(),
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                                    color = MaterialTheme.colorScheme.onError,
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
+                            }
+                        }
+                    }
+                }
                 HitButton(
                     description = "Session settings",
                     space = space,
@@ -595,6 +651,15 @@ fun SessionScreen(
                                 modifier = Modifier.semantics { contentDescription = "Close session settings" },
                             ) { Text("Close") }
                         }
+                        TextButton(
+                            onClick = {
+                                if (chatReady) {
+                                    sheet = false
+                                    chatSheet = true
+                                }
+                            },
+                            enabled = chatReady,
+                        ) { Text(if (chatReady) "Chat" else CHAT_NEEDS_TIP) }
                         RemoteOptionsForm(
                             options = remote,
                             onChange = onRemote,
@@ -617,6 +682,22 @@ fun SessionScreen(
                         )
                     }
                 }
+            }
+        }
+        if (chatSheet) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .clickable { chatSheet = false },
+            )
+            Box(Modifier.align(Alignment.BottomCenter)) {
+                ChatSheet(
+                    lines = chatLines,
+                    ready = chatReady,
+                    onSend = onChat,
+                    onClose = { chatSheet = false },
+                )
             }
         }
         if (confirmEnd) {

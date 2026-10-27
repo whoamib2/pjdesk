@@ -1,6 +1,7 @@
 //! Host mode: stay online, show ID + password, stream to one controller at a time.
 
 pub mod capture;
+pub(crate) mod chatwin;
 mod ctrl;
 pub(crate) mod direct;
 mod encoder;
@@ -82,8 +83,8 @@ pub struct HostShared {
     consent: Mutex<Option<ConsentAsk>>,
     consent_reply: Mutex<Option<ConsentReply>>,
     consent_seq: AtomicU64,
-    chat: Mutex<Vec<(bool, String)>>,
-    chat_out: Mutex<Vec<String>>,
+    chat: Mutex<Vec<pjdesk_proto::peer::ChatEntry>>,
+    chat_out: Mutex<Vec<pjdesk_proto::peer::ChatEntry>>,
     send_files: Mutex<Vec<std::path::PathBuf>>,
     /// Lines for a transfer list. Nothing in the window reads them yet.
     #[allow(dead_code)]
@@ -250,27 +251,39 @@ impl HostShared {
         });
     }
 
-    pub fn push_chat(&self, from_me: bool, text: &str) {
+    pub fn push_chat(&self, entry: pjdesk_proto::peer::ChatEntry) {
         let mut chat = self.chat.lock().unwrap();
-        chat.push((from_me, text.to_string()));
+        chat.push(entry);
         if chat.len() > 200 {
             let drop_n = chat.len() - 200;
             chat.drain(0..drop_n);
         }
     }
 
-    pub fn chat(&self) -> Vec<(bool, String)> {
+    pub fn chat(&self) -> Vec<pjdesk_proto::peer::ChatEntry> {
         self.chat.lock().unwrap().clone()
     }
 
-    pub fn send_chat(&self, text: String) {
-        if !text.trim().is_empty() {
-            self.push_chat(true, text.trim());
-            self.chat_out.lock().unwrap().push(text.trim().to_string());
-        }
+    /// Drops the transcript. History lasts for one session.
+    pub fn clear_chat(&self) {
+        self.chat.lock().unwrap().clear();
+        self.chat_out.lock().unwrap().clear();
     }
 
-    pub fn take_chat_out(&self) -> Vec<String> {
+    pub fn send_chat(&self, text: String) {
+        let Some(text) = pjdesk_proto::peer::chat_line(&text) else { return };
+        let entry = pjdesk_proto::peer::ChatEntry {
+            mine: true,
+            name: pjdesk_proto::peer::chat_name(&crate::hostname(), "Computer"),
+            text,
+            unix: pjdesk_proto::peer::chat_now(),
+        };
+        self.push_chat(entry.clone());
+        self.chat_out.lock().unwrap().push(entry.clone());
+        chatwin::note(entry);
+    }
+
+    pub fn take_chat_out(&self) -> Vec<pjdesk_proto::peer::ChatEntry> {
         std::mem::take(&mut *self.chat_out.lock().unwrap())
     }
 

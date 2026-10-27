@@ -698,9 +698,11 @@ impl App {
         ui.label(widgets::muted(ui, "Chat during a session"));
         let lines = self.engine.shared.chat();
         let start = lines.len().saturating_sub(4);
-        for (mine, line) in lines.iter().skip(start) {
-            let who = if *mine { "You" } else { "Them" };
-            ui.label(format!("{who}: {line}"));
+        for line in lines.iter().skip(start) {
+            ui.label(pjdesk_proto::peer::format_chat_line(line.unix, &line.name, &line.text));
+        }
+        if crate::host::chatwin::armed() && ui.button("Open chat window").clicked() {
+            crate::host::chatwin::open();
         }
         ui.horizontal(|ui| {
             let resp = ui.add(

@@ -256,6 +256,8 @@ fn ui_thread() {
                     }
                     place(hwnd);
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                } else if super::chatwin::armed() && hit_chat(hwnd, x, y) {
+                    super::chatwin::open();
                 } else if hit_disconnect(hwnd, x, y) {
                     request_disconnect();
                 } else if hit_collapse(hwnd, x, y) {
@@ -310,6 +312,18 @@ fn ui_thread() {
         );
     }
 
+    unsafe fn hit_chat(hwnd: HWND, x: i32, y: i32) -> bool {
+        let mut rect = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rect);
+        let r = chat_rect(&rect, dpi(hwnd));
+        x >= r.left && x < r.right && y >= r.top && y < r.bottom
+    }
+
+    fn chat_rect(client: &RECT, dpi: i32) -> RECT {
+        let s = |px: i32| px * dpi / 96;
+        RECT { left: s(12), top: client.bottom - s(36), right: s(108), bottom: client.bottom - s(10) }
+    }
+
     unsafe fn hit_disconnect(hwnd: HWND, x: i32, y: i32) -> bool {
         let mut rect = RECT::default();
         let _ = GetClientRect(hwnd, &mut rect);
@@ -359,6 +373,14 @@ fn ui_thread() {
             }
             if !card.detail.is_empty() {
                 text(dc, &card.detail, RECT { left: scale(hwnd, 14), top: y, right: rect.right - scale(hwnd, 12), bottom: y + scale(hwnd, 20) }, -(12 * d / 96), false);
+            }
+            if super::chatwin::armed() {
+                let chat = chat_rect(&rect, d);
+                let blue = CreateSolidBrush(COLORREF(0x00_ff_9b_4d));
+                let _ = FillRect(dc, &chat, blue);
+                let _ = DeleteObject(HGDIOBJ(blue.0));
+                let _ = SetTextColor(dc, COLORREF(0x00_ff_ff_ff));
+                text(dc, "Chat", chat, -(13 * d / 96), true);
             }
             let btn = disconnect_rect(&rect, d);
             let red = CreateSolidBrush(COLORREF(0x00_3b_3b_c4));

@@ -21,7 +21,10 @@ import androidx.activity.compose.setContent
 import androidx.fragment.app.FragmentActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.layout.Row
@@ -48,6 +51,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -931,6 +936,7 @@ class MainActivity : FragmentActivity() {
             var controlEnabled by remember { mutableStateOf(PjAccessibilityService.enabled(this@MainActivity)) }
             var controlBound by remember { mutableStateOf(RemoteControl.service != null) }
             var controlDismissed by remember { mutableStateOf(false) }
+            var hostChat by remember { mutableStateOf(false) }
             LaunchedEffect(state.supportCode, state.id) {
                 if (isFinishing) return@LaunchedEffect
                 val code = state.supportCode
@@ -978,7 +984,19 @@ class MainActivity : FragmentActivity() {
                 }
             }
             LaunchedEffect(state.hosting) {
-                if (!state.hosting) controlDismissed = false
+                if (!state.hosting) {
+                    controlDismissed = false
+                    hostChat = false
+                }
+            }
+            LaunchedEffect(state.chatSeq) {
+                if (!state.chatAlert) return@LaunchedEffect
+                val line = state.chatLines.lastOrNull() ?: return@LaunchedEffect
+                if (state.hosting) {
+                    hostChat = true
+                    us.spader.pjdesk.service.ChatNotice.show(this@MainActivity, line.name, line.text)
+                    engine.chatSeen()
+                }
             }
             LaunchedEffect(state.id, account, uiUnlocked) {
                 val digits = state.id.filter { it.isDigit() }
@@ -1830,6 +1848,11 @@ class MainActivity : FragmentActivity() {
                         idleWarn = sessionIdleWarn,
                         onStay = { sessionIdleWarn = false },
                         onActivity = {},
+                        chatReady = state.chatReady,
+                        chatLines = state.chatLines,
+                        chatUnread = state.chatUnread,
+                        onChat = engine::chat,
+                        onChatOpen = engine::chatSeen,
                         onClipboard = {
                             val text = clipboardText()
                             if (text.isBlank()) {
@@ -2032,7 +2055,7 @@ class MainActivity : FragmentActivity() {
                             PjBottomBar(selected = tab, onSelect = { tab = it })
                         },
                     ) { padding ->
-                        androidx.compose.foundation.layout.Box(Modifier.padding(padding)) {
+                        androidx.compose.foundation.layout.Box(Modifier.padding(padding).fillMaxSize()) {
                             when (tab) {
                                 0 -> HomeScreen(
                                     state = state,
@@ -2376,6 +2399,39 @@ class MainActivity : FragmentActivity() {
                                     },
                                     onDismissImport = { importOffer = null; importPass = "" },
                                 )
+                            }
+                            if (state.hosting) {
+                                if (!hostChat) {
+                                    val chatTip = if (state.chatReady) "Chat" else us.spader.pjdesk.ui.CHAT_NEEDS_TIP
+                                    androidx.compose.foundation.layout.Box(
+                                        Modifier.align(Alignment.BottomEnd).padding(12.dp),
+                                    ) {
+                                        androidx.compose.material3.TooltipBox(
+                                            positionProvider = androidx.compose.material3.TooltipDefaults.rememberPlainTooltipPositionProvider(),
+                                            tooltip = { androidx.compose.material3.PlainTooltip { Text(chatTip) } },
+                                            state = androidx.compose.material3.rememberTooltipState(),
+                                        ) {
+                                            TextButton(onClick = { if (state.chatReady) hostChat = true }) {
+                                                Text("Chat")
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    androidx.compose.foundation.layout.Box(
+                                        Modifier
+                                            .fillMaxSize()
+                                            .background(Color.Black.copy(alpha = 0.45f))
+                                            .clickable { hostChat = false },
+                                    )
+                                    androidx.compose.foundation.layout.Box(Modifier.align(Alignment.BottomCenter)) {
+                                        us.spader.pjdesk.ui.ChatSheet(
+                                            lines = state.chatLines,
+                                            ready = state.chatReady,
+                                            onSend = engine::chat,
+                                            onClose = { hostChat = false },
+                                        )
+                                    }
+                                }
                             }
                         }
                     }

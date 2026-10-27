@@ -2934,6 +2934,10 @@ fn adopt_service_notice() {
     crate::host::notice::update(account, computer, user, id);
 }
 
+fn adopt_service_chat() {
+    crate::host::chatwin::adopt();
+}
+
 fn read_service_consent() -> Option<ServiceConsent> {
     let path = crate::syspaths::service_dir().join("consent.json");
     let bytes = std::fs::read(path).ok()?;
@@ -3436,6 +3440,7 @@ impl eframe::App for App {
             self.consent_prompt(&ctx);
             poll_client_heartbeat();
             adopt_service_notice();
+            adopt_service_chat();
             self.poll_lan();
             return;
         }
@@ -3464,6 +3469,7 @@ impl eframe::App for App {
         self.consent_prompt(&ctx);
         poll_client_heartbeat();
         adopt_service_notice();
+        adopt_service_chat();
         self.login_window(&ctx);
         self.change_password_window(&ctx);
         self.poll_lan();

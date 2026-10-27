@@ -74,7 +74,15 @@ pub struct Live {
     pub atlas: Vec<AtlasTile>,
     pub remote_files: Vec<String>,
     pub transfers: Vec<Transfer>,
-    pub chat: Vec<(bool, String)>,
+    pub chat: Vec<pjdesk_proto::peer::ChatEntry>,
+    /// The host sent ChatReady. The Chat button stays off until then.
+    pub chat_ready: bool,
+    /// Messages that arrived while the chat panel was closed.
+    pub chat_unread: u32,
+    /// The session window is showing the chat panel.
+    pub chat_open: bool,
+    /// Host computer name, used when an older host sends a chat line with no name.
+    pub peer_label: String,
     pub notices: Vec<String>,
     pub privacy: bool,
     pub audio: bool,
@@ -117,6 +125,10 @@ impl Live {
             remote_files: Vec::new(),
             transfers: Vec::new(),
             chat: Vec::new(),
+            chat_ready: false,
+            chat_unread: 0,
+            chat_open: false,
+            peer_label: String::new(),
             notices: Vec::new(),
             privacy: false,
             audio: false,
@@ -164,6 +176,10 @@ impl Live {
             remote_files: self.remote_files.clone(),
             transfers: self.transfers.clone(),
             chat: self.chat.clone(),
+            chat_ready: self.chat_ready,
+            chat_unread: self.chat_unread,
+            chat_open: self.chat_open,
+            peer_label: self.peer_label.clone(),
             notices: self.notices.clone(),
             privacy: self.privacy,
             audio: self.audio,
@@ -180,6 +196,19 @@ impl Live {
             wanted: HashSet::new(),
             next_id: 0,
             clip_text: None,
+        }
+    }
+
+    pub fn push_remote(&mut self, name: &str, text: &str, unix: u64) {
+        let Some(text) = pjdesk_proto::peer::chat_line(text) else { return };
+        let name = pjdesk_proto::peer::chat_name(name, &self.peer_label);
+        self.chat.push(pjdesk_proto::peer::ChatEntry { mine: false, name, text, unix });
+        if self.chat.len() > 200 {
+            let drop_n = self.chat.len() - 200;
+            self.chat.drain(0..drop_n);
+        }
+        if !self.chat_open {
+            self.chat_unread = self.chat_unread.saturating_add(1);
         }
     }
 
@@ -218,6 +247,7 @@ pub fn start(
     frames: std::sync::mpsc::Sender<(VideoHeader, Vec<u8>)>,
     peer_proto: u16,
     host_id: String,
+    host_name: String,
     relayed: bool,
     opening_view: Option<u8>,
     opening_display: Option<u8>,
@@ -225,6 +255,7 @@ pub fn start(
 ) -> (Arc<Mutex<Live>>, mpsc::UnboundedSender<Cmd>, Arc<Mutex<RecorderSlot>>) {
     let _ = VIEWER_RT.set(rt);
     let mut session = Live::new(peer_proto >= 3);
+    session.peer_label = host_name.clone();
     session.relayed = relayed;
     session.opening_display = opening_display
         .or_else(|| std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()))
@@ -247,7 +278,7 @@ pub fn start(
 
     if peer_proto >= 3 {
         let _ = control.send(ControlMsg::Hello {
-            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR,
+            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR | perms::CHAT_PEER,
             monitor: saved_display,
             quality: quality::preset("balanced").unwrap_or_default(),
         });
@@ -457,7 +488,19 @@ fn on_host(
             }
         }
         HostMsg::Denied { what, reason } => g.note(format!("{what}: {reason}")),
-        HostMsg::Chat { text } => g.chat.push((false, text)),
+        HostMsg::Chat { text } => {
+            let name = g.peer_label.clone();
+            let unix = pjdesk_proto::peer::chat_now();
+            g.push_remote(&name, &text, unix);
+        }
+        HostMsg::ChatReady => g.chat_ready = true,
+        HostMsg::ChatLine { text, name, unix } => {
+            if !name.trim().is_empty() {
+                g.peer_label = pjdesk_proto::peer::chat_name(&name, &g.peer_label);
+            }
+            g.chat_ready = true;
+            g.push_remote(&name, &text, unix);
+        }
         HostMsg::Privacy { enabled } => g.privacy = enabled,
         HostMsg::Restarting => {
             g.restart = true;
@@ -520,6 +563,17 @@ fn on_host(
     }
     drop(g);
     wake();
+}
+
+/// Account when this computer is signed in, otherwise its computer name.
+pub(crate) fn controller_chat_name() -> String {
+    match this_visitor() {
+        ControlMsg::Visitor { account, computer, .. } => {
+            let picked = if account.trim().is_empty() { computer.clone() } else { account };
+            pjdesk_proto::peer::chat_name(&picked, &computer)
+        }
+        _ => pjdesk_proto::peer::chat_name(&crate::hostname(), "Computer"),
+    }
 }
 
 /// Account email when this computer is signed in to pjdesk.com, otherwise blank.
@@ -1172,6 +1226,7 @@ mod tests {
             frames,
             3,
             "100000001".into(),
+            "OFFICE".into(),
             false,
             None,
             None,
