@@ -140,7 +140,22 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         if args.headless {
             return runtime.block_on(headless(link, args.frames));
         }
-        match window::run(&runtime, link)? {
+        let display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let view = std::env::var("PJDESK_VIEW").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let seed = window::Seed {
+            server: format!("{}:{}", server.host, server.port),
+            target: target.clone(),
+            password: password.clone(),
+            direct: direct.clone(),
+            force_relay: args.force_relay,
+            display,
+            view,
+            remember: false,
+            from_store: std::env::var("PJDESK_SAVED").ok().as_deref() == Some("1"),
+            files: std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files"),
+            label: String::new(),
+        };
+        match window::run(&runtime, link, seed)? {
             window::ViewerStop::UserClosed => break,
             window::ViewerStop::HostRestart => {
                 prefer_standby = false;
@@ -200,6 +215,34 @@ pub(crate) fn password_source(
         None if stdin_is_terminal => PasswordSource::Prompt,
         None => PasswordSource::NoConsole,
     }
+}
+
+/// Opens one more computer inside a session window that is already running.
+pub(crate) async fn open_admitted(
+    admit: &crate::session_window::Admit,
+    move_to: Option<&str>,
+    waiting_retry: bool,
+) -> Result<Link> {
+    let mut config = Config::load().context("reading settings")?;
+    if !admit.direct.trim().is_empty() {
+        return connect_direct(&mut config, admit.direct.trim(), &admit.password, None, false).await;
+    }
+    let server = ServerAddr::parse(&admit.server).unwrap_or(ServerAddr {
+        host: admit.server.clone(),
+        port: pjdesk_proto::DEFAULT_PORT,
+    });
+    connect(
+        &server,
+        &mut config,
+        &admit.id,
+        &admit.password,
+        None,
+        admit.force_relay,
+        waiting_retry,
+        false,
+        move_to,
+    )
+    .await
 }
 
 /// Signaling → UDP binding → hole punching / relay → QUIC → password check.

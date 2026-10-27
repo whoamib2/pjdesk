@@ -2,7 +2,8 @@
 //! arguments (or double-clicking it).
 //!
 //! The left rail is this computer. The main column connects to another one.
-//! Each outgoing session opens in its own viewer process. Anything that can
+//! The first outgoing session opens a viewer process. Another computer, while
+//! that window is still open, is added as a tab in it. Anything that can
 //! block (service control, scheduled tasks, the status file) runs on a
 //! background thread; the window only reads the latest snapshot.
 
@@ -337,7 +338,10 @@ pub struct App {
     ask_person_next: bool,
     ask_view_next: bool,
     ask_view_label: String,
-    viewer_rx: Vec<Receiver<(String, i32, bool)>>,
+    viewer_rx: Vec<Receiver<(String, i32, bool, u32)>>,
+    /// Process ids of viewer windows this window started. A session-tab offer
+    /// is sent only to one of these, so a stale listener file is ignored.
+    viewer_pids: Vec<u32>,
 
     /// Background service / scheduled-task snapshot. Never queried on this thread.
     probe: Option<probe::Probe>,
@@ -552,6 +556,7 @@ impl App {
             ask_view_next: false,
             ask_view_label: String::new(),
             viewer_rx: Vec::new(),
+            viewer_pids: Vec::new(),
             probe: if preview { None } else { Some(probe::Probe::start(cc.egui_ctx.clone())) },
             scm_installed: false,
             scm_running: false,
@@ -2140,6 +2145,11 @@ impl App {
     /// came from storage is marked `PJDESK_SAVED`; if it is rejected the viewer
     /// exits 3 and this window asks again.
     fn spawn_viewer(&mut self, id: &str, password: &str, files: bool, remember: bool, from_store: bool) {
+        if !password.is_empty() && self.offer_session_tab(id, password, files, remember, from_store, "") {
+            self.ask_person_next = false;
+            self.ask_view_next = false;
+            return;
+        }
         let server = self.cfg.effective_server();
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
@@ -2196,21 +2206,77 @@ impl App {
         }
         prepare_viewer(&mut cmd);
         match cmd.spawn() {
-            Ok(mut child) => {
+            Ok(child) => {
                 clear_session_status();
                 self.mark_recent(id);
                 let what = if files { "Opening file transfer for" } else { "Opening" };
                 self.toast.show(format!("{what} {}", format_id(id)));
-                let (tx, rx) = std::sync::mpsc::channel();
-                let id = id.to_string();
-                std::thread::spawn(move || {
-                    let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-                    let _ = tx.send((id, code, files));
-                });
-                self.viewer_rx.push(rx);
+                self.track_viewer(id.to_string(), child, files);
             }
             Err(e) => self.fail_session(format!("Could not open the viewer: {e}")),
         }
+    }
+
+    /// Hands this computer to the session window that is already open.
+    fn offer_session_tab(
+        &mut self,
+        id: &str,
+        password: &str,
+        files: bool,
+        remember: bool,
+        from_store: bool,
+        direct: &str,
+    ) -> bool {
+        if password.is_empty() || self.viewer_pids.is_empty() {
+            return false;
+        }
+        let Some((port, pid)) = crate::session_window::read_listener() else { return false };
+        if !self.viewer_pids.contains(&pid) {
+            return false;
+        }
+        let (view, display) = self
+            .cfg
+            .settings
+            .peers
+            .get(id)
+            .map(|note| (note.view_mode, note.last_display))
+            .unwrap_or((0, 0));
+        let label = if direct.is_empty() { self.row_title(id) } else { direct.to_string() };
+        let admit = crate::session_window::Admit {
+            id: id.to_string(),
+            password: password.to_string(),
+            server: self.cfg.effective_server(),
+            direct: direct.to_string(),
+            label,
+            files,
+            remember,
+            from_store,
+            force_relay: false,
+            view,
+            display,
+        };
+        if !crate::session_window::send_admit(port, &admit) {
+            return false;
+        }
+        clear_session_status();
+        if direct.is_empty() {
+            self.mark_recent(id);
+        }
+        let what = if files { "Opening file transfer for" } else { "Opening" };
+        let who = if direct.is_empty() { format_id(id) } else { direct.to_string() };
+        self.toast.show(format!("{what} {who}"));
+        true
+    }
+
+    fn track_viewer(&mut self, id: String, mut child: std::process::Child, files: bool) {
+        let pid = child.id();
+        self.viewer_pids.push(pid);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+            let _ = tx.send((id, code, files, pid));
+        });
+        self.viewer_rx.push(rx);
     }
 
     fn poll_client_update(&mut self) {
@@ -2231,36 +2297,40 @@ impl App {
         }
     }
 
+    fn note_viewer_exit(&mut self, id: &str, code: i32, files: bool, reopen: &mut Option<(String, bool)>) {
+        self.reload_peer_reports();
+        if code == 0 {
+            return;
+        }
+        let reason = last_session_reason().unwrap_or_else(|| {
+            if code == 3 { "Wrong password".into() } else { "The session ended before it could start.".into() }
+        });
+        // A wrong password comes back in the password dialog.
+        // Any other failure is a dialog, not only the Opening toast.
+        if code == 3 {
+            self.status = reason;
+            *reopen = Some((id.to_string(), files));
+        } else {
+            self.fail_session(reason);
+            if code == 4 {
+                self.prompt_open = false;
+                self.prompt_checking = false;
+                self.ask_alive = false;
+            }
+        }
+    }
+
     fn poll_viewers(&mut self) {
         let pending = std::mem::take(&mut self.viewer_rx);
         let mut reopen = None;
+        if let Some((id, code, files)) = crate::session_window::take_admit_result() {
+            self.note_viewer_exit(&id, code, files, &mut reopen);
+        }
         for rx in pending {
             match rx.try_recv() {
-                Ok((id, code, files)) => {
-                    self.reload_peer_reports();
-                    if code != 0 {
-                        let reason = last_session_reason().unwrap_or_else(|| {
-                            if code == 3 {
-                                "Wrong password".into()
-                            } else {
-                                "The session ended before it could start.".into()
-                            }
-                        });
-                        // A wrong password comes back in the password dialog.
-                        // Any other failure is a dialog, not only the Opening toast.
-                        if code == 3 {
-                            self.status = reason;
-                        } else {
-                            self.fail_session(reason);
-                        }
-                        if code == 3 {
-                            reopen = Some((id, files));
-                        } else if code == 4 {
-                            self.prompt_open = false;
-                            self.prompt_checking = false;
-                            self.ask_alive = false;
-                        }
-                    }
+                Ok((id, code, files, pid)) => {
+                    self.viewer_pids.retain(|existing| *existing != pid);
+                    self.note_viewer_exit(&id, code, files, &mut reopen);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => self.viewer_rx.push(rx),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
@@ -2362,6 +2432,9 @@ impl App {
     }
 
     fn spawn_direct_with_password(&mut self, addr: &str, password: &str) {
+        if self.offer_session_tab(addr, password, false, false, false, addr) {
+            return;
+        }
         let server = self.cfg.effective_server();
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
@@ -2378,15 +2451,7 @@ impl App {
         }
         prepare_viewer(&mut cmd);
         match cmd.spawn() {
-            Ok(mut child) => {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let id = addr.to_string();
-                std::thread::spawn(move || {
-                    let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-                    let _ = tx.send((id, code, false));
-                });
-                self.viewer_rx.push(rx);
-            }
+            Ok(child) => self.track_viewer(addr.to_string(), child, false),
             Err(e) => self.fail_session(format!("Could not open the viewer: {e}")),
         }
     }
@@ -2410,15 +2475,9 @@ impl App {
         }
         prepare_viewer(&mut cmd);
         match cmd.spawn() {
-            Ok(mut child) => {
+            Ok(child) => {
                 self.toast.show(format!("Opening {addr}"));
-                let (tx, rx) = std::sync::mpsc::channel();
-                let id = addr.to_string();
-                std::thread::spawn(move || {
-                    let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-                    let _ = tx.send((id, code, false));
-                });
-                self.viewer_rx.push(rx);
+                self.track_viewer(addr.to_string(), child, false);
             }
             Err(e) => self.fail_session(format!("Could not open the viewer: {e}")),
         }

@@ -33,6 +33,7 @@ mod platform;
 mod secure;
 mod service;
 mod session;
+mod session_window;
 mod support_keys;
 mod signaling;
 mod syspaths;

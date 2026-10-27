@@ -65,6 +65,10 @@ pub struct Live {
     pub platform_version: String,
     pub view_mode: u8,
     pub current_display: u8,
+    /// View mode and display chosen when this session opened. Not the process environment,
+    /// so a second computer in the same window does not inherit the first one's screen.
+    opening_view: u8,
+    opening_display: u8,
     pub atlas_w: u16,
     pub atlas_h: u16,
     pub atlas: Vec<AtlasTile>,
@@ -103,6 +107,8 @@ impl Live {
             platform_version: String::new(),
             view_mode: VIEW_SINGLE,
             current_display: 0,
+            opening_view: VIEW_SINGLE,
+            opening_display: 0,
             atlas_w: 0,
             atlas_h: 0,
             atlas: Vec::new(),
@@ -147,6 +153,8 @@ impl Live {
             platform_version: self.platform_version.clone(),
             view_mode: self.view_mode,
             current_display: self.current_display,
+            opening_view: self.opening_view,
+            opening_display: self.opening_display,
             atlas_w: self.atlas_w,
             atlas_h: self.atlas_h,
             atlas: self.atlas.clone(),
@@ -207,11 +215,25 @@ pub fn start(
     peer_proto: u16,
     host_id: String,
     relayed: bool,
+    opening_view: Option<u8>,
+    opening_display: Option<u8>,
     wake: impl Fn() + Send + Sync + 'static,
 ) -> (Arc<Mutex<Live>>, mpsc::UnboundedSender<Cmd>, Arc<Mutex<RecorderSlot>>) {
     let _ = VIEWER_RT.set(rt);
     let mut session = Live::new(peer_proto >= 3);
     session.relayed = relayed;
+    session.opening_display = opening_display
+        .or_else(|| std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    let view = opening_view
+        .or_else(|| std::env::var("PJDESK_VIEW").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(VIEW_SINGLE);
+    session.opening_view = match view {
+        VIEW_ALL => VIEW_ALL,
+        VIEW_SEPARATE => VIEW_SEPARATE,
+        _ => VIEW_SINGLE,
+    };
+    let saved_display = session.opening_display;
     let live = Arc::new(Mutex::new(session));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let recorder = Arc::new(Mutex::new(RecorderSlot::new()));
@@ -220,7 +242,6 @@ pub fn start(
     let tunnels = Arc::new(Mutex::new(PendingTunnel { waiters: HashMap::new() }));
 
     if peer_proto >= 3 {
-        let saved_display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0u8);
         let _ = control.send(ControlMsg::Hello {
             permissions: perms::ALL | perms::LAYOUT | perms::VISITOR,
             monitor: saved_display,
@@ -353,13 +374,8 @@ fn on_host(
             let first = g.displays.is_empty();
             g.displays = displays;
             if first {
-                let mode = std::env::var("PJDESK_VIEW").ok().and_then(|s| s.parse().ok()).unwrap_or(VIEW_SINGLE);
-                let display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let mode = match mode {
-                    VIEW_ALL => VIEW_ALL,
-                    VIEW_SEPARATE => VIEW_SEPARATE,
-                    _ => VIEW_SINGLE,
-                };
+                let mode = g.opening_view;
+                let display = g.opening_display;
                 let display = if g.displays.iter().any(|d| d.index == display) {
                     display
                 } else {
@@ -1115,7 +1131,19 @@ mod tests {
         assert!(Handle::try_current().is_err(), "this thread must be outside the Tokio runtime");
         let (control, _rx) = mpsc::unbounded_channel();
         let (frames, _frames_rx) = std::sync::mpsc::channel();
-        let _ = start(rt.handle().clone(), connection.clone(), recv, control, frames, 3, "100000001".into(), false, || {});
+        let _ = start(
+            rt.handle().clone(),
+            connection.clone(),
+            recv,
+            control,
+            frames,
+            3,
+            "100000001".into(),
+            false,
+            None,
+            None,
+            || {},
+        );
         connection.close(0u32.into(), b"test");
         rt.shutdown_timeout(Duration::from_secs(3));
     }
