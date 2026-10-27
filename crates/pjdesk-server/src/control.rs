@@ -772,7 +772,7 @@ fn token_groups_include_admin(token: windows::Win32::Foundation::HANDLE) -> bool
         let entries = std::slice::from_raw_parts(groups.Groups.as_ptr(), count);
         let mut yes = false;
         for entry in entries {
-            if EqualSid(entry.Sid, admin).as_bool() && admin_group_counts(entry.Attributes) {
+            if EqualSid(entry.Sid, admin).is_ok() && admin_group_counts(entry.Attributes) {
                 yes = true;
                 break;
             }
