@@ -31,6 +31,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.systemGestures
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -40,13 +41,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TooltipBox
-import androidx.compose.material3.TooltipDefaults
-import androidx.compose.material3.rememberTooltipState
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -561,15 +558,10 @@ fun SessionScreen(
                     .padding(top = 8.dp, end = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                val chatTip = if (chatReady) "Chat" else CHAT_NEEDS_TIP
-                TooltipBox(
-                    positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
-                    tooltip = { PlainTooltip { Text(chatTip) } },
-                    state = rememberTooltipState(),
-                ) {
+                Column(horizontalAlignment = Alignment.End) {
                     Box {
                         HitButton(
-                            description = chatTip,
+                            description = if (chatReady) "Chat" else CHAT_NEEDS_TIP,
                             space = space,
                             padId = "chat",
                             color = if (chatReady) {
@@ -578,7 +570,8 @@ fun SessionScreen(
                                 MaterialTheme.colorScheme.surface.copy(alpha = 0.55f)
                             },
                             pressedColor = MaterialTheme.colorScheme.primary,
-                            onClick = { if (chatReady) chatSheet = true },
+                            enabled = chatReady,
+                            onClick = { chatSheet = true },
                         ) { Text("Chat", style = MaterialTheme.typography.labelLarge) }
                         if (chatUnread > 0) {
                             Surface(
@@ -594,6 +587,15 @@ fun SessionScreen(
                                 )
                             }
                         }
+                    }
+                    if (!chatReady) {
+                        Text(
+                            CHAT_NEEDS_TIP,
+                            modifier = Modifier.widthIn(max = 220.dp),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            style = MaterialTheme.typography.labelSmall,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.End,
+                        )
                     }
                 }
                 HitButton(
@@ -723,6 +725,7 @@ private fun HitButton(
     padId: String? = null,
     color: Color,
     pressedColor: Color,
+    enabled: Boolean = true,
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null,
     icon: @Composable () -> Unit,
@@ -730,7 +733,9 @@ private fun HitButton(
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val located = if (space != null && padId != null) Modifier.reportPad(space, padId) else Modifier
-    val gesture = if (onLongClick == null) {
+    val gesture = if (!enabled) {
+        Modifier
+    } else if (onLongClick == null) {
         Modifier.clickable(
             interactionSource = interaction,
             indication = ripple(bounded = false),

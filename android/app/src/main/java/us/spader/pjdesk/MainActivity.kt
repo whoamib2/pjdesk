@@ -29,6 +29,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.OutlinedTextField
@@ -52,6 +53,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -2070,14 +2072,14 @@ class MainActivity : FragmentActivity() {
                                     selfId = state.id,
                                     onRefreshSupport = { engine.refreshSupport() },
                                     onSupportConnect = { code, password ->
-                                        if (state.incomingOnly) {
-                                            scope.launch { snackbar.showSnackbar("Incoming only is on. This computer can't connect to others.") }
-                                            return@onSupportConnect
-                                        }
-                                        if (code.length != 8 || password.isBlank()) {
-                                            scope.launch { snackbar.showSnackbar("Enter the 8-digit code and the temporary password.") }
-                                        } else {
-                                            scope.launch {
+                                        when {
+                                            state.incomingOnly -> scope.launch {
+                                                snackbar.showSnackbar("Incoming only is on. This computer can't connect to others.")
+                                            }
+                                            code.length != 8 || password.isBlank() -> scope.launch {
+                                                snackbar.showSnackbar("Enter the 8-digit code and the temporary password.")
+                                            }
+                                            else -> scope.launch {
                                                 val found = withContext(Dispatchers.IO) {
                                                     runCatching { us.spader.pjdesk.core.CloudAuth.lookupSupport(code) }
                                                 }
@@ -2385,19 +2387,22 @@ class MainActivity : FragmentActivity() {
                             }
                             if (state.hosting) {
                                 if (!hostChat) {
-                                    val chatTip = if (state.chatReady) "Chat" else us.spader.pjdesk.ui.CHAT_NEEDS_TIP
-                                    androidx.compose.foundation.layout.Box(
-                                        Modifier.align(Alignment.BottomEnd).padding(12.dp),
+                                    Column(
+                                        Modifier.align(Alignment.BottomEnd).padding(12.dp).widthIn(max = 240.dp),
+                                        horizontalAlignment = Alignment.End,
                                     ) {
-                                        androidx.compose.material3.TooltipBox(
-                                            positionProvider = androidx.compose.material3.TooltipDefaults.rememberPlainTooltipPositionProvider(),
-                                            tooltip = { androidx.compose.material3.PlainTooltip { Text(chatTip) } },
-                                            state = androidx.compose.material3.rememberTooltipState(),
-                                        ) {
-                                            TextButton(onClick = { if (state.chatReady) hostChat = true }) {
-                                                Text("Chat")
-                                            }
+                                        if (!state.chatReady) {
+                                            Text(
+                                                us.spader.pjdesk.ui.CHAT_NEEDS_TIP,
+                                                color = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant,
+                                                style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+                                                textAlign = TextAlign.End,
+                                            )
                                         }
+                                        TextButton(
+                                            onClick = { hostChat = true },
+                                            enabled = state.chatReady,
+                                        ) { Text("Chat") }
                                     }
                                 } else {
                                     androidx.compose.foundation.layout.Box(
