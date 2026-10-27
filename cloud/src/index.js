@@ -23,6 +23,9 @@
 //                               unconditional put older servers send.
 //   GET  /api/sync/health       (Bearer, sync on) { peers: [...] }
 //   PUT  /api/sync/health       (Bearer, sync on) one server's version/role
+//                               plus its public, LAN, and hostname addresses
+//   GET  /api/probe             (Bearer, sync on) ?host=&port=21200
+//                               opens that public address from this Worker
 //   GET  /api/admin/accounts    (Bearer, admin)
 //   GET  /api/admin/overview    (Bearer, admin)
 //   GET  /api/admin/servers     (Bearer, admin) health reports + sign-ins
@@ -35,6 +38,7 @@
 
 import { effectivePlan, isPlan } from "./plans.js";
 import { route as networkRoute } from "./network.js";
+import { probeQuery, shapeHealth } from "./health.js";
 
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 const AUTH_HASH_ITERATIONS = 100000; // the Workers PBKDF2 maximum
@@ -223,6 +227,7 @@ async function api(request, env, url, ctx) {
   if (p === "/api/sync" && m === "PUT") return syncPut(request, env);
   if (p === "/api/sync/health" && m === "GET") return syncHealthGet(request, env);
   if (p === "/api/sync/health" && m === "PUT") return syncHealthPut(request, env);
+  if (p === "/api/probe" && m === "GET") return probePort(request, env, url);
   if (p === "/api/admin/accounts" && m === "GET") return adminAccounts(request, env);
   if (p === "/api/admin/overview" && m === "GET") return adminOverview(request, env);
   if (p === "/api/admin/servers" && m === "GET") return adminServers(request, env);
@@ -451,16 +456,7 @@ async function syncHealthPut(request, env) {
   requireSync(s);
   const body = await readJson(request);
   if (!validInstance(body.instance)) throw new HttpError(400, "Bad request.");
-  const record = {
-    instance: body.instance,
-    name: String(body.name || "").slice(0, 64),
-    version: String(body.version || "").slice(0, 32),
-    role: body.role === "active" ? "active" : "standby",
-    epoch: Number.isFinite(body.epoch) ? body.epoch : 0,
-    healthy: !!body.healthy,
-    at: now(),
-    maintenance_until: Number.isFinite(body.maintenance_until) ? body.maintenance_until : 0,
-  };
+  const record = shapeHealth(body, now());
   await env.SYNC.put(healthKey(s.accountId, record.instance), JSON.stringify(record), {
     httpMetadata: { contentType: "application/json" },
   });
@@ -487,6 +483,30 @@ async function syncHealthPut(request, env) {
     )
     .run();
   return json({ ok: true });
+}
+
+async function probePort(request, env, url) {
+  const s = await session(request, env);
+  requireSync(s);
+  const target = probeQuery(url.searchParams.get("host"), url.searchParams.get("port"));
+  if (!target) throw new HttpError(400, "Bad request.");
+  try {
+    const { connect } = await import("cloudflare:sockets");
+    const socket = connect({ hostname: target.host, port: target.port });
+    await socket.opened;
+    try {
+      socket.close();
+    } catch {
+      // The open already answered the question.
+    }
+    return json({ ok: true, open: true });
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (msg.includes("cloudflare:sockets") || msg.includes("Cannot find module")) {
+      return json({ ok: false, open: false }, 501);
+    }
+    return json({ ok: true, open: false });
+  }
 }
 
 async function syncHealthGet(request, env) {

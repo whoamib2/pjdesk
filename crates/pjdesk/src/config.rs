@@ -756,7 +756,10 @@ impl Config {
         }
         self.network_lan = session.lan.clone();
         self.network_public_ip = session.public_ip.clone();
-        self.network_routes = session.routes.clone();
+        // A refresh that only lists the current primary must not erase the
+        // other server. Re-registering after that primary stops has to work
+        // from the addresses already saved.
+        self.network_routes = pjdesk_proto::routes::keep_other_server(&self.network_routes, &session.routes);
         if let Ok(fp) = parse_fingerprint(&session.fingerprint) {
             self.server_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         }

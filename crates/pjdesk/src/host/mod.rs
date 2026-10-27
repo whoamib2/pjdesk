@@ -649,8 +649,23 @@ enum SignalEnd {
     Follow,
 }
 
+/// Saves a catalog without dropping the other server when this push omits it.
+fn remember_routes(config: &mut Config, routes: pjdesk_proto::routes::ServerRoutes) -> bool {
+    if routes.is_empty() {
+        return false;
+    }
+    let merged = pjdesk_proto::routes::keep_other_server(&config.network_routes, &routes);
+    if merged == config.network_routes {
+        return false;
+    }
+    config.network_routes = merged;
+    let _ = config.save();
+    true
+}
+
 /// Dials the fresh advertised IPs, then a saved hostname, and registers.
-/// A standby redirect is followed at once.
+/// A standby redirect is followed at once. A named primary that does not
+/// answer is not the only address tried.
 async fn register_catalog(
     config: &mut Config,
     state: &Arc<HostState>,
@@ -663,17 +678,37 @@ async fn register_catalog(
     let device_secret = config.device_secret()?;
     let mut without_token = false;
     let mut redirects = 0u8;
-    let follow = state.follow.lock().unwrap().clone().filter(|addr| !addr.trim().is_empty());
-    let mut signal = if let Some(addr) = follow {
-        info!("failover: registering with the new primary at {addr}");
-        SignalClient::connect_endpoint(&addr, config, pjdesk_proto::routes::dial_budget(&addr)).await.map_err(|err| {
-            anyhow::anyhow!("could not reach the new primary at {addr}; retrying. {err:#}")
-        })?
-    } else {
-        SignalClient::connect_catalog(config, &mine).await.map_err(|err| {
-            anyhow::anyhow!("could not reach the primary or the standby; retrying. {err:#}")
-        })?
-    };
+    // Take the follow address now. A miss must not pin every later try to it.
+    let follow = state.follow.lock().unwrap().take().filter(|addr| !addr.trim().is_empty());
+    let targets = pjdesk_proto::routes::registration_targets(
+        follow.as_deref().unwrap_or(""),
+        &config.network_routes,
+        &mine,
+        &config.effective_server(),
+    );
+    if targets.is_empty() {
+        bail!("could not reach the primary or the standby; retrying. the server address is empty");
+    }
+    let mut signal = None;
+    let mut last = None;
+    for target in &targets {
+        info!("Dialing {target}");
+        match SignalClient::connect_endpoint(target, config, pjdesk_proto::routes::dial_budget(target)).await {
+            Ok(got) => {
+                info!("Server answered at {target} via {} ({})", got.via, got.server_addr);
+                signal = Some(got);
+                break;
+            }
+            Err(err) => {
+                info!("Dial {target} failed: {err:#}");
+                last = Some(err);
+            }
+        }
+    }
+    let mut signal = signal.ok_or_else(|| {
+        let err = last.map(|err| format!("{err:#}")).unwrap_or_else(|| "no address answered".into());
+        anyhow::anyhow!("could not reach the primary or the standby; retrying. {err}")
+    })?;
     loop {
         let register_proto = state.server_proto.load(Ordering::SeqCst);
         let server = ServerAddr { host: signal.server_addr.ip().to_string(), port: signal.server_addr.port() };
@@ -696,10 +731,7 @@ async fn register_catalog(
                     return Ok((signal, server, device_id));
                 }
                 Ok(Some(ServerMsg::Routes(routes))) => {
-                    if !routes.is_empty() {
-                        config.network_routes = routes;
-                        let _ = config.save();
-                    }
+                    remember_routes(config, routes);
                 }
                 Ok(Some(ServerMsg::Error { code: ErrorCode::IdConflict, message })) => {
                     config.device_id = None;
@@ -713,10 +745,7 @@ async fn register_catalog(
                     let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) else {
                         bail!("could not reach the primary after the standby redirect; retrying");
                     };
-                    if !routes.is_empty() {
-                        config.network_routes = routes;
-                        let _ = config.save();
-                    }
+                    remember_routes(config, routes);
                     if addr.is_empty() {
                         bail!("could not reach the primary after the standby redirect; retrying");
                     }
@@ -814,7 +843,7 @@ async fn signaling_loop(
     state.publish_password();
 
     let server_ip = signal.server_addr.ip();
-    let mut ping = tokio::time::interval(Duration::from_secs(10));
+    let mut ping = tokio::time::interval(pjdesk_proto::signal::HEARTBEAT);
     ping.tick().await;
     let mut ui_tick = tokio::time::interval(Duration::from_millis(300));
     let mut report_host = false;
@@ -854,8 +883,8 @@ async fn signaling_loop(
                     );
                     return Ok(SignalEnd::Lost);
                 }
-                if last_heard.elapsed() >= Duration::from_secs(30) {
-                    warn!("No reply from the server for 30 s ({role}); reconnecting");
+                if last_heard.elapsed() >= pjdesk_proto::signal::HEARTBEAT_SILENCE {
+                    warn!("No reply from the server for {} s ({role}); reconnecting", pjdesk_proto::signal::HEARTBEAT_SILENCE.as_secs());
                     return Ok(SignalEnd::Lost);
                 }
                 if config.reload_access_key() {
@@ -952,9 +981,7 @@ async fn signaling_loop(
                         }
                     }
                     ServerMsg::Routes(routes) => {
-                        if !routes.is_empty() {
-                            config.network_routes = routes;
-                            let _ = config.save();
+                        if remember_routes(config, routes) {
                             info!("Updated server addresses from the primary");
                         }
                     }

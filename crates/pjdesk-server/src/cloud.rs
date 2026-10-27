@@ -1873,9 +1873,14 @@ const ROUTES_GEN: &str = "routes-generation.txt";
 /// addresses changed. Returns true when clients and the cloud should be told now.
 pub fn refresh_advertisement(data_dir: &Path) -> bool {
     let _ = crate::public_addr::poll_public_ip(data_dir, now());
-    let _ = crate::public_addr::refresh_address_warning(data_dir);
     let routes = assemble_routes(data_dir);
-    let bytes = serde_json::to_vec(&routes).unwrap_or_default();
+    let changed = store_routes(data_dir, &routes);
+    let _ = crate::public_addr::refresh_address_warning(data_dir);
+    changed
+}
+
+fn store_routes(data_dir: &Path, routes: &pjdesk_proto::routes::ServerRoutes) -> bool {
+    let bytes = serde_json::to_vec(routes).unwrap_or_default();
     let prev = std::fs::read(data_dir.join(ROUTES_FILE)).unwrap_or_default();
     if bytes == prev {
         return false;
@@ -1933,6 +1938,15 @@ fn local_advertised(data_dir: &Path) -> pjdesk_proto::routes::Advertised {
 }
 
 fn assemble_routes(data_dir: &Path) -> pjdesk_proto::routes::ServerRoutes {
+    let built = assemble_routes_now(data_dir);
+    let previous = std::fs::read(data_dir.join(ROUTES_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    pjdesk_proto::routes::keep_other_server(&previous, &built)
+}
+
+fn assemble_routes_now(data_dir: &Path) -> pjdesk_proto::routes::ServerRoutes {
     let mine = local_advertised(data_dir);
     let (peer_public, peer_lan, peer_names) = peer_endpoints(data_dir);
     let primary = accepts_host_registrations(data_dir);
@@ -2664,6 +2678,14 @@ fn register_network(data_dir: &Path, role: Role, replace: bool) {
             };
             crate::public_addr::save(data_dir, &record);
             if !needs {
+                if let Some(routes) = value.get("network").and_then(|net| net.get("routes")) {
+                    if let Ok(parsed) = serde_json::from_value::<pjdesk_proto::routes::ServerRoutes>(routes.clone()) {
+                        if !parsed.is_empty() {
+                            let previous = advertised_routes(data_dir);
+                            let _ = store_routes(data_dir, &pjdesk_proto::routes::keep_other_server(&previous, &parsed));
+                        }
+                    }
+                }
                 let changed = value.get("changed").and_then(|v| v.as_bool()).unwrap_or(true);
                 if changed {
                     tracing::info!("network: published this server as {}", role_name(role));

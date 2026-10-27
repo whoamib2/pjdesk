@@ -25,9 +25,9 @@ use tracing::{debug, info, warn};
 use crate::registry::Registry;
 use crate::ServerOpts;
 
-/// Clients must send something within this time. Current hosts ping every 10 s
-/// and reconnect after 30 s of silence. 0.6.26 hosts still ping every 25 s, so
-/// this stays at 90 s and does not drop them.
+/// Clients must send something within this time. Current hosts ping every 2 s
+/// and reconnect after a few seconds of silence. 0.6.26 hosts still ping every
+/// 25 s, so this stays at 90 s and does not drop them.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// How long Connect waits when the computer was registered recently but is
 /// missing from the live table. It is usually reconnecting.

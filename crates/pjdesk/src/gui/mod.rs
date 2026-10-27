@@ -342,6 +342,9 @@ pub struct App {
     /// Process ids of viewer windows this window started. A session-tab offer
     /// is sent only to one of these, so a stale listener file is ignored.
     viewer_pids: Vec<u32>,
+    /// TCP to the open session window. The UI thread only polls this.
+    admit_rx: Option<Receiver<bool>>,
+    admit_job: Option<AdmitJob>,
 
     /// Background service / scheduled-task snapshot. Never queried on this thread.
     probe: Option<probe::Probe>,
@@ -474,6 +477,15 @@ pub struct App {
     setup_pin_focused: bool,
 }
 
+struct AdmitJob {
+    id: String,
+    password: String,
+    files: bool,
+    remember: bool,
+    from_store: bool,
+    direct: String,
+}
+
 enum InviteMsg {
     Ready(crate::network::JoinCode),
     Active(crate::network::JoinCode),
@@ -557,6 +569,8 @@ impl App {
             ask_view_label: String::new(),
             viewer_rx: Vec::new(),
             viewer_pids: Vec::new(),
+            admit_rx: None,
+            admit_job: None,
             probe: if preview { None } else { Some(probe::Probe::start(cc.egui_ctx.clone())) },
             scm_installed: false,
             scm_running: false,
@@ -2150,6 +2164,10 @@ impl App {
             self.ask_view_next = false;
             return;
         }
+        self.launch_viewer_process(id, password, files, remember, from_store);
+    }
+
+    fn launch_viewer_process(&mut self, id: &str, password: &str, files: bool, remember: bool, from_store: bool) {
         let server = self.cfg.effective_server();
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
@@ -2255,17 +2273,56 @@ impl App {
             view,
             display,
         };
-        if !crate::session_window::send_admit(port, &admit) {
+        if self.admit_rx.is_some() {
+            return true;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::thread::Builder::new()
+            .name("session-admit".into())
+            .spawn(move || {
+                let _ = tx.send(crate::session_window::send_admit(port, &admit));
+            })
+            .is_ok();
+        if !started {
             return false;
         }
-        clear_session_status();
-        if direct.is_empty() {
-            self.mark_recent(id);
-        }
+        self.admit_rx = Some(rx);
+        self.admit_job = Some(AdmitJob {
+            id: id.to_string(),
+            password: password.to_string(),
+            files,
+            remember,
+            from_store,
+            direct: direct.to_string(),
+        });
         let what = if files { "Opening file transfer for" } else { "Opening" };
         let who = if direct.is_empty() { format_id(id) } else { direct.to_string() };
         self.toast.show(format!("{what} {who}"));
         true
+    }
+
+    /// The session window's reply. A miss starts a new viewer process.
+    fn poll_admit(&mut self) {
+        let Some(rx) = &self.admit_rx else { return };
+        let accepted = match rx.try_recv() {
+            Ok(accepted) => accepted,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        };
+        self.admit_rx = None;
+        let Some(job) = self.admit_job.take() else { return };
+        if !accepted {
+            if job.direct.is_empty() {
+                self.launch_viewer_process(&job.id, &job.password, job.files, job.remember, job.from_store);
+            } else {
+                self.launch_direct_process(&job.direct, &job.password);
+            }
+            return;
+        }
+        clear_session_status();
+        if job.direct.is_empty() {
+            self.mark_recent(&job.id);
+        }
     }
 
     fn track_viewer(&mut self, id: String, mut child: std::process::Child, files: bool) {
@@ -2435,6 +2492,10 @@ impl App {
         if self.offer_session_tab(addr, password, false, false, false, addr) {
             return;
         }
+        self.launch_direct_process(addr, password);
+    }
+
+    fn launch_direct_process(&mut self, addr: &str, password: &str) {
         let server = self.cfg.effective_server();
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
@@ -3147,6 +3208,7 @@ impl eframe::App for App {
         self.poll_ask();
         self.poll_session_status();
         self.poll_viewers();
+        self.poll_admit();
         self.poll_client_update();
         self.poll_support_offer();
         self.poll_support_connect();

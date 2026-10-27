@@ -24,6 +24,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Identifies one connection attempt between a controller and a host.
 pub type SessionId = u64;
 
+/// How often a registered computer pings. One missed reply means the server
+/// stopped answering, so the next dial starts within a few seconds.
+pub const HEARTBEAT: Duration = Duration::from_secs(2);
+/// No reply for this long also means the server stopped answering.
+pub const HEARTBEAT_SILENCE: Duration = Duration::from_secs(6);
+
 /// Messages sent by clients (hosts and controllers) to the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {

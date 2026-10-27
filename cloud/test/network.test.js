@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { applyPresence, canonical, decide, flattenRoutes, inviteError, isPrivateAddress, joinAuthMode, mergeRoutes, normalizeFingerprint, planRegistration, presenceView, relayAccessParts, requireAccountsOn, savedShape } from "../src/network.js";
+import { probeQuery, shapeHealth } from "../src/health.js";
 
 test("canonical matches the shared fixture", () => {
   const text = canonical({
@@ -366,4 +367,28 @@ test("an empty display name clears, and a missing one does not", () => {
   const view = presenceView({ id: "1", hostname: "CABINDESK", display_name: "Cabin", console_user: "Ben" }, "member");
   assert.equal(view.display_name, "Cabin");
   assert.equal(view.console_user, "");
+});
+
+test("a health report keeps each server's addresses", () => {
+  const row = shapeHealth(
+    {
+      instance: "a".repeat(32),
+      name: "CHIP20",
+      version: "0.6.46",
+      role: "active",
+      epoch: 7,
+      healthy: true,
+      maintenance_until: 0,
+      public_addrs: ["68.234.75.68:21200", "not-an-address"],
+      lan_addrs: ["192.168.1.40:21200"],
+      names: ["pjdesk.spader.us:21200"],
+    },
+    100,
+  );
+  assert.deepEqual(row.public_addrs, ["68.234.75.68:21200", "not-an-address"]);
+  assert.deepEqual(row.lan_addrs, ["192.168.1.40:21200"]);
+  assert.deepEqual(row.names, ["pjdesk.spader.us:21200"]);
+  assert.equal(probeQuery("68.234.75.68", "21200").host, "68.234.75.68");
+  assert.equal(probeQuery("192.168.1.40", "21200"), null);
+  assert.equal(probeQuery("204.248.122.44", "80"), null);
 });

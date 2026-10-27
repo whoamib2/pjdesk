@@ -604,7 +604,9 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 if let Some(ip) = cmd.get("myPublicIp").and_then(|v| v.as_str()) {
                     *state.my_public_ip.lock().unwrap() = ip.trim().to_string();
                 }
-                *state.routes.lock().unwrap() = routes_from_command(&cmd);
+                let incoming = routes_from_command(&cmd);
+                let previous = state.routes.lock().unwrap().clone();
+                *state.routes.lock().unwrap() = pjdesk_proto::routes::keep_other_server(&previous, &incoming);
                 persist(state);
                 publish(state, cb);
                 log_line(
@@ -1030,13 +1032,9 @@ fn routes_from_command(cmd: &Value) -> pjdesk_proto::routes::ServerRoutes {
 async fn open_ordered(state: &State, cb: &Arc<dyn Callbacks>, pinned: Option<pjdesk_proto::tls::Fingerprint>) -> Result<SignalClient> {
     let routes = state.routes.lock().unwrap().clone();
     let saved = state.server.lock().unwrap().clone();
-    let told = state.move_primary.lock().unwrap().clone();
+    let told = std::mem::take(&mut *state.move_primary.lock().unwrap());
     let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
-    let mut targets = pjdesk_proto::routes::dial_targets(&routes, &mine, &saved);
-    if !told.trim().is_empty() {
-        targets.retain(|target| target != &told);
-        targets.insert(0, told);
-    }
+    let targets = pjdesk_proto::routes::registration_targets(&told, &routes, &mine, &saved);
     if targets.is_empty() {
         bail!("This phone has no server address yet. Sign in again, or set the server in Settings.");
     }
@@ -1254,7 +1252,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
         app_version: APP_VERSION.into(),
     })?;
     let server_ip = signal.server_addr.ip();
-    let mut ping = tokio::time::interval(Duration::from_secs(10));
+    let mut ping = tokio::time::interval(pjdesk_proto::signal::HEARTBEAT);
     ping.tick().await;
     let mut last_heard = Instant::now();
     let mut awaiting_pong = false;
@@ -1294,8 +1292,11 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                     emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
                     return Ok(PhoneHost::Lost);
                 }
-                if last_heard.elapsed() >= Duration::from_secs(30) {
-                    warn!("No reply from the server for 30 s (phone); reconnecting");
+                if last_heard.elapsed() >= pjdesk_proto::signal::HEARTBEAT_SILENCE {
+                    warn!(
+                        "No reply from the server for {} s (phone); reconnecting",
+                        pjdesk_proto::signal::HEARTBEAT_SILENCE.as_secs()
+                    );
                     emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
                     return Ok(PhoneHost::Lost);
                 }
@@ -1408,9 +1409,10 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                             routes.remove(&session_id);
                         }
                     }
-                    ServerMsg::Routes(routes) => {
-                        if !routes.is_empty() {
-                            *state.routes.lock().unwrap() = routes;
+                    ServerMsg::Routes(incoming) => {
+                        if !incoming.is_empty() {
+                            let previous = state.routes.lock().unwrap().clone();
+                            *state.routes.lock().unwrap() = pjdesk_proto::routes::keep_other_server(&previous, &incoming);
                             persist(&state);
                         }
                     }
@@ -1419,7 +1421,8 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                             redirected = true;
                             if let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) {
                                 if !routes.is_empty() {
-                                    *state.routes.lock().unwrap() = routes;
+                                    let previous = state.routes.lock().unwrap().clone();
+                                    *state.routes.lock().unwrap() = pjdesk_proto::routes::keep_other_server(&previous, &routes);
                                     persist(&state);
                                 }
                                 if !addr.is_empty() {
@@ -2463,7 +2466,8 @@ async fn controller_session(
                     bail!("{message}");
                 };
                 if !routes.is_empty() {
-                    *state.routes.lock().unwrap() = routes;
+                    let previous = state.routes.lock().unwrap().clone();
+                    *state.routes.lock().unwrap() = pjdesk_proto::routes::keep_other_server(&previous, &routes);
                     persist(&state);
                 }
                 if addr.is_empty() {
