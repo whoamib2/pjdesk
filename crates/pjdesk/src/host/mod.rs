@@ -88,6 +88,10 @@ pub struct HostShared {
     /// Lines for a transfer list. Nothing in the window reads them yet.
     #[allow(dead_code)]
     transfers: Mutex<Vec<String>>,
+    /// Primary address for a relayed session the server asked to move.
+    pub relay_move: Mutex<Option<String>>,
+    /// The host has forwarded that move to the controller.
+    pub relay_sent: AtomicBool,
 }
 
 /// Shown when someone wants to connect and approval is set to prompt.
@@ -111,6 +115,27 @@ pub struct ConsentReply {
     pub permissions: u32,
     #[serde(default)]
     pub receive_dir: String,
+}
+
+/// The first line of a dial error, short enough to show next to an address.
+fn one_line(err: &anyhow::Error) -> String {
+    let text = format!("{err:#}");
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("failed");
+    let mut out = String::new();
+    for part in line.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    if out.is_empty() {
+        "failed".into()
+    } else if out.chars().count() > 180 {
+        let cut: String = out.chars().take(179).collect();
+        format!("{cut}…")
+    } else {
+        out
+    }
 }
 
 fn unix_secs() -> u64 {
@@ -307,6 +332,16 @@ pub(crate) struct HostState {
     /// Refresh token and key id for the connection log. Absent when this computer
     /// has no support key. The digits are not here.
     support_log: Mutex<Option<SupportLog>>,
+    /// New primary from [`ServerMsg::MoveRelay`]. The next registration dials it.
+    follow: Mutex<Option<String>>,
+    /// Session the server asked to move.
+    moving: Mutex<Option<SessionId>>,
+    /// Random key for this install. Shared with the service via ProgramData.
+    install_key: [u8; 32],
+    /// Set when a server closed `RegisterInstall` before answering. This
+    /// process then uses classic Register. A successful install registration
+    /// clears it.
+    legacy_register: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -515,6 +550,10 @@ async fn host_main(
         server_proto: AtomicU16::new(pjdesk_proto::PROTOCOL_VERSION),
         device_id: Mutex::new(String::new()),
         support_log: Mutex::new(None),
+        follow: Mutex::new(None),
+        moving: Mutex::new(None),
+        install_key: crate::identity::install_key(),
+        legacy_register: AtomicBool::new(false),
     });
     if args.allow_direct {
         let direct = state.clone();
@@ -553,7 +592,7 @@ async fn host_main(
                 }
                 return Ok(());
             }
-            Ok(SignalEnd::Again) => None,
+            Ok(SignalEnd::Again) | Ok(SignalEnd::Follow) => None,
             Ok(SignalEnd::Lost) => Some(pjdesk_proto::failover::RegFail::Unreachable),
             Err(e) if format!("{e:#}").contains("SERVER KEY MISMATCH") => {
                 if let Some(shared) = &state.shared {
@@ -635,10 +674,133 @@ enum SignalEnd {
     Again,
     /// The server stopped answering.
     Lost,
+    /// Register with the primary named by a relay move.
+    Follow,
+}
+
+/// Saves a catalog without dropping the other server when this push omits it.
+fn remember_routes(config: &mut Config, routes: pjdesk_proto::routes::ServerRoutes) -> bool {
+    if routes.is_empty() {
+        return false;
+    }
+    let merged = pjdesk_proto::routes::keep_other_server(&config.network_routes, &routes);
+    if merged == config.network_routes {
+        return false;
+    }
+    config.network_routes = merged;
+    crate::routes_store::store(&config.network_routes);
+    let _ = config.save();
+    true
+}
+
+/// Copies the account fields a cloud refresh may have replaced.
+/// Advertised routes keep whichever half the new reply left out.
+fn copy_refreshed(config: &mut Config, refreshed: &Config) {
+    config.network_access = refreshed.network_access.clone();
+    config.network_access_exp = refreshed.network_access_exp;
+    config.network_refresh = refreshed.network_refresh.clone();
+    config.network_email = refreshed.network_email.clone();
+    config.server = refreshed.server.clone();
+    config.server_fingerprint = refreshed.server_fingerprint.clone();
+    config.network_lan = refreshed.network_lan.clone();
+    config.network_public_ip = refreshed.network_public_ip.clone();
+    config.network_standby = refreshed.network_standby.clone();
+    config.network_standby_fingerprint = refreshed.network_standby_fingerprint.clone();
+    config.network_routes = pjdesk_proto::routes::keep_other_server(&config.network_routes, &refreshed.network_routes);
+}
+
+/// Asks pjdesk.com for the current catalog. The signaling servers do not have
+/// to be reachable. Returns true when the saved addresses changed and include
+/// an advertised IP.
+async fn pull_cloud_routes(config: &mut Config) -> bool {
+    if config.network_refresh_token().is_empty() || config.network_device_id.as_deref().unwrap_or("").trim().is_empty() {
+        info!("This computer has no account session, so pjdesk.com was not asked for routes");
+        return false;
+    }
+    info!("Asking pjdesk.com for the current server addresses");
+    let mut copy = config.clone();
+    let refreshed = match tokio::task::spawn_blocking(move || {
+        crate::network::refresh_config_now(&mut copy);
+        copy
+    })
+    .await
+    {
+        Ok(cfg) => cfg,
+        Err(_) => return false,
+    };
+    let before = config.network_routes.clone();
+    copy_refreshed(config, &refreshed);
+    if config.network_routes == before {
+        info!("pjdesk.com did not change the saved server addresses");
+        return false;
+    }
+    crate::routes_store::store(&config.network_routes);
+    let _ = config.save();
+    let listed = config
+        .network_routes
+        .primary_lan
+        .iter()
+        .chain(config.network_routes.primary_public.iter())
+        .chain(config.network_routes.standby_lan.iter())
+        .chain(config.network_routes.standby_public.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    info!("pjdesk.com advertised {listed}");
+    pjdesk_proto::routes::ServerRoutes::has_advertised_ip(&config.network_routes)
+}
+
+/// Dials each address that has not already failed in this attempt.
+async fn dial_until_answer(
+    config: &mut Config,
+    targets: &[String],
+    attempts: &mut Vec<(String, String)>,
+) -> Option<SignalClient> {
+    for target in targets {
+        if attempts.iter().any(|(addr, _)| pjdesk_proto::routes::same_endpoint(addr, target)) {
+            continue;
+        }
+        info!("Dialing {target}");
+        match SignalClient::connect_endpoint(target, config, pjdesk_proto::routes::dial_budget(target)).await {
+            Ok(got) => {
+                info!("Server answered at {target} via {} ({})", got.via, got.server_addr);
+                return Some(got);
+            }
+            Err(err) => {
+                let why = one_line(&err);
+                info!("registration route {target} failed: {why}");
+                attempts.push((target.clone(), why));
+            }
+        }
+    }
+    None
+}
+
+/// Sends `RegisterInstall` unless this process already found a server that
+/// cannot decode it. The legacy secret stays in the message either way.
+fn send_registration(signal: &mut SignalClient, config: &mut Config, state: &HostState) -> Result<()> {
+    let device_secret = config.device_secret()?;
+    let device_id = config.device_id.clone();
+    let hostname = state.name.clone();
+    let app_version = env!("CARGO_PKG_VERSION").to_string();
+    let proto = state.server_proto.load(Ordering::SeqCst);
+    if state.legacy_register.load(Ordering::SeqCst) {
+        signal.send(ClientMsg::Register { proto, device_id, device_secret, hostname, app_version })
+    } else {
+        signal.send(ClientMsg::RegisterInstall {
+            proto,
+            device_id,
+            device_secret,
+            install_key: state.install_key,
+            hostname,
+            app_version,
+        })
+    }
 }
 
 /// Dials the fresh advertised IPs, then a saved hostname, and registers.
-/// A standby redirect is followed at once.
+/// A standby redirect is followed at once. A named primary that does not
+/// answer is not the only address tried.
 async fn register_catalog(
     config: &mut Config,
     state: &Arc<HostState>,
@@ -648,11 +810,44 @@ async fn register_catalog(
     let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
     let token = config.presented_access();
     let access_key = pjdesk_proto::access::is_access_key(&token);
-    let device_secret = config.device_secret()?;
     let mut without_token = false;
     let mut redirects = 0u8;
-    let mut signal = SignalClient::connect_catalog(config, &mine).await.map_err(|err| {
-        anyhow::anyhow!("could not reach the primary or the standby; retrying. {err:#}")
+    // Take the follow address now. A miss must not pin every later try to it.
+    let follow = state.follow.lock().unwrap().take().filter(|addr| !addr.trim().is_empty());
+    // The last registration's catalog, even when this process has no live session.
+    crate::routes_store::absorb(config);
+    let mut pulled = false;
+    if !config.network_routes.has_advertised_ip() {
+        info!("No advertised server addresses saved. Asking pjdesk.com before DNS.");
+        pulled = true;
+        let _ = pull_cloud_routes(config).await;
+    }
+    let targets = pjdesk_proto::routes::registration_targets(
+        follow.as_deref().unwrap_or(""),
+        &config.network_routes,
+        &mine,
+        &config.effective_server(),
+    );
+    if targets.is_empty() {
+        info!("registration has no address to dial");
+        bail!("could not reach the primary or the standby; retrying. the server address is empty");
+    }
+    let mut attempts = Vec::new();
+    let mut signal = dial_until_answer(config, &targets, &mut attempts).await;
+    if signal.is_none() && !pulled && pull_cloud_routes(config).await {
+        let more = pjdesk_proto::routes::registration_targets(
+            follow.as_deref().unwrap_or(""),
+            &config.network_routes,
+            &mine,
+            &config.effective_server(),
+        );
+        signal = dial_until_answer(config, &more, &mut attempts).await;
+    }
+    let mut signal = signal.ok_or_else(|| {
+        let pairs: Vec<(&str, &str)> = attempts.iter().map(|(addr, err)| (addr.as_str(), err.as_str())).collect();
+        let report = pjdesk_proto::routes::registration_miss(&pairs);
+        info!("{report}");
+        anyhow::anyhow!("{report}")
     })?;
     loop {
         let register_proto = state.server_proto.load(Ordering::SeqCst);
@@ -662,21 +857,19 @@ async fn register_catalog(
         if !presented.is_empty() {
             let _ = signal.send(ClientMsg::PresentAccess { token: presented });
         }
-        signal.send(ClientMsg::Register {
-            proto: register_proto,
-            device_id: config.device_id.clone(),
-            device_secret,
-            hostname: state.name.clone(),
-            app_version: env!("CARGO_PKG_VERSION").into(),
-        })?;
+        let used_install_key = !state.legacy_register.load(Ordering::SeqCst);
+        send_registration(&mut signal, config, state)?;
         loop {
             match timeout(Duration::from_secs(10), signal.recv()).await {
-                Ok(Some(ServerMsg::Registered { device_id })) => return Ok((signal, server, device_id)),
-                Ok(Some(ServerMsg::Routes(routes))) => {
-                    if !routes.is_empty() {
-                        config.network_routes = routes;
-                        let _ = config.save();
+                Ok(Some(ServerMsg::Registered { device_id })) => {
+                    if used_install_key {
+                        state.legacy_register.store(false, Ordering::SeqCst);
                     }
+                    *state.follow.lock().unwrap() = None;
+                    return Ok((signal, server, device_id));
+                }
+                Ok(Some(ServerMsg::Routes(routes))) => {
+                    remember_routes(config, routes);
                 }
                 Ok(Some(ServerMsg::Error { code: ErrorCode::IdConflict, message })) => {
                     config.device_id = None;
@@ -690,16 +883,15 @@ async fn register_catalog(
                     let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) else {
                         bail!("could not reach the primary after the standby redirect; retrying");
                     };
-                    if !routes.is_empty() {
-                        config.network_routes = routes;
-                        let _ = config.save();
-                    }
+                    remember_routes(config, routes);
                     if addr.is_empty() {
                         bail!("could not reach the primary after the standby redirect; retrying");
                     }
                     info!("Standby redirected registration to {addr}");
                     signal = SignalClient::connect_endpoint(&addr, config, pjdesk_proto::routes::dial_budget(&addr)).await.map_err(|err| {
-                        anyhow::anyhow!("could not reach the primary at {addr}; retrying. {err:#}")
+                        let why = one_line(&err);
+                        info!("registration route {addr} failed: {why}");
+                        anyhow::anyhow!("{}", pjdesk_proto::routes::registration_miss(&[(&addr, why.as_str())]))
                     })?;
                     break;
                 }
@@ -711,6 +903,16 @@ async fn register_catalog(
                     bail!("the server refused registration: {message}");
                 }
                 Ok(Some(other)) => bail!("unexpected reply from the server: {other:?}"),
+                Ok(None) if used_install_key && !state.legacy_register.swap(true, Ordering::SeqCst) => {
+                    info!("registration with the install key was closed before a reply; trying the legacy registration");
+                    let addr = signal.server_addr.to_string();
+                    signal = SignalClient::connect_endpoint(&addr, config, pjdesk_proto::routes::dial_budget(&addr)).await.map_err(|err| {
+                        let why = one_line(&err);
+                        info!("registration route {addr} failed: {why}");
+                        anyhow::anyhow!("{}", pjdesk_proto::routes::registration_miss(&[(&addr, why.as_str())]))
+                    })?;
+                    break;
+                }
                 Ok(None) if !token.is_empty() && !access_key && !without_token => {
                     without_token = true;
                     signal = SignalClient::connect_catalog(config, &mine).await?;
@@ -744,17 +946,10 @@ async fn signaling_loop(
     .await
     .ok()
     .map(|refreshed| {
-        config.network_access = refreshed.network_access;
-        config.network_access_exp = refreshed.network_access_exp;
-        config.network_refresh = refreshed.network_refresh;
-        config.network_email = refreshed.network_email;
-        config.server = refreshed.server;
-        config.server_fingerprint = refreshed.server_fingerprint;
-        config.network_lan = refreshed.network_lan;
-        config.network_public_ip = refreshed.network_public_ip;
-        config.network_standby = refreshed.network_standby;
-        config.network_standby_fingerprint = refreshed.network_standby_fingerprint;
-        config.network_routes = refreshed.network_routes;
+        copy_refreshed(config, &refreshed);
+        if config.network_routes.has_advertised_ip() {
+            crate::routes_store::store(&config.network_routes);
+        }
     });
     let _ = config.reload_access_key();
     state.remember_support(config);
@@ -791,7 +986,7 @@ async fn signaling_loop(
     state.publish_password();
 
     let server_ip = signal.server_addr.ip();
-    let mut ping = tokio::time::interval(Duration::from_secs(10));
+    let mut ping = tokio::time::interval(pjdesk_proto::signal::HEARTBEAT);
     ping.tick().await;
     let mut ui_tick = tokio::time::interval(Duration::from_millis(300));
     let mut report_host = false;
@@ -811,6 +1006,17 @@ async fn signaling_loop(
                     return Ok(SignalEnd::Stop);
                 }
                 state.apply_ui_requests();
+                let sent = state.shared.as_ref().is_some_and(|s| s.relay_sent.load(Ordering::SeqCst));
+                if sent && !state.streaming.load(Ordering::SeqCst) {
+                    if let Some(id) = state.moving.lock().unwrap().take() {
+                        let _ = signal.send(ClientMsg::RelayMoved { session_id: id });
+                    }
+                    if let Some(shared) = &state.shared {
+                        shared.relay_sent.store(false, Ordering::SeqCst);
+                    }
+                    info!("failover: relayed session left; registering with the new primary");
+                    return Ok(SignalEnd::Follow);
+                }
             }
             _ = ping.tick() => {
                 if awaiting_pong {
@@ -820,8 +1026,8 @@ async fn signaling_loop(
                     );
                     return Ok(SignalEnd::Lost);
                 }
-                if last_heard.elapsed() >= Duration::from_secs(30) {
-                    warn!("No reply from the server for 30 s ({role}); reconnecting");
+                if last_heard.elapsed() >= pjdesk_proto::signal::HEARTBEAT_SILENCE {
+                    warn!("No reply from the server for {} s ({role}); reconnecting", pjdesk_proto::signal::HEARTBEAT_SILENCE.as_secs());
                     return Ok(SignalEnd::Lost);
                 }
                 if config.reload_access_key() {
@@ -831,15 +1037,7 @@ async fn signaling_loop(
                 if heartbeats == 0 {
                     // The first ack also carries this build's version, so an
                     // in-place update is stored before the next heartbeat.
-                    if let Ok(device_secret) = config.device_secret() {
-                        let _ = signal.send(ClientMsg::Register {
-                            proto: state.server_proto.load(Ordering::SeqCst),
-                            device_id: config.device_id.clone(),
-                            device_secret,
-                            hostname: state.name.clone(),
-                            app_version: env!("CARGO_PKG_VERSION").into(),
-                        });
-                    }
+                    let _ = send_registration(&mut signal, config, state);
                 }
                 signal.send(ClientMsg::Ping)?;
                 awaiting_pong = true;
@@ -918,10 +1116,21 @@ async fn signaling_loop(
                         }
                     }
                     ServerMsg::Routes(routes) => {
-                        if !routes.is_empty() {
-                            config.network_routes = routes;
-                            let _ = config.save();
+                        if remember_routes(config, routes) {
                             info!("Updated server addresses from the primary");
+                        }
+                    }
+                    ServerMsg::MoveRelay { session_id, primary } => {
+                        info!("failover: moving relayed session {session_id:016x} to the primary {primary}");
+                        *state.follow.lock().unwrap() = Some(primary.clone());
+                        *state.moving.lock().unwrap() = Some(session_id);
+                        if let Some(shared) = &state.shared {
+                            *shared.relay_move.lock().unwrap() = Some(primary);
+                            shared.relay_sent.store(false, Ordering::SeqCst);
+                        }
+                        if !state.streaming.load(Ordering::SeqCst) {
+                            let _ = signal.send(ClientMsg::RelayMoved { session_id });
+                            return Ok(SignalEnd::Follow);
                         }
                     }
                     ServerMsg::WantHostReport => {
@@ -955,6 +1164,23 @@ fn print_banner(id: &str, _password: &str, has_permanent: bool, server: &ServerA
     println!();
 }
 
+/// Waits until a direct listener accepts the controller, or the limit passes.
+async fn wait_until_direct(state: &HostState, limit: Duration) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if state.streaming.load(Ordering::SeqCst) {
+            info!("Direct LAN connection is up; the relay is not needed");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    if state.streaming.load(Ordering::SeqCst) {
+        info!("Direct LAN connection is up; the relay is not needed");
+        return Ok(());
+    }
+    bail!("the controller never finished setting up the connection");
+}
+
 /// Wraps [`session_inner`] with logging and bookkeeping.
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
@@ -982,7 +1208,13 @@ async fn run_session(
     )
     .await
     {
-        Ok(()) => info!("Remote session ended"),
+        Ok(()) => {
+            if state.streaming.load(Ordering::SeqCst) {
+                info!("Relayed setup ended; a direct LAN session is running");
+            } else {
+                info!("Remote session ended");
+            }
+        }
         Err(e) if e.is::<WrongPassword>() => {
             warn!("\"{controller_name}\" ({controller_ip}) entered a wrong password");
         }
@@ -1009,12 +1241,50 @@ async fn session_inner(
     controller_ip: &str,
     still_pending: &mut bool,
 ) -> Result<()> {
-    let binding = p2p::bind_udp(server_udp, session_id, token, Role::Host).await?;
+    // Tell the controller our LAN addresses before the relay's UDP handshake.
+    // Two computers on the same subnet can connect on UDP 21201 even when the
+    // relay (often at the other site) never answers a BindAck.
+    let mut lan_direct = Vec::new();
+    if state.args.allow_direct {
+        for ip in pjdesk_proto::discover::private_ipv4s() {
+            let addr = SocketAddr::new(std::net::IpAddr::V4(ip), pjdesk_proto::DIRECT_PORT);
+            if !lan_direct.contains(&addr) {
+                lan_direct.push(addr);
+            }
+        }
+    }
+    if !lan_direct.is_empty() {
+        let listed = lan_direct.iter().map(|addr| addr.to_string()).collect::<Vec<_>>().join(", ");
+        info!("Advertising LAN addresses for a direct connection: {listed}");
+        let _ = signal.send(ClientMsg::UdpReady {
+            session_id,
+            local_addrs: lan_direct.clone(),
+            cert_fingerprint: Some(state.identity.fingerprint()),
+        });
+    }
+    let binding = match p2p::bind_udp(server_udp, session_id, token, Role::Host).await {
+        Ok(binding) => binding,
+        Err(e) if !lan_direct.is_empty() => {
+            info!(
+                "UDP registration with the relay at {server_udp} failed: {e:#}. A computer on this network can still connect to UDP {}.",
+                pjdesk_proto::DIRECT_PORT
+            );
+            wait_until_direct(state, Duration::from_secs(20)).await?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     debug!("our public address for this session: {}", binding.observed);
     let endpoint = p2p::host_endpoint(binding.socket, &state.identity)?;
+    let mut locals = lan_direct;
+    for addr in binding.local_addrs.clone() {
+        if !locals.contains(&addr) {
+            locals.push(addr);
+        }
+    }
     signal.send(ClientMsg::UdpReady {
         session_id,
-        local_addrs: binding.local_addrs.clone(),
+        local_addrs: locals,
         cert_fingerprint: Some(state.identity.fingerprint()),
     })?;
 
@@ -1040,6 +1310,10 @@ async fn session_inner(
     )
     .await;
     punching.abort();
+    if state.streaming.load(Ordering::SeqCst) {
+        info!("A computer on this network connected directly; the relay is not used");
+        return Ok(());
+    }
     let (connection, mut auth) = accepted?;
     let source = source_for(&connection, server_udp.ip(), peer_public, controller_ip, controller_name);
     if auth.password_slot != ASK_SLOT {
@@ -1199,6 +1473,11 @@ async fn accept_authenticated(
                 Ok(Err(e)) => debug!("a connection attempt failed: {e:#}"),
                 Err(_) => {}
             },
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                if state.streaming.load(Ordering::SeqCst) {
+                    bail!("a direct LAN connection is already up");
+                }
+            }
             _ = tokio::time::sleep_until(deadline) => bail!("the controller did not connect in time"),
         }
     }

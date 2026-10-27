@@ -57,7 +57,9 @@ impl App {
                     self.open_invite();
                 }
                 if self.temp.is_some() {
-                    ui.label(RichText::new("Signed in until you close PJDesk").color(p.warn).size(13.0));
+                    ui.menu_button(RichText::new("Signed in until you close PJDesk").color(p.warn).size(13.0), |ui| {
+                        self.sign_in_duration_menu(ui);
+                    });
                     if ui.button("Sign out").clicked() {
                         self.end_temporary_sign_in();
                     }
@@ -67,6 +69,7 @@ impl App {
                             ui.ctx().open_url(egui::OpenUrl::new_tab("https://pjdesk.com/account"));
                             ui.close();
                         }
+                        self.sign_in_duration_menu(ui);
                         if ui.button("Sign out").clicked() {
                             self.sign_out_network();
                             ui.close();
@@ -265,6 +268,31 @@ impl App {
         });
     }
 
+    pub(super) fn note_sign_in_error(&mut self, err: String) {
+        if let Some(secs) = crate::network::sign_in_pause_seconds_from_text(&err) {
+            self.net_pause_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+            self.net_error = crate::network::sign_in_pause_text(secs);
+        } else {
+            self.net_pause_until = None;
+            self.net_error = err;
+        }
+    }
+
+    /// Remaining seconds of a login pause. Zero re-enables Sign in and clears the sentence.
+    pub(super) fn sign_in_paused(&mut self) -> Option<u64> {
+        let until = self.net_pause_until?;
+        let left = until.saturating_duration_since(std::time::Instant::now()).as_secs();
+        if left == 0 {
+            self.net_pause_until = None;
+            if self.net_error.starts_with("Too many sign-in attempts") {
+                self.net_error.clear();
+            }
+            None
+        } else {
+            Some(left)
+        }
+    }
+
     fn sign_in_panel(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
         let mut go = false;
@@ -276,10 +304,11 @@ impl App {
             ui.label(RichText::new("Sign in to your network").size(26.0).strong().color(p.text));
             ui.add_space(4.0);
             let intro = match self.net_mode {
+                3 => "Paste a server access key from PJDesk Server. This computer registers on that server without a PJDesk account. The key's expiry and computer limit still apply.",
                 2 if self.net_temporary => {
-                    "Paste a network key. This computer is added to your account. This sign-in ends when you close PJDesk."
+                    "Paste a network key. A server access key (pjdesk-key1) is accepted here too. This computer is added to your account. This sign-in ends when you close PJDesk."
                 }
-                2 => "Paste a network key from My network or the PJDesk Server window. This computer enrolls and stays signed in after a restart.",
+                2 => "Paste a network key from My network or the PJDesk Server window. A pasted server access key (pjdesk-key1) enrolls this computer without an account. A network key stays signed in after a restart.",
                 1 => "Enter an 8-digit code. An invite works once and lasts one hour. A support key uses the options chosen when it was created. You do not need a PJDesk account.",
                 _ => "Your PJDesk account sets the servers for this network. It does not connect you to a computer, and it is not that computer's password.",
             };
@@ -289,7 +318,26 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.set_max_width(440.0);
             theme::card(ui, |ui| {
-                if self.net_mode == 2 {
+                if self.net_mode == 3 {
+                    if self.net_server.trim().is_empty() {
+                        self.net_server = self.cfg.effective_server();
+                    }
+                    widgets::field_label(ui, "Server access key");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.net_blob)
+                            .hint_text("pjdesk-key1.…")
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    ui.add_space(8.0);
+                    widgets::field_label(ui, "Server address");
+                    widgets::text_field(ui, &mut self.net_server, "desk.example.com or 192.168.1.10", false);
+                    ui.label(widgets::muted(
+                        ui,
+                        "From PJDesk Server. This computer is not added to a PJDesk account. The key's expiry and computer limit still apply.",
+                    ));
+                } else if self.net_mode == 2 {
                     widgets::field_label(ui, "Network key");
                     ui.add(
                         egui::TextEdit::multiline(&mut self.net_blob)
@@ -347,17 +395,24 @@ impl App {
                     }
                 }
                 ui.add_space(8.0);
-                widgets::checkbox(
-                    ui,
-                    &mut self.net_temporary,
-                    "Sign me out when I'm done (use on someone else's computer)",
-                );
-                ui.label(widgets::muted(
-                    ui,
-                    "This computer is added to your account either way. When this is checked, the sign-in ends when you close PJDesk and is not kept on this computer.",
-                ));
+                if self.net_mode != 3 {
+                    widgets::checkbox(
+                        ui,
+                        &mut self.net_temporary,
+                        "Sign me out when I'm done (use on someone else's computer)",
+                    );
+                    ui.label(widgets::muted(
+                        ui,
+                        "This computer is added to your account either way. When this is checked, the sign-in ends when you close PJDesk and is not kept on this computer.",
+                    ));
+                }
                 ui.add_space(8.0);
-                if !self.net_error.is_empty() && crate::support_keys::parse_consent(&self.net_error).is_none() {
+                let pause_left = if self.net_mode == 0 { self.sign_in_paused() } else { None };
+                if let Some(left) = pause_left {
+                    ui.colored_label(p.warn, crate::network::sign_in_pause_text(left));
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                    ui.add_space(6.0);
+                } else if !self.net_error.is_empty() && crate::support_keys::parse_consent(&self.net_error).is_none() {
                     ui.colored_label(p.warn, &self.net_error);
                     ui.add_space(6.0);
                 }
@@ -369,6 +424,8 @@ impl App {
                 }
                 let label = if self.net_busy {
                     "Signing in…"
+                } else if self.net_mode == 3 {
+                    "Use server access key"
                 } else if self.net_mode == 2 {
                     "Use network key"
                 } else if self.net_mode == 1 {
@@ -376,10 +433,16 @@ impl App {
                 } else {
                     "Sign in"
                 };
-                if widgets::accent_button(ui, label, egui::vec2(ui.available_width(), 40.0)) && !self.net_busy {
+                let sign_in_open = !self.net_busy && pause_left.is_none();
+                let clicked = ui
+                    .add_enabled_ui(sign_in_open, |ui| {
+                        widgets::accent_button(ui, label, egui::vec2(ui.available_width(), 40.0))
+                    })
+                    .inner;
+                if clicked && sign_in_open {
                     go = true;
                 }
-                if self.net_mode == 0 && !self.net_busy {
+                if self.net_mode == 0 && sign_in_open {
                     ui.add_space(4.0);
                     let link = ui.add(
                         egui::Button::new(
@@ -407,6 +470,15 @@ impl App {
                     }
                     if self.net_mode != 2 && ui.button("Use a network key").clicked() && !self.net_busy {
                         self.net_mode = 2;
+                        self.net_error.clear();
+                        self.net_offer = false;
+                        self.net_login.clear();
+                    }
+                    if self.net_mode != 3 && ui.button("Use a server access key").clicked() && !self.net_busy {
+                        self.net_mode = 3;
+                        if self.net_server.trim().is_empty() {
+                            self.net_server = self.cfg.effective_server();
+                        }
                         self.net_error.clear();
                         self.net_offer = false;
                         self.net_login.clear();
@@ -508,6 +580,14 @@ impl App {
         };
         let server = if reach.is_empty() { server } else { format!("{server} · {reach}") };
         let rtt = self.share_rtt();
+        let failure = if self.registrar_acked() {
+            None
+        } else if self.engine.service_running {
+            let err = self.svc_status.error.trim();
+            if err.is_empty() { None } else { Some(err.to_string()) }
+        } else {
+            self.engine.shared.error()
+        };
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             if self.engine.service_running {
@@ -516,6 +596,8 @@ impl App {
                     widgets::status_dot(ui, p.accent, "In a session");
                 } else if self.registrar_acked() {
                     widgets::status_dot(ui, p.ok, "Service ready");
+                } else if let Some(err) = &failure {
+                    widgets::status_dot(ui, p.warn, &short(err));
                 } else if fresh && self.svc_status.online {
                     widgets::status_dot(ui, p.warn, "Reconnecting");
                 } else {
@@ -527,10 +609,10 @@ impl App {
                 widgets::status_dot(ui, p.accent, &format!("In a session · {peer}"));
             } else if self.registrar_acked() {
                 widgets::status_dot(ui, p.ok, "Ready");
+            } else if let Some(err) = &failure {
+                widgets::status_dot(ui, p.warn, &short(err));
             } else if self.engine.shared.is_online() {
                 widgets::status_dot(ui, p.warn, "Reconnecting");
-            } else if let Some(err) = self.engine.shared.error() {
-                widgets::status_dot(ui, p.warn, &short(&err));
             } else {
                 widgets::status_dot(ui, p.muted, "Connecting");
             }
@@ -539,6 +621,16 @@ impl App {
                 widgets::status_dot(ui, p.muted, &format!("{rtt} ms"));
             }
         });
+        if let Some(err) = &failure {
+            let lines = pjdesk_proto::routes::registration_detail_lines(err);
+            if !lines.is_empty() {
+                egui::CollapsingHeader::new("Details").id_salt("registration-dial-details").show(ui, |ui| {
+                    for line in &lines {
+                        ui.label(RichText::new(line).monospace().size(12.0).color(p.muted));
+                    }
+                });
+            }
+        }
     }
 
     /// ID, one-time password, whether a permanent password is set, and whether

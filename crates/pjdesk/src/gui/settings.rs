@@ -13,6 +13,7 @@ use crate::signaling::ServerAddr;
 enum Tab {
     General,
     Security,
+    Privacy,
     Network,
     Display,
     Account,
@@ -209,6 +210,7 @@ impl App {
                                                         self.scm_known,
                                                     );
                                                 }
+                                                Tab::Privacy => self.privacy_tab(ui),
                                                 Tab::Network => self.network_tab(ui),
                                                 Tab::Display => display_tab(ui, &mut self.settings),
                                                 Tab::Account => self.account_tab(ui),
@@ -237,6 +239,28 @@ impl App {
         }
     }
 
+    fn privacy_tab(&mut self, ui: &mut egui::Ui) {
+        widgets::heading(ui, "PRIVACY");
+        ui.label("Saved computers on this computer");
+        ui.label(widgets::muted(
+            ui,
+            "Removing them here does not delete them from your pjdesk.com account or from your other computers.",
+        ));
+        ui.add_space(8.0);
+        if ui.button("Remove all saved computers from this computer").clicked() {
+            self.confirm_clear_saved = true;
+        }
+        ui.add_space(8.0);
+        if ui.button("Sign out and remove everything from this computer").clicked() {
+            self.confirm_sign_out_clear = true;
+        }
+        ui.add_space(8.0);
+        ui.label(widgets::muted(
+            ui,
+            "Sign out and remove also ends the pjdesk.com sign-in on this computer. When Sign out when PJDesk closes is on, closing PJDesk clears the saved list, cached passwords, and recent computers.",
+        ));
+    }
+
     fn account_tab(&mut self, ui: &mut egui::Ui) {
         widgets::heading(ui, "PJDESK ACCOUNT");
         let email = self.cfg.network_email.clone().unwrap_or_default();
@@ -258,6 +282,29 @@ impl App {
                     self.sign_out_network();
                 }
             });
+            ui.add_space(12.0);
+            ui.label("This sign-in");
+            let until_close = self.temp.is_some() || self.cfg.ephemeral_network;
+            if ui.selectable_label(!until_close, "Stay signed in on this computer").clicked() && until_close {
+                self.stay_signed_in();
+            }
+            if ui.selectable_label(until_close, "Sign out when PJDesk closes").clicked() && !until_close {
+                self.sign_out_when_closes();
+            }
+            ui.label(widgets::muted(
+                ui,
+                "Stay signed in keeps this account on this computer. The other choice ends the sign-in when you close PJDesk.",
+            ));
+        }
+        if self.signed_in() && !self.cfg.syncs_saved_computers() {
+            ui.add_space(8.0);
+            if ui.button("Load my saved computers").clicked() {
+                self.load_saved_computers();
+            }
+            ui.label(widgets::muted(
+                ui,
+                "This downloads your saved computers and their passwords onto this computer, then keeps them in sync.",
+            ));
         }
         ui.add_space(8.0);
         ui.label(widgets::muted(
@@ -298,6 +345,23 @@ impl App {
         };
 
         let key_text = d.access_key.trim().to_string();
+        if !key_text.is_empty() {
+            match pjdesk_proto::netkey::classify_paste(&key_text) {
+                pjdesk_proto::netkey::PasteKind::Network => {
+                    self.status = pjdesk_proto::netkey::NETWORK_KEY_GOES.into();
+                    return false;
+                }
+                pjdesk_proto::netkey::PasteKind::Access => {}
+                pjdesk_proto::netkey::PasteKind::AccessIncomplete => {
+                    self.status = pjdesk_proto::netkey::ACCESS_KEY_INCOMPLETE.into();
+                    return false;
+                }
+                pjdesk_proto::netkey::PasteKind::Neither => {
+                    self.status = "That is not a server access key. A server access key starts with pjdesk-key1. A network key starts with pjdesk-net1 and goes in Use a network key.".into();
+                    return false;
+                }
+            }
+        }
         let key_changed = key_text != self.cfg.server_access_key();
         let server_changed = self.cfg.server != new_server;
         if server_changed {
@@ -432,6 +496,7 @@ fn nav(ui: &mut egui::Ui, tab: &mut Tab) {
     for (which, label) in [
         (Tab::General, "General"),
         (Tab::Security, "Security"),
+        (Tab::Privacy, "Privacy"),
         (Tab::Network, "Network"),
         (Tab::Display, "Display"),
         (Tab::Account, "Account"),
@@ -627,7 +692,7 @@ impl App {
         widgets::text_field(ui, &mut self.settings.server, "desk.example.com  or  192.168.1.10", false);
         ui.add_space(6.0);
         widgets::field_label(ui, "Access key");
-        widgets::password_field(ui, &mut self.settings.access_key, "Optional", &mut self.settings.show_access_key);
+        widgets::password_field(ui, &mut self.settings.access_key, "pjdesk-key1.…", &mut self.settings.show_access_key);
         ui.label(widgets::muted(
             ui,
             "From the person who runs the server. With this key, this computer can register when signed-in accounts are required.",

@@ -39,6 +39,10 @@ pub enum Action {
     ViewSeparate,
     /// Close the screen window this bar belongs to.
     CloseScreen,
+    /// Show another computer already open in this window.
+    SelectSession(usize),
+    /// End that computer's session. The window stays if another tab is open.
+    CloseSession(usize),
     /// Android host: 0 Back, 1 Home, 2 Recents, 3 Volume up, 4 Volume down, 5 Power, 6 Notifications.
     Android(u8),
     /// Show or hide the Android navigation bar under the phone picture.
@@ -64,6 +68,8 @@ const TOP: f32 = 10.0;
 const BAR_H: f32 = 40.0;
 /// Persistent screen tabs. Hidden when the remote has a single display.
 pub const TAB_H: f32 = 40.0;
+/// Computer tabs. Hidden until the window is given a session list.
+pub const SESSION_H: f32 = 36.0;
 const ITEM_H: f32 = 30.0;
 const PAD: f32 = 12.0;
 const MAP_W: f32 = 280.0;
@@ -418,6 +424,10 @@ pub struct Toolbar {
     /// Light client theme. The tab strip follows this; the floating bar stays dark glass.
     light: bool,
     hovered_slot: Option<usize>,
+    /// Computer names in this window. Empty keeps the older single-session strip.
+    sessions: Vec<String>,
+    active_session: usize,
+    hovered_session: Option<usize>,
     android: bool,
     /// The navigation bar under an Android picture. On until the Phone menu hides it.
     android_nav: bool,
@@ -461,6 +471,9 @@ impl Default for Toolbar {
             screens_open: false,
             light: false,
             hovered_slot: None,
+            sessions: Vec::new(),
+            active_session: 0,
+            hovered_session: None,
             android: false,
             android_nav: true,
         }
@@ -519,12 +532,38 @@ struct Slot {
     active: bool,
 }
 
-fn tooltip_rect_of(slot: &Slot) -> Option<(f32, f32, f32, f32)> {
+struct SessionSlot {
+    index: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    close: (f32, f32, f32, f32),
+    label: String,
+    active: bool,
+}
+
+fn fit_label(label: &str, max_w: f32) -> String {
+    if text_width(label) <= max_w {
+        return label.to_string();
+    }
+    let mut out = String::new();
+    for c in label.chars() {
+        let next = format!("{out}{c}…");
+        if text_width(&next) > max_w {
+            break;
+        }
+        out.push(c);
+    }
+    if out.is_empty() { "…".into() } else { format!("{out}…") }
+}
+
+fn tooltip_rect_of(slot: &Slot, below: f32) -> Option<(f32, f32, f32, f32)> {
     if slot.tip.is_empty() {
         return None;
     }
     let tw = text_width(&slot.tip) + 16.0;
-    Some((slot.x, TAB_H + 6.0, tw, 22.0))
+    Some((slot.x, below + 6.0, tw, 22.0))
 }
 
 fn draw_windows_icon(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, color: u32, hole: u32) {
@@ -560,17 +599,38 @@ impl Toolbar {
         chrome(self.light).panel
     }
 
-    /// Height reserved at the top when the remote has more than one display.
-    pub fn tab_height(&self) -> f32 {
-        if self.shows_tabs() {
-            TAB_H
-        } else {
-            0.0
+    /// Names of the computers open in this window, and which one is showing.
+    ///
+    /// An empty list leaves the strip out, so a remote with one display still
+    /// has no tab row.
+    pub fn set_sessions(&mut self, names: &[String], active: usize) {
+        self.sessions = names.to_vec();
+        self.active_session = active;
+        if self.hovered_session.is_some_and(|i| i >= self.sessions.len()) {
+            self.hovered_session = None;
         }
+    }
+
+    /// Height reserved at the top for computer tabs and, under them, screen tabs.
+    pub fn tab_height(&self) -> f32 {
+        self.session_height() + if self.shows_tabs() { TAB_H } else { 0.0 }
+    }
+
+    fn session_height(&self) -> f32 {
+        if self.shows_sessions() { SESSION_H } else { 0.0 }
+    }
+
+    fn shows_sessions(&self) -> bool {
+        !self.sessions.is_empty()
     }
 
     fn shows_tabs(&self) -> bool {
         self.displays.len() >= 2
+    }
+
+    /// Screen tabs start under the computer tabs when those are showing.
+    fn monitor_top(&self) -> f32 {
+        self.session_height()
     }
 
     /// Shows or hides the Android section (Back, Home, Recents, volume, power).
@@ -647,7 +707,13 @@ impl Toolbar {
         let w = if self.collapsed { self.collapsed_w } else { self.width };
         let x = ((win_w as f32 - w) / 2.0).max(8.0);
         // Leave room under the tabs for a resolution tooltip.
-        let y = if self.shows_tabs() { TAB_H + 36.0 } else { TOP };
+        let y = if self.shows_tabs() {
+            self.tab_height() + 36.0
+        } else if self.shows_sessions() {
+            self.tab_height() + 8.0
+        } else {
+            TOP
+        };
         (x, y, w, BAR_H)
     }
 
@@ -656,7 +722,7 @@ impl Toolbar {
         if !self.shows_tabs() || win_w < 120 {
             return Vec::new();
         }
-        let y = 6.0;
+        let y = self.monitor_top() + 6.0;
         let h = 28.0;
         let right = 28.0;
         let limit = win_w as f32 - right - 16.0;
@@ -715,14 +781,18 @@ impl Toolbar {
         slots
     }
 
+    fn hit(px: f64, py: f64, x: f32, y: f32, w: f32, h: f32) -> bool {
+        px >= x as f64 && py >= y as f64 && px <= (x + w) as f64 && py <= (y + h) as f64
+    }
+
     fn point_in(px: f64, py: f64, s: &Slot) -> bool {
-        px >= s.x as f64 && py >= s.y as f64 && px <= (s.x + s.w) as f64 && py <= (s.y + s.h) as f64
+        Self::hit(px, py, s.x, s.y, s.w, s.h)
     }
 
     fn slot_at(&self, px: f64, py: f64, win_w: usize) -> Option<usize> {
         let slots = self.tab_slots(win_w);
         if let Some(i) = self.hovered_slot {
-            if let Some(tip) = tooltip_rect_of(slots.get(i)?) {
+            if let Some(tip) = tooltip_rect_of(slots.get(i)?, self.monitor_top() + TAB_H) {
                 if px >= tip.0 as f64
                     && py >= tip.1 as f64
                     && px <= (tip.0 + tip.2) as f64
@@ -745,14 +815,94 @@ impl Toolbar {
         })
     }
 
-    pub fn draw_tabs(&self, buf: &mut [u32], win_w: usize, win_h: usize) {
-        let slots = self.tab_slots(win_w);
-        if slots.is_empty() || win_h < TAB_H as usize {
+    fn session_slots(&self, win_w: usize) -> Vec<SessionSlot> {
+        if !self.shows_sessions() || win_w < 80 {
+            return Vec::new();
+        }
+        let n = self.sessions.len();
+        let gap = 4.0;
+        let pad = 8.0;
+        let avail = (win_w as f32 - pad * 2.0 - gap * (n.saturating_sub(1) as f32)).max(72.0);
+        let w = (avail / n as f32).clamp(72.0, 220.0);
+        let h = 28.0;
+        let y = 4.0;
+        let mut x = pad;
+        let mut slots = Vec::with_capacity(n);
+        for (index, label) in self.sessions.iter().enumerate() {
+            let close_w = 22.0;
+            let close = (x + w - close_w - 4.0, y + 4.0, close_w, h - 8.0);
+            slots.push(SessionSlot {
+                index,
+                x,
+                y,
+                w,
+                h,
+                close,
+                label: fit_label(label, (w - close_w - 20.0).max(24.0)),
+                active: index == self.active_session,
+            });
+            x += w + gap;
+        }
+        slots
+    }
+
+    fn session_at(&self, px: f64, py: f64, win_w: usize) -> Option<usize> {
+        self.session_slots(win_w).iter().position(|s| Self::hit(px, py, s.x, s.y, s.w, s.h))
+    }
+
+    fn session_action(&self, px: f64, py: f64, win_w: usize) -> Option<Action> {
+        let slots = self.session_slots(win_w);
+        let slot = slots.iter().find(|s| Self::hit(px, py, s.x, s.y, s.w, s.h))?;
+        let (cx, cy, cw, ch) = slot.close;
+        let on_close = Self::hit(px, py, cx, cy, cw, ch);
+        Some(if on_close { Action::CloseSession(slot.index) } else { Action::SelectSession(slot.index) })
+    }
+
+    fn draw_sessions(&self, buf: &mut [u32], win_w: usize, win_h: usize) {
+        let slots = self.session_slots(win_w);
+        if slots.is_empty() || win_h < SESSION_H as usize {
             return;
         }
         let c = chrome(self.light);
-        fill_rect(buf, win_w, win_h, 0.0, 0.0, win_w as f32, TAB_H, c.panel);
-        fill_rect(buf, win_w, win_h, 0.0, TAB_H - 1.0, win_w as f32, 1.0, c.line);
+        fill_rect(buf, win_w, win_h, 0.0, 0.0, win_w as f32, SESSION_H, c.panel);
+        fill_rect(buf, win_w, win_h, 0.0, SESSION_H - 1.0, win_w as f32, 1.0, c.line);
+        for slot in &slots {
+            let hover = self.hovered_session == Some(slot.index);
+            let fill = if slot.active {
+                Some(c.card)
+            } else if hover {
+                Some(c.elev)
+            } else {
+                None
+            };
+            if let Some(color) = fill {
+                fill_round(buf, win_w, win_h, slot.x, slot.y, slot.w, slot.h, 8.0, color);
+            }
+            if slot.active {
+                fill_rect(buf, win_w, win_h, slot.x + 12.0, slot.y + slot.h - 2.0, slot.w - 24.0, 2.0, c.accent);
+            }
+            let color = if slot.active || hover { c.text } else { c.muted };
+            draw_text(buf, win_w, win_h, slot.x + 10.0, slot.y + 19.0, &slot.label, color);
+            let (cx, cy, cw, ch) = slot.close;
+            if hover {
+                fill_round(buf, win_w, win_h, cx, cy, cw, ch, 4.0, c.elev);
+            }
+            let mark = "×";
+            let mw = text_width(mark);
+            draw_text(buf, win_w, win_h, cx + (cw - mw) / 2.0, cy + ch - 4.0, mark, color);
+        }
+    }
+
+    pub fn draw_tabs(&self, buf: &mut [u32], win_w: usize, win_h: usize) {
+        self.draw_sessions(buf, win_w, win_h);
+        let slots = self.tab_slots(win_w);
+        let top = self.monitor_top();
+        if slots.is_empty() || win_h < (top + TAB_H) as usize {
+            return;
+        }
+        let c = chrome(self.light);
+        fill_rect(buf, win_w, win_h, 0.0, top, win_w as f32, TAB_H, c.panel);
+        fill_rect(buf, win_w, win_h, 0.0, top + TAB_H - 1.0, win_w as f32, 1.0, c.line);
         for (i, slot) in slots.iter().enumerate() {
             let hover = self.hovered_slot == Some(i);
             let fill = if slot.active {
@@ -785,7 +935,7 @@ impl Toolbar {
         }
         if let Some(i) = self.hovered_slot {
             if let Some(slot) = slots.get(i) {
-                if let Some((x, y, tw, th)) = tooltip_rect_of(slot) {
+                if let Some((x, y, tw, th)) = tooltip_rect_of(slot, self.monitor_top() + TAB_H) {
                     let x = x.min((win_w as f32 - tw - 8.0).max(8.0));
                     fill_round(buf, win_w, win_h, x, y, tw, th, 6.0, c.card);
                     fill_rect(buf, win_w, win_h, x, y, tw, 1.0, c.line);
@@ -882,7 +1032,8 @@ impl Toolbar {
     }
 
     pub fn covers(&self, px: f64, py: f64, win_w: usize) -> bool {
-        if self.shows_tabs() && py >= 0.0 && py <= TAB_H as f64 && px >= 0.0 && px <= win_w as f64 {
+        let strip = self.tab_height();
+        if strip > 0.0 && py >= 0.0 && py <= strip as f64 && px >= 0.0 && px <= win_w as f64 {
             return true;
         }
         if self.slot_at(px, py, win_w).is_some() {
@@ -916,13 +1067,21 @@ impl Toolbar {
     }
 
     pub fn on_pointer(&mut self, px: f64, py: f64, win_w: usize) -> bool {
+        if let Some(i) = self.session_at(px, py, win_w) {
+            self.hovered_session = Some(i);
+            self.hovered_slot = None;
+            self.hovered_button = None;
+            return true;
+        }
+        self.hovered_session = None;
         if let Some(i) = self.slot_at(px, py, win_w) {
             self.hovered_slot = Some(i);
             self.hovered_button = None;
             return true;
         }
         self.hovered_slot = None;
-        if self.shows_tabs() && py >= 0.0 && py <= TAB_H as f64 && px >= 0.0 && px <= win_w as f64 {
+        let strip = self.tab_height();
+        if strip > 0.0 && py >= 0.0 && py <= strip as f64 && px >= 0.0 && px <= win_w as f64 {
             self.hovered_button = None;
             return true;
         }
@@ -973,6 +1132,11 @@ impl Toolbar {
     }
 
     pub fn click(&mut self, px: f64, py: f64, win_w: usize) -> Option<Action> {
+        if let Some(action) = self.session_action(px, py, win_w) {
+            self.open = None;
+            self.screens_open = false;
+            return Some(action);
+        }
         if let Some(action) = self.tab_action(px, py, win_w) {
             self.open = None;
             self.screens_open = false;
@@ -1163,6 +1327,162 @@ impl Toolbar {
             );
             draw_text(buf, win_w, win_h, mx + 16.0, y + 16.0, label, 0xFF_e8_ec_f2);
         }
+    }
+}
+
+/// Close-all prompt drawn over the session window when more than one computer is open.
+pub fn confirm_close_boxes(win_w: usize, win_h: usize) -> ((f32, f32, f32, f32), (f32, f32, f32, f32)) {
+    let card_w = 440.0_f32.min((win_w as f32 - 32.0).max(280.0));
+    let card_h = 168.0;
+    let x = ((win_w as f32 - card_w) / 2.0).max(8.0);
+    let y = ((win_h as f32 - card_h) / 2.0).max(8.0);
+    let btn_w = 140.0;
+    let btn_h = 36.0;
+    let by = y + card_h - btn_h - 20.0;
+    let close = (x + 24.0, by, btn_w, btn_h);
+    let cancel = (x + card_w - 24.0 - btn_w, by, btn_w, btn_h);
+    (close, cancel)
+}
+
+/// `Some(true)` is Close all. `Some(false)` is Cancel.
+pub fn confirm_close_hit(px: f64, py: f64, win_w: usize, win_h: usize) -> Option<bool> {
+    let (close, cancel) = confirm_close_boxes(win_w, win_h);
+    if Toolbar::hit(px, py, close.0, close.1, close.2, close.3) {
+        return Some(true);
+    }
+    if Toolbar::hit(px, py, cancel.0, cancel.1, cancel.2, cancel.3) {
+        return Some(false);
+    }
+    None
+}
+
+pub fn draw_confirm_close(buf: &mut [u32], win_w: usize, win_h: usize, sessions: usize, light: bool) {
+    let c = chrome(light);
+    fill_rect(buf, win_w, win_h, 0.0, 0.0, win_w as f32, win_h as f32, 0x88_10_13_18);
+    let (close, cancel) = confirm_close_boxes(win_w, win_h);
+    let card_w = cancel.0 + cancel.2 + 24.0 - (close.0 - 24.0);
+    let card_h = 168.0;
+    let x = close.0 - 24.0;
+    let y = close.1 + close.3 + 20.0 - card_h;
+    fill_round(buf, win_w, win_h, x, y, card_w, card_h, 12.0, c.card);
+    let title = format!("Close all {sessions} sessions?");
+    draw_text(buf, win_w, win_h, x + 24.0, y + 40.0, &title, c.text);
+    draw_text(
+        buf,
+        win_w,
+        win_h,
+        x + 24.0,
+        y + 68.0,
+        "This ends every computer open in this window.",
+        c.muted,
+    );
+    fill_round(buf, win_w, win_h, close.0, close.1, close.2, close.3, 8.0, 0xFF_8a_30_34);
+    fill_round(buf, win_w, win_h, cancel.0, cancel.1, cancel.2, cancel.3, 8.0, c.elev);
+    let close_label = "Close all";
+    let cancel_label = "Cancel";
+    draw_text(
+        buf,
+        win_w,
+        win_h,
+        close.0 + (close.2 - text_width(close_label)) / 2.0,
+        close.1 + 24.0,
+        close_label,
+        0xFF_ff_ff_ff,
+    );
+    draw_text(
+        buf,
+        win_w,
+        win_h,
+        cancel.0 + (cancel.2 - text_width(cancel_label)) / 2.0,
+        cancel.1 + 24.0,
+        cancel_label,
+        c.text,
+    );
+}
+
+/// What the session window draws over a picture that is no longer live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionCover {
+    Reconnecting,
+    Lost,
+    Ended,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionCoverAction {
+    Cancel,
+    Reconnect,
+    Close,
+}
+
+fn cover_buttons(kind: SessionCover) -> &'static [(&'static str, SessionCoverAction)] {
+    match kind {
+        SessionCover::Reconnecting => &[("Cancel", SessionCoverAction::Cancel)],
+        SessionCover::Lost => &[("Reconnect", SessionCoverAction::Reconnect), ("Close", SessionCoverAction::Close)],
+        SessionCover::Ended => &[("Close", SessionCoverAction::Close)],
+    }
+}
+
+fn cover_boxes(win_w: usize, win_h: usize, buttons: usize) -> (f32, f32, f32, f32, Vec<(f32, f32, f32, f32)>) {
+    let card_w = 440.0_f32.min((win_w as f32 - 32.0).max(280.0));
+    let card_h = 156.0;
+    let x = ((win_w as f32 - card_w) / 2.0).max(8.0);
+    let y = ((win_h as f32 - card_h) / 2.0).max(8.0);
+    let btn_h = 36.0;
+    let by = y + card_h - btn_h - 22.0;
+    let mut boxes = Vec::new();
+    if buttons <= 1 {
+        let btn_w = 160.0;
+        boxes.push((x + (card_w - btn_w) / 2.0, by, btn_w, btn_h));
+    } else {
+        let btn_w = 150.0;
+        let gap = 16.0;
+        let start = x + (card_w - (btn_w * 2.0 + gap)) / 2.0;
+        boxes.push((start, by, btn_w, btn_h));
+        boxes.push((start + btn_w + gap, by, btn_w, btn_h));
+    }
+    (x, y, card_w, card_h, boxes)
+}
+
+pub fn session_cover_hit(kind: SessionCover, px: f64, py: f64, win_w: usize, win_h: usize) -> Option<SessionCoverAction> {
+    let buttons = cover_buttons(kind);
+    let (_, _, _, _, boxes) = cover_boxes(win_w, win_h, buttons.len());
+    for (button, (x, y, w, h)) in buttons.iter().zip(boxes) {
+        if Toolbar::hit(px, py, x, y, w, h) {
+            return Some(button.1);
+        }
+    }
+    None
+}
+
+pub fn draw_session_cover(buf: &mut [u32], win_w: usize, win_h: usize, kind: SessionCover, detail: &str, light: bool) {
+    let c = chrome(light);
+    let ended = detail.lines().next().unwrap_or(detail).trim();
+    let ended = if ended.is_empty() { "The session ended" } else { ended };
+    let title = match kind {
+        SessionCover::Reconnecting => "Reconnecting…",
+        SessionCover::Lost => "Connection lost",
+        SessionCover::Ended => ended,
+    };
+    let buttons = cover_buttons(kind);
+    fill_rect(buf, win_w, win_h, 0.0, 0.0, win_w as f32, win_h as f32, 0x88_10_13_18);
+    let (x, y, card_w, card_h, boxes) = cover_boxes(win_w, win_h, buttons.len());
+    fill_round(buf, win_w, win_h, x, y, card_w, card_h, 12.0, c.card);
+    let shown = if title.chars().count() > 48 {
+        let end = title.char_indices().nth(48).map(|(i, _)| i).unwrap_or(title.len());
+        &title[..end]
+    } else {
+        title
+    };
+    draw_text(buf, win_w, win_h, x + 24.0, y + 42.0, shown, c.text);
+    if kind == SessionCover::Lost {
+        draw_text(buf, win_w, win_h, x + 24.0, y + 70.0, "Every route failed.", c.muted);
+    }
+    for (button, (bx, by, bw, bh)) in buttons.iter().zip(boxes) {
+        let fill = if button.1 == SessionCoverAction::Reconnect { c.accent } else { c.elev };
+        let ink = if button.1 == SessionCoverAction::Reconnect { 0xFF_ff_ff_ff } else { c.text };
+        fill_round(buf, win_w, win_h, bx, by, bw, bh, 8.0, fill);
+        draw_text(buf, win_w, win_h, bx + (bw - text_width(button.0)) / 2.0, by + 24.0, button.0, ink);
     }
 }
 
@@ -1626,6 +1946,49 @@ mod tests {
     }
 
     #[test]
+    fn session_tabs_name_each_computer_and_keep_screen_tabs() {
+        let mut bar = Toolbar::default();
+        assert_eq!(bar.tab_height(), 0.0);
+        bar.set_sessions(&["Cabin Desk".into(), "CHIP20".into()], 1);
+        assert_eq!(bar.tab_height(), SESSION_H);
+        bar.sync(two_screens(), 0, 0);
+        assert_eq!(bar.tab_height(), SESSION_H + TAB_H);
+        let w = 1100usize;
+        let sessions = bar.session_slots(w);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].label, "Cabin Desk");
+        assert!(sessions[1].active);
+        assert!(!sessions[0].active);
+        let (cx, cy, cw, ch) = sessions[0].close;
+        assert_eq!(
+            bar.click((cx + cw / 2.0) as f64, (cy + ch / 2.0) as f64, w),
+            Some(Action::CloseSession(0))
+        );
+        assert_eq!(
+            bar.click((sessions[1].x + 12.0) as f64, (sessions[1].y + 8.0) as f64, w),
+            Some(Action::SelectSession(1))
+        );
+        let screens = bar.tab_slots(w);
+        assert!(screens.iter().any(|s| matches!(s.kind, SlotKind::Display(0))));
+        assert!(screens.iter().all(|s| s.y >= SESSION_H));
+        let screen = screens.iter().find(|s| matches!(s.kind, SlotKind::Display(1))).unwrap();
+        assert_eq!(
+            bar.click((screen.x + 10.0) as f64, (screen.y + 8.0) as f64, w),
+            Some(Action::SelectDisplay(1))
+        );
+        let separate = screens.iter().find(|s| matches!(s.kind, SlotKind::Separate)).unwrap();
+        assert_eq!(
+            bar.click((separate.x + 8.0) as f64, (separate.y + 8.0) as f64, w),
+            Some(Action::ViewSeparate)
+        );
+        let (close, cancel) = confirm_close_boxes(w, 700);
+        assert!(close.0 + close.2 < cancel.0);
+        assert_eq!(confirm_close_hit((close.0 + 8.0) as f64, (close.1 + 8.0) as f64, w, 700), Some(true));
+        assert_eq!(confirm_close_hit((cancel.0 + 8.0) as f64, (cancel.1 + 8.0) as f64, w, 700), Some(false));
+        assert_eq!(confirm_close_hit(4.0, 4.0, w, 700), None);
+    }
+
+    #[test]
     fn tab_strip_highlights_the_active_tab() {
         let mut bar = Toolbar::default();
         bar.sync(pjdesk_proto::layout::sample_layout(), 2, pjdesk_proto::peer::VIEW_SINGLE);
@@ -1767,6 +2130,20 @@ mod tests {
         assert!(bar.menus[3].items.iter().any(|(label, action)| label == "Show navigation bar" && *action == Action::ToggleAndroidBar));
         bar.toggle_android_nav();
         assert!(bar.shows_android_nav());
+    }
+
+    #[test]
+    fn reconnect_overlay_has_cancel_and_the_lost_overlay_has_two_buttons() {
+        let w = 800;
+        let h = 600;
+        let mut buf = vec![0u32; w * h];
+        draw_session_cover(&mut buf, w, h, SessionCover::Reconnecting, "", false);
+        assert!(buf.iter().any(|px| *px != 0));
+        assert_eq!(session_cover_hit(SessionCover::Reconnecting, 400.0, 338.0, w, h), Some(SessionCoverAction::Cancel));
+        assert_eq!(session_cover_hit(SessionCover::Lost, 400.0, 20.0, w, h), None);
+        assert_eq!(session_cover_hit(SessionCover::Lost, 317.0, 338.0, w, h), Some(SessionCoverAction::Reconnect));
+        assert_eq!(session_cover_hit(SessionCover::Lost, 483.0, 338.0, w, h), Some(SessionCoverAction::Close));
+        assert_eq!(session_cover_hit(SessionCover::Ended, 400.0, 338.0, w, h), Some(SessionCoverAction::Close));
     }
 
     fn button(buttons: &[AndroidButton], which: u8) -> AndroidButton {

@@ -296,6 +296,8 @@ pub(crate) struct ApiFail {
     pub role: String,
     pub owner: String,
     pub label: String,
+    /// `Retry-After` delta-seconds, when the Worker sent one.
+    pub retry_after: Option<u64>,
 }
 
 /// A failed token refresh. `revoked` is an explicit 401 or a revoked key.
@@ -353,6 +355,7 @@ fn post_api(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> std::r
     match req.send_string(&body.to_string()) {
         Ok(resp) => Ok(resp.into_string().unwrap_or_default()),
         Err(ureq::Error::Status(code, resp)) => {
+            let retry_after = resp.header("retry-after").and_then(parse_retry_after);
             let text = resp.into_string().unwrap_or_default();
             let parsed: ErrorBody = serde_json::from_str(&text).unwrap_or_default();
             let message = if !parsed.error.is_empty() {
@@ -369,6 +372,7 @@ fn post_api(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> std::r
                 role: parsed.role,
                 owner: parsed.owner,
                 label: parsed.label,
+                retry_after,
             })
         }
         Err(ureq::Error::Transport(_)) => Err(ApiFail {
@@ -378,6 +382,7 @@ fn post_api(url: &str, bearer: Option<&str>, body: &serde_json::Value) -> std::r
             role: String::new(),
             owner: String::new(),
             label: String::new(),
+            retry_after: None,
         }),
     }
 }
@@ -420,11 +425,14 @@ pub fn confirm_account_password(email: &str, password: &str) -> Result<[u8; 32]>
         bail!("Enter your account password.");
     }
     let (auth, _sync) = pjdesk_proto::access::derive_account_keys(&email, password);
-    let login: LoginReply = serde_json::from_str(&post_json(
-        &format!("{}/api/login", api_base()),
-        None,
-        &account_login_body(&email, &hex::encode(auth), "PJDesk PIN check"),
-    )?)
+    let login: LoginReply = serde_json::from_str(
+        &post_api(
+            &format!("{}/api/login", api_base()),
+            None,
+            &account_login_body(&email, &hex::encode(auth), "PJDesk PIN check"),
+        )
+        .map_err(login_failure)?,
+    )
     .context("unexpected reply from PJDesk")?;
     let _ = post_json(&format!("{}/api/logout", api_base()), Some(&login.token), &serde_json::json!({}));
     Ok(pjdesk_proto::access::derive_password_vault_key(&email, password))
@@ -486,8 +494,13 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
         bail!(NO_SERVER);
     }
     let routes = session_routes(&network);
+    let email = if email.trim().is_empty() {
+        pjdesk_proto::access::email_from_access_token(&reply.access).unwrap_or_default()
+    } else {
+        email.trim().to_lowercase()
+    };
     Ok(Session {
-        email: email.to_string(),
+        email,
         access: reply.access,
         exp: reply.exp,
         refresh: reply.refresh,
@@ -554,6 +567,106 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
     })
 }
 
+/// The account login window when pjdesk.com does not say how long to wait.
+pub const SIGN_IN_PAUSE_SECS: u64 = 15 * 60;
+
+/// Seconds to wait after a 429 from `/api/login`. `None` for any other failure.
+/// `retry_after` is the Worker's `Retry-After` delta-seconds and wins over the body.
+/// A code-guess or PIN lock ("Too many tries") is not this pause.
+pub fn sign_in_pause_seconds(status: u16, message: &str, retry_after: Option<u64>) -> Option<u64> {
+    let limited = (status == 429 && !message.contains("Too many tries"))
+        || message.contains("Too many failed sign-ins")
+        || message.contains("Too many sign-in attempts");
+    if !limited {
+        return None;
+    }
+    if let Some(secs) = retry_after.filter(|secs| *secs > 0) {
+        return Some(secs.clamp(1, SIGN_IN_PAUSE_SECS));
+    }
+    Some(wait_minutes(message).unwrap_or(SIGN_IN_PAUSE_SECS / 60) * 60)
+}
+
+/// The sentence on the Sign in screen. Minutes are the remaining time, rounded up.
+pub fn sign_in_pause_text(remaining_secs: u64) -> String {
+    let minutes = remaining_secs.div_ceil(60).max(1);
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!("Too many sign-in attempts. Try again in {minutes} {unit}.")
+}
+
+/// The sentence plus a trailing clock. The clock is the exact `Retry-After`.
+/// The Sign in screen shows [`sign_in_pause_text`] and does not show the clock.
+pub fn sign_in_pause_error(remaining_secs: u64) -> String {
+    let mm = remaining_secs / 60;
+    let ss = remaining_secs % 60;
+    format!("{} {mm:02}:{ss:02}", sign_in_pause_text(remaining_secs))
+}
+
+/// The sentence alone, when `message` is a sign-in pause (with or without the clock).
+pub fn sign_in_pause_user_text(message: &str) -> String {
+    match sign_in_pause_seconds_from_text(message) {
+        Some(secs) => sign_in_pause_text(secs),
+        None => message.to_string(),
+    }
+}
+
+/// Reads a pause out of an error string. The clock at the end wins. Otherwise
+/// "N minutes", or 15 minutes when the body has no duration.
+pub fn sign_in_pause_seconds_from_text(message: &str) -> Option<u64> {
+    let sign_in = message.contains("Too many sign-in attempts");
+    let legacy = message.contains("Too many failed sign-ins");
+    if !sign_in && !legacy {
+        return None;
+    }
+    if let Some(secs) = trailing_clock(message) {
+        return Some(secs);
+    }
+    Some(wait_minutes(message).unwrap_or(SIGN_IN_PAUSE_SECS / 60) * 60)
+}
+
+fn wait_minutes(message: &str) -> Option<u64> {
+    let lower = message.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let digits = &lower[start..i];
+        let after = lower[i..].trim_start();
+        if after.starts_with("minute") {
+            return digits.parse().ok();
+        }
+    }
+    None
+}
+
+fn trailing_clock(message: &str) -> Option<u64> {
+    let token = message.trim().rsplit_once(|c: char| c.is_whitespace())?.1;
+    let (mm, ss) = token.split_once(':')?;
+    if mm.is_empty() || ss.len() != 2 || !mm.chars().all(|c| c.is_ascii_digit()) || !ss.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(mm.parse::<u64>().ok()? * 60 + ss.parse::<u64>().ok()?)
+}
+
+fn parse_retry_after(value: &str) -> Option<u64> {
+    let secs = value.trim().parse::<u64>().ok()?;
+    if secs == 0 { None } else { Some(secs) }
+}
+
+fn login_failure(fail: ApiFail) -> anyhow::Error {
+    if let Some(secs) = sign_in_pause_seconds(fail.status, &fail.message, fail.retry_after) {
+        anyhow::anyhow!(sign_in_pause_error(secs))
+    } else {
+        anyhow::anyhow!(fail.message)
+    }
+}
+
 /// Signs in with the PJDesk account password and fetches the private server.
 /// An empty network returns [`SignIn::NoServer`] so the owner can publish the
 /// server this computer already uses. The login token stays in memory only.
@@ -563,12 +676,9 @@ pub fn sign_in(email: &str, password: &str, device_id: &str, device_name: &str) 
         bail!("Enter your email and password.");
     }
     let (auth, _sync) = pjdesk_proto::access::derive_account_keys(&email, password);
-    let login: LoginReply = serde_json::from_str(&post_json(
-        &format!("{}/api/login", api_base()),
-        None,
-        &account_login_body(&email, &hex::encode(auth), &format!("PJDesk on {device_name}")),
-    )?)
-    .context("unexpected reply from PJDesk")?;
+    let login_body = account_login_body(&email, &hex::encode(auth), &format!("PJDesk on {device_name}"));
+    let login_text = post_api(&format!("{}/api/login", api_base()), None, &login_body).map_err(login_failure)?;
+    let login: LoginReply = serde_json::from_str(&login_text).context("unexpected reply from PJDesk")?;
     match post_api(
         &format!("{}/api/network/token", api_base()),
         Some(&login.token),
@@ -639,6 +749,9 @@ fn refresh_account(
     if pjdesk_proto::is_valid_id(&pjdesk_id) {
         body["pjdesk_id"] = serde_json::Value::String(pjdesk_id);
     }
+    // The account uses this to tell two computers apart when they used to
+    // share one ID. A worker that does not know the field ignores it.
+    body["install_key"] = serde_json::Value::String(hex::encode(crate::identity::install_key()));
     if reinstate {
         body["reinstate"] = serde_json::Value::Bool(true);
     }
@@ -741,12 +854,9 @@ fn login_token(email: &str, password: &str) -> Result<String> {
         bail!("Enter the email and password for the account this network key is for.");
     }
     let (auth, _sync) = pjdesk_proto::access::derive_account_keys(&email, password);
-    let login: LoginReply = serde_json::from_str(&post_json(
-        &format!("{}/api/login", api_base()),
-        None,
-        &account_login_body(&email, &hex::encode(auth), "PJDesk"),
-    )?)
-    .context("unexpected reply from PJDesk")?;
+    let login_body = account_login_body(&email, &hex::encode(auth), "PJDesk");
+    let login_text = post_api(&format!("{}/api/login", api_base()), None, &login_body).map_err(login_failure)?;
+    let login: LoginReply = serde_json::from_str(&login_text).context("unexpected reply from PJDesk")?;
     Ok(login.token)
 }
 
@@ -961,7 +1071,7 @@ pub fn finish_account_sign_in(session: Session, this: &ThisComputer, local: &[Sa
 
 /// The saved list this computer would upload, including nicknames and hide flags.
 pub fn saved_from_config(config: &Config) -> Vec<SavedComputer> {
-    let body = computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden);
+    let body = upload_computers_body(config);
     let Some(list) = body.get("computers").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -989,6 +1099,15 @@ pub fn saved_from_config(config: &Config) -> Vec<SavedComputer> {
             })
         })
         .collect()
+}
+
+/// A local wipe uploads an empty list. The account keeps its rows when the
+/// list is empty, and nothing is sent as hidden.
+fn upload_computers_body(config: &Config) -> serde_json::Value {
+    if config.local_saved_cleared {
+        return serde_json::json!({ "computers": [] });
+    }
+    computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden)
 }
 
 /// Nickname, hostname, ID, and OS. A password is dropped. An alias that is
@@ -1047,7 +1166,7 @@ pub fn push_saved_computers_from_disk() -> Result<()> {
     if refresh_token.is_empty() || device.is_empty() {
         return Ok(());
     }
-    let body = computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden);
+    let body = upload_computers_body(&config);
     let mut session = refresh(&refresh_token, &device, Some(&body))?;
     if let Ok(disk) = Config::load() {
         config.fill_peer_facts_from(&disk);
@@ -1087,7 +1206,7 @@ fn refresh_config_inner(config: &mut Config, force: bool) {
     if !force && now < NEXT_REFRESH_AT.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let body = computers_body(&config.address_book, &config.settings.peers, &config.saved_hidden);
+    let body = upload_computers_body(config);
     let pjdesk_id = config.device_id.clone().unwrap_or_default();
     match refresh_account(&refresh_token, &device, Some(&body), &pjdesk_id, false) {
         Ok(mut session) => {
@@ -1139,6 +1258,8 @@ pub fn copy_to_service(user: &Config) {
     cfg.network_standby_fingerprint = user.network_standby_fingerprint.clone();
     cfg.network_lan = user.network_lan.clone();
     cfg.network_public_ip = user.network_public_ip.clone();
+    cfg.network_routes = pjdesk_proto::routes::keep_other_server(&cfg.network_routes, &user.network_routes);
+    crate::routes_store::store(&cfg.network_routes);
     cfg.server_access_key = user.server_access_key.clone();
     cfg.network_role = user.network_role.clone();
     let grant_changed = cfg.support_grant != user.support_grant;
@@ -1583,5 +1704,31 @@ mod tests {
         assert_eq!(invite_failure_message(401, ""), "PJDesk replied 401.");
         assert!(!invite_failure_message(401, "upstream down").contains("Wrong email"));
         assert!(invite_failure_message(502, "upstream down").contains("502"));
+    }
+
+    #[test]
+    fn a_login_429_uses_bens_sentence_and_a_clock() {
+        let production = "Too many failed sign-ins. Wait 15 minutes and try again.";
+        assert_eq!(sign_in_pause_seconds(429, production, None), Some(15 * 60));
+        assert_eq!(sign_in_pause_seconds(429, "PJDesk could not sign in (429).", None), Some(15 * 60));
+        assert_eq!(sign_in_pause_seconds(429, "ignored", Some(150)), Some(150));
+        assert_eq!(sign_in_pause_seconds(429, "Wait 15 minutes", Some(61)), Some(61));
+        assert_eq!(sign_in_pause_seconds(429, "ignored", Some(100_000)), Some(15 * 60));
+        assert_eq!(sign_in_pause_seconds(429, "Too many tries. Try again in 2 minutes.", Some(120)), None);
+        assert_eq!(sign_in_pause_seconds(401, "Wrong email or password.", None), None);
+        assert_eq!(sign_in_pause_text(15 * 60), "Too many sign-in attempts. Try again in 15 minutes.");
+        assert_eq!(sign_in_pause_text(1), "Too many sign-in attempts. Try again in 1 minute.");
+        assert_eq!(sign_in_pause_text(61), "Too many sign-in attempts. Try again in 2 minutes.");
+        assert_eq!(sign_in_pause_text(150), "Too many sign-in attempts. Try again in 3 minutes.");
+        let carried = sign_in_pause_error(150);
+        assert_eq!(sign_in_pause_seconds_from_text(&carried), Some(150));
+        assert_eq!(sign_in_pause_user_text(&carried), "Too many sign-in attempts. Try again in 3 minutes.");
+        assert_eq!(sign_in_pause_seconds_from_text(&sign_in_pause_text(15 * 60)), Some(15 * 60));
+        assert_eq!(sign_in_pause_seconds_from_text(production), Some(15 * 60));
+        assert_eq!(sign_in_pause_seconds_from_text("Wrong email or password."), None);
+        assert_eq!(sign_in_pause_seconds_from_text("Too many tries. Try again in 2 minutes."), None);
+        assert_eq!(parse_retry_after("150"), Some(150));
+        assert_eq!(parse_retry_after(" 0 "), None);
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
     }
 }

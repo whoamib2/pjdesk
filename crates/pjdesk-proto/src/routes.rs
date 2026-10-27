@@ -40,6 +40,14 @@ impl ServerRoutes {
             && self.names.is_empty()
     }
 
+    /// True when a server published an IP. A hostname alone is not enough:
+    /// dialing must try those IPs before DNS.
+    pub fn has_advertised_ip(&self) -> bool {
+        self.primary_lan.iter().chain(self.primary_public.iter()).chain(self.standby_lan.iter()).chain(self.standby_public.iter()).any(
+            |addr| is_ip_endpoint(addr),
+        )
+    }
+
     /// Builds a catalog from the account fields older servers already publish.
     /// A hostname goes into `names`. An IP goes into the public list.
     pub fn from_legacy(
@@ -157,6 +165,139 @@ pub fn dial_targets(routes: &ServerRoutes, mine: &[Ipv4Addr], saved: &str) -> Ve
         push_unique(&mut order, canonical(saved));
     }
     order
+}
+
+/// The banner, then one `address: error` line for every dial that failed.
+pub fn registration_miss(attempts: &[(&str, &str)]) -> String {
+    let last = attempts
+        .last()
+        .map(|(_, err)| err.trim())
+        .filter(|err| !err.is_empty())
+        .unwrap_or("no address answered");
+    let mut text = format!("could not reach the primary or the standby; retrying. {last}");
+    for (addr, err) in attempts {
+        let addr = addr.trim();
+        if addr.is_empty() {
+            continue;
+        }
+        let err = err.trim();
+        let err = if err.is_empty() { "failed" } else { err };
+        text.push('\n');
+        text.push_str(addr);
+        text.push_str(": ");
+        text.push_str(err);
+    }
+    text
+}
+
+/// The per-address lines under the registration banner. The first line is the banner.
+pub fn registration_detail_lines(text: &str) -> Vec<String> {
+    text.lines().skip(1).map(str::trim).filter(|line| !line.is_empty()).map(str::to_string).collect()
+}
+
+/// LAN addresses of a peer that share a /24 with this computer, on the
+/// direct-connect port. Other subnets and hostnames are left out so a relay
+/// is not required for two computers on the same network.
+pub fn same_subnet_direct(addrs: &[String], mine: &[Ipv4Addr]) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in addrs {
+        if !on_subnet(raw, mine) {
+            continue;
+        }
+        let Some(ip) = endpoint_v4(raw) else { continue };
+        if ip.is_unspecified() || ip.is_loopback() || ip.is_broadcast() || ip.is_multicast() {
+            continue;
+        }
+        push_unique(&mut out, format!("{ip}:{}", crate::DIRECT_PORT));
+    }
+    out
+}
+
+/// The address a server named, then the advertised order.
+///
+/// A follow address that does not answer is not the only attempt. The primary
+/// LAN (same /24), the primary public IP, the other server, and DNS still run.
+pub fn registration_targets(follow: &str, routes: &ServerRoutes, mine: &[Ipv4Addr], saved: &str) -> Vec<String> {
+    let mut order = dial_targets(routes, mine, saved);
+    let follow = canonical(follow);
+    if follow.is_empty() {
+        return order;
+    }
+    order.retain(|addr| !same_endpoint(addr, &follow));
+    order.insert(0, follow);
+    order
+}
+
+/// Keeps addresses the new catalog left out.
+///
+/// A primary that only knows itself would otherwise erase the other server.
+/// Those addresses stay, so a computer can register with the new primary after
+/// the old one is gone.
+pub fn keep_other_server(previous: &ServerRoutes, incoming: &ServerRoutes) -> ServerRoutes {
+    if incoming.is_empty() {
+        return previous.clone();
+    }
+    let mut next = incoming.clone();
+    let previous_addrs: Vec<String> = previous
+        .primary_lan
+        .iter()
+        .chain(previous.primary_public.iter())
+        .chain(previous.standby_lan.iter())
+        .chain(previous.standby_public.iter())
+        .chain(previous.names.iter())
+        .cloned()
+        .collect();
+    let fill_primary = next.primary_lan.is_empty() && next.primary_public.is_empty();
+    let fill_standby = next.standby_lan.is_empty() && next.standby_public.is_empty();
+    if !fill_primary && !fill_standby {
+        return next;
+    }
+    for addr in previous_addrs {
+        if listed(&next, &addr) {
+            continue;
+        }
+        let (lan, public) = if fill_primary {
+            (&mut next.primary_lan, &mut next.primary_public)
+        } else {
+            (&mut next.standby_lan, &mut next.standby_public)
+        };
+        classify_kept(&addr, lan, public, &mut next.names);
+    }
+    next
+}
+
+/// Both servers published the same public IP. That address cannot reach both sites.
+pub fn shared_public_line(routes: &ServerRoutes) -> String {
+    let primary = public_ips(&routes.primary_public);
+    let standby = public_ips(&routes.standby_public);
+    for ip in &primary {
+        if standby.contains(ip) {
+            return format!(
+                "This server and the other server both advertise {ip}. Computers at the other site cannot use that address to reach this one. Set each server's public address to the address its own internet connection uses."
+            );
+        }
+    }
+    String::new()
+}
+
+/// The primary's public address did not accept a connection.
+pub fn probe_line(addr: &str, open: bool, from_outside: bool, self_check: bool) -> String {
+    if open || addr.trim().is_empty() {
+        return String::new();
+    }
+    if from_outside {
+        return format!(
+            "The primary's public address {addr} did not answer a reachability check from pjdesk.com. Computers that are not on its local network cannot register with it."
+        );
+    }
+    if self_check {
+        return format!(
+            "This server could not open its public address {addr}. Computers off this network may not be able to register. A router that does not loop that address back can fail this check even when the address works from outside."
+        );
+    }
+    format!(
+        "The primary's public address {addr} did not answer a reachability check from this server. Computers that are not on its local network cannot register with it."
+    )
 }
 
 /// LAN dials are short. Public IPs and hostnames get a few seconds.
@@ -319,6 +460,45 @@ fn with_port(raw: &str, port: u16) -> String {
     format!("{raw}:{port}")
 }
 
+fn listed(routes: &ServerRoutes, addr: &str) -> bool {
+    routes
+        .primary_lan
+        .iter()
+        .chain(routes.primary_public.iter())
+        .chain(routes.standby_lan.iter())
+        .chain(routes.standby_public.iter())
+        .chain(routes.names.iter())
+        .any(|have| same_endpoint(have, addr))
+}
+
+fn classify_kept(addr: &str, lan: &mut Vec<String>, public: &mut Vec<String>, names: &mut Vec<String>) {
+    let text = canonical(addr);
+    if text.is_empty() {
+        return;
+    }
+    if let Some(ip) = endpoint_v4(&text) {
+        if ip.is_private() {
+            push_unique(lan, text);
+        } else {
+            push_unique(public, text);
+        }
+    } else {
+        push_unique(names, text);
+    }
+}
+
+fn public_ips(list: &[String]) -> Vec<Ipv4Addr> {
+    let mut out = Vec::new();
+    for raw in list {
+        let Some(ip) = endpoint_v4(raw) else { continue };
+        if ip.is_private() || out.contains(&ip) {
+            continue;
+        }
+        out.push(ip);
+    }
+    out
+}
+
 fn push_unique(list: &mut Vec<String>, value: String) {
     if value.is_empty() || list.iter().any(|have| same_endpoint(have, &value)) {
         return;
@@ -414,6 +594,43 @@ mod tests {
     fn an_empty_catalog_still_dials_the_saved_address() {
         let order = dial_targets(&ServerRoutes::default(), &[], "office.example:21100");
         assert_eq!(order, vec!["office.example:21100".to_string()]);
+        assert!(!ServerRoutes::default().has_advertised_ip());
+    }
+
+    #[test]
+    fn a_cached_catalog_is_dialed_before_the_saved_hostname() {
+        let cached = ServerRoutes {
+            primary_lan: vec!["10.1.1.8:21200".into()],
+            primary_public: vec!["198.51.100.8:21200".into()],
+            standby_public: vec!["204.248.122.44:21200".into()],
+            ..ServerRoutes::default()
+        };
+        assert!(cached.has_advertised_ip());
+        let house = [v4(192, 168, 0, 10)];
+        let order = dial_targets(&cached, &house, "pjdesk.spader.us:21200");
+        assert_eq!(order[0], "198.51.100.8:21200");
+        assert!(order.iter().any(|addr| addr == "204.248.122.44:21200"));
+        assert!(!order.iter().any(|addr| addr.starts_with("10.1.1.8")), "cabin LAN is a different subnet");
+        assert_eq!(order.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
+        let cabin = [v4(10, 1, 1, 50)];
+        let from_cabin = dial_targets(&cached, &cabin, "pjdesk.spader.us:21200");
+        assert_eq!(from_cabin[0], "10.1.1.8:21200");
+        assert_eq!(from_cabin.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
+    }
+
+    #[test]
+    fn a_peer_on_this_subnet_is_dialed_on_the_direct_port() {
+        let mine = [v4(192, 168, 1, 10)];
+        let got = same_subnet_direct(
+            &[
+                "192.168.1.20:40000".into(),
+                "192.168.1.20:21201".into(),
+                "10.1.1.5:21201".into(),
+                "pjdesk.spader.us:21200".into(),
+            ],
+            &mine,
+        );
+        assert_eq!(got, vec!["192.168.1.20:21201".to_string()]);
     }
 
     #[test]
@@ -470,5 +687,76 @@ mod tests {
         );
         assert!(ours.is_empty());
         assert!(address_warning("pjdesk.spader.us:21200", &[], &lan, public).is_empty());
+    }
+
+    #[test]
+    fn a_dead_follow_address_does_not_hide_the_other_server() {
+        let house = [v4(192, 168, 0, 10)];
+        let order = registration_targets("192.168.0.20:21200", &sample(), &house, "pjdesk.spader.us:21200");
+        assert_eq!(order[0], "192.168.0.20:21200");
+        assert!(order.iter().any(|addr| addr == "198.51.100.8:21200"));
+        assert_eq!(order.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
+        // 10.1.1.8 is the standby LAN. The primary LAN is a different /24, so
+        // this computer dials the primary's public address first, then the
+        // standby it shares a subnet with.
+        let cabin = [v4(10, 1, 1, 50)];
+        let from_cabin = registration_targets("", &sample(), &cabin, "");
+        assert_eq!(from_cabin[0], "204.248.122.44:21200");
+        assert_eq!(from_cabin[1], "10.1.1.8:21200");
+        assert!(from_cabin.iter().any(|addr| addr == "198.51.100.8:21200"));
+        assert_eq!(from_cabin.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
+    }
+
+    #[test]
+    fn a_failed_registration_names_every_address_it_tried() {
+        let report = registration_miss(&[
+            ("192.168.0.20:21200", "timed out"),
+            ("204.248.122.44:21200", "connection refused"),
+            ("pjdesk.spader.us:21200", "timed out"),
+        ]);
+        assert!(report.starts_with("could not reach the primary or the standby; retrying. timed out"));
+        let lines = registration_detail_lines(&report);
+        assert_eq!(
+            lines,
+            vec![
+                "192.168.0.20:21200: timed out".to_string(),
+                "204.248.122.44:21200: connection refused".to_string(),
+                "pjdesk.spader.us:21200: timed out".to_string(),
+            ]
+        );
+        assert!(registration_detail_lines("could not reach the primary or the standby; retrying. timed out").is_empty());
+    }
+
+    #[test]
+    fn a_routes_push_that_omits_the_other_server_keeps_it() {
+        let previous = sample();
+        let only_house = ServerRoutes {
+            primary_lan: vec!["192.168.0.20:21200".into()],
+            primary_public: vec!["204.248.122.44:21200".into()],
+            names: vec!["pjdesk.spader.us:21200".into()],
+            ..ServerRoutes::default()
+        };
+        let kept = keep_other_server(&previous, &only_house);
+        assert!(kept.standby_public.iter().any(|addr| addr == "198.51.100.8:21200"));
+        assert!(kept.standby_lan.iter().any(|addr| addr == "10.1.1.8:21200"));
+        let house = [v4(192, 168, 1, 9)];
+        let order = dial_order(&kept, &house);
+        assert_eq!(order[0], "204.248.122.44:21200");
+        assert!(order.iter().any(|addr| addr == "198.51.100.8:21200"));
+        assert_eq!(order.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
+    }
+
+    #[test]
+    fn the_same_public_ip_on_both_servers_is_a_warning() {
+        let shared = shared_public_line(&sample());
+        assert!(shared.is_empty());
+        let mut both = sample();
+        both.standby_public = vec!["204.248.122.44:21200".into()];
+        let line = shared_public_line(&both);
+        assert!(line.contains("204.248.122.44"));
+        assert!(line.contains("other server"));
+        assert!(probe_line("198.51.100.8:21200", true, true, false).is_empty());
+        assert!(probe_line("198.51.100.8:21200", false, true, false).contains("pjdesk.com"));
+        assert!(probe_line("198.51.100.8:21200", false, false, true).contains("loop"));
     }
 }

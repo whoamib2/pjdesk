@@ -19,7 +19,9 @@ pub enum Step {
     /// Nothing to do. `log` is empty when the reason did not change.
     Stay { misses: u32, log: String },
     Promote { from: String, misses: u32 },
-    Yielded { epoch: u64, name: String },
+    /// Another server holds a newer generation. Migrate relayed sessions to
+    /// `primary`, then record standby. This does not write the role by itself.
+    YieldPending { epoch: u64, name: String, instance: String, primary: String },
 }
 
 /// TCP connect, then a UDP datagram. An answer on either one means the
@@ -65,11 +67,16 @@ pub fn watch_once(data_dir: &Path, misses: u32) -> Step {
         // Only the server that is currently accepting computers steps down.
         if let Some(peer) = higher_peer(&peers, &mine, local_epoch) {
             let healthy_for = Duration::from_secs(0);
-            if on_return(local_epoch, peer.epoch, false, healthy_for, false) == Yield::Demote {
-                let changed = cloud::yield_to_epoch(data_dir, peer.epoch, &peer.instance, &peer.name);
-                if changed {
-                    return Step::Yielded { epoch: peer.epoch, name: peer.name.clone() };
-                }
+            if on_return(local_epoch, peer.epoch, false, healthy_for, false) == Yield::Demote
+                && !cloud::already_fenced(data_dir, peer.epoch, &peer.instance)
+            {
+                let primary = pjdesk_proto::failover::move_target(&peer.public_addrs, &peer.lan_addrs, &peer.names);
+                return Step::YieldPending {
+                    epoch: peer.epoch,
+                    name: peer.name.clone(),
+                    instance: peer.instance.clone(),
+                    primary,
+                };
             }
         }
         return Step::Stay { misses: 0, log: String::new() };

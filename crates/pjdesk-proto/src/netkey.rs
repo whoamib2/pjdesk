@@ -16,7 +16,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use sha2::{Digest, Sha256};
 
-use crate::access::normalize_fingerprint;
+use crate::access::{normalize_fingerprint, ACCESS_KEY_PREFIX};
 
 pub const PREFIX: &str = "pjdesk-net1:";
 
@@ -31,6 +31,26 @@ pub const KEY_USED_UP: &str = "This network key has already been used the maximu
 pub const KEY_BOUND: &str = "This network key is for a specific account. Sign in as that account.";
 pub const KEY_INVALID: &str = "This network key is not valid.";
 pub const KEY_OPEN_FAILED: &str = "That network key could not be opened. Check the text and the passphrase.";
+
+/// A `pjdesk-key1.` secret was pasted where a network key was expected, or the other way around.
+pub const ACCESS_KEY_GOES: &str = "This is a server access key (pjdesk-key1). It enrolls this computer on the server without a PJDesk account. The key's expiry and computer limit still apply. Put it in Access key, or use Use a server access key. A network key starts with pjdesk-net1 and goes in Use a network key.";
+pub const NETWORK_KEY_GOES: &str = "This is a network key (pjdesk-net1). It goes in Sign in, Use a network key, or Import server config. A server access key starts with pjdesk-key1 and goes in Access key.";
+pub const KEY_NOT_EITHER: &str = "This network key is not valid. A network key starts with pjdesk-net1. A server access key starts with pjdesk-key1 and goes in Access key, or use Use a server access key.";
+pub const ACCESS_KEY_INCOMPLETE: &str = "This looks like a server access key (pjdesk-key1), but it is not complete. Create it in PJDesk Server, Server access keys, and paste the whole key. A network key starts with pjdesk-net1 and goes in Use a network key.";
+pub const ACCESS_KEY_NEEDS_SERVER: &str = "This is a server access key (pjdesk-key1). Type the server address from PJDesk Server. This computer then registers without a PJDesk account. A network key starts with pjdesk-net1 and goes in Use a network key.";
+
+/// What a pasted string is. Whitespace is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteKind {
+    /// `pjdesk-net1:` blob, still encrypted.
+    Network,
+    /// `pjdesk-key1.` plus a full url-safe secret.
+    Access,
+    /// Starts with `pjdesk-key1.` but the secret is too short or cut off.
+    AccessIncomplete,
+    /// Neither prefix.
+    Neither,
+}
 
 const MODE_PASSPHRASE: u8 = 1;
 const MODE_EMBEDDED: u8 = 2;
@@ -160,6 +180,45 @@ pub fn blob_from_text(text: &str) -> Option<String> {
         return None;
     }
     Some(format!("{PREFIX}{}", &rest[..end]))
+}
+
+fn compact_paste(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn access_body(text: &str) -> Option<(&str, usize)> {
+    let idx = text.find(ACCESS_KEY_PREFIX)?;
+    let rest = &text[idx + ACCESS_KEY_PREFIX.len()..];
+    let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')).unwrap_or(rest.len());
+    Some((&rest[..end], idx))
+}
+
+fn access_body_ok(body: &str) -> bool {
+    (40..=80).contains(&body.len()) && body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Tells a network key from a server access key. A short `pjdesk-key1.` is incomplete, not a network key.
+pub fn classify_paste(text: &str) -> PasteKind {
+    let compact = compact_paste(text);
+    if blob_from_text(&compact).is_some() {
+        return PasteKind::Network;
+    }
+    match access_body(&compact) {
+        Some((body, _)) if access_body_ok(body) => PasteKind::Access,
+        Some(_) => PasteKind::AccessIncomplete,
+        None => PasteKind::Neither,
+    }
+}
+
+/// The `pjdesk-key1.` secret inside `text`, when [`classify_paste`] says it is complete.
+pub fn access_key_from_text(text: &str) -> Option<String> {
+    let compact = compact_paste(text);
+    if classify_paste(&compact) != PasteKind::Access {
+        return None;
+    }
+    let (body, idx) = access_body(&compact)?;
+    let _ = idx;
+    Some(format!("{ACCESS_KEY_PREFIX}{body}"))
 }
 
 pub fn kind(blob: &str) -> Result<KeyKind, NetKeyError> {
@@ -429,6 +488,27 @@ mod tests {
         assert_eq!(blob_from_text(&format!("\n{blob} \n")).as_deref(), Some(blob.as_str()));
         assert!(blob_from_text("PJDesk-Setup-0.6.0--host=office.example,key=abc.exe").is_none());
         assert!(blob_from_text("just some text").is_none());
+        assert_eq!(classify_paste(&blob), PasteKind::Network);
+        assert!(NETWORK_KEY_GOES.contains("pjdesk-net1"));
+        assert!(NETWORK_KEY_GOES.contains("pjdesk-key1"));
+    }
+
+    #[test]
+    fn a_server_access_key_is_not_called_a_bad_network_key() {
+        let body = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let key = format!("{ACCESS_KEY_PREFIX}{body}");
+        assert!(access_body_ok(&body));
+        assert_eq!(classify_paste(&format!("  {key}\n")), PasteKind::Access);
+        assert_eq!(access_key_from_text(&key).as_deref(), Some(key.as_str()));
+        assert_eq!(classify_paste("pjdesk-key1."), PasteKind::AccessIncomplete);
+        assert_eq!(classify_paste("pjdesk-key1.abc"), PasteKind::AccessIncomplete);
+        assert_eq!(classify_paste("hello"), PasteKind::Neither);
+        assert!(ACCESS_KEY_GOES.contains("pjdesk-key1"));
+        assert!(ACCESS_KEY_GOES.contains("Use a server access key"));
+        assert!(KEY_NOT_EITHER.contains("pjdesk-net1"));
+        assert!(KEY_NOT_EITHER.contains("pjdesk-key1"));
+        assert!(ACCESS_KEY_INCOMPLETE.contains("not complete"));
+        assert!(ACCESS_KEY_NEEDS_SERVER.contains("server address"));
     }
 
     #[test]

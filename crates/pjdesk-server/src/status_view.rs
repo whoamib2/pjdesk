@@ -123,6 +123,12 @@ pub struct Snapshot {
     pub log_tail: String,
 }
 
+/// Local `online.json` or the cloud presence the primary published. A standby
+/// has an empty local file, so the cloud list is what makes the count real.
+pub fn row_is_online(local_online: bool, cloud_online: bool) -> bool {
+    local_online || cloud_online
+}
+
 /// One computer, safe to put on the status pipe. No password, secret, or key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListedDevice {
@@ -342,6 +348,7 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
     let Ok(file) = serde_json::from_slice::<File>(&bytes) else {
         return Vec::new();
     };
+    let cloud_online = crate::cloud::cloud_presence_online(dir);
     let online_fresh = crate::cloud::online_file_is_fresh(&dir.join("online.json"));
     let online: std::collections::BTreeMap<String, String> = if online_fresh {
         std::fs::read(dir.join("online.json"))
@@ -363,10 +370,10 @@ fn listed_devices(dir: &Path) -> Vec<ListedDevice> {
             let live = online.get(&id);
             let access_label = labels.get(&rec.access_key_id).cloned().unwrap_or_default();
             ListedDevice {
-                id,
+                id: id.clone(),
                 hostname: rec.hostname,
-                version: live.cloned().unwrap_or(rec.app_version),
-                online: live.is_some(),
+                version: live.cloned().filter(|version| !version.trim().is_empty()).unwrap_or(rec.app_version),
+                online: row_is_online(live.is_some(), cloud_online.contains(&id)),
                 signed_in: rec.signed_in,
                 last_ip: rec.last_ip,
                 first_seen: rec.first_seen,
@@ -564,5 +571,12 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_standby_counts_a_computer_the_cloud_says_is_online() {
+        assert!(!row_is_online(false, false));
+        assert!(row_is_online(false, true));
+        assert!(row_is_online(true, false));
     }
 }

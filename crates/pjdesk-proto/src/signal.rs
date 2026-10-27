@@ -24,6 +24,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Identifies one connection attempt between a controller and a host.
 pub type SessionId = u64;
 
+/// How often a registered computer pings. One missed reply means the server
+/// stopped answering, so the next dial starts within a few seconds.
+pub const HEARTBEAT: Duration = Duration::from_secs(2);
+/// No reply for this long also means the server stopped answering.
+pub const HEARTBEAT_SILENCE: Duration = Duration::from_secs(6);
+
 /// Messages sent by clients (hosts and controllers) to the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {
@@ -153,6 +159,33 @@ pub enum ClientMsg {
         computer_limit: u32,
         #[serde(default)]
         key_id: String,
+    },
+    /// 0.6.47+. The host has told this relayed session to open again on the
+    /// new primary. The server finishes stepping down after these arrive.
+    RelayMoved {
+        session_id: SessionId,
+    },
+    /// 0.6.47+. The current primary asks the standby to take the next
+    /// generation. Sent only to the paired server, over the shared server
+    /// certificate. An older server cannot decode it and drops the connection;
+    /// the primary then stays primary.
+    TakePrimary {
+        epoch: u64,
+        at: u64,
+        proof: [u8; 32],
+    },
+    /// 0.6.47+. Register this install. `device_secret` is the legacy secret
+    /// (Windows MachineGuid, or the stored random secret). `install_key` is
+    /// random and stored with this install, so two cloned images do not share
+    /// an ID. An older server cannot decode this and drops the connection;
+    /// the client registers again with [`ClientMsg::Register`].
+    RegisterInstall {
+        proto: u16,
+        device_id: Option<String>,
+        device_secret: [u8; 32],
+        install_key: [u8; 32],
+        hostname: String,
+        app_version: String,
     },
 }
 
@@ -349,6 +382,21 @@ pub enum ServerMsg {
     /// registration, and again when an address changes. Older clients are not
     /// sent this variant.
     Routes(crate::routes::ServerRoutes),
+    /// 0.6.47+. This server is leaving the primary role. A relayed session
+    /// opens again on `primary` now, before the role change finishes.
+    /// Sent only to a client whose version can decode it.
+    MoveRelay {
+        session_id: SessionId,
+        primary: String,
+    },
+    /// 0.6.47+. Reply to [`ClientMsg::TakePrimary`]. Sent only to the paired
+    /// server. Hosts and phones are not sent this variant.
+    Handoff {
+        ok: bool,
+        epoch: u64,
+        name: String,
+        message: String,
+    },
 }
 
 /// One server access key, safe to list. The secret and its hash are not here.
@@ -555,6 +603,28 @@ mod tests {
         assert_eq!(keys[0], 13, "AccessKeys is appended after WantHostReport");
         let routes = postcard::to_stdvec(&ServerMsg::Routes(crate::routes::ServerRoutes::default())).unwrap();
         assert_eq!(routes[0], 14, "Routes is appended after AccessKeys");
+        let moved = postcard::to_stdvec(&ClientMsg::RelayMoved { session_id: 1 }).unwrap();
+        let take = postcard::to_stdvec(&ClientMsg::TakePrimary { epoch: 6, at: 1, proof: [9; 32] }).unwrap();
+        assert_eq!(take[0], moved[0] + 1, "TakePrimary is appended after RelayMoved");
+        let install = postcard::to_stdvec(&ClientMsg::RegisterInstall {
+            proto: 3,
+            device_id: None,
+            device_secret: [1u8; 32],
+            install_key: [2u8; 32],
+            hostname: "PC".into(),
+            app_version: "0.6.46".into(),
+        })
+        .unwrap();
+        assert_eq!(install[0], take[0] + 1, "RegisterInstall is appended after TakePrimary");
+        let move_relay = postcard::to_stdvec(&ServerMsg::MoveRelay { session_id: 1, primary: "x".into() }).unwrap();
+        let handoff = postcard::to_stdvec(&ServerMsg::Handoff {
+            ok: true,
+            epoch: 7,
+            name: "CHIP20".into(),
+            message: String::new(),
+        })
+        .unwrap();
+        assert_eq!(handoff[0], move_relay[0] + 1, "Handoff is appended after MoveRelay");
         let back: ClientMsg = postcard::from_bytes(&ping).unwrap();
         assert!(matches!(back, ClientMsg::Ping));
         match postcard::from_bytes::<ServerMsg>(&keys).unwrap() {

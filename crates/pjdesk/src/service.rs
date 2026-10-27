@@ -607,6 +607,7 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
         status.acked_unix = shared.acked_unix.load(std::sync::atomic::Ordering::SeqCst);
         status.server = shared.server();
         status.app_version = env!("CARGO_PKG_VERSION").into();
+        status.error = shared.error().unwrap_or_default();
         status.support_code = shared.support_code();
         status.support_password = shared.support_password();
         status.support_born_unix = shared.support_born();

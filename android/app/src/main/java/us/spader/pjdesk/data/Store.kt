@@ -30,7 +30,24 @@ class Store(context: Context) {
 
     init {
         movePlainPermanentIntoKeystore()
+        decideSavedSyncOnLoad()
         if (markerFile.exists()) endTemporaryVisit()
+    }
+
+    /**
+     * `yes` downloads the account's saved computers. `no` leaves this phone's
+     * list alone. Empty is a phone from before the choice.
+     */
+    var savedSyncChoice: String
+        get() = prefs.getString("savedSync", "") ?: ""
+        set(value) { prefs.edit().putString("savedSync", value).commit() }
+
+    fun syncsSavedComputers(): Boolean = savedSyncChoice == "yes"
+
+    /** An update keeps a list that is already on this phone. It does not wipe it. */
+    fun decideSavedSyncOnLoad() {
+        val next = us.spader.pjdesk.core.savedSyncChoiceOnUpdate(savedSyncChoice, saved().size)
+        if (next != savedSyncChoice) savedSyncChoice = next
     }
 
     /** Server access key. Sealed in the Android keystore. Not written to pjdesk.json. */
@@ -251,6 +268,8 @@ class Store(context: Context) {
      * A later refresh leaves a nickname typed on this phone. Passwords are a separate sealed vault.
      */
     fun mergeCloud(remote: List<SavedComputer>, preferAccount: Boolean = false) {
+        if (!us.spader.pjdesk.core.mergeSavedFromAccount(localSavedCleared, preferAccount)) return
+        if (preferAccount) localSavedCleared = false
         val local = saved().toMutableList()
         for (incoming in remote) {
             if (incoming.id.length != 9) continue
@@ -332,6 +351,11 @@ class Store(context: Context) {
     var networkEmail: String
         get() = prefs.getString("networkEmail", "") ?: ""
         set(value) { prefs.edit().putString("networkEmail", value).apply() }
+
+    /** Joined with a code or a key. The account email may be known. The password was not typed here. */
+    var joinedWithoutPassword: Boolean
+        get() = prefs.getBoolean("joinedWithoutPassword", false)
+        set(value) { prefs.edit().putBoolean("joinedWithoutPassword", value).apply() }
 
     /** The encrypted network key last applied here. The passphrase is not stored. */
     var networkKey: String
@@ -458,9 +482,12 @@ class Store(context: Context) {
         set(value) { prefs.edit().putString("accountPinEmail", value).commit() }
 
     fun hasAccountPin(): Boolean {
-        val email = networkEmail.trim().lowercase()
+        val stored = accountPinEmail.trim().lowercase()
+        val email = networkEmail.trim().lowercase().ifBlank {
+            if (joinedWithoutPassword) stored else ""
+        }
         return email.isNotEmpty()
-            && email == accountPinEmail.trim().lowercase()
+            && email == stored
             && accountPinHash.length == 64
             && accountPinSalt.isNotBlank()
             && accountPinIters > 0
@@ -534,6 +561,34 @@ class Store(context: Context) {
 
     fun temporaryActive(): Boolean = markerFile.exists()
 
+    /**
+     * The saved list on this phone was cleared. Account refreshes must not
+     * put it back. The next explicit sign-in clears this.
+     */
+    var localSavedCleared: Boolean
+        get() = prefs.getBoolean("localSavedCleared", false)
+        set(value) { prefs.edit().putBoolean("localSavedCleared", value).commit() }
+
+    /** The next sign-in may fill the saved list from the account again. */
+    fun allowSavedMerge() {
+        localSavedCleared = false
+    }
+
+    /**
+     * Drops the saved list, cached passwords, recents, and saved LAN addresses
+     * on this phone. The account is not changed.
+     */
+    fun clearLocalSaved() {
+        writeSaved(emptyList())
+        passwordBlob.write("{}")
+        prefs.edit()
+            .putString("passwordTimes", "{}")
+            .putString("recent", "{}")
+            .putString("lanPaths", "{}")
+            .putBoolean("localSavedCleared", true)
+            .commit()
+    }
+
     /** Remembers the saved list from before a temporary sign-in. */
     fun beginTemporaryVisit() {
         if (savedFile.exists()) savedFile.copyTo(snapshotFile, overwrite = true) else snapshotFile.writeText("[]")
@@ -550,19 +605,17 @@ class Store(context: Context) {
         markerFile.writeText(obj.toString())
     }
 
-    /** Puts the saved list and passwords back, and clears the account email. */
+    /**
+     * Ends a temporary sign-in. The saved list, cached passwords, and recents
+     * on this phone are cleared. The account on pjdesk.com is not deleted.
+     */
     fun endTemporaryVisit() {
         if (!markerFile.exists() && !snapshotFile.exists()) return
-        val marker = runCatching { JSONObject(if (markerFile.exists()) markerFile.readText() else "{}") }.getOrNull()
-        if (snapshotFile.exists()) {
-            snapshotFile.copyTo(savedFile, overwrite = true)
-            snapshotFile.delete()
-        }
-        marker?.optJSONArray("passwords")?.let { arr ->
-            for (i in 0 until arr.length()) saveComputerPassword(arr.optString(i), "")
-        }
+        clearLocalSaved()
         networkEmail = ""
+        joinedWithoutPassword = false
         saveNetworkRefresh("")
+        snapshotFile.delete()
         markerFile.delete()
     }
 

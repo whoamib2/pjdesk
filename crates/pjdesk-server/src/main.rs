@@ -26,6 +26,7 @@ mod public_addr;
 mod registry;
 mod relay;
 mod requests;
+mod role_handoff;
 mod self_update;
 mod server;
 #[cfg(windows)]
@@ -590,26 +591,17 @@ fn cloud_command(cmd: CloudCommand, data_dir: &std::path::Path) -> Result<()> {
                 println!("Cancelled.");
                 return Ok(());
             }
-            if cloud::status_is_fresh(data_dir) {
-                requests::push(data_dir, requests::PROMOTE_FILE, "now")?;
-                println!("Asked the running server to become the primary.");
-            } else {
-                cloud::promote(data_dir)?;
-                println!("This server is now the primary.");
-            }
+            println!("{}", role_handoff::become_primary(data_dir)?);
         }
         CloudCommand::Demote { yes } => {
-            if !confirm(yes, "Step this server down to standby? It will stop uploading. The other server stays primary until you promote it.")? {
+            if !confirm(
+                yes,
+                "Step this server down? It hands the primary to the other server and stays primary if that server does not take it.",
+            )? {
                 println!("Cancelled.");
                 return Ok(());
             }
-            if cloud::status_is_fresh(data_dir) {
-                requests::push(data_dir, requests::DEMOTE_FILE, "now")?;
-                println!("Asked the running server to step down to standby.");
-            } else {
-                cloud::demote(data_dir)?;
-                println!("This server is now on standby.");
-            }
+            println!("{}", role_handoff::step_down(data_dir)?);
         }
         CloudCommand::Off => {
             cloud::turn_off(data_dir);

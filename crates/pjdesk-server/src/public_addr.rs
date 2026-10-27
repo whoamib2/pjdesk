@@ -64,17 +64,29 @@ pub fn save(data_dir: &Path, address: &PublicAddress) {
 pub fn ensure(data_dir: &Path, port: u16) -> PublicAddress {
     if let Some(mut existing) = load(data_dir) {
         if !existing.address.trim().is_empty() {
-            if is_hostname(&existing.address) {
+            let host = legacy_host();
+            let saved_host = host_of(&existing.address).unwrap_or("");
+            // A name the operator typed stays. The shared legacy name does not,
+            // when this server's own public address is a different IP.
+            if is_hostname(&existing.address) && !saved_host.eq_ignore_ascii_case(host) {
                 return existing;
             }
             let port = if port == 0 { remembered_port(data_dir) } else { port };
-            let host = legacy_host();
-            let restored = prefer_hostname(&existing.address, host, port, &resolve_host(host));
+            let observed = IpWatch::load(data_dir).observed.parse().ok();
+            let restored = keep_distinct_public(&existing.address, host, port, &resolve_host(host), observed);
             if restored != existing.address.trim() {
+                let kept_name = is_hostname(&restored);
                 existing.address = restored;
-                existing.source = "legacy".into();
-                existing.note =
-                    "Kept the hostname computers already use. A public IP change does not replace it.".into();
+                if kept_name {
+                    existing.source = "legacy".into();
+                    existing.note =
+                        "Kept the hostname computers already use. A public IP change does not replace it.".into();
+                } else {
+                    existing.source = "public-ip".into();
+                    existing.note = format!(
+                        "This server's public address is not an address {host} points at, so that shared name was not published."
+                    );
+                }
                 save(data_dir, &existing);
             }
             return existing;
@@ -239,6 +251,35 @@ pub fn prefer_hostname(current: &str, legacy_host: &str, port: u16, legacy_ips: 
         return format!("{legacy_host}:{port}");
     }
     current.to_string()
+}
+
+/// A saved IP that is not the legacy name's address stays. Rewriting it to
+/// `pjdesk.spader.us` would publish the other site's address.
+///
+/// When this server observes a public IP that the legacy name does not point
+/// at, a saved copy of that name or of the name's IP is replaced. Both sites
+/// had been publishing 204.248.122.44 because the name resolved there.
+pub fn keep_distinct_public(
+    current: &str,
+    legacy_host: &str,
+    port: u16,
+    legacy_ips: &[IpAddr],
+    observed: Option<IpAddr>,
+) -> String {
+    if let Some(ip) = observed {
+        if !is_private_ip(ip) && !legacy_ips.is_empty() && !legacy_ips.contains(&ip) {
+            let current_ip = host_of(current).and_then(|host| host.parse::<IpAddr>().ok());
+            let saved_is_shared = current.trim().is_empty()
+                || host_of(current).is_some_and(|host| host.eq_ignore_ascii_case(legacy_host))
+                || current_ip.is_some_and(|saved| legacy_ips.contains(&saved));
+            if saved_is_shared {
+                let port = if port == 0 { pjdesk_proto::DEFAULT_PORT } else { port };
+                return format_endpoint(ip, port);
+            }
+            return current.trim().to_string();
+        }
+    }
+    prefer_hostname(current, legacy_host, port, legacy_ips)
 }
 
 /// The toggle defaults on for an IP or an empty field, and off for a hostname.
@@ -503,22 +544,84 @@ pub fn refresh_address_warning(data_dir: &Path) -> String {
     let path = data_dir.join(WARN_FILE);
     let cache: WarnCache = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
     let host = host_of(&published).unwrap_or("").to_string();
-    if !host.is_empty() && cache.host == host && cache.at != 0 && now.saturating_sub(cache.at) < IP_CHECK_EVERY {
-        return cache.text;
-    }
-    let resolved = if is_hostname(&published) {
-        resolve_host(&host)
-    } else if let Ok(ip) = host.parse::<IpAddr>() {
-        vec![ip]
+    let routes = crate::cloud::advertised_routes(data_dir);
+    let shared = pjdesk_proto::routes::shared_public_line(&routes);
+    let base = if !host.is_empty() && cache.host == host && cache.at != 0 && now.saturating_sub(cache.at) < IP_CHECK_EVERY
+    {
+        cache.text
     } else {
-        Vec::new()
+        let resolved = if is_hostname(&published) {
+            resolve_host(&host)
+        } else if let Ok(ip) = host.parse::<IpAddr>() {
+            vec![ip]
+        } else {
+            Vec::new()
+        };
+        let dns = pjdesk_proto::routes::address_warning(&published, &resolved, &lan, public_ip);
+        let primary = routes.primary_public.iter().find(|addr| {
+            pjdesk_proto::routes::endpoint_v4(addr).is_some_and(|ip| !ip.is_private())
+        });
+        let probe = match primary {
+            Some(addr) => {
+                let addr = pjdesk_proto::routes::canonical(addr);
+                let self_check = crate::cloud::accepts_host_registrations(data_dir);
+                let (open, outside) = match crate::cloud::CloudConfig::load(data_dir) {
+                    Some(cfg) if cfg.is_account() && !cfg.token.is_empty() => {
+                        match worker_says_open(&cfg.api, &cfg.token, &addr) {
+                            Some(open) => (open, true),
+                            None => (tcp_open(&addr), false),
+                        }
+                    }
+                    _ => (tcp_open(&addr), false),
+                };
+                pjdesk_proto::routes::probe_line(&addr, open, outside, self_check)
+            }
+            None => String::new(),
+        };
+        let mut parts = Vec::new();
+        if !dns.is_empty() {
+            parts.push(dns);
+        }
+        if !probe.is_empty() {
+            parts.push(probe);
+        }
+        let text = parts.join(" ");
+        let next = WarnCache { host, at: now, text: text.clone() };
+        if let Ok(bytes) = serde_json::to_vec(&next) {
+            let _ = std::fs::write(path, bytes);
+        }
+        text
     };
-    let text = pjdesk_proto::routes::address_warning(&published, &resolved, &lan, public_ip);
-    let next = WarnCache { host, at: now, text: text.clone() };
-    if let Ok(bytes) = serde_json::to_vec(&next) {
-        let _ = std::fs::write(path, bytes);
+    if shared.is_empty() {
+        base
+    } else if base.is_empty() {
+        shared
+    } else {
+        format!("{base} {shared}")
     }
-    text
+}
+
+fn tcp_open(addr: &str) -> bool {
+    let Ok(sock) = addr.parse::<std::net::SocketAddr>() else { return false };
+    std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_secs(3)).is_ok()
+}
+
+/// Asks the Worker to open `addr` from outside. `None` when that route is not
+/// deployed yet, so the caller falls back to a connection from this server.
+fn worker_says_open(api: &str, token: &str, addr: &str) -> Option<bool> {
+    let (host, port) = addr.rsplit_once(':')?;
+    if host.parse::<std::net::Ipv4Addr>().is_err() || token.is_empty() {
+        return None;
+    }
+    let url = format!("{}/api/probe?host={host}&port={port}", api.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(5)).build();
+    let resp = agent.get(&url).set("Authorization", &format!("Bearer {token}")).call().ok()?;
+    if resp.status() != 200 {
+        return None;
+    }
+    let text = resp.into_string().ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("open").and_then(|flag| flag.as_bool())
 }
 
 pub fn stored_address_warning(data_dir: &Path) -> String {
@@ -650,6 +753,38 @@ mod tests {
         assert_eq!(restored, "pjdesk.spader.us:21200");
         let foreign = prefer_hostname("198.51.100.8:21200", "pjdesk.spader.us", 21200, &[v4(204, 248, 122, 44)]);
         assert_eq!(foreign, "198.51.100.8:21200");
+        let cabin = keep_distinct_public(
+            "68.234.75.68:21200",
+            "pjdesk.spader.us",
+            21200,
+            &[v4(204, 248, 122, 44)],
+            Some(v4(68, 234, 75, 68)),
+        );
+        assert_eq!(cabin, "68.234.75.68:21200");
+        let shared_ip = keep_distinct_public(
+            "204.248.122.44:21200",
+            "pjdesk.spader.us",
+            21200,
+            &[v4(204, 248, 122, 44)],
+            Some(v4(68, 234, 75, 68)),
+        );
+        assert_eq!(shared_ip, "68.234.75.68:21200");
+        let shared_name = keep_distinct_public(
+            "pjdesk.spader.us:21200",
+            "pjdesk.spader.us",
+            21200,
+            &[v4(204, 248, 122, 44)],
+            Some(v4(68, 234, 75, 68)),
+        );
+        assert_eq!(shared_name, "68.234.75.68:21200");
+        let house = keep_distinct_public(
+            "pjdesk.spader.us:21200",
+            "pjdesk.spader.us",
+            21200,
+            &[v4(204, 248, 122, 44)],
+            Some(v4(204, 248, 122, 44)),
+        );
+        assert_eq!(house, "pjdesk.spader.us:21200");
         assert_eq!(
             address_after_ip_change("pjdesk.spader.us:21200", "203.0.113.9", 21200, true),
             "pjdesk.spader.us:21200"

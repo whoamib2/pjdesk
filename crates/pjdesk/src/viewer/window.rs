@@ -8,7 +8,8 @@
 //!
 //! Local shortcut (not sent to the host): Ctrl+Alt+Enter toggles full screen.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use pjdesk_proto::format_id;
 use pjdesk_proto::peer::{ControlMsg, InputEvent, MouseButton, VideoHeader, KEY_NUMPAD_DIGIT};
-use quinn::{Connection, SendStream};
+use quinn::{Connection, Endpoint, SendStream};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -38,14 +39,16 @@ use pjdesk_proto::peer::SpecialCommand;
 /// Events delivered to the window from other threads.
 #[derive(Debug)]
 enum UserEvent {
-    /// A new decoded frame is ready.
-    Frame,
-    /// New title text (statistics).
-    Title(String),
-    /// The connection ended.
-    Closed(String),
+    /// A new decoded frame is ready for this session.
+    Frame(u64),
+    /// New title text (statistics) for this session.
+    Title { session: u64, text: String },
+    /// The connection ended for this session.
+    Closed { session: u64, reason: String },
     /// Files dragged onto the viewer from Explorer.
     Files(Vec<std::path::PathBuf>),
+    /// Another computer was accepted, or a connect finished.
+    Work,
 }
 
 /// Hand-off point between the decoder thread and the window.
@@ -63,37 +66,91 @@ struct Stats {
     encode_us: AtomicU64,
 }
 
+/// Enough to open the same computer again without asking for the password.
+///
+/// The password stays in this process. It is not written to the log.
+#[derive(Clone)]
+pub(crate) struct Seed {
+    pub server: String,
+    pub target: String,
+    pub password: String,
+    pub direct: Option<String>,
+    pub force_relay: bool,
+    pub display: u8,
+    pub view: u8,
+    pub remember: bool,
+    pub from_store: bool,
+    pub files: bool,
+    pub label: String,
+    /// Addresses that reached this computer without the relay.
+    pub direct_targets: Vec<std::net::SocketAddr>,
+    pub host_fingerprint: Option<pjdesk_proto::tls::Fingerprint>,
+}
+
+#[derive(Clone)]
+enum SessionCover {
+    Reconnecting,
+    Lost,
+    Ended(String),
+}
+
 pub enum ViewerStop {
     /// The person closed the window.
     UserClosed,
     /// The host is restarting. Wait, then connect again.
     HostRestart,
-    /// A relayed session lost the server. Connect again with the same password.
-    RelayResume,
+    /// A relayed session is moving to the primary. Connect again with the same password.
+    /// `primary` is empty when the account's current primary should be used.
+    RelayResume { primary: String },
 }
 
-pub fn run(runtime: &Runtime, link: Link) -> Result<ViewerStop> {
+struct Armed {
+    title: String,
+    slot: Arc<FrameSlot>,
+    control: mpsc::UnboundedSender<ControlMsg>,
+    live: Arc<Mutex<super::controls::Live>>,
+    cmds: mpsc::UnboundedSender<super::controls::Cmd>,
+    saw_picture: Arc<AtomicBool>,
+    host_name: String,
+    peer_id: String,
+    connection: Connection,
+    endpoint: Endpoint,
+    retire: Arc<AtomicBool>,
+}
+
+enum Queued {
+    Admit(crate::session_window::Admit),
+    Linked { sid: u64, link: Link, seed: Seed },
+    Failed { sid: u64, error: String, id: String, files: bool, from_store: bool },
+    Relinked { sid: u64, link: Link },
+    RelinkFailed { sid: u64, error: String },
+}
+
+fn arm_link(
+    runtime: &tokio::runtime::Handle,
+    link: Link,
+    proxy: &EventLoopProxy<UserEvent>,
+    sid: u64,
+    view: u8,
+    display: u8,
+) -> Result<Armed> {
     if let Some(reason) = link.connection.close_reason() {
         let text = format!("The host closed the session before the window opened: {reason}");
         crate::note_failure(&text);
         anyhow::bail!(text);
     }
-    crate::note_status("Opening the viewer window");
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build().context("could not create the viewer window")?;
-    let proxy = event_loop.create_proxy();
     let slot = Arc::new(FrameSlot::default());
     let stats = Arc::new(Stats::default());
     let (control_tx, control_rx) = mpsc::unbounded_channel::<ControlMsg>();
     let (frame_tx, frame_rx) = std::sync::mpsc::channel::<(VideoHeader, Vec<u8>)>();
-
-    let Link { connection, endpoint, control_send, control_recv, host_name, host_id, path, peer_proto } = link;
+    let Link { connection, endpoint, control_send, control_recv, host_name, host_id, path, peer_proto, .. } = link;
     let relayed = matches!(path, crate::p2p::LinkPath::Relay(_));
     let title = format!("{host_name} ({}) — PJDesk, {path}", format_id(&host_id));
-
+    let retire = Arc::new(AtomicBool::new(false));
     runtime.spawn(send_control(control_send, control_rx));
     let wake_proxy = proxy.clone();
     let (live, cmds, recorder) = super::controls::start(
-        runtime.handle().clone(),
+        runtime.clone(),
         connection.clone(),
         control_recv,
         control_tx.clone(),
@@ -101,37 +158,184 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<ViewerStop> {
         peer_proto,
         host_id.clone(),
         relayed,
+        Some(view),
+        Some(display),
         move || {
-            let _ = wake_proxy.send_event(UserEvent::Frame);
+            let _ = wake_proxy.send_event(UserEvent::Frame(sid));
         },
     );
-    runtime.spawn(report_stats(connection.clone(), stats.clone(), proxy.clone(), title.clone()));
+    runtime.spawn(report_stats(connection.clone(), stats.clone(), proxy.clone(), title.clone(), sid, retire.clone()));
     {
-        let (slot, control_tx, proxy, stats, recorder) =
-            (slot.clone(), control_tx.clone(), proxy.clone(), stats.clone(), recorder.clone());
+        let (slot, control_tx, proxy, stats, recorder, retire) =
+            (slot.clone(), control_tx.clone(), proxy.clone(), stats.clone(), recorder.clone(), retire.clone());
         std::thread::Builder::new()
             .name("decoder".into())
-            .spawn(move || decode_loop(frame_rx, slot, control_tx, proxy, stats, recorder))?;
+            .spawn(move || decode_loop(frame_rx, slot, control_tx, proxy, stats, recorder, sid, retire))?;
     }
+    let saw_picture = Arc::new(AtomicBool::new(false));
+    let saw_watch = saw_picture.clone();
+    let live_watch = live.clone();
+    let host_for_watch = host_name.clone();
+    let proxy_watch = proxy.clone();
+    let retire_watch = retire.clone();
+    runtime.spawn(async move {
+        watch_picture(sid, saw_watch, live_watch, host_for_watch, proxy_watch, retire_watch).await;
+    });
+    Ok(Armed {
+        title,
+        slot,
+        control: control_tx,
+        live,
+        cmds,
+        saw_picture,
+        host_name,
+        peer_id: host_id,
+        connection,
+        endpoint,
+        retire,
+    })
+}
 
+async fn watch_picture(
+    session: u64,
+    saw: Arc<AtomicBool>,
+    live: Arc<Mutex<super::controls::Live>>,
+    host_name: String,
+    proxy: EventLoopProxy<UserEvent>,
+    retire: Arc<AtomicBool>,
+) {
+    let started = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if retire.load(Ordering::SeqCst) || saw.load(Ordering::Relaxed) {
+            return;
+        }
+        let guard = live.lock().unwrap();
+        if guard.resume_relay {
+            drop(guard);
+            if !retire.load(Ordering::SeqCst) {
+                let _ = proxy.send_event(UserEvent::Closed {
+                    session,
+                    reason: pjdesk_proto::failover::RELAY_RESUME.into(),
+                });
+            }
+            return;
+        }
+        if guard.restart {
+            return;
+        }
+        if let Some(text) = guard.closed.clone() {
+            drop(guard);
+            if !retire.load(Ordering::SeqCst) {
+                let _ = proxy.send_event(UserEvent::Closed { session, reason: text });
+            }
+            return;
+        }
+        let notices = guard.notices.clone();
+        drop(guard);
+        let limit = super::controls::picture_limit_secs(&notices);
+        if started.elapsed() < Duration::from_secs(limit) {
+            continue;
+        }
+        if saw.load(Ordering::Relaxed) || retire.load(Ordering::SeqCst) {
+            return;
+        }
+        let text = super::controls::picture_gave_up(&host_name, &notices);
+        let mut guard = live.lock().unwrap();
+        if guard.closed.is_some() || guard.restart || saw.load(Ordering::Relaxed) || retire.load(Ordering::SeqCst) {
+            return;
+        }
+        crate::note_failure(&text);
+        guard.closed = Some(text.clone());
+        drop(guard);
+        let _ = proxy.send_event(UserEvent::Closed { session, reason: text });
+        return;
+    }
+}
+
+fn serve_admits(
+    stop: Arc<AtomicBool>,
+    proxy: EventLoopProxy<UserEvent>,
+    queue: Arc<Mutex<Vec<Queued>>>,
+) {
+    let listener = match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(e) => {
+            warn!("session tabs: could not listen for another computer: {e}");
+            return;
+        }
+    };
+    let Ok(port) = listener.local_addr().map(|addr| addr.port()) else { return };
+    if let Err(e) = crate::session_window::publish_listener(port) {
+        warn!("session tabs: could not publish the listener: {e}");
+        return;
+    }
+    info!("Session window is listening for more computers");
+    let _ = listener.set_nonblocking(true);
+    while !stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((mut sock, addr)) => {
+                if !addr.ip().is_loopback() {
+                    continue;
+                }
+                let _ = sock.set_nonblocking(false);
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = sock.set_write_timeout(Some(Duration::from_secs(2)));
+                if let Some(admit) = crate::session_window::read_admit(&mut sock) {
+                    let _ = sock.write_all(b"ok\n");
+                    queue.lock().unwrap().push(Queued::Admit(admit));
+                    let _ = proxy.send_event(UserEvent::Work);
+                } else {
+                    let _ = sock.write_all(b"no\n");
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    crate::session_window::take_down_listener(port);
+}
+
+pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> {
+    crate::note_status("Opening the viewer window");
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().context("could not create the viewer window")?;
+    let proxy = event_loop.create_proxy();
+    let view = seed.view;
+    let display = seed.display;
+    if !link.direct_targets.is_empty() {
+        seed.direct_targets = link.direct_targets.clone();
+    }
+    seed.host_fingerprint = link.host_fingerprint.or(seed.host_fingerprint);
+    let armed = arm_link(runtime.handle(), link, &proxy, 1, view, display)?;
     let loaded = crate::config::Config::load().ok();
     let theme_name = loaded.as_ref().map(|c| c.settings.theme.clone()).unwrap_or_default();
     let mut toolbar = toolbar::Toolbar::default();
     let follow_system_theme = theme_name != "light" && theme_name != "dark";
-    if theme_name == "light" {
+    let light = theme_name == "light";
+    if light {
         toolbar.set_light(true);
     }
+    let host_id = armed.peer_id.clone();
     let places =
         loaded.as_ref().and_then(|c| c.settings.peers.get(&host_id).map(|n| n.windows.clone())).unwrap_or_default();
-    let live_watch = live.clone();
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let stop_listener = Arc::new(AtomicBool::new(false));
+    let listener = {
+        let stop = stop_listener.clone();
+        let proxy = proxy.clone();
+        let queue = queue.clone();
+        std::thread::Builder::new().name("session-tabs".into()).spawn(move || serve_admits(stop, proxy, queue)).ok()
+    };
     let mut app = App {
-        title,
+        title: armed.title,
         window: None,
         surface: None,
-        slot,
+        slot: armed.slot,
         current: None,
         layout: Layout::default(),
-        control: control_tx,
+        control: armed.control,
         sized_to_remote: false,
         keys_down: HashMap::new(),
         modifiers: ModifiersState::empty(),
@@ -142,15 +346,16 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<ViewerStop> {
         toolbar,
         zoom: Zoom::Fit,
         pan: (0, 0),
-        live,
-        cmds,
+        live: armed.live,
+        cmds: armed.cmds,
         panel: super::panel::Panel::default(),
         restarting: false,
         relay_resume: false,
-        peer_id: host_id.clone(),
-        host_name,
+        relay_primary: String::new(),
+        peer_id: armed.peer_id,
+        host_name: armed.host_name,
         extra: Vec::new(),
-        primary_display: std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
+        primary_display: display,
         toast: None,
         sent_watch: Vec::new(),
         places,
@@ -162,57 +367,30 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<ViewerStop> {
         fitted_extra: None,
         android_stroke: pjdesk_proto::gesture::StrokeTracker::default(),
         pointer_down: false,
-        saw_picture: Arc::new(AtomicBool::new(false)),
+        saw_picture: armed.saw_picture,
         failed_open: None,
         window_shown: Arc::new(AtomicBool::new(false)),
         proxy: proxy.clone(),
+        sid: 1,
+        seed,
+        connection: armed.connection,
+        endpoint: armed.endpoint,
+        retire: armed.retire,
+        others: Vec::new(),
+        tab_order: vec![1],
+        connecting: Vec::new(),
+        cancelled: HashSet::new(),
+        relinking: HashSet::new(),
+        cover: HashMap::new(),
+        resume_stop: Arc::new(Mutex::new(HashSet::new())),
+        confirm_close: false,
+        queue,
+        rt: runtime.handle().clone(),
+        next_sid: 2,
+        light,
     };
-    let saw_watch = app.saw_picture.clone();
-    let host_for_watch = app.host_name.clone();
-    let proxy_watch = proxy.clone();
-    runtime.spawn(async move {
-        let started = tokio::time::Instant::now();
-        loop {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            if saw_watch.load(Ordering::Relaxed) {
-                return;
-            }
-            let guard = live_watch.lock().unwrap();
-            if guard.resume_relay {
-                drop(guard);
-                let _ = proxy_watch.send_event(UserEvent::Closed(pjdesk_proto::failover::RELAY_RESUME.into()));
-                return;
-            }
-            if guard.restart {
-                return;
-            }
-            if let Some(text) = guard.closed.clone() {
-                drop(guard);
-                let _ = proxy_watch.send_event(UserEvent::Closed(text));
-                return;
-            }
-            let notices = guard.notices.clone();
-            drop(guard);
-            let limit = super::controls::picture_limit_secs(&notices);
-            if started.elapsed() < Duration::from_secs(limit) {
-                continue;
-            }
-            if saw_watch.load(Ordering::Relaxed) {
-                return;
-            }
-            let text = super::controls::picture_gave_up(&host_for_watch, &notices);
-            let mut guard = live_watch.lock().unwrap();
-            if guard.closed.is_some() || guard.restart || saw_watch.load(Ordering::Relaxed) {
-                return;
-            }
-            crate::note_failure(&text);
-            guard.closed = Some(text.clone());
-            drop(guard);
-            let _ = proxy_watch.send_event(UserEvent::Closed(text));
-            return;
-        }
-    });
-    if std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files") {
+    app.apply_tab_strip();
+    if std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files") || app.seed.files {
         app.panel.open = true;
         app.panel.tab = 0;
     }
@@ -228,22 +406,34 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<ViewerStop> {
         }
     });
     event_loop.run_app(&mut app)?;
+    stop_listener.store(true, Ordering::SeqCst);
+    if let Some(listener) = listener {
+        let _ = listener.join();
+    }
     if let Some(text) = app.failed_open.clone() {
         anyhow::bail!(text);
     }
 
     let stop = if app.relay_resume {
-        ViewerStop::RelayResume
+        ViewerStop::RelayResume { primary: app.relay_primary }
     } else if app.restarting {
         ViewerStop::HostRestart
     } else {
         ViewerStop::UserClosed
     };
-    if !matches!(stop, ViewerStop::HostRestart | ViewerStop::RelayResume) {
-        connection.close(0u32.into(), b"viewer closed");
+    if !matches!(stop, ViewerStop::HostRestart | ViewerStop::RelayResume { .. }) {
+        app.retire.store(true, Ordering::SeqCst);
+        app.connection.close(0u32.into(), b"viewer closed");
+        for other in &app.others {
+            other.retire.store(true, Ordering::SeqCst);
+            other.connection.close(0u32.into(), b"viewer closed");
+        }
     }
     runtime.block_on(async {
-        let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), app.endpoint.wait_idle()).await;
+        for other in &app.others {
+            let _ = tokio::time::timeout(Duration::from_secs(1), other.endpoint.wait_idle()).await;
+        }
     });
     Ok(stop)
 }
@@ -267,12 +457,19 @@ async fn send_control(mut send: SendStream, mut rx: mpsc::UnboundedReceiver<Cont
     }
 }
 
-async fn report_stats(connection: Connection, stats: Arc<Stats>, proxy: EventLoopProxy<UserEvent>, title: String) {
+async fn report_stats(
+    connection: Connection,
+    stats: Arc<Stats>,
+    proxy: EventLoopProxy<UserEvent>,
+    title: String,
+    session: u64,
+    retire: Arc<AtomicBool>,
+) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let (mut frames_before, mut bytes_before) = (0u64, 0u64);
     loop {
         tick.tick().await;
-        if connection.close_reason().is_some() {
+        if retire.load(Ordering::SeqCst) || connection.close_reason().is_some() {
             return;
         }
         let frames = stats.frames.load(Ordering::Relaxed);
@@ -285,7 +482,7 @@ async fn report_stats(connection: Connection, stats: Arc<Stats>, proxy: EventLoo
             stats.encode_us.load(Ordering::Relaxed) as f64 / 1000.0
         );
         (frames_before, bytes_before) = (frames, bytes);
-        if proxy.send_event(UserEvent::Title(text)).is_err() {
+        if proxy.send_event(UserEvent::Title { session, text }).is_err() {
             return;
         }
     }
@@ -300,11 +497,16 @@ fn decode_loop(
     proxy: EventLoopProxy<UserEvent>,
     stats: Arc<Stats>,
     recorder: Arc<Mutex<super::controls::RecorderSlot>>,
+    session: u64,
+    retire: Arc<AtomicBool>,
 ) {
     let mut decoder = match VideoDecoder::new() {
         Ok(decoder) => decoder,
         Err(e) => {
-            let _ = proxy.send_event(UserEvent::Closed(format!("cannot start the H.264 decoder: {e:#}")));
+            let _ = proxy.send_event(UserEvent::Closed {
+                session,
+                reason: format!("cannot start the H.264 decoder: {e:#}"),
+            });
             return;
         }
     };
@@ -312,6 +514,9 @@ fn decode_loop(
     let mut last_request = Instant::now() - Duration::from_secs(10);
 
     while let Ok((header, data)) = frames.recv() {
+        if retire.load(Ordering::SeqCst) {
+            return;
+        }
         let finished = {
             let mut guard = recorder.lock().unwrap();
             if guard.push(&data, header.keyframe, header.width, header.height).is_err() {
@@ -335,7 +540,7 @@ fn decode_loop(
                 waiting_for_keyframe = false;
                 *slot.latest.lock().unwrap() = Some(RgbFrame { width, height, pixels });
                 stats.frames.fetch_add(1, Ordering::Relaxed);
-                let _ = proxy.send_event(UserEvent::Frame);
+                let _ = proxy.send_event(UserEvent::Frame(session));
             }
             Ok(None) => slot.spare.lock().unwrap().push(pixels),
             Err(e) => {
@@ -359,6 +564,55 @@ enum Zoom {
     Fit,
     /// An explicit scale (1.0 = pixel-for-pixel).
     Scale(f32),
+}
+
+struct Held {
+    sid: u64,
+    seed: Seed,
+    title: String,
+    slot: Arc<FrameSlot>,
+    current: Option<RgbFrame>,
+    layout: Layout,
+    control: mpsc::UnboundedSender<ControlMsg>,
+    sized_to_remote: bool,
+    keys_down: HashMap<KeyCode, u16>,
+    modifiers: ModifiersState,
+    last_position: Option<(u16, u16)>,
+    cursor_px: (f64, f64),
+    wheel: (f64, f64),
+    closed: bool,
+    toolbar: super::toolbar::Toolbar,
+    zoom: Zoom,
+    pan: (i32, i32),
+    live: Arc<Mutex<super::controls::Live>>,
+    cmds: mpsc::UnboundedSender<super::controls::Cmd>,
+    panel: super::panel::Panel,
+    restarting: bool,
+    relay_resume: bool,
+    relay_primary: String,
+    peer_id: String,
+    host_name: String,
+    extra: Vec<ExtraPane>,
+    primary_display: u8,
+    toast: Option<(String, Instant)>,
+    sent_watch: Vec<u8>,
+    places: Vec<crate::config::SavedWindow>,
+    place_saved: Instant,
+    placed_primary: bool,
+    noted_platform: String,
+    remote_size: Option<(usize, usize)>,
+    fitted_extra: Option<u32>,
+    android_stroke: pjdesk_proto::gesture::StrokeTracker,
+    pointer_down: bool,
+    saw_picture: Arc<AtomicBool>,
+    connection: Connection,
+    endpoint: Endpoint,
+    retire: Arc<AtomicBool>,
+}
+
+fn retire_held(held: &Held) {
+    held.retire.store(true, Ordering::SeqCst);
+    held.connection.close(0u32.into(), b"tab closed");
 }
 
 struct App {
@@ -389,6 +643,7 @@ struct App {
     panel: super::panel::Panel,
     restarting: bool,
     relay_resume: bool,
+    relay_primary: String,
     peer_id: String,
     host_name: String,
     extra: Vec<ExtraPane>,
@@ -411,6 +666,23 @@ struct App {
     failed_open: Option<String>,
     window_shown: Arc<AtomicBool>,
     proxy: EventLoopProxy<UserEvent>,
+    sid: u64,
+    seed: Seed,
+    connection: Connection,
+    endpoint: Endpoint,
+    retire: Arc<AtomicBool>,
+    others: Vec<Held>,
+    tab_order: Vec<u64>,
+    connecting: Vec<(u64, String)>,
+    cancelled: HashSet<u64>,
+    relinking: HashSet<u64>,
+    cover: HashMap<u64, SessionCover>,
+    resume_stop: Arc<Mutex<HashSet<u64>>>,
+    confirm_close: bool,
+    queue: Arc<Mutex<Vec<Queued>>>,
+    rt: tokio::runtime::Handle,
+    next_sid: u64,
+    light: bool,
 }
 
 struct ExtraPane {
@@ -501,7 +773,12 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        self.drain_queue();
+        self.apply_tab_strip();
         self.pump_frame();
+        let confirm = self.confirm_close;
+        let open = self.open_count();
+        let light = self.light;
         let separate = self.is_separate();
         let display = self.primary_display;
         let cropped = if separate { self.tile_picture(display) } else { None };
@@ -607,6 +884,17 @@ impl App {
             );
         }
         self.panel.draw(&mut buffer, win_w, win_h, &snap);
+        if confirm {
+            toolbar::draw_confirm_close(&mut buffer, win_w, win_h, open.max(2), light);
+        }
+        if let Some(cover) = self.cover.get(&self.sid) {
+            let (kind, detail) = match cover {
+                SessionCover::Reconnecting => (toolbar::SessionCover::Reconnecting, ""),
+                SessionCover::Lost => (toolbar::SessionCover::Lost, ""),
+                SessionCover::Ended(text) => (toolbar::SessionCover::Ended, text.as_str()),
+            };
+            toolbar::draw_session_cover(&mut buffer, win_w, win_h, kind, detail, light);
+        }
         if snap.restart {
             self.restarting = true;
         }
@@ -681,7 +969,9 @@ impl App {
                     self.panel.focus = if tab == 1 { 1 } else { 0 };
                 }
             }
-            Action::Disconnect => return true,
+            Action::Disconnect => return self.end_sid(self.sid),
+            Action::SelectSession(index) => self.focus_index(index),
+            Action::CloseSession(index) => return self.end_index(index),
             Action::SelectDisplay(index) => self.choose_view(pjdesk_proto::peer::VIEW_SINGLE, index),
             Action::ViewSingle => {
                 let display = self.live.lock().unwrap().current_display;
@@ -888,6 +1178,21 @@ impl App {
     fn on_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent, focused: Option<Rc<Window>>) {
         let PhysicalKey::Code(code) = event.physical_key else { return };
         let down = event.state == ElementState::Pressed;
+        if self.confirm_close {
+            if down && code == KeyCode::Escape {
+                self.confirm_close = false;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            return;
+        }
+        if self.cover.contains_key(&self.sid) {
+            if down && code == KeyCode::Escape && matches!(self.cover.get(&self.sid), Some(SessionCover::Reconnecting)) {
+                self.cancel_resume(self.sid);
+            }
+            return;
+        }
 
         if self.panel.focus != 0 && down {
             if code == KeyCode::Escape {
@@ -975,6 +1280,12 @@ impl App {
 
     fn on_cursor(&mut self, position: PhysicalPosition<f64>) {
         self.cursor_px = (position.x, position.y);
+        if self.confirm_close {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        }
         // The toolbar reveals near the top; hovering it must not move the
         // remote pointer.
         if let Some(window) = self.window.clone() {
@@ -1601,6 +1912,8 @@ impl App {
         }
         let toast = self.toast.clone();
         let background = self.toolbar.letterbox();
+        let cover = self.cover.get(&self.sid).cloned();
+        let light = self.light;
         let pane = &mut self.extra[i];
         let size = pane.window.inner_size();
         let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
@@ -1622,6 +1935,14 @@ impl App {
                 if at.elapsed() < Duration::from_secs(4) {
                     toolbar::draw_toast(&mut buffer, win_w, win_h, text);
                 }
+            }
+            if let Some(cover) = &cover {
+                let (kind, detail) = match cover {
+                    SessionCover::Reconnecting => (toolbar::SessionCover::Reconnecting, ""),
+                    SessionCover::Lost => (toolbar::SessionCover::Lost, ""),
+                    SessionCover::Ended(text) => (toolbar::SessionCover::Ended, text.as_str()),
+                };
+                toolbar::draw_session_cover(&mut buffer, win_w, win_h, kind, detail, light);
             }
             let _ = buffer.present();
             layout
@@ -1677,6 +1998,33 @@ impl App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(cover) = self.cover.get(&self.sid).cloned() {
+                    let size = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.window.inner_size());
+                    let cursor = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.cursor).unwrap_or((0.0, 0.0));
+                    if let Some(size) = size {
+                        let (w, h) = (size.width as usize, size.height as usize);
+                        if state == ElementState::Pressed && button == winit::event::MouseButton::Left {
+                            let kind = match cover {
+                                SessionCover::Reconnecting => toolbar::SessionCover::Reconnecting,
+                                SessionCover::Lost => toolbar::SessionCover::Lost,
+                                SessionCover::Ended(_) => toolbar::SessionCover::Ended,
+                            };
+                            if let Some(hit) = toolbar::session_cover_hit(kind, cursor.0, cursor.1, w, h) {
+                                let sid = self.sid;
+                                match hit {
+                                    toolbar::SessionCoverAction::Cancel => self.cancel_resume(sid),
+                                    toolbar::SessionCoverAction::Reconnect => self.begin_relink(sid, String::new(), false),
+                                    toolbar::SessionCoverAction::Close => {
+                                        if self.end_sid(sid) {
+                                            event_loop.exit();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 let size = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.window.inner_size());
                 let cursor = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.cursor).unwrap_or((0.0, 0.0));
                 let Some(size) = size else { return };
@@ -1730,6 +2078,612 @@ impl App {
         if let Some(pane) = self.extra.iter().find(|p| p.display == index) {
             pane.window.focus_window();
         }
+    }
+
+    fn open_count(&self) -> usize {
+        1 + self.others.len() + self.connecting.len()
+    }
+
+    fn live_ids(&self) -> Vec<u64> {
+        let mut ids = vec![self.sid];
+        ids.extend(self.others.iter().map(|held| held.sid));
+        ids
+    }
+
+    fn apply_tab_strip(&mut self) {
+        let names: Vec<String> = self.tab_order.iter().copied().map(|sid| self.tab_label(sid)).collect();
+        let active = self.tab_order.iter().position(|sid| *sid == self.sid).unwrap_or(0);
+        if names.is_empty() {
+            self.toolbar.set_sessions(&[], 0);
+        } else {
+            self.toolbar.set_sessions(&names, active);
+        }
+    }
+
+    fn tab_label(&self, sid: u64) -> String {
+        if sid == self.sid {
+            return session_name(&self.host_name, &self.peer_id, &self.seed.label);
+        }
+        if let Some(held) = self.others.iter().find(|held| held.sid == sid) {
+            return session_name(&held.host_name, &held.peer_id, &held.seed.label);
+        }
+        if let Some((_, name)) = self.connecting.iter().find(|(id, _)| *id == sid) {
+            return name.clone();
+        }
+        "Session".into()
+    }
+
+    fn reveal(&self) {
+        if let Some(window) = &self.window {
+            window.set_title(&self.title);
+            window.request_redraw();
+            window.focus_window();
+        }
+    }
+
+    fn take_active(&mut self, next: Held) -> Held {
+        Held {
+            sid: std::mem::replace(&mut self.sid, next.sid),
+            seed: std::mem::replace(&mut self.seed, next.seed),
+            title: std::mem::replace(&mut self.title, next.title),
+            slot: std::mem::replace(&mut self.slot, next.slot),
+            current: std::mem::replace(&mut self.current, next.current),
+            layout: std::mem::replace(&mut self.layout, next.layout),
+            control: std::mem::replace(&mut self.control, next.control),
+            sized_to_remote: std::mem::replace(&mut self.sized_to_remote, next.sized_to_remote),
+            keys_down: std::mem::replace(&mut self.keys_down, next.keys_down),
+            modifiers: std::mem::replace(&mut self.modifiers, next.modifiers),
+            last_position: std::mem::replace(&mut self.last_position, next.last_position),
+            cursor_px: std::mem::replace(&mut self.cursor_px, next.cursor_px),
+            wheel: std::mem::replace(&mut self.wheel, next.wheel),
+            closed: std::mem::replace(&mut self.closed, next.closed),
+            toolbar: std::mem::replace(&mut self.toolbar, next.toolbar),
+            zoom: std::mem::replace(&mut self.zoom, next.zoom),
+            pan: std::mem::replace(&mut self.pan, next.pan),
+            live: std::mem::replace(&mut self.live, next.live),
+            cmds: std::mem::replace(&mut self.cmds, next.cmds),
+            panel: std::mem::replace(&mut self.panel, next.panel),
+            restarting: std::mem::replace(&mut self.restarting, next.restarting),
+            relay_resume: std::mem::replace(&mut self.relay_resume, next.relay_resume),
+            relay_primary: std::mem::replace(&mut self.relay_primary, next.relay_primary),
+            peer_id: std::mem::replace(&mut self.peer_id, next.peer_id),
+            host_name: std::mem::replace(&mut self.host_name, next.host_name),
+            extra: std::mem::replace(&mut self.extra, next.extra),
+            primary_display: std::mem::replace(&mut self.primary_display, next.primary_display),
+            toast: std::mem::replace(&mut self.toast, next.toast),
+            sent_watch: std::mem::replace(&mut self.sent_watch, next.sent_watch),
+            places: std::mem::replace(&mut self.places, next.places),
+            place_saved: std::mem::replace(&mut self.place_saved, next.place_saved),
+            placed_primary: std::mem::replace(&mut self.placed_primary, next.placed_primary),
+            noted_platform: std::mem::replace(&mut self.noted_platform, next.noted_platform),
+            remote_size: std::mem::replace(&mut self.remote_size, next.remote_size),
+            fitted_extra: std::mem::replace(&mut self.fitted_extra, next.fitted_extra),
+            android_stroke: std::mem::replace(&mut self.android_stroke, next.android_stroke),
+            pointer_down: std::mem::replace(&mut self.pointer_down, next.pointer_down),
+            saw_picture: std::mem::replace(&mut self.saw_picture, next.saw_picture),
+            connection: std::mem::replace(&mut self.connection, next.connection),
+            endpoint: std::mem::replace(&mut self.endpoint, next.endpoint),
+            retire: std::mem::replace(&mut self.retire, next.retire),
+        }
+    }
+
+    fn install(&mut self, next: Held) {
+        hide_panes(&mut self.extra);
+        let previous = self.take_active(next);
+        self.others.push(previous);
+        show_panes(&self.extra);
+        self.apply_tab_strip();
+        self.reveal();
+    }
+
+    fn focus_index(&mut self, index: usize) {
+        let Some(&sid) = self.tab_order.get(index) else { return };
+        if sid == self.sid {
+            if let Some(window) = &self.window {
+                window.focus_window();
+            }
+            return;
+        }
+        if self.connecting.iter().any(|(id, _)| *id == sid) {
+            self.show_toast("Connecting…");
+            return;
+        }
+        let Some(pos) = self.others.iter().position(|held| held.sid == sid) else { return };
+        let next = self.others.remove(pos);
+        hide_panes(&mut self.extra);
+        let previous = self.take_active(next);
+        self.others.push(previous);
+        show_panes(&self.extra);
+        self.apply_tab_strip();
+        self.reveal();
+    }
+
+    fn end_index(&mut self, index: usize) -> bool {
+        let Some(&sid) = self.tab_order.get(index) else { return false };
+        self.end_sid(sid)
+    }
+
+    /// Ends one computer. True when that was the last live session and the window should close.
+    fn end_sid(&mut self, sid: u64) -> bool {
+        let order = self.tab_order.clone();
+        let rest: Vec<u64> = self.live_ids().into_iter().filter(|id| *id != sid).collect();
+        self.tab_order.retain(|id| *id != sid);
+        if self.connecting.iter().any(|(id, _)| *id == sid) {
+            self.connecting.retain(|(id, _)| *id != sid);
+            self.cancelled.insert(sid);
+            self.apply_tab_strip();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return false;
+        }
+        if sid != self.sid {
+            if let Some(held) = self.others.iter().find(|held| held.sid == sid) {
+                retire_held(held);
+            }
+            self.others.retain(|held| held.sid != sid);
+            self.relinking.remove(&sid);
+            self.cover.remove(&sid);
+            self.resume_stop.lock().unwrap().insert(sid);
+            self.apply_tab_strip();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return false;
+        }
+        let Some(next_sid) = crate::session_window::focus_after_close(&order, sid, &rest) else {
+            return true;
+        };
+        let Some(pos) = self.others.iter().position(|held| held.sid == next_sid) else { return true };
+        let next = self.others.remove(pos);
+        hide_panes(&mut self.extra);
+        let previous = self.take_active(next);
+        retire_held(&previous);
+        drop(previous);
+        show_panes(&self.extra);
+        self.relinking.remove(&sid);
+        self.cover.remove(&sid);
+        self.resume_stop.lock().unwrap().insert(sid);
+        self.apply_tab_strip();
+        self.reveal();
+        false
+    }
+
+    /// True when this frame already switched the window (exit or an in-window reconnect).
+    fn note_transport(&mut self, event_loop: &ActiveEventLoop, session: u64) -> bool {
+        let Some((restart, resume, primary, ended)) = self.transport_flags(session) else { return false };
+        if restart {
+            return self.leave_or_relink(event_loop, session, String::new(), true);
+        }
+        if resume {
+            return self.leave_or_relink(event_loop, session, primary, false);
+        }
+        if let Some(text) = ended {
+            self.show_cover(session, SessionCover::Ended(text));
+            return true;
+        }
+        false
+    }
+
+    fn relay_or_restart(&mut self, event_loop: &ActiveEventLoop, session: u64, reason: &str) -> bool {
+        let relay = pjdesk_proto::failover::is_relay_resume(reason)
+            || self.transport_flags(session).is_some_and(|(_, resume, _, _)| resume);
+        if !relay {
+            return false;
+        }
+        let mut primary = self.transport_flags(session).map(|(_, _, primary, _)| primary).unwrap_or_default();
+        if primary.is_empty() {
+            primary = pjdesk_proto::failover::primary_from_resume(reason);
+        }
+        self.leave_or_relink(event_loop, session, primary, false)
+    }
+
+    fn transport_flags(&self, session: u64) -> Option<(bool, bool, String, Option<String>)> {
+        let pack = |live: &super::controls::Live| {
+            let ended = if live.host_ended { live.closed.clone() } else { None };
+            (live.restart, live.resume_relay, live.move_primary.clone(), ended)
+        };
+        if session == self.sid {
+            let live = self.live.lock().unwrap();
+            return Some(pack(&live));
+        }
+        let held = self.others.iter().find(|held| held.sid == session)?;
+        let live = held.live.lock().unwrap();
+        Some(pack(&live))
+    }
+
+    fn leave_or_relink(&mut self, event_loop: &ActiveEventLoop, session: u64, primary: String, restart: bool) -> bool {
+        if restart && self.live_ids().len() <= 1 {
+            self.restarting = true;
+            event_loop.exit();
+            return true;
+        }
+        self.begin_relink(session, primary, restart);
+        true
+    }
+
+    fn show_cover(&mut self, sid: u64, cover: SessionCover) {
+        self.cover.insert(sid, cover);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn cancel_resume(&mut self, sid: u64) {
+        self.resume_stop.lock().unwrap().insert(sid);
+        self.relinking.remove(&sid);
+        self.show_cover(sid, SessionCover::Lost);
+    }
+
+    fn begin_relink(&mut self, sid: u64, primary: String, restart: bool) {
+        if !self.relinking.insert(sid) {
+            return;
+        }
+        self.resume_stop.lock().unwrap().remove(&sid);
+        self.show_cover(sid, SessionCover::Reconnecting);
+        let seed = if sid == self.sid {
+            self.retire.store(true, Ordering::SeqCst);
+            self.connection.close(0u32.into(), b"reconnecting");
+            self.seed.clone()
+        } else if let Some(held) = self.others.iter_mut().find(|held| held.sid == sid) {
+            held.retire.store(true, Ordering::SeqCst);
+            held.connection.close(0u32.into(), b"reconnecting");
+            held.seed.clone()
+        } else {
+            self.relinking.remove(&sid);
+            self.cover.remove(&sid);
+            return;
+        };
+        let rt = self.rt.clone();
+        let queue = self.queue.clone();
+        let proxy = self.proxy.clone();
+        let stop = self.resume_stop.clone();
+        let targets = seed.direct_targets.clone();
+        let fingerprint = seed.host_fingerprint;
+        rt.spawn(async move {
+            if restart {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            if stop.lock().unwrap().contains(&sid) {
+                return;
+            }
+            let admit = admit_from_seed(&seed);
+            let moved = if primary.trim().is_empty() { None } else { Some(primary) };
+            let msg = match super::resume_session(&admit, moved.as_deref(), &targets, fingerprint).await {
+                Ok(link) => {
+                    if stop.lock().unwrap().contains(&sid) {
+                        link.connection.close(0u32.into(), b"cancelled");
+                        return;
+                    }
+                    Queued::Relinked { sid, link }
+                }
+                Err(e) => {
+                    if stop.lock().unwrap().contains(&sid) {
+                        return;
+                    }
+                    Queued::RelinkFailed { sid, error: format!("{e:#}") }
+                }
+            };
+            queue.lock().unwrap().push(msg);
+            let _ = proxy.send_event(UserEvent::Work);
+        });
+    }
+
+    fn drain_queue(&mut self) {
+        let batch = std::mem::take(&mut *self.queue.lock().unwrap());
+        for msg in batch {
+            self.handle_queued(msg);
+        }
+    }
+
+    fn handle_queued(&mut self, msg: Queued) {
+        match msg {
+            Queued::Admit(admit) => self.start_admit(admit),
+            Queued::Linked { sid, link, seed } => self.finish_link(sid, link, seed),
+            Queued::Failed { sid, error, id, files, from_store } => self.fail_link(sid, error, id, files, from_store),
+            Queued::Relinked { sid, link } => self.finish_relink(sid, link),
+            Queued::RelinkFailed { sid, error } => self.fail_relink(sid, error),
+        }
+    }
+
+    fn start_admit(&mut self, admit: crate::session_window::Admit) {
+        let sid = self.next_sid;
+        self.next_sid += 1;
+        let label = if !admit.label.trim().is_empty() {
+            admit.label.clone()
+        } else if !admit.direct.trim().is_empty() {
+            admit.direct.clone()
+        } else {
+            format_id(&admit.id)
+        };
+        let shown = if admit.direct.trim().is_empty() { format_id(&admit.id) } else { admit.direct.clone() };
+        info!("Adding a session tab for {shown}");
+        self.connecting.push((sid, label));
+        self.tab_order.push(sid);
+        self.apply_tab_strip();
+        let seed = seed_from_admit(&admit);
+        let rt = self.rt.clone();
+        let queue = self.queue.clone();
+        let proxy = self.proxy.clone();
+        rt.spawn(async move {
+            let id = admit.id.clone();
+            let files = admit.files;
+            let from_store = admit.from_store;
+            let msg = match super::open_admitted(&admit, None, false).await {
+                Ok(link) => Queued::Linked { sid, link, seed },
+                Err(e) => Queued::Failed { sid, error: format!("{e:#}"), id, files, from_store },
+            };
+            queue.lock().unwrap().push(msg);
+            let _ = proxy.send_event(UserEvent::Work);
+        });
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn finish_link(&mut self, sid: u64, link: Link, seed: Seed) {
+        self.connecting.retain(|(id, _)| *id != sid);
+        if self.cancelled.contains(&sid) || !self.tab_order.contains(&sid) {
+            link.connection.close(0u32.into(), b"tab closed");
+            return;
+        }
+        if seed.remember && !seed.password.is_empty() && pjdesk_proto::is_valid_id(&seed.target) {
+            if let Ok(mut cfg) = crate::config::Config::load() {
+                cfg.remember_password(&seed.target, Some(&seed.password));
+                let _ = cfg.save();
+            }
+        }
+        match self.hold(link, seed, sid) {
+            Ok(held) => self.install(held),
+            Err(e) => {
+                self.tab_order.retain(|id| *id != sid);
+                self.show_toast(format!("Could not open that computer: {e:#}"));
+                self.apply_tab_strip();
+            }
+        }
+    }
+
+    fn fail_link(&mut self, sid: u64, error: String, id: String, files: bool, from_store: bool) {
+        self.connecting.retain(|(existing, _)| *existing != sid);
+        self.tab_order.retain(|existing| *existing != sid);
+        self.cancelled.insert(sid);
+        let wrong = error.to_ascii_lowercase().contains("wrong password");
+        if wrong && from_store && pjdesk_proto::is_valid_id(&id) {
+            if let Ok(mut cfg) = crate::config::Config::load() {
+                cfg.remember_password(&id, None);
+                if let Some(entry) = cfg.address_book.iter_mut().find(|entry| entry.id == id) {
+                    entry.password = None;
+                }
+                let _ = cfg.save();
+            }
+        }
+        if wrong {
+            crate::session_window::write_admit_result(&id, 3, files);
+            self.show_toast("Wrong password");
+        } else {
+            crate::note_failure(&error);
+            crate::session_window::write_admit_result(&id, 1, files);
+            self.show_toast(error);
+        }
+        self.apply_tab_strip();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn finish_relink(&mut self, sid: u64, link: Link) {
+        self.relinking.remove(&sid);
+        self.cover.remove(&sid);
+        self.remember_route(sid, &link);
+        let pair = if sid == self.sid {
+            Some((self.seed.view, self.seed.display))
+        } else {
+            self.others.iter().find(|held| held.sid == sid).map(|held| (held.seed.view, held.seed.display))
+        };
+        let Some((view, display)) = pair else {
+            link.connection.close(0u32.into(), b"tab closed");
+            return;
+        };
+        match arm_link(&self.rt, link, &self.proxy, sid, view, display) {
+            Ok(armed) => {
+                self.graft(sid, armed);
+                self.show_toast("Reconnected");
+            }
+            Err(e) => self.fail_relink(sid, format!("{e:#}")),
+        }
+    }
+
+    fn fail_relink(&mut self, sid: u64, error: String) {
+        self.relinking.remove(&sid);
+        info!("Could not reconnect: {error}");
+        self.show_cover(sid, SessionCover::Lost);
+    }
+
+    fn remember_route(&mut self, sid: u64, link: &Link) {
+        let apply = |seed: &mut Seed| {
+            if !link.direct_targets.is_empty() {
+                seed.direct_targets = link.direct_targets.clone();
+            }
+            if let Some(fp) = link.host_fingerprint {
+                seed.host_fingerprint = Some(fp);
+            }
+        };
+        if sid == self.sid {
+            apply(&mut self.seed);
+        } else if let Some(held) = self.others.iter_mut().find(|held| held.sid == sid) {
+            apply(&mut held.seed);
+        }
+    }
+
+    fn hold(&self, link: Link, mut seed: Seed, sid: u64) -> Result<Held> {
+        if !link.direct_targets.is_empty() {
+            seed.direct_targets = link.direct_targets.clone();
+        }
+        if link.host_fingerprint.is_some() {
+            seed.host_fingerprint = link.host_fingerprint;
+        }
+        let armed = arm_link(&self.rt, link, &self.proxy, sid, seed.view, seed.display)?;
+        let places = crate::config::Config::load()
+            .ok()
+            .and_then(|cfg| cfg.settings.peers.get(&armed.peer_id).map(|note| note.windows.clone()))
+            .unwrap_or_default();
+        let mut toolbar = super::toolbar::Toolbar::default();
+        toolbar.set_light(self.light);
+        let mut panel = super::panel::Panel::default();
+        if seed.files {
+            panel.open = true;
+            panel.tab = 0;
+        }
+        Ok(Held {
+            sid,
+            primary_display: seed.display,
+            seed,
+            title: armed.title,
+            slot: armed.slot,
+            current: None,
+            layout: Layout::default(),
+            control: armed.control,
+            sized_to_remote: false,
+            keys_down: HashMap::new(),
+            modifiers: ModifiersState::empty(),
+            last_position: None,
+            cursor_px: (0.0, 0.0),
+            wheel: (0.0, 0.0),
+            closed: false,
+            toolbar,
+            zoom: Zoom::Fit,
+            pan: (0, 0),
+            live: armed.live,
+            cmds: armed.cmds,
+            panel,
+            restarting: false,
+            relay_resume: false,
+            relay_primary: String::new(),
+            peer_id: armed.peer_id,
+            host_name: armed.host_name,
+            extra: Vec::new(),
+            toast: None,
+            sent_watch: Vec::new(),
+            places,
+            place_saved: Instant::now() - Duration::from_secs(5),
+            placed_primary: false,
+            noted_platform: String::new(),
+            remote_size: None,
+            fitted_extra: None,
+            android_stroke: pjdesk_proto::gesture::StrokeTracker::default(),
+            pointer_down: false,
+            saw_picture: armed.saw_picture,
+            connection: armed.connection,
+            endpoint: armed.endpoint,
+            retire: armed.retire,
+        })
+    }
+
+    fn graft(&mut self, sid: u64, armed: Armed) {
+        if sid == self.sid {
+            self.connection.close(0u32.into(), b"reconnecting");
+            self.connection = armed.connection;
+            self.endpoint = armed.endpoint;
+            self.slot = armed.slot;
+            self.control = armed.control;
+            self.live = armed.live;
+            self.cmds = armed.cmds;
+            self.saw_picture = armed.saw_picture;
+            self.retire = armed.retire;
+            self.closed = false;
+            self.restarting = false;
+            self.relay_resume = false;
+            self.extra.clear();
+            self.host_name = armed.host_name;
+            self.title = armed.title;
+            self.peer_id = armed.peer_id;
+            self.sized_to_remote = false;
+            self.remote_size = None;
+        } else if let Some(held) = self.others.iter_mut().find(|held| held.sid == sid) {
+            held.connection.close(0u32.into(), b"reconnecting");
+            held.connection = armed.connection;
+            held.endpoint = armed.endpoint;
+            held.slot = armed.slot;
+            held.control = armed.control;
+            held.live = armed.live;
+            held.cmds = armed.cmds;
+            held.saw_picture = armed.saw_picture;
+            held.retire = armed.retire;
+            held.closed = false;
+            held.restarting = false;
+            held.relay_resume = false;
+            held.extra.clear();
+            held.host_name = armed.host_name;
+            held.title = armed.title;
+            held.peer_id = armed.peer_id;
+            held.sized_to_remote = false;
+            held.remote_size = None;
+        }
+        self.apply_tab_strip();
+        self.reveal();
+    }
+}
+
+fn hide_panes(extra: &mut [ExtraPane]) {
+    for pane in extra.iter() {
+        pane.window.set_visible(false);
+    }
+}
+
+fn show_panes(extra: &[ExtraPane]) {
+    for pane in extra {
+        pane.window.set_visible(true);
+        pane.window.request_redraw();
+    }
+}
+
+fn session_name(host_name: &str, peer_id: &str, label: &str) -> String {
+    let host_name = host_name.trim();
+    if !host_name.is_empty() {
+        return host_name.to_string();
+    }
+    if !label.trim().is_empty() {
+        return label.trim().to_string();
+    }
+    if pjdesk_proto::is_valid_id(peer_id) {
+        return format_id(peer_id);
+    }
+    "Session".into()
+}
+
+fn seed_from_admit(admit: &crate::session_window::Admit) -> Seed {
+    Seed {
+        server: admit.server.clone(),
+        target: admit.id.clone(),
+        password: admit.password.clone(),
+        direct: if admit.direct.trim().is_empty() { None } else { Some(admit.direct.clone()) },
+        force_relay: admit.force_relay,
+        display: admit.display,
+        view: admit.view,
+        remember: admit.remember,
+        from_store: admit.from_store,
+        files: admit.files,
+        label: admit.label.clone(),
+        direct_targets: Vec::new(),
+        host_fingerprint: None,
+    }
+}
+
+fn admit_from_seed(seed: &Seed) -> crate::session_window::Admit {
+    crate::session_window::Admit {
+        id: seed.target.clone(),
+        password: seed.password.clone(),
+        server: seed.server.clone(),
+        direct: seed.direct.clone().unwrap_or_default(),
+        label: seed.label.clone(),
+        files: seed.files,
+        remember: seed.remember,
+        from_store: seed.from_store,
+        force_relay: seed.force_relay,
+        view: seed.view,
+        display: seed.display,
     }
 }
 
@@ -1790,41 +2744,41 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         if self.follow_system_theme {
-            self.toolbar.set_light(matches!(window.theme(), Some(winit::window::Theme::Light)));
+            self.light = matches!(window.theme(), Some(winit::window::Theme::Light));
+            self.toolbar.set_light(self.light);
         }
         window.request_redraw();
         self.window = Some(window);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        let Some(window) = self.window.clone() else { return };
         match event {
-            UserEvent::Frame => {
-                let (restart, resume) = {
-                    let live = self.live.lock().unwrap();
-                    (live.restart, live.resume_relay)
-                };
-                if restart {
-                    self.restarting = true;
-                    event_loop.exit();
+            UserEvent::Work => {
+                self.drain_queue();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                return;
+            }
+            UserEvent::Frame(session) => {
+                if self.note_transport(event_loop, session) {
                     return;
                 }
-                if resume {
-                    self.relay_resume = true;
-                    info!("{}", pjdesk_proto::failover::RELAY_RESUME);
-                    event_loop.exit();
+                if session != self.sid {
                     return;
                 }
+                let Some(window) = self.window.clone() else { return };
                 self.sync_separate(event_loop);
                 window.request_redraw();
                 for pane in &self.extra {
                     pane.window.request_redraw();
                 }
             }
-            UserEvent::Title(text) => {
-                if self.closed {
+            UserEvent::Title { session, text } => {
+                if session != self.sid || self.closed {
                     return;
                 }
+                let Some(window) = self.window.clone() else { return };
                 if self.is_separate() {
                     window.set_title(&self.screen_named(self.primary_display));
                     for pane in &self.extra {
@@ -1835,18 +2789,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Files(paths) => self.accept_dropped(paths),
-            UserEvent::Closed(reason) => {
-                if self.live.lock().unwrap().resume_relay || pjdesk_proto::failover::is_relay_resume(&reason) {
-                    self.relay_resume = true;
-                    info!("{}", pjdesk_proto::failover::RELAY_RESUME);
-                    event_loop.exit();
+            UserEvent::Closed { session, reason } => {
+                if self.relay_or_restart(event_loop, session, &reason) {
                     return;
                 }
-                self.closed = true;
                 info!("Disconnected: {reason}");
                 crate::note_status(&format!("Session stopped: {reason}"));
-                window.set_title(&format!("{} — {reason}", self.title));
-                window.request_redraw();
+                self.show_cover(session, SessionCover::Ended(reason.clone()));
+                if session == self.sid {
+                    if let Some(window) = self.window.clone() {
+                        window.set_title(&format!("{} — {reason}", self.title));
+                    }
+                }
             }
         }
     }
@@ -1862,7 +2816,12 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => {
                 self.remember_places(true);
-                if self.is_separate() {
+                if crate::session_window::window_close_needs_confirm(self.open_count()) {
+                    self.confirm_close = true;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                } else if self.is_separate() {
                     if self.close_primary_screen() {
                         event_loop.exit();
                     }
@@ -1880,7 +2839,8 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::ThemeChanged(theme) => {
                 if self.follow_system_theme {
-                    self.toolbar.set_light(matches!(theme, winit::window::Theme::Light));
+                    self.light = matches!(theme, winit::window::Theme::Light);
+                    self.toolbar.set_light(self.light);
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -1894,6 +2854,44 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let win_w = self.window.as_ref().map(|w| w.inner_size().width as usize).unwrap_or(0);
                 let win_h = self.window.as_ref().map(|w| w.inner_size().height as usize).unwrap_or(0);
+                if self.confirm_close {
+                    if state == ElementState::Pressed && button == winit::event::MouseButton::Left {
+                        if let Some(close_all) = toolbar::confirm_close_hit(self.cursor_px.0, self.cursor_px.1, win_w, win_h)
+                        {
+                            if close_all {
+                                event_loop.exit();
+                            } else {
+                                self.confirm_close = false;
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                if let Some(cover) = self.cover.get(&self.sid).cloned() {
+                    if state == ElementState::Pressed && button == winit::event::MouseButton::Left {
+                        let kind = match cover {
+                            SessionCover::Reconnecting => toolbar::SessionCover::Reconnecting,
+                            SessionCover::Lost => toolbar::SessionCover::Lost,
+                            SessionCover::Ended(_) => toolbar::SessionCover::Ended,
+                        };
+                        if let Some(hit) = toolbar::session_cover_hit(kind, self.cursor_px.0, self.cursor_px.1, win_w, win_h) {
+                            let sid = self.sid;
+                            match hit {
+                                toolbar::SessionCoverAction::Cancel => self.cancel_resume(sid),
+                                toolbar::SessionCoverAction::Reconnect => self.begin_relink(sid, String::new(), false),
+                                toolbar::SessionCoverAction::Close => {
+                                    if self.end_sid(sid) {
+                                        event_loop.exit();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 if self.toolbar.shows_android_nav() {
                     let disabled = self.live.lock().unwrap().control_off;
                     let lay = self.layout;

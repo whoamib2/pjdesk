@@ -2,7 +2,8 @@
 //! arguments (or double-clicking it).
 //!
 //! The left rail is this computer. The main column connects to another one.
-//! Each outgoing session opens in its own viewer process. Anything that can
+//! The first outgoing session opens a viewer process. Another computer, while
+//! that window is still open, is added as a tab in it. Anything that can
 //! block (service control, scheduled tasks, the status file) runs on a
 //! background thread; the window only reads the latest snapshot.
 
@@ -111,6 +112,9 @@ pub fn run(server_flag: Option<String>, import_config: Option<String>) -> Result
     crate::client_update::adopt_completed_update();
     crate::temp_sign::scrub_abandoned();
     let mut config = Config::load().unwrap_or_default();
+    if config.decide_saved_sync_on_load() {
+        let _ = config.save();
+    }
     if let Some(flag) = &server_flag {
         if let Ok(addr) = ServerAddr::parse(flag) {
             config.server = Some(addr.to_string());
@@ -318,6 +322,8 @@ pub struct App {
     rename_text: String,
     confirm_remove: Option<String>,
     confirm_delete: Option<String>,
+    confirm_clear_saved: bool,
+    confirm_sign_out_clear: bool,
     delete_rx: Option<Receiver<Result<String, String>>>,
     next_account_pull: u64,
     /// Last self-online value written to the log, so a refresh does not repeat it.
@@ -337,7 +343,13 @@ pub struct App {
     ask_person_next: bool,
     ask_view_next: bool,
     ask_view_label: String,
-    viewer_rx: Vec<Receiver<(String, i32, bool)>>,
+    viewer_rx: Vec<Receiver<(String, i32, bool, u32)>>,
+    /// Process ids of viewer windows this window started. A session-tab offer
+    /// is sent only to one of these, so a stale listener file is ignored.
+    viewer_pids: Vec<u32>,
+    /// TCP to the open session window. The UI thread only polls this.
+    admit_rx: Option<Receiver<bool>>,
+    admit_job: Option<AdmitJob>,
 
     /// Background service / scheduled-task snapshot. Never queried on this thread.
     probe: Option<probe::Probe>,
@@ -352,15 +364,19 @@ pub struct App {
     net_show: bool,
     net_code: String,
     net_consent: bool,
-    /// 0 account, 1 enrollment code, 2 network key.
+    /// 0 account, 1 enrollment code, 2 network key, 3 server access key.
     net_mode: u8,
     net_blob: String,
+    /// Server address typed with a server access key. The key itself has no address.
+    net_server: String,
     net_key_pass: String,
     net_key_show: bool,
     /// The key is limited to one account, so email and password are shown too.
     net_key_account: bool,
     net_busy: bool,
     net_error: String,
+    /// When pjdesk.com paused email sign-in. Sign in stays off until this instant.
+    net_pause_until: Option<Instant>,
     show_net_sign_in: bool,
     /// The signed-in account owns an empty network and this computer already has a server.
     net_offer: bool,
@@ -381,6 +397,8 @@ pub struct App {
     net_enroll_only: bool,
     pending_temporary: bool,
     pending_enroll_only: bool,
+    /// The join in flight used a code or a key, not an email and password.
+    pending_without_password: bool,
     /// Set while a temporary sign-in is in this process. The refresh token is not on disk.
     temp: Option<TempHold>,
     session_end: Option<Receiver<()>>,
@@ -450,6 +468,8 @@ pub struct App {
     pin_new: String,
     pin_confirm: String,
     pin_password: String,
+    /// Typed on Set a PIN when this computer has no account email yet.
+    pin_email: String,
     pin_show_current: bool,
     pin_show_new: bool,
     pin_show_confirm: bool,
@@ -462,6 +482,15 @@ pub struct App {
     lock_pin_armed: bool,
     /// The Set-a-PIN field has been focused for this appearance.
     setup_pin_focused: bool,
+}
+
+struct AdmitJob {
+    id: String,
+    password: String,
+    files: bool,
+    remember: bool,
+    from_store: bool,
+    direct: String,
 }
 
 enum InviteMsg {
@@ -528,6 +557,8 @@ impl App {
             rename_text: String::new(),
             confirm_remove: None,
             confirm_delete: None,
+            confirm_clear_saved: false,
+            confirm_sign_out_clear: false,
             delete_rx: None,
             next_account_pull: 0,
             logged_self_online: None,
@@ -546,6 +577,9 @@ impl App {
             ask_view_next: false,
             ask_view_label: String::new(),
             viewer_rx: Vec::new(),
+            viewer_pids: Vec::new(),
+            admit_rx: None,
+            admit_job: None,
             probe: if preview { None } else { Some(probe::Probe::start(cc.egui_ctx.clone())) },
             scm_installed: false,
             scm_running: false,
@@ -559,11 +593,13 @@ impl App {
             net_consent: false,
             net_mode: 0,
             net_blob: String::new(),
+            net_server: String::new(),
             net_key_pass: String::new(),
             net_key_show: false,
             net_key_account: false,
             net_busy: false,
             net_error: String::new(),
+            net_pause_until: None,
             show_net_sign_in: false,
             net_offer: false,
             net_login: String::new(),
@@ -578,6 +614,7 @@ impl App {
             net_enroll_only: false,
             pending_temporary: false,
             pending_enroll_only: false,
+            pending_without_password: false,
             temp: None,
             session_end: if preview { None } else { Some(crate::temp_sign::watch_session_end()) },
             temp_left: 0,
@@ -639,6 +676,7 @@ impl App {
             pin_new: String::new(),
             pin_confirm: String::new(),
             pin_password: String::new(),
+            pin_email: String::new(),
             pin_show_current: false,
             pin_show_new: false,
             pin_show_confirm: false,
@@ -655,6 +693,11 @@ impl App {
         }
         if app.cfg.account.is_some() {
             app.start_token_refresh();
+        }
+        if !preview && app.cfg.release_stuck_pin_prompt() {
+            if let Err(err) = app.cfg.save() {
+                tracing::info!("Could not record the PIN prompt: {err}");
+            }
         }
         if !preview {
             crate::host::direct::set_lan_discovery(app.cfg.settings.discover_lan);
@@ -685,6 +728,7 @@ impl App {
             acked_unix: unix_now(),
             server: "office.example:21200".into(),
             app_version: env!("CARGO_PKG_VERSION").into(),
+            error: String::new(),
         };
         self.connect_id = "123 456 789".into();
         self.cfg.server = Some("office.example:21200".into());
@@ -907,13 +951,23 @@ impl App {
         let had = !snapshot.network_refresh_token().is_empty();
         crate::temp_sign::begin_marker(had);
         self.note_enrolled(&session.computers);
-        // Show the account's computers for this visit. The list that was already
-        // on this computer stays in the snapshot and is not uploaded.
-        self.cfg.address_book.clear();
-        self.cfg.saved_hidden.clear();
-        self.cfg.settings.peers.clear();
+        let syncing = self.cfg.syncs_saved_computers();
         self.cfg.ephemeral_network = true;
+        if syncing {
+            // Show the account's computers for this visit. The list that was
+            // already on this computer stays in the snapshot and is not uploaded.
+            self.cfg.address_book.clear();
+            self.cfg.saved_hidden.clear();
+            self.cfg.settings.peers.clear();
+            self.cfg.allow_saved_merge();
+        } else {
+            self.cfg.saved_sync = Some(false);
+        }
         self.cfg.apply_network_session(&session);
+        if !syncing {
+            // Remember "don't download" without writing this visit's tokens.
+            let _ = self.cfg.save();
+        }
         self.net_email = self.cfg.network_email.clone().unwrap_or_default();
         self.settings.set_server_text(&self.cfg.effective_server());
         self.temp = Some(TempHold { snapshot, last_activity: Instant::now(), warning: false });
@@ -952,6 +1006,57 @@ impl App {
         self.engine.retarget(&self.cfg);
         self.settings.set_server_text(&self.cfg.effective_server());
         self.toast.show("Signed out");
+    }
+
+    /// Writes the visit's session the same way a normal sign-in does.
+    fn stay_signed_in(&mut self) {
+        if self.temp.is_none() && !self.cfg.ephemeral_network {
+            return;
+        }
+        self.cfg.ephemeral_network = false;
+        crate::vault::store_session_key(&mut self.cfg);
+        crate::temp_sign::clear_marker();
+        self.temp = None;
+        self.temp_left = 0;
+        // Save this session directly. The usual save reloads the account that
+        // was already on disk, which is empty for this visit.
+        if let Err(e) = self.cfg.save() {
+            self.status = format!("Could not save settings: {e}");
+        }
+        crate::network::copy_to_service(&self.cfg);
+        self.sync_passwords(true);
+        self.toast.show("Signed in on this computer");
+    }
+
+    /// Keeps this visit in memory and takes the account off disk.
+    fn sign_out_when_closes(&mut self) {
+        if self.temp.is_some() || self.cfg.ephemeral_network {
+            return;
+        }
+        let mut snapshot = self.cfg.clone();
+        snapshot.ephemeral_network = false;
+        snapshot.leave_network_sign_in();
+        if let Err(e) = snapshot.save() {
+            self.status = format!("Could not save settings: {e}");
+            return;
+        }
+        self.cfg.ephemeral_network = true;
+        crate::temp_sign::begin_marker(false);
+        self.temp = Some(TempHold { snapshot, last_activity: Instant::now(), warning: false });
+        self.temp_left = 0;
+        self.toast.show("Signed in until you close PJDesk");
+    }
+
+    fn sign_in_duration_menu(&mut self, ui: &mut egui::Ui) {
+        let until_close = self.temp.is_some() || self.cfg.ephemeral_network;
+        if ui.selectable_label(!until_close, "Stay signed in on this computer").clicked() {
+            self.stay_signed_in();
+            ui.close();
+        }
+        if ui.selectable_label(until_close, "Sign out when PJDesk closes").clicked() {
+            self.sign_out_when_closes();
+            ui.close();
+        }
     }
 
     /// True when Windows locked, signed out, or is shutting down since the last check.
@@ -1084,7 +1189,7 @@ impl App {
         if let Some(grant) = &support {
             crate::network::ensure_support_computer(&mut account, &id, &grant.label);
         }
-        let local = if self.temp.is_some() || support.is_some() {
+        let local = if self.temp.is_some() || support.is_some() || !self.cfg.syncs_saved_computers() {
             Vec::new()
         } else {
             crate::network::saved_from_config(&self.cfg)
@@ -1377,9 +1482,11 @@ impl App {
                 self.net_key_pass.clear();
                 self.import_pass.clear();
                 self.net_error.clear();
+                self.net_pause_until = None;
                 self.show_net_sign_in = false;
                 self.pending_temporary = false;
                 self.pending_enroll_only = false;
+                self.pending_without_password = false;
                 let who = if email.is_empty() { self.net_email.trim().to_string() } else { email };
                 self.toast.show(format!(
                     "Added this computer to {who}. Nothing from that sign-in was kept on this computer."
@@ -1390,6 +1497,8 @@ impl App {
                 self.net_rx = None;
                 self.net_offer = false;
                 self.net_login.clear();
+                let without_password = self.pending_without_password;
+                self.pending_without_password = false;
                 if let Some(blob) =
                     self.pending_blob.take().or_else(|| pjdesk_proto::netkey::blob_from_text(&self.net_blob))
                 {
@@ -1410,15 +1519,16 @@ impl App {
                 self.net_key_pass.clear();
                 self.import_pass.clear();
                 self.net_error.clear();
+                self.net_pause_until = None;
                 self.show_net_sign_in = false;
-                if session.email.is_empty() {
-                    if self.cfg.network_email.is_none() {
+                let mut session = session;
+                if !without_password {
+                    if session.email.is_empty() && self.cfg.network_email.is_none() {
                         self.cfg.network_email = Some(self.net_email.trim().to_string());
                     }
-                }
-                let mut session = session;
-                if session.email.is_empty() {
-                    session.email = self.net_email.trim().to_lowercase();
+                    if session.email.is_empty() {
+                        session.email = self.net_email.trim().to_lowercase();
+                    }
                 }
                 let temporary = self.pending_temporary;
                 self.pending_temporary = false;
@@ -1432,16 +1542,24 @@ impl App {
                 if temporary {
                     self.begin_temporary(session);
                     self.sync_passwords(false);
+                    if without_password {
+                        self.cfg.joined_without_password = true;
+                        self.arrive_without_password();
+                    }
                 } else {
-                    self.note_enrolled(&session.computers);
-                    self.cfg.apply_network_session(&session);
-                    self.net_email = self.cfg.network_email.clone().unwrap_or_default();
-                    self.settings.set_server_text(&self.cfg.effective_server());
-                    self.save_cfg();
-                    crate::network::copy_to_service(&self.cfg);
-                    self.engine.retarget(&self.cfg);
-                    self.sync_passwords(true);
-                    if imported {
+                    self.cfg.joined_without_password = without_password;
+                self.note_enrolled(&session.computers);
+                self.cfg.prepare_sign_in_saved_sync();
+                self.cfg.apply_network_session(&session);
+                self.net_email = self.cfg.network_email.clone().unwrap_or_default();
+                self.settings.set_server_text(&self.cfg.effective_server());
+                self.save_cfg();
+                crate::network::copy_to_service(&self.cfg);
+                self.engine.retarget(&self.cfg);
+                self.sync_passwords(true);
+                if without_password {
+                        self.arrive_without_password();
+                    } else if imported {
                         self.toast.show("Import server configuration successfully");
                     } else {
                         self.toast.show(format!("Signed in as {}", self.net_email));
@@ -1453,6 +1571,7 @@ impl App {
                 self.net_rx = None;
                 self.net_importing = false;
                 self.pending_blob = None;
+                self.pending_without_password = false;
                 if e.contains("specific account") {
                     self.show_net_sign_in = true;
                     self.net_mode = 2;
@@ -1468,10 +1587,10 @@ impl App {
                     self.support_keys.enter_note = format!(
                         "{owner} needs your permission before this computer can be opened without asking."
                     );
-                    self.net_error = e;
+                    self.note_sign_in_error(e);
                 } else {
-                    self.support_keys.enter_note = e.clone();
-                    self.net_error = e;
+                    self.note_sign_in_error(e);
+                    self.support_keys.enter_note = self.net_error.clone();
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -1483,6 +1602,9 @@ impl App {
     }
 
     fn sync_passwords(&mut self, upload: bool) {
+        if !self.cfg.syncs_saved_computers() {
+            return;
+        }
         let Some(key) = crate::vault::key_from(&self.cfg) else { return };
         let refresh = self.cfg.network_refresh_token();
         let device = self.cfg.network_device_id.clone().unwrap_or_default();
@@ -1516,6 +1638,12 @@ impl App {
         if self.net_busy {
             return;
         }
+        if self.net_mode == 0 && self.sign_in_paused().is_some() {
+            return;
+        }
+        if (self.net_mode == 2 || self.net_mode == 3) && self.route_pasted_key() {
+            return;
+        }
         let enroll_only = self.net_enroll_only;
         self.net_enroll_only = false;
         let pjdesk_id = self.visible_id();
@@ -1526,8 +1654,9 @@ impl App {
         }
         self.pending_temporary = self.net_temporary && !enroll_only;
         self.pending_enroll_only = enroll_only;
+        self.pending_without_password = self.net_mode == 1 || self.net_mode == 2;
         let this = crate::network::ThisComputer::local(&pjdesk_id);
-        let local = if self.pending_temporary || enroll_only {
+        let local = if self.pending_temporary || enroll_only || !self.cfg.syncs_saved_computers() {
             Vec::new()
         } else {
             crate::network::saved_from_config(&self.cfg)
@@ -1599,6 +1728,100 @@ impl App {
         }
     }
 
+    /// An access key enrolls here. A network key pasted on the access-key form is sent back.
+    /// Returns true when redeem must not run.
+    fn route_pasted_key(&mut self) -> bool {
+        let kind = pjdesk_proto::netkey::classify_paste(&self.net_blob);
+        match (self.net_mode, kind) {
+            (_, pjdesk_proto::netkey::PasteKind::Access) => {
+                let key = self.net_blob.clone();
+                self.apply_server_access_key(&key);
+                true
+            }
+            (_, pjdesk_proto::netkey::PasteKind::AccessIncomplete) => {
+                self.net_mode = 3;
+                self.show_net_sign_in = true;
+                self.net_error = pjdesk_proto::netkey::ACCESS_KEY_INCOMPLETE.into();
+                true
+            }
+            (2, pjdesk_proto::netkey::PasteKind::Neither) => {
+                self.net_error = pjdesk_proto::netkey::KEY_NOT_EITHER.into();
+                true
+            }
+            (3, pjdesk_proto::netkey::PasteKind::Network) => {
+                self.net_mode = 2;
+                self.net_error = pjdesk_proto::netkey::NETWORK_KEY_GOES.into();
+                true
+            }
+            (3, pjdesk_proto::netkey::PasteKind::Neither) => {
+                self.net_error = "This is not a server access key. A server access key starts with pjdesk-key1. A network key starts with pjdesk-net1 and goes in Use a network key.".into();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Saves a server access key and registers this computer without a PJDesk account.
+    /// Expiry and the computer limit are enforced by the server when it registers.
+    fn apply_server_access_key(&mut self, raw: &str) {
+        let Some(key) = pjdesk_proto::netkey::access_key_from_text(raw) else {
+            self.net_mode = 3;
+            self.show_net_sign_in = true;
+            self.net_error = pjdesk_proto::netkey::ACCESS_KEY_INCOMPLETE.into();
+            return;
+        };
+        let typed = self.net_server.trim();
+        let address = if !typed.is_empty() { typed.to_string() } else { self.cfg.effective_server() };
+        if address.is_empty() {
+            self.net_mode = 3;
+            self.net_blob = key;
+            self.show_net_sign_in = true;
+            self.net_error = pjdesk_proto::netkey::ACCESS_KEY_NEEDS_SERVER.into();
+            return;
+        }
+        let parsed = match ServerAddr::parse(&address) {
+            Ok(addr) => addr.to_string(),
+            Err(err) => {
+                self.net_mode = 3;
+                self.net_blob = key;
+                self.show_net_sign_in = true;
+                self.net_error = format!("Server address: {err}");
+                return;
+            }
+        };
+        if self.cfg.server.as_deref().map(str::trim) != Some(parsed.as_str()) {
+            self.cfg.server_fingerprint = None;
+            self.cfg.server = Some(parsed);
+        }
+        self.cfg.set_server_access_key(&key);
+        if crate::vault::key_from(&self.cfg).is_none() || self.cfg.joined_without_password {
+            self.cfg.joined_without_password = true;
+        }
+        if let Err(err) = self.cfg.save() {
+            self.net_error = format!("Could not save the access key: {err}");
+            return;
+        }
+        crate::network::copy_to_service(&self.cfg);
+        self.engine.retarget(&self.cfg);
+        self.net_busy = false;
+        self.net_blob.clear();
+        self.net_error.clear();
+        self.show_net_sign_in = false;
+        self.arrive_without_password();
+    }
+
+    /// A code or a key is connected. The main window follows. No account password and no PIN.
+    fn arrive_without_password(&mut self) {
+        self.lock_ui = false;
+        self.lock_armed = true;
+        self.lock_resetting = false;
+        self.pin_note.clear();
+        self.toast.show(pjdesk_proto::applock::connected_confirmation(
+            &self.account_email(),
+            &self.cfg.effective_server(),
+        ));
+    }
+
     fn claim_current_server(&mut self) {
         if self.net_busy || self.net_login.is_empty() {
             return;
@@ -1610,7 +1833,7 @@ impl App {
         let name = crate::hostname();
         let enroll_only = self.pending_enroll_only;
         let this = crate::network::ThisComputer::local(&self.visible_id());
-        let local = if self.pending_temporary || enroll_only {
+        let local = if self.pending_temporary || enroll_only || !self.cfg.syncs_saved_computers() {
             Vec::new()
         } else {
             crate::network::saved_from_config(&self.cfg)
@@ -1673,11 +1896,25 @@ impl App {
 
     fn import_server_config(&mut self) {
         let text = crate::clip::get_text().unwrap_or_default();
-        let Some(blob) = pjdesk_proto::netkey::blob_from_text(&text) else {
-            self.toast.show(if text.trim().is_empty() { "Clipboard is empty" } else { "Invalid server configuration" });
-            return;
-        };
-        self.queue_import(blob, true);
+        match pjdesk_proto::netkey::classify_paste(&text) {
+            pjdesk_proto::netkey::PasteKind::Access => self.apply_server_access_key(&text),
+            pjdesk_proto::netkey::PasteKind::AccessIncomplete => {
+                self.toast.show(pjdesk_proto::netkey::ACCESS_KEY_INCOMPLETE);
+            }
+            pjdesk_proto::netkey::PasteKind::Network => {
+                if let Some(blob) = pjdesk_proto::netkey::blob_from_text(&text) {
+                    self.queue_import(blob, true);
+                }
+            }
+            pjdesk_proto::netkey::PasteKind::Neither => {
+                let message = if text.trim().is_empty() {
+                    "Clipboard is empty"
+                } else {
+                    pjdesk_proto::netkey::KEY_NOT_EITHER
+                };
+                self.toast.show(message);
+            }
+        }
     }
 
     fn export_server_config(&mut self) {
@@ -1732,17 +1969,33 @@ impl App {
         if !self.showing_sign_in() {
             return;
         }
-        let found = ctx.input(|input| {
+        let pasted = ctx.input(|input| {
             input.events.iter().find_map(|event| match event {
-                egui::Event::Paste(text) => pjdesk_proto::netkey::blob_from_text(text),
+                egui::Event::Paste(text) => Some(text.clone()),
                 _ => None,
             })
         });
-        let Some(blob) = found else { return };
-        if self.dismissed_paste.as_deref() == Some(blob.as_str()) {
-            return;
+        let Some(text) = pasted else { return };
+        match pjdesk_proto::netkey::classify_paste(&text) {
+            pjdesk_proto::netkey::PasteKind::Access | pjdesk_proto::netkey::PasteKind::AccessIncomplete => {
+                self.net_blob = text;
+                self.net_mode = 3;
+                self.show_net_sign_in = true;
+                if self.net_server.trim().is_empty() {
+                    self.net_server = self.cfg.effective_server();
+                }
+                let key = self.net_blob.clone();
+                self.apply_server_access_key(&key);
+            }
+            pjdesk_proto::netkey::PasteKind::Network => {
+                let Some(blob) = pjdesk_proto::netkey::blob_from_text(&text) else { return };
+                if self.dismissed_paste.as_deref() == Some(blob.as_str()) {
+                    return;
+                }
+                self.queue_import(blob, false);
+            }
+            pjdesk_proto::netkey::PasteKind::Neither => {}
         }
-        self.queue_import(blob, false);
     }
 
     fn dismiss_import(&mut self) {
@@ -1782,9 +2035,8 @@ impl App {
         }
     }
 
-    /// Leaves the PJDesk account. The server address, saved computers, and
-    /// per-computer passwords stay on this computer.
-    /// A temporary sign-in instead restores this computer to how it was.
+    /// Leaves the PJDesk account. A normal sign-out keeps the saved list.
+    /// A temporary sign-in clears the saved list, cached passwords, and recents.
     fn sign_out_network(&mut self) {
         if self.temp.is_some() {
             self.end_temporary_sign_in();
@@ -1801,12 +2053,65 @@ impl App {
         self.toast.show("Signed out");
     }
 
+    /// Clears the saved list on this computer and leaves the account signed in.
+    /// The usual save reloads peer notes from disk, which would put the list back.
+    fn clear_saved_on_this_computer(&mut self) {
+        self.cfg.clear_local_saved();
+        self.cfg.saved_sync = Some(false);
+        if let Some(temp) = &mut self.temp {
+            temp.snapshot.clear_local_saved();
+            temp.snapshot.saved_sync = Some(false);
+        }
+        if let Err(e) = self.cfg.save() {
+            self.status = format!("Could not save settings: {e}");
+        }
+        self.toast.show("Removed saved computers from this computer");
+    }
+
+    /// Signs out on this computer and clears the saved list, passwords, and recents.
+    /// The pjdesk.com account and other devices are left as they are.
+    fn sign_out_and_clear_local(&mut self) {
+        if self.temp.is_some() {
+            self.temp = None;
+            self.temp_left = 0;
+            crate::temp_sign::clear_marker();
+        }
+        self.cfg.ephemeral_network = false;
+        self.cfg.clear_local_saved();
+        self.cfg.saved_sync = Some(false);
+        self.cfg.leave_network_sign_in();
+        crate::vault::clear_session_key();
+        if let Err(e) = self.cfg.save() {
+            self.status = format!("Could not save settings: {e}");
+        }
+        crate::network::copy_to_service(&self.cfg);
+        self.engine.retarget(&self.cfg);
+        self.net_email.clear();
+        self.show_net_sign_in = false;
+        self.enrolled_for.clear();
+        self.account_computers.clear();
+        self.toast.show("Signed out. Saved computers were removed from this computer");
+    }
+
     fn request_saved_refresh(&mut self) {
         self.next_account_pull = 0;
     }
 
+    /// Downloads the account list once and keeps syncing it on this device.
+    fn load_saved_computers(&mut self) {
+        self.cfg.saved_sync = Some(true);
+        self.cfg.local_saved_cleared = false;
+        self.cfg.network_list_merged = false;
+        if let Err(e) = self.cfg.save() {
+            self.status = format!("Could not save settings: {e}");
+        }
+        self.request_saved_refresh();
+        self.sync_passwords(false);
+        self.toast.show("Loading saved computers");
+    }
+
     fn maybe_pull_account(&mut self) {
-        if self.temp.is_some() || self.saved_rx.is_some() || self.delete_rx.is_some() {
+        if (self.temp.is_some() && !self.cfg.syncs_saved_computers()) || self.saved_rx.is_some() || self.delete_rx.is_some() {
             return;
         }
         let refresh_token = self.cfg.network_refresh_token();
@@ -1987,6 +2292,15 @@ impl App {
     /// came from storage is marked `PJDESK_SAVED`; if it is rejected the viewer
     /// exits 3 and this window asks again.
     fn spawn_viewer(&mut self, id: &str, password: &str, files: bool, remember: bool, from_store: bool) {
+        if !password.is_empty() && self.offer_session_tab(id, password, files, remember, from_store, "") {
+            self.ask_person_next = false;
+            self.ask_view_next = false;
+            return;
+        }
+        self.launch_viewer_process(id, password, files, remember, from_store);
+    }
+
+    fn launch_viewer_process(&mut self, id: &str, password: &str, files: bool, remember: bool, from_store: bool) {
         let server = self.cfg.effective_server();
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
@@ -2043,21 +2357,116 @@ impl App {
         }
         prepare_viewer(&mut cmd);
         match cmd.spawn() {
-            Ok(mut child) => {
+            Ok(child) => {
                 clear_session_status();
                 self.mark_recent(id);
                 let what = if files { "Opening file transfer for" } else { "Opening" };
                 self.toast.show(format!("{what} {}", format_id(id)));
-                let (tx, rx) = std::sync::mpsc::channel();
-                let id = id.to_string();
-                std::thread::spawn(move || {
-                    let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-                    let _ = tx.send((id, code, files));
-                });
-                self.viewer_rx.push(rx);
+                self.track_viewer(id.to_string(), child, files);
             }
             Err(e) => self.fail_session(format!("Could not open the viewer: {e}")),
         }
+    }
+
+    /// Hands this computer to the session window that is already open.
+    fn offer_session_tab(
+        &mut self,
+        id: &str,
+        password: &str,
+        files: bool,
+        remember: bool,
+        from_store: bool,
+        direct: &str,
+    ) -> bool {
+        if password.is_empty() || self.viewer_pids.is_empty() {
+            return false;
+        }
+        let Some((port, pid)) = crate::session_window::read_listener() else { return false };
+        if !self.viewer_pids.contains(&pid) {
+            return false;
+        }
+        let (view, display) = self
+            .cfg
+            .settings
+            .peers
+            .get(id)
+            .map(|note| (note.view_mode, note.last_display))
+            .unwrap_or((0, 0));
+        let label = if direct.is_empty() { self.row_title(id) } else { direct.to_string() };
+        let admit = crate::session_window::Admit {
+            id: id.to_string(),
+            password: password.to_string(),
+            server: self.cfg.effective_server(),
+            direct: direct.to_string(),
+            label,
+            files,
+            remember,
+            from_store,
+            force_relay: false,
+            view,
+            display,
+        };
+        if self.admit_rx.is_some() {
+            return true;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::thread::Builder::new()
+            .name("session-admit".into())
+            .spawn(move || {
+                let _ = tx.send(crate::session_window::send_admit(port, &admit));
+            })
+            .is_ok();
+        if !started {
+            return false;
+        }
+        self.admit_rx = Some(rx);
+        self.admit_job = Some(AdmitJob {
+            id: id.to_string(),
+            password: password.to_string(),
+            files,
+            remember,
+            from_store,
+            direct: direct.to_string(),
+        });
+        let what = if files { "Opening file transfer for" } else { "Opening" };
+        let who = if direct.is_empty() { format_id(id) } else { direct.to_string() };
+        self.toast.show(format!("{what} {who}"));
+        true
+    }
+
+    /// The session window's reply. A miss starts a new viewer process.
+    fn poll_admit(&mut self) {
+        let Some(rx) = &self.admit_rx else { return };
+        let accepted = match rx.try_recv() {
+            Ok(accepted) => accepted,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        };
+        self.admit_rx = None;
+        let Some(job) = self.admit_job.take() else { return };
+        if !accepted {
+            if job.direct.is_empty() {
+                self.launch_viewer_process(&job.id, &job.password, job.files, job.remember, job.from_store);
+            } else {
+                self.launch_direct_process(&job.direct, &job.password);
+            }
+            return;
+        }
+        clear_session_status();
+        if job.direct.is_empty() {
+            self.mark_recent(&job.id);
+        }
+    }
+
+    fn track_viewer(&mut self, id: String, mut child: std::process::Child, files: bool) {
+        let pid = child.id();
+        self.viewer_pids.push(pid);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+            let _ = tx.send((id, code, files, pid));
+        });
+        self.viewer_rx.push(rx);
     }
 
     fn poll_client_update(&mut self) {
@@ -2078,36 +2487,40 @@ impl App {
         }
     }
 
+    fn note_viewer_exit(&mut self, id: &str, code: i32, files: bool, reopen: &mut Option<(String, bool)>) {
+        self.reload_peer_reports();
+        if code == 0 {
+            return;
+        }
+        let reason = last_session_reason().unwrap_or_else(|| {
+            if code == 3 { "Wrong password".into() } else { "The session ended before it could start.".into() }
+        });
+        // A wrong password comes back in the password dialog.
+        // Any other failure is a dialog, not only the Opening toast.
+        if code == 3 {
+            self.status = reason;
+            *reopen = Some((id.to_string(), files));
+        } else {
+            self.fail_session(reason);
+            if code == 4 {
+                self.prompt_open = false;
+                self.prompt_checking = false;
+                self.ask_alive = false;
+            }
+        }
+    }
+
     fn poll_viewers(&mut self) {
         let pending = std::mem::take(&mut self.viewer_rx);
         let mut reopen = None;
+        if let Some((id, code, files)) = crate::session_window::take_admit_result() {
+            self.note_viewer_exit(&id, code, files, &mut reopen);
+        }
         for rx in pending {
             match rx.try_recv() {
-                Ok((id, code, files)) => {
-                    self.reload_peer_reports();
-                    if code != 0 {
-                        let reason = last_session_reason().unwrap_or_else(|| {
-                            if code == 3 {
-                                "Wrong password".into()
-                            } else {
-                                "The session ended before it could start.".into()
-                            }
-                        });
-                        // A wrong password comes back in the password dialog.
-                        // Any other failure is a dialog, not only the Opening toast.
-                        if code == 3 {
-                            self.status = reason;
-                        } else {
-                            self.fail_session(reason);
-                        }
-                        if code == 3 {
-                            reopen = Some((id, files));
-                        } else if code == 4 {
-                            self.prompt_open = false;
-                            self.prompt_checking = false;
-                            self.ask_alive = false;
-                        }
-                    }
+                Ok((id, code, files, pid)) => {
+                    self.viewer_pids.retain(|existing| *existing != pid);
+                    self.note_viewer_exit(&id, code, files, &mut reopen);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => self.viewer_rx.push(rx),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
@@ -2209,6 +2622,13 @@ impl App {
     }
 
     fn spawn_direct_with_password(&mut self, addr: &str, password: &str) {
+        if self.offer_session_tab(addr, password, false, false, false, addr) {
+            return;
+        }
+        self.launch_direct_process(addr, password);
+    }
+
+    fn launch_direct_process(&mut self, addr: &str, password: &str) {
         let server = self.cfg.effective_server();
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
@@ -2225,15 +2645,7 @@ impl App {
         }
         prepare_viewer(&mut cmd);
         match cmd.spawn() {
-            Ok(mut child) => {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let id = addr.to_string();
-                std::thread::spawn(move || {
-                    let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-                    let _ = tx.send((id, code, false));
-                });
-                self.viewer_rx.push(rx);
-            }
+            Ok(child) => self.track_viewer(addr.to_string(), child, false),
             Err(e) => self.fail_session(format!("Could not open the viewer: {e}")),
         }
     }
@@ -2257,15 +2669,9 @@ impl App {
         }
         prepare_viewer(&mut cmd);
         match cmd.spawn() {
-            Ok(mut child) => {
+            Ok(child) => {
                 self.toast.show(format!("Opening {addr}"));
-                let (tx, rx) = std::sync::mpsc::channel();
-                let id = addr.to_string();
-                std::thread::spawn(move || {
-                    let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-                    let _ = tx.send((id, code, false));
-                });
-                self.viewer_rx.push(rx);
+                self.track_viewer(addr.to_string(), child, false);
             }
             Err(e) => self.fail_session(format!("Could not open the viewer: {e}")),
         }
@@ -2366,10 +2772,11 @@ impl App {
     fn note_lan_names(&mut self) {
         let mut changed = false;
         let found = self.lan.clone();
-        for (name, id, _) in found {
+        for (name, id, addr) in found {
             let id = normalize_id(&id);
             let name = name.trim();
-            if name.is_empty() || name == "Computer" || !is_valid_id(&id) {
+            let addr = addr.trim();
+            if !is_valid_id(&id) {
                 continue;
             }
             let known = self.cfg.address_book.iter().any(|e| e.id == id) || self.cfg.settings.peers.contains_key(&id);
@@ -2377,8 +2784,16 @@ impl App {
                 continue;
             }
             let note = self.cfg.settings.peers.entry(id).or_default();
-            if note.hostname.is_empty() {
+            if !name.is_empty() && name != "Computer" && note.hostname.is_empty() {
                 note.hostname = name.to_string();
+                changed = true;
+            }
+            if !addr.is_empty() && !note.lan_addrs.iter().any(|have| pjdesk_proto::routes::same_endpoint(have, addr)) {
+                note.lan_addrs.push(addr.to_string());
+                if note.lan_addrs.len() > 8 {
+                    let drop = note.lan_addrs.len() - 8;
+                    note.lan_addrs.drain(0..drop);
+                }
                 changed = true;
             }
         }
@@ -2935,6 +3350,7 @@ impl eframe::App for App {
         self.poll_ask();
         self.poll_session_status();
         self.poll_viewers();
+        self.poll_admit();
         self.poll_client_update();
         self.poll_support_offer();
         self.poll_support_connect();
@@ -2978,8 +3394,11 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(if pending { 50 } else { 400 }));
         }
 
-        if self.lock_ui && self.signed_in() {
-            if self.lock_resetting || self.cfg.app_lock_for(&self.account_email()).is_none() {
+        if self.lock_ui && self.cfg.joined_by_code_or_key() && self.saved_pin().is_none() && !self.lock_resetting {
+            self.lock_ui = false;
+        }
+        if self.lock_ui && (self.signed_in() || self.pin_required()) {
+            if self.lock_resetting || self.saved_pin().is_none() {
                 self.setup_screen(ui);
             } else {
                 self.lock_screen(ui);
@@ -3005,6 +3424,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.body(ui));
 
         self.settings_window(&ctx);
+        self.saved_clear_dialogs(&ctx);
         self.invite_window(&ctx);
         self.support_keys_window(&ctx);
         self.session_error_dialog(&ctx);

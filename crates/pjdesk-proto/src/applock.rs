@@ -85,6 +85,46 @@ pub fn window_gate(signed_in: bool, has_pin: bool) -> WindowGate {
     }
 }
 
+/// Written once so an update can tell a session that already existed from a later sign-in.
+pub const PIN_PROMPT_VERSION: &str = "0.6.47";
+
+/// Whether to show the blocking Set a PIN screen.
+///
+/// A computer that joined with a code or a key is not asked, even when the
+/// account email is known. Skip for now is remembered. An account that already
+/// has a PIN uses the unlock screen instead.
+pub fn should_ask_for_pin(signed_in: bool, has_pin: bool, code_or_key: bool, declined: bool) -> bool {
+    signed_in && !has_pin && !code_or_key && !declined
+}
+
+/// After a code or a key join. The main window follows this sentence.
+/// The account password and a PIN are not part of it.
+pub fn connected_confirmation(account: &str, network: &str) -> String {
+    let account = account.trim();
+    let network = network.trim();
+    let who = if !account.is_empty() {
+        account
+    } else if !network.is_empty() {
+        network
+    } else {
+        "this network"
+    };
+    format!("You are now connected to {who}.")
+}
+
+/// First launch of this build. `had_session` with no PIN means the previous
+/// build already had them on Set a PIN, so that screen is not shown again.
+/// Returns `(declined, save)`. `save` is false when this build already decided.
+pub fn pin_prompt_on_launch(saved_prompt: &str, saved_declined: bool, had_session: bool, has_pin: bool) -> (bool, bool) {
+    if saved_prompt == PIN_PROMPT_VERSION {
+        (saved_declined, false)
+    } else if had_session && !has_pin {
+        (true, true)
+    } else {
+        (saved_declined, true)
+    }
+}
+
 /// A second launch must leave. The first window is the one that opens.
 pub fn second_window_should_exit(acquired: bool) -> bool {
     !acquired
@@ -108,6 +148,12 @@ pub struct WindowLockFile {
     pub updated: u64,
     #[serde(default)]
     pub verifier: String,
+    /// Skip for now. The blocking Set a PIN screen stays off.
+    #[serde(default)]
+    pub pin_declined: bool,
+    /// [`PIN_PROMPT_VERSION`] after this build has decided whether to ask.
+    #[serde(default)]
+    pub pin_prompt: String,
 }
 
 pub fn window_lock_path() -> std::path::PathBuf {
@@ -301,6 +347,23 @@ mod tests {
         assert_eq!(window_gate(true, true), WindowGate::Unlock);
         assert!(second_window_should_exit(false));
         assert!(!second_window_should_exit(true));
+    }
+
+    #[test]
+    fn a_code_or_a_skipped_prompt_does_not_ask_for_a_pin() {
+        assert!(!should_ask_for_pin(false, false, false, false));
+        assert!(!should_ask_for_pin(true, true, false, false));
+        assert!(!should_ask_for_pin(true, false, true, false));
+        assert!(!should_ask_for_pin(true, false, false, true));
+        assert!(should_ask_for_pin(true, false, false, false));
+        assert_eq!(connected_confirmation("ben@spader.us", "desk.example.com"), "You are now connected to ben@spader.us.");
+        assert_eq!(connected_confirmation("", "desk.example.com:21200"), "You are now connected to desk.example.com:21200.");
+        assert_eq!(connected_confirmation("  ", ""), "You are now connected to this network.");
+        assert_eq!(pin_prompt_on_launch("", false, true, false), (true, true));
+        assert_eq!(pin_prompt_on_launch("", false, true, true), (false, true));
+        assert_eq!(pin_prompt_on_launch("", false, false, false), (false, true));
+        assert_eq!(pin_prompt_on_launch(PIN_PROMPT_VERSION, false, true, false), (false, false));
+        assert_eq!(pin_prompt_on_launch(PIN_PROMPT_VERSION, true, false, false), (true, false));
     }
 
     #[test]

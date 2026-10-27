@@ -174,7 +174,7 @@ The relay still cannot see inside the QUIC packets. The byte cap limits damage; 
 
 **Impact:** The secret is SHA-256 of a fixed label plus the Windows MachineGuid. MachineGuid is in `HKLM` and readable by any signed-in user. That user can register as this computer from another address and take the online slot. The real copy is pushed to standby.
 
-**Status:** Deferred. Changing the derivation would give every existing computer a new ID and break address books. The server now logs a warning when the same ID registers from a different IP. Treat a local user who can read MachineGuid as someone who can claim the ID. A later design can add a second secret that is not readable by Users, and keep the current one so old IDs still resolve.
+**Status:** A cloned image copied MachineGuid, so two computers proved one secret and shared one ID. 0.6.47 adds a random per-install key. The first install keeps the ID. A different key is given a new ID and the rows are not merged. The legacy secret is unchanged, so an existing computer keeps its ID on the next registration. The install key is readable by Users so the unelevated window and the SYSTEM service stay one computer. A local user who can read that file can still claim that computer's ID.
 
 ### L2. `--password` on the command line is still visible
 

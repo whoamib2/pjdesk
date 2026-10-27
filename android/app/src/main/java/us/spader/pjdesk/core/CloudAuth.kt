@@ -370,6 +370,21 @@ object CloudAuth {
         }
     }
 
+    /** Account named in an access token. The signature is not checked. This is not a sign-in. */
+    fun emailFromAccessToken(token: String): String {
+        val bodyHex = token.substringBefore('.', missingDelimiterValue = "")
+        if (bodyHex.length < 2 || bodyHex.length % 2 != 0) return ""
+        if (bodyHex.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' }) return ""
+        val bytes = runCatching {
+            ByteArray(bodyHex.length / 2) { i -> bodyHex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+        }.getOrNull() ?: return ""
+        val text = runCatching { String(bytes, Charsets.UTF_8) }.getOrNull() ?: return ""
+        val lines = text.split('\n')
+        if (lines.size < 2 || lines[0] != "PJN1") return ""
+        val email = lines[1].trim().lowercase()
+        return if ('@' in email && ' ' !in email) email else ""
+    }
+
     private fun session(email: String, deviceId: String, reply: JSONObject): Session {
         val network = reply.optJSONObject("network") ?: throw CloudAuthException("This account has no network yet.")
         val address = network.optString("active_address")
@@ -412,7 +427,7 @@ object CloudAuth {
             }
         }
         return Session(
-            email = email,
+            email = email.trim().ifBlank { emailFromAccessToken(reply.optString("access")) },
             access = reply.optString("access"),
             exp = reply.optLong("exp"),
             refresh = reply.optString("refresh"),
@@ -483,10 +498,13 @@ object CloudAuth {
         if (code !in 200..299) {
             val parsed = runCatching { JSONObject(text) }.getOrNull()
             val message = parsed?.optString("error").orEmpty()
+            val retryAfter = conn.getHeaderField("Retry-After")?.trim()?.toLongOrNull()?.takeIf { it > 0 }
             throw CloudAuthException(
                 message.ifBlank { "Could not sign in ($code)." },
                 parsed?.optString("code").orEmpty(),
                 parsed?.optString("role").orEmpty(),
+                status = code,
+                retryAfter = retryAfter,
             )
         }
         return JSONObject(text)
@@ -498,6 +516,8 @@ class CloudAuthException(
     val code: String = "",
     val role: String = "",
     val loginToken: String = "",
+    val status: Int = 0,
+    val retryAfter: Long? = null,
 ) : Exception(message)
 
 data class JoinCode(

@@ -168,7 +168,7 @@ pub fn direct_port_candidates(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
             continue;
         }
         let direct = SocketAddr::new(addr.ip(), DIRECT_PORT);
-        if direct != *addr && !out.contains(&direct) {
+        if !out.contains(&direct) {
             out.push(direct);
         }
     }
@@ -228,9 +228,10 @@ pub fn spawn_punching(
 
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
-    // Keeps NAT mappings and relay routes alive; detects dead peers quickly.
-    t.keep_alive_interval(Some(Duration::from_secs(3)));
-    t.max_idle_timeout(Some(quinn::IdleTimeout::try_from(Duration::from_secs(15)).expect("valid timeout")));
+    // A keepalive every second refreshes NAT mappings. Five seconds without
+    // any packet means the path is dead, so a stopped relay does not sit frozen.
+    t.keep_alive_interval(Some(Duration::from_secs(1)));
+    t.max_idle_timeout(Some(quinn::IdleTimeout::try_from(Duration::from_secs(5)).expect("valid timeout")));
     // Retransmit lost handshake packets quickly while NAT pinholes open up.
     t.initial_rtt(Duration::from_millis(100));
     t.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
@@ -391,6 +392,9 @@ mod tests {
         assert!(order.iter().any(|(addr, delay)| *addr == public && !delay.is_zero()));
         let wan: SocketAddr = "203.0.113.8:9".parse().unwrap();
         assert!(direct_port_candidates(&[wan]).is_empty());
+        let already: SocketAddr = "192.168.1.20:21201".parse().unwrap();
+        let order = dial_order(&[already]);
+        assert_eq!(order, vec![(already, Duration::ZERO)]);
     }
 
     #[test]

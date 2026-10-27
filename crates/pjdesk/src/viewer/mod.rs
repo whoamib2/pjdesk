@@ -42,6 +42,10 @@ pub struct Link {
     pub host_id: String,
     pub path: LinkPath,
     pub peer_proto: u16,
+    /// LAN and public addresses from the last introduction. Tried before the relay.
+    pub direct_targets: Vec<SocketAddr>,
+    /// Host certificate from that introduction.
+    pub host_fingerprint: Option<pjdesk_proto::tls::Fingerprint>,
 }
 
 pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<()> {
@@ -72,6 +76,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let mut waiting = false;
     let mut prefer_standby = false;
+    let mut move_to: Option<String> = None;
     let mut tries = 0u32;
     loop {
         let link = if let Some(addr) = direct.clone() {
@@ -86,10 +91,15 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
                 args.force_relay,
                 waiting,
                 prefer_standby,
+                move_to.as_deref(),
+                Duration::from_secs(90),
             ))
         };
         let link = match link {
-            Ok(link) => link,
+            Ok(link) => {
+                move_to = None;
+                link
+            }
             Err(e) if waiting && tries < 40 => {
                 let text = format!("{e:#}");
                 if pjdesk_proto::signal::is_standby_refusal(&text) {
@@ -135,8 +145,24 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         if args.headless {
             return runtime.block_on(headless(link, args.frames));
         }
-        let was_relay = matches!(link.path, crate::p2p::LinkPath::Relay(_));
-        match window::run(&runtime, link)? {
+        let display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let view = std::env::var("PJDESK_VIEW").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let seed = window::Seed {
+            server: format!("{}:{}", server.host, server.port),
+            target: target.clone(),
+            password: password.clone(),
+            direct: direct.clone(),
+            force_relay: args.force_relay,
+            display,
+            view,
+            remember: false,
+            from_store: std::env::var("PJDESK_SAVED").ok().as_deref() == Some("1"),
+            files: std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files"),
+            label: String::new(),
+            direct_targets: Vec::new(),
+            host_fingerprint: None,
+        };
+        match window::run(&runtime, link, seed)? {
             window::ViewerStop::UserClosed => break,
             window::ViewerStop::HostRestart => {
                 prefer_standby = false;
@@ -147,20 +173,20 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
                 tracing::info!("Waiting for the computer to come back");
                 std::thread::sleep(Duration::from_secs(5));
             }
-            window::ViewerStop::RelayResume => {
+            window::ViewerStop::RelayResume { primary } => {
                 waiting = true;
-                prefer_standby = was_relay;
-                let standby = config.network_standby.clone().unwrap_or_default();
-                if prefer_standby && !standby.trim().is_empty() {
+                prefer_standby = false;
+                move_to = if primary.trim().is_empty() { None } else { Some(primary.clone()) };
+                if primary.trim().is_empty() {
                     tracing::info!(
-                        "failover: relayed session lost the rendezvous server; reconnecting through the standby {standby}"
+                        "failover: relayed session moving to the current primary; reconnecting with the password already entered"
                     );
                 } else {
                     tracing::info!(
-                        "failover: relayed session lost the rendezvous server; reconnecting with the password already entered"
+                        "failover: relayed session moving to the primary {primary}; reconnecting with the password already entered"
                     );
                 }
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(200));
             }
         }
     }
@@ -198,6 +224,225 @@ pub(crate) fn password_source(
     }
 }
 
+/// Opens one more computer inside a session window that is already running.
+pub(crate) async fn open_admitted(
+    admit: &crate::session_window::Admit,
+    move_to: Option<&str>,
+    waiting_retry: bool,
+) -> Result<Link> {
+    open_for(admit, move_to, waiting_retry, Duration::from_secs(90)).await
+}
+
+/// Same as [`open_admitted`], with a shorter wait for the host to answer.
+async fn open_for(
+    admit: &crate::session_window::Admit,
+    move_to: Option<&str>,
+    waiting_retry: bool,
+    host_wait: Duration,
+) -> Result<Link> {
+    let mut config = Config::load().context("reading settings")?;
+    if !admit.direct.trim().is_empty() {
+        return connect_direct(&mut config, admit.direct.trim(), &admit.password, None, false).await;
+    }
+    let server = ServerAddr::parse(&admit.server).unwrap_or(ServerAddr {
+        host: admit.server.clone(),
+        port: pjdesk_proto::DEFAULT_PORT,
+    });
+    connect(
+        &server,
+        &mut config,
+        &admit.id,
+        &admit.password,
+        None,
+        admit.force_relay,
+        waiting_retry,
+        false,
+        move_to,
+        host_wait,
+    )
+    .await
+}
+
+/// Direct first, then the current primary, then the other server. The password
+/// already entered is reused. `move_to` is the primary a role change named.
+pub(crate) async fn resume_session(
+    admit: &crate::session_window::Admit,
+    move_to: Option<&str>,
+    targets: &[SocketAddr],
+    fingerprint: Option<pjdesk_proto::tls::Fingerprint>,
+) -> Result<Link> {
+    if !admit.force_relay {
+        if let Some(fp) = fingerprint {
+            match try_direct_resume(&admit.password, targets, Some(fp), &admit.id, &admit.label).await {
+                Ok(Some(link)) => return Ok(link),
+                Ok(None) => {}
+                Err(e) if already_in_session(&e) => {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    if let Ok(Some(link)) = try_direct_resume(&admit.password, targets, Some(fp), &admit.id, &admit.label).await {
+                        return Ok(link);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    let wait = Duration::from_secs(8);
+    let mut last = None;
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        match open_for(admit, move_to, false, wait).await {
+            Ok(link) => return Ok(link),
+            Err(e) if already_in_session(&e) => last = Some(e),
+            Err(e) => {
+                let wrong = e.to_string().to_ascii_lowercase().contains("wrong password");
+                last = Some(e);
+                if wrong {
+                    break;
+                }
+            }
+        }
+    }
+    if move_to.is_some() {
+        if let Ok(link) = open_for(admit, None, false, wait).await {
+            return Ok(link);
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("could not reconnect")))
+}
+
+fn already_in_session(err: &anyhow::Error) -> bool {
+    format!("{err:#}").to_ascii_lowercase().contains("already connected")
+}
+
+/// QUIC straight to an address this session already reached, with the same key.
+async fn try_direct_resume(
+    password: &str,
+    targets: &[SocketAddr],
+    fingerprint: Option<pjdesk_proto::tls::Fingerprint>,
+    host_id: &str,
+    host_label: &str,
+) -> Result<Option<Link>> {
+    if targets.is_empty() || password.is_empty() {
+        return Ok(None);
+    }
+    let udp = std::net::UdpSocket::bind("0.0.0.0:0").context("opening a UDP socket")?;
+    let (endpoint, verifier) = p2p::controller_endpoint_pin(udp, fingerprint)?;
+    let mut attempts = tokio::task::JoinSet::new();
+    for (addr, delay) in p2p::dial_order(targets) {
+        let endpoint = endpoint.clone();
+        attempts.spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let connection = endpoint.connect(addr, pjdesk_proto::PEER_SERVER_NAME)?.await?;
+            Ok::<_, anyhow::Error>((connection, addr))
+        });
+    }
+    let winner = timeout(Duration::from_secs(3), async {
+        while let Some(result) = attempts.join_next().await {
+            if let Ok(Ok(found)) = result {
+                return Some(found);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    attempts.abort_all();
+    let Some((connection, addr)) = winner else {
+        return Ok(None);
+    };
+    let auth = match session::controller_auth(&connection, password, &crate::hostname()).await {
+        Ok(auth) => auth,
+        Err(e) if e.is::<session::WrongPassword>() || already_in_session(&e) => {
+            connection.close(1u32.into(), b"resume");
+            return Err(e);
+        }
+        Err(e) => {
+            tracing::info!("direct resume did not stay up: {e:#}");
+            connection.close(1u32.into(), b"resume");
+            return Ok(None);
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    if let Some(reason) = connection.close_reason() {
+        let text = reason.to_string();
+        connection.close(1u32.into(), b"resume");
+        if already_in_session(&anyhow!(text.clone())) {
+            bail!(text);
+        }
+        tracing::info!("direct resume closed: {text}");
+        return Ok(None);
+    }
+    tracing::info!("Reconnected directly to {addr}");
+    Ok(Some(Link {
+        connection,
+        endpoint,
+        control_send: auth.send,
+        control_recv: auth.recv,
+        host_name: if auth.peer_name.trim().is_empty() { host_label.trim().to_string() } else { auth.peer_name },
+        host_id: host_id.to_string(),
+        path: LinkPath::Direct(addr),
+        peer_proto: auth.peer_proto,
+        direct_targets: targets.to_vec(),
+        host_fingerprint: verifier.observed().or(fingerprint),
+    }))
+}
+
+/// Dials a saved LAN address for this computer before opening a relay session.
+/// Same-subnet peers connect on UDP 21201 and do not need the server's relay.
+async fn try_cached_lan(config: &Config, target: &str, password: &str, mine: &[std::net::Ipv4Addr]) -> Result<Option<Link>> {
+    let target = normalize_id(target);
+    if password.is_empty() || !is_valid_id(&target) {
+        return Ok(None);
+    }
+    let Some(note) = config.settings.peers.get(&target) else {
+        return Ok(None);
+    };
+    let listed = pjdesk_proto::routes::same_subnet_direct(&note.lan_addrs, mine);
+    if listed.is_empty() {
+        return Ok(None);
+    }
+    let targets: Vec<SocketAddr> = listed.iter().filter_map(|addr| addr.parse().ok()).collect();
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    let fingerprint = pjdesk_proto::tls::parse_fingerprint(&note.host_fingerprint).ok();
+    tracing::info!("Trying the host on this network before the relay: {}", listed.join(", "));
+    let found = try_direct_resume(password, &targets, fingerprint, &target, "").await?;
+    if let Some(link) = &found {
+        let addrs: Vec<String> = link.direct_targets.iter().map(|addr| addr.to_string()).collect();
+        let fp = link.host_fingerprint.map(|fp| pjdesk_proto::tls::format_fingerprint(&fp));
+        Config::remember_lan(&target, &addrs, fp.as_deref());
+    }
+    Ok(found)
+}
+
+/// Listens briefly for a LAN beacon from `target` and stores its address.
+fn note_lan_beacon(target: &str) {
+    let want = normalize_id(target);
+    if !is_valid_id(&want) {
+        return;
+    }
+    let found = crate::host::direct::discover_for(Duration::from_millis(800));
+    let mut addrs = Vec::new();
+    let mut fingerprint = None;
+    for (beacon, src) in found {
+        if normalize_id(&beacon.id) != want || !pjdesk_proto::discover::accept_lan_ip(src.ip()) {
+            continue;
+        }
+        addrs.push(SocketAddr::new(src.ip(), beacon.port).to_string());
+        fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&beacon.fingerprint));
+    }
+    if !addrs.is_empty() {
+        tracing::info!("Heard {} on this network at {}", format_id(&want), addrs.join(", "));
+        Config::remember_lan(&want, &addrs, fingerprint.as_deref());
+    }
+}
+
 /// Signaling → UDP binding → hole punching / relay → QUIC → password check.
 async fn connect(
     server: &ServerAddr,
@@ -208,6 +453,8 @@ async fn connect(
     force_relay: bool,
     waiting_retry: bool,
     prefer_standby: bool,
+    move_to: Option<&str>,
+    host_wait: Duration,
 ) -> Result<Link> {
     tracing::info!("Connecting to {} through the advertised servers", format_id(target));
     let _ = (server, prefer_standby);
@@ -221,7 +468,23 @@ async fn connect(
     let access_key = pjdesk_proto::access::is_access_key(&access);
     let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s);
     let mine = mine.await.unwrap_or_default();
-    let mut signal = SignalClient::connect_catalog(config, &mine).await?;
+    if !force_relay {
+        match try_cached_lan(config, target, password, &mine).await {
+            Ok(Some(link)) => {
+                tracing::info!("Connected over the LAN; the relay was not used");
+                return Ok(link);
+            }
+            Ok(None) => {}
+            Err(e) if e.is::<WrongPassword>() || already_in_session(&e) => return Err(e),
+            Err(e) => tracing::info!("LAN connection did not start: {e:#}"),
+        }
+    }
+    let mut signal = if let Some(addr) = move_to.filter(|addr| !addr.trim().is_empty()) {
+        tracing::info!("failover: dialing the new primary {addr}");
+        SignalClient::connect_endpoint(addr, config, pjdesk_proto::routes::dial_budget(addr)).await?
+    } else {
+        SignalClient::connect_catalog(config, &mine).await?
+    };
     let mut followed_redirect = false;
     tracing::info!("Reached the server via {}", signal.via);
     if !access.is_empty() {
@@ -237,7 +500,7 @@ async fn connect(
     tracing::info!("Waiting for {} to answer", format_id(target));
     let mut retried_without_token = false;
     let (session_id, token, udp_port, host_name) = loop {
-        match timeout(Duration::from_secs(90), signal.recv()).await {
+        match timeout(host_wait, signal.recv()).await {
             Ok(None) if !access.is_empty() && !access_key && !retried_without_token => {
                 retried_without_token = true;
                 signal = SignalClient::connect_catalog(config, &mine).await?;
@@ -252,7 +515,8 @@ async fn connect(
                     bail!("{message}");
                 };
                 if !routes.is_empty() {
-                    config.network_routes = routes;
+                    config.network_routes = pjdesk_proto::routes::keep_other_server(&config.network_routes, &routes);
+                    crate::routes_store::store(&config.network_routes);
                     let _ = config.save();
                 }
                 if addr.is_empty() {
@@ -276,7 +540,8 @@ async fn connect(
             }
             Ok(Some(ServerMsg::Routes(routes))) => {
                 if !routes.is_empty() {
-                    config.network_routes = routes;
+                    config.network_routes = pjdesk_proto::routes::keep_other_server(&config.network_routes, &routes);
+                    crate::routes_store::store(&config.network_routes);
                     let _ = config.save();
                 }
             }
@@ -288,7 +553,34 @@ async fn connect(
     };
 
     let server_udp = SocketAddr::new(signal.server_addr.ip(), udp_port);
-    let binding = p2p::bind_udp(server_udp, session_id, token, Role::Controller).await?;
+    let binding = match p2p::bind_udp(server_udp, session_id, token, Role::Controller).await {
+        Ok(binding) => binding,
+        Err(e) => {
+            tracing::info!("UDP to the relay failed: {e:#}. Trying the host on this network.");
+            if !force_relay && !password.is_empty() {
+                let heard = tokio::task::spawn_blocking({
+                    let id = target.to_string();
+                    move || note_lan_beacon(&id)
+                })
+                .await;
+                if heard.is_ok() {
+                    if let Ok(disk) = Config::load() {
+                        config.fill_peer_facts_from(&disk);
+                    }
+                    match try_cached_lan(config, target, password, &mine).await {
+                        Ok(Some(link)) => {
+                            tracing::info!("Connected over the LAN after the relay's UDP handshake failed");
+                            return Ok(link);
+                        }
+                        Ok(None) => {}
+                        Err(err) if err.is::<WrongPassword>() || already_in_session(&err) => return Err(err),
+                        Err(err) => tracing::info!("LAN connection did not start: {err:#}"),
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
     tracing::debug!("our public address for this session: {}", binding.observed);
     signal.send(ClientMsg::UdpReady {
         session_id,
@@ -297,7 +589,7 @@ async fn connect(
     })?;
 
     let (peer_public, peer_local, fingerprint) = loop {
-        match timeout(Duration::from_secs(20), signal.recv()).await {
+        match timeout(host_wait.min(Duration::from_secs(20)), signal.recv()).await {
             Ok(Some(ServerMsg::PeerInfo { public_addr, local_addrs, cert_fingerprint, .. })) => {
                 tracing::info!(
                     "Host addresses: public {public_addr}, on this network {}",
@@ -307,6 +599,14 @@ async fn connect(
                         local_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
                     }
                 );
+                if let Some(fp) = cert_fingerprint {
+                    let lan: Vec<String> = local_addrs
+                        .iter()
+                        .filter(|addr| p2p::is_lan_ip(addr.ip()))
+                        .map(|addr| addr.to_string())
+                        .collect();
+                    Config::remember_lan(target, &lan, Some(&pjdesk_proto::tls::format_fingerprint(&fp)));
+                }
                 break (public_addr, local_addrs, cert_fingerprint.context("the server didn't send the host's key")?)
             }
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
@@ -436,6 +736,8 @@ async fn connect(
         host_id: target.to_string(),
         path,
         peer_proto: auth.peer_proto,
+        direct_targets: candidates,
+        host_fingerprint: Some(fingerprint),
     })
 }
 
@@ -597,6 +899,8 @@ async fn connect_direct(
         host_id: "000000000".into(),
         path: LinkPath::Direct(socket_addr),
         peer_proto: auth.peer_proto,
+        direct_targets: vec![socket_addr],
+        host_fingerprint: verifier.observed(),
     })
 }
 

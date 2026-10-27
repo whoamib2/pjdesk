@@ -113,10 +113,11 @@ pub const ALPN_PEER: &[u8] = b"pjdesk-peer/1";
 pub const SIGNAL_SERVER_NAME: &str = "pjdesk-server";
 pub const PEER_SERVER_NAME: &str = "pjdesk-host";
 
-/// Derives a stable 32-byte device secret from a machine-unique string (such as
-/// the Windows MachineGuid). It is deterministic, so the same machine always
-/// yields the same secret: the GUI and the background service then register as
-/// one device (no duplicates) and the assigned ID survives reinstalls.
+/// Legacy device secret from a machine id such as the Windows MachineGuid.
+/// The window and the service on one install compute the same value. A cloned
+/// image copies MachineGuid, so this secret is not unique across computers.
+/// `RegisterInstall` sends a separate per-install key, and that key is what
+/// keeps each computer on its own ID.
 pub fn derive_device_secret(machine_id: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();

@@ -18,6 +18,15 @@ pub fn set_session_key(key: [u8; 32]) {
     *SESSION_KEY.lock().unwrap() = Some(key);
 }
 
+/// Writes the in-memory vault key the way a normal sign-in does.
+pub fn store_session_key(config: &mut Config) {
+    let Some(key) = *SESSION_KEY.lock().unwrap() else { return };
+    if config.password_vault_key.is_some() {
+        return;
+    }
+    config.password_vault_key = Some(crate::secure::protect(&hex::encode(key)));
+}
+
 pub fn clear_session_key() {
     *SESSION_KEY.lock().unwrap() = None;
 }

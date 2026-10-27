@@ -23,6 +23,9 @@
 //                               unconditional put older servers send.
 //   GET  /api/sync/health       (Bearer, sync on) { peers: [...] }
 //   PUT  /api/sync/health       (Bearer, sync on) one server's version/role
+//                               plus its public, LAN, and hostname addresses
+//   GET  /api/probe             (Bearer, sync on) ?host=&port=21200
+//                               opens that public address from this Worker
 //   GET  /api/admin/accounts    (Bearer, admin)
 //   GET  /api/admin/overview    (Bearer, admin)
 //   GET  /api/admin/servers     (Bearer, admin) health reports + sign-ins
@@ -35,11 +38,11 @@
 
 import { effectivePlan, isPlan } from "./plans.js";
 import { route as networkRoute } from "./network.js";
+import { probeQuery, shapeHealth } from "./health.js";
+import { LOGIN_FAILS, LOGIN_IP, loginRetryAfter, retryAfterSeconds, signInLimitMessage } from "./login-limit.js";
 
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 const AUTH_HASH_ITERATIONS = 100000; // the Workers PBKDF2 maximum
-const LOGIN_FAILS = { limit: 10, window: 15 * 60 };
-const LOGIN_IP = { limit: 30, window: 15 * 60 };
 const SIGNUPS = { limit: 5, window: 60 * 60 };
 const SESSION_IDLE = 90 * 24 * 3600;
 const SESSION_ABSOLUTE = 365 * 24 * 3600;
@@ -159,6 +162,12 @@ async function noteEvent(env, bucket) {
   await env.DB.batch(stmts);
 }
 
+/** Unix times still inside one bucket's window. A 429 does not insert a row. */
+async function eventsSince(env, bucket, since) {
+  const rows = await env.DB.prepare("SELECT at FROM rate_events WHERE bucket = ? AND at > ?").bind(bucket, since).all();
+  return (rows.results || []).map((row) => Number(row.at) || 0);
+}
+
 /** The signed-in account for a Bearer token. */
 async function session(request, env) {
   const m = (request.headers.get("authorization") || "").match(/^Bearer\s+([A-Za-z0-9_-]{20,128})$/);
@@ -223,6 +232,7 @@ async function api(request, env, url, ctx) {
   if (p === "/api/sync" && m === "PUT") return syncPut(request, env);
   if (p === "/api/sync/health" && m === "GET") return syncHealthGet(request, env);
   if (p === "/api/sync/health" && m === "PUT") return syncHealthPut(request, env);
+  if (p === "/api/probe" && m === "GET") return probePort(request, env, url);
   if (p === "/api/admin/accounts" && m === "GET") return adminAccounts(request, env);
   if (p === "/api/admin/overview" && m === "GET") return adminOverview(request, env);
   if (p === "/api/admin/servers" && m === "GET") return adminServers(request, env);
@@ -275,11 +285,13 @@ async function login(request, env) {
   const email = normEmail(rawEmail);
   if (!validEmail(email) || !validKey(auth_key)) throw new HttpError(400, "Enter your email and password.");
   const ip = request.headers.get("cf-connecting-ip") || "local";
-  if (
-    (await rateLimited(env, `login:${email}`, LOGIN_FAILS)) ||
-    (await rateLimited(env, `login-ip:${ip}`, LOGIN_IP))
-  ) {
-    throw new HttpError(429, "Too many failed sign-ins. Wait 15 minutes and try again.");
+  const checked = now();
+  const emailEvents = await eventsSince(env, `login:${email}`, checked - LOGIN_FAILS.window);
+  const ipEvents = await eventsSince(env, `login-ip:${ip}`, checked - LOGIN_IP.window);
+  const wait = loginRetryAfter(emailEvents, ipEvents, checked);
+  if (wait > 0) {
+    // Not recorded. Another try while this is on does not extend the 15 minutes.
+    return json({ error: signInLimitMessage(wait) }, 429, { "retry-after": String(wait) });
   }
   const acct = await env.DB.prepare("SELECT id, auth_hash, auth_salt, sync_enabled FROM accounts WHERE email = ?")
     .bind(email)
@@ -327,8 +339,18 @@ async function changePassword(request, env) {
   const s = await session(request, env);
   const { old_auth_key, new_auth_key } = await readJson(request);
   if (!validKey(old_auth_key) || !validKey(new_auth_key)) throw new HttpError(400, "Bad request.");
-  if (await rateLimited(env, `login:${s.email}`, LOGIN_FAILS)) {
-    throw new HttpError(429, "Too many failed attempts. Wait 15 minutes and try again.");
+  const t = now();
+  const wait = retryAfterSeconds(
+    await eventsSince(env, `login:${s.email}`, t - LOGIN_FAILS.window),
+    t,
+    LOGIN_FAILS,
+  );
+  if (wait > 0) {
+    return json(
+      { error: "Too many failed attempts. Wait 15 minutes and try again." },
+      429,
+      { "retry-after": String(wait) },
+    );
   }
   const acct = await env.DB.prepare("SELECT auth_hash, auth_salt FROM accounts WHERE id = ?").bind(s.accountId).first();
   if (!sameHex(await hashAuthKey(old_auth_key, acct.auth_salt), acct.auth_hash)) {
@@ -451,16 +473,7 @@ async function syncHealthPut(request, env) {
   requireSync(s);
   const body = await readJson(request);
   if (!validInstance(body.instance)) throw new HttpError(400, "Bad request.");
-  const record = {
-    instance: body.instance,
-    name: String(body.name || "").slice(0, 64),
-    version: String(body.version || "").slice(0, 32),
-    role: body.role === "active" ? "active" : "standby",
-    epoch: Number.isFinite(body.epoch) ? body.epoch : 0,
-    healthy: !!body.healthy,
-    at: now(),
-    maintenance_until: Number.isFinite(body.maintenance_until) ? body.maintenance_until : 0,
-  };
+  const record = shapeHealth(body, now());
   await env.SYNC.put(healthKey(s.accountId, record.instance), JSON.stringify(record), {
     httpMetadata: { contentType: "application/json" },
   });
@@ -487,6 +500,30 @@ async function syncHealthPut(request, env) {
     )
     .run();
   return json({ ok: true });
+}
+
+async function probePort(request, env, url) {
+  const s = await session(request, env);
+  requireSync(s);
+  const target = probeQuery(url.searchParams.get("host"), url.searchParams.get("port"));
+  if (!target) throw new HttpError(400, "Bad request.");
+  try {
+    const { connect } = await import("cloudflare:sockets");
+    const socket = connect({ hostname: target.host, port: target.port });
+    await socket.opened;
+    try {
+      socket.close();
+    } catch {
+      // The open already answered the question.
+    }
+    return json({ ok: true, open: true });
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (msg.includes("cloudflare:sockets") || msg.includes("Cannot find module")) {
+      return json({ ok: false, open: false }, 501);
+    }
+    return json({ ok: true, open: false });
+  }
 }
 
 async function syncHealthGet(request, env) {

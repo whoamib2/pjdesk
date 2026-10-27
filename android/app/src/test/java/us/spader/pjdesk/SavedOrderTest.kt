@@ -18,6 +18,11 @@ import us.spader.pjdesk.core.osDetail
 import us.spader.pjdesk.core.PresenceReport
 import us.spader.pjdesk.core.presenceOnlineFlag
 import us.spader.pjdesk.core.presenceStale
+import us.spader.pjdesk.core.mergeSavedFromAccount
+import us.spader.pjdesk.core.savedComputerCountLine
+import us.spader.pjdesk.core.savedSyncChoiceOnUpdate
+import us.spader.pjdesk.core.signInPauseSeconds
+import us.spader.pjdesk.core.signInPauseText
 import us.spader.pjdesk.core.savedSubtitle
 import us.spader.pjdesk.core.shownVersion
 import us.spader.pjdesk.core.versionBehind
@@ -185,6 +190,39 @@ class SavedOrderTest {
         assertEquals("0.6.43", shownVersion("0.6.43", mine = true, selfVersion = ""))
         assertTrue(versionBehind("0.6.43", "0.6.44"))
         assertFalse(versionBehind("0.6.44", ""))
+    }
+
+    @Test
+    fun aLocalClearStaysUntilTheNextSignIn() {
+        assertFalse(mergeSavedFromAccount(localCleared = true, preferAccount = false))
+        assertTrue(mergeSavedFromAccount(localCleared = true, preferAccount = true))
+        assertTrue(mergeSavedFromAccount(localCleared = false, preferAccount = false))
+        assertEquals("This computer has 3 saved computers.", savedComputerCountLine(3))
+        assertEquals("This computer has 1 saved computer.", savedComputerCountLine(1))
+    }
+
+    @Test
+    fun anExistingListKeepsSyncingAndANewPhoneDoesNot() {
+        assertEquals("yes", savedSyncChoiceOnUpdate("", 2))
+        assertEquals("", savedSyncChoiceOnUpdate("", 0))
+        assertEquals("no", savedSyncChoiceOnUpdate("no", 4))
+        assertEquals("yes", savedSyncChoiceOnUpdate("yes", 0))
+    }
+
+    @Test
+    fun aLogin429UsesBensSentenceAndAClock() {
+        val production = "Too many failed sign-ins. Wait 15 minutes and try again."
+        assertEquals(15L * 60, signInPauseSeconds(429, production))
+        assertEquals(15L * 60, signInPauseSeconds(429, "PJDesk could not sign in (429)."))
+        assertEquals(150L, signInPauseSeconds(429, "ignored", 150))
+        assertEquals(61L, signInPauseSeconds(429, "Wait 15 minutes", 61))
+        assertEquals(15L * 60, signInPauseSeconds(429, "ignored", 100_000))
+        assertEquals(null, signInPauseSeconds(429, "Too many tries. Try again in 2 minutes.", 120))
+        assertEquals(null, signInPauseSeconds(401, "Wrong email or password."))
+        assertEquals("Too many sign-in attempts. Try again in 15 minutes.", signInPauseText(15 * 60))
+        assertEquals("Too many sign-in attempts. Try again in 1 minute.", signInPauseText(1))
+        assertEquals("Too many sign-in attempts. Try again in 2 minutes.", signInPauseText(61))
+        assertEquals("Too many sign-in attempts. Try again in 3 minutes.", signInPauseText(150))
     }
 
     @Test

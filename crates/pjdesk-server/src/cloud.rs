@@ -17,8 +17,8 @@
 //!   are conditional on it, so two servers never both write. The previous
 //!   primary sees the newer epoch on its next check, stops uploading, and
 //!   becomes the standby.
-//! * **Demote** stops this server uploading. It does not make another server
-//!   the primary; that server has to be promoted.
+//! * **Demote** hands the epoch to the other server and becomes standby only
+//!   after that server owns the newer generation. It does not leave zero primaries.
 //!
 //! The copy is sealed with ChaCha20-Poly1305 — under the password-derived
 //! sync key (PJDesk Cloud), or a random key made at setup that travels in the
@@ -1426,11 +1426,13 @@ fn upload(
 pub fn promote(data_dir: &Path) -> Result<()> {
     let cfg = CloudConfig::load(data_dir).context("Cloud sync is not set up on this server.")?;
     let mine = instance_id(data_dir);
+    let mut previous_primary = String::new();
     let (epoch, guard) = match fetch(&cfg, None)? {
         Remote::Missing => (1, Guard::IfAbsent),
         Remote::NotModified => bail!("could not read the cloud copy"),
         Remote::Copy { bundle, etag } => {
             if bundle.instance != mine {
+                previous_primary = bundle.written_by.clone();
                 apply_bundle(data_dir, &bundle, etag.clone())?;
             }
             (next_epoch(bundle.epoch), Guard::IfMatch(etag))
@@ -1454,8 +1456,8 @@ pub fn promote(data_dir: &Path) -> Result<()> {
     st.desired = "active".into();
     st.fenced_epoch = 0;
     st.fenced_instance.clear();
-    st.notice =
-        "This server is now the primary. The other server will switch to standby the next time it checks.".into();
+    let other = if previous_primary.eq_ignore_ascii_case(&hostname()) { String::new() } else { previous_primary };
+    st.notice = pjdesk_proto::failover::primary_result(st.epoch, &other);
     st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Active);
     tracing::info!("failover: {}", st.notice);
@@ -1464,22 +1466,72 @@ pub fn promote(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stops this server uploading. The cloud copy stays as it is until some
-/// other server is promoted.
+/// Becomes standby only when another server already owns a newer generation.
+/// A demote that would leave no primary is refused.
 pub fn demote(data_dir: &Path) -> Result<()> {
     if CloudConfig::load(data_dir).is_none() {
         bail!("Cloud sync is not set up on this server.");
     }
+    let local = SyncState::load(data_dir).epoch;
+    let mine = instance_id(data_dir);
+    let owner = cloud_owner(data_dir)?;
+    if !pjdesk_proto::failover::peer_took_the_epoch(local, owner.epoch, &owner.instance, &mine) {
+        bail!(
+            "The other server has not taken the primary. This server stayed the primary (generation {local})."
+        );
+    }
+    let _ = yield_to_epoch(data_dir, owner.epoch, &owner.instance, &owner.name);
     let mut st = SyncState::load(data_dir);
-    st.desired = "standby".into();
-    st.notice =
-        "This server stepped down to standby and will not upload. Make another server the primary before relying on it."
-            .into();
+    st.notice = pjdesk_proto::failover::standby_result(&owner.name, owner.epoch);
     st.save(data_dir);
     let _ = sync_status_now(data_dir, Role::Standby);
     tracing::info!("{}", st.notice);
-    register_network(data_dir, Role::Standby, false);
     Ok(())
+}
+
+/// Who currently owns the sealed cloud copy.
+pub struct CloudOwner {
+    pub epoch: u64,
+    pub instance: String,
+    pub name: String,
+}
+
+pub fn cloud_owner(data_dir: &Path) -> Result<CloudOwner> {
+    let cfg = CloudConfig::load(data_dir).context("Cloud sync is not set up on this server.")?;
+    match fetch(&cfg, None)? {
+        Remote::Copy { bundle, .. } => Ok(CloudOwner {
+            epoch: bundle.epoch,
+            instance: bundle.instance,
+            name: bundle.written_by,
+        }),
+        Remote::Missing => Ok(CloudOwner { epoch: 0, instance: String::new(), name: String::new() }),
+        Remote::NotModified => bail!("could not read the cloud copy"),
+    }
+}
+
+/// The sync key both servers of this account share. Used to prove a handoff.
+pub fn sync_key(data_dir: &Path) -> Option<[u8; 32]> {
+    CloudConfig::load(data_dir)?.key_bytes().ok()
+}
+
+/// Addresses to try when asking the other server to take the primary.
+/// LAN first, then public, then the account's other published address.
+pub fn peer_dial_targets(data_dir: &Path) -> Vec<String> {
+    let (public_addrs, lan_addrs, names) = peer_endpoints(data_dir);
+    let mut out = Vec::new();
+    for addr in lan_addrs.into_iter().chain(public_addrs).chain(names) {
+        let addr = addr.trim().to_string();
+        if addr.is_empty() || out.iter().any(|have: &String| have.eq_ignore_ascii_case(&addr)) {
+            continue;
+        }
+        out.push(addr);
+    }
+    if let Some(extra) = peer_target(data_dir) {
+        if !out.iter().any(|have| pjdesk_proto::failover::same_server(have, &extra)) {
+            out.push(extra);
+        }
+    }
+    out
 }
 
 /// What the cloud holds.
@@ -1780,6 +1832,11 @@ pub fn publish_heartbeat(data_dir: &Path) {
     }
     // A version change reaches the account on this heartbeat, not the 30 s sync.
     publish_presence(data_dir);
+    // The standby does not host the live registrations. The primary published
+    // them; read that list back so this window's online count matches.
+    if !accepts_host_registrations(data_dir) {
+        refresh_cloud_presence(data_dir);
+    }
 }
 
 const MAINT_FILE: &str = "maintenance-until.txt";
@@ -1816,9 +1873,14 @@ const ROUTES_GEN: &str = "routes-generation.txt";
 /// addresses changed. Returns true when clients and the cloud should be told now.
 pub fn refresh_advertisement(data_dir: &Path) -> bool {
     let _ = crate::public_addr::poll_public_ip(data_dir, now());
-    let _ = crate::public_addr::refresh_address_warning(data_dir);
     let routes = assemble_routes(data_dir);
-    let bytes = serde_json::to_vec(&routes).unwrap_or_default();
+    let changed = store_routes(data_dir, &routes);
+    let _ = crate::public_addr::refresh_address_warning(data_dir);
+    changed
+}
+
+fn store_routes(data_dir: &Path, routes: &pjdesk_proto::routes::ServerRoutes) -> bool {
+    let bytes = serde_json::to_vec(routes).unwrap_or_default();
     let prev = std::fs::read(data_dir.join(ROUTES_FILE)).unwrap_or_default();
     if bytes == prev {
         return false;
@@ -1876,6 +1938,15 @@ fn local_advertised(data_dir: &Path) -> pjdesk_proto::routes::Advertised {
 }
 
 fn assemble_routes(data_dir: &Path) -> pjdesk_proto::routes::ServerRoutes {
+    let built = assemble_routes_now(data_dir);
+    let previous = std::fs::read(data_dir.join(ROUTES_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    pjdesk_proto::routes::keep_other_server(&previous, &built)
+}
+
+fn assemble_routes_now(data_dir: &Path) -> pjdesk_proto::routes::ServerRoutes {
     let mine = local_advertised(data_dir);
     let (peer_public, peer_lan, peer_names) = peer_endpoints(data_dir);
     let primary = accepts_host_registrations(data_dir);
@@ -2020,9 +2091,7 @@ pub fn yield_to_epoch(data_dir: &Path, remote_epoch: u64, remote_instance: &str,
     st.desired = "standby".into();
     st.fenced_epoch = remote_epoch;
     st.fenced_instance = remote_instance.to_string();
-    st.notice = format!(
-        "{name} is now the primary (generation {remote_epoch}). This server switched to standby and will not take the primary back on its own."
-    );
+    st.notice = pjdesk_proto::failover::standby_result(name, remote_epoch);
     st.save(data_dir);
     tracing::warn!("failover: {}", st.notice);
     let _ = sync_status_now(data_dir, Role::Standby);
@@ -2030,7 +2099,62 @@ pub fn yield_to_epoch(data_dir: &Path, remote_epoch: u64, remote_instance: &str,
     true
 }
 
+/// True when this server already recorded that generation as someone else's.
+pub fn already_fenced(data_dir: &Path, epoch: u64, instance: &str) -> bool {
+    let st = SyncState::load(data_dir);
+    st.desired == "standby" && st.fenced_epoch == epoch && st.fenced_instance == instance
+}
+
 const PEER_FILE: &str = "failover-peer.txt";
+
+/// The other server's address. When this server is the published primary,
+/// that is the standby. Otherwise it is the primary. Empty when the account
+/// has no other address.
+pub fn migration_target(data_dir: &Path) -> String {
+    let cached = std::fs::read_to_string(data_dir.join(PEER_FILE))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let Some(cfg) = CloudConfig::load(data_dir) else {
+        return cached.unwrap_or_default();
+    };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return cached.unwrap_or_default();
+    }
+    let mine = crate::public_addr::load(data_dir).map(|record| record.address).unwrap_or_default();
+    match network_addresses(&cfg) {
+        Ok((active, standby)) => {
+            let active = active.trim();
+            let standby = standby.trim();
+            let other = if !active.is_empty() && !pjdesk_proto::failover::same_server(&mine, active) {
+                active
+            } else if !standby.is_empty() && !pjdesk_proto::failover::same_server(&mine, standby) {
+                standby
+            } else {
+                ""
+            };
+            if other.is_empty() {
+                cached.unwrap_or_default()
+            } else {
+                let _ = std::fs::write(data_dir.join(PEER_FILE), other);
+                other.to_string()
+            }
+        }
+        Err(e) => {
+            tracing::debug!("failover: could not read the account server list: {e:#}");
+            cached.unwrap_or_default()
+        }
+    }
+}
+
+/// The other server's address from the last successful lookup. No network call.
+pub fn cached_peer_address(data_dir: &Path) -> String {
+    std::fs::read_to_string(data_dir.join(PEER_FILE))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_default()
+}
 
 /// Address of the account's active server, when it is not this server.
 /// A failed lookup keeps the last address this server learned.
@@ -2115,6 +2239,87 @@ fn publish_health(data_dir: &Path, role: Role) {
     publish_presence(data_dir);
 }
 
+/// Computers the primary published to the account. The standby has no local
+/// `online.json` rows for them. Missing when this server is not the account
+/// owner, or the account could not be read. A failed read leaves the last file.
+pub const PRESENCE_FILE: &str = "cloud-presence.json";
+const PRESENCE_FRESH_SECS: u64 = 90;
+
+#[derive(Default, Serialize, Deserialize, PartialEq, Eq)]
+struct PresenceCache {
+    #[serde(default)]
+    at: u64,
+    #[serde(default)]
+    online: Vec<String>,
+}
+
+pub fn refresh_cloud_presence(data_dir: &Path) {
+    let Some(online) = fetch_presence_online(data_dir) else { return };
+    let path = data_dir.join(PRESENCE_FILE);
+    let previous = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PresenceCache>(&bytes).ok())
+        .map(|cache| cache.online)
+        .unwrap_or_default();
+    if previous != online {
+        let listed = if online.is_empty() {
+            "none".to_string()
+        } else {
+            online.iter().map(|id| pjdesk_proto::format_id(id)).collect::<Vec<_>>().join(", ")
+        };
+        tracing::info!("presence: the cloud reports {} online: {listed}", online.len());
+    }
+    let cache = PresenceCache { at: now(), online };
+    if let Ok(bytes) = serde_json::to_vec(&cache) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+/// Ids the cloud still calls online. Empty when the file is missing or older
+/// than [`PRESENCE_FRESH_SECS`], so a dead primary does not stay "online".
+pub fn cloud_presence_online(data_dir: &Path) -> std::collections::HashSet<String> {
+    let path = data_dir.join(PRESENCE_FILE);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(cache) = serde_json::from_slice::<PresenceCache>(&bytes) else {
+        return std::collections::HashSet::new();
+    };
+    if now().saturating_sub(cache.at) > PRESENCE_FRESH_SECS {
+        return std::collections::HashSet::new();
+    }
+    cache.online.into_iter().collect()
+}
+
+fn fetch_presence_online(data_dir: &Path) -> Option<Vec<String>> {
+    let cfg = CloudConfig::load(data_dir)?;
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return None;
+    }
+    let text = agent()
+        .get(&format!("{}/api/network", cfg.api.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let rows = doc.get("presence")?.as_array()?;
+    let mut ids = Vec::new();
+    for row in rows {
+        if !row.get("online").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let Some(id) = row.get("id").and_then(|v| v.as_str()) else { continue };
+        if id.len() == 9 && id.bytes().all(|b| b.is_ascii_digit()) {
+            ids.push(id.to_string());
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    Some(ids)
+}
+
 /// Uploads this server's computer list to the owner's account. The user name
 /// is in the body the account API stores; it is not written to the log.
 fn publish_presence(data_dir: &Path) {
@@ -2154,6 +2359,7 @@ fn publish_presence(data_dir: &Path) {
             "online": live,
             "signed_in": row.signed_in,
             "app_version": app_version,
+            "install_key": row.install_sha256,
         }));
         if devices.len() >= 500 {
             break;
@@ -2473,6 +2679,14 @@ fn register_network(data_dir: &Path, role: Role, replace: bool) {
             };
             crate::public_addr::save(data_dir, &record);
             if !needs {
+                if let Some(routes) = value.get("network").and_then(|net| net.get("routes")) {
+                    if let Ok(parsed) = serde_json::from_value::<pjdesk_proto::routes::ServerRoutes>(routes.clone()) {
+                        if !parsed.is_empty() {
+                            let previous = advertised_routes(data_dir);
+                            let _ = store_routes(data_dir, &pjdesk_proto::routes::keep_other_server(&previous, &parsed));
+                        }
+                    }
+                }
                 let changed = value.get("changed").and_then(|v| v.as_bool()).unwrap_or(true);
                 if changed {
                     tracing::info!("network: published this server as {}", role_name(role));
@@ -3198,6 +3412,21 @@ mod tests {
                 .success());
             assert!(online_ids(&dir).unwrap().is_empty(), "an old at stamp is not live presence");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cloud_presence_counts_only_while_the_fetch_is_fresh() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-cloud-presence-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = serde_json::json!({ "at": now(), "online": ["111111111", "222222222"] });
+        std::fs::write(dir.join(PRESENCE_FILE), fresh.to_string()).unwrap();
+        let live = cloud_presence_online(&dir);
+        assert!(live.contains("111111111") && live.contains("222222222"));
+        let stale = serde_json::json!({ "at": now().saturating_sub(PRESENCE_FRESH_SECS + 5), "online": ["111111111"] });
+        std::fs::write(dir.join(PRESENCE_FILE), stale.to_string()).unwrap();
+        assert!(cloud_presence_online(&dir).is_empty(), "a stale cloud list is not online");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

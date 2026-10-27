@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyPresence, canonical, decide, flattenRoutes, inviteError, isPrivateAddress, joinAuthMode, mergeRoutes, normalizeFingerprint, planRegistration, presenceView, relayAccessParts, requireAccountsOn, savedShape } from "../src/network.js";
+import { applyPresence, canonical, decide, flattenRoutes, inviteError, isPrivateAddress, joinAuthMode, mergeRoutes, normalizeFingerprint, planRegistration, presenceAllows, presenceInstallGuard, presenceView, relayAccessParts, requireAccountsOn, savedShape, shouldDropReplacedId } from "../src/network.js";
+import { probeQuery, shapeHealth } from "../src/health.js";
 
 test("canonical matches the shared fixture", () => {
   const text = canonical({
@@ -218,6 +219,19 @@ test("an owner server fills an empty slot and does not overwrite a different key
   assert.equal(confirmedLan.status, 200);
 });
 
+test("a different install key does not take over an existing computer", () => {
+  const opas = "a".repeat(64);
+  const omas = "b".repeat(64);
+  assert.equal(presenceAllows(opas, opas), true);
+  assert.equal(presenceAllows("", omas), true);
+  assert.equal(presenceAllows(opas, ""), true);
+  assert.equal(presenceAllows(opas, omas), false);
+  assert.match(presenceInstallGuard(), /install_key = excluded.install_key/);
+  assert.equal(shouldDropReplacedId(opas, omas), false);
+  assert.equal(shouldDropReplacedId("", omas), false);
+  assert.equal(shouldDropReplacedId(opas, opas), true);
+});
+
 test("an empty host report does not erase the name or the user", () => {
   const kept = applyPresence(
     { hostname: "BENLENOVODESK", os_family: "windows", os_version: "11", console_user: "SPADER\\Ben", last_seen: 10 },
@@ -366,4 +380,28 @@ test("an empty display name clears, and a missing one does not", () => {
   const view = presenceView({ id: "1", hostname: "CABINDESK", display_name: "Cabin", console_user: "Ben" }, "member");
   assert.equal(view.display_name, "Cabin");
   assert.equal(view.console_user, "");
+});
+
+test("a health report keeps each server's addresses", () => {
+  const row = shapeHealth(
+    {
+      instance: "a".repeat(32),
+      name: "CHIP20",
+      version: "0.6.46",
+      role: "active",
+      epoch: 7,
+      healthy: true,
+      maintenance_until: 0,
+      public_addrs: ["68.234.75.68:21200", "not-an-address"],
+      lan_addrs: ["192.168.1.40:21200"],
+      names: ["pjdesk.spader.us:21200"],
+    },
+    100,
+  );
+  assert.deepEqual(row.public_addrs, ["68.234.75.68:21200", "not-an-address"]);
+  assert.deepEqual(row.lan_addrs, ["192.168.1.40:21200"]);
+  assert.deepEqual(row.names, ["pjdesk.spader.us:21200"]);
+  assert.equal(probeQuery("68.234.75.68", "21200").host, "68.234.75.68");
+  assert.equal(probeQuery("192.168.1.40", "21200"), null);
+  assert.equal(probeQuery("204.248.122.44", "80"), null);
 });

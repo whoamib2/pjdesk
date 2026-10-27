@@ -122,7 +122,7 @@ pub async fn run(
         grant,
         connection.clone(),
         host_tx,
-        ui,
+        ui.clone(),
     );
     session.spawn_side_loops();
     let _notice = if args.service_host {
@@ -183,6 +183,17 @@ pub async fn run(
                 }
             }
             _ = tick.tick() => {
+                if let Some(ui) = &ui {
+                    let primary = ui.relay_move.lock().unwrap().clone();
+                    if let Some(primary) = primary {
+                        if !ui.relay_sent.load(Ordering::SeqCst) {
+                            info!("failover: telling the controller to reconnect through the primary {primary}");
+                            let _ = write_msg(&mut control_send, &HostMsg::MoveRelay { primary }).await;
+                            ui.relay_sent.store(true, Ordering::SeqCst);
+                            *ui.relay_move.lock().unwrap() = None;
+                        }
+                    }
+                }
                 if super::notice::disconnect_requested() {
                     info!("The person at this computer disconnected the session");
                     let _ = write_msg(&mut control_send, &HostMsg::Notice("The person at this computer disconnected".into())).await;

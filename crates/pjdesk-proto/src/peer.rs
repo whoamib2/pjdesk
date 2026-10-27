@@ -370,6 +370,12 @@ pub enum HostMsg {
     /// 0.6.8. The host can show who connected. Sent only when Hello carried
     /// [`crate::perms::VISITOR`]. An older controller never sets that bit.
     AskVisitor,
+    /// 0.6.47. The relay is moving to this primary. The controller reconnects
+    /// there with the password it already has. Sent only by a 0.6.47 host
+    /// after the server's [`crate::signal::ServerMsg::MoveRelay`].
+    MoveRelay {
+        primary: String,
+    },
 }
 
 /// Input from the controller, replayed on the host with `SendInput`.

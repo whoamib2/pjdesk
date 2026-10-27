@@ -41,7 +41,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.46";
+pub const APP_VERSION: &str = "0.6.47";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -87,6 +87,10 @@ struct State {
     /// OS and the Android profile name, filled by the app before registration.
     facts: Mutex<HostFacts>,
     secret: [u8; 32],
+    /// Random key stored in pjdesk.json. Separate from the Android id secret.
+    install_key: [u8; 32],
+    /// Set when a server closed RegisterInstall before answering.
+    legacy_register: AtomicBool,
     identity: TlsIdentity,
     device_id: Mutex<Option<String>>,
     server: Mutex<String>,
@@ -158,6 +162,14 @@ struct State {
     /// uses a new value, so an older session ending cannot clear it.
     host_live: AtomicU64,
     host_live_seq: AtomicU64,
+    /// Primary a relayed session was told to use. Tried before the catalog.
+    move_primary: Mutex<String>,
+    /// Session the server asked this phone to move, and the primary address.
+    relay_move: Mutex<Option<(u64, String)>>,
+    /// Wakes registration so this phone follows that primary.
+    moved: Notify,
+    /// Set with [`State::moved`] so a notify that arrives early is not lost.
+    leave_primary: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -185,6 +197,9 @@ struct Disk {
     /// Used only when the device has no Android id to derive a secret from.
     #[serde(default)]
     secret_hex: String,
+    /// Random per-install key. Empty in a file written before 0.6.47.
+    #[serde(default)]
+    install_key_hex: String,
     #[serde(default)]
     access_token: String,
     #[serde(default)]
@@ -245,8 +260,21 @@ impl Engine {
         };
         let identity = TlsIdentity::load_or_create(&dir.join("host.crt"), &dir.join("host.key"), "pjdesk-host")?;
         let mut stored = disk;
+        let mut dirty = false;
         if android_id.trim().is_empty() && stored.secret_hex.is_empty() {
             stored.secret_hex = hex::encode(secret);
+            dirty = true;
+        }
+        let install_key = match decode_install_key(&stored.install_key_hex) {
+            Some(key) => key,
+            None => {
+                let key = pjdesk_proto::random_bytes::<32>();
+                stored.install_key_hex = hex::encode(key);
+                dirty = true;
+                key
+            }
+        };
+        if dirty {
             save_disk(&dir, &stored);
         }
         let routes = stored_routes(&stored);
@@ -255,6 +283,8 @@ impl Engine {
             hostname: if hostname.trim().is_empty() { "Android".into() } else { hostname },
             facts: Mutex::new(HostFacts::default()),
             secret,
+            install_key,
+            legacy_register: AtomicBool::new(false),
             identity,
             device_id: Mutex::new((!stored.device_id.is_empty()).then_some(stored.device_id)),
             server: Mutex::new(server),
@@ -301,6 +331,10 @@ impl Engine {
             file_seq: AtomicU64::new(1),
             host_live: AtomicU64::new(0),
             host_live_seq: AtomicU64::new(0),
+            move_primary: Mutex::new(String::new()),
+            relay_move: Mutex::new(None),
+            moved: Notify::new(),
+            leave_primary: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let engine = Self { state: state.clone(), cmds: tx };
@@ -342,6 +376,40 @@ pub(crate) fn should_replace_frame(pending_keyframe: bool, next_keyframe: bool) 
     !pending_keyframe || next_keyframe
 }
 
+fn decode_install_key(hexed: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(hexed.trim()).ok()?;
+    let key = <[u8; 32]>::try_from(bytes).ok()?;
+    if key == [0u8; 32] { None } else { Some(key) }
+}
+
+fn reported_hostname(state: &State) -> String {
+    let reported = state.facts.lock().unwrap().hostname.clone();
+    if reported.trim().is_empty() { state.hostname.clone() } else { reported }
+}
+
+fn send_host_register(signal: &mut SignalClient, state: &State) -> Result<()> {
+    let device_id = state.device_id.lock().unwrap().clone().filter(|id| is_valid_id(id));
+    let hostname = reported_hostname(state);
+    if state.legacy_register.load(Ordering::SeqCst) {
+        signal.send(ClientMsg::Register {
+            proto: PROTOCOL_VERSION,
+            device_id,
+            device_secret: state.secret,
+            hostname,
+            app_version: APP_VERSION.into(),
+        })
+    } else {
+        signal.send(ClientMsg::RegisterInstall {
+            proto: PROTOCOL_VERSION,
+            device_id,
+            device_secret: state.secret,
+            install_key: state.install_key,
+            hostname,
+            app_version: APP_VERSION.into(),
+        })
+    }
+}
+
 fn device_secret(android_id: &str, disk: &Disk) -> [u8; 32] {
     let id = android_id.trim();
     if !id.is_empty() {
@@ -380,6 +448,7 @@ fn persist(state: &State) {
         fingerprint: state.fingerprint.lock().unwrap().clone().unwrap_or_default(),
         device_id: state.device_id.lock().unwrap().clone().unwrap_or_default(),
         secret_hex: String::new(),
+        install_key_hex: hex::encode(state.install_key),
         access_token: state.access_token.lock().unwrap().clone(),
         routes: serde_json::to_string(&*state.routes.lock().unwrap()).unwrap_or_default(),
     };
@@ -592,7 +661,9 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 if let Some(ip) = cmd.get("myPublicIp").and_then(|v| v.as_str()) {
                     *state.my_public_ip.lock().unwrap() = ip.trim().to_string();
                 }
-                *state.routes.lock().unwrap() = routes_from_command(&cmd);
+                let incoming = routes_from_command(&cmd);
+                let previous = state.routes.lock().unwrap().clone();
+                *state.routes.lock().unwrap() = pjdesk_proto::routes::keep_other_server(&previous, &incoming);
                 persist(state);
                 publish(state, cb);
                 log_line(
@@ -699,15 +770,15 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                                 break;
                             }
                             resumes += 1;
-                            prefer_standby = !state.standby.lock().unwrap().trim().is_empty();
-                            let standby = state.standby.lock().unwrap().clone();
+                            prefer_standby = false;
+                            let primary = state.move_primary.lock().unwrap().clone();
                             log_line(
                                 &cb,
-                                if standby.trim().is_empty() {
-                                    "failover: relayed session lost the rendezvous server; reconnecting".into()
+                                if primary.trim().is_empty() {
+                                    "failover: relayed session moving to the current primary; reconnecting".into()
                                 } else {
                                     format!(
-                                        "failover: relayed session lost the rendezvous server; reconnecting through the standby {standby}"
+                                        "failover: relayed session moving to the primary {primary}; reconnecting"
                                     )
                                 },
                             );
@@ -1018,12 +1089,13 @@ fn routes_from_command(cmd: &Value) -> pjdesk_proto::routes::ServerRoutes {
 async fn open_ordered(state: &State, cb: &Arc<dyn Callbacks>, pinned: Option<pjdesk_proto::tls::Fingerprint>) -> Result<SignalClient> {
     let routes = state.routes.lock().unwrap().clone();
     let saved = state.server.lock().unwrap().clone();
+    let told = std::mem::take(&mut *state.move_primary.lock().unwrap());
     let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
-    let targets = pjdesk_proto::routes::dial_targets(&routes, &mine, &saved);
+    let targets = pjdesk_proto::routes::registration_targets(&told, &routes, &mine, &saved);
     if targets.is_empty() {
         bail!("This phone has no server address yet. Sign in again, or set the server in Settings.");
     }
-    let mut last = None;
+    let mut attempts = Vec::new();
     for target in &targets {
         log_line(cb, format!("dialing {target}"));
         match SignalClient::connect_endpoint(target, pinned, pjdesk_proto::routes::dial_budget(target)).await {
@@ -1032,12 +1104,17 @@ async fn open_ordered(state: &State, cb: &Arc<dyn Callbacks>, pinned: Option<pjd
                 return Ok(signal);
             }
             Err(err) => {
-                log_line(cb, format!("dial {target} failed: {err:#}"));
-                last = Some(err);
+                let why = err.to_string();
+                let why = why.lines().next().unwrap_or("failed").trim();
+                log_line(cb, format!("registration route {target} failed: {why}"));
+                attempts.push((target.clone(), why.to_string()));
             }
         }
     }
-    Err(last.unwrap_or_else(|| anyhow!("could not reach the primary or the standby")))
+    let pairs: Vec<(&str, &str)> = attempts.iter().map(|(addr, err)| (addr.as_str(), err.as_str())).collect();
+    let report = pjdesk_proto::routes::registration_miss(&pairs);
+    log_line(cb, report.clone());
+    Err(anyhow!(report))
 }
 
 /// TCP 21200 to the account's LAN address and the public address, the same race Windows uses.
@@ -1221,23 +1298,9 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
     if presented {
         let _ = signal.send(ClientMsg::PresentAccess { token });
     }
-    let device_id = state.device_id.lock().unwrap().clone().filter(|id| is_valid_id(id));
-    signal.send(ClientMsg::Register {
-        proto: PROTOCOL_VERSION,
-        device_id,
-        device_secret: state.secret,
-        hostname: {
-            let reported = state.facts.lock().unwrap().hostname.clone();
-            if reported.trim().is_empty() {
-                state.hostname.clone()
-            } else {
-                reported
-            }
-        },
-        app_version: APP_VERSION.into(),
-    })?;
+    send_host_register(&mut signal, &state)?;
     let server_ip = signal.server_addr.ip();
-    let mut ping = tokio::time::interval(Duration::from_secs(10));
+    let mut ping = tokio::time::interval(pjdesk_proto::signal::HEARTBEAT);
     ping.tick().await;
     let mut last_heard = Instant::now();
     let mut awaiting_pong = false;
@@ -1250,7 +1313,18 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
         if state.app_stop.load(Ordering::SeqCst) {
             return Ok(PhoneHost::Stop);
         }
+        if state.leave_primary.swap(false, Ordering::SeqCst) {
+            log_line(&cb, "failover: registering with the new primary");
+            emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
+            return Ok(PhoneHost::Lost);
+        }
         tokio::select! {
+            _ = state.moved.notified() => {
+                state.leave_primary.store(false, Ordering::SeqCst);
+                log_line(&cb, "failover: registering with the new primary");
+                emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
+                return Ok(PhoneHost::Lost);
+            }
             _ = ping.tick() => {
                 if state.access_epoch.load(Ordering::SeqCst) != epoch {
                     return Ok(PhoneHost::Again);
@@ -1266,8 +1340,11 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                     emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
                     return Ok(PhoneHost::Lost);
                 }
-                if last_heard.elapsed() >= Duration::from_secs(30) {
-                    warn!("No reply from the server for 30 s (phone); reconnecting");
+                if last_heard.elapsed() >= pjdesk_proto::signal::HEARTBEAT_SILENCE {
+                    warn!(
+                        "No reply from the server for {} s (phone); reconnecting",
+                        pjdesk_proto::signal::HEARTBEAT_SILENCE.as_secs()
+                    );
                     emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
                     return Ok(PhoneHost::Lost);
                 }
@@ -1279,16 +1356,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                     }
                 }
                 if heartbeats == 0 {
-                    let _ = signal.send(ClientMsg::Register {
-                        proto: PROTOCOL_VERSION,
-                        device_id: state.device_id.lock().unwrap().clone().filter(|id| is_valid_id(id)),
-                        device_secret: state.secret,
-                        hostname: {
-                            let reported = state.facts.lock().unwrap().hostname.clone();
-                            if reported.trim().is_empty() { state.hostname.clone() } else { reported }
-                        },
-                        app_version: APP_VERSION.into(),
-                    });
+                    let _ = send_host_register(&mut signal, &state);
                 }
                 signal.send(ClientMsg::Ping)?;
                 awaiting_pong = true;
@@ -1304,6 +1372,10 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
             msg = signal.recv() => {
                 let Some(msg) = msg else {
                     warn!("Lost the connection to the server (phone); reconnecting");
+                    if !saw_registered && !state.legacy_register.load(Ordering::SeqCst) {
+                        state.legacy_register.store(true, Ordering::SeqCst);
+                        log_line(&cb, "this server closed the install-key registration; retrying with the legacy registration");
+                    }
                     if presented && !saw_registered && !keyed {
                         state.suppress_token.store(true, Ordering::SeqCst);
                     }
@@ -1380,9 +1452,10 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                             routes.remove(&session_id);
                         }
                     }
-                    ServerMsg::Routes(routes) => {
-                        if !routes.is_empty() {
-                            *state.routes.lock().unwrap() = routes;
+                    ServerMsg::Routes(incoming) => {
+                        if !incoming.is_empty() {
+                            let previous = state.routes.lock().unwrap().clone();
+                            *state.routes.lock().unwrap() = pjdesk_proto::routes::keep_other_server(&previous, &incoming);
                             persist(&state);
                         }
                     }
@@ -1391,7 +1464,8 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                             redirected = true;
                             if let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) {
                                 if !routes.is_empty() {
-                                    *state.routes.lock().unwrap() = routes;
+                                    let previous = state.routes.lock().unwrap().clone();
+                                    *state.routes.lock().unwrap() = pjdesk_proto::routes::keep_other_server(&previous, &routes);
                                     persist(&state);
                                 }
                                 if !addr.is_empty() {
@@ -1407,16 +1481,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                                             let _ = signal.send(ClientMsg::PresentAccess { token });
                                         }
                                     }
-                                    signal.send(ClientMsg::Register {
-                                        proto: PROTOCOL_VERSION,
-                                        device_id: state.device_id.lock().unwrap().clone().filter(|id| is_valid_id(id)),
-                                        device_secret: state.secret,
-                                        hostname: {
-                                            let reported = state.facts.lock().unwrap().hostname.clone();
-                                            if reported.trim().is_empty() { state.hostname.clone() } else { reported }
-                                        },
-                                        app_version: APP_VERSION.into(),
-                                    })?;
+                                    send_host_register(&mut signal, &state)?;
                                     continue;
                                 }
                             }
@@ -1449,6 +1514,17 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                                 &cb,
                                 format!("heartbeat from {server} via {} ({}) (phone)", signal.via, signal.server_addr),
                             );
+                        }
+                    }
+                    ServerMsg::MoveRelay { session_id, primary } => {
+                        log_line(&cb, format!("failover: moving the relayed session to the primary {primary}"));
+                        *state.move_primary.lock().unwrap() = primary.clone();
+                        if routes.contains_key(&session_id) {
+                            *state.relay_move.lock().unwrap() = Some((session_id, primary));
+                            state.session_wake.notify_waiters();
+                        } else {
+                            state.leave_primary.store(true, Ordering::SeqCst);
+                            state.moved.notify_waiters();
                         }
                     }
                     ServerMsg::UpdateNow => {
@@ -1826,6 +1902,19 @@ async fn host_session(
         emit(&cb, &json!({"event":"keyframe"}));
     }
     let result = loop {
+        let pending_move = state.relay_move.lock().unwrap().clone();
+        if let Some((sid, primary)) = pending_move {
+            if sid == session_id {
+                *state.relay_move.lock().unwrap() = None;
+                let _ = write_msg(&mut control_send, &HostMsg::MoveRelay { primary: primary.clone() }).await;
+                let _ = signal.send(ClientMsg::RelayMoved { session_id });
+                *state.move_primary.lock().unwrap() = primary;
+                log_line(&cb, "failover: told the other computer to move; registering with the new primary");
+                state.leave_primary.store(true, Ordering::SeqCst);
+                state.moved.notify_waiters();
+                break Err(anyhow!("relayed session moving to the new primary"));
+            }
+        }
         if connection.close_reason().is_some() {
             break Err(anyhow!("the other computer closed the session"));
         }
@@ -1847,7 +1936,7 @@ async fn host_session(
         if let Some(deadline) = share_deadline {
             consent_ticks = consent_ticks.saturating_add(1);
             if consent_ticks % CONSENT_KEEPALIVE_TICKS == 0 {
-                // Pong is ignored by the viewer. The packet keeps a 15s idle
+                // Pong is ignored by the viewer. The packet keeps the idle
                 // timeout from closing the session during the minute we wait.
                 let _ = write_msg(&mut control_send, &HostMsg::Pong { t_us: 0 }).await;
                 log_line(&cb, "still waiting for screen sharing");
@@ -2021,8 +2110,8 @@ async fn deliver_control(state: &State, send: &mut quinn::SendStream, warned: &m
 const SCREEN_WAIT: &str = "Waiting for the phone to allow screen sharing";
 /// How long the host keeps the session while Android's share dialog is up.
 const SHARE_WAIT: Duration = Duration::from_secs(60);
-/// A write on the control stream inside the 15 second QUIC idle timeout.
-const CONSENT_KEEPALIVE_TICKS: u32 = 20;
+/// A write on the control stream inside the 5 second QUIC idle timeout.
+const CONSENT_KEEPALIVE_TICKS: u32 = 8;
 
 /// A replaced Connect (`stopped`) or a dismissed password (`cancelled`) is not a failure to show.
 fn surfaced_connect_error(raw: &str) -> Option<String> {
@@ -2399,6 +2488,7 @@ async fn controller_session(
         }
         match tokio::time::timeout(Duration::from_secs(90), signal.recv()).await {
             Ok(Some(ServerMsg::SessionReady { session_id, token, udp_port, host_name })) => {
+                *state.move_primary.lock().unwrap() = String::new();
                 log_line(&cb, format!("the other computer accepted, session {session_id:x}"));
                 break (session_id, token, udp_port, host_name);
             }
@@ -2410,7 +2500,8 @@ async fn controller_session(
                     bail!("{message}");
                 };
                 if !routes.is_empty() {
-                    *state.routes.lock().unwrap() = routes;
+                    let previous = state.routes.lock().unwrap().clone();
+                    *state.routes.lock().unwrap() = pjdesk_proto::routes::keep_other_server(&previous, &routes);
                     persist(&state);
                 }
                 if addr.is_empty() {
@@ -2675,6 +2766,11 @@ async fn controller_session(
                 );
             }
             Ok(HostMsg::Notice(text)) => emit(&cb, &json!({"event":"status","text": text})),
+            Ok(HostMsg::MoveRelay { primary }) => {
+                *state.move_primary.lock().unwrap() = primary.clone();
+                log_line(&cb, format!("failover: moving this relayed session to the primary {primary}"));
+                break pjdesk_proto::failover::relay_resume_message(&primary);
+            }
             Ok(HostMsg::AskVisitor) => {
                 let _ = control_tx.send(android_visitor(&state));
             }
@@ -2736,11 +2832,17 @@ async fn controller_session(
     let still_watching = state.view_gen.load(Ordering::SeqCst) == view_mark
         && state.gen.load(Ordering::SeqCst) == gen
         && !state.app_stop.load(Ordering::SeqCst);
-    if relayed && still_watching && pjdesk_proto::failover::session_fate(pjdesk_proto::failover::MediaPath::Relayed)
-        == pjdesk_proto::failover::SessionFate::Reconnect
+    if relayed && still_watching && (pjdesk_proto::failover::is_relay_resume(&end_reason)
+        || pjdesk_proto::failover::session_fate(pjdesk_proto::failover::MediaPath::Relayed)
+            == pjdesk_proto::failover::SessionFate::Reconnect)
     {
-        log_line(&cb, pjdesk_proto::failover::RELAY_RESUME);
-        bail!(pjdesk_proto::failover::RELAY_RESUME);
+        let message = if pjdesk_proto::failover::is_relay_resume(&end_reason) {
+            end_reason.clone()
+        } else {
+            pjdesk_proto::failover::RELAY_RESUME.to_string()
+        };
+        log_line(&cb, message.clone());
+        bail!(message);
     }
     log_line(&cb, format!("controller session ended: {end_reason}"));
     emit(&cb, &json!({"event":"disconnected","role":"controller","reason": end_reason}));
@@ -2905,7 +3007,7 @@ mod tests {
     #[test]
     fn the_consent_wait_sends_a_packet_inside_the_idle_timeout() {
         assert_eq!(SHARE_WAIT, Duration::from_secs(60));
-        assert!(CONSENT_KEEPALIVE_TICKS * 250 < 15_000);
+        assert!(CONSENT_KEEPALIVE_TICKS * 250 < 5_000);
     }
 
     #[test]
@@ -3062,6 +3164,8 @@ mod tests {
             hostname: "Pixel".into(),
             facts: Mutex::new(HostFacts::default()),
             secret: [7u8; 32],
+            install_key: [9u8; 32],
+            legacy_register: AtomicBool::new(false),
             identity,
             device_id: Mutex::new(None),
             server: Mutex::new("office.example:21200".into()),
@@ -3108,6 +3212,10 @@ mod tests {
             file_seq: AtomicU64::new(1),
             host_live: AtomicU64::new(0),
             host_live_seq: AtomicU64::new(0),
+            move_primary: Mutex::new(String::new()),
+            relay_move: Mutex::new(None),
+            moved: Notify::new(),
+            leave_primary: AtomicBool::new(false),
         })
     }
 

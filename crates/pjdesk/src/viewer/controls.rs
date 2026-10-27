@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pjdesk_proto::filesafe::{self, MAX_TRANSFER_BYTES};
 use pjdesk_proto::framing::{read_msg, MAX_CONTROL_FRAME};
@@ -65,6 +65,10 @@ pub struct Live {
     pub platform_version: String,
     pub view_mode: u8,
     pub current_display: u8,
+    /// View mode and display chosen when this session opened. Not the process environment,
+    /// so a second computer in the same window does not inherit the first one's screen.
+    opening_view: u8,
+    opening_display: u8,
     pub atlas_w: u16,
     pub atlas_h: u16,
     pub atlas: Vec<AtlasTile>,
@@ -81,6 +85,10 @@ pub struct Live {
     pub relayed: bool,
     /// That relay path dropped. The window reconnects without asking again.
     pub resume_relay: bool,
+    /// Primary the relayed session should open on. Empty uses the account's current primary.
+    pub move_primary: String,
+    /// The person at the computer ended the session. Do not open it again.
+    pub host_ended: bool,
     pub closed: Option<String>,
     /// The phone's accessibility service is off, so clicks do not land.
     pub control_off: bool,
@@ -101,6 +109,8 @@ impl Live {
             platform_version: String::new(),
             view_mode: VIEW_SINGLE,
             current_display: 0,
+            opening_view: VIEW_SINGLE,
+            opening_display: 0,
             atlas_w: 0,
             atlas_h: 0,
             atlas: Vec::new(),
@@ -115,6 +125,8 @@ impl Live {
             restart: false,
             relayed: false,
             resume_relay: false,
+            move_primary: String::new(),
+            host_ended: false,
             closed: None,
             control_off: false,
             paths: HashMap::new(),
@@ -144,6 +156,8 @@ impl Live {
             platform_version: self.platform_version.clone(),
             view_mode: self.view_mode,
             current_display: self.current_display,
+            opening_view: self.opening_view,
+            opening_display: self.opening_display,
             atlas_w: self.atlas_w,
             atlas_h: self.atlas_h,
             atlas: self.atlas.clone(),
@@ -158,6 +172,8 @@ impl Live {
             restart: self.restart,
             relayed: self.relayed,
             resume_relay: self.resume_relay,
+            move_primary: self.move_primary.clone(),
+            host_ended: self.host_ended,
             closed: self.closed.clone(),
             control_off: self.control_off,
             paths: HashMap::new(),
@@ -203,11 +219,25 @@ pub fn start(
     peer_proto: u16,
     host_id: String,
     relayed: bool,
+    opening_view: Option<u8>,
+    opening_display: Option<u8>,
     wake: impl Fn() + Send + Sync + 'static,
 ) -> (Arc<Mutex<Live>>, mpsc::UnboundedSender<Cmd>, Arc<Mutex<RecorderSlot>>) {
     let _ = VIEWER_RT.set(rt);
     let mut session = Live::new(peer_proto >= 3);
     session.relayed = relayed;
+    session.opening_display = opening_display
+        .or_else(|| std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    let view = opening_view
+        .or_else(|| std::env::var("PJDESK_VIEW").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(VIEW_SINGLE);
+    session.opening_view = match view {
+        VIEW_ALL => VIEW_ALL,
+        VIEW_SEPARATE => VIEW_SEPARATE,
+        _ => VIEW_SINGLE,
+    };
+    let saved_display = session.opening_display;
     let live = Arc::new(Mutex::new(session));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let recorder = Arc::new(Mutex::new(RecorderSlot::new()));
@@ -216,7 +246,6 @@ pub fn start(
     let tunnels = Arc::new(Mutex::new(PendingTunnel { waiters: HashMap::new() }));
 
     if peer_proto >= 3 {
-        let saved_display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0u8);
         let _ = control.send(ControlMsg::Hello {
             permissions: perms::ALL | perms::LAYOUT | perms::VISITOR,
             monitor: saved_display,
@@ -262,6 +291,12 @@ pub fn start(
 }
 
 fn note_relay_resume(live: &mut Live) {
+    if !pjdesk_proto::failover::resume_after_drop(live.restart, live.host_ended) {
+        return;
+    }
+    if live.resume_relay {
+        return;
+    }
     live.resume_relay = true;
     live.closed = Some(pjdesk_proto::failover::RELAY_RESUME.into());
     live.note("Reconnecting…");
@@ -279,22 +314,26 @@ async fn run_loop(
     wake: Arc<dyn Fn() + Send + Sync>,
     host_id: String,
 ) {
+    let mut last_heard = Instant::now();
+    let mut ping = tokio::time::interval(Duration::from_secs(1));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             msg = read_msg::<_, HostMsg>(&mut control_recv, MAX_CONTROL_FRAME) => {
                 match msg {
-                    Ok(msg) => on_host(msg, &connection, &control, &live, &tunnels, &wake, &host_id),
+                    Ok(msg) => {
+                        last_heard = Instant::now();
+                        on_host(msg, &connection, &control, &live, &tunnels, &wake, &host_id);
+                    }
                     Err(e) => {
                         let mut g = live.lock().unwrap();
-                        if g.closed.is_none() && !g.restart {
-                            if g.relayed {
-                                note_relay_resume(&mut g);
-                            } else {
-                                let text = format!("The host closed the session: {e:#}");
-                                tracing::error!("{text}");
-                                crate::note_failure(&text);
-                                g.closed = Some(text);
-                            }
+                        if g.closed.is_none() && resume_after_drop_live(&g) {
+                            note_relay_resume(&mut g);
+                        } else if g.closed.is_none() && !g.restart {
+                            let text = format!("The host closed the session: {e:#}");
+                            tracing::error!("{text}");
+                            crate::note_failure(&text);
+                            g.closed = Some(text);
                         }
                         wake();
                         break;
@@ -305,27 +344,42 @@ async fn run_loop(
                 let Some(cmd) = cmd else { break };
                 on_cmd(cmd, &connection, &control, &live, &tunnels, &recorder, &wake).await;
             }
+            _ = ping.tick() => {
+                let silent = last_heard.elapsed();
+                let mut g = live.lock().unwrap();
+                if pjdesk_proto::failover::path_is_dead(silent) && g.closed.is_none() && resume_after_drop_live(&g) {
+                    tracing::info!("failover: no packet from the host for {} ms", silent.as_millis());
+                    note_relay_resume(&mut g);
+                    drop(g);
+                    wake();
+                    break;
+                }
+                drop(g);
+                let _ = control.send(ControlMsg::Ping { t_us: 0 });
+            }
             _ = connection.closed() => {
                 let mut g = live.lock().unwrap();
-                if g.closed.is_none() && !g.restart {
-                    if g.relayed {
-                        note_relay_resume(&mut g);
-                    } else {
-                        let why = connection
-                            .close_reason()
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "the connection ended".into());
-                        let text = session_end_message(&why);
-                        tracing::error!("{text}");
-                        crate::note_failure(&text);
-                        g.closed = Some(text);
-                    }
+                if g.closed.is_none() && resume_after_drop_live(&g) {
+                    note_relay_resume(&mut g);
+                } else if g.closed.is_none() && !g.restart {
+                    let why = connection
+                        .close_reason()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "the connection ended".into());
+                    let text = session_end_message(&why);
+                    tracing::error!("{text}");
+                    crate::note_failure(&text);
+                    g.closed = Some(text);
                 }
                 wake();
                 break;
             }
         }
     }
+}
+
+fn resume_after_drop_live(live: &Live) -> bool {
+    pjdesk_proto::failover::resume_after_drop(live.restart, live.host_ended)
 }
 
 fn on_host(
@@ -349,13 +403,8 @@ fn on_host(
             let first = g.displays.is_empty();
             g.displays = displays;
             if first {
-                let mode = std::env::var("PJDESK_VIEW").ok().and_then(|s| s.parse().ok()).unwrap_or(VIEW_SINGLE);
-                let display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let mode = match mode {
-                    VIEW_ALL => VIEW_ALL,
-                    VIEW_SEPARATE => VIEW_SEPARATE,
-                    _ => VIEW_SINGLE,
-                };
+                let mode = g.opening_view;
+                let display = g.opening_display;
                 let display = if g.displays.iter().any(|d| d.index == display) {
                     display
                 } else {
@@ -392,6 +441,10 @@ fn on_host(
                 g.control_off = false;
                 crate::note_status(&text);
                 g.note(text);
+            } else if pjdesk_proto::failover::host_ended_the_session(&text) {
+                g.host_ended = true;
+                crate::note_status(&text);
+                g.closed = Some(text);
             } else if screen_share_failure_text(&text) || phone_stopped_sharing(&text) {
                 crate::note_failure(&text);
                 g.closed = Some(text);
@@ -453,6 +506,12 @@ fn on_host(
                 }
                 let _ = control.send(ControlMsg::File(FileMsg::Accept { id, resume_from: resume }));
             }
+        }
+        HostMsg::MoveRelay { primary } => {
+            g.move_primary = primary;
+            g.note("Reconnecting…");
+            note_relay_resume(&mut g);
+            wake();
         }
         HostMsg::AskVisitor => {
             let _ = control.send(this_visitor());
@@ -1105,7 +1164,19 @@ mod tests {
         assert!(Handle::try_current().is_err(), "this thread must be outside the Tokio runtime");
         let (control, _rx) = mpsc::unbounded_channel();
         let (frames, _frames_rx) = std::sync::mpsc::channel();
-        let _ = start(rt.handle().clone(), connection.clone(), recv, control, frames, 3, "100000001".into(), false, || {});
+        let _ = start(
+            rt.handle().clone(),
+            connection.clone(),
+            recv,
+            control,
+            frames,
+            3,
+            "100000001".into(),
+            false,
+            None,
+            None,
+            || {},
+        );
         connection.close(0u32.into(), b"test");
         rt.shutdown_timeout(Duration::from_secs(3));
     }

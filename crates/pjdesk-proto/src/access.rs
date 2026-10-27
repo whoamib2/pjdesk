@@ -104,6 +104,24 @@ pub fn sign_seed(seed: &[u8; 32], claims: &Claims) -> Result<(String, [u8; 32]),
     Ok((format!("{}.{}", hex::encode(body.as_bytes()), hex::encode(sig.as_ref())), public))
 }
 
+/// The account named inside an access token. The signature is not checked.
+/// A code or a key carries the account email this way. Naming that account
+/// is not a sign-in and does not prove the password.
+pub fn email_from_access_token(token: &str) -> Option<String> {
+    let body_hex = token.trim().split_once('.')?.0;
+    if body_hex.is_empty() || !body_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let body = hex::decode(body_hex).ok()?;
+    let text = std::str::from_utf8(&body).ok()?;
+    let mut lines = text.split('\n');
+    if lines.next()? != "PJN1" {
+        return None;
+    }
+    let email = lines.next()?.trim().to_lowercase();
+    if email.contains('@') && !email.contains(' ') { Some(email) } else { None }
+}
+
 /// Checks the signature and the expiry. `server_fingerprint` empty skips the
 /// server check (the caller decides whether that is allowed).
 pub fn verify(public_key: &[u8], token: &str, now: u64, server_fingerprint: &str) -> Result<Claims, VerifyError> {
@@ -216,6 +234,10 @@ mod tests {
         );
         assert_eq!(text, "PJN1\nben@spader.us\nnet_1\n00112233,aabbccdd\ndevice-1\n2000000000\n");
         assert_eq!(normalize_fingerprint("sha256:AB-CD"), "abcd");
+        let (token, _) = sign_seed(&[9u8; 32], &sample(2_000_000_000, &["abcd"])).unwrap();
+        assert_eq!(email_from_access_token(&token).as_deref(), Some("ben@spader.us"));
+        assert!(email_from_access_token("not-a-token").is_none());
+        assert!(email_from_access_token("").is_none());
     }
 
     #[test]

@@ -25,9 +25,9 @@ use tracing::{debug, info, warn};
 use crate::registry::Registry;
 use crate::ServerOpts;
 
-/// Clients must send something within this time. Current hosts ping every 10 s
-/// and reconnect after 30 s of silence. 0.6.26 hosts still ping every 25 s, so
-/// this stays at 90 s and does not drop them.
+/// Clients must send something within this time. Current hosts ping every 2 s
+/// and reconnect after a few seconds of silence. 0.6.26 hosts still ping every
+/// 25 s, so this stays at 90 s and does not drop them.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// How long Connect waits when the computer was registered recently but is
 /// missing from the live table. It is usually reconnecting.
@@ -68,6 +68,9 @@ pub struct State {
     /// still-open one here takes over, so the computer doesn't look offline.
     pub standby: HashMap<String, Vec<OnlineHost>>,
     pub sessions: HashMap<SessionId, Session>,
+    /// Set while relayed sessions are moving to the new primary.
+    /// Step-down is written only after they have followed, or after a short wait.
+    pub pending_move: Option<PendingMove>,
     pub limiter: RateLimiter,
     pub udp_port: u16,
     /// Data folder, so accounts can be re-read when they change out-of-process.
@@ -112,6 +115,25 @@ pub struct Session {
     pub controller: PeerSlot,
     pub info_sent: bool,
     pub created: Instant,
+    /// Both peers bound, so the UDP relay is carrying this session.
+    pub relayed: bool,
+    /// [`ServerMsg::MoveRelay`] was sent to the host.
+    pub move_told: bool,
+    /// The host reported [`ClientMsg::RelayMoved`].
+    pub move_acked: bool,
+}
+
+/// A role change that is waiting for relayed sessions to leave.
+pub struct PendingMove {
+    pub primary: String,
+    pub since: Instant,
+    pub kind: StepKind,
+}
+
+/// The other server already owns the next generation. Sessions move, then
+/// this server records standby.
+pub enum StepKind {
+    Yield { epoch: u64, instance: String, name: String },
 }
 
 /// What we know about one side of a session.
@@ -250,6 +272,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         online: HashMap::new(),
         standby: HashMap::new(),
         sessions: HashMap::new(),
+        pending_move: None,
         limiter: RateLimiter::default(),
         udp_port: opts.port,
         data_dir: data_dir.clone(),
@@ -312,7 +335,10 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
 
     tokio::select! {
         _ = accept_loop => {}
-        _ = shutdown => info!("Shutting down"),
+        _ = shutdown => {
+            info!("Shutting down");
+            release_relays_on_stop(&state).await;
+        }
         r = relay => warn!("UDP relay stopped: {r:?}"),
     }
     janitor.abort();
@@ -444,6 +470,24 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
             burst += 1;
             if burst > MAX_MSGS_PER_SEC {
                 bail!("too many messages");
+            }
+            if let ClientMsg::TakePrimary { epoch, at, proof } = msg {
+                let dir = state.lock().unwrap().data_dir.clone();
+                let reply = tokio::task::spawn_blocking(move || crate::role_handoff::accept_take_primary(&dir, epoch, at, &proof))
+                    .await
+                    .unwrap_or_else(|_| crate::role_handoff::TakeReply {
+                        ok: false,
+                        epoch: 0,
+                        name: String::new(),
+                        message: "This server could not take the primary.".into(),
+                    });
+                conn.send(ServerMsg::Handoff {
+                    ok: reply.ok,
+                    epoch: reply.epoch,
+                    name: reply.name,
+                    message: reply.message,
+                });
+                continue;
             }
             handle_message(&state, &mut conn, msg);
         }
@@ -752,6 +796,9 @@ fn start_session(st: &mut State, ctrl: &ControllerSide, target: &str, controller
         controller: PeerSlot::default(),
         info_sent: false,
         created: Instant::now(),
+        relayed: false,
+        move_told: false,
+        move_acked: false,
     };
     st.sessions.insert(session_id, session);
     crate::audit::AuditLog::open(&st.data_dir).record(
@@ -760,6 +807,94 @@ fn start_session(st: &mut State, ctrl: &ControllerSide, target: &str, controller
         &format!("to {} from {}", format_id(target), ctrl.addr.ip()),
     );
     info!("Session {session_id:016x}: \"{controller_name}\" ({}) → host {}", ctrl.addr.ip(), format_id(target));
+}
+
+/// Puts a registered computer online and tells it the ID it owns.
+/// `reassigned_from` is set when a second install key asked for an ID the
+/// first install already holds. The first row is left as it is.
+fn finish_registration(
+    st: &mut State,
+    conn: &mut Conn,
+    id: String,
+    hostname: &str,
+    app_version: &str,
+    admitted: &Admitted,
+    reassigned_from: Option<&str>,
+) {
+    let access_key_id = match admitted {
+        Admitted::Key(key) => key.id.clone(),
+        Admitted::Open | Admitted::Signed(_) => String::new(),
+    };
+    let host = OnlineHost {
+        conn_id: conn.id,
+        tx: conn.tx.clone(),
+        hostname: hostname.to_string(),
+        app_version: app_version.to_string(),
+        addr: conn.addr,
+        proto: conn.proto,
+        since: Instant::now(),
+        close: Arc::clone(&conn.close),
+        access_key_id: access_key_id.clone(),
+    };
+    if let Some(prev) = st.online.insert(id.clone(), host) {
+        if prev.conn_id != conn.id {
+            let held = prev.since.elapsed().as_secs();
+            if prev.addr.ip() != conn.addr.ip() {
+                warn!(
+                    "Host {} is now registered from {} (it was {}, held {held}s). The device secret is known to both.",
+                    format_id(&id),
+                    conn.addr.ip(),
+                    prev.addr.ip()
+                );
+            } else {
+                info!(
+                    "Host {} registered again from {} (another PJDesk process on this computer, previous connection held {held}s)",
+                    format_id(&id),
+                    conn.addr.ip()
+                );
+            }
+            if !prev.tx.is_closed() {
+                info!("Host {} kept the previous connection on standby", format_id(&id));
+                st.standby.entry(id.clone()).or_default().push(prev);
+            }
+        }
+    }
+    conn.host_id = Some(id.clone());
+    st.registry.note_address(&id, &conn.addr.ip().to_string());
+    let signed_in = matches!(admitted, Admitted::Signed(_));
+    st.registry.note_access_key(&id, &access_key_id);
+    st.registry.mark_signed_in(&id, signed_in);
+    if let Some(kept) = reassigned_from {
+        warn!(
+            "ID {} is already held by another install. That computer keeps it. \"{hostname}\" is now {}.",
+            format_id(kept),
+            format_id(&id)
+        );
+    }
+    conn.send(ServerMsg::Registered { device_id: id.clone() });
+    if conn.proto >= 3 {
+        conn.send(ServerMsg::Policy(st.accounts.policy()));
+    }
+    let os = st.registry.os_family(&id);
+    if crate::registry::supports_host_report_for(app_version, &os) {
+        conn.send(ServerMsg::WantHostReport);
+    }
+    crate::audit::AuditLog::open(&st.data_dir).record(
+        "register",
+        hostname,
+        &format!("{} from {}", format_id(&id), conn.addr.ip()),
+    );
+    info!("Host {} \"{hostname}\" online from {} (v{app_version}); this server is the primary", format_id(&id), conn.addr.ip());
+    if pjdesk_proto::update::version_at_least(app_version, "0.6.45") {
+        conn.send(ServerMsg::Routes(crate::cloud::advertised_routes(&st.data_dir)));
+    }
+    // Same computer name, offline leftovers only. A different install key is a
+    // different hostname here, and a different name is not removed.
+    let online: HashSet<String> = st.online.keys().cloned().collect();
+    let removed = st.registry.remove_stale_duplicates(&id, &online);
+    if removed > 0 {
+        info!("Removed {removed} old record(s) for \"{hostname}\"; it is {} now", format_id(&id));
+    }
 }
 
 fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
@@ -827,77 +962,59 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             let hostname: String = hostname.chars().take(64).collect();
             let app_version: String = app_version.chars().take(32).collect();
             match st.registry.register(device_id.as_deref(), &device_secret, &hostname, &app_version) {
-                Ok(id) => {
-                    let access_key_id = match &admitted {
-                        Admitted::Key(key) => key.id.clone(),
-                        Admitted::Open | Admitted::Signed(_) => String::new(),
-                    };
-                    let host = OnlineHost {
-                        conn_id: conn.id,
-                        tx: conn.tx.clone(),
-                        hostname: hostname.clone(),
-                        app_version: app_version.clone(),
-                        addr: conn.addr,
-                        proto: conn.proto,
-                        since: Instant::now(),
-                        close: Arc::clone(&conn.close),
-                        access_key_id: access_key_id.clone(),
-                    };
-                    if let Some(prev) = st.online.insert(id.clone(), host) {
-                        if prev.conn_id != conn.id {
-                            let held = prev.since.elapsed().as_secs();
-                            if prev.addr.ip() != conn.addr.ip() {
-                                warn!(
-                                    "Host {} is now registered from {} (it was {}, held {held}s). The device secret is known to both.",
-                                    format_id(&id),
-                                    conn.addr.ip(),
-                                    prev.addr.ip()
-                                );
-                            } else {
-                                info!(
-                                    "Host {} registered again from {} (another PJDesk process on this computer, previous connection held {held}s)",
-                                    format_id(&id),
-                                    conn.addr.ip()
-                                );
-                            }
-                            if !prev.tx.is_closed() {
-                                info!("Host {} kept the previous connection on standby", format_id(&id));
-                                st.standby.entry(id.clone()).or_default().push(prev);
-                            }
-                        }
+                Ok(id) => finish_registration(st, conn, id, &hostname, &app_version, &admitted, None),
+                Err(e) => {
+                    warn!("{}: registration refused: {e}", conn.addr);
+                    if matches!(e, crate::registry::RegisterError::Blocked(_)) {
+                        conn.error(ErrorCode::Unauthorized, "This computer is blocked.");
+                    } else {
+                        conn.error(ErrorCode::IdConflict, e.to_string());
                     }
-                    conn.host_id = Some(id.clone());
-                    st.registry.note_address(&id, &conn.addr.ip().to_string());
-                    let signed_in = matches!(admitted, Admitted::Signed(_));
-                    st.registry.note_access_key(&id, &access_key_id);
-                    st.registry.mark_signed_in(&id, signed_in);
-                    conn.send(ServerMsg::Registered { device_id: id.clone() });
-                    if conn.proto >= 3 {
-                        conn.send(ServerMsg::Policy(st.accounts.policy()));
-                    }
-                    let os = st.registry.os_family(&id);
-                    if crate::registry::supports_host_report_for(&app_version, &os) {
-                        conn.send(ServerMsg::WantHostReport);
-                    }
-                    crate::audit::AuditLog::open(&st.data_dir).record(
-                        "register",
-                        &hostname,
-                        &format!("{} from {}", format_id(&id), conn.addr.ip()),
-                    );
-                    info!(
-                        "Host {} \"{hostname}\" online from {} (v{app_version}); this server is the primary",
-                        format_id(&id),
-                        conn.addr.ip()
-                    );
-                    if pjdesk_proto::update::version_at_least(&app_version, "0.6.45") {
-                        conn.send(ServerMsg::Routes(crate::cloud::advertised_routes(&st.data_dir)));
-                    }
-                    // One record per computer: drop its old, offline records.
-                    let online: HashSet<String> = st.online.keys().cloned().collect();
-                    let removed = st.registry.remove_stale_duplicates(&id, &online);
-                    if removed > 0 {
-                        info!("Removed {removed} old record(s) for \"{hostname}\"; it is {} now", format_id(&id));
-                    }
+                }
+            }
+        }
+
+        ClientMsg::RegisterInstall { proto, device_id, device_secret, install_key, hostname, app_version } => {
+            if !crate::cloud::accepts_host_registrations(&st.data_dir) {
+                info!(
+                    "Redirecting host registration from {}: this server is the standby and is not the live table",
+                    conn.addr
+                );
+                conn.error(ErrorCode::Unauthorized, crate::cloud::redirect_text(&st.data_dir));
+                return;
+            }
+            let admitted = match gate(st, conn) {
+                Ok(admitted) => admitted,
+                Err(()) => {
+                    conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
+                    return;
+                }
+            };
+            if install_key == [0u8; 32] {
+                conn.error(ErrorCode::BadRequest, "this install has no device key");
+                return;
+            }
+            let limit_secret = st.registry.install_limit_secret(device_id.as_deref(), &device_secret, &install_key);
+            if let Admitted::Key(key) = &admitted {
+                if !st.registry.key_has_room(&key.id, &limit_secret, key.computer_limit) {
+                    warn!("{}: access key {} is at its computer limit", conn.addr, key.label);
+                    conn.error(ErrorCode::Unauthorized, crate::access_keys::LIMIT_MESSAGE);
+                    return;
+                }
+            }
+            if !note_proto(conn, proto) {
+                return;
+            }
+            if !st.limiter.allow(conn.addr.ip(), "register", 20) {
+                conn.error(ErrorCode::RateLimited, "too many registrations, slow down");
+                return;
+            }
+            let hostname: String = hostname.chars().take(64).collect();
+            let app_version: String = app_version.chars().take(32).collect();
+            match st.registry.register_install(device_id.as_deref(), &device_secret, &install_key, &hostname, &app_version)
+            {
+                Ok((id, replaced)) => {
+                    finish_registration(st, conn, id, &hostname, &app_version, &admitted, replaced.as_deref())
                 }
                 Err(e) => {
                     warn!("{}: registration refused: {e}", conn.addr);
@@ -1177,6 +1294,16 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             },
             None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
         },
+
+        ClientMsg::RelayMoved { session_id } => {
+            if let Some(session) = st.sessions.get_mut(&session_id) {
+                session.move_acked = true;
+                info!("failover: session {session_id:016x} is moving to the new primary");
+            }
+        }
+
+        // The connection task handles this before taking the server lock.
+        ClientMsg::TakePrimary { .. } => {}
     }
 }
 
@@ -1256,6 +1383,126 @@ fn drop_access_key(st: &mut State, key_id: &str) -> bool {
         disconnect_device(st, id, "This access key is no longer valid.");
     }
     any
+}
+
+/// How long a role change waits for relayed sessions to follow.
+const MOVE_WAIT: Duration = Duration::from_secs(8);
+
+/// Tells every relayed session that has not been told yet. An older host is
+/// marked done so this server does not wait for a message it cannot read.
+fn tell_open_relays(st: &mut State, primary: &str) {
+    let pending_ids: Vec<(SessionId, String)> = st
+        .sessions
+        .iter()
+        .filter(|(_, session)| session.relayed && !session.move_told)
+        .map(|(id, session)| (*id, session.host_id.clone()))
+        .collect();
+    let host_versions: Vec<(SessionId, String)> = pending_ids
+        .into_iter()
+        .map(|(id, host_id)| {
+            let version = st.online.get(&host_id).map(|host| host.app_version.clone()).unwrap_or_default();
+            (id, version)
+        })
+        .collect();
+    for (id, version) in host_versions {
+        let Some(session) = st.sessions.get_mut(&id) else { continue };
+        session.move_told = true;
+        if !pjdesk_proto::update::version_at_least(&version, "0.6.47") {
+            session.move_acked = true;
+            info!("failover: session {id:016x} is on an older client; it reconnects when the relay stops");
+            continue;
+        }
+        let msg = ServerMsg::MoveRelay { session_id: id, primary: primary.to_string() };
+        let _ = session.host_tx.send(msg);
+        let where_next = if primary.is_empty() { "the current primary" } else { primary };
+        info!("failover: told session {id:016x} to reconnect through {where_next}");
+    }
+}
+
+/// Before the process exits, ask relayed sessions to open on the other server.
+/// Direct sessions are not on this path. The wait is short so a stop still finishes.
+async fn release_relays_on_stop(state: &Shared) {
+    let carrying = state.lock().unwrap().sessions.values().any(|session| session.relayed);
+    if !carrying {
+        return;
+    }
+    let already = state.lock().unwrap().pending_move.is_some();
+    if !already {
+        let data_dir = state.lock().unwrap().data_dir.clone();
+        let primary = crate::cloud::cached_peer_address(&data_dir);
+        let where_next = if primary.is_empty() { "the current primary".to_string() } else { primary.clone() };
+        info!("failover: shutting down; telling relayed sessions to move to {where_next}");
+        tell_open_relays(&mut state.lock().unwrap(), &primary);
+    }
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(4) {
+        let waiting = state.lock().unwrap().sessions.values().any(|session| session.relayed && !session.move_acked);
+        if !waiting {
+            info!("failover: relayed sessions left before this server stopped");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    warn!("failover: stopping with a relayed session still here; that session reconnects through the next server");
+}
+
+/// Tells relayed sessions to open again on `primary`. Returns true when the
+/// role change may be written: nothing is waiting, or every told session has
+/// followed, or the wait ran out (the crash path drops the relay).
+fn step_down_ready(state: &Shared, primary: &str, kind: StepKind) -> bool {
+    let mut st = state.lock().unwrap();
+    if st.pending_move.is_none() {
+        let target = if primary.is_empty() { "the current primary".to_string() } else { primary.to_string() };
+        info!("failover: role change started; relayed sessions move to {target} before this server steps down");
+        st.pending_move = Some(PendingMove { primary: primary.to_string(), since: Instant::now(), kind });
+    }
+    let (primary, since) = {
+        let pending = st.pending_move.as_ref().unwrap();
+        (pending.primary.clone(), pending.since)
+    };
+    tell_open_relays(&mut st, &primary);
+    let waiting = st.sessions.values().any(|session| session.relayed && !session.move_acked);
+    let timed_out = since.elapsed() > MOVE_WAIT;
+    if waiting && !timed_out {
+        return false;
+    }
+    if waiting && timed_out {
+        warn!("failover: relayed sessions did not confirm the move; finishing step-down. A lost relay reconnects through the primary.");
+    }
+    true
+}
+
+/// Writes the standby role, then drops every relayed session.
+async fn commit_step_down(state: &Shared, acceptor: &RwLock<TlsAcceptor>) {
+    let pending = {
+        let mut st = state.lock().unwrap();
+        st.pending_move.take()
+    };
+    let Some(pending) = pending else { return };
+    let data_dir = state.lock().unwrap().data_dir.clone();
+    let StepKind::Yield { epoch, instance, name } = pending.kind;
+    let dir = data_dir.clone();
+    let label = name.clone();
+    let _ = tokio::task::spawn_blocking(move || crate::cloud::yield_to_epoch(&dir, epoch, &instance, &name)).await;
+    warn!("failover: generation {epoch} belongs to {label}; this server is now the standby");
+    drop_relayed_sessions(state);
+    release_hosts_for_failover(state);
+    let data_dir = state.lock().unwrap().data_dir.clone();
+    reload_from_disk(state, acceptor, &data_dir);
+}
+
+/// A standby carries no relay routes. Removing the session makes the relay
+/// task drop the forwarding entries.
+fn drop_relayed_sessions(state: &Shared) {
+    let mut st = state.lock().unwrap();
+    let ids: Vec<SessionId> = st.sessions.iter().filter(|(_, session)| session.relayed).map(|(id, _)| *id).collect();
+    let n = ids.len();
+    for id in ids {
+        st.sessions.remove(&id);
+    }
+    if n > 0 {
+        info!("failover: dropped {n} relayed session(s); this standby carries none");
+    }
 }
 
 /// Closes live registrations so those computers connect to the new primary.
@@ -1522,12 +1769,24 @@ async fn failover_watch(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
                     Err(e) => warn!("failover: could not take over: {e}"),
                 }
             }
-            crate::failover::Step::Yielded { epoch, name } => {
-                misses = 0;
-                last_log.clear();
-                warn!("failover: generation {epoch} belongs to {name}; this server is now the standby");
-                release_hosts_for_failover(&state);
-                reload_from_disk(&state, &acceptor, &data_dir);
+            crate::failover::Step::YieldPending { epoch, name, instance, primary } => {
+                let primary = if primary.is_empty() {
+                    let dir = data_dir.clone();
+                    tokio::task::spawn_blocking(move || crate::cloud::migration_target(&dir))
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    primary
+                };
+                if step_down_ready(
+                    &state,
+                    &primary,
+                    StepKind::Yield { epoch, instance, name },
+                ) {
+                    misses = 0;
+                    last_log.clear();
+                    commit_step_down(&state, &acceptor).await;
+                }
             }
         }
         if let Some(routes) = crate::cloud::take_routes_push(&data_dir, &mut routes_gen) {
@@ -1551,12 +1810,13 @@ fn push_routes(state: &Shared, routes: &pjdesk_proto::routes::ServerRoutes) {
 /// the main server if it is on standby — then reloads the key, accounts and
 /// computer list so it is ready to take over.
 async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
-    use crate::cloud::{demote, promote, sync_once, Role};
+    use crate::cloud::{promote, sync_once, Role};
     use crate::requests::{take, DEMOTE_FILE, PROMOTE_FILE, RELOAD_FILE, SYNC_FILE};
     const PASS_EVERY: u32 = 15; // ticks of 2 s
     let data_dir = state.lock().unwrap().data_dir.clone();
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let mut ticks: u32 = 0;
+    let mut want_demote = false;
     loop {
         tick.tick().await;
         ticks = ticks.wrapping_add(1);
@@ -1564,21 +1824,54 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
             reload_from_disk(&state, &acceptor, &data_dir);
         }
         let promote_now = !take(&data_dir, PROMOTE_FILE).is_empty();
-        let demote_now = !take(&data_dir, DEMOTE_FILE).is_empty();
+        if !take(&data_dir, DEMOTE_FILE).is_empty() {
+            want_demote = true;
+        }
         if promote_now {
+            want_demote = false;
             let dir = data_dir.clone();
             match tokio::task::spawn_blocking(move || promote(&dir)).await {
-                Ok(Ok(())) => info!("This server is now the cloud primary"),
-                Ok(Err(e)) => warn!("could not become the cloud primary: {e:#}"),
-                Err(e) => warn!("could not become the cloud primary: {e}"),
+                Ok(Ok(())) => {
+                    let notice = crate::cloud::CloudStatus::load(&data_dir)
+                        .map(|status| status.notice)
+                        .filter(|notice| !notice.trim().is_empty())
+                        .unwrap_or_else(|| "This server is now the primary.".into());
+                    info!("{notice}");
+                    crate::role_handoff::write_result(&data_dir, true, &notice);
+                }
+                Ok(Err(e)) => {
+                    warn!("could not become the cloud primary: {e:#}");
+                    crate::role_handoff::write_result(&data_dir, false, &format!("{e:#}"));
+                }
+                Err(e) => {
+                    warn!("could not become the cloud primary: {e}");
+                    crate::role_handoff::write_result(&data_dir, false, "Could not become the primary.");
+                }
             }
             reload_from_disk(&state, &acceptor, &data_dir);
-        } else if demote_now {
-            let dir = data_dir.clone();
-            match tokio::task::spawn_blocking(move || demote(&dir)).await {
-                Ok(Ok(())) => info!("This server stepped down to cloud standby"),
-                Ok(Err(e)) => warn!("could not step down: {e:#}"),
-                Err(e) => warn!("could not step down: {e}"),
+        } else if want_demote {
+            let accepted = crate::role_handoff::load_accepted(&data_dir);
+            if let Some(took) = accepted {
+                if step_down_ready(
+                    &state,
+                    &took.address,
+                    StepKind::Yield { epoch: took.epoch, instance: took.instance, name: took.name.clone() },
+                ) {
+                    commit_step_down(&state, &acceptor).await;
+                    let sentence = pjdesk_proto::failover::standby_result(&took.name, took.epoch);
+                    info!("{sentence}");
+                    crate::role_handoff::write_result(&data_dir, true, &sentence);
+                    crate::role_handoff::clear_accepted(&data_dir);
+                    want_demote = false;
+                }
+            } else {
+                let epoch = crate::cloud::local_epoch(&data_dir);
+                let message = format!(
+                    "The other server has not taken the primary. This server stayed the primary (generation {epoch})."
+                );
+                warn!("{message}");
+                crate::role_handoff::write_result(&data_dir, false, &message);
+                want_demote = false;
             }
         }
         let forced = !take(&data_dir, SYNC_FILE).is_empty();
@@ -1694,6 +1987,7 @@ mod tests {
             online: HashMap::new(),
             standby: HashMap::new(),
             sessions: HashMap::new(),
+            pending_move: None,
             limiter: RateLimiter::default(),
             udp_port: 21200,
             data_dir: dir.to_path_buf(),
@@ -1777,6 +2071,57 @@ mod tests {
         };
         let row = state.lock().unwrap().registry.list().into_iter().find(|d| d.id == id).unwrap();
         assert!(!row.signed_in);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_install_keys_claiming_one_id_stay_two_computers() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = state_in(&dir);
+        let legacy = [4u8; 32];
+        let (mut first_conn, mut first_rx) = conn_pair();
+        handle_message(
+            &state,
+            &mut first_conn,
+            ClientMsg::RegisterInstall {
+                proto: 3,
+                device_id: Some("588773545".into()),
+                device_secret: legacy,
+                install_key: [1u8; 32],
+                hostname: "OPAS-DESKTOP".into(),
+                app_version: "0.6.46".into(),
+            },
+        );
+        let first = match first_rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => device_id,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(first, "588773545");
+        let (mut second_conn, mut second_rx) = conn_pair();
+        second_conn.id = 2;
+        second_conn.addr = "192.0.2.11:40000".parse().unwrap();
+        handle_message(
+            &state,
+            &mut second_conn,
+            ClientMsg::RegisterInstall {
+                proto: 3,
+                device_id: Some("588773545".into()),
+                device_secret: legacy,
+                install_key: [2u8; 32],
+                hostname: "OMAS-DESKTOP".into(),
+                app_version: "0.6.46".into(),
+            },
+        );
+        let second = match second_rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => device_id,
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(second, first);
+        let rows = state.lock().unwrap().registry.list();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().find(|row| row.id == first).unwrap().hostname, "OPAS-DESKTOP");
+        assert_eq!(rows.iter().find(|row| row.id == second).unwrap().hostname, "OMAS-DESKTOP");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
