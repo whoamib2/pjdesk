@@ -470,6 +470,43 @@ impl Registry {
             .collect()
     }
 
+    /// The sentence a blocked computer is given. It names where to undo the block.
+    pub const BLOCKED_MESSAGE: &str =
+        "This computer is blocked. Open PJDesk Server, Computers, and choose Unblock.";
+
+    pub fn is_blocked_id(&self, id: &str) -> bool {
+        self.data.blocked.contains_key(id)
+    }
+
+    pub fn is_blocked_secret(&self, secret: &[u8; 32]) -> bool {
+        self.secret_is_blocked(&hex::encode(Sha256::digest(secret)))
+    }
+
+    pub fn is_signed_in(&self, id: &str) -> bool {
+        self.data.devices.get(id).is_some_and(|device| device.signed_in)
+    }
+
+    /// Drops a block that matches this secret. The computer can register again.
+    /// An account owner's sign-in uses this so a revoke is not permanent.
+    pub fn unblock_secret(&mut self, secret: &[u8; 32]) -> bool {
+        let hash = hex::encode(Sha256::digest(secret));
+        let ids: Vec<String> = self
+            .data
+            .blocked
+            .iter()
+            .filter(|(_, row)| !row.secret_sha256.is_empty() && row.secret_sha256 == hash)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if ids.is_empty() {
+            return false;
+        }
+        for id in ids {
+            self.data.blocked.remove(&id);
+        }
+        let _ = self.save();
+        true
+    }
+
     /// Lets that computer register again. It is not put back on the list until it connects.
     pub fn unblock(&mut self, id: &str) -> Result<bool> {
         if !is_valid_id(id) {

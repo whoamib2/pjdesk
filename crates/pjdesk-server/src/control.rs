@@ -100,6 +100,13 @@ pub struct Response {
     /// The token stays in the service. This field is not a secret.
     #[serde(default)]
     pub email: String,
+    /// `Account copy: synced …` or `Account copy: error …`. Not a secret.
+    #[serde(default)]
+    pub account_copy: String,
+    /// Redacted tail of server.log so a window that cannot read the data folder
+    /// can still show the service log. Capped so this reply stays under the pipe limit.
+    #[serde(default)]
+    pub log_tail: String,
 }
 
 fn ok(message: impl Into<String>) -> Response {
@@ -277,7 +284,25 @@ fn session_status(data_dir: &Path) -> Response {
         ok(format!("Signed in as {email}."))
     };
     response.email = email;
+    response.account_copy = crate::account_mirror::status_line(data_dir);
+    response.log_tail = session_log_tail(data_dir);
     response
+}
+
+fn session_log_tail(data_dir: &Path) -> String {
+    let service = crate::status_view::redacted_log_tail(&data_dir.join("server.log"));
+    let text = if service.trim().is_empty() {
+        crate::status_view::redacted_log_tail(&data_dir.join("pjdesk-server.log"))
+    } else {
+        service
+    };
+    let max = 6_000;
+    let count = text.chars().count();
+    if count <= max {
+        text
+    } else {
+        text.chars().skip(count - max).collect()
+    }
 }
 
 fn sign_in(data_dir: &Path, req: &Request) -> Response {
@@ -288,6 +313,7 @@ fn sign_in(data_dir: &Path, req: &Request) -> Response {
         tracing::info!("sign-in: {email}: already signed in; the saved session stays");
         let mut response = ok(format!("Signed in as {saved}. Syncing as before."));
         response.email = saved;
+        response.account_copy = crate::account_mirror::pull_now(data_dir);
         return response;
     }
     let password = req.password.clone();
@@ -369,7 +395,7 @@ fn finish_sign_in(data_dir: &Path, cfg: CloudConfig, choice: Option<crate::cloud
         Ok(done) => {
             crate::cloud::publish_network(data_dir, online, false);
             let _ = crate::requests::push(data_dir, crate::requests::SYNC_FILE, "now");
-            ok(match done {
+            let mut response = ok(match done {
                 crate::cloud::Connected::Uploaded => format!("Signed in as {email}. This server's data is backed up."),
                 crate::cloud::Connected::Resumed => format!("Signed in as {email}. Syncing as before."),
                 crate::cloud::Connected::Joined { from } => {
@@ -379,7 +405,10 @@ fn finish_sign_in(data_dir: &Path, cfg: CloudConfig, choice: Option<crate::cloud
                     format!("Signed in as {email}. This server's data replaced the copy in PJDesk Cloud.")
                 }
                 crate::cloud::Connected::Ask { .. } => "Signed in.".into(),
-            })
+            });
+            response.email = email;
+            response.account_copy = crate::account_mirror::pull_now(data_dir);
+            response
         }
         Err(e) => fail(format!("{e:#}")),
     }

@@ -359,6 +359,10 @@ mod tests {
         assert_eq!(connected_confirmation("ben@spader.us", "desk.example.com"), "You are now connected to ben@spader.us.");
         assert_eq!(connected_confirmation("", "desk.example.com:21200"), "You are now connected to desk.example.com:21200.");
         assert_eq!(connected_confirmation("  ", ""), "You are now connected to this network.");
+        let joined = connected_confirmation("", "pjdesk.spader.us:21200");
+        assert!(joined.starts_with("You are now connected"));
+        assert!(!joined.contains("does not have an ID"));
+        assert!(!joined.contains("Sign in required"));
         assert_eq!(pin_prompt_on_launch("", false, true, false), (true, true));
         assert_eq!(pin_prompt_on_launch("", false, true, true), (false, true));
         assert_eq!(pin_prompt_on_launch("", false, false, false), (false, true));

@@ -413,7 +413,15 @@ impl App {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
                     ui.add_space(6.0);
                 } else if !self.net_error.is_empty() && crate::support_keys::parse_consent(&self.net_error).is_none() {
-                    ui.colored_label(p.warn, &self.net_error);
+                    let shown = if self.net_error.contains("does not have an ID") {
+                        self.blocked_registration_notice().unwrap_or_else(|| self.net_error.clone())
+                    } else {
+                        self.net_error.clone()
+                    };
+                    ui.colored_label(p.warn, &shown);
+                    ui.add_space(6.0);
+                } else if let Some(notice) = self.blocked_registration_notice() {
+                    ui.colored_label(p.warn, &notice);
                     ui.add_space(6.0);
                 }
                 if self.net_offer

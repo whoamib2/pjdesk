@@ -28,6 +28,9 @@ const JOURNAL_FILE: &str = "account-journal.json";
 const PAUSE_FILE: &str = "cloud-pause.json";
 const BATCH_FILE: &str = "account-batch-at.txt";
 const REPLICA_FILE: &str = "account-replica-at.txt";
+const STATUS_FILE: &str = "account-copy-status.json";
+const REENROLL_FILE: &str = "owner-reenroll-until.txt";
+const REENROLL_SECS: u64 = 120;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Pause {
@@ -168,13 +171,117 @@ pub fn batch(dir: &Path, force: bool) -> bool {
             let pending = journal(dir);
             local = merge(&fresh, &local, &pending);
         }
-        Err(Pull::Paused) => note_edge(dir),
-        Err(Pull::Missing) => {}
-        Err(Pull::Other(err)) => tracing::warn!("account mirror pull: {err}"),
+        Err(Pull::Paused) => {
+            note_edge(dir);
+            let _ = record_status(dir, 0, "pjdesk.com is rate limited");
+        }
+        Err(Pull::Missing) => {
+            let _ = record_status(dir, 0, "HTTP 404: pjdesk.com has no account copy for this sign-in");
+        }
+        Err(Pull::Other(err)) => {
+            tracing::warn!("account mirror pull: {err}");
+            let _ = record_status(dir, 0, &err);
+        }
     }
     ensure_sign_key(&mut local);
     save(dir, &local);
+    if has_verifier(&local) {
+        record_status(dir, now(), "");
+    }
+    // A fresh install does not turn Require signed-in accounts on from the copy.
+    let _ = crate::access::restore_grace(dir);
     true
+}
+
+/// Pulls the account copy now. Sign-in and service start call this. The
+/// five-minute batch is not the first pull.
+pub fn pull_now(dir: &Path) -> String {
+    let Some(mut cfg) = CloudConfig::load(dir) else {
+        return record_status(dir, 0, "not signed in");
+    };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return record_status(dir, 0, "not signed in");
+    }
+    if cfg.api.trim().is_empty() {
+        cfg.api = cloud::default_api();
+    }
+    let line = match pull(&cfg) {
+        Ok(fresh) => {
+            note_cloud_ok(dir);
+            let mut local = merge(&fresh, &load(dir), &journal(dir));
+            ensure_sign_key(&mut local);
+            save(dir, &local);
+            let _ = crate::access::restore_grace(dir);
+            record_status(dir, now(), "")
+        }
+        Err(Pull::Paused) => {
+            note_edge(dir);
+            record_status(dir, 0, "pjdesk.com is rate limited")
+        }
+        Err(Pull::Missing) => record_status(dir, 0, "HTTP 404: pjdesk.com has no account copy for this sign-in"),
+        Err(Pull::Other(err)) => record_status(dir, 0, &err),
+    };
+    tracing::info!("{line}");
+    line
+}
+
+/// `Account copy: synced <time>` or `Account copy: error <reason>`.
+pub fn status_line(dir: &Path) -> String {
+    let status = read_status(dir);
+    if !status.error.is_empty() {
+        format!("Account copy: error {}", one_line(&status.error))
+    } else if status.synced_at > 0 {
+        format!("Account copy: synced {}", fmt_time(status.synced_at))
+    } else {
+        "Account copy: error not synced yet".into()
+    }
+}
+
+/// The owner just signed in with email and password. A blocked computer may
+/// register again for the next two minutes.
+pub fn note_owner_reenroll(dir: &Path) {
+    let until = now().saturating_add(REENROLL_SECS);
+    let _ = std::fs::write(dir.join(REENROLL_FILE), format!("{until}\n"));
+}
+
+pub fn owner_reenroll_open(dir: &Path) -> bool {
+    stamp(&dir.join(REENROLL_FILE)) > now()
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct CopyStatus {
+    #[serde(default)]
+    synced_at: u64,
+    #[serde(default)]
+    error: String,
+}
+
+fn read_status(dir: &Path) -> CopyStatus {
+    std::fs::read(dir.join(STATUS_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn record_status(dir: &Path, synced_at: u64, error: &str) -> String {
+    let row = if error.is_empty() {
+        CopyStatus { synced_at, error: String::new() }
+    } else {
+        let previous = read_status(dir);
+        CopyStatus { synced_at: previous.synced_at, error: one_line(error) }
+    };
+    if let Ok(bytes) = serde_json::to_vec(&row) {
+        let _ = std::fs::write(dir.join(STATUS_FILE), bytes);
+    }
+    status_line(dir)
+}
+
+fn one_line(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.chars().take(180).collect()
+}
+
+fn fmt_time(secs: u64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| secs.to_string())
 }
 
 /// Changes that are in `local` and not already the cloud row. Used after a
@@ -213,15 +320,60 @@ fn endpoint(cfg: &CloudConfig) -> String {
     format!("{}/api/account/mirror", cfg.api.trim_end_matches('/'))
 }
 
+fn mirror_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(Duration::from_secs(8)).build()
+}
+
 fn pull(cfg: &CloudConfig) -> std::result::Result<AccountCopy, Pull> {
-    let response = cloud::agent().get(&endpoint(cfg)).set("authorization", &format!("Bearer {}", cfg.token)).call();
+    let response = mirror_agent().get(&endpoint(cfg)).set("authorization", &format!("Bearer {}", cfg.token)).call();
     let response = match response {
         Ok(response) => response,
-        Err(ureq::Error::Status(404, _)) => return Err(Pull::Missing),
-        Err(err) => return Err(classify_pull(err)),
+        Err(ureq::Error::Status(code, response)) => return Err(classify_status(code, response)),
+        Err(err) => return Err(Pull::Other(err.to_string())),
     };
     let text = response.into_string().map_err(|err| Pull::Other(err.to_string()))?;
     serde_json::from_str(&text).map_err(|err| Pull::Other(err.to_string()))
+}
+
+fn classify_status(code: u16, response: ureq::Response) -> Pull {
+    let ctype = response.header("content-type").unwrap_or("").to_string();
+    let body = response.into_string().unwrap_or_default();
+    if code == 429 && (ctype.to_ascii_lowercase().contains("text/html") || cloud_edge_limited(code, &ctype, &body)) {
+        return Pull::Paused;
+    }
+    if code == 404 {
+        return Pull::Missing;
+    }
+    Pull::Other(mirror_http_error(code, &body))
+}
+
+/// 401/403 is the session (auth). 500 that mentions the signing key is that key.
+pub fn mirror_http_error(code: u16, body: &str) -> String {
+    let detail = json_error(body).unwrap_or_else(|| {
+        let trimmed = body.trim();
+        if trimmed.is_empty() { "empty response".into() } else { one_line(trimmed) }
+    });
+    let lower = format!("{detail} {body}").to_ascii_lowercase();
+    let kind = if code == 401 || code == 403 {
+        "auth"
+    } else if code >= 500 && (lower.contains("sign") || lower.contains("network_sign_keys") || lower.contains("ed25519")) {
+        "signing key"
+    } else if code >= 500 {
+        "server"
+    } else {
+        "http"
+    };
+    format!("HTTP {code} {kind}: {detail}")
+}
+
+fn json_error(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    for key in ["error", "message"] {
+        if let Some(msg) = value.get(key).and_then(|item| item.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(one_line(msg));
+        }
+    }
+    None
 }
 
 fn push(cfg: &CloudConfig, revision: &str, changes: &[AccountChange]) -> std::result::Result<AccountCopy, Push> {
@@ -253,14 +405,6 @@ fn push(cfg: &CloudConfig, revision: &str, changes: &[AccountChange]) -> std::re
 struct ConflictBody {
     #[serde(default)]
     mirror: Option<AccountCopy>,
-}
-
-fn classify_pull(err: ureq::Error) -> Pull {
-    if is_edge(&err) {
-        Pull::Paused
-    } else {
-        Pull::Other(err.to_string())
-    }
 }
 
 fn classify_push(err: ureq::Error) -> Push {
@@ -347,7 +491,15 @@ pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
         return replica(dir, &proof);
     }
     if !has_verifier(&load(dir)) && !cloud_paused(dir) {
-        batch(dir, true);
+        let _ = pull_now(dir);
+    }
+    if !has_verifier(&load(dir)) && (op == "sign-in" || op == "verify") {
+        if let Err(err) = proxy_login_seed(dir, &email, &auth_key) {
+            tracing::warn!("account copy proxy: {err}");
+            if !has_verifier(&load(dir)) {
+                return fail(&op, &err);
+            }
+        }
     }
     let mut copy = load(dir);
     ensure_sign_key(&mut copy);
@@ -365,6 +517,58 @@ pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
     }
 }
 
+/// The server has no copy. Sign in to pjdesk.com with the client's auth key
+/// (never the password) and store the mirror that token can read.
+fn proxy_login_seed(dir: &Path, email: &str, auth_key: &str) -> Result<(), String> {
+    if auth_key.len() != 64 || !auth_key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Enter your email and password.".into());
+    }
+    let api = CloudConfig::load(dir)
+        .map(|cfg| cfg.api)
+        .filter(|api| !api.trim().is_empty())
+        .unwrap_or_else(cloud::default_api);
+    let api = api.trim_end_matches('/').to_string();
+    let body = cloud::login_body(email, auth_key, "PJDesk Server account copy");
+    let response = mirror_agent()
+        .post(&format!("{api}/api/login"))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string());
+    let token = match response {
+        Ok(resp) => {
+            let text = resp.into_string().map_err(|err| err.to_string())?;
+            serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| value.get("token").and_then(|item| item.as_str()).map(str::to_string))
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| format!("HTTP 200 login: {}", one_line(&text)))?
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            return Err(cloud::cloud_error_text(code, &body));
+        }
+        Err(err) => return Err(format!("login: {err}")),
+    };
+    let mut cfg = CloudConfig::load(dir).unwrap_or_else(CloudConfig::blank_account);
+    cfg.api = api;
+    cfg.token = token;
+    cfg.mode = "account".into();
+    match pull(&cfg) {
+        Ok(fresh) => {
+            note_cloud_ok(dir);
+            let mut local = merge(&fresh, &load(dir), &journal(dir));
+            ensure_sign_key(&mut local);
+            save(dir, &local);
+            let _ = crate::access::restore_grace(dir);
+            let line = record_status(dir, now(), "");
+            tracing::info!("account copy seeded from the client's sign-in; {line}");
+            Ok(())
+        }
+        Err(Pull::Paused) => Err("pjdesk.com is rate limited".into()),
+        Err(Pull::Missing) => Err("HTTP 404: pjdesk.com has no account copy for this sign-in".into()),
+        Err(Pull::Other(err)) => Err(err),
+    }
+}
+
 fn answer_sign_in(dir: &Path, email: &str, auth_key: &str, device_id: &str, device_name: &str) -> ServerMsg {
     // Reject a body that is not an auth key before touching the verifier.
     if auth_key.len() != 64 || !auth_key.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -378,6 +582,10 @@ fn answer_sign_in(dir: &Path, email: &str, auth_key: &str, device_id: &str, devi
             if let Some(device) = copy.devices.iter().find(|row| row.device_id == session.device_id).cloned() {
                 save(dir, &copy);
                 remember_device(dir, device);
+            }
+            let saved = crate::cloud::saved_account_email(dir);
+            if saved.is_empty() || saved.eq_ignore_ascii_case(email.trim()) {
+                note_owner_reenroll(dir);
             }
             session_msg(&copy, "sign-in", &session, &refresh)
         }
@@ -842,6 +1050,46 @@ pub fn mirror_path(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mirror_http_error_names_auth_and_the_signing_key() {
+        let auth = mirror_http_error(401, r#"{"error":"Please sign in."}"#);
+        assert!(auth.contains("HTTP 401 auth"), "{auth}");
+        assert!(auth.contains("Please sign in."), "{auth}");
+        let key = mirror_http_error(500, "network_sign_keys ed25519 failed");
+        assert!(key.contains("HTTP 500 signing key"), "{key}");
+        let server = mirror_http_error(500, r#"{"error":"Something went wrong."}"#);
+        assert!(server.contains("HTTP 500 server"), "{server}");
+    }
+
+    #[test]
+    fn status_line_names_the_sync_or_the_error() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(status_line(&dir), "Account copy: error not synced yet");
+        std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":1700000000,"error":""}"#).unwrap();
+        assert_eq!(status_line(&dir), "Account copy: synced 2023-11-14 22:13:20 UTC");
+        std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":1700000000,"error":"HTTP 401 auth: Please sign in."}"#).unwrap();
+        assert_eq!(status_line(&dir), "Account copy: error HTTP 401 auth: Please sign in.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mirror_that_requires_accounts_does_not_turn_the_switch_on() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-require-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut copy = AccountCopy::default();
+        copy.network.require_accounts = true;
+        save(&dir, &copy);
+        let policy = crate::access::Policy { require_accounts: true, require_chosen: false, ..crate::access::Policy::default() };
+        policy.save(&dir).unwrap();
+        assert!(crate::access::restore_grace(&dir));
+        assert!(!crate::access::Policy::load(&dir).require_accounts);
+        assert!(load(&dir).network.require_accounts);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_replica_proof_matches_this_minute_and_not_an_empty_key() {

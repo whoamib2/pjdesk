@@ -1572,6 +1572,7 @@ impl App {
                 self.net_importing = false;
                 self.pending_blob = None;
                 self.pending_without_password = false;
+                let e = self.present_sign_in_error(e);
                 if e.contains("specific account") {
                     self.show_net_sign_in = true;
                     self.net_mode = 2;
@@ -1634,6 +1635,40 @@ impl App {
         }
     }
 
+    /// A blocked computer is told where to unblock it. The ID sentence is never used.
+    pub(super) fn blocked_registration_notice(&self) -> Option<String> {
+        let err = self.engine.shared.error()?;
+        if !err.to_ascii_lowercase().contains("blocked") {
+            return None;
+        }
+        if let Some(start) = err.find("This computer is blocked") {
+            let sentence = err[start..].trim();
+            if sentence.contains("Unblock") {
+                return Some(sentence.to_string());
+            }
+        }
+        Some("This computer is blocked. Open PJDesk Server, Computers, and choose Unblock.".into())
+    }
+
+    fn present_sign_in_error(&self, err: String) -> String {
+        if err.to_ascii_lowercase().contains("blocked") && !err.contains("Unblock") {
+            return self.blocked_registration_notice().unwrap_or_else(|| {
+                "This computer is blocked. Open PJDesk Server, Computers, and choose Unblock.".into()
+            });
+        }
+        if err.contains("does not have an ID") {
+            if let Some(notice) = self.blocked_registration_notice() {
+                return notice;
+            }
+            if let Some(host) = self.engine.shared.error() {
+                if !host.is_empty() {
+                    return host;
+                }
+            }
+        }
+        err
+    }
+
     fn start_network_sign_in(&mut self) {
         if self.net_busy {
             return;
@@ -1647,11 +1682,6 @@ impl App {
         let enroll_only = self.net_enroll_only;
         self.net_enroll_only = false;
         let pjdesk_id = self.visible_id();
-        if enroll_only && !pjdesk_proto::is_valid_id(&pjdesk_id) {
-            self.net_error =
-                "This computer does not have an ID yet. Wait until Your ID appears, then try again.".into();
-            return;
-        }
         self.pending_temporary = self.net_temporary && !enroll_only;
         self.pending_enroll_only = enroll_only;
         self.pending_without_password = self.net_mode == 1 || self.net_mode == 2;

@@ -777,7 +777,6 @@ fn note_cloud_transport(fail: &ApiFail) {
 fn account_answer_is_final(message: &str) -> bool {
     message.contains("Wrong email or password")
         || message.contains("Too many sign-in attempts")
-        || message.contains("does not have the account yet")
         || message.contains("Enter your email")
 }
 
@@ -1912,6 +1911,16 @@ pub fn clear_installer_network_key() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_account_copy_is_not_a_final_sign_in_answer() {
+        assert!(!account_answer_is_final(
+            "This server does not have the account yet, and pjdesk.com did not answer."
+        ));
+        assert!(account_answer_is_final("Wrong email or password."));
+        assert!(account_answer_is_final("Too many sign-in attempts. Try again in 1 minute."));
+        assert!(account_answer_is_final("Enter your email and password."));
+    }
 
     #[test]
     fn account_login_uses_auth_key_not_password() {

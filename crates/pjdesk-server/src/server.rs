@@ -679,7 +679,9 @@ enum Admitted {
 
 /// Loads the policy and checks this connection's token.
 /// An access key that is unknown, revoked, or expired is refused even during grace.
-/// `Err` is "Sign in required". The computer limit is checked by the caller on Register.
+/// `Err` is "Sign in required" for Connect. Register does not use that refusal:
+/// a computer with no token still receives an ID so it can sign in.
+/// The computer limit is checked by the caller on Register.
 fn gate(st: &State, conn: &Conn) -> Result<Admitted, ()> {
     let token = conn.access_token.trim();
     if pjdesk_proto::access::is_access_key(token) {
@@ -699,6 +701,68 @@ fn gate(st: &State, conn: &Conn) -> Result<Admitted, ()> {
             warn!("{}: network access refused ({reason})", conn.addr);
             Err(())
         }
+    }
+}
+
+/// True when this connection's token belongs to the account the server is signed in as.
+fn owner_token(st: &State, conn: &Conn) -> bool {
+    let owner = crate::cloud::saved_account_email(&st.data_dir);
+    if owner.is_empty() {
+        return false;
+    }
+    match gate(st, conn) {
+        Ok(Admitted::Signed(claims)) => claims.email.eq_ignore_ascii_case(owner.trim()),
+        _ => false,
+    }
+}
+
+/// An account password sign-in, or a token for that account, removes a block
+/// so the same computer can be given an ID again.
+fn registration_is_blocked(st: &mut State, conn: &Conn, secrets: &[&[u8; 32]], requested: Option<&str>, app_version: &str) -> bool {
+    let lift = owner_token(st, conn) || crate::account_mirror::owner_reenroll_open(&st.data_dir);
+    if lift {
+        for secret in secrets {
+            if st.registry.unblock_secret(secret) {
+                info!("{}: account sign-in removed the block on this computer", conn.addr);
+            }
+        }
+        if let Some(id) = requested {
+            if st.registry.is_blocked_id(id) {
+                if st.registry.unblock(id).unwrap_or(false) {
+                    info!("{}: account sign-in unblocked {}", conn.addr, format_id(id));
+                }
+            }
+        }
+    }
+    let blocked = requested.is_some_and(|id| st.registry.is_blocked_id(id))
+        || secrets.iter().any(|secret| st.registry.is_blocked_secret(secret));
+    if !blocked {
+        return false;
+    }
+    offer_routes(st, conn, app_version);
+    conn.error(ErrorCode::Unauthorized, crate::registry::Registry::BLOCKED_MESSAGE);
+    true
+}
+
+/// Require signed-in accounts does not refuse registration. A computer with no
+/// token is given an ID (pending, not signed in) so it can sign in afterwards.
+/// Connect still requires a token when the switch is on.
+fn admit_registration(st: &State, conn: &Conn) -> Admitted {
+    match gate(st, conn) {
+        Ok(admitted) => admitted,
+        Err(()) => {
+            info!(
+                "{}: registration has no usable sign-in yet; issuing an ID so this computer can sign in",
+                conn.addr
+            );
+            Admitted::Open
+        }
+    }
+}
+
+fn offer_routes(st: &State, conn: &Conn, app_version: &str) {
+    if pjdesk_proto::update::version_at_least(app_version, "0.6.45") {
+        conn.send(ServerMsg::Routes(crate::cloud::advertised_routes(&st.data_dir)));
     }
 }
 
@@ -897,7 +961,10 @@ fn finish_registration(
     }
     conn.host_id = Some(id.clone());
     st.registry.note_address(&id, &conn.addr.ip().to_string());
-    let signed_in = matches!(admitted, Admitted::Signed(_));
+    // A failed token must not clear a sign-in this computer already had.
+    // An update reconnects before the new token is ready, and that must not
+    // take the computer offline.
+    let signed_in = matches!(admitted, Admitted::Signed(_) | Admitted::Key(_)) || st.registry.is_signed_in(&id);
     st.registry.note_access_key(&id, &access_key_id);
     st.registry.mark_signed_in(&id, signed_in);
     if let Some(kept) = reassigned_from {
@@ -982,13 +1049,10 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 conn.error(ErrorCode::Unauthorized, crate::cloud::redirect_text(&st.data_dir));
                 return;
             }
-            let admitted = match gate(st, conn) {
-                Ok(admitted) => admitted,
-                Err(()) => {
-                    conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
-                    return;
-                }
-            };
+            if registration_is_blocked(st, conn, &[&device_secret], device_id.as_deref(), &app_version) {
+                return;
+            }
+            let admitted = admit_registration(st, conn);
             if let Admitted::Key(key) = &admitted {
                 if !st.registry.key_has_room(&key.id, &device_secret, key.computer_limit) {
                     warn!("{}: access key {} is at its computer limit", conn.addr, key.label);
@@ -1010,7 +1074,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 Err(e) => {
                     warn!("{}: registration refused: {e}", conn.addr);
                     if matches!(e, crate::registry::RegisterError::Blocked(_)) {
-                        conn.error(ErrorCode::Unauthorized, "This computer is blocked.");
+                        conn.error(ErrorCode::Unauthorized, crate::registry::Registry::BLOCKED_MESSAGE);
                     } else {
                         conn.error(ErrorCode::IdConflict, e.to_string());
                     }
@@ -1027,13 +1091,16 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 conn.error(ErrorCode::Unauthorized, crate::cloud::redirect_text(&st.data_dir));
                 return;
             }
-            let admitted = match gate(st, conn) {
-                Ok(admitted) => admitted,
-                Err(()) => {
-                    conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
-                    return;
-                }
-            };
+            if registration_is_blocked(
+                st,
+                conn,
+                &[&device_secret, &install_key],
+                device_id.as_deref(),
+                &app_version,
+            ) {
+                return;
+            }
+            let admitted = admit_registration(st, conn);
             if install_key == [0u8; 32] {
                 conn.error(ErrorCode::BadRequest, "this install has no device key");
                 return;
@@ -1063,7 +1130,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 Err(e) => {
                     warn!("{}: registration refused: {e}", conn.addr);
                     if matches!(e, crate::registry::RegisterError::Blocked(_)) {
-                        conn.error(ErrorCode::Unauthorized, "This computer is blocked.");
+                        conn.error(ErrorCode::Unauthorized, crate::registry::Registry::BLOCKED_MESSAGE);
                     } else {
                         conn.error(ErrorCode::IdConflict, e.to_string());
                     }
@@ -1866,6 +1933,11 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
     use crate::requests::{take, DEMOTE_FILE, PROMOTE_FILE, RELOAD_FILE, SYNC_FILE};
     const PASS_EVERY: u32 = 150; // ticks of 2 s: one cloud batch every 5 minutes
     let data_dir = state.lock().unwrap().data_dir.clone();
+    let startup = data_dir.clone();
+    match tokio::task::spawn_blocking(move || crate::account_mirror::pull_now(&startup)).await {
+        Ok(line) => info!("{line}"),
+        Err(err) => warn!("account copy: {err}"),
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let mut ticks: u32 = 0;
     let mut want_demote = false;
@@ -2100,14 +2172,165 @@ mod tests {
                 device_id: Some("123456789".into()),
                 device_secret: [1u8; 32],
                 hostname: "Office".into(),
-                app_version: "0.6.0".into(),
+                app_version: "0.6.49".into(),
             },
         );
-        match rx.try_recv().unwrap() {
-            ServerMsg::Error { message, .. } => assert_eq!(message, "Sign in required"),
+        let id = match rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => device_id,
+            other => panic!("a computer must get an ID even when sign-in is required, got {other:?}"),
+        };
+        assert_eq!(id, "123456789");
+        assert!(!state.lock().unwrap().registry.is_signed_in(&id), "the ID is pending until the account signs in");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_blocked_computer_is_told_where_to_unblock_until_the_owner_signs_in() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-reblock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::access::Policy { require_accounts: true, require_chosen: true, ..crate::access::Policy::default() }
+            .save(&dir)
+            .unwrap();
+        let state = state_in(&dir);
+        let secret = [5u8; 32];
+        let (mut conn, mut rx) = conn_pair();
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::Register {
+                proto: 3,
+                device_id: Some("123456789".into()),
+                device_secret: secret,
+                hostname: "Office".into(),
+                app_version: "0.6.49".into(),
+            },
+        );
+        let id = match rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => device_id,
             other => panic!("{other:?}"),
+        };
+        state.lock().unwrap().registry.block(&id).unwrap();
+        let (mut again, mut again_rx) = conn_pair();
+        again.id = 2;
+        handle_message(
+            &state,
+            &mut again,
+            ClientMsg::Register {
+                proto: 3,
+                device_id: Some(id.clone()),
+                device_secret: secret,
+                hostname: "Office".into(),
+                app_version: "0.6.49".into(),
+            },
+        );
+        let message = loop {
+            match again_rx.try_recv().unwrap() {
+                ServerMsg::Routes(_) => continue,
+                ServerMsg::Error { message, .. } => break message,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(message.contains("Unblock"), "{message}");
+        assert!(!message.contains("does not have an ID"));
+        assert_ne!(message, "Sign in required");
+        crate::account_mirror::note_owner_reenroll(&dir);
+        let (mut back, mut back_rx) = conn_pair();
+        back.id = 3;
+        handle_message(
+            &state,
+            &mut back,
+            ClientMsg::Register {
+                proto: 3,
+                device_id: Some(id.clone()),
+                device_secret: secret,
+                hostname: "Office".into(),
+                app_version: "0.6.49".into(),
+            },
+        );
+        match back_rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => assert_eq!(device_id, id),
+            other => panic!("owner sign-in must register the computer again, got {other:?}"),
         }
-        assert!(state.lock().unwrap().registry.list().is_empty(), "a refused register must not create a record");
+        assert!(state.lock().unwrap().online.contains_key(&id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoke_sign_out_then_owner_sign_in_registers_the_computer_again() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-revoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::access::Policy { require_accounts: true, require_chosen: true, ..crate::access::Policy::default() }
+            .save(&dir)
+            .unwrap();
+        let state = state_in(&dir);
+        let secret = [6u8; 32];
+        let register = |conn: &mut Conn, id: Option<String>| {
+            handle_message(
+                &state,
+                conn,
+                ClientMsg::Register {
+                    proto: 3,
+                    device_id: id,
+                    device_secret: secret,
+                    hostname: "Office".into(),
+                    app_version: "0.6.49".into(),
+                },
+            );
+        };
+        let (mut conn, mut rx) = conn_pair();
+        register(&mut conn, Some("123456789".into()));
+        let id = match rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => device_id,
+            other => panic!("first registration must issue an ID, got {other:?}"),
+        };
+        assert!(state.lock().unwrap().online.contains_key(&id));
+        state.lock().unwrap().registry.mark_signed_in(&id, true);
+
+        // Sign out ends the session and drops the saved access. Require stays on.
+        state.lock().unwrap().online.remove(&id);
+        let (mut signed_out, mut out_rx) = conn_pair();
+        signed_out.id = 2;
+        signed_out.access_token.clear();
+        register(&mut signed_out, Some(id.clone()));
+        match out_rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => assert_eq!(device_id, id),
+            other => panic!("sign-out must not lock the computer out of registering, got {other:?}"),
+        }
+        assert!(state.lock().unwrap().online.contains_key(&id));
+
+        // Revoke puts the same computer on the blocked list and ends the session again.
+        state.lock().unwrap().registry.block(&id).unwrap();
+        state.lock().unwrap().online.remove(&id);
+        let (mut revoked, mut rev_rx) = conn_pair();
+        revoked.id = 3;
+        revoked.access_token.clear();
+        register(&mut revoked, Some(id.clone()));
+        let message = loop {
+            match rev_rx.try_recv().unwrap() {
+                ServerMsg::Routes(_) => continue,
+                ServerMsg::Error { message, .. } => break message,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(message.contains("Unblock"), "{message}");
+        assert!(!message.contains("does not have an ID"), "{message}");
+        assert_ne!(message, "Sign in required");
+        assert!(!state.lock().unwrap().online.contains_key(&id));
+
+        // The account owner signs in with email and password, then this computer registers again.
+        crate::account_mirror::note_owner_reenroll(&dir);
+        let (mut back, mut back_rx) = conn_pair();
+        back.id = 4;
+        back.access_token.clear();
+        register(&mut back, Some(id.clone()));
+        match back_rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => assert_eq!(device_id, id),
+            other => panic!("owner sign-in must register the computer again, got {other:?}"),
+        }
+        let guard = state.lock().unwrap();
+        assert!(guard.online.contains_key(&id), "the computer is online after sign-in");
+        assert!(!guard.registry.is_blocked_id(&id));
+        drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

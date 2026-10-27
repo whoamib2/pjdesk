@@ -244,6 +244,12 @@ impl CloudConfig {
         }
     }
 
+    /// Account mode with no saved token. A client sign-in can fill the token
+    /// for one mirror pull without replacing `cloud-sync.json`.
+    pub(crate) fn blank_account() -> Self {
+        Self { mode: "account".into(), ..Self::blank() }
+    }
+
     /// Signed in to a PJDesk account (rather than using your own bucket).
     pub fn is_account(&self) -> bool {
         self.mode == "account"

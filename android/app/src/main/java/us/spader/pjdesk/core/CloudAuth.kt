@@ -144,7 +144,6 @@ object CloudAuth {
             val pause = local.optLong("pause")
             val finalAnswer = message.contains("Wrong email or password")
                 || message.contains("Too many sign-in attempts")
-                || message.contains("does not have the account yet")
                 || message.contains("Enter your email")
                 || pause > 0
             if (finalAnswer) {

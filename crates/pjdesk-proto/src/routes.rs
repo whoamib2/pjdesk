@@ -228,6 +228,35 @@ pub fn registration_targets(follow: &str, routes: &ServerRoutes, mine: &[Ipv4Add
     order
 }
 
+/// Uses the older LAN and public fields when `routes` has no advertised IP.
+/// Those addresses are dialed before the hostname. A catalog that already
+/// has an IP is left as it is.
+pub fn routes_with_legacy(
+    routes: &ServerRoutes,
+    primary: &str,
+    primary_lan: &[String],
+    primary_public_ip: &str,
+    standby: &str,
+    standby_lan: &[String],
+    standby_public_ip: &str,
+) -> ServerRoutes {
+    if routes.has_advertised_ip() {
+        return routes.clone();
+    }
+    let mut legacy = ServerRoutes::from_legacy(primary, primary_lan, primary_public_ip, standby, standby_lan, standby_public_ip);
+    if !legacy.has_advertised_ip() {
+        return if routes.is_empty() { legacy } else { routes.clone() };
+    }
+    for name in &routes.names {
+        let text = canonical(name);
+        if text.is_empty() || legacy.names.iter().any(|have| same_endpoint(have, &text)) {
+            continue;
+        }
+        legacy.names.push(text);
+    }
+    legacy
+}
+
 /// Keeps addresses the new catalog left out.
 ///
 /// A primary that only knows itself would otherwise erase the other server.
@@ -549,6 +578,24 @@ mod tests {
             standby_public: vec!["198.51.100.8:21200".into()],
             names: vec!["pjdesk.spader.us:21200".into()],
         }
+    }
+
+    #[test]
+    fn saved_lan_is_dialed_before_the_hostname_when_the_catalog_has_no_ip() {
+        let routes = ServerRoutes { names: vec!["pjdesk.spader.us:21200".into()], ..ServerRoutes::default() };
+        let merged = routes_with_legacy(
+            &routes,
+            "pjdesk.spader.us:21200",
+            &["192.168.0.193:21200".into()],
+            "204.248.122.44",
+            "",
+            &[],
+            "",
+        );
+        let order = dial_targets(&merged, &[v4(192, 168, 0, 10)], "pjdesk.spader.us:21200");
+        assert_eq!(order.first().map(String::as_str), Some("192.168.0.193:21200"));
+        assert!(order.iter().any(|addr| addr.starts_with("204.248.122.44")), "{order:?}");
+        assert_eq!(order.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
     }
 
     #[test]

@@ -54,7 +54,7 @@ fn serve_once(data_dir: &std::path::Path, port: u16) -> bool {
             PIPE_ACCESS_OUTBOUND,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
-            64 * 1024,
+            256 * 1024,
             0,
             0,
             Some(&sa),
@@ -74,7 +74,14 @@ fn serve_once(data_dir: &std::path::Path, port: u16) -> bool {
         }
         let snap = Snapshot::from_disk(data_dir, port, true);
         if let Ok(bytes) = serde_json::to_vec(&snap) {
-            let _ = WriteFile(pipe, Some(&bytes), None, None);
+            let mut sent = 0usize;
+            while sent < bytes.len() {
+                let mut wrote = 0u32;
+                if WriteFile(pipe, Some(&bytes[sent..]), Some(&mut wrote), None).is_err() || wrote == 0 {
+                    break;
+                }
+                sent += wrote as usize;
+            }
         }
         let _ = DisconnectNamedPipe(pipe);
         let _ = windows::Win32::Foundation::CloseHandle(pipe);
