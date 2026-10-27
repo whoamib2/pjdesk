@@ -1360,39 +1360,6 @@ class MainActivity : FragmentActivity() {
                 if (app.store.pinLockedUntil > System.currentTimeMillis()) return
                 lockError = ""
             }
-            fun peekPin(pin: String) {
-                if (lockBusy || app.store.pinLockedUntil > System.currentTimeMillis()) return
-                val epoch = pinEpoch
-                if (app.store.hasAccountPin()) {
-                    val salt = app.store.accountPinSalt
-                    val hash = app.store.accountPinHash
-                    val iters = app.store.accountPinIters
-                    val pinSalt = app.store.pinSaltBytes()
-                    val wrapped = app.store.pinWrap
-                    scope.launch {
-                        val ok = withContext(Dispatchers.IO) {
-                            AccountPin.matches(pin, salt, hash, iters)
-                        }
-                        if (epoch != pinEpoch || !ok) return@launch
-                        val key = if (pinSalt != null && wrapped.isNotBlank()) {
-                            withContext(Dispatchers.IO) { PinWrap.unwrap(wrapped, pin, pinSalt) }
-                        } else {
-                            null
-                        }
-                        if (epoch != pinEpoch) return@launch
-                        unlockWithPin(key)
-                    }
-                    return
-                }
-                val pinSalt = app.store.pinSaltBytes() ?: return
-                val wrapped = app.store.pinWrap
-                if (wrapped.isBlank()) return
-                scope.launch {
-                    val key = withContext(Dispatchers.IO) { PinWrap.unwrap(wrapped, pin, pinSalt) }
-                    if (epoch != pinEpoch || key == null) return@launch
-                    unlockWithPin(key)
-                }
-            }
             fun submitPin(pin: String) {
                 if (app.store.pinLockedUntil > System.currentTimeMillis()) return
                 val epoch = pinEpoch
@@ -1793,7 +1760,6 @@ class MainActivity : FragmentActivity() {
                         rejectCount = pinRejects,
                         lockedOut = pinWait,
                         onSubmit = { submitPin(it) },
-                        onPeek = { peekPin(it) },
                         onEdit = { notePinEdit() },
                         onBiometric = { tryBio() },
                         computerId = state.idFormatted.ifBlank { state.id },

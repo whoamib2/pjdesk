@@ -3,6 +3,7 @@ package us.spader.pjdesk.ui
 import android.os.Build
 import android.view.HapticFeedbackConstants
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -14,9 +15,11 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -33,6 +36,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -49,11 +53,13 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 import us.spader.pjdesk.R
 import us.spader.pjdesk.core.AppLockPolicy
 
@@ -140,7 +146,7 @@ fun SetPinScreen(
             if (confirming) "Confirm PIN" else "Choose a PIN",
             style = MaterialTheme.typography.titleLarge,
         )
-        PinDots(count = entered.length, shakeToken = shakeToken)
+        PinMarks(count = entered.length, shakeToken = shakeToken)
         if (shown.isNotEmpty()) {
             Text(shown, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
         }
@@ -215,7 +221,6 @@ fun UnlockScreen(
     rejectCount: Int = 0,
     lockedOut: Boolean = false,
     onSubmit: (String) -> Unit,
-    onPeek: (String) -> Unit = {},
     onEdit: () -> Unit = {},
     onBiometric: () -> Unit,
     onForgot: () -> Unit = {},
@@ -228,28 +233,33 @@ fun UnlockScreen(
     onRefreshPassword: () -> Unit = {},
 ) {
     var pin by remember { mutableStateOf("") }
-    var peeked by remember { mutableStateOf("") }
+    var localError by remember { mutableStateOf("") }
+    var localShake by remember { mutableIntStateOf(0) }
     val focus = remember { FocusRequester() }
     fun submit() {
-        if (!busy && !lockedOut && AppLockPolicy.pinAcceptable(pin)) onSubmit(pin)
+        if (busy || lockedOut) return
+        if (!AppLockPolicy.pinAcceptable(pin)) {
+            localError = "Wrong PIN."
+            localShake++
+            return
+        }
+        localError = ""
+        onSubmit(pin)
     }
     fun replacePin(next: String) {
         if (next == pin) return
         pin = next
+        localError = ""
         onEdit()
-        if (!busy && !lockedOut && AppLockPolicy.pinAcceptable(next) && next != peeked) {
-            peeked = next
-            onPeek(next)
-        }
     }
     LaunchedEffect(rejectCount) {
         if (rejectCount > 0) {
             pin = ""
-            peeked = ""
+            localError = ""
         }
     }
-    LaunchedEffect(biometrics) {
-        if (!biometrics) runCatching { focus.requestFocus() }
+    LaunchedEffect(Unit) {
+        runCatching { focus.requestFocus() }
     }
     val withheld = oneTimeWithheld(oneTimePassword, permanentSet, passwordHidden)
     val help = lockHelp(computerId, oneTimePassword, withheld)
@@ -289,19 +299,23 @@ fun UnlockScreen(
         )
         Spacer(Modifier.size(24.dp))
         LockMark()
-        Spacer(Modifier.size(16.dp))
-        Text("Enter PIN", style = MaterialTheme.typography.headlineMedium)
+        Spacer(Modifier.size(8.dp))
+        Text("PJDesk", style = MaterialTheme.typography.titleLarge)
+        Spacer(Modifier.size(12.dp))
+        Text("Enter your PIN", style = MaterialTheme.typography.headlineMedium, textAlign = TextAlign.Center)
         Spacer(Modifier.size(8.dp))
         Text(
             "Your account stays signed in.",
             color = pjMuted(),
             style = MaterialTheme.typography.bodyMedium,
+            textAlign = TextAlign.Center,
         )
         Spacer(Modifier.size(24.dp))
-        PinDots(count = pin.length, shakeToken = rejectCount)
-        if (error.isNotEmpty()) {
+        PinMarks(count = pin.length, shakeToken = rejectCount + localShake)
+        val shownError = error.ifBlank { localError }
+        if (shownError.isNotEmpty()) {
             Spacer(Modifier.size(12.dp))
-            Text(error, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
+            Text(shownError, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
         }
         Spacer(Modifier.size(28.dp))
         PinKeypad(
@@ -317,9 +331,9 @@ fun UnlockScreen(
         Spacer(Modifier.size(20.dp))
         Button(
             onClick = { submit() },
-            enabled = !busy && !lockedOut && AppLockPolicy.pinAcceptable(pin),
+            enabled = !busy && !lockedOut && pin.isNotEmpty(),
             modifier = Modifier.fillMaxWidth(),
-        ) { Text(if (busy) "Checking…" else "Unlock") }
+        ) { Text(if (busy) "Checking…" else "Continue") }
         TextButton(onClick = onForgot, enabled = !busy) { Text("Forgot PIN? Sign in again") }
     }
 }
@@ -432,24 +446,62 @@ private fun LockMark() {
     )
 }
 
+/** Center-to-center offsets. An empty PIN has none, so no slots show the length. */
+internal fun pinMarkOffsets(count: Int, gap: Float): FloatArray {
+    if (count <= 0) return FloatArray(0)
+    val start = -((count - 1) * gap) / 2f
+    return FloatArray(count) { index -> start + index * gap }
+}
+
 @Composable
-private fun PinDots(count: Int, shakeToken: Int) {
+private fun PinMarks(count: Int, shakeToken: Int) {
     val shift = shakeOffset(shakeToken)
-    Row(
-        Modifier.offset(x = shift.dp),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-        verticalAlignment = Alignment.CenterVertically,
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(28.dp)
+            .offset(x = shift.dp),
+        contentAlignment = Alignment.Center,
     ) {
-        repeat(8) { index ->
-            val filled = index < count
+        if (count <= 0) {
             Box(
                 Modifier
-                    .size(if (filled) 12.dp else 10.dp)
-                    .clip(CircleShape)
-                    .background(if (filled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline),
+                    .width(56.dp)
+                    .height(2.dp)
+                    .clip(RoundedCornerShape(1.dp))
+                    .background(MaterialTheme.colorScheme.outline),
             )
+        } else {
+            val offsets = pinMarkOffsets(count, 18f)
+            repeat(count) { index ->
+                key(index) {
+                    val x by animateDpAsState(offsets[index].dp, tween(180), label = "pin-dot")
+                    ArrivingDot(Modifier.offset(x = x))
+                }
+            }
         }
     }
+}
+
+@Composable
+private fun ArrivingDot(modifier: Modifier = Modifier) {
+    val scale = remember { Animatable(0.7f) }
+    val alpha = remember { Animatable(0f) }
+    LaunchedEffect(Unit) {
+        launch { scale.animateTo(1f, tween(180)) }
+        launch { alpha.animateTo(1f, tween(180)) }
+    }
+    Box(
+        modifier
+            .size(12.dp)
+            .graphicsLayer {
+                scaleX = scale.value
+                scaleY = scale.value
+                this.alpha = alpha.value
+            }
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.primary),
+    )
 }
 
 @Composable

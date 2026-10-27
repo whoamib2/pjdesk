@@ -275,6 +275,7 @@ impl App {
                 tracing::info!("Wrong PIN ({fails} misses)");
                 self.lock_pin.clear();
                 self.lock_peeked.clear();
+                self.lock_shook = Some(Instant::now());
                 self.lock_error = if until > now {
                     wait_label(until - now)
                 } else {
@@ -533,6 +534,12 @@ impl App {
                     ui.add_space(28.0);
                     self.lock_help_card(ui);
                     ui.add_space(28.0);
+                    if let Some(logo) = &self.logo {
+                        ui.add(egui::Image::new(egui::load::SizedTexture::new(logo.id(), egui::vec2(56.0, 56.0))));
+                        ui.add_space(8.0);
+                    }
+                    ui.label(RichText::new("PJDesk").strong().size(18.0).color(p.text));
+                    ui.add_space(8.0);
                     ui.label(RichText::new("Enter your PIN").strong().size(22.0));
                     ui.add_space(6.0);
                     ui.label(widgets::muted(
@@ -541,7 +548,12 @@ impl App {
                     ));
                     ui.add_space(16.0);
                     let mut pin = self.lock_pin.clone();
-                    let pin_box = widgets::password_field(ui, &mut pin, "4 to 8 digits", &mut self.lock_show);
+                    let shook = self.lock_shook;
+                    pin_marks(ui, pin.chars().count(), pin_shake_offset(shook));
+                    if shook.is_some_and(|at| at.elapsed() < Duration::from_millis(320)) {
+                        ui.ctx().request_repaint_after(Duration::from_millis(16));
+                    }
+                    let pin_box = pin_key_field(ui, &mut pin);
                     if !self.lock_pin_armed {
                         pin_box.request_focus();
                         self.lock_pin_armed = true;
@@ -551,18 +563,26 @@ impl App {
                     if self.lock_pin != prior && !waiting {
                         self.lock_error.clear();
                     }
-                    self.peek_pin();
-                    let can = !self.lock_busy && !waiting && pjdesk_proto::applock::pin_acceptable(&self.lock_pin);
-                    if widgets::submitted(ui, &pin_box) && can {
-                        self.start_unlock();
+                    let ready = !self.lock_busy && !waiting && !self.lock_pin.is_empty();
+                    let can = ready && pjdesk_proto::applock::pin_acceptable(&self.lock_pin);
+                    if widgets::submitted(ui, &pin_box) && ready {
+                        if can {
+                            self.start_unlock();
+                        } else {
+                            self.note_short_pin();
+                        }
                     }
                     if !self.lock_error.is_empty() {
                         ui.add_space(8.0);
                         ui.label(RichText::new(&self.lock_error).color(p.warn));
                     }
                     ui.add_space(12.0);
-                    if widgets::accent_button(ui, if self.lock_busy { "Checking…" } else { "Unlock" }, egui::Vec2::new(420.0, 40.0)) && can {
-                        self.start_unlock();
+                    if widgets::accent_button(ui, if self.lock_busy { "Checking…" } else { "Continue" }, egui::Vec2::new(420.0, 40.0)) && ready {
+                        if can {
+                            self.start_unlock();
+                        } else {
+                            self.note_short_pin();
+                        }
                     }
                     ui.add_space(8.0);
                     if self.cfg.joined_by_code_or_key() {
@@ -680,9 +700,17 @@ impl App {
             });
     }
 
+    /// A PIN that is not ready to check. This is not a counted miss.
+    fn note_short_pin(&mut self) {
+        self.lock_shook = Some(Instant::now());
+        self.lock_error = "Wrong PIN.".into();
+    }
+
     /// Hash the current PIN in the background. A match unlocks. Anything else
     /// is ignored: it is not a wrong attempt and it does not show an error.
-    /// Enter and Unlock still use [`Self::start_unlock`].
+    /// The lock screen does not call this. Enter and Continue use [`Self::start_unlock`],
+    /// so reaching a length does not submit.
+    #[allow(dead_code)]
     fn peek_pin(&mut self) {
         if self.lock_busy || self.lock_resetting || !self.lock_ui {
             return;
@@ -1229,6 +1257,70 @@ fn digits_only(text: &str) -> String {
     text.chars().filter(|c| c.is_ascii_digit()).take(8).collect()
 }
 
+/// Horizontal centers for the masked PIN dots, around 0. An empty PIN has no
+/// dots, so the screen does not reserve slots for a length.
+fn pin_mark_xs(count: usize, gap: f32) -> Vec<f32> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let start = -((count as f32 - 1.0) * gap) / 2.0;
+    (0..count).map(|i| start + i as f32 * gap).collect()
+}
+
+/// A short side-to-side move after a wrong PIN. Zero once it has finished.
+fn pin_shake_offset(started: Option<Instant>) -> f32 {
+    let Some(started) = started else {
+        return 0.0;
+    };
+    let t = started.elapsed().as_secs_f32();
+    if t >= 0.32 {
+        return 0.0;
+    }
+    let damp = 1.0 - t / 0.32;
+    (t * 48.0).sin() * 7.0 * damp
+}
+
+/// Centered dots for the digits typed so far, or a single line when none are.
+/// Empty places are not drawn.
+fn pin_marks(ui: &mut egui::Ui, count: usize, shake: f32) {
+    let p = theme::paint(ui);
+    let width = ui.available_width().min(420.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::hover());
+    let center = rect.center() + egui::vec2(shake, 0.0);
+    if count == 0 {
+        let line = egui::Rect::from_center_size(center, egui::vec2(56.0, 2.0));
+        ui.painter().rect_filled(line, egui::CornerRadius::same(1), p.line);
+        return;
+    }
+    for (i, x) in pin_mark_xs(count, 18.0).into_iter().enumerate() {
+        let appear = ui.ctx().animate_bool_with_time(egui::Id::new(("lock-pin-dot", i)), true, 0.16);
+        let radius = 5.0 * (0.7 + 0.3 * appear);
+        ui.painter().circle_filled(center + egui::vec2(x, 0.0), radius, p.text.linear_multiply(0.35 + 0.65 * appear));
+    }
+    // Drop animation state for dots that were deleted, without painting them.
+    for i in count..8 {
+        ui.ctx().animate_bool_with_time(egui::Id::new(("lock-pin-dot", i)), false, 0.01);
+    }
+}
+
+/// Keyboard entry for the PIN. The field itself draws no bullets and no hint,
+/// so it does not show how long the PIN is.
+fn pin_key_field(ui: &mut egui::Ui, pin: &mut String) -> egui::Response {
+    let mut layouter = |ui: &egui::Ui, _: &dyn egui::TextBuffer, wrap: f32| {
+        ui.fonts_mut(|fonts| fonts.layout(String::new(), egui::FontId::proportional(14.0), egui::Color32::TRANSPARENT, wrap))
+    };
+    ui.add(
+        egui::TextEdit::singleline(pin)
+            .id(egui::Id::new("lock-pin-entry"))
+            .password(true)
+            .frame(egui::Frame::NONE)
+            .margin(egui::Margin::ZERO)
+            .desired_width(ui.available_width())
+            .char_limit(8)
+            .layouter(&mut layouter),
+    )
+}
+
 fn user_activity(ctx: &egui::Context) -> bool {
     ctx.input(|i| {
         i.pointer.any_pressed()
@@ -1299,7 +1391,9 @@ fn wait_label(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_help, one_time_withheld};
+    use std::time::{Duration, Instant};
+
+    use super::{lock_help, one_time_withheld, pin_mark_xs, pin_shake_offset};
 
     #[test]
     fn the_lock_screen_shows_the_id_and_one_time_password_unless_it_is_hidden() {
@@ -1330,5 +1424,18 @@ mod tests {
             !one_time_withheld("", false, false),
             "no password yet is not permanent-only until a permanent password is set"
         );
+    }
+
+    #[test]
+    fn pin_marks_grow_from_the_center_and_do_not_reserve_a_length() {
+        assert!(pin_mark_xs(0, 18.0).is_empty(), "an empty PIN is a line, not a row of slots");
+        assert_eq!(pin_mark_xs(1, 18.0), vec![0.0]);
+        assert_eq!(pin_mark_xs(2, 18.0), vec![-9.0, 9.0]);
+        assert_eq!(pin_mark_xs(3, 18.0), vec![-18.0, 0.0, 18.0]);
+        let five = pin_mark_xs(5, 16.0);
+        assert_eq!(five.len(), 5);
+        assert!((five[0] + five[4]).abs() < 0.01, "dots stay centered as they are added");
+        assert_eq!(pin_shake_offset(None), 0.0);
+        assert_eq!(pin_shake_offset(Some(Instant::now() - Duration::from_secs(2))), 0.0);
     }
 }
