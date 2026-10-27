@@ -340,6 +340,7 @@ class MainActivity : FragmentActivity() {
                 inviteExpires = 0
                 inviteListed = false
                 engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", "").toString())
+                engine.noteAccountSession("")
                 account = ""
                 saved = app.store.saved()
                 recentIds = app.store.recentIds()
@@ -368,6 +369,7 @@ class MainActivity : FragmentActivity() {
                 inviteExpires = 0
                 inviteListed = false
                 engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", "").toString())
+                engine.noteAccountSession("")
                 account = ""
                 saved = app.store.saved()
                 recentIds = app.store.recentIds()
@@ -881,10 +883,15 @@ class MainActivity : FragmentActivity() {
                     AppLog.e(connectError.orEmpty())
                     return
                 }
-                if (knownOffline && !ignoreOffline) {
+                if (
+                    computer != null &&
+                    knownOffline &&
+                    !ignoreOffline &&
+                    us.spader.pjdesk.core.blockOfflineConnect(computer.online, computer.lastSeen, System.currentTimeMillis())
+                ) {
                     connecting = false
                     offlineRetry = computer
-                    val who = name.ifBlank { computer?.hostname?.ifBlank { null } ?: "That computer" }
+                    val who = name.ifBlank { computer.hostname.ifBlank { null } ?: "That computer" }
                     connectError = "$who is offline."
                     AppLog.i(connectError.orEmpty())
                     return
@@ -1057,32 +1064,35 @@ class MainActivity : FragmentActivity() {
             LaunchedEffect(account, memoryRefresh, temporarySession) {
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                 val device = app.store.networkDeviceId
+                engine.stageAccount(refresh, device)
                 if (!temporarySession && state.server.isBlank() && app.store.accountServer.isNotBlank()) {
                     engine.applyAccountServer(app.store.accountServer, app.store.accountFingerprint, quiet = true)
                 }
                 if (account.isBlank() || refresh.isBlank() || device.isBlank()) return@LaunchedEffect
                 val computers = if (temporarySession || !app.store.syncsSavedComputers()) null else CloudAuth.computersJson(app.store.saved())
-                val session = withContext(Dispatchers.IO) {
+                val outcome = withContext(Dispatchers.IO) {
                     val mine = CloudAuth.publicIp()
                     if (mine.isNotBlank()) app.store.myPublicIp = mine
                     runCatching { refreshAccount(refresh, device, computers) }
-                        .onFailure { AppLog.e("account refresh failed: ${it.message}") }
-                        .getOrNull()
                 }
-                if (session == null) {
+                outcome.onSuccess { session ->
+                    engine.noteAccountSession("valid")
+                    cloudAccess = session.access
+                    engine.presentAccess(session.access, session.refresh, session.deviceId)
+                    if (!temporarySession) {
+                        rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
+                        if (app.store.syncsSavedComputers()) {
+                            app.store.mergeCloud(session.computers)
+                            saved = app.store.saved()
+                            if (app.vaultKey != null) syncPasswords(true)
+                        }
+                    }
+                }.onFailure { err ->
+                    AppLog.e("account refresh failed: ${err.message}")
+                    val next = us.spader.pjdesk.core.sessionAfterRefreshFailure(err.message.orEmpty())
+                    if (next != null) engine.noteAccountSession(next)
                     if (!temporarySession && app.store.accountServer.isNotBlank()) {
                         engine.applyAccountServer(app.store.accountServer, app.store.accountFingerprint, quiet = true)
-                    }
-                    return@LaunchedEffect
-                }
-                cloudAccess = session.access
-                engine.presentAccess(session.access, session.refresh, session.deviceId)
-                if (!temporarySession) {
-                    rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
-                    if (app.store.syncsSavedComputers()) {
-                        app.store.mergeCloud(session.computers)
-                        saved = app.store.saved()
-                        if (app.vaultKey != null) syncPasswords(true)
                     }
                 }
             }
@@ -1152,7 +1162,8 @@ class MainActivity : FragmentActivity() {
                     engine.dismissError()
                     return@LaunchedEffect
                 }
-                val friendly = connectFailureText(text, connectComputerName(saved, connectId))
+                val listedOnline = liveSaved.firstOrNull { it.id == digits }?.online == true
+                val friendly = connectFailureText(text, connectComputerName(saved, connectId), listedOnline)
                 if (friendly == null) {
                     AppLog.i("connect attempt ended quietly: $text")
                     engine.dismissError()
@@ -1956,7 +1967,7 @@ class MainActivity : FragmentActivity() {
                         },
                         onClose = { netScan = false },
                     )
-                } else if (account.isEmpty() && (state.server.isEmpty() || signingIn)) {
+                } else if (signingIn || (account.isEmpty() && state.server.isEmpty())) {
                     SignInScreen(
                         email = netEmail,
                         password = netPass,
@@ -1996,6 +2007,11 @@ class MainActivity : FragmentActivity() {
                         onDismissImport = { importOffer = null; importPass = "" },
                         temporary = signOutWhenDone,
                         onTemporary = { signOutWhenDone = it },
+                        onClose = if (account.isNotEmpty() || state.server.isNotEmpty()) {
+                            { signingIn = false }
+                        } else {
+                            null
+                        },
                         onEnrollOnly = {
                             val device = app.store.networkDeviceId.ifBlank {
                                 UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
@@ -2160,12 +2176,22 @@ class MainActivity : FragmentActivity() {
                                     controlBound = controlBound,
                                     onOpenControl = { PjAccessibilityService.openSettings(this@MainActivity) },
                                     onUnattended = { engine.setApproval(if (it) "unattended" else "prompt") },
-                                    onSignIn = if (account.isEmpty() && state.server.isNotEmpty()) {
+                                    onSignIn = if (account.isEmpty() || state.accountSession != "valid") {
                                         { signingIn = true }
                                     } else {
                                         null
                                     },
                                     accountEmail = account,
+                                    accountSession = state.accountSession,
+                                    onSignOut = if (account.isEmpty()) {
+                                        null
+                                    } else {
+                                        {
+                                            signOutAndClearSaved()
+                                            engine.noteAccountSession("")
+                                            scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
+                                        }
+                                    },
                                     temporary = temporarySession,
                                     recent = liveSaved.filter { recentIds.contains(it.id) }.take(3),
                                     onRecent = { beginConnect(it) },
@@ -2430,6 +2456,13 @@ class MainActivity : FragmentActivity() {
                                     },
                                     engineDetail = readiness.detail,
                                     accountEmail = account,
+                                    accountSession = state.accountSession,
+                                    temporary = temporarySession,
+                                    onSignIn = if (account.isEmpty() || state.accountSession != "valid") {
+                                        { signingIn = true }
+                                    } else {
+                                        null
+                                    },
                                     savedCount = saved.size,
                                     onRemoveAllSaved = {
                                         app.store.clearLocalSaved()
@@ -2449,6 +2482,7 @@ class MainActivity : FragmentActivity() {
                                     } else {
                                         {
                                             signOutAndClearSaved()
+                                            engine.noteAccountSession("")
                                             scope.launch { snackbar.showSnackbar("Signed out. Saved computers were removed from this computer") }
                                         }
                                     },
@@ -2722,21 +2756,25 @@ class MainActivity : FragmentActivity() {
                             connectError = null
                             offlineRetry = null
                         },
-                        title = { Text("Couldn't connect") },
+                        title = { Text(if (failure == "Your sign-in expired") "Your sign-in expired" else "Couldn't connect") },
                         text = { Text(failure) },
                         confirmButton = {
                             val retry = offlineRetry
-                            if (retry != null) {
-                                TextButton(onClick = {
+                            when {
+                                failure == "Your sign-in expired" -> TextButton(onClick = {
+                                    connectError = null
+                                    offlineRetry = null
+                                    signingIn = true
+                                }) { Text("Sign in") }
+                                retry != null -> TextButton(onClick = {
                                     offlineRetry = null
                                     connectError = null
                                     beginConnect(retry.id, ignoreOffline = true)
                                 }) { Text("Try anyway") }
-                            } else {
-                                TextButton(onClick = { connectError = null }) { Text("OK") }
+                                else -> TextButton(onClick = { connectError = null }) { Text("OK") }
                             }
                         },
-                        dismissButton = if (offlineRetry != null) {
+                        dismissButton = if (offlineRetry != null || failure == "Your sign-in expired") {
                             {
                                 TextButton(onClick = {
                                     offlineRetry = null

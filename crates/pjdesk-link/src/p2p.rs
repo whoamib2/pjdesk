@@ -155,6 +155,24 @@ pub fn candidates(public: SocketAddr, local: &[SocketAddr]) -> Vec<SocketAddr> {
     out
 }
 
+/// Direct candidates this phone can actually reach.
+///
+/// On the host's LAN, the LAN addresses stay first. Off that network they are
+/// left out, so the public address and then the relay are not stuck behind
+/// addresses that only exist at the other site.
+pub fn candidates_from(public: SocketAddr, local: &[SocketAddr], mine: &[Ipv4Addr]) -> Vec<SocketAddr> {
+    let all = candidates(public, local);
+    let shares = all.iter().any(|addr| match addr.ip() {
+        IpAddr::V4(ip) if is_lan_ip(addr.ip()) => mine.iter().any(|own| pjdesk_proto::routes::same_slash24(ip, *own)),
+        _ => false,
+    });
+    if shares {
+        all
+    } else {
+        all.into_iter().filter(|addr| !is_lan_ip(addr.ip())).collect()
+    }
+}
+
 /// LAN addresses to try on the host's fixed direct port (UDP 21201).
 ///
 /// The punched ephemeral port is a different socket. Windows Firewall often
@@ -366,7 +384,7 @@ pub async fn connect_to_host(
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::net::{Ipv4Addr, SocketAddr};
 
     use super::*;
 
@@ -404,5 +422,18 @@ mod tests {
         assert_eq!(LinkPath::Direct(lan).to_string(), "LAN (192.168.1.9:1)");
         assert_eq!(LinkPath::Direct(wan).to_string(), "Internet (203.0.113.8:1)");
         assert_eq!(LinkPath::Relay(wan).to_string(), "Internet, relayed via 203.0.113.8:1");
+    }
+
+    #[test]
+    fn another_network_skips_the_host_lan_and_keeps_the_public_address() {
+        let public = "203.0.113.5:21116".parse().unwrap();
+        let local = vec!["192.168.1.20:9".parse().unwrap(), "10.0.0.4:9".parse().unwrap(), public];
+        let cellular = [Ipv4Addr::new(10, 9, 9, 9)];
+        let got = candidates_from(public, &local, &cellular);
+        assert_eq!(got, vec![public]);
+        let home = [Ipv4Addr::new(192, 168, 1, 10)];
+        let on_lan = candidates_from(public, &local, &home);
+        assert!(is_lan_ip(on_lan[0].ip()));
+        assert_eq!(*on_lan.last().unwrap(), public);
     }
 }

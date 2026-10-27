@@ -666,6 +666,10 @@ pub fn is_sign_in_required(message: &str) -> bool {
     message.contains(crate::access::SIGN_IN_REQUIRED)
 }
 
+/// Shown on the controller when the account session cannot be refreshed.
+/// The registration notice stays the 0.6.52 sentence. This one is for the person connecting.
+pub const SIGN_IN_EXPIRED: &str = "Your sign-in expired";
+
 /// The sentence shown when that server refused registration or an account write.
 /// `version` is empty when the server did not say which build it is running.
 pub fn sign_in_required_notice(addr: &str, version: &str) -> String {
@@ -953,6 +957,8 @@ mod tests {
         assert!(is_sign_in_required("Sign in required"));
         assert!(is_sign_in_required("Sign in required."));
         assert!(!is_sign_in_required("the server closed the connection"));
+        assert_eq!(SIGN_IN_EXPIRED, "Your sign-in expired");
+        assert!(!is_sign_in_required(SIGN_IN_EXPIRED));
         assert_eq!(INCOMING_ONLY_REFUSAL, "Incoming only is on. This computer can't connect to others.");
         assert_eq!(reconcile_incoming_only(true, false, false), (true, true));
         assert_eq!(reconcile_incoming_only(true, false, true), (false, false));

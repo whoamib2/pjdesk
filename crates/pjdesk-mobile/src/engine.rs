@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.53";
+pub const APP_VERSION: &str = "0.6.54";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -686,16 +686,25 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         }
         "accessToken" => {
             let token = cmd.get("token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            *state.access_token.lock().unwrap() = token.clone();
-            if token.is_empty() {
+            let refresh = cmd.get("refresh").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+            let device = cmd.get("device").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+            // An empty token with a refresh keeps the saved access token. Sign-out
+            // sends neither, and that clears the session. The refresh secret is not logged.
+            if token.is_empty() && refresh.is_none() && device.is_none() {
+                *state.access_token.lock().unwrap() = String::new();
                 *state.account_refresh.lock().unwrap() = String::new();
                 *state.account_device.lock().unwrap() = String::new();
+                emit(cb, &json!({"event":"accountSession","state":""}));
             } else {
-                if let Some(refresh) = cmd.get("refresh").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
-                    *state.account_refresh.lock().unwrap() = refresh.to_string();
+                if !token.is_empty() {
+                    *state.access_token.lock().unwrap() = token;
+                    emit(cb, &json!({"event":"accountSession","state":"valid"}));
                 }
-                if let Some(device) = cmd.get("device").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
-                    *state.account_device.lock().unwrap() = device.to_string();
+                if let Some(refresh) = refresh {
+                    *state.account_refresh.lock().unwrap() = refresh;
+                }
+                if let Some(device) = device {
+                    *state.account_device.lock().unwrap() = device;
                 }
             }
             state.suppress_token.store(false, Ordering::SeqCst);
@@ -2547,27 +2556,76 @@ fn explain_connect_error(target: &str, host_name: &str, err: &anyhow::Error) -> 
     let head = raw.lines().next().unwrap_or(&raw).trim();
     let lower = head.to_ascii_lowercase();
     let who = if host_name.trim().is_empty() { format_id(target) } else { host_name.trim().to_string() };
+    if pjdesk_proto::signal::is_sign_in_required(head) {
+        return pjdesk_proto::signal::SIGN_IN_EXPIRED.to_string();
+    }
+    if lower.contains(pjdesk_proto::signal::SIGN_IN_EXPIRED) {
+        return pjdesk_proto::signal::SIGN_IN_EXPIRED.to_string();
+    }
     if lower.contains("even through the relay") {
-        format!("Could not reach {who}, even through the relay.")
-    } else if lower.contains("did not respond")
-        || lower.contains("did not finish setting up")
-        || lower.contains("is offline")
+        return format!("Could not reach {who}, even through the relay.");
+    }
+    if lower.contains("no udp reply") {
+        return head.to_string();
+    }
+    if lower.contains("did not finish the relay") || lower.contains("did not finish setting up") {
+        return format!("{who} is on the PJDesk server, but it did not finish the relay setup.");
+    }
+    if lower.contains("did not start a session")
+        || lower.contains("did not answer through the pjdesk server")
+        || lower.contains("did not respond")
+        || lower.contains("is offline, or it did not answer")
     {
-        if head.contains(&who) {
-            head.to_string()
-        } else {
-            format!("{who} is offline, or it did not answer.")
+        return format!(
+            "{who} did not answer through the PJDesk server. This phone reached the server, but that computer did not start a session."
+        );
+    }
+    if lower.contains("is offline") && head.contains(&who) {
+        return head.to_string();
+    }
+    if raw.contains("could not reach the primary") || raw.contains("could not reach the standby") {
+        if let Some(text) = public_dial_failure(&raw, &who) {
+            return text;
         }
-    } else if lower.contains("server address is empty") || lower.contains("no server address") {
-        "This phone has no server address yet. Sign in again, or set the server in Settings.".into()
-    } else if lower.contains("cannot reach the pjdesk server")
+    }
+    if lower.contains("server address is empty") || lower.contains("no server address") {
+        return "This phone has no server address yet. Sign in again, or set the server in Settings.".into();
+    }
+    if lower.contains("cannot reach the pjdesk server")
         || lower.contains("timed out connecting to the server")
         || lower.contains("tls handshake")
     {
-        format!("Could not reach the PJDesk server, so {who} could not be connected.")
-    } else {
-        head.to_string()
+        return format!("Could not reach the PJDesk server, so {who} could not be connected.");
     }
+    head.to_string()
+}
+
+/// Names the public address that failed when this phone is not on the server LAN.
+fn public_dial_failure(raw: &str, who: &str) -> Option<String> {
+    let mut public_addr = None;
+    let mut saw_line = false;
+    for line in raw.lines().skip(1) {
+        let line = line.trim();
+        let Some((addr, err)) = line.split_once(": ") else { continue };
+        saw_line = true;
+        let addr = addr.trim();
+        if pjdesk_proto::routes::endpoint_v4(addr).is_some_and(|ip| !ip.is_private()) {
+            public_addr = Some((addr.to_string(), err.trim().to_string()));
+            break;
+        }
+    }
+    if let Some((addr, err)) = public_addr {
+        let why = if err.is_empty() { "it did not answer" } else { err.as_str() };
+        return Some(format!(
+            "Could not reach the PJDesk server at {addr} ({why}). This phone is not on that server's local network, so {who} could not be connected."
+        ));
+    }
+    if saw_line {
+        return Some(format!(
+            "This phone is not on the server's local network, and no public address answered, so {who} could not be connected."
+        ));
+    }
+    Some(format!("Could not reach the PJDesk server from this phone, so {who} could not be connected."))
 }
 
 /// A reason the Windows client can show instead of a generic picture timeout.
@@ -2952,7 +3010,8 @@ async fn controller_session(
         persist(&state);
     }
     let key = state.access_key.lock().unwrap().trim().to_string();
-    let access = if !key.is_empty() { key } else { state.access_token.lock().unwrap().clone() };
+    let mut access = if !key.is_empty() { key } else { state.access_token.lock().unwrap().clone() };
+    let mut tried_refresh = false;
     if !access.is_empty() {
         let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
     }
@@ -2999,10 +3058,38 @@ async fn controller_session(
                 })?;
                 continue;
             }
+            Ok(Some(ServerMsg::Error { message, .. }))
+                if !tried_refresh && pjdesk_proto::signal::is_sign_in_required(&message) =>
+            {
+                tried_refresh = true;
+                log_line(
+                    &cb,
+                    "the server requires a signed-in account; refreshing this phone's session on this connection",
+                );
+                if let Some(fresh) = refresh_phone_access(&mut signal, &state).await {
+                    *state.access_token.lock().unwrap() = fresh.clone();
+                    persist(&state);
+                    access = fresh;
+                    let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
+                    signal.send(ClientMsg::Connect {
+                        proto: PROTOCOL_VERSION,
+                        target_id: target.into(),
+                        controller_name: label.clone(),
+                    })?;
+                    emit(&cb, &json!({"event":"accountSession","state":"valid"}));
+                    continue;
+                }
+                emit(&cb, &json!({"event":"accountSession","state":"expired"}));
+                bail!("{}", pjdesk_proto::signal::SIGN_IN_EXPIRED);
+            }
+            Ok(Some(ServerMsg::Error { message, .. })) if pjdesk_proto::signal::is_sign_in_required(&message) => {
+                emit(&cb, &json!({"event":"accountSession","state":"expired"}));
+                bail!("{}", pjdesk_proto::signal::SIGN_IN_EXPIRED);
+            }
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
             Ok(Some(_)) => continue,
             Ok(None) => bail!("the server closed the connection"),
-            Err(_) => bail!("{} is offline, or it did not answer.", format_id(target)),
+            Err(_) => bail!("the PJDesk server did not start a session"),
         }
     };
     let server_udp = SocketAddr::new(signal.server_addr.ip(), udp_port);
@@ -3020,12 +3107,20 @@ async fn controller_session(
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
             Ok(Some(_)) => continue,
             Ok(None) => bail!("the server closed the connection"),
-            Err(_) => bail!("{} is offline, or it did not answer.", format_id(target)),
+            Err(_) => bail!("the computer did not finish the relay setup"),
         }
     };
     drop(signal);
     let endpoint = p2p::controller_endpoint(binding.socket, fingerprint)?;
-    let candidates = p2p::candidates(peer_public, &peer_local);
+    let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
+    let direct = p2p::candidates(peer_public, &peer_local);
+    let candidates = p2p::candidates_from(peer_public, &peer_local, &mine);
+    if candidates.len() != direct.len() {
+        log_line(
+            &cb,
+            "This phone is not on that computer's network. Trying its public address, then the relay.",
+        );
+    }
     let mut password = if ask_now { String::new() } else { password.to_string() };
     let mut from_store = !password.is_empty();
     let mut rejected = false;
@@ -3565,7 +3660,28 @@ mod tests {
             "Could not reach Cabin Desk, even through the relay."
         );
         let offline = anyhow::anyhow!("the host did not respond");
-        assert_eq!(explain_connect_error("902488771", "", &offline), "902 488 771 is offline, or it did not answer.");
+        assert_eq!(
+            explain_connect_error("902488771", "", &offline),
+            "902 488 771 did not answer through the PJDesk server. This phone reached the server, but that computer did not start a session."
+        );
+        let expired = anyhow::anyhow!("Sign in required");
+        assert_eq!(explain_connect_error("902488771", "Cabin Desk", &expired), "Your sign-in expired");
+        let relay_setup = anyhow::anyhow!("the computer did not finish the relay setup");
+        assert_eq!(
+            explain_connect_error("902488771", "BENLENOVODESK", &relay_setup),
+            "BENLENOVODESK is on the PJDesk server, but it did not finish the relay setup."
+        );
+        let udp = anyhow::anyhow!(
+            "no UDP reply from the server at 204.248.122.44:21201. Make sure UDP port 21201 is allowed in the server's firewall"
+        );
+        assert!(explain_connect_error("902488771", "Cabin Desk", &udp).contains("no UDP reply from the server at 204.248.122.44:21201"));
+        let missed = anyhow::anyhow!(
+            "could not reach the primary or the standby; retrying. timed out\n192.168.0.20:21200: timed out\n204.248.122.44:21200: connection refused"
+        );
+        let named = explain_connect_error("902488771", "BENLENOVODESK", &missed);
+        assert!(named.contains("204.248.122.44:21200"), "{named}");
+        assert!(named.contains("not on that server's local network"), "{named}");
+        assert!(named.contains("BENLENOVODESK"), "{named}");
         let locked = anyhow::anyhow!("locked out, try again in 20 minutes");
         assert_eq!(explain_connect_error("902488771", "Cabin Desk", &locked), "locked out, try again in 20 minutes");
         let empty = anyhow::anyhow!("the server address is empty");

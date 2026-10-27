@@ -93,6 +93,8 @@ data class DeskState(
     val selfVersion: String = "",
     /** This phone can be controlled and cannot connect to other computers. */
     val incomingOnly: Boolean = false,
+    /** "valid", "expired", or blank when the account session has not been checked. */
+    val accountSession: String = "",
 )
 
 data class SavedComputer(

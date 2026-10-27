@@ -57,6 +57,7 @@ fun SignInScreen(
     onTemporary: (Boolean) -> Unit = {},
     onEnrollOnly: () -> Unit = {},
     signInPaused: Boolean = false,
+    onClose: (() -> Unit)? = null,
 ) {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -71,6 +72,9 @@ fun SignInScreen(
                 onCancel = onDismissImport,
                 fromPaste = true,
             )
+        }
+        if (onClose != null) {
+            TextButton(onClick = onClose) { Text("Back") }
         }
         Text("Sign in to your network", style = MaterialTheme.typography.headlineMedium)
         Text(

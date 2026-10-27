@@ -224,6 +224,23 @@ class Engine(context: Context) : EngineListener {
         command(body.toString())
     }
 
+    /** Gives the engine the keystore refresh before a cloud refresh finishes. Does not clear a saved access token. */
+    fun stageAccount(refresh: String, device: String) {
+        if (refresh.isBlank() && device.isBlank()) return
+        val body = JSONObject().put("cmd", "accessToken").put("token", "")
+        if (refresh.isNotBlank()) body.put("refresh", refresh)
+        if (device.isNotBlank()) body.put("device", device)
+        command(body.toString())
+    }
+
+    fun noteAccountSession(state: String) {
+        val cleaned = when (state) {
+            "valid", "expired" -> state
+            else -> ""
+        }
+        update { it.copy(accountSession = cleaned) }
+    }
+
     fun command(json: String) {
         val h = handle.get()
         if (h == 0L) {
@@ -693,6 +710,7 @@ class Engine(context: Context) : EngineListener {
                 val id = event.optString("id")
                 if (id.isNotBlank()) store.saveComputerPassword(id, "")
             }
+            "accountSession" -> noteAccountSession(event.optString("state"))
             "error" -> {
                 val text = event.optString("text").trim()
                 when (text) {
