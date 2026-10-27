@@ -87,6 +87,10 @@ struct State {
     /// OS and the Android profile name, filled by the app before registration.
     facts: Mutex<HostFacts>,
     secret: [u8; 32],
+    /// Random key stored in pjdesk.json. Separate from the Android id secret.
+    install_key: [u8; 32],
+    /// Set when a server closed RegisterInstall before answering.
+    legacy_register: AtomicBool,
     identity: TlsIdentity,
     device_id: Mutex<Option<String>>,
     server: Mutex<String>,
@@ -193,6 +197,9 @@ struct Disk {
     /// Used only when the device has no Android id to derive a secret from.
     #[serde(default)]
     secret_hex: String,
+    /// Random per-install key. Empty in a file written before 0.6.47.
+    #[serde(default)]
+    install_key_hex: String,
     #[serde(default)]
     access_token: String,
     #[serde(default)]
@@ -253,8 +260,21 @@ impl Engine {
         };
         let identity = TlsIdentity::load_or_create(&dir.join("host.crt"), &dir.join("host.key"), "pjdesk-host")?;
         let mut stored = disk;
+        let mut dirty = false;
         if android_id.trim().is_empty() && stored.secret_hex.is_empty() {
             stored.secret_hex = hex::encode(secret);
+            dirty = true;
+        }
+        let install_key = match decode_install_key(&stored.install_key_hex) {
+            Some(key) => key,
+            None => {
+                let key = pjdesk_proto::random_bytes::<32>();
+                stored.install_key_hex = hex::encode(key);
+                dirty = true;
+                key
+            }
+        };
+        if dirty {
             save_disk(&dir, &stored);
         }
         let routes = stored_routes(&stored);
@@ -263,6 +283,8 @@ impl Engine {
             hostname: if hostname.trim().is_empty() { "Android".into() } else { hostname },
             facts: Mutex::new(HostFacts::default()),
             secret,
+            install_key,
+            legacy_register: AtomicBool::new(false),
             identity,
             device_id: Mutex::new((!stored.device_id.is_empty()).then_some(stored.device_id)),
             server: Mutex::new(server),
@@ -354,6 +376,40 @@ pub(crate) fn should_replace_frame(pending_keyframe: bool, next_keyframe: bool) 
     !pending_keyframe || next_keyframe
 }
 
+fn decode_install_key(hexed: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(hexed.trim()).ok()?;
+    let key = <[u8; 32]>::try_from(bytes).ok()?;
+    if key == [0u8; 32] { None } else { Some(key) }
+}
+
+fn reported_hostname(state: &State) -> String {
+    let reported = state.facts.lock().unwrap().hostname.clone();
+    if reported.trim().is_empty() { state.hostname.clone() } else { reported }
+}
+
+fn send_host_register(signal: &mut SignalClient, state: &State) -> Result<()> {
+    let device_id = state.device_id.lock().unwrap().clone().filter(|id| is_valid_id(id));
+    let hostname = reported_hostname(state);
+    if state.legacy_register.load(Ordering::SeqCst) {
+        signal.send(ClientMsg::Register {
+            proto: PROTOCOL_VERSION,
+            device_id,
+            device_secret: state.secret,
+            hostname,
+            app_version: APP_VERSION.into(),
+        })
+    } else {
+        signal.send(ClientMsg::RegisterInstall {
+            proto: PROTOCOL_VERSION,
+            device_id,
+            device_secret: state.secret,
+            install_key: state.install_key,
+            hostname,
+            app_version: APP_VERSION.into(),
+        })
+    }
+}
+
 fn device_secret(android_id: &str, disk: &Disk) -> [u8; 32] {
     let id = android_id.trim();
     if !id.is_empty() {
@@ -392,6 +448,7 @@ fn persist(state: &State) {
         fingerprint: state.fingerprint.lock().unwrap().clone().unwrap_or_default(),
         device_id: state.device_id.lock().unwrap().clone().unwrap_or_default(),
         secret_hex: String::new(),
+        install_key_hex: hex::encode(state.install_key),
         access_token: state.access_token.lock().unwrap().clone(),
         routes: serde_json::to_string(&*state.routes.lock().unwrap()).unwrap_or_default(),
     };
@@ -1241,21 +1298,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
     if presented {
         let _ = signal.send(ClientMsg::PresentAccess { token });
     }
-    let device_id = state.device_id.lock().unwrap().clone().filter(|id| is_valid_id(id));
-    signal.send(ClientMsg::Register {
-        proto: PROTOCOL_VERSION,
-        device_id,
-        device_secret: state.secret,
-        hostname: {
-            let reported = state.facts.lock().unwrap().hostname.clone();
-            if reported.trim().is_empty() {
-                state.hostname.clone()
-            } else {
-                reported
-            }
-        },
-        app_version: APP_VERSION.into(),
-    })?;
+    send_host_register(&mut signal, &state)?;
     let server_ip = signal.server_addr.ip();
     let mut ping = tokio::time::interval(pjdesk_proto::signal::HEARTBEAT);
     ping.tick().await;
@@ -1313,16 +1356,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                     }
                 }
                 if heartbeats == 0 {
-                    let _ = signal.send(ClientMsg::Register {
-                        proto: PROTOCOL_VERSION,
-                        device_id: state.device_id.lock().unwrap().clone().filter(|id| is_valid_id(id)),
-                        device_secret: state.secret,
-                        hostname: {
-                            let reported = state.facts.lock().unwrap().hostname.clone();
-                            if reported.trim().is_empty() { state.hostname.clone() } else { reported }
-                        },
-                        app_version: APP_VERSION.into(),
-                    });
+                    let _ = send_host_register(&mut signal, &state);
                 }
                 signal.send(ClientMsg::Ping)?;
                 awaiting_pong = true;
@@ -1338,6 +1372,10 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
             msg = signal.recv() => {
                 let Some(msg) = msg else {
                     warn!("Lost the connection to the server (phone); reconnecting");
+                    if !saw_registered && !state.legacy_register.load(Ordering::SeqCst) {
+                        state.legacy_register.store(true, Ordering::SeqCst);
+                        log_line(&cb, "this server closed the install-key registration; retrying with the legacy registration");
+                    }
                     if presented && !saw_registered && !keyed {
                         state.suppress_token.store(true, Ordering::SeqCst);
                     }
@@ -1443,16 +1481,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                                             let _ = signal.send(ClientMsg::PresentAccess { token });
                                         }
                                     }
-                                    signal.send(ClientMsg::Register {
-                                        proto: PROTOCOL_VERSION,
-                                        device_id: state.device_id.lock().unwrap().clone().filter(|id| is_valid_id(id)),
-                                        device_secret: state.secret,
-                                        hostname: {
-                                            let reported = state.facts.lock().unwrap().hostname.clone();
-                                            if reported.trim().is_empty() { state.hostname.clone() } else { reported }
-                                        },
-                                        app_version: APP_VERSION.into(),
-                                    })?;
+                                    send_host_register(&mut signal, &state)?;
                                     continue;
                                 }
                             }
@@ -3135,6 +3164,8 @@ mod tests {
             hostname: "Pixel".into(),
             facts: Mutex::new(HostFacts::default()),
             secret: [7u8; 32],
+            install_key: [9u8; 32],
+            legacy_register: AtomicBool::new(false),
             identity,
             device_id: Mutex::new(None),
             server: Mutex::new("office.example:21200".into()),

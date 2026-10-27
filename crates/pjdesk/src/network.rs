@@ -644,6 +644,9 @@ fn refresh_account(
     if pjdesk_proto::is_valid_id(&pjdesk_id) {
         body["pjdesk_id"] = serde_json::Value::String(pjdesk_id);
     }
+    // The account uses this to tell two computers apart when they used to
+    // share one ID. A worker that does not know the field ignores it.
+    body["install_key"] = serde_json::Value::String(hex::encode(crate::identity::install_key()));
     if reinstate {
         body["reinstate"] = serde_json::Value::Bool(true);
     }

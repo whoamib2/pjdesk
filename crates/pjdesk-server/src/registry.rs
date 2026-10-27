@@ -1,10 +1,12 @@
 //! Persistent device registry: which ID belongs to which device.
 //!
-//! Each host proves ownership of its ID with a 32-byte secret (since 0.3.1 it
-//! is derived from the computer itself, so the app and the background service
-//! share it). The server stores only the SHA-256 of that secret, in
-//! `devices.json` inside the data folder. The secret is the device's identity:
-//! one secret always maps to one ID, so a computer keeps a single record.
+//! Each host proves ownership of its ID with a 32-byte secret. The server
+//! stores only the SHA-256 of that secret, in `devices.json`. A Windows
+//! install derives that secret from MachineGuid, which a cloned image copies,
+//! so two computers can present one secret. `register_install` also stores the
+//! hash of a per-install key. The first install to claim an ID keeps it. A
+//! second install key is a different computer and receives a new ID. Rows are
+//! never merged across install keys.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -61,6 +63,10 @@ struct DeviceRecord {
     /// account or grace. Missing before 0.6.33. Not a secret.
     #[serde(default)]
     access_key_id: String,
+    /// SHA-256 of the per-install key, hex. Empty on a record written before
+    /// the first `RegisterInstall`. Not the key itself.
+    #[serde(default)]
+    install_sha256: String,
 }
 
 /// A computer that was removed and must not register again.
@@ -92,6 +98,9 @@ pub struct PresenceRow {
     pub last_seen: u64,
     pub signed_in: bool,
     pub app_version: String,
+    /// SHA-256 of the per-install key, hex. Empty until this computer registers
+    /// with one. Published to the account so two computers cannot share a row.
+    pub install_sha256: String,
 }
 
 /// A registered device, for the management window.
@@ -176,6 +185,57 @@ fn store_version(record: &mut DeviceRecord, app_version: &str) -> bool {
 
 fn clip(text: &str, max: usize) -> String {
     text.trim().chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Empty keys are records from before install keys existed. Those may still
+/// be one computer's leftover rows. Two different keys are two computers.
+fn installs_can_merge(a: &str, b: &str) -> bool {
+    a.is_empty() || b.is_empty() || a == b
+}
+
+fn fresh_id(data: &RegistryFile) -> String {
+    loop {
+        let candidate = generate_id();
+        if !data.devices.contains_key(&candidate) && !data.blocked.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+fn new_device(secret_sha256: String, install_sha256: String, hostname: &str, app_version: &str, now: u64) -> DeviceRecord {
+    DeviceRecord {
+        secret_sha256,
+        install_sha256,
+        hostname: hostname.to_string(),
+        app_version: app_version.to_string(),
+        first_seen: now,
+        last_seen: now,
+        group: String::new(),
+        signed_in: false,
+        os_family: String::new(),
+        os_version: String::new(),
+        console_user: String::new(),
+        display_name: String::new(),
+        last_ip: String::new(),
+        access_key_id: String::new(),
+    }
+}
+
+enum InstallPlan {
+    /// This install key already owns `id`.
+    Known { id: String, secret_is_legacy: bool },
+    /// First install key to claim a row that still has the legacy secret.
+    Bind { id: String },
+    /// Another install key already holds `kept`.
+    Split { kept: String },
+    /// No matching row. `claim` is a free ID the client asked to keep.
+    Fresh { claim: Option<String> },
+    Conflict(String),
+    Blocked(String),
 }
 
 /// True when this app version can decode [`pjdesk_proto::signal::ServerMsg::WantHostReport`].
@@ -471,23 +531,26 @@ impl Registry {
             return Err(RegisterError::Blocked(requested.unwrap_or("").to_string()));
         }
 
-        let mut owned: Vec<(String, u64)> = self
+        let mut owned: Vec<(String, u64, String)> = self
             .data
             .devices
             .iter()
             .filter(|(_, d)| d.secret_sha256 == secret_sha256)
-            .map(|(id, d)| (id.clone(), d.last_seen))
+            .map(|(id, d)| (id.clone(), d.last_seen, d.install_sha256.clone()))
             .collect();
         if !owned.is_empty() {
-            let keep = match requested.filter(|r| owned.iter().any(|(id, _)| id == r)) {
+            let keep = match requested.filter(|r| owned.iter().any(|(id, _, _)| id == r)) {
                 Some(r) => r.to_string(),
                 None => {
                     owned.sort_by(|a, b| b.1.cmp(&a.1));
                     owned[0].0.clone()
                 }
             };
-            for (id, _) in &owned {
-                if *id != keep {
+            let keep_install = owned.iter().find(|(id, _, _)| id == &keep).map(|(_, _, key)| key.clone()).unwrap_or_default();
+            for (id, _, install) in &owned {
+                // Two install keys are two computers, even when a cloned image
+                // made them share a legacy secret. Do not fold those rows together.
+                if id != &keep && installs_can_merge(&keep_install, install) {
                     self.data.devices.remove(id);
                 }
             }
@@ -516,26 +579,178 @@ impl Registry {
             },
         };
 
-        self.data.devices.insert(
-            id.clone(),
-            DeviceRecord {
-                secret_sha256,
-                hostname: hostname.to_string(),
-                app_version: app_version.to_string(),
-                first_seen: now,
-                last_seen: now,
-                group: String::new(),
-                signed_in: false,
-                os_family: String::new(),
-                os_version: String::new(),
-                console_user: String::new(),
-                display_name: String::new(),
-                last_ip: String::new(),
-                access_key_id: String::new(),
-            },
-        );
+        self.data.devices.insert(id.clone(), new_device(secret_sha256, String::new(), hostname, app_version, now));
         self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
         Ok(id)
+    }
+
+    /// The secret [`Self::key_has_room`] should count for a `RegisterInstall`.
+    /// A newcomer is counted under the install key. The first claimant of an
+    /// existing row is still counted under the legacy secret.
+    pub fn install_limit_secret(&self, requested: Option<&str>, legacy: &[u8; 32], install_key: &[u8; 32]) -> [u8; 32] {
+        let legacy_hash = sha256_hex(legacy);
+        let install_hash = sha256_hex(install_key);
+        match self.plan_install(requested, &legacy_hash, &install_hash) {
+            InstallPlan::Known { secret_is_legacy: false, .. } | InstallPlan::Split { .. } => *install_key,
+            _ => *legacy,
+        }
+    }
+
+    /// Registers one install.
+    ///
+    /// * This install key already has a row → that ID. No other row is changed.
+    /// * The requested ID has no install key yet and the legacy secret matches
+    ///   → this install is the first claimant. The ID stays. The legacy secret
+    ///   hash stays, so a classic [`Self::register`] from this computer still
+    ///   maps here.
+    /// * The requested ID already has a different install key → the first
+    ///   computer keeps the ID and its hostname. This install receives a new
+    ///   ID. The two rows are not merged.
+    /// * No ID, and the legacy secret already belongs to a different install
+    ///   key → a new ID.
+    /// * Otherwise a new computer, or a well-formed ID the server has lost.
+    ///
+    /// The `Option` is the ID the first install kept, when this one was given
+    /// a different ID.
+    pub fn register_install(
+        &mut self,
+        requested: Option<&str>,
+        legacy: &[u8; 32],
+        install_key: &[u8; 32],
+        hostname: &str,
+        app_version: &str,
+    ) -> Result<(String, Option<String>), RegisterError> {
+        if *install_key == [0u8; 32] {
+            return Err(RegisterError::Conflict(requested.unwrap_or("").to_string()));
+        }
+        let legacy_hash = sha256_hex(legacy);
+        let install_hash = sha256_hex(install_key);
+        let now = now();
+        match self.plan_install(requested, &legacy_hash, &install_hash) {
+            InstallPlan::Blocked(id) => Err(RegisterError::Blocked(id)),
+            InstallPlan::Conflict(id) => Err(RegisterError::Conflict(id)),
+            InstallPlan::Known { id, .. } | InstallPlan::Bind { id } => {
+                let binding = self.data.devices.get(&id).is_some_and(|record| record.install_sha256.is_empty());
+                if binding {
+                    self.drop_unbound_duplicates(&id, &legacy_hash);
+                }
+                if let Some(record) = self.data.devices.get_mut(&id) {
+                    record.last_seen = now;
+                    record.hostname = hostname.to_string();
+                    if record.install_sha256.is_empty() {
+                        record.install_sha256 = install_hash;
+                    }
+                    store_version(record, app_version);
+                }
+                self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
+                Ok((id, None))
+            }
+            InstallPlan::Split { kept } => {
+                let id = fresh_id(&self.data);
+                self.data.devices.insert(
+                    id.clone(),
+                    new_device(install_hash.clone(), install_hash, hostname, app_version, now),
+                );
+                self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
+                Ok((id, Some(kept)))
+            }
+            InstallPlan::Fresh { claim } => {
+                let id = claim.unwrap_or_else(|| fresh_id(&self.data));
+                self.data.devices.insert(
+                    id.clone(),
+                    new_device(legacy_hash, install_hash, hostname, app_version, now),
+                );
+                self.save().map_err(|e| RegisterError::Io(e.to_string()))?;
+                Ok((id, None))
+            }
+        }
+    }
+
+    fn plan_install(&self, requested: Option<&str>, legacy_hash: &str, install_hash: &str) -> InstallPlan {
+        if self.secret_is_blocked(install_hash) {
+            return InstallPlan::Blocked(requested.unwrap_or("").to_string());
+        }
+        if requested.is_some_and(|id| self.data.blocked.contains_key(id)) {
+            return InstallPlan::Blocked(requested.unwrap_or("").to_string());
+        }
+        if let Some((id, record)) = self.data.devices.iter().find(|(_, device)| device.install_sha256 == install_hash) {
+            return InstallPlan::Known {
+                id: id.clone(),
+                secret_is_legacy: record.secret_sha256 == legacy_hash,
+            };
+        }
+        if let Some(id) = requested.filter(|id| is_valid_id(id)) {
+            if let Some(record) = self.data.devices.get(id) {
+                if record.secret_sha256 == legacy_hash && record.install_sha256.is_empty() {
+                    if self.secret_is_blocked(legacy_hash) {
+                        return InstallPlan::Blocked(id.to_string());
+                    }
+                    return InstallPlan::Bind { id: id.to_string() };
+                }
+                if record.secret_sha256 == legacy_hash
+                    && !record.install_sha256.is_empty()
+                    && record.install_sha256 != install_hash
+                {
+                    return InstallPlan::Split { kept: id.to_string() };
+                }
+                return InstallPlan::Conflict(id.to_string());
+            }
+        }
+        let other_install = self.data.devices.iter().any(|(_, device)| {
+            device.secret_sha256 == legacy_hash && !device.install_sha256.is_empty() && device.install_sha256 != install_hash
+        });
+        if self.secret_is_blocked(legacy_hash) && !other_install {
+            return InstallPlan::Blocked(requested.unwrap_or("").to_string());
+        }
+        if let Some(id) = self.unbound_legacy_id(requested, legacy_hash) {
+            return InstallPlan::Bind { id };
+        }
+        if let Some((id, _)) = self.data.devices.iter().find(|(_, device)| {
+            device.secret_sha256 == legacy_hash && !device.install_sha256.is_empty() && device.install_sha256 != install_hash
+        }) {
+            return InstallPlan::Split { kept: id.clone() };
+        }
+        if let Some(id) = requested.filter(|id| is_valid_id(id)) {
+            return InstallPlan::Fresh { claim: Some(id.to_string()) };
+        }
+        InstallPlan::Fresh { claim: None }
+    }
+
+    /// The unbound row this legacy secret should keep. The requested ID wins
+    /// when it is one of them; otherwise the most recently seen.
+    fn unbound_legacy_id(&self, requested: Option<&str>, legacy_hash: &str) -> Option<String> {
+        let mut owned: Vec<(String, u64)> = self
+            .data
+            .devices
+            .iter()
+            .filter(|(_, device)| device.secret_sha256 == legacy_hash && device.install_sha256.is_empty())
+            .map(|(id, device)| (id.clone(), device.last_seen))
+            .collect();
+        if owned.is_empty() {
+            return None;
+        }
+        if let Some(requested) = requested.filter(|id| owned.iter().any(|(have, _)| have == id)) {
+            return Some(requested.to_string());
+        }
+        owned.sort_by(|a, b| b.1.cmp(&a.1));
+        Some(owned[0].0.clone())
+    }
+
+    /// Drops other rows that have this legacy secret and no install key.
+    /// Those are one computer's leftover IDs, not a second install.
+    fn drop_unbound_duplicates(&mut self, keep: &str, legacy_hash: &str) {
+        let stale: Vec<String> = self
+            .data
+            .devices
+            .iter()
+            .filter(|(id, device)| {
+                id.as_str() != keep && device.secret_sha256 == legacy_hash && device.install_sha256.is_empty()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.data.devices.remove(&id);
+        }
     }
 
     /// Removes the other records with the same computer name as `keep` that
@@ -638,6 +853,7 @@ impl Registry {
                 last_seen: d.last_seen,
                 signed_in: d.signed_in,
                 app_version: d.app_version.clone(),
+                install_sha256: d.install_sha256.clone(),
             })
             .collect()
     }
@@ -889,6 +1105,78 @@ mod tests {
         let reg = Registry::load(path).unwrap();
         assert!(!reg.list()[0].signed_in);
         assert!(reg.list()[0].access_key_id.is_empty());
+        assert!(reg.presence()[0].install_sha256.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_cloned_images_do_not_share_one_id() {
+        let (path, mut reg) = fresh("clone");
+        let legacy = [4u8; 32];
+        let opas = [1u8; 32];
+        let omas = [2u8; 32];
+        let shared = "588773545";
+        assert_eq!(reg.register(Some(shared), &legacy, "OPAS-DESKTOP", "0.6.46").unwrap(), shared);
+        let (kept, moved) = reg.register_install(Some(shared), &legacy, &opas, "OPAS-DESKTOP", "0.6.46").unwrap();
+        assert_eq!(kept, shared);
+        assert!(moved.is_none());
+        let (newcomer, moved) = reg.register_install(Some(shared), &legacy, &omas, "OMAS-DESKTOP", "0.6.46").unwrap();
+        assert_ne!(newcomer, shared);
+        assert_eq!(moved.as_deref(), Some(shared));
+        assert_eq!(reg.len(), 2);
+        let rows = reg.list();
+        assert_eq!(rows.iter().find(|row| row.id == shared).unwrap().hostname, "OPAS-DESKTOP");
+        assert_eq!(rows.iter().find(|row| row.id == newcomer).unwrap().hostname, "OMAS-DESKTOP");
+        // The same install key comes back to its own row and does not rename the other.
+        let (again, moved) = reg.register_install(Some(&newcomer), &legacy, &opas, "OPAS-DESKTOP", "0.6.47").unwrap();
+        assert_eq!(again, shared);
+        assert!(moved.is_none());
+        let (still, moved) = reg.register_install(Some(shared), &legacy, &omas, "OMAS-DESKTOP", "0.6.47").unwrap();
+        assert_eq!(still, newcomer);
+        assert!(moved.is_none());
+        let rows = reg.list();
+        assert_eq!(rows.iter().find(|row| row.id == shared).unwrap().hostname, "OPAS-DESKTOP");
+        assert_eq!(rows.iter().find(|row| row.id == newcomer).unwrap().hostname, "OMAS-DESKTOP");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_second_install_with_no_saved_id_still_gets_its_own_id() {
+        let (path, mut reg) = fresh("clone-noid");
+        let legacy = [4u8; 32];
+        let (first, _) = reg.register_install(None, &legacy, &[1u8; 32], "OPAS-DESKTOP", "0.6.46").unwrap();
+        let (second, moved) = reg.register_install(None, &legacy, &[2u8; 32], "OMAS-DESKTOP", "0.6.46").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(moved.as_deref(), Some(first.as_str()));
+        assert_eq!(reg.list().iter().find(|row| row.id == first).unwrap().hostname, "OPAS-DESKTOP");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_install_key_cannot_take_a_strangers_id() {
+        let (path, mut reg) = fresh("stranger");
+        let id = reg.register(None, &[9u8; 32], "OTHER", "0.6.46").unwrap();
+        let err = reg.register_install(Some(&id), &[4u8; 32], &[1u8; 32], "OPAS-DESKTOP", "0.6.46");
+        assert!(matches!(err, Err(RegisterError::Conflict(_))));
+        assert_eq!(reg.list().iter().find(|row| row.id == id).unwrap().hostname, "OTHER");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_blocked_legacy_secret_stays_blocked() {
+        let (path, mut reg) = fresh("clone-block");
+        let legacy = [4u8; 32];
+        let id = reg.register(None, &legacy, "OPAS-DESKTOP", "0.6.46").unwrap();
+        assert!(reg.block(&id).unwrap());
+        assert!(matches!(
+            reg.register_install(Some(&id), &legacy, &[1u8; 32], "OPAS-DESKTOP", "0.6.46"),
+            Err(RegisterError::Blocked(_))
+        ));
+        assert!(matches!(
+            reg.register_install(None, &legacy, &[2u8; 32], "OMAS-DESKTOP", "0.6.46"),
+            Err(RegisterError::Blocked(_))
+        ));
+        assert!(reg.list().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

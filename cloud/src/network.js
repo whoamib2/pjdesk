@@ -1027,7 +1027,7 @@ async function clearRemoved(env, networkId, id) {
   }
 }
 
-async function rememberPjdesk(env, networkId, deviceId, pjdesk, hardwareId) {
+async function rememberPjdesk(env, networkId, deviceId, pjdesk, hardwareId, installKey) {
   if (!pjdesk || !deviceId) return;
   const hardware = String(hardwareId || "").trim().slice(0, 64);
   let previous = "";
@@ -1041,7 +1041,20 @@ async function rememberPjdesk(env, networkId, deviceId, pjdesk, hardwareId) {
   } catch (err) {
     if (!missingPjdeskColumn(err)) throw err;
   }
-  if (previous && previous !== pjdesk) await dropStalePresence(env, networkId, previous);
+  if (previous && previous !== pjdesk) {
+    let drop = false;
+    try {
+      const row = await env.DB.prepare(
+        "SELECT install_key FROM network_presence WHERE network_id = ? AND pjdesk_id = ?",
+      )
+        .bind(networkId, previous)
+        .first();
+      drop = shouldDropReplacedId(row?.install_key, installKey);
+    } catch (err) {
+      if (!missingInstallColumn(err) && !missingPresence(err)) throw err;
+    }
+    if (drop) await dropStalePresence(env, networkId, previous);
+  }
   if (hardware) await dropSameHardware(env, networkId, hardware, pjdesk);
   if (hardware) {
     try {
@@ -1085,6 +1098,36 @@ async function rememberPjdesk(env, networkId, deviceId, pjdesk, hardwareId) {
 
 function missingHardwareColumn(err) {
   return /no such column/i.test(String(err?.message || err)) && /hardware_id/i.test(String(err?.message || err));
+}
+
+function missingInstallColumn(err) {
+  return /no such column/i.test(String(err?.message || err)) && /install_key/i.test(String(err?.message || err));
+}
+
+/** Drop the previous ID only when its install key is this same install.
+ * An empty key, or a different key, is another computer and stays. */
+export function shouldDropReplacedId(existingKey, incomingKey) {
+  const have = String(existingKey || "").trim().toLowerCase();
+  const next = String(incomingKey || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(have) || !/^[0-9a-f]{64}$/.test(next)) return false;
+  return have === next;
+}
+
+/** A publish may update a row when either side has no install key yet, or the keys match. */
+export function presenceAllows(existingKey, incomingKey) {
+  const have = String(existingKey || "").trim().toLowerCase();
+  const next = String(incomingKey || "").trim().toLowerCase();
+  if (!have || !next) return true;
+  return have === next;
+}
+
+export function presenceInstallGuard() {
+  return "network_presence.install_key = '' OR excluded.install_key = '' OR network_presence.install_key = excluded.install_key";
+}
+
+function cleanInstallKey(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return /^[0-9a-f]{64}$/.test(text) ? text : "";
 }
 
 /** Drops an old PJDesk id from the list without deleting this device's sign-in. */
@@ -1682,7 +1725,7 @@ async function refresh(request, env) {
   if (requireAccountsOn(row.require_accounts) && !row.active_address) throw new HttpError(401, "Sign in required.");
   const self = pjdeskId(body.pjdesk_id);
   const hardware = String(body.hardware_id || "").trim().slice(0, 64);
-  if (self) await rememberPjdesk(env, row.id, deviceId, self, hardware);
+  if (self) await rememberPjdesk(env, row.id, deviceId, self, hardware, body.install_key);
   const reportedName = String(body.hostname || "").trim().slice(0, 64);
   if (self && reportedName) await dropSameHostname(env, row.id, reportedName, self);
   if (body.reinstate === true && self) await clearRemoved(env, row.id, self);
@@ -1712,7 +1755,8 @@ async function postPresence(request, env, account) {
   const devices = Array.isArray(body.devices) ? body.devices.slice(0, 500) : [];
   const removed = new Set(await removedFor(env, found.network.id));
   const cutoff = now() - 90 * 24 * 3600;
-  const stmts = [];
+  const installStmts = [];
+  const versionStmts = [];
   const legacy = [];
   for (const raw of devices) {
     const id = String(raw.id || "").replace(/\D/g, "");
@@ -1721,6 +1765,7 @@ async function postPresence(request, env, account) {
     if (last < cutoff) continue;
     const next = applyPresence({}, raw);
     next.last_seen = last;
+    const installKey = cleanInstallKey(raw.install_key);
     const values = [
       found.network.id,
       id,
@@ -1733,34 +1778,51 @@ async function postPresence(request, env, account) {
       next.online,
       next.signed_in,
     ];
-    stmts.push(env.DB.prepare(presenceInsert(true)).bind(...values, next.app_version));
-    legacy.push(env.DB.prepare(presenceInsert(false)).bind(...values));
+    installStmts.push(env.DB.prepare(presenceInsert("install")).bind(...values, next.app_version, installKey));
+    versionStmts.push(env.DB.prepare(presenceInsert("version")).bind(...values, next.app_version));
+    legacy.push(env.DB.prepare(presenceInsert("plain")).bind(...values));
   }
-  if (!stmts.length) return json({ ok: true, count: 0 });
+  if (!installStmts.length) return json({ ok: true, count: 0 });
   try {
-    await env.DB.batch(stmts);
+    await env.DB.batch(installStmts);
   } catch (err) {
-    if (missingAppVersion(err)) {
+    if (missingInstallColumn(err) || missingAppVersion(err)) {
+      const fallback = missingAppVersion(err) ? legacy : versionStmts;
       try {
-        await env.DB.batch(legacy);
+        await env.DB.batch(fallback);
       } catch (again) {
+        if (missingAppVersion(again)) {
+          try {
+            await env.DB.batch(legacy);
+          } catch (third) {
+            if (missingDisplay(third) || missingPresence(third)) return json({ ok: false, count: 0 });
+            throw third;
+          }
+          return json({ ok: true, count: legacy.length });
+        }
         if (missingDisplay(again) || missingPresence(again)) return json({ ok: false, count: 0 });
         throw again;
       }
-      return json({ ok: true, count: legacy.length });
+      return json({ ok: true, count: fallback.length });
     }
     if (missingDisplay(err) || missingPresence(err)) return json({ ok: false, count: 0 });
     throw err;
   }
-  return json({ ok: true, count: stmts.length });
+  return json({ ok: true, count: installStmts.length });
 }
 
-function presenceInsert(withVersion) {
-  const column = withVersion ? ", app_version" : "";
-  const mark = withVersion ? ", ?" : "";
-  const keep = withVersion
+function presenceInsert(kind) {
+  const version = kind === "version" || kind === "install";
+  const install = kind === "install";
+  const column = `${version ? ", app_version" : ""}${install ? ", install_key" : ""}`;
+  const mark = `${version ? ", ?" : ""}${install ? ", ?" : ""}`;
+  const keepVersion = version
     ? ",\n           app_version = CASE WHEN excluded.app_version != '' THEN excluded.app_version ELSE network_presence.app_version END"
     : "";
+  const keepInstall = install
+    ? ",\n           install_key = CASE WHEN network_presence.install_key = '' THEN excluded.install_key ELSE network_presence.install_key END"
+    : "";
+  const where = install ? `\n         WHERE ${presenceInstallGuard()}` : "";
   return `INSERT INTO network_presence
            (network_id, pjdesk_id, hostname, os_family, os_version, console_user, display_name, last_seen, online, signed_in${column})
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?${mark})
@@ -1772,7 +1834,7 @@ function presenceInsert(withVersion) {
            display_name = excluded.display_name,
            last_seen = CASE WHEN excluded.last_seen > network_presence.last_seen THEN excluded.last_seen ELSE network_presence.last_seen END,
            online = excluded.online,
-           signed_in = excluded.signed_in${keep}`;
+           signed_in = excluded.signed_in${keepVersion}${keepInstall}${where}`;
 }
 
 async function listComputers(env, account) {

@@ -809,6 +809,94 @@ fn start_session(st: &mut State, ctrl: &ControllerSide, target: &str, controller
     info!("Session {session_id:016x}: \"{controller_name}\" ({}) → host {}", ctrl.addr.ip(), format_id(target));
 }
 
+/// Puts a registered computer online and tells it the ID it owns.
+/// `reassigned_from` is set when a second install key asked for an ID the
+/// first install already holds. The first row is left as it is.
+fn finish_registration(
+    st: &mut State,
+    conn: &mut Conn,
+    id: String,
+    hostname: &str,
+    app_version: &str,
+    admitted: &Admitted,
+    reassigned_from: Option<&str>,
+) {
+    let access_key_id = match admitted {
+        Admitted::Key(key) => key.id.clone(),
+        Admitted::Open | Admitted::Signed(_) => String::new(),
+    };
+    let host = OnlineHost {
+        conn_id: conn.id,
+        tx: conn.tx.clone(),
+        hostname: hostname.to_string(),
+        app_version: app_version.to_string(),
+        addr: conn.addr,
+        proto: conn.proto,
+        since: Instant::now(),
+        close: Arc::clone(&conn.close),
+        access_key_id: access_key_id.clone(),
+    };
+    if let Some(prev) = st.online.insert(id.clone(), host) {
+        if prev.conn_id != conn.id {
+            let held = prev.since.elapsed().as_secs();
+            if prev.addr.ip() != conn.addr.ip() {
+                warn!(
+                    "Host {} is now registered from {} (it was {}, held {held}s). The device secret is known to both.",
+                    format_id(&id),
+                    conn.addr.ip(),
+                    prev.addr.ip()
+                );
+            } else {
+                info!(
+                    "Host {} registered again from {} (another PJDesk process on this computer, previous connection held {held}s)",
+                    format_id(&id),
+                    conn.addr.ip()
+                );
+            }
+            if !prev.tx.is_closed() {
+                info!("Host {} kept the previous connection on standby", format_id(&id));
+                st.standby.entry(id.clone()).or_default().push(prev);
+            }
+        }
+    }
+    conn.host_id = Some(id.clone());
+    st.registry.note_address(&id, &conn.addr.ip().to_string());
+    let signed_in = matches!(admitted, Admitted::Signed(_));
+    st.registry.note_access_key(&id, &access_key_id);
+    st.registry.mark_signed_in(&id, signed_in);
+    if let Some(kept) = reassigned_from {
+        warn!(
+            "ID {} is already held by another install. That computer keeps it. \"{hostname}\" is now {}.",
+            format_id(kept),
+            format_id(&id)
+        );
+    }
+    conn.send(ServerMsg::Registered { device_id: id.clone() });
+    if conn.proto >= 3 {
+        conn.send(ServerMsg::Policy(st.accounts.policy()));
+    }
+    let os = st.registry.os_family(&id);
+    if crate::registry::supports_host_report_for(app_version, &os) {
+        conn.send(ServerMsg::WantHostReport);
+    }
+    crate::audit::AuditLog::open(&st.data_dir).record(
+        "register",
+        hostname,
+        &format!("{} from {}", format_id(&id), conn.addr.ip()),
+    );
+    info!("Host {} \"{hostname}\" online from {} (v{app_version}); this server is the primary", format_id(&id), conn.addr.ip());
+    if pjdesk_proto::update::version_at_least(app_version, "0.6.45") {
+        conn.send(ServerMsg::Routes(crate::cloud::advertised_routes(&st.data_dir)));
+    }
+    // Same computer name, offline leftovers only. A different install key is a
+    // different hostname here, and a different name is not removed.
+    let online: HashSet<String> = st.online.keys().cloned().collect();
+    let removed = st.registry.remove_stale_duplicates(&id, &online);
+    if removed > 0 {
+        info!("Removed {removed} old record(s) for \"{hostname}\"; it is {} now", format_id(&id));
+    }
+}
+
 fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
     // Password checks are slow (Argon2). Do them off the process-wide lock so
     // one sign-in attempt cannot stall every other connection.
@@ -874,77 +962,59 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             let hostname: String = hostname.chars().take(64).collect();
             let app_version: String = app_version.chars().take(32).collect();
             match st.registry.register(device_id.as_deref(), &device_secret, &hostname, &app_version) {
-                Ok(id) => {
-                    let access_key_id = match &admitted {
-                        Admitted::Key(key) => key.id.clone(),
-                        Admitted::Open | Admitted::Signed(_) => String::new(),
-                    };
-                    let host = OnlineHost {
-                        conn_id: conn.id,
-                        tx: conn.tx.clone(),
-                        hostname: hostname.clone(),
-                        app_version: app_version.clone(),
-                        addr: conn.addr,
-                        proto: conn.proto,
-                        since: Instant::now(),
-                        close: Arc::clone(&conn.close),
-                        access_key_id: access_key_id.clone(),
-                    };
-                    if let Some(prev) = st.online.insert(id.clone(), host) {
-                        if prev.conn_id != conn.id {
-                            let held = prev.since.elapsed().as_secs();
-                            if prev.addr.ip() != conn.addr.ip() {
-                                warn!(
-                                    "Host {} is now registered from {} (it was {}, held {held}s). The device secret is known to both.",
-                                    format_id(&id),
-                                    conn.addr.ip(),
-                                    prev.addr.ip()
-                                );
-                            } else {
-                                info!(
-                                    "Host {} registered again from {} (another PJDesk process on this computer, previous connection held {held}s)",
-                                    format_id(&id),
-                                    conn.addr.ip()
-                                );
-                            }
-                            if !prev.tx.is_closed() {
-                                info!("Host {} kept the previous connection on standby", format_id(&id));
-                                st.standby.entry(id.clone()).or_default().push(prev);
-                            }
-                        }
+                Ok(id) => finish_registration(st, conn, id, &hostname, &app_version, &admitted, None),
+                Err(e) => {
+                    warn!("{}: registration refused: {e}", conn.addr);
+                    if matches!(e, crate::registry::RegisterError::Blocked(_)) {
+                        conn.error(ErrorCode::Unauthorized, "This computer is blocked.");
+                    } else {
+                        conn.error(ErrorCode::IdConflict, e.to_string());
                     }
-                    conn.host_id = Some(id.clone());
-                    st.registry.note_address(&id, &conn.addr.ip().to_string());
-                    let signed_in = matches!(admitted, Admitted::Signed(_));
-                    st.registry.note_access_key(&id, &access_key_id);
-                    st.registry.mark_signed_in(&id, signed_in);
-                    conn.send(ServerMsg::Registered { device_id: id.clone() });
-                    if conn.proto >= 3 {
-                        conn.send(ServerMsg::Policy(st.accounts.policy()));
-                    }
-                    let os = st.registry.os_family(&id);
-                    if crate::registry::supports_host_report_for(&app_version, &os) {
-                        conn.send(ServerMsg::WantHostReport);
-                    }
-                    crate::audit::AuditLog::open(&st.data_dir).record(
-                        "register",
-                        &hostname,
-                        &format!("{} from {}", format_id(&id), conn.addr.ip()),
-                    );
-                    info!(
-                        "Host {} \"{hostname}\" online from {} (v{app_version}); this server is the primary",
-                        format_id(&id),
-                        conn.addr.ip()
-                    );
-                    if pjdesk_proto::update::version_at_least(&app_version, "0.6.45") {
-                        conn.send(ServerMsg::Routes(crate::cloud::advertised_routes(&st.data_dir)));
-                    }
-                    // One record per computer: drop its old, offline records.
-                    let online: HashSet<String> = st.online.keys().cloned().collect();
-                    let removed = st.registry.remove_stale_duplicates(&id, &online);
-                    if removed > 0 {
-                        info!("Removed {removed} old record(s) for \"{hostname}\"; it is {} now", format_id(&id));
-                    }
+                }
+            }
+        }
+
+        ClientMsg::RegisterInstall { proto, device_id, device_secret, install_key, hostname, app_version } => {
+            if !crate::cloud::accepts_host_registrations(&st.data_dir) {
+                info!(
+                    "Redirecting host registration from {}: this server is the standby and is not the live table",
+                    conn.addr
+                );
+                conn.error(ErrorCode::Unauthorized, crate::cloud::redirect_text(&st.data_dir));
+                return;
+            }
+            let admitted = match gate(st, conn) {
+                Ok(admitted) => admitted,
+                Err(()) => {
+                    conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
+                    return;
+                }
+            };
+            if install_key == [0u8; 32] {
+                conn.error(ErrorCode::BadRequest, "this install has no device key");
+                return;
+            }
+            let limit_secret = st.registry.install_limit_secret(device_id.as_deref(), &device_secret, &install_key);
+            if let Admitted::Key(key) = &admitted {
+                if !st.registry.key_has_room(&key.id, &limit_secret, key.computer_limit) {
+                    warn!("{}: access key {} is at its computer limit", conn.addr, key.label);
+                    conn.error(ErrorCode::Unauthorized, crate::access_keys::LIMIT_MESSAGE);
+                    return;
+                }
+            }
+            if !note_proto(conn, proto) {
+                return;
+            }
+            if !st.limiter.allow(conn.addr.ip(), "register", 20) {
+                conn.error(ErrorCode::RateLimited, "too many registrations, slow down");
+                return;
+            }
+            let hostname: String = hostname.chars().take(64).collect();
+            let app_version: String = app_version.chars().take(32).collect();
+            match st.registry.register_install(device_id.as_deref(), &device_secret, &install_key, &hostname, &app_version)
+            {
+                Ok((id, replaced)) => {
+                    finish_registration(st, conn, id, &hostname, &app_version, &admitted, replaced.as_deref())
                 }
                 Err(e) => {
                     warn!("{}: registration refused: {e}", conn.addr);
@@ -2001,6 +2071,57 @@ mod tests {
         };
         let row = state.lock().unwrap().registry.list().into_iter().find(|d| d.id == id).unwrap();
         assert!(!row.signed_in);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_install_keys_claiming_one_id_stay_two_computers() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = state_in(&dir);
+        let legacy = [4u8; 32];
+        let (mut first_conn, mut first_rx) = conn_pair();
+        handle_message(
+            &state,
+            &mut first_conn,
+            ClientMsg::RegisterInstall {
+                proto: 3,
+                device_id: Some("588773545".into()),
+                device_secret: legacy,
+                install_key: [1u8; 32],
+                hostname: "OPAS-DESKTOP".into(),
+                app_version: "0.6.46".into(),
+            },
+        );
+        let first = match first_rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => device_id,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(first, "588773545");
+        let (mut second_conn, mut second_rx) = conn_pair();
+        second_conn.id = 2;
+        second_conn.addr = "192.0.2.11:40000".parse().unwrap();
+        handle_message(
+            &state,
+            &mut second_conn,
+            ClientMsg::RegisterInstall {
+                proto: 3,
+                device_id: Some("588773545".into()),
+                device_secret: legacy,
+                install_key: [2u8; 32],
+                hostname: "OMAS-DESKTOP".into(),
+                app_version: "0.6.46".into(),
+            },
+        );
+        let second = match second_rx.try_recv().unwrap() {
+            ServerMsg::Registered { device_id } => device_id,
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(second, first);
+        let rows = state.lock().unwrap().registry.list();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().find(|row| row.id == first).unwrap().hostname, "OPAS-DESKTOP");
+        assert_eq!(rows.iter().find(|row| row.id == second).unwrap().hostname, "OMAS-DESKTOP");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

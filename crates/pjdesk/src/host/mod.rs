@@ -336,6 +336,12 @@ pub(crate) struct HostState {
     follow: Mutex<Option<String>>,
     /// Session the server asked to move.
     moving: Mutex<Option<SessionId>>,
+    /// Random key for this install. Shared with the service via ProgramData.
+    install_key: [u8; 32],
+    /// Set when a server closed `RegisterInstall` before answering. This
+    /// process then uses classic Register. A successful install registration
+    /// clears it.
+    legacy_register: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -546,6 +552,8 @@ async fn host_main(
         support_log: Mutex::new(None),
         follow: Mutex::new(None),
         moving: Mutex::new(None),
+        install_key: crate::identity::install_key(),
+        legacy_register: AtomicBool::new(false),
     });
     if args.allow_direct {
         let direct = state.clone();
@@ -684,6 +692,28 @@ fn remember_routes(config: &mut Config, routes: pjdesk_proto::routes::ServerRout
     true
 }
 
+/// Sends `RegisterInstall` unless this process already found a server that
+/// cannot decode it. The legacy secret stays in the message either way.
+fn send_registration(signal: &mut SignalClient, config: &mut Config, state: &HostState) -> Result<()> {
+    let device_secret = config.device_secret()?;
+    let device_id = config.device_id.clone();
+    let hostname = state.name.clone();
+    let app_version = env!("CARGO_PKG_VERSION").to_string();
+    let proto = state.server_proto.load(Ordering::SeqCst);
+    if state.legacy_register.load(Ordering::SeqCst) {
+        signal.send(ClientMsg::Register { proto, device_id, device_secret, hostname, app_version })
+    } else {
+        signal.send(ClientMsg::RegisterInstall {
+            proto,
+            device_id,
+            device_secret,
+            install_key: state.install_key,
+            hostname,
+            app_version,
+        })
+    }
+}
+
 /// Dials the fresh advertised IPs, then a saved hostname, and registers.
 /// A standby redirect is followed at once. A named primary that does not
 /// answer is not the only address tried.
@@ -696,7 +726,6 @@ async fn register_catalog(
     let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
     let token = config.presented_access();
     let access_key = pjdesk_proto::access::is_access_key(&token);
-    let device_secret = config.device_secret()?;
     let mut without_token = false;
     let mut redirects = 0u8;
     // Take the follow address now. A miss must not pin every later try to it.
@@ -742,16 +771,14 @@ async fn register_catalog(
         if !presented.is_empty() {
             let _ = signal.send(ClientMsg::PresentAccess { token: presented });
         }
-        signal.send(ClientMsg::Register {
-            proto: register_proto,
-            device_id: config.device_id.clone(),
-            device_secret,
-            hostname: state.name.clone(),
-            app_version: env!("CARGO_PKG_VERSION").into(),
-        })?;
+        let used_install_key = !state.legacy_register.load(Ordering::SeqCst);
+        send_registration(&mut signal, config, state)?;
         loop {
             match timeout(Duration::from_secs(10), signal.recv()).await {
                 Ok(Some(ServerMsg::Registered { device_id })) => {
+                    if used_install_key {
+                        state.legacy_register.store(false, Ordering::SeqCst);
+                    }
                     *state.follow.lock().unwrap() = None;
                     return Ok((signal, server, device_id));
                 }
@@ -790,6 +817,16 @@ async fn register_catalog(
                     bail!("the server refused registration: {message}");
                 }
                 Ok(Some(other)) => bail!("unexpected reply from the server: {other:?}"),
+                Ok(None) if used_install_key && !state.legacy_register.swap(true, Ordering::SeqCst) => {
+                    info!("registration with the install key was closed before a reply; trying the legacy registration");
+                    let addr = signal.server_addr.to_string();
+                    signal = SignalClient::connect_endpoint(&addr, config, pjdesk_proto::routes::dial_budget(&addr)).await.map_err(|err| {
+                        let why = one_line(&err);
+                        info!("registration route {addr} failed: {why}");
+                        anyhow::anyhow!("{}", pjdesk_proto::routes::registration_miss(&[(&addr, why.as_str())]))
+                    })?;
+                    break;
+                }
                 Ok(None) if !token.is_empty() && !access_key && !without_token => {
                     without_token = true;
                     signal = SignalClient::connect_catalog(config, &mine).await?;
@@ -921,15 +958,7 @@ async fn signaling_loop(
                 if heartbeats == 0 {
                     // The first ack also carries this build's version, so an
                     // in-place update is stored before the next heartbeat.
-                    if let Ok(device_secret) = config.device_secret() {
-                        let _ = signal.send(ClientMsg::Register {
-                            proto: state.server_proto.load(Ordering::SeqCst),
-                            device_id: config.device_id.clone(),
-                            device_secret,
-                            hostname: state.name.clone(),
-                            app_version: env!("CARGO_PKG_VERSION").into(),
-                        });
-                    }
+                    let _ = send_registration(&mut signal, config, state);
                 }
                 signal.send(ClientMsg::Ping)?;
                 awaiting_pong = true;

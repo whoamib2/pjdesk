@@ -174,6 +174,19 @@ pub enum ClientMsg {
         at: u64,
         proof: [u8; 32],
     },
+    /// 0.6.47+. Register this install. `device_secret` is the legacy secret
+    /// (Windows MachineGuid, or the stored random secret). `install_key` is
+    /// random and stored with this install, so two cloned images do not share
+    /// an ID. An older server cannot decode this and drops the connection;
+    /// the client registers again with [`ClientMsg::Register`].
+    RegisterInstall {
+        proto: u16,
+        device_id: Option<String>,
+        device_secret: [u8; 32],
+        install_key: [u8; 32],
+        hostname: String,
+        app_version: String,
+    },
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -593,6 +606,16 @@ mod tests {
         let moved = postcard::to_stdvec(&ClientMsg::RelayMoved { session_id: 1 }).unwrap();
         let take = postcard::to_stdvec(&ClientMsg::TakePrimary { epoch: 6, at: 1, proof: [9; 32] }).unwrap();
         assert_eq!(take[0], moved[0] + 1, "TakePrimary is appended after RelayMoved");
+        let install = postcard::to_stdvec(&ClientMsg::RegisterInstall {
+            proto: 3,
+            device_id: None,
+            device_secret: [1u8; 32],
+            install_key: [2u8; 32],
+            hostname: "PC".into(),
+            app_version: "0.6.46".into(),
+        })
+        .unwrap();
+        assert_eq!(install[0], take[0] + 1, "RegisterInstall is appended after TakePrimary");
         let move_relay = postcard::to_stdvec(&ServerMsg::MoveRelay { session_id: 1, primary: "x".into() }).unwrap();
         let handoff = postcard::to_stdvec(&ServerMsg::Handoff {
             ok: true,

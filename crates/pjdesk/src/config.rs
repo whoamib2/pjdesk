@@ -627,12 +627,14 @@ impl Config {
         writing
     }
 
-    /// The device secret, created (and saved) on first use.
+    /// The legacy device secret, created (and saved) on first use.
     ///
-    /// Prefers a machine-derived secret so the GUI and the background service
-    /// share one identity (no duplicate device registrations) and the assigned
-    /// ID survives restarts and reinstalls. Falls back to a stored random secret
-    /// only where no stable machine id is available.
+    /// Prefers a machine-derived secret so the window and the background service
+    /// share one identity. A cloned image copies that secret, so the ID itself
+    /// comes from [`crate::identity::install_key`], not from this value. Falls
+    /// back to a stored random secret only where no stable machine id is
+    /// available. Adopting the machine secret still drops an ID that belonged
+    /// to a different stored secret. Creating the install key does not.
     pub fn device_secret(&mut self) -> Result<[u8; 32]> {
         if let Some(secret) = crate::identity::machine_secret() {
             let hexed = hex::encode(secret);

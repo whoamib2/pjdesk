@@ -2359,6 +2359,7 @@ fn publish_presence(data_dir: &Path) {
             "online": live,
             "signed_in": row.signed_in,
             "app_version": app_version,
+            "install_key": row.install_sha256,
         }));
         if devices.len() >= 500 {
             break;

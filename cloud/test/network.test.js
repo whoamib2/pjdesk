@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyPresence, canonical, decide, flattenRoutes, inviteError, isPrivateAddress, joinAuthMode, mergeRoutes, normalizeFingerprint, planRegistration, presenceView, relayAccessParts, requireAccountsOn, savedShape } from "../src/network.js";
+import { applyPresence, canonical, decide, flattenRoutes, inviteError, isPrivateAddress, joinAuthMode, mergeRoutes, normalizeFingerprint, planRegistration, presenceAllows, presenceInstallGuard, presenceView, relayAccessParts, requireAccountsOn, savedShape, shouldDropReplacedId } from "../src/network.js";
 import { probeQuery, shapeHealth } from "../src/health.js";
 
 test("canonical matches the shared fixture", () => {
@@ -217,6 +217,19 @@ test("an owner server fills an empty slot and does not overwrite a different key
     activeFingerprint: "",
   });
   assert.equal(confirmedLan.status, 200);
+});
+
+test("a different install key does not take over an existing computer", () => {
+  const opas = "a".repeat(64);
+  const omas = "b".repeat(64);
+  assert.equal(presenceAllows(opas, opas), true);
+  assert.equal(presenceAllows("", omas), true);
+  assert.equal(presenceAllows(opas, ""), true);
+  assert.equal(presenceAllows(opas, omas), false);
+  assert.match(presenceInstallGuard(), /install_key = excluded.install_key/);
+  assert.equal(shouldDropReplacedId(opas, omas), false);
+  assert.equal(shouldDropReplacedId("", omas), false);
+  assert.equal(shouldDropReplacedId(opas, opas), true);
 });
 
 test("an empty host report does not erase the name or the user", () => {
