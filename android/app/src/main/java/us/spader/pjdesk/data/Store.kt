@@ -479,6 +479,11 @@ class Store(context: Context) {
         get() = prefs.getLong("appLockUpdated", 0L)
         set(value) { prefs.edit().putLong("appLockUpdated", value).commit() }
 
+    /** The PIN is on this phone and has not reached the account yet. */
+    var appLockPending: Boolean
+        get() = prefs.getBoolean("appLockPending", false)
+        set(value) { prefs.edit().putBoolean("appLockPending", value).commit() }
+
     var pinLockedUntil: Long
         get() = prefs.getLong("pinLockedUntil", 0L)
         set(value) { prefs.edit().putLong("pinLockedUntil", value).commit() }
@@ -518,6 +523,7 @@ class Store(context: Context) {
             .putInt("accountPinLen", verifier.len)
             .putString("appLockSealed", sealed)
             .putLong("appLockUpdated", updated)
+            .putBoolean("appLockPending", false)
             .putInt("pinFails", 0)
             .putLong("pinLockedUntil", 0L)
             .putInt("autoLockSeconds", idle)
@@ -541,6 +547,7 @@ class Store(context: Context) {
             .putLong("accountPinUpdated", 0L)
             .putString("appLockSealed", "")
             .putLong("appLockUpdated", 0L)
+            .putBoolean("appLockPending", false)
             .putInt("accountPinLen", 0)
             .putLong("bioForUpdated", 0L)
             .putInt("pinFails", 0)

@@ -800,6 +800,14 @@ fn admit_registration(st: &State, conn: &Conn) -> Admitted {
     }
 }
 
+/// Names this server before any registration reply. An older client cannot
+/// decode the new message, so it is sent only when the client's own version can.
+fn offer_server_version(conn: &Conn, app_version: &str) {
+    if pjdesk_proto::update::version_at_least(app_version, "0.6.52") {
+        conn.send(ServerMsg::ServerVersion { version: env!("CARGO_PKG_VERSION").to_string() });
+    }
+}
+
 fn offer_routes(st: &State, conn: &Conn, app_version: &str) {
     if pjdesk_proto::update::version_at_least(app_version, "0.6.45") {
         conn.send(ServerMsg::Routes(crate::cloud::advertised_routes(&st.data_dir)));
@@ -1085,6 +1093,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::Register { proto, device_id, device_secret, hostname, app_version } => {
+            offer_server_version(conn, &app_version);
             if !crate::cloud::accepts_host_registrations(&st.data_dir) {
                 info!(
                     "Redirecting host registration from {}: this server is the standby and is not the live table",
@@ -1127,6 +1136,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::RegisterInstall { proto, device_id, device_secret, install_key, hostname, app_version } => {
+            offer_server_version(conn, &app_version);
             if !crate::cloud::accepts_host_registrations(&st.data_dir) {
                 info!(
                     "Redirecting host registration from {}: this server is the standby and is not the live table",

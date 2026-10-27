@@ -275,10 +275,12 @@ impl SignalClient {
             match Self::connect_endpoint(target, config, budget).await {
                 Ok(signal) => {
                     info!("Server answered at {target} via {} ({})", signal.via, signal.server_addr);
+                    crate::routes_store::note_answer(config, target);
                     return Ok(signal);
                 }
                 Err(err) => {
                     info!("Dial {target} failed: {err:#}");
+                    crate::routes_store::note_timeout(config, target);
                     last = Some(err);
                 }
             }

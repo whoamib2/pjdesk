@@ -561,6 +561,10 @@ pub enum ServerMsg {
     /// again. Sent only to a client whose version can decode it. Older clients
     /// are not sent this variant.
     IncomingOnly { on: bool },
+    /// 0.6.52+. This server's version, sent before a registration reply so a
+    /// client can name the server that refused it. Sent only to a client whose
+    /// Register app_version can decode it. Older clients are not sent this variant.
+    ServerVersion { version: String },
 }
 
 /// One computer the primary can see, for the Saved list.
@@ -655,6 +659,26 @@ pub const STANDBY_REGISTRATION: &str = "This server is the standby. Connect to t
 
 pub fn is_standby_refusal(message: &str) -> bool {
     message.contains("This server is the standby")
+}
+
+/// True when a server answered and refused because Require signed-in accounts is on.
+pub fn is_sign_in_required(message: &str) -> bool {
+    message.contains(crate::access::SIGN_IN_REQUIRED)
+}
+
+/// The sentence shown when that server refused registration or an account write.
+/// `version` is empty when the server did not say which build it is running.
+pub fn sign_in_required_notice(addr: &str, version: &str) -> String {
+    let host = crate::routes::display_host(addr);
+    let host = if host.is_empty() { "this address" } else { host.as_str() };
+    let version = version.trim();
+    if version.is_empty() {
+        format!("The server at {host} requires sign-in. Update it to 0.6.52 or turn off Require signed-in accounts.")
+    } else {
+        format!(
+            "The server at {host} is running PJDesk Server {version} and requires sign-in. Update it to 0.6.52 or turn off Require signed-in accounts."
+        )
+    }
 }
 
 /// A standby tells the client where the primary is, and sends the full catalog.
@@ -910,6 +934,21 @@ mod tests {
         assert_eq!(set[0], account[0] + 1, "SetIncomingOnly is appended after Account");
         let only = postcard::to_stdvec(&ServerMsg::IncomingOnly { on: true }).unwrap();
         assert_eq!(only[0], release[0] + 1, "IncomingOnly is appended after Release");
+        let version = postcard::to_stdvec(&ServerMsg::ServerVersion { version: "0.6.52".into() }).unwrap();
+        assert_eq!(version[0], only[0] + 1, "ServerVersion is appended after IncomingOnly");
+        let named = sign_in_required_notice("192.168.0.193:21200", "0.6.48");
+        assert_eq!(
+            named,
+            "The server at 192.168.0.193 is running PJDesk Server 0.6.48 and requires sign-in. Update it to 0.6.52 or turn off Require signed-in accounts."
+        );
+        let unnamed = sign_in_required_notice("192.168.0.193:21200", "");
+        assert_eq!(
+            unnamed,
+            "The server at 192.168.0.193 requires sign-in. Update it to 0.6.52 or turn off Require signed-in accounts."
+        );
+        assert!(is_sign_in_required("Sign in required"));
+        assert!(is_sign_in_required("Sign in required."));
+        assert!(!is_sign_in_required("the server closed the connection"));
         assert_eq!(INCOMING_ONLY_REFUSAL, "Incoming only is on. This computer can't connect to others.");
         assert_eq!(reconcile_incoming_only(true, false, false), (true, true));
         assert_eq!(reconcile_incoming_only(true, false, true), (false, false));

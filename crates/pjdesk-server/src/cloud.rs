@@ -1969,6 +1969,7 @@ fn assemble_routes_now(data_dir: &Path) -> pjdesk_proto::routes::ServerRoutes {
             standby_lan: peer_lan,
             standby_public: peer_public,
             names,
+            ..Default::default()
         };
     }
     let mut primary_public = peer_public;
@@ -1986,6 +1987,7 @@ fn assemble_routes_now(data_dir: &Path) -> pjdesk_proto::routes::ServerRoutes {
         standby_lan: mine.lan,
         standby_public: mine.public,
         names,
+        ..Default::default()
     }
 }
 

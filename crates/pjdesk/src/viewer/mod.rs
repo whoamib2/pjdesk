@@ -542,7 +542,7 @@ async fn connect(
             }
             Ok(Some(ServerMsg::Routes(routes))) => {
                 if !routes.is_empty() {
-                    config.network_routes = pjdesk_proto::routes::keep_other_server(&config.network_routes, &routes);
+                    config.network_routes = pjdesk_proto::routes::adopt_advertised(&config.network_routes, &routes);
                     crate::routes_store::store(&config.network_routes);
                     let _ = config.save();
                 }

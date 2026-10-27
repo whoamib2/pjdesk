@@ -24,15 +24,35 @@ pub fn store(routes: &ServerRoutes) {
 }
 
 /// Fills empty halves from the on-disk catalog. A catalog already in memory
-/// keeps the halves it has.
+/// keeps the halves it has. A file that only remembers which address answered
+/// is still applied.
 pub fn absorb(config: &mut Config) {
     let cached = load();
-    if cached.is_empty() {
+    if cached.is_empty() && cached.preferred.trim().is_empty() && cached.misses.is_empty() && cached.server_version.is_empty()
+    {
         return;
     }
     let merged = pjdesk_proto::routes::keep_other_server(&cached, &config.network_routes);
     if merged != config.network_routes {
         config.network_routes = merged;
+    }
+}
+
+pub fn note_answer(config: &mut Config, addr: &str) {
+    pjdesk_proto::routes::note_answer(&mut config.network_routes, addr);
+    store(&config.network_routes);
+}
+
+pub fn note_timeout(config: &mut Config, addr: &str) {
+    pjdesk_proto::routes::note_timeout(&mut config.network_routes, addr);
+    store(&config.network_routes);
+}
+
+pub fn note_version(config: &mut Config, version: &str) {
+    let before = config.network_routes.server_version.clone();
+    pjdesk_proto::routes::note_server_version(&mut config.network_routes, version);
+    if config.network_routes.server_version != before {
+        store(&config.network_routes);
     }
 }
 
@@ -44,7 +64,7 @@ fn load_file(path: &Path) -> ServerRoutes {
 }
 
 fn store_file(path: &Path, routes: &ServerRoutes) {
-    if routes.is_empty() {
+    if routes.is_empty() && routes.preferred.trim().is_empty() && routes.misses.is_empty() && routes.server_version.is_empty() {
         return;
     }
     if let Some(dir) = path.parent() {
