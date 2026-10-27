@@ -696,7 +696,7 @@ fn remember_routes(config: &mut Config, routes: pjdesk_proto::routes::ServerRout
     if routes.is_empty() {
         return false;
     }
-    let merged = pjdesk_proto::routes::keep_other_server(&config.network_routes, &routes);
+    let merged = pjdesk_proto::routes::adopt_advertised(&config.network_routes, &routes);
     if merged == config.network_routes {
         return false;
     }
@@ -781,11 +781,13 @@ async fn dial_until_answer(
         match SignalClient::connect_endpoint(target, config, pjdesk_proto::routes::dial_budget(target)).await {
             Ok(got) => {
                 info!("Server answered at {target} via {} ({})", got.via, got.server_addr);
+                crate::routes_store::note_answer(config, target);
                 return Some(got);
             }
             Err(err) => {
                 let why = one_line(&err);
                 info!("registration route {target} failed: {why}");
+                crate::routes_store::note_timeout(config, target);
                 attempts.push((target.clone(), why));
             }
         }
@@ -815,6 +817,56 @@ fn send_registration(signal: &mut SignalClient, config: &mut Config, state: &Hos
     }
 }
 
+/// Asks this server to refresh the account, then returns the new access token.
+/// The password is not used and the token is not logged. An older server
+/// accepts Account before it will Register.
+async fn refresh_presented_access(signal: &mut SignalClient, config: &mut Config) -> Option<String> {
+    let refresh = config.network_refresh_token();
+    let device = config.network_device_id.clone().unwrap_or_default();
+    if refresh.is_empty() || device.trim().is_empty() {
+        return None;
+    }
+    if signal
+        .send(ClientMsg::Account {
+            op: "refresh".into(),
+            email: String::new(),
+            auth_key: String::new(),
+            refresh,
+            device_id: device,
+            device_name: String::new(),
+            vault: String::new(),
+            app_lock: String::new(),
+            computers: Vec::new(),
+            proof: String::new(),
+        })
+        .is_err()
+    {
+        return None;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match timeout(left, signal.recv()).await {
+            Ok(Some(ServerMsg::AccountResult { ok: true, access, exp, .. })) if !access.is_empty() => {
+                config.network_access = Some(crate::secure::protect(&access));
+                if exp > 0 {
+                    config.network_access_exp = exp;
+                }
+                let _ = config.save();
+                return Some(access);
+            }
+            Ok(Some(ServerMsg::ServerVersion { version })) => {
+                crate::routes_store::note_version(config, &version);
+            }
+            Ok(Some(ServerMsg::AccountResult { .. })) | Ok(Some(ServerMsg::Error { .. })) | Ok(None) | Err(_) => return None,
+            Ok(Some(_)) => {}
+        }
+    }
+}
+
 /// Dials the fresh advertised IPs, then a saved hostname, and registers.
 /// A standby redirect is followed at once. A named primary that does not
 /// answer is not the only address tried.
@@ -825,9 +877,11 @@ async fn register_catalog(
     key: &str,
 ) -> Result<(SignalClient, ServerAddr, String)> {
     let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
-    let token = config.presented_access();
+    let mut token = config.presented_access();
     let access_key = pjdesk_proto::access::is_access_key(&token);
     let mut without_token = false;
+    let mut tried_proxy = false;
+    let mut server_version = String::new();
     let mut redirects = 0u8;
     // Take the follow address now. A miss must not pin every later try to it.
     let follow = state.follow.lock().unwrap().take().filter(|addr| !addr.trim().is_empty());
@@ -885,6 +939,10 @@ async fn register_catalog(
                     *state.follow.lock().unwrap() = None;
                     return Ok((signal, server, device_id));
                 }
+                Ok(Some(ServerMsg::ServerVersion { version })) => {
+                    server_version = version.clone();
+                    crate::routes_store::note_version(config, &version);
+                }
                 Ok(Some(ServerMsg::Routes(routes))) => {
                     remember_routes(config, routes);
                 }
@@ -894,12 +952,16 @@ async fn register_catalog(
                     bail!("{message}; a new ID will be requested");
                 }
                 Ok(Some(ServerMsg::Error { message, .. }))
-                    if message.contains("Sign in required") && !token.is_empty() && !without_token =>
+                    if pjdesk_proto::signal::is_sign_in_required(&message) && !tried_proxy =>
                 {
-                    without_token = true;
-                    info!("registration was refused until this computer is signed in; trying once without the saved access");
-                    signal = SignalClient::connect_catalog(config, &mine).await?;
-                    break;
+                    tried_proxy = true;
+                    info!("registration was refused until this computer is signed in; refreshing the account on this server");
+                    if let Some(access) = refresh_presented_access(&mut signal, config).await {
+                        token = access;
+                        break;
+                    }
+                    let notice = pjdesk_proto::signal::sign_in_required_notice(&server.host, &server_version);
+                    bail!("{notice}");
                 }
                 Ok(Some(ServerMsg::Error { message, .. }))
                     if pjdesk_proto::signal::is_standby_refusal(&message) && redirects < 1 =>

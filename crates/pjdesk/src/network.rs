@@ -464,24 +464,57 @@ fn fetch_app_lock_cloud(refresh: &str, device_id: &str) -> Result<(String, u64)>
 }
 
 pub fn put_app_lock(refresh: &str, device_id: &str, lock: &str) -> Result<u64> {
-    if let Ok(pjdesk_proto::signal::ServerMsg::AccountResult { ok: true, app_lock_updated, .. }) =
-        account_rpc(pjdesk_proto::signal::ClientMsg::Account {
-            op: "lock-write".into(),
-            email: String::new(),
-            auth_key: String::new(),
-            refresh: refresh.to_string(),
-            device_id: device_id.to_string(),
-            device_name: String::new(),
-            vault: String::new(),
-            app_lock: lock.to_string(),
-            computers: Vec::new(),
-            proof: String::new(),
+    match account_rpc_meta(pjdesk_proto::signal::ClientMsg::Account {
+        op: "lock-write".into(),
+        email: String::new(),
+        auth_key: String::new(),
+        refresh: refresh.to_string(),
+        device_id: device_id.to_string(),
+        device_name: String::new(),
+        vault: String::new(),
+        app_lock: lock.to_string(),
+        computers: Vec::new(),
+        proof: String::new(),
+    }) {
+        Ok(AccountRpc { msg: pjdesk_proto::signal::ServerMsg::AccountResult { ok: true, app_lock_updated, .. }, .. }) => {
+            note_server_answered();
+            Ok(app_lock_updated.max(1))
+        }
+        Ok(AccountRpc {
+            msg: pjdesk_proto::signal::ServerMsg::AccountResult { message, .. },
+            host,
+            version,
         })
-    {
-        note_server_answered();
-        return Ok(app_lock_updated.max(1));
+        | Ok(AccountRpc {
+            msg: pjdesk_proto::signal::ServerMsg::Error { message, .. },
+            host,
+            version,
+        }) => bail!("{}", account_refusal(&host, &version, &message)),
+        Ok(_) => bail!("No PJDesk server answered."),
+        Err(err) => {
+            let text = err.to_string();
+            if pjdesk_proto::signal::is_sign_in_required(&text) {
+                bail!("{}", pjdesk_proto::signal::sign_in_required_notice("", ""));
+            }
+            if text.contains("closed the connection") || text.contains("did not answer") || text.contains("connecting") || text.contains("empty")
+            {
+                bail!("No PJDesk server answered.");
+            }
+            bail!("{text}");
+        }
     }
-    bail!("No PJDesk server answered.");
+}
+
+fn account_refusal(host: &str, version: &str, message: &str) -> String {
+    if pjdesk_proto::signal::is_sign_in_required(message) {
+        return pjdesk_proto::signal::sign_in_required_notice(host, version);
+    }
+    let message = message.trim();
+    if message.is_empty() {
+        "No PJDesk server answered.".into()
+    } else {
+        message.to_string()
+    }
 }
 
 /// Checks the account password and drops the short session that check creates.
@@ -587,6 +620,7 @@ fn session_routes(network: &NetworkBody) -> pjdesk_proto::routes::ServerRoutes {
             standby_lan: routes.standby_lan.clone(),
             standby_public: routes.standby_public.clone(),
             names: routes.names.clone(),
+            ..Default::default()
         };
         if !parsed.is_empty() {
             return parsed;
@@ -831,11 +865,22 @@ fn server_refresh(refresh: &str, device_id: &str, computers: Option<&serde_json:
     session_from_account(&reply, device_id)
 }
 
+struct AccountRpc {
+    msg: pjdesk_proto::signal::ServerMsg,
+    host: String,
+    version: String,
+}
+
 fn account_rpc(msg: pjdesk_proto::signal::ClientMsg) -> Result<pjdesk_proto::signal::ServerMsg> {
+    Ok(account_rpc_meta(msg)?.msg)
+}
+
+fn account_rpc_meta(msg: pjdesk_proto::signal::ClientMsg) -> Result<AccountRpc> {
     let mut config = crate::config::Config::load().unwrap_or_default();
     if config.effective_server().trim().is_empty() && config.network_routes.is_empty() {
         bail!("no PJDesk server is saved on this computer");
     }
+    let cached_version = config.network_routes.server_version.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -845,11 +890,27 @@ fn account_rpc(msg: pjdesk_proto::signal::ClientMsg) -> Result<pjdesk_proto::sig
         let mut signal = crate::signaling::SignalClient::connect_catalog(&mut config, &mine)
             .await
             .context("connecting to the PJDesk server")?;
+        let host = signal.server_addr.ip().to_string();
         signal.send(msg)?;
-        match tokio::time::timeout(std::time::Duration::from_secs(20), signal.recv()).await {
-            Ok(Some(reply)) => Ok(reply),
-            Ok(None) => bail!("the server closed the connection"),
-            Err(_) => bail!("the server did not answer"),
+        let mut version = cached_version;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                bail!("the server did not answer");
+            }
+            match tokio::time::timeout(left, signal.recv()).await {
+                Ok(Some(pjdesk_proto::signal::ServerMsg::ServerVersion { version: reported })) => {
+                    if !reported.trim().is_empty() {
+                        version = reported;
+                    }
+                }
+                Ok(Some(reply)) => {
+                    return Ok(AccountRpc { msg: reply, host, version });
+                }
+                Ok(None) => bail!("the server closed the connection"),
+                Err(_) => bail!("the server did not answer"),
+            }
         }
     })
 }

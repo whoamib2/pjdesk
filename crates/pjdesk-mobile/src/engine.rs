@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.51";
+pub const APP_VERSION: &str = "0.6.52";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -144,6 +144,10 @@ struct State {
     video: Mutex<Option<Arc<VideoOut>>>,
     app_stop: AtomicBool,
     access_token: Mutex<String>,
+    /// Refresh token kept in memory so an older server can be signed in before Register.
+    /// It is not written to pjdesk.json.
+    account_refresh: Mutex<String>,
+    account_device: Mutex<String>,
     /// pjdesk.com account email while this phone is signed in. Empty otherwise.
     account: Mutex<String>,
     trusted_accounts: Mutex<Vec<String>>,
@@ -337,6 +341,8 @@ impl Engine {
             video: Mutex::new(None),
             app_stop: AtomicBool::new(false),
             access_token: Mutex::new(stored.access_token.clone()),
+            account_refresh: Mutex::new(String::new()),
+            account_device: Mutex::new(String::new()),
             account: Mutex::new(String::new()),
             trusted_accounts: Mutex::new(Vec::new()),
             trusted_computers: Mutex::new(Vec::new()),
@@ -432,6 +438,47 @@ fn send_host_register(signal: &mut SignalClient, state: &State) -> Result<()> {
             hostname,
             app_version: APP_VERSION.into(),
         })
+    }
+}
+
+/// One Account refresh on the connection that refused Register. The token is not logged.
+async fn refresh_phone_access(signal: &mut SignalClient, state: &State) -> Option<String> {
+    let refresh = state.account_refresh.lock().unwrap().clone();
+    let device = state.account_device.lock().unwrap().clone();
+    if refresh.is_empty() || device.trim().is_empty() {
+        return None;
+    }
+    if signal
+        .send(ClientMsg::Account {
+            op: "refresh".into(),
+            email: String::new(),
+            auth_key: String::new(),
+            refresh,
+            device_id: device,
+            device_name: reported_hostname(state),
+            vault: String::new(),
+            app_lock: String::new(),
+            computers: Vec::new(),
+            proof: String::new(),
+        })
+        .is_err()
+    {
+        return None;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(left, signal.recv()).await {
+            Ok(Some(ServerMsg::AccountResult { ok: true, access, .. })) if !access.is_empty() => return Some(access),
+            Ok(Some(ServerMsg::ServerVersion { version })) => {
+                pjdesk_proto::routes::note_server_version(&mut state.routes.lock().unwrap(), &version);
+            }
+            Ok(Some(ServerMsg::AccountResult { .. })) | Ok(Some(ServerMsg::Error { .. })) | Ok(None) | Err(_) => return None,
+            Ok(Some(_)) => {}
+        }
     }
 }
 
@@ -630,7 +677,18 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
         }
         "accessToken" => {
             let token = cmd.get("token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            *state.access_token.lock().unwrap() = token;
+            *state.access_token.lock().unwrap() = token.clone();
+            if token.is_empty() {
+                *state.account_refresh.lock().unwrap() = String::new();
+                *state.account_device.lock().unwrap() = String::new();
+            } else {
+                if let Some(refresh) = cmd.get("refresh").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                    *state.account_refresh.lock().unwrap() = refresh.to_string();
+                }
+                if let Some(device) = cmd.get("device").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                    *state.account_device.lock().unwrap() = device.to_string();
+                }
+            }
             state.suppress_token.store(false, Ordering::SeqCst);
             persist(state);
         }
@@ -653,6 +711,12 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             let vault = cmd.get("vault").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let app_lock = cmd.get("app_lock").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let computers = fleet_from_command(cmd.get("computers"));
+            if !refresh.is_empty() {
+                *state.account_refresh.lock().unwrap() = refresh.clone();
+            }
+            if !device_id.is_empty() {
+                *state.account_device.lock().unwrap() = device_id.clone();
+            }
             let state = state.clone();
             let cb = cb.clone();
             tokio::spawn(async move {
@@ -1197,12 +1261,16 @@ async fn open_ordered(state: &State, cb: &Arc<dyn Callbacks>, pinned: Option<pjd
         match SignalClient::connect_endpoint(target, pinned, pjdesk_proto::routes::dial_budget(target)).await {
             Ok(signal) => {
                 log_line(cb, format!("signaling via {} {} (TCP 21200)", signal.via, signal.server_addr));
+                pjdesk_proto::routes::note_answer(&mut state.routes.lock().unwrap(), target);
+                persist(state);
                 return Ok(signal);
             }
             Err(err) => {
                 let why = err.to_string();
                 let why = why.lines().next().unwrap_or("failed").trim();
                 log_line(cb, format!("registration route {target} failed: {why}"));
+                pjdesk_proto::routes::note_timeout(&mut state.routes.lock().unwrap(), target);
+                persist(state);
                 attempts.push((target.clone(), why.to_string()));
             }
         }
@@ -1405,6 +1473,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
     let mut heartbeats = 0u32;
     let mut routes: HashMap<u64, mpsc::UnboundedSender<ServerMsg>> = HashMap::new();
     let mut saw_registered = false;
+    let mut tried_proxy = false;
     let mut report_host = false;
     let mut since_report = 0u32;
     let mut incoming_ready = state.incoming_ready.load(Ordering::SeqCst);
@@ -1571,14 +1640,34 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                             routes.remove(&session_id);
                         }
                     }
+                    ServerMsg::ServerVersion { version } => {
+                        pjdesk_proto::routes::note_server_version(&mut state.routes.lock().unwrap(), &version);
+                        persist(&state);
+                    }
                     ServerMsg::Routes(incoming) => {
                         if !incoming.is_empty() {
                             let previous = state.routes.lock().unwrap().clone();
-                            *state.routes.lock().unwrap() = pjdesk_proto::routes::keep_other_server(&previous, &incoming);
+                            *state.routes.lock().unwrap() = pjdesk_proto::routes::adopt_advertised(&previous, &incoming);
                             persist(&state);
                         }
                     }
                     ServerMsg::Error { message, .. } => {
+                        if !tried_proxy && pjdesk_proto::signal::is_sign_in_required(&message) {
+                            tried_proxy = true;
+                            log_line(&cb, "registration was refused until this phone is signed in; refreshing the account on this server");
+                            if let Some(access) = refresh_phone_access(&mut signal, &state).await {
+                                *state.access_token.lock().unwrap() = access.clone();
+                                let _ = signal.send(ClientMsg::PresentAccess { token: access });
+                                send_host_register(&mut signal, &state)?;
+                                continue;
+                            }
+                            let host = signal.server_addr.ip().to_string();
+                            let version = state.routes.lock().unwrap().server_version.clone();
+                            let notice = pjdesk_proto::signal::sign_in_required_notice(&host, &version);
+                            log_line(&cb, notice.clone());
+                            emit(&cb, &json!({"event":"status","text": notice}));
+                            continue;
+                        }
                         if !redirected && pjdesk_proto::signal::is_standby_refusal(&message) {
                             redirected = true;
                             if let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) {
@@ -3557,6 +3646,8 @@ mod tests {
             video: Mutex::new(None),
             app_stop: AtomicBool::new(false),
             access_token: Mutex::new(String::new()),
+            account_refresh: Mutex::new(String::new()),
+            account_device: Mutex::new(String::new()),
             account: Mutex::new(String::new()),
             trusted_accounts: Mutex::new(Vec::new()),
             trusted_computers: Mutex::new(Vec::new()),

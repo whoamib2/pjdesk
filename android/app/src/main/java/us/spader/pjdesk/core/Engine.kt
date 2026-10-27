@@ -217,6 +217,13 @@ class Engine(context: Context) : EngineListener {
         pushTrusted()
     }
 
+    fun presentAccess(token: String, refresh: String = "", device: String = "") {
+        val body = JSONObject().put("cmd", "accessToken").put("token", token)
+        if (refresh.isNotBlank()) body.put("refresh", refresh)
+        if (device.isNotBlank()) body.put("device", device)
+        command(body.toString())
+    }
+
     fun command(json: String) {
         val h = handle.get()
         if (h == 0L) {

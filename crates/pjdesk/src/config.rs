@@ -83,6 +83,9 @@ pub struct Config {
     /// Unix time until which more PIN tries wait. 0 when there is no wait.
     #[serde(default)]
     pub app_lock_until: u64,
+    /// The PIN is saved on this computer and has not reached the account yet.
+    #[serde(default)]
+    pub app_lock_pending: bool,
     /// Skip for now on Set a PIN. The blocking screen stays off.
     #[serde(default)]
     pub pin_declined: bool,
@@ -957,6 +960,7 @@ impl Config {
         self.app_lock_verifier = None;
         self.app_lock_fails = 0;
         self.app_lock_until = 0;
+        self.app_lock_pending = false;
     }
 
     pub fn note_app_lock_fail(&mut self, fails: u32, until: u64) {

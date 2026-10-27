@@ -15,6 +15,8 @@ pub(super) enum LockMsg {
     Rejected,
     Reauthed([u8; 32]),
     Stored { sealed: String, updated: u64, verifier: pjdesk_proto::applock::Verifier, key: [u8; 32] },
+    /// The PIN is on this computer. The account copy did not take it yet.
+    StoredLocal { sealed: String, verifier: pjdesk_proto::applock::Verifier, key: [u8; 32], note: String },
     Cleared { updated: u64 },
     /// The password on the Set a PIN screen signed in. The PIN is saved after this when it is complete.
     SignedIn(crate::network::Session),
@@ -24,6 +26,7 @@ pub(super) enum LockMsg {
 pub(super) struct LockRemote {
     sealed: String,
     updated: u64,
+    synced: bool,
 }
 
 impl App {
@@ -184,14 +187,16 @@ impl App {
         if refresh.is_empty() || device.is_empty() {
             return;
         }
+        let pending = if self.cfg.app_lock_pending { self.cfg.app_lock_sealed.clone() } else { String::new() };
         self.next_lock_pull = Instant::now() + Duration::from_secs(45);
         let (tx, rx) = mpsc::channel();
         self.lock_pull_rx = Some(rx);
         std::thread::Builder::new()
             .name("app-lock-pull".into())
             .spawn(move || {
+                let synced = !pending.trim().is_empty() && crate::network::put_app_lock(&refresh, &device, &pending).is_ok();
                 let result = crate::network::fetch_app_lock(&refresh, &device)
-                    .map(|(sealed, updated)| LockRemote { sealed, updated })
+                    .map(|(sealed, updated)| LockRemote { sealed, updated, synced })
                     .map_err(|e| e.to_string());
                 let _ = tx.send(result);
             })
@@ -200,6 +205,15 @@ impl App {
 
     fn apply_remote_lock(&mut self, remote: LockRemote) {
         if self.cfg.joined_by_code_or_key() {
+            return;
+        }
+        if remote.synced {
+            self.cfg.app_lock_pending = false;
+            self.save_cfg();
+        }
+        if self.cfg.app_lock_pending
+            && (remote.sealed.trim().is_empty() || remote.updated == 0 || remote.updated < self.cfg.app_lock_updated)
+        {
             return;
         }
         if remote.updated < self.cfg.app_lock_updated {
@@ -325,6 +339,7 @@ impl App {
                 let email = self.account_email();
                 self.pin_idle_minutes = (verifier.idle_sec / 60).clamp(1, 24 * 60) as u32;
                 self.cfg.write_app_lock(&email, &sealed, updated, Some(&verifier));
+                self.cfg.app_lock_pending = false;
                 self.cfg.clear_app_lock_fails();
                 self.save_cfg();
                 self.publish_shared();
@@ -336,6 +351,28 @@ impl App {
                 self.pin_note = "PIN saved. This window will ask for it.".into();
                 self.next_lock_pull = Instant::now() + Duration::from_secs(45);
                 tracing::info!("Saved the account PIN");
+            }
+            LockMsg::StoredLocal { sealed, verifier, key, note } => {
+                crate::vault::set_session_key(key);
+                if self.temp.is_none() {
+                    self.cfg.password_vault_key = Some(crate::secure::protect(&hex::encode(key)));
+                }
+                let email = self.account_email();
+                self.pin_idle_minutes = (verifier.idle_sec / 60).clamp(1, 24 * 60) as u32;
+                self.cfg.write_app_lock(&email, &sealed, verifier.updated.max(1), Some(&verifier));
+                self.cfg.app_lock_pending = true;
+                self.cfg.clear_app_lock_fails();
+                self.save_cfg();
+                self.publish_shared();
+                self.clear_pin_form();
+                self.lock_resetting = false;
+                self.lock_ui = false;
+                self.lock_armed = true;
+                self.last_input = Instant::now();
+                self.pin_note = note.clone();
+                self.toast.show(note);
+                self.next_lock_pull = Instant::now() + Duration::from_secs(45);
+                tracing::info!("Saved the PIN on this computer. The account copy will catch up later.");
             }
             LockMsg::Cleared { updated } => {
                 self.cfg.clear_app_lock();
@@ -1064,10 +1101,6 @@ impl App {
         let idle = u64::from(self.pin_idle_minutes.max(1)) * 60;
         let refresh = self.cfg.network_refresh_token();
         let device = self.cfg.network_device_id.clone().unwrap_or_default();
-        if refresh.is_empty() || device.is_empty() {
-            self.pin_note = "Sign in again, then set the PIN.".into();
-            return;
-        }
         self.spawn_save(SaveJob {
             email,
             current,
@@ -1106,11 +1139,6 @@ impl App {
         }
         let refresh = self.cfg.network_refresh_token();
         let device = self.cfg.network_device_id.clone().unwrap_or_default();
-        if refresh.is_empty() || device.is_empty() {
-            self.pin_idle_minutes = (have.idle_sec / 60).clamp(1, 24 * 60) as u32;
-            self.pin_note = "Sign in again, then choose the time.".into();
-            return;
-        }
         self.spawn_save(SaveJob {
             email,
             current: String::new(),
@@ -1253,7 +1281,7 @@ fn save_lock(job: SaveJob) -> LockMsg {
         return LockMsg::Failed("Enter your account password.".into());
     };
     if job.idle_only {
-        let Some(mut verifier) = job.have else {
+        let Some(mut verifier) = job.have.clone() else {
             return LockMsg::Failed("No PIN is set.".into());
         };
         verifier.idle_sec = pjdesk_proto::applock::clamp_idle(job.idle);
@@ -1262,10 +1290,7 @@ fn save_lock(job: SaveJob) -> LockMsg {
             Ok(s) => s,
             Err(err) => return LockMsg::Failed(err),
         };
-        return match crate::network::put_app_lock(&job.refresh, &job.device, &sealed) {
-            Ok(updated) => LockMsg::Stored { sealed, updated, verifier, key },
-            Err(err) => LockMsg::Failed(err.to_string()),
-        };
+        return finish_lock_upload(&job, sealed, verifier, key);
     }
     if job.remove {
         return match crate::network::put_app_lock(&job.refresh, &job.device, "") {
@@ -1281,9 +1306,25 @@ fn save_lock(job: SaveJob) -> LockMsg {
         Ok(s) => s,
         Err(err) => return LockMsg::Failed(err),
     };
+    finish_lock_upload(&job, sealed, verifier, key)
+}
+
+fn finish_lock_upload(job: &SaveJob, sealed: String, verifier: pjdesk_proto::applock::Verifier, key: [u8; 32]) -> LockMsg {
+    if job.refresh.is_empty() || job.device.is_empty() {
+        return LockMsg::StoredLocal { sealed, verifier, key, note: local_pin_note("") };
+    }
     match crate::network::put_app_lock(&job.refresh, &job.device, &sealed) {
         Ok(updated) => LockMsg::Stored { sealed, updated, verifier, key },
-        Err(err) => LockMsg::Failed(err.to_string()),
+        Err(err) => LockMsg::StoredLocal { sealed, verifier, key, note: local_pin_note(&err.to_string()) },
+    }
+}
+
+fn local_pin_note(err: &str) -> String {
+    let saved = "PIN saved on this computer. It will sync to the account when the server answers.";
+    if pjdesk_proto::signal::is_sign_in_required(err) || err.contains("requires sign-in") {
+        format!("{err}\n{saved}")
+    } else {
+        saved.to_string()
     }
 }
 

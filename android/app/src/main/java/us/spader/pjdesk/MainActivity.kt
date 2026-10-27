@@ -536,7 +536,7 @@ class MainActivity : FragmentActivity() {
                     saved = app.store.saved()
                     if (session.access.isNotBlank()) {
                         cloudAccess = session.access
-                        engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
+                        engine.presentAccess(session.access, session.refresh, session.deviceId)
                     }
                     rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
                     syncPasswords(false)
@@ -640,7 +640,7 @@ class MainActivity : FragmentActivity() {
                         enrolledFor = if (pjdeskId.length == 9) pjdeskId else ""
                         rememberAccountServer(enrolled.address, enrolled.fingerprint, enrolled.lan, enrolled.publicIp, enrolled.standbyAddress, enrolled.routes, enrolled.standbyLan, enrolled.standbyPublicIp)
                         cloudAccess = enrolled.access
-                        engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", enrolled.access).toString())
+                        engine.presentAccess(enrolled.access, enrolled.refresh, enrolled.deviceId)
                         account = who
                         signingIn = false
                         saved = app.store.saved()
@@ -796,7 +796,7 @@ class MainActivity : FragmentActivity() {
                         } ?: return@launch
                         if (session.access.isNotBlank()) {
                             cloudAccess = session.access
-                            engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
+                            engine.presentAccess(session.access, session.refresh, session.deviceId)
                         }
                         rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
                         if (app.store.syncsSavedComputers() && !state.incomingOnly) {
@@ -871,7 +871,7 @@ class MainActivity : FragmentActivity() {
                             }
                             rememberAccountServer(fetched.address, fetched.fingerprint, fetched.lan, fetched.publicIp, fetched.standbyAddress, fetched.routes, fetched.standbyLan, fetched.standbyPublicIp)
                             cloudAccess = fetched.access
-                            engine.command(JSONObject().put("cmd", "accessToken").put("token", fetched.access).toString())
+                            engine.presentAccess(fetched.access, fetched.refresh, fetched.deviceId)
                             beginConnect(rawId, ignoreOffline)
                         }
                         return
@@ -1076,7 +1076,7 @@ class MainActivity : FragmentActivity() {
                     return@LaunchedEffect
                 }
                 cloudAccess = session.access
-                engine.command(JSONObject().put("cmd", "accessToken").put("token", session.access).toString())
+                engine.presentAccess(session.access, session.refresh, session.deviceId)
                 if (!temporarySession) {
                     rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
                     if (app.store.syncsSavedComputers()) {
@@ -1493,7 +1493,7 @@ class MainActivity : FragmentActivity() {
                             if (signed.refresh.isNotBlank()) app.store.saveNetworkRefresh(signed.refresh)
                             rememberAccountServer(signed.address, signed.fingerprint, signed.lan, signed.publicIp, signed.standbyAddress, signed.routes, signed.standbyLan, signed.standbyPublicIp)
                             cloudAccess = signed.access
-                            engine.command(JSONObject().put("cmd", "accessToken").put("token", signed.access).toString())
+                            engine.presentAccess(signed.access, signed.refresh, signed.deviceId)
                             commitAutofill()
                         }
                         val salt = PinWrap.newSalt()
@@ -1584,9 +1584,18 @@ class MainActivity : FragmentActivity() {
                 if (refresh.isBlank() || device.isBlank()) return
                 scope.launch {
                     val remote = withContext(Dispatchers.IO) {
+                        if (app.store.appLockPending && app.store.appLockSealed.isNotBlank()) {
+                            runCatching { CloudAuth.putAppLock(refresh, device, app.store.appLockSealed) }.getOrNull()?.let { uploaded ->
+                                app.store.appLockPending = false
+                                app.store.appLockUpdated = uploaded
+                            }
+                        }
                         runCatching { CloudAuth.fetchAppLock(refresh, device) }
                     }.getOrNull() ?: return@launch
                     val (lock, updated) = remote
+                    if (app.store.appLockPending && (lock.isBlank() || updated == 0L || updated < app.store.appLockUpdated)) {
+                        return@launch
+                    }
                     if (updated < app.store.appLockUpdated) return@launch
                     if (updated == app.store.appLockUpdated && lock == app.store.appLockSealed) return@launch
                     if (lock.isBlank()) {
@@ -1686,20 +1695,38 @@ class MainActivity : FragmentActivity() {
                             val sealed = AccountPin.seal(key, verifier)
                             val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                             val device = app.store.networkDeviceId
-                            if (refresh.isBlank() || device.isBlank()) error("Sign in again, then set the PIN.")
-                            val updated = CloudAuth.putAppLock(refresh, device, sealed)
-                            Triple(key, verifier, sealed to updated)
+                            val stored = if (refresh.isBlank() || device.isBlank()) {
+                                null to "PIN saved on this phone. It will sync to the account when the server answers."
+                            } else {
+                                runCatching { CloudAuth.putAppLock(refresh, device, sealed) }.fold(
+                                    onSuccess = { it to "" },
+                                    onFailure = { err ->
+                                        val why = err.message.orEmpty()
+                                        val saved = "PIN saved on this phone. It will sync to the account when the server answers."
+                                        val note = if (why.contains("Sign in required") || why.contains("requires sign-in")) {
+                                            "$why\n$saved"
+                                        } else {
+                                            saved
+                                        }
+                                        null to note
+                                    },
+                                )
+                            }
+                            Triple(key, verifier, sealed to stored)
                         }
                     }
                     lockBusy = false
                     result.onSuccess { (key, verifier, stored) ->
-                        val (sealed, updated) = stored
-                        app.store.saveAccountPin(email, verifier, sealed, updated)
+                        val (sealed, outcome) = stored
+                        val (updated, note) = outcome
+                        val whenSaved = updated ?: (System.currentTimeMillis() / 1000)
+                        app.store.saveAccountPin(email, verifier, sealed, whenSaved)
+                        app.store.appLockPending = updated == null
                         val salt = PinWrap.newSalt()
                         app.store.savePinSalt(salt)
                         app.store.pinWrap = PinWrap.wrap(key, newPin, salt)
                         app.holdVaultKey(key)
-                        pinFormError = ""
+                        pinFormError = note
                         if (enableBio && BioVault.available(this@MainActivity)) {
                             app.bioPrompt = true
                             BioVault.sealWithAuth(
@@ -1709,7 +1736,7 @@ class MainActivity : FragmentActivity() {
                                     app.bioPrompt = false
                                     app.store.bioWrap = wrap
                                     app.store.biometricsOn = true
-                                    app.store.bioForUpdated = updated
+                                    app.store.bioForUpdated = whenSaved
                                 },
                                 onCancel = { app.bioPrompt = false },
                                 onError = {
@@ -2376,8 +2403,10 @@ class MainActivity : FragmentActivity() {
                                                         app.store.accountPinLen,
                                                     )
                                                     val sealed = AccountPin.seal(key, verifier)
-                                                    val updated = CloudAuth.putAppLock(refresh, device, sealed)
-                                                    app.store.saveAccountPin(email, verifier, sealed, updated)
+                                                    val updated = runCatching { CloudAuth.putAppLock(refresh, device, sealed) }.getOrNull()
+                                                    val whenSaved = updated ?: (System.currentTimeMillis() / 1000)
+                                                    app.store.saveAccountPin(email, verifier, sealed, whenSaved)
+                                                    app.store.appLockPending = updated == null
                                                 }
                                             }
                                         }

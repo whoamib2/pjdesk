@@ -29,6 +29,23 @@ pub struct ServerRoutes {
     pub standby_public: Vec<String>,
     #[serde(default)]
     pub names: Vec<String>,
+    /// Address that answered most recently. The next dial tries it first.
+    #[serde(default)]
+    pub preferred: String,
+    /// Consecutive dial timeouts. Two demotes an address. Four drops it.
+    #[serde(default)]
+    pub misses: Vec<RouteMiss>,
+    /// Version the answering server reported. Empty when it did not say.
+    #[serde(default)]
+    pub server_version: String,
+}
+
+/// How many times one address failed to answer, in a row.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteMiss {
+    pub addr: String,
+    #[serde(default)]
+    pub count: u32,
 }
 
 impl ServerRoutes {
@@ -164,7 +181,7 @@ pub fn dial_targets(routes: &ServerRoutes, mine: &[Ipv4Addr], saved: &str) -> Ve
     if !is_ip_endpoint(saved) && !order.iter().any(|have| same_endpoint(have, saved)) {
         push_unique(&mut order, canonical(saved));
     }
-    order
+    apply_route_health(order, routes)
 }
 
 /// The banner, then one `address: error` line for every dial that failed.
@@ -244,6 +261,7 @@ pub fn routes_with_legacy(
         return routes.clone();
     }
     let mut legacy = ServerRoutes::from_legacy(primary, primary_lan, primary_public_ip, standby, standby_lan, standby_public_ip);
+    carry_health(&mut legacy, routes);
     if !legacy.has_advertised_ip() {
         return if routes.is_empty() { legacy } else { routes.clone() };
     }
@@ -267,15 +285,8 @@ pub fn keep_other_server(previous: &ServerRoutes, incoming: &ServerRoutes) -> Se
         return previous.clone();
     }
     let mut next = incoming.clone();
-    let previous_addrs: Vec<String> = previous
-        .primary_lan
-        .iter()
-        .chain(previous.primary_public.iter())
-        .chain(previous.standby_lan.iter())
-        .chain(previous.standby_public.iter())
-        .chain(previous.names.iter())
-        .cloned()
-        .collect();
+    carry_health(&mut next, previous);
+    let previous_addrs = listed_addrs(previous);
     let fill_primary = next.primary_lan.is_empty() && next.primary_public.is_empty();
     let fill_standby = next.standby_lan.is_empty() && next.standby_public.is_empty();
     if !fill_primary && !fill_standby {
@@ -293,6 +304,140 @@ pub fn keep_other_server(previous: &ServerRoutes, incoming: &ServerRoutes) -> Se
         classify_kept(&addr, lan, public, &mut next.names);
     }
     next
+}
+
+/// Replaces the cached catalog with what the answering server just advertised.
+///
+/// An address the advertisement leaves out is not kept once that half is
+/// filled. A half the advertisement left empty still keeps a previous address,
+/// unless that address has already timed out twice.
+pub fn adopt_advertised(previous: &ServerRoutes, incoming: &ServerRoutes) -> ServerRoutes {
+    if incoming.is_empty() {
+        return previous.clone();
+    }
+    let mut next = incoming.clone();
+    carry_health(&mut next, previous);
+    let fill_primary = next.primary_lan.is_empty() && next.primary_public.is_empty();
+    let fill_standby = next.standby_lan.is_empty() && next.standby_public.is_empty();
+    if fill_primary || fill_standby {
+        for addr in listed_addrs(previous) {
+            if listed(&next, &addr) || miss_count(previous, &addr) >= 2 {
+                continue;
+            }
+            let (lan, public) = if fill_primary {
+                (&mut next.primary_lan, &mut next.primary_public)
+            } else {
+                (&mut next.standby_lan, &mut next.standby_public)
+            };
+            classify_kept(&addr, lan, public, &mut next.names);
+        }
+    }
+    let preferred = next.preferred.clone();
+    let kept: Vec<RouteMiss> = next
+        .misses
+        .iter()
+        .filter(|row| listed(&next, &row.addr) || same_endpoint(&row.addr, &preferred))
+        .cloned()
+        .collect();
+    next.misses = kept;
+    next
+}
+
+/// The address that answered moves to the front. Two timeouts in a row move
+/// an address to the end. Four drop it, unless that would leave nothing to dial.
+pub fn apply_route_health(order: Vec<String>, routes: &ServerRoutes) -> Vec<String> {
+    if routes.preferred.trim().is_empty() && routes.misses.is_empty() {
+        return order;
+    }
+    let mut kept = Vec::new();
+    let mut demoted = Vec::new();
+    let mut dropped = Vec::new();
+    for addr in order {
+        match miss_count(routes, &addr) {
+            count if count >= 4 => dropped.push(addr),
+            count if count >= 2 => push_unique(&mut demoted, addr),
+            _ => push_unique(&mut kept, addr),
+        }
+    }
+    if kept.is_empty() && demoted.is_empty() {
+        kept = dropped;
+    }
+    kept.extend(demoted);
+    let preferred = canonical(&routes.preferred);
+    if !preferred.is_empty() && miss_count(routes, &preferred) == 0 {
+        if let Some(pos) = kept.iter().position(|addr| same_endpoint(addr, &preferred)) {
+            let item = kept.remove(pos);
+            kept.insert(0, item);
+        } else {
+            kept.insert(0, preferred);
+        }
+    }
+    kept
+}
+
+pub fn miss_count(routes: &ServerRoutes, addr: &str) -> u32 {
+    routes.misses.iter().find(|row| same_endpoint(&row.addr, addr)).map(|row| row.count).unwrap_or(0)
+}
+
+/// This address answered. Later dials try it first, and its timeout count is cleared.
+pub fn note_answer(routes: &mut ServerRoutes, addr: &str) {
+    let addr = canonical(addr);
+    if addr.is_empty() {
+        return;
+    }
+    routes.preferred = addr.clone();
+    routes.misses.retain(|row| !same_endpoint(&row.addr, &addr));
+}
+
+/// This address did not answer. The count is consecutive.
+pub fn note_timeout(routes: &mut ServerRoutes, addr: &str) {
+    let addr = canonical(addr);
+    if addr.is_empty() {
+        return;
+    }
+    if let Some(row) = routes.misses.iter_mut().find(|row| same_endpoint(&row.addr, &addr)) {
+        row.count = row.count.saturating_add(1);
+        row.addr = addr;
+        return;
+    }
+    routes.misses.push(RouteMiss { addr, count: 1 });
+}
+
+pub fn note_server_version(routes: &mut ServerRoutes, version: &str) {
+    let version = version.trim();
+    if version.is_empty() {
+        return;
+    }
+    routes.server_version = version.to_string();
+}
+
+/// Host without the port, for a sentence a person reads.
+pub fn display_host(text: &str) -> String {
+    host_of(text).unwrap_or("").to_string()
+}
+
+fn carry_health(next: &mut ServerRoutes, previous: &ServerRoutes) {
+    if next.preferred.trim().is_empty() {
+        next.preferred = previous.preferred.clone();
+    }
+    if next.misses.is_empty() {
+        next.misses = previous.misses.clone();
+    }
+    if next.server_version.is_empty() {
+        next.server_version = previous.server_version.clone();
+    }
+}
+
+fn listed_addrs(routes: &ServerRoutes) -> Vec<String> {
+    routes
+        .primary_lan
+        .iter()
+        .chain(routes.primary_public.iter())
+        .chain(routes.standby_lan.iter())
+        .chain(routes.standby_public.iter())
+        .chain(routes.names.iter())
+        .cloned()
+        .collect()
 }
 
 /// Both servers published the same public IP. That address cannot reach both sites.
@@ -577,6 +722,7 @@ mod tests {
             standby_lan: vec!["192.168.0.50:21200".into(), "10.1.1.8:21200".into()],
             standby_public: vec!["198.51.100.8:21200".into()],
             names: vec!["pjdesk.spader.us:21200".into()],
+            ..ServerRoutes::default()
         }
     }
 
@@ -805,5 +951,60 @@ mod tests {
         assert!(probe_line("198.51.100.8:21200", true, true, false).is_empty());
         assert!(probe_line("198.51.100.8:21200", false, true, false).contains("pjdesk.com"));
         assert!(probe_line("198.51.100.8:21200", false, false, true).contains("loop"));
+    }
+
+    #[test]
+    fn an_address_that_answered_is_dialed_first_and_repeated_timeouts_are_dropped() {
+        let mut routes = sample();
+        note_answer(&mut routes, "pjdesk.spader.us:21200");
+        note_timeout(&mut routes, "192.168.0.231:21200");
+        note_timeout(&mut routes, "204.248.122.44:21200");
+        note_timeout(&mut routes, "204.248.122.44:21200");
+        note_timeout(&mut routes, "68.234.75.68:21200");
+        note_timeout(&mut routes, "68.234.75.68:21200");
+        note_timeout(&mut routes, "68.234.75.68:21200");
+        note_timeout(&mut routes, "68.234.75.68:21200");
+        routes.primary_lan.insert(0, "192.168.0.231:21200".into());
+        routes.primary_public.push("68.234.75.68:21200".into());
+        let house = [v4(192, 168, 0, 10)];
+        let order = dial_targets(&routes, &house, "pjdesk.spader.us:21200");
+        assert_eq!(order[0], "pjdesk.spader.us:21200");
+        assert!(!order.iter().any(|addr| addr.starts_with("68.234.75.68")), "{order:?}");
+        let stale = order.iter().position(|addr| addr.starts_with("204.248.122.44")).unwrap();
+        assert!(stale > 1, "{order:?}");
+        assert_eq!(miss_count(&routes, "pjdesk.spader.us:21200"), 0);
+    }
+
+    #[test]
+    fn an_advertisement_drops_an_address_that_already_timed_out_twice() {
+        let mut previous = sample();
+        note_timeout(&mut previous, "192.168.0.231:21200");
+        note_timeout(&mut previous, "192.168.0.231:21200");
+        previous.primary_lan.insert(0, "192.168.0.231:21200".into());
+        let incoming = ServerRoutes {
+            primary_lan: vec!["192.168.0.193:21200".into()],
+            primary_public: vec!["204.248.122.44:21200".into()],
+            standby_lan: vec!["10.1.1.8:21200".into()],
+            standby_public: vec!["198.51.100.8:21200".into()],
+            names: vec!["pjdesk.spader.us:21200".into()],
+            ..ServerRoutes::default()
+        };
+        let adopted = adopt_advertised(&previous, &incoming);
+        assert!(!adopted.primary_lan.iter().any(|addr| addr.starts_with("192.168.0.231")));
+        assert!(adopted.primary_lan.iter().any(|addr| addr.starts_with("192.168.0.193")));
+        let mut quiet = sample();
+        note_timeout(&mut quiet, "10.9.9.9:21200");
+        quiet.standby_lan.push("10.9.9.9:21200".into());
+        let half = ServerRoutes {
+            primary_lan: vec!["192.168.0.193:21200".into()],
+            primary_public: vec!["204.248.122.44:21200".into()],
+            names: vec!["pjdesk.spader.us:21200".into()],
+            ..ServerRoutes::default()
+        };
+        let kept = adopt_advertised(&quiet, &half);
+        assert!(kept.standby_lan.iter().any(|addr| addr.starts_with("10.9.9.9")));
+        note_timeout(&mut quiet, "10.9.9.9:21200");
+        let dropped = adopt_advertised(&quiet, &half);
+        assert!(!dropped.standby_lan.iter().any(|addr| addr.starts_with("10.9.9.9")));
     }
 }
