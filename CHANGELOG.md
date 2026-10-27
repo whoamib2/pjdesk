@@ -6,6 +6,7 @@ Windows is 0.6.53. Android is 0.6.53 (versionCode 63122). The installer reads th
 
 * Choosing a new PIN and then opening the lock screen checks the PIN just saved on this computer. An older account copy, or the shared window file, does not put the previous PIN back, even when that copy's timestamp is newer or the same. The length stored with the new PIN is what auto-unlock uses. Continue checks that same PIN.
 * PIN save and check results are written without the PIN: saved on this computer or uploaded, matched, or rejected, with the digit count and the miss count. The client writes that line to pjdesk.log and to service.log. The check runs in the signed-in user's PJDesk window. The service does not see the PIN.
+* A remote session that loses its connection stays open on Windows and Android. The window says Connection lost, reconnecting…, shows the seconds until the next try, and has Reconnect now and Close. The first tries are a few seconds apart. Later tries wait longer, up to about 90 seconds, and each one looks up the routes and the relay again. The same monitor comes back when it connects. Retrying stops when the session is closed, or when the other computer refuses it, and the reason is the sentence on the window: Wrong password. Access was revoked. This computer is blocked. The other computer declined the session. The other computer stopped sharing. The computer being controlled keeps trying its server the same way, including after the server key changes, and does not stop for good.
 
 ## 0.6.52
 

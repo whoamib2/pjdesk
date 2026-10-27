@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -136,6 +136,12 @@ struct State {
     gen: AtomicU64,
     /// Bumped to end a session this phone is controlling, without dropping the host.
     view_gen: AtomicU64,
+    /// Wakes a controller retry so Close and Reconnect now are not stuck in the wait.
+    view_wake: Notify,
+    /// Monitor to select again after the same session reconnects.
+    view_monitor: AtomicU8,
+    /// True when the session was showing one monitor's layout, not the whole desktop.
+    view_layout: AtomicBool,
     approval_tx: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
     password_tx: Mutex<Option<oneshot::Sender<TypedAuth>>>,
     lockout: Mutex<Lockout>,
@@ -333,6 +339,9 @@ impl Engine {
             capture_deny: Mutex::new(String::new()),
             gen: AtomicU64::new(1),
             view_gen: AtomicU64::new(1),
+            view_wake: Notify::new(),
+            view_monitor: AtomicU8::new(0),
+            view_layout: AtomicBool::new(false),
             approval_tx: Mutex::new(None),
             password_tx: Mutex::new(None),
             lockout: Mutex::new(Lockout::default()),
@@ -885,9 +894,16 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             let view_mark = state.view_gen.load(Ordering::SeqCst);
             let (state, cb) = (state.clone(), cb.clone());
             tokio::spawn(async move {
-                let mut resumes = 0u32;
+                let mut established = false;
+                let mut delay = Duration::from_secs(1);
                 let mut prefer_standby = false;
                 loop {
+                    if state.view_gen.load(Ordering::SeqCst) != view_mark
+                        || state.gen.load(Ordering::SeqCst) != gen
+                        || state.app_stop.load(Ordering::SeqCst)
+                    {
+                        break;
+                    }
                     match controller_session(
                         state.clone(),
                         cb.clone(),
@@ -897,42 +913,76 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                         view_mark,
                         ask_now,
                         prefer_standby,
+                        established,
                     )
                     .await
                     {
                         Ok(()) => break,
-                        Err(e) if pjdesk_proto::failover::is_relay_resume(&format!("{e:#}")) && resumes < 8 => {
+                        Err(e) => {
                             if state.view_gen.load(Ordering::SeqCst) != view_mark
                                 || state.gen.load(Ordering::SeqCst) != gen
+                                || state.app_stop.load(Ordering::SeqCst)
                             {
                                 break;
                             }
-                            resumes += 1;
-                            prefer_standby = false;
-                            let primary = state.move_primary.lock().unwrap().clone();
-                            log_line(
-                                &cb,
-                                if primary.trim().is_empty() {
-                                    "failover: relayed session moving to the current primary; reconnecting".into()
-                                } else {
-                                    format!(
-                                        "failover: relayed session moving to the primary {primary}; reconnecting"
-                                    )
-                                },
-                            );
-                            emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                        Err(e) => {
                             let raw = format!("{e:#}");
                             let head = raw.lines().next().unwrap_or("").trim().to_string();
-                            log_line(&cb, format!("connect ended: {head}"));
-                            if let Some(text) = surfaced_connect_error(&head) {
-                                let text = explain_connect_error(&id, "", &anyhow::Error::msg(text));
-                                emit(&cb, &json!({"event":"error","text": &text}));
-                                emit(&cb, &json!({"event":"disconnected","role":"controller","reason": &text}));
+                            let lower = head.to_ascii_lowercase();
+                            if lower == "stopped" || lower == "cancelled" || lower.contains("cancelled") {
+                                break;
                             }
-                            break;
+                            if let Some(plain) = pjdesk_proto::failover::session_refusal(&head) {
+                                log_line(&cb, format!("connect refused: {plain}"));
+                                if established {
+                                    emit(&cb, &json!({"event":"disconnected","role":"controller","reason": plain}));
+                                } else if let Some(text) = surfaced_connect_error(&head) {
+                                    let text = explain_connect_error(&id, "", &anyhow::Error::msg(text));
+                                    emit(&cb, &json!({"event":"error","text": &text}));
+                                    emit(&cb, &json!({"event":"disconnected","role":"controller","reason": &text}));
+                                } else {
+                                    emit(&cb, &json!({"event":"disconnected","role":"controller","reason": plain}));
+                                }
+                                break;
+                            }
+                            let lost = established
+                                || lower.contains("session lost:")
+                                || pjdesk_proto::failover::is_relay_resume(&head);
+                            if !lost {
+                                log_line(&cb, format!("connect ended: {head}"));
+                                if let Some(text) = surfaced_connect_error(&head) {
+                                    let text = explain_connect_error(&id, "", &anyhow::Error::msg(text));
+                                    emit(&cb, &json!({"event":"error","text": &text}));
+                                    emit(&cb, &json!({"event":"disconnected","role":"controller","reason": &text}));
+                                }
+                                break;
+                            }
+                            established = true;
+                            prefer_standby = false;
+                            let secs = delay.as_secs().max(1);
+                            log_line(&cb, format!("connection lost; trying again in {secs} s"));
+                            emit(
+                                &cb,
+                                &json!({
+                                    "event": "reconnecting",
+                                    "after": secs,
+                                    "reason": "Connection lost, reconnecting…"
+                                }),
+                            );
+                            let woke = tokio::select! {
+                                _ = tokio::time::sleep(delay) => false,
+                                _ = state.view_wake.notified() => true,
+                            };
+                            if state.view_gen.load(Ordering::SeqCst) != view_mark
+                                || state.gen.load(Ordering::SeqCst) != gen
+                                || state.app_stop.load(Ordering::SeqCst)
+                            {
+                                break;
+                            }
+                            if woke {
+                                delay = Duration::from_secs(1);
+                            } else {
+                                delay = pjdesk_proto::signal::next_reconnect_delay(delay);
+                            }
                         }
                     }
                 }
@@ -979,6 +1029,7 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             let reason = reason.chars().take(200).collect::<String>();
             *state.end_reason.lock().unwrap() = reason.clone();
             state.view_gen.fetch_add(1, Ordering::SeqCst);
+            state.view_wake.notify_one();
             if let Some(tx) = state.password_tx.lock().unwrap().take() {
                 let _ = tx.send(TypedAuth::Cancel);
             }
@@ -993,6 +1044,7 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             let reason = reason.chars().take(200).collect::<String>();
             *state.end_reason.lock().unwrap() = reason.clone();
             state.view_gen.fetch_add(1, Ordering::SeqCst);
+            state.view_wake.notify_one();
             state.gen.fetch_add(1, Ordering::SeqCst);
             *state.control.lock().unwrap() = None;
             *state.video.lock().unwrap() = None;
@@ -1070,9 +1122,14 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             send_control(state, ControlMsg::File(FileMsg::Offer { id, name: name.clone(), size, resume_from: 0 }));
             emit(cb, &json!({"event":"status","text": format!("Offering {name}")}));
         }
+        "reconnectNow" => {
+            state.view_wake.notify_one();
+        }
         "display" => {
             let index = cmd.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
             let layout = cmd.get("layout").and_then(|v| v.as_bool()).unwrap_or(false);
+            state.view_monitor.store(index, Ordering::SeqCst);
+            state.view_layout.store(layout, Ordering::SeqCst);
             if layout {
                 send_control(state, ControlMsg::View { mode: VIEW_SINGLE, display: index });
             } else {
@@ -1391,9 +1448,16 @@ async fn host_loop(state: Arc<State>, cb: Arc<dyn Callbacks>) {
             }
             Err(e) => {
                 let full = format!("{e:#}");
+                let mismatch = full.contains("SERVER KEY MISMATCH");
                 let head = full.lines().next().unwrap_or("could not reach the PJDesk server").trim();
-                warn!("host signaling: {full}");
-                let kind = if pjdesk_proto::signal::is_standby_refusal(&full) {
+                if mismatch {
+                    warn!("host signaling: the server key changed. This phone will keep trying.");
+                } else {
+                    warn!("host signaling: {full}");
+                }
+                let kind = if mismatch {
+                    pjdesk_proto::failover::RegFail::KeyMismatch
+                } else if pjdesk_proto::signal::is_standby_refusal(&full) {
                     pjdesk_proto::failover::RegFail::StillStandby
                 } else {
                     pjdesk_proto::failover::RegFail::Unreachable
@@ -1409,7 +1473,9 @@ async fn host_loop(state: Arc<State>, cb: Arc<dyn Callbacks>) {
                 }
                 let shown = if matches!(
                     kind,
-                    pjdesk_proto::failover::RegFail::Unreachable | pjdesk_proto::failover::RegFail::StillStandby
+                    pjdesk_proto::failover::RegFail::Unreachable
+                        | pjdesk_proto::failover::RegFail::StillStandby
+                        | pjdesk_proto::failover::RegFail::KeyMismatch
                 ) {
                     "Reconnecting"
                 } else {
@@ -1420,7 +1486,12 @@ async fn host_loop(state: Arc<State>, cb: Arc<dyn Callbacks>) {
                 public_only = hop.use_standby || kind == pjdesk_proto::failover::RegFail::StillStandby;
                 wait = hop.delay;
                 advance = hop.advance_backoff;
-                if advance {
+                if kind == pjdesk_proto::failover::RegFail::KeyMismatch {
+                    wait = pjdesk_proto::signal::RECONNECT_CAP;
+                    fast_tries = pjdesk_proto::failover::FAST_REGISTER_TRIES;
+                    advance = false;
+                    log_line(&cb, "The server key changed. This phone will keep trying.");
+                } else if advance {
                     fast_tries = pjdesk_proto::failover::FAST_REGISTER_TRIES;
                 } else {
                     fast_tries = fast_tries.saturating_add(1);
@@ -2867,6 +2938,7 @@ async fn controller_session(
     view_mark: u64,
     ask_now: bool,
     prefer_standby: bool,
+    established: bool,
 ) -> Result<()> {
     *state.end_reason.lock().unwrap() = String::new();
     let primary = state.server.lock().unwrap().clone();
@@ -3029,6 +3101,9 @@ async fn controller_session(
             Err(e) if e.is::<WrongPassword>() => {
                 connection.close(1u32.into(), b"authentication failed");
                 log_line(&cb, format!("incorrect password for {} (saved cleared: {from_store})", format_id(target)));
+                if established {
+                    bail!("incorrect password");
+                }
                 let mut text = format!("Incorrect password for {}", format_id(target));
                 if from_store {
                     emit(&cb, &json!({"event":"clearSaved","id": target}));
@@ -3047,7 +3122,7 @@ async fn controller_session(
         }
     };
     let peer = if auth.peer_name.is_empty() { host_name } else { auth.peer_name };
-    let relayed = matches!(path, LinkPath::Relay(_));
+    let _relayed = matches!(path, LinkPath::Relay(_));
     let path = match path {
         LinkPath::Direct(addr) if p2p::is_lan_ip(addr.ip()) => "LAN",
         LinkPath::Direct(_) => "Internet",
@@ -3092,6 +3167,13 @@ async fn controller_session(
             quality: quality::preset("balanced").unwrap_or(StreamQuality::default()),
         });
         let _ = control_tx.send(ControlMsg::SetKeyboardMode(KeyboardMode::Translate));
+        let index = state.view_monitor.load(Ordering::SeqCst);
+        let layout = state.view_layout.load(Ordering::SeqCst);
+        if layout {
+            let _ = control_tx.send(ControlMsg::View { mode: VIEW_SINGLE, display: index });
+        } else if index > 0 {
+            let _ = control_tx.send(ControlMsg::SelectMonitor { index });
+        }
     }
     let mut control_send = auth.send;
     let mut control_recv = auth.recv;
@@ -3257,21 +3339,20 @@ async fn controller_session(
     let still_watching = state.view_gen.load(Ordering::SeqCst) == view_mark
         && state.gen.load(Ordering::SeqCst) == gen
         && !state.app_stop.load(Ordering::SeqCst);
-    if relayed && still_watching && (pjdesk_proto::failover::is_relay_resume(&end_reason)
-        || pjdesk_proto::failover::session_fate(pjdesk_proto::failover::MediaPath::Relayed)
-            == pjdesk_proto::failover::SessionFate::Reconnect)
-    {
-        let message = if pjdesk_proto::failover::is_relay_resume(&end_reason) {
-            end_reason.clone()
-        } else {
-            pjdesk_proto::failover::RELAY_RESUME.to_string()
-        };
-        log_line(&cb, message.clone());
-        bail!(message);
+    if !still_watching {
+        return Ok(());
     }
-    log_line(&cb, format!("controller session ended: {end_reason}"));
-    emit(&cb, &json!({"event":"disconnected","role":"controller","reason": end_reason}));
-    Ok(())
+    if let Some(plain) = pjdesk_proto::failover::session_refusal(&end_reason) {
+        log_line(&cb, format!("controller session refused: {plain}"));
+        emit(&cb, &json!({"event":"disconnected","role":"controller","reason": plain}));
+        return Ok(());
+    }
+    if pjdesk_proto::failover::is_relay_resume(&end_reason) {
+        log_line(&cb, end_reason.clone());
+        bail!(end_reason);
+    }
+    log_line(&cb, format!("controller session lost: {end_reason}"));
+    bail!("session lost: {end_reason}");
 }
 
 async fn send_file_bytes(conn: quinn::Connection, id: u64, path: &Path, resume: u64) -> Result<()> {
@@ -3638,6 +3719,9 @@ mod tests {
             capture_deny: Mutex::new(String::new()),
             gen: AtomicU64::new(1),
             view_gen: AtomicU64::new(1),
+            view_wake: Notify::new(),
+            view_monitor: AtomicU8::new(0),
+            view_layout: AtomicBool::new(false),
             approval_tx: Mutex::new(None),
             password_tx: Mutex::new(None),
             lockout: Mutex::new(Lockout::default()),

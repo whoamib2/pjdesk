@@ -1475,8 +1475,10 @@ pub enum SessionCoverAction {
 
 fn cover_buttons(kind: SessionCover) -> &'static [(&'static str, SessionCoverAction)] {
     match kind {
-        SessionCover::Reconnecting => &[("Cancel", SessionCoverAction::Cancel)],
-        SessionCover::Lost => &[("Reconnect", SessionCoverAction::Reconnect), ("Close", SessionCoverAction::Close)],
+        SessionCover::Reconnecting => {
+            &[("Reconnect now", SessionCoverAction::Reconnect), ("Close", SessionCoverAction::Close)]
+        }
+        SessionCover::Lost => &[("Reconnect now", SessionCoverAction::Reconnect), ("Close", SessionCoverAction::Close)],
         SessionCover::Ended => &[("Close", SessionCoverAction::Close)],
     }
 }
@@ -1518,7 +1520,7 @@ pub fn draw_session_cover(buf: &mut [u32], win_w: usize, win_h: usize, kind: Ses
     let ended = detail.lines().next().unwrap_or(detail).trim();
     let ended = if ended.is_empty() { "The session ended" } else { ended };
     let title = match kind {
-        SessionCover::Reconnecting => "Reconnecting…",
+        SessionCover::Reconnecting => "Connection lost, reconnecting…",
         SessionCover::Lost => "Connection lost",
         SessionCover::Ended => ended,
     };
@@ -1533,8 +1535,16 @@ pub fn draw_session_cover(buf: &mut [u32], win_w: usize, win_h: usize, kind: Ses
         title
     };
     draw_text(buf, win_w, win_h, x + 24.0, y + 42.0, shown, c.text);
-    if kind == SessionCover::Lost {
-        draw_text(buf, win_w, win_h, x + 24.0, y + 70.0, "Every route failed.", c.muted);
+    let subtitle = match kind {
+        SessionCover::Reconnecting => {
+            let line = detail.trim();
+            if line.is_empty() { "Trying again now…" } else { line }
+        }
+        SessionCover::Lost => "Every route failed.",
+        SessionCover::Ended => "",
+    };
+    if !subtitle.is_empty() {
+        draw_text(buf, win_w, win_h, x + 24.0, y + 70.0, subtitle, c.muted);
     }
     for (button, (bx, by, bw, bh)) in buttons.iter().zip(boxes) {
         let fill = if button.1 == SessionCoverAction::Reconnect { c.accent } else { c.elev };
@@ -2221,13 +2231,14 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_overlay_has_cancel_and_the_lost_overlay_has_two_buttons() {
+    fn reconnect_overlay_has_reconnect_now_and_close() {
         let w = 800;
         let h = 600;
         let mut buf = vec![0u32; w * h];
-        draw_session_cover(&mut buf, w, h, SessionCover::Reconnecting, "", false);
+        draw_session_cover(&mut buf, w, h, SessionCover::Reconnecting, "Trying again in 90 s.", false);
         assert!(buf.iter().any(|px| *px != 0));
-        assert_eq!(session_cover_hit(SessionCover::Reconnecting, 400.0, 338.0, w, h), Some(SessionCoverAction::Cancel));
+        assert_eq!(session_cover_hit(SessionCover::Reconnecting, 317.0, 338.0, w, h), Some(SessionCoverAction::Reconnect));
+        assert_eq!(session_cover_hit(SessionCover::Reconnecting, 483.0, 338.0, w, h), Some(SessionCoverAction::Close));
         assert_eq!(session_cover_hit(SessionCover::Lost, 400.0, 20.0, w, h), None);
         assert_eq!(session_cover_hit(SessionCover::Lost, 317.0, 338.0, w, h), Some(SessionCoverAction::Reconnect));
         assert_eq!(session_cover_hit(SessionCover::Lost, 483.0, 338.0, w, h), Some(SessionCoverAction::Close));

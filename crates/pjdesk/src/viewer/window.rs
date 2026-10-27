@@ -94,6 +94,12 @@ enum SessionCover {
     Ended(String),
 }
 
+/// When the next automatic dial for this tab is due, and how long that wait was.
+struct RetryWait {
+    next_at: Instant,
+    delay: Duration,
+}
+
 pub enum ViewerStop {
     /// The person closed the window.
     UserClosed,
@@ -122,8 +128,8 @@ enum Queued {
     Admit(crate::session_window::Admit),
     Linked { sid: u64, link: Link, seed: Seed },
     Failed { sid: u64, error: String, id: String, files: bool, from_store: bool },
-    Relinked { sid: u64, link: Link },
-    RelinkFailed { sid: u64, error: String },
+    Relinked { sid: u64, link: Link, gen: u64 },
+    RelinkFailed { sid: u64, error: String, gen: u64 },
 }
 
 fn arm_link(
@@ -383,6 +389,9 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
         cancelled: HashSet::new(),
         relinking: HashSet::new(),
         cover: HashMap::new(),
+        retries: HashMap::new(),
+        retry_drawn: None,
+        link_gen: Arc::new(Mutex::new(HashMap::new())),
         resume_stop: Arc::new(Mutex::new(HashSet::new())),
         confirm_close: false,
         queue,
@@ -678,6 +687,12 @@ struct App {
     cancelled: HashSet<u64>,
     relinking: HashSet<u64>,
     cover: HashMap<u64, SessionCover>,
+    /// Automatic redials. Absent once the tab is connected or the person stopped it.
+    retries: HashMap<u64, RetryWait>,
+    /// Last countdown second drawn, so the wait loop does not redraw every turn.
+    retry_drawn: Option<u64>,
+    /// Bumped on every dial so a slower attempt cannot replace a newer one.
+    link_gen: Arc<Mutex<HashMap<u64, u64>>>,
     resume_stop: Arc<Mutex<HashSet<u64>>>,
     confirm_close: bool,
     queue: Arc<Mutex<Vec<Queued>>>,
@@ -784,6 +799,10 @@ impl App {
         let separate = self.is_separate();
         let display = self.primary_display;
         let cropped = if separate { self.tile_picture(display) } else { None };
+        let cover_paint = self.cover.get(&self.sid).cloned().map(|cover| {
+            let detail = self.cover_detail(self.sid, &cover);
+            (cover_kind(&cover), detail)
+        });
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else { return };
         let snap = self.live.lock().unwrap().snapshot();
         self.toolbar.sync(screens_of(&snap.displays), snap.current_display, snap.view_mode);
@@ -889,13 +908,8 @@ impl App {
         if confirm {
             toolbar::draw_confirm_close(&mut buffer, win_w, win_h, open.max(2), light);
         }
-        if let Some(cover) = self.cover.get(&self.sid) {
-            let (kind, detail) = match cover {
-                SessionCover::Reconnecting => (toolbar::SessionCover::Reconnecting, ""),
-                SessionCover::Lost => (toolbar::SessionCover::Lost, ""),
-                SessionCover::Ended(text) => (toolbar::SessionCover::Ended, text.as_str()),
-            };
-            toolbar::draw_session_cover(&mut buffer, win_w, win_h, kind, detail, light);
+        if let Some((kind, detail)) = &cover_paint {
+            toolbar::draw_session_cover(&mut buffer, win_w, win_h, *kind, detail, light);
         }
         if snap.restart {
             self.restarting = true;
@@ -1197,7 +1211,7 @@ impl App {
         }
         if self.cover.contains_key(&self.sid) {
             if down && code == KeyCode::Escape && matches!(self.cover.get(&self.sid), Some(SessionCover::Reconnecting)) {
-                self.cancel_resume(self.sid);
+                self.stop_retry(self.sid);
             }
             return;
         }
@@ -1921,6 +1935,7 @@ impl App {
         let toast = self.toast.clone();
         let background = self.toolbar.letterbox();
         let cover = self.cover.get(&self.sid).cloned();
+        let cover_detail = cover.as_ref().map(|cover| self.cover_detail(self.sid, cover));
         let light = self.light;
         let pane = &mut self.extra[i];
         let size = pane.window.inner_size();
@@ -1945,12 +1960,8 @@ impl App {
                 }
             }
             if let Some(cover) = &cover {
-                let (kind, detail) = match cover {
-                    SessionCover::Reconnecting => (toolbar::SessionCover::Reconnecting, ""),
-                    SessionCover::Lost => (toolbar::SessionCover::Lost, ""),
-                    SessionCover::Ended(text) => (toolbar::SessionCover::Ended, text.as_str()),
-                };
-                toolbar::draw_session_cover(&mut buffer, win_w, win_h, kind, detail, light);
+                let detail = cover_detail.as_deref().unwrap_or("");
+                toolbar::draw_session_cover(&mut buffer, win_w, win_h, cover_kind(cover), detail, light);
             }
             let _ = buffer.present();
             layout
@@ -2020,8 +2031,8 @@ impl App {
                             if let Some(hit) = toolbar::session_cover_hit(kind, cursor.0, cursor.1, w, h) {
                                 let sid = self.sid;
                                 match hit {
-                                    toolbar::SessionCoverAction::Cancel => self.cancel_resume(sid),
-                                    toolbar::SessionCoverAction::Reconnect => self.begin_relink(sid, String::new(), false),
+                                    toolbar::SessionCoverAction::Cancel => self.stop_retry(sid),
+                                    toolbar::SessionCoverAction::Reconnect => self.reconnect_now(sid),
                                     toolbar::SessionCoverAction::Close => {
                                         if self.end_sid(sid) {
                                             event_loop.exit();
@@ -2256,6 +2267,7 @@ impl App {
             self.others.retain(|held| held.sid != sid);
             self.relinking.remove(&sid);
             self.cover.remove(&sid);
+            self.retries.remove(&sid);
             self.resume_stop.lock().unwrap().insert(sid);
             self.apply_tab_strip();
             if let Some(window) = &self.window {
@@ -2275,6 +2287,7 @@ impl App {
         show_panes(&self.extra);
         self.relinking.remove(&sid);
         self.cover.remove(&sid);
+        self.retries.remove(&sid);
         self.resume_stop.lock().unwrap().insert(sid);
         self.apply_tab_strip();
         self.reveal();
@@ -2341,16 +2354,30 @@ impl App {
         }
     }
 
-    fn cancel_resume(&mut self, sid: u64) {
+    fn stop_retry(&mut self, sid: u64) {
         self.resume_stop.lock().unwrap().insert(sid);
         self.relinking.remove(&sid);
-        self.show_cover(sid, SessionCover::Lost);
+        self.retries.remove(&sid);
+        self.show_cover(sid, SessionCover::Ended("Stopped reconnecting.".into()));
+    }
+
+    fn reconnect_now(&mut self, sid: u64) {
+        self.resume_stop.lock().unwrap().insert(sid);
+        self.relinking.remove(&sid);
+        self.retries.insert(sid, RetryWait { next_at: Instant::now(), delay: Duration::from_secs(1) });
+        self.begin_relink(sid, String::new(), false);
     }
 
     fn begin_relink(&mut self, sid: u64, primary: String, restart: bool) {
         if !self.relinking.insert(sid) {
             return;
         }
+        let gen = {
+            let mut gens = self.link_gen.lock().unwrap();
+            let gen = gens.get(&sid).copied().unwrap_or(0).wrapping_add(1);
+            gens.insert(sid, gen);
+            gen
+        };
         self.resume_stop.lock().unwrap().remove(&sid);
         self.show_cover(sid, SessionCover::Reconnecting);
         let seed = if sid == self.sid {
@@ -2364,12 +2391,14 @@ impl App {
         } else {
             self.relinking.remove(&sid);
             self.cover.remove(&sid);
+            self.retries.remove(&sid);
             return;
         };
         let rt = self.rt.clone();
         let queue = self.queue.clone();
         let proxy = self.proxy.clone();
         let stop = self.resume_stop.clone();
+        let gens = self.link_gen.clone();
         let targets = seed.direct_targets.clone();
         let fingerprint = seed.host_fingerprint;
         rt.spawn(async move {
@@ -2378,24 +2407,24 @@ impl App {
             } else {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
-            if stop.lock().unwrap().contains(&sid) {
+            if stop.lock().unwrap().contains(&sid) || gens.lock().unwrap().get(&sid).copied() != Some(gen) {
                 return;
             }
             let admit = admit_from_seed(&seed);
             let moved = if primary.trim().is_empty() { None } else { Some(primary) };
             let msg = match super::resume_session(&admit, moved.as_deref(), &targets, fingerprint).await {
                 Ok(link) => {
-                    if stop.lock().unwrap().contains(&sid) {
+                    if stop.lock().unwrap().contains(&sid) || gens.lock().unwrap().get(&sid).copied() != Some(gen) {
                         link.connection.close(0u32.into(), b"cancelled");
                         return;
                     }
-                    Queued::Relinked { sid, link }
+                    Queued::Relinked { sid, link, gen }
                 }
                 Err(e) => {
-                    if stop.lock().unwrap().contains(&sid) {
+                    if stop.lock().unwrap().contains(&sid) || gens.lock().unwrap().get(&sid).copied() != Some(gen) {
                         return;
                     }
-                    Queued::RelinkFailed { sid, error: format!("{e:#}") }
+                    Queued::RelinkFailed { sid, error: format!("{e:#}"), gen }
                 }
             };
             queue.lock().unwrap().push(msg);
@@ -2415,8 +2444,8 @@ impl App {
             Queued::Admit(admit) => self.start_admit(admit),
             Queued::Linked { sid, link, seed } => self.finish_link(sid, link, seed),
             Queued::Failed { sid, error, id, files, from_store } => self.fail_link(sid, error, id, files, from_store),
-            Queued::Relinked { sid, link } => self.finish_relink(sid, link),
-            Queued::RelinkFailed { sid, error } => self.fail_relink(sid, error),
+            Queued::Relinked { sid, link, gen } => self.finish_relink(sid, link, gen),
+            Queued::RelinkFailed { sid, error, gen } => self.fail_relink(sid, error, gen),
         }
     }
 
@@ -2505,8 +2534,14 @@ impl App {
         }
     }
 
-    fn finish_relink(&mut self, sid: u64, link: Link) {
+    fn finish_relink(&mut self, sid: u64, link: Link, gen: u64) {
+        let current = self.link_gen.lock().unwrap().get(&sid).copied();
+        if current != Some(gen) || self.resume_stop.lock().unwrap().contains(&sid) {
+            link.connection.close(0u32.into(), b"cancelled");
+            return;
+        }
         self.relinking.remove(&sid);
+        self.retries.remove(&sid);
         self.cover.remove(&sid);
         self.remember_route(sid, &link);
         let pair = if sid == self.sid {
@@ -2523,14 +2558,66 @@ impl App {
                 self.graft(sid, armed);
                 self.show_toast("Reconnected");
             }
-            Err(e) => self.fail_relink(sid, format!("{e:#}")),
+            Err(e) => self.fail_relink(sid, format!("{e:#}"), gen),
         }
     }
 
-    fn fail_relink(&mut self, sid: u64, error: String) {
+    fn fail_relink(&mut self, sid: u64, error: String, gen: u64) {
+        if self.link_gen.lock().unwrap().get(&sid).copied() != Some(gen) {
+            return;
+        }
         self.relinking.remove(&sid);
-        info!("Could not reconnect: {error}");
-        self.show_cover(sid, SessionCover::Lost);
+        if self.resume_stop.lock().unwrap().contains(&sid) {
+            return;
+        }
+        if let Some(plain) = pjdesk_proto::failover::session_refusal(&error) {
+            self.retries.remove(&sid);
+            info!("Reconnect stopped: {plain}");
+            self.show_cover(sid, SessionCover::Ended(plain.to_string()));
+            return;
+        }
+        let prev = self.retries.get(&sid).map(|wait| wait.delay).unwrap_or(Duration::from_secs(1));
+        let delay = pjdesk_proto::signal::next_reconnect_delay(prev);
+        self.retries.insert(sid, RetryWait { next_at: Instant::now() + delay, delay });
+        info!("Could not reconnect ({}); trying again in {} s", public_failure(&error), delay.as_secs());
+        self.show_cover(sid, SessionCover::Reconnecting);
+    }
+
+    fn schedule_retry(&mut self, sid: u64) {
+        if self.resume_stop.lock().unwrap().contains(&sid) {
+            return;
+        }
+        if self.relinking.contains(&sid) {
+            self.show_cover(sid, SessionCover::Reconnecting);
+            return;
+        }
+        self.retries.entry(sid).or_insert(RetryWait { next_at: Instant::now(), delay: Duration::from_secs(1) });
+        self.begin_relink(sid, String::new(), false);
+    }
+
+    fn cover_detail(&self, sid: u64, cover: &SessionCover) -> String {
+        match cover {
+            SessionCover::Reconnecting => {
+                let trying = self.relinking.contains(&sid);
+                let secs = self
+                    .retries
+                    .get(&sid)
+                    .and_then(|wait| wait.next_at.checked_duration_since(Instant::now()))
+                    .map(|left| left.as_secs())
+                    .unwrap_or(0);
+                pjdesk_proto::failover::retry_countdown(secs, trying)
+            }
+            SessionCover::Lost => String::new(),
+            SessionCover::Ended(text) => text.clone(),
+        }
+    }
+
+    fn refuse_session(&mut self, sid: u64, plain: &str) {
+        self.resume_stop.lock().unwrap().insert(sid);
+        self.relinking.remove(&sid);
+        self.retries.remove(&sid);
+        info!("Session refused: {plain}");
+        self.show_cover(sid, SessionCover::Ended(plain.to_string()));
     }
 
     fn remember_route(&mut self, sid: u64, link: &Link) {
@@ -2703,6 +2790,24 @@ fn seed_from_admit(admit: &crate::session_window::Admit) -> Seed {
     }
 }
 
+fn cover_kind(cover: &SessionCover) -> toolbar::SessionCover {
+    match cover {
+        SessionCover::Reconnecting => toolbar::SessionCover::Reconnecting,
+        SessionCover::Lost => toolbar::SessionCover::Lost,
+        SessionCover::Ended(_) => toolbar::SessionCover::Ended,
+    }
+}
+
+/// A short line for the log. A password, token, or PIN is not included.
+fn public_failure(error: &str) -> String {
+    let line = error.lines().next().unwrap_or("").trim();
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("password") || lower.contains("token") || lower.contains("pin") {
+        return "the other computer refused the session".into();
+    }
+    line.chars().take(180).collect()
+}
+
 fn admit_from_seed(seed: &Seed) -> crate::session_window::Admit {
     crate::session_window::Admit {
         id: seed.target.clone(),
@@ -2825,15 +2930,65 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.relay_or_restart(event_loop, session, &reason) {
                     return;
                 }
-                info!("Disconnected: {reason}");
-                crate::note_status(&format!("Session stopped: {reason}"));
-                self.show_cover(session, SessionCover::Ended(reason.clone()));
-                if session == self.sid {
-                    if let Some(window) = self.window.clone() {
-                        window.set_title(&format!("{} — {reason}", self.title));
-                    }
+                if self.resume_stop.lock().unwrap().contains(&session) {
+                    return;
                 }
+                if self.transport_flags(session).is_some_and(|(_, _, _, ended)| ended.is_some()) {
+                    let plain = pjdesk_proto::failover::session_refusal(&reason)
+                        .unwrap_or("The other computer ended the session.");
+                    self.refuse_session(session, plain);
+                    return;
+                }
+                if let Some(plain) = pjdesk_proto::failover::session_refusal(&reason) {
+                    self.refuse_session(session, plain);
+                    return;
+                }
+                info!("Connection lost ({})", public_failure(&reason));
+                crate::note_status("Connection lost, reconnecting…");
+                self.schedule_retry(session);
             }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.retries.is_empty() {
+            self.retry_drawn = None;
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            return;
+        }
+        let now = Instant::now();
+        let due: Vec<u64> = self
+            .retries
+            .iter()
+            .filter(|(sid, wait)| {
+                wait.next_at <= now
+                    && !self.relinking.contains(sid)
+                    && matches!(self.cover.get(sid), Some(SessionCover::Reconnecting))
+            })
+            .map(|(sid, _)| *sid)
+            .collect();
+        let starting = !due.is_empty();
+        for sid in due {
+            self.begin_relink(sid, String::new(), false);
+        }
+        let secs_now = self
+            .retries
+            .values()
+            .map(|wait| wait.next_at.checked_duration_since(now).map(|left| left.as_secs()).unwrap_or(0))
+            .min();
+        if starting || self.retry_drawn != secs_now {
+            self.retry_drawn = secs_now;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            for pane in &self.extra {
+                pane.window.request_redraw();
+            }
+        }
+        let soon = self.retries.values().map(|wait| wait.next_at).min();
+        if let Some(at) = soon {
+            let tick = Instant::now() + Duration::from_secs(1);
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at.min(tick)));
         }
     }
 
@@ -2912,8 +3067,8 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(hit) = toolbar::session_cover_hit(kind, self.cursor_px.0, self.cursor_px.1, win_w, win_h) {
                             let sid = self.sid;
                             match hit {
-                                toolbar::SessionCoverAction::Cancel => self.cancel_resume(sid),
-                                toolbar::SessionCoverAction::Reconnect => self.begin_relink(sid, String::new(), false),
+                                toolbar::SessionCoverAction::Cancel => self.stop_retry(sid),
+                                toolbar::SessionCoverAction::Reconnect => self.reconnect_now(sid),
                                 toolbar::SessionCoverAction::Close => {
                                     if self.end_sid(sid) {
                                         event_loop.exit();

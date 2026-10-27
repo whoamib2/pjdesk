@@ -261,6 +261,34 @@ pub fn resume_after_drop(restarting: bool, host_ended: bool) -> bool {
     !restarting && !host_ended
 }
 
+/// The other computer refused this session. The sentence is what the window shows.
+/// A dropped route is not a refusal: the controller keeps trying.
+pub fn session_refusal(reason: &str) -> Option<&'static str> {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("wrong password") || lower.contains("incorrect password") {
+        Some("Wrong password.")
+    } else if lower.contains("revoked") {
+        Some("Access was revoked.")
+    } else if lower.contains("blocked") {
+        Some("This computer is blocked.")
+    } else if lower.contains("not allowed") || lower.contains("declined") {
+        Some("The other computer declined the session.")
+    } else if lower.contains("stopped sharing") {
+        Some("The other computer stopped sharing.")
+    } else {
+        None
+    }
+}
+
+/// Line under "Connection lost, reconnecting…". `trying` means a dial is already running.
+pub fn retry_countdown(wait_secs: u64, trying: bool) -> String {
+    if trying || wait_secs == 0 {
+        "Trying again now…".into()
+    } else {
+        format!("Trying again in {wait_secs} s.")
+    }
+}
+
 /// The person at the computer, or the phone, ended the session on purpose.
 pub fn host_ended_the_session(notice: &str) -> bool {
     let lower = notice.to_ascii_lowercase();
@@ -865,5 +893,22 @@ mod tests {
         assert_eq!(primary_result(7, ""), "Now primary, gen 7.");
         assert!(handoff_proof_is_fresh(1_000, 1_100));
         assert!(!handoff_proof_is_fresh(1_000, 1_000 + HANDOFF_SKEW_SECS + 1));
+    }
+
+    #[test]
+    fn a_refused_session_stops_and_a_drop_keeps_trying() {
+        assert_eq!(session_refusal("wrong password"), Some("Wrong password."));
+        assert_eq!(session_refusal("Incorrect password for 123"), Some("Wrong password."));
+        assert_eq!(session_refusal("access revoked"), Some("Access was revoked."));
+        assert_eq!(session_refusal("this computer is blocked"), Some("This computer is blocked."));
+        assert_eq!(session_refusal("screen sharing not allowed"), Some("The other computer declined the session."));
+        assert_eq!(session_refusal("the person declined"), Some("The other computer declined the session."));
+        assert_eq!(session_refusal("stopped sharing"), Some("The other computer stopped sharing."));
+        assert_eq!(session_refusal("the connection ended"), None);
+        assert_eq!(session_refusal("Disconnected: timed out"), None);
+        assert_eq!(session_refusal("session lost: the control stream closed"), None);
+        assert_eq!(retry_countdown(0, false), "Trying again now…");
+        assert_eq!(retry_countdown(12, true), "Trying again now…");
+        assert_eq!(retry_countdown(90, false), "Trying again in 90 s.");
     }
 }
