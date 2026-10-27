@@ -20,6 +20,29 @@ object AppLockPolicy {
 
     fun pinAcceptable(pin: String): Boolean = pin.length in 4..8 && pin.all { it.isDigit() }
 
+    /** A length saved beside the verifier. Zero means it was not saved. */
+    fun knownPinLen(len: Int): Boolean = len in 4..8
+
+    /**
+     * Try this entry locally. A match unlocks. A miss is not shown and is not
+     * a lockout, so the stored length stays off the screen.
+     * When [knownLen] is 4 to 8, only that many digits are tried. An older PIN
+     * (0) is tried after every digit from 4 through 8.
+     */
+    fun pinSilentCheck(typed: Int, knownLen: Int): Boolean {
+        if (typed !in 4..8) return false
+        return if (knownPinLen(knownLen)) typed == knownLen else true
+    }
+
+    /**
+     * A wrong PIN counts when Continue or Enter submitted an acceptable one,
+     * or when 8 digits are in. A wrong PIN of a shorter stored length waits
+     * for Continue, so the error does not reveal that length.
+     */
+    fun pinMissCounts(typed: Int, submitted: Boolean): Boolean {
+        return if (submitted) typed in 4..8 else typed == 8
+    }
+
     fun lockedOut(fails: Int): Boolean = fails >= MAX_FAILS
 
     fun relock(awayMs: Long, delayMs: Long): Boolean = delayMs > 0 && awayMs >= delayMs
@@ -90,6 +113,8 @@ object AccountPin {
         val iterations: Int,
         val idleSec: Int,
         val updated: Long,
+        /** Digit count. 0 means an older PIN did not record it. Not shown. */
+        val len: Int = 0,
     )
 
     fun hashPin(pin: String, salt: ByteArray, iterations: Int): ByteArray {
@@ -121,6 +146,7 @@ object AccountPin {
             ITERATIONS,
             idle,
             updated.coerceAtLeast(1),
+            pin.length,
         )
     }
 
@@ -133,6 +159,7 @@ object AccountPin {
             .put("iterations", verifier.iterations)
             .put("idle_sec", verifier.idleSec)
             .put("updated", verifier.updated)
+            .put("len", verifier.len)
             .toString()
             .toByteArray(Charsets.UTF_8)
         val ct = crypt(true, key, nonce, plain)
@@ -157,6 +184,7 @@ object AccountPin {
             obj.getInt("iterations"),
             obj.optInt("idle_sec", IDLE_DEFAULT),
             obj.optLong("updated"),
+            obj.optInt("len", 0),
         )
     }
 

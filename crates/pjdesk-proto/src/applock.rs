@@ -21,11 +21,48 @@ pub struct Verifier {
     pub iterations: u32,
     pub idle_sec: u64,
     pub updated: u64,
+    /// How many digits the PIN has. Stored with the hash so the right PIN can
+    /// unlock as soon as it is typed. Zero means an older PIN did not record
+    /// it. The lock screen does not show this.
+    #[serde(default)]
+    pub len: u8,
 }
 
 pub fn pin_acceptable(pin: &str) -> bool {
     let n = pin.chars().count();
     (4..=8).contains(&n) && pin.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A length saved beside the verifier. Zero means it was not saved.
+pub fn known_pin_len(len: u8) -> bool {
+    (4..=8).contains(&len)
+}
+
+/// Try this entry locally. A match unlocks immediately. A miss is not shown
+/// and is not a lockout, so the stored length stays off the screen.
+///
+/// When `known_len` is 4 to 8, only that many digits are tried. An older PIN
+/// (`known_len` 0) is tried after every digit from 4 through 8.
+pub fn pin_silent_check(typed: usize, known_len: u8) -> bool {
+    if !(4..=8).contains(&typed) {
+        return false;
+    }
+    if known_pin_len(known_len) {
+        typed == known_len as usize
+    } else {
+        true
+    }
+}
+
+/// A wrong PIN counts when Continue or Enter submitted an acceptable one, or
+/// when 8 digits are in. Eight is the public maximum, so counting it does not
+/// reveal a shorter PIN. A wrong PIN of that shorter length waits for Continue.
+pub fn pin_miss_counts(typed: usize, submitted: bool) -> bool {
+    if submitted {
+        (4..=8).contains(&typed)
+    } else {
+        typed == 8
+    }
 }
 
 /// Wait after this many wrong PINs. The first four misses do not wait.
@@ -220,6 +257,7 @@ pub fn create(pin: &str, idle_sec: u64, updated: u64) -> Result<Verifier, String
         iterations: ITERATIONS,
         idle_sec: clamp_idle(idle_sec),
         updated: updated.max(1),
+        len: pin.chars().count() as u8,
     })
 }
 
@@ -326,6 +364,7 @@ mod tests {
             iterations: ITERATIONS,
             idle_sec: 300,
             updated: 9,
+            len: 6,
         };
         let blob = seal_with_nonce(&key, &verifier, &nonce).unwrap();
         assert!(blob.starts_with("UEpMT0NLMD"), "{blob}");
@@ -336,7 +375,28 @@ mod tests {
         let made = create("1234", 0, 0).unwrap();
         assert_eq!(made.idle_sec, IDLE_DEFAULT);
         assert_eq!(made.iterations, ITERATIONS);
+        assert_eq!(made.len, 4);
         assert!(matches(&made, "1234"));
+        let opened = open(&key, &seal(&key, &made).unwrap()).unwrap();
+        assert_eq!(opened.len, 4);
+        let old = r#"{"salt":"YQ==","hash":"aa","iterations":1,"idle_sec":300,"updated":1}"#;
+        let legacy: Verifier = serde_json::from_str(old).unwrap();
+        assert_eq!(legacy.len, 0, "a PIN sealed before the length was stored stays unknown");
+    }
+
+    #[test]
+    fn a_correct_pin_unlocks_at_its_length_without_showing_that_length() {
+        assert!(pin_silent_check(4, 4));
+        assert!(!pin_silent_check(3, 4));
+        assert!(!pin_silent_check(5, 4), "a longer entry is not checked at the stored length");
+        assert!(pin_silent_check(6, 0), "an older PIN is checked after each digit from 4");
+        assert!(pin_silent_check(8, 0));
+        assert!(!pin_silent_check(3, 0));
+        assert!(!pin_miss_counts(4, false), "a wrong PIN of the stored length waits for Continue");
+        assert!(pin_miss_counts(4, true));
+        assert!(!pin_miss_counts(3, true), "a short PIN is not a counted miss");
+        assert!(pin_miss_counts(8, false), "eight digits is the public maximum");
+        assert!(!pin_miss_counts(7, false));
     }
 
     #[test]

@@ -43,6 +43,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -53,6 +54,9 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalView
+import androidx.core.view.WindowCompat
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -1358,13 +1362,22 @@ class MainActivity : FragmentActivity() {
                 app.markUnlocked()
                 syncPasswords(!temporarySession)
             }
+            var pinEditGen by remember { mutableIntStateOf(0) }
+            var pinMissGen by remember { mutableIntStateOf(-1) }
             fun notePinEdit() {
+                pinEditGen++
                 if (app.store.pinLockedUntil > System.currentTimeMillis()) return
                 lockError = ""
+            }
+            fun notePinMissFor(gen: Int) {
+                if (gen == pinMissGen) return
+                pinMissGen = gen
+                notePinMiss()
             }
             fun submitPin(pin: String) {
                 if (app.store.pinLockedUntil > System.currentTimeMillis()) return
                 val epoch = pinEpoch
+                val gen = pinEditGen
                 if (app.store.hasAccountPin()) {
                     lockBusy = true
                     lockError = ""
@@ -1378,7 +1391,7 @@ class MainActivity : FragmentActivity() {
                         }
                         if (!ok) {
                             lockBusy = false
-                            notePinMiss()
+                            notePinMissFor(gen)
                             return@launch
                         }
                         val salt = app.store.pinSaltBytes()
@@ -1409,7 +1422,43 @@ class MainActivity : FragmentActivity() {
                     }
                     if (key == null) {
                         lockBusy = false
-                        notePinMiss()
+                        notePinMissFor(gen)
+                        return@launch
+                    }
+                    unlockWithPin(key)
+                }
+            }
+            fun peekPin(pin: String) {
+                if (app.store.pinLockedUntil > System.currentTimeMillis()) return
+                val epoch = pinEpoch
+                val gen = pinEditGen
+                val account = app.store.hasAccountPin()
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        if (account) {
+                            val match = AccountPin.matches(
+                                pin,
+                                app.store.accountPinSalt,
+                                app.store.accountPinHash,
+                                app.store.accountPinIters,
+                            )
+                            if (!match) return@withContext null to false
+                            val salt = app.store.pinSaltBytes()
+                            val wrapped = app.store.pinWrap
+                            val key = if (salt != null && wrapped.isNotBlank()) PinWrap.unwrap(wrapped, pin, salt) else null
+                            key to true
+                        } else {
+                            val salt = app.store.pinSaltBytes()
+                            val wrapped = app.store.pinWrap
+                            if (salt == null || wrapped.isBlank()) return@withContext null to false
+                            val key = PinWrap.unwrap(wrapped, pin, salt)
+                            key to (key != null)
+                        }
+                    }
+                    if (epoch != pinEpoch) return@launch
+                    val (key, ok) = result
+                    if (!ok) {
+                        if (gen == pinEditGen && AppLockPolicy.pinMissCounts(pin.length, false)) notePinMissFor(gen)
                         return@launch
                     }
                     unlockWithPin(key)
@@ -1450,6 +1499,7 @@ class MainActivity : FragmentActivity() {
                         val salt = PinWrap.newSalt()
                         app.store.savePinSalt(salt)
                         app.store.pinWrap = PinWrap.wrap(key, pin, salt)
+                        app.store.localPinLen = pin.length
                         app.store.pinFails = 0
                         app.holdVaultKey(key)
                         changingPin = false
@@ -1716,6 +1766,14 @@ class MainActivity : FragmentActivity() {
                 }
             }
             PjTheme(theme.value) {
+                val view = LocalView.current
+                val lightBars = androidx.compose.material3.MaterialTheme.colorScheme.background.luminance() > 0.5f
+                SideEffect {
+                    WindowCompat.getInsetsController(this@MainActivity.window, view).apply {
+                        isAppearanceLightStatusBars = lightBars
+                        isAppearanceLightNavigationBars = lightBars
+                    }
+                }
                 val session = state.session
                 val persistent = account.isNotEmpty() && !temporarySession
                 val noPassword = app.store.joinedWithoutPassword || visitWithoutPassword
@@ -1761,7 +1819,9 @@ class MainActivity : FragmentActivity() {
                             && (!app.store.hasAccountPin() || app.store.bioForUpdated == app.store.accountPinUpdated),
                         rejectCount = pinRejects,
                         lockedOut = pinWait,
+                        knownLen = if (app.store.hasAccountPin()) app.store.accountPinLen else app.store.localPinLen,
                         onSubmit = { submitPin(it) },
+                        onSilent = { peekPin(it) },
                         onEdit = { notePinEdit() },
                         onBiometric = { tryBio() },
                         computerId = state.idFormatted.ifBlank { state.id },
@@ -2313,6 +2373,7 @@ class MainActivity : FragmentActivity() {
                                                         app.store.accountPinIters,
                                                         seconds,
                                                         System.currentTimeMillis() / 1000,
+                                                        app.store.accountPinLen,
                                                     )
                                                     val sealed = AccountPin.seal(key, verifier)
                                                     val updated = CloudAuth.putAppLock(refresh, device, sealed)
