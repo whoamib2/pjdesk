@@ -223,6 +223,8 @@ struct App {
     ak_secret: String,
     ak_show: bool,
     ak_keys: Vec<pjdesk_proto::signal::AccessKeyBrief>,
+    /// The list returned with the last create or revoke. Shown until a snapshot has the same keys.
+    ak_hold: Option<Vec<pjdesk_proto::signal::AccessKeyBrief>>,
     ak_confirm: Option<String>,
     ak_rx: Option<std::sync::mpsc::Receiver<AkResult>>,
     ak_busy: bool,
@@ -397,6 +399,7 @@ impl App {
             ak_secret: String::new(),
             ak_show: false,
             ak_keys: Vec::new(),
+            ak_hold: None,
             ak_confirm: None,
             ak_rx: None,
             ak_busy: false,
@@ -1195,6 +1198,10 @@ impl App {
         }
         if let Some(held) = self.require_hold {
             snap.require_accounts = held;
+        }
+        let covered = self.ak_hold.as_ref().is_some_and(|hold| hold_covered(&snap.access_keys, hold));
+        if covered {
+            self.ak_hold = None;
         }
         self.live = Some(snap);
     }
@@ -3091,11 +3098,10 @@ impl App {
     }
 
     fn shown_keys(&self) -> Vec<pjdesk_proto::signal::AccessKeyBrief> {
-        if self.access == Access::Readable {
-            self.ak_keys.clone()
-        } else {
-            self.live.as_ref().map(|snap| snap.access_keys.clone()).unwrap_or_default()
-        }
+        let local = if self.access == Access::Readable { self.ak_keys.clone() } else { Vec::new() };
+        let live = self.live.as_ref().map(|snap| snap.access_keys.clone()).unwrap_or_default();
+        let hold = self.ak_hold.clone().unwrap_or_default();
+        keys_to_show(&local, &live, &hold)
     }
 
     fn key_label(&self, key_id: &str) -> String {
@@ -3116,18 +3122,25 @@ impl App {
         self.ak_rx = None;
         self.ak_busy = false;
         match result {
-            AkResult::Secret(secret) => {
+            AkResult::Secret { secret, keys } => {
                 self.ak_secret = secret;
                 self.ak_show = true;
                 self.ak_label.clear();
                 self.status = "Copy this key now. It is shown once.".into();
-                self.request_refresh();
+                self.hold_keys(keys);
             }
-            AkResult::Note(message) => {
+            AkResult::Note { message, keys } => {
                 self.status = message;
-                self.request_refresh();
+                self.hold_keys(keys);
             }
         }
+    }
+
+    fn hold_keys(&mut self, keys: Vec<pjdesk_proto::signal::AccessKeyBrief>) {
+        if !keys.is_empty() {
+            self.ak_hold = Some(keys);
+        }
+        self.request_refresh();
     }
 
     fn start_access_key(&mut self, act: AkAct) {
@@ -3187,20 +3200,31 @@ impl App {
                     })
                 };
                 let local = || match crate::access_keys::Store::create(&dir, &label, secs, limit) {
-                    Ok(secret) => AkResult::Secret(secret),
-                    Err(e) => AkResult::Note(e),
+                    Ok(secret) => AkResult::Secret {
+                        secret,
+                        keys: crate::access_keys::Store::public_list(&dir),
+                    },
+                    Err(e) => AkResult::Note { message: e, keys: Vec::new() },
                 };
                 if via_pipe {
                     match pipe() {
-                        Some(response) if response.ok && !response.secret.is_empty() => AkResult::Secret(response.secret),
-                        Some(response) if response.code == "timeout" => AkResult::Note(unanswered.into()),
+                        Some(response) if response.ok && !response.secret.is_empty() => AkResult::Secret {
+                            secret: response.secret,
+                            keys: response.keys,
+                        },
+                        Some(response) if response.code == "timeout" => {
+                            AkResult::Note { message: unanswered.into(), keys: Vec::new() }
+                        }
                         None if can_write => local(),
-                        Some(response) => AkResult::Note(if response.message.is_empty() {
-                            "Could not create an access key.".into()
-                        } else {
-                            response.message
-                        }),
-                        None => AkResult::Note(unanswered.into()),
+                        Some(response) => AkResult::Note {
+                            message: if response.message.is_empty() {
+                                "Could not create an access key.".into()
+                            } else {
+                                response.message
+                            },
+                            keys: response.keys,
+                        },
+                        None => AkResult::Note { message: unanswered.into(), keys: Vec::new() },
                     }
                 } else {
                     local()
@@ -3215,20 +3239,30 @@ impl App {
                     })
                 };
                 let local = || match crate::requests::revoke_access_key(&dir, &key_id) {
-                    Ok(()) => AkResult::Note("Revoked. Every computer that used it will be disconnected and removed.".into()),
-                    Err(e) => AkResult::Note(format!("Could not revoke that key: {e}")),
+                    Ok(()) => AkResult::Note {
+                        message: "Revoked. Every computer that used it will be disconnected and removed.".into(),
+                        keys: crate::access_keys::Store::public_list(&dir),
+                    },
+                    Err(e) => AkResult::Note { message: format!("Could not revoke that key: {e}"), keys: Vec::new() },
                 };
                 if via_pipe {
                     match pipe() {
-                        Some(response) if response.ok => AkResult::Note(response.message),
-                        Some(response) if response.code == "timeout" => AkResult::Note(unanswered.into()),
+                        Some(response) if response.ok => {
+                            AkResult::Note { message: response.message, keys: response.keys }
+                        }
+                        Some(response) if response.code == "timeout" => {
+                            AkResult::Note { message: unanswered.into(), keys: Vec::new() }
+                        }
                         None if can_write => local(),
-                        Some(response) => AkResult::Note(if response.message.is_empty() {
-                            "Could not revoke that key.".into()
-                        } else {
-                            response.message
-                        }),
-                        None => AkResult::Note(unanswered.into()),
+                        Some(response) => AkResult::Note {
+                            message: if response.message.is_empty() {
+                                "Could not revoke that key.".into()
+                            } else {
+                                response.message
+                            },
+                            keys: response.keys,
+                        },
+                        None => AkResult::Note { message: unanswered.into(), keys: Vec::new() },
                     }
                 } else {
                     local()
@@ -3935,8 +3969,8 @@ enum AkAct {
 }
 
 enum AkResult {
-    Secret(String),
-    Note(String),
+    Secret { secret: String, keys: Vec<pjdesk_proto::signal::AccessKeyBrief> },
+    Note { message: String, keys: Vec<pjdesk_proto::signal::AccessKeyBrief> },
 }
 
 struct ServiceProbe {
@@ -4383,6 +4417,44 @@ fn other_server_name(active_name: &str) -> String {
     }
 }
 
+fn brief(id: &str, label: &str) -> pjdesk_proto::signal::AccessKeyBrief {
+    pjdesk_proto::signal::AccessKeyBrief { id: id.into(), label: label.into(), computer_limit: 1, ..Default::default() }
+}
+
+/// Empty local reads (the window cannot open a SYSTEM-locked file) must not hide
+/// keys the service already has. A list that contains a new id wins until the
+/// other list catches up. When both have the same ids, the live snapshot wins
+/// so computer counts and a revoke show up.
+fn keys_to_show(
+    local: &[pjdesk_proto::signal::AccessKeyBrief],
+    live: &[pjdesk_proto::signal::AccessKeyBrief],
+    hold: &[pjdesk_proto::signal::AccessKeyBrief],
+) -> Vec<pjdesk_proto::signal::AccessKeyBrief> {
+    if !hold.is_empty() && !key_ids_cover(live, hold) && !key_ids_cover(local, hold) {
+        return hold.to_vec();
+    }
+    if local.is_empty() {
+        return if live.is_empty() { hold.to_vec() } else { live.to_vec() };
+    }
+    if live.is_empty() {
+        return local.to_vec();
+    }
+    if key_ids_cover(local, live) && !key_ids_cover(live, local) {
+        return local.to_vec();
+    }
+    live.to_vec()
+}
+
+fn key_ids_cover(hay: &[pjdesk_proto::signal::AccessKeyBrief], needle: &[pjdesk_proto::signal::AccessKeyBrief]) -> bool {
+    needle.iter().all(|row| hay.iter().any(|have| have.id == row.id))
+}
+
+fn hold_covered(live: &[pjdesk_proto::signal::AccessKeyBrief], hold: &[pjdesk_proto::signal::AccessKeyBrief]) -> bool {
+    hold.iter().all(|held| {
+        live.iter().any(|row| row.id == held.id && row.label == held.label && row.revoked_at == held.revoked_at)
+    })
+}
+
 fn primary_role_text(epoch: u64) -> String {
     format!("Role: Primary. This server uploads to the cloud (generation {epoch}).")
 }
@@ -4394,6 +4466,23 @@ fn standby_role_text(active_name: &str, epoch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_access_key_shows_before_the_folder_read_catches_up() {
+        let created = brief("aa", "Ada");
+        let listed = keys_to_show(&[], &[], &[created.clone()]);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].label, "Ada");
+        let stale_local = Vec::new();
+        let live_without = Vec::new();
+        assert_eq!(keys_to_show(&stale_local, &live_without, &[created.clone()])[0].id, "aa");
+        let mut live = created.clone();
+        live.computers = 1;
+        assert_eq!(keys_to_show(&[], &[live.clone()], &[created.clone()])[0].computers, 1);
+        assert!(hold_covered(&[live.clone()], &[created]));
+        assert!(keys_to_show(&[brief("bb", "Local")], &[], &[]).iter().any(|row| row.id == "bb"));
+        assert_eq!(keys_to_show(&[], &[brief("cc", "Live")], &[])[0].id, "cc");
+    }
 
     #[test]
     fn the_confirm_names_unsigned_computers_and_skips_access_keys() {

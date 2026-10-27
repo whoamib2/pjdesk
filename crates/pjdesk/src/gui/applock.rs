@@ -16,6 +16,8 @@ pub(super) enum LockMsg {
     Reauthed([u8; 32]),
     Stored { sealed: String, updated: u64, verifier: pjdesk_proto::applock::Verifier, key: [u8; 32] },
     Cleared { updated: u64 },
+    /// The password on the Set a PIN screen signed in. The PIN is saved after this when it is complete.
+    SignedIn(crate::network::Session),
     Failed(String),
 }
 
@@ -46,15 +48,36 @@ impl App {
         Duration::from_secs(pjdesk_proto::applock::clamp_idle(secs))
     }
 
+    fn pin_screen_wanted(&self) -> bool {
+        let email = self.account_email();
+        let has_pin = self.cfg.app_lock_for(&email).is_some();
+        pjdesk_proto::applock::should_ask_for_pin(
+            self.signed_in(),
+            has_pin,
+            self.cfg.joined_by_code_or_key() || email.is_empty(),
+            self.cfg.pin_declined,
+        )
+    }
+
     pub(super) fn note_lock_visibility(&mut self, ctx: &egui::Context) {
         if !self.signed_in() {
             self.lock_armed = false;
             self.lock_ui = false;
             return;
         }
+        let email = self.account_email();
+        let has_pin = self.cfg.app_lock_for(&email).is_some();
+        let ask = self.pin_screen_wanted() || self.lock_resetting;
+        if !has_pin && !ask {
+            self.lock_ui = false;
+            self.lock_armed = true;
+            return;
+        }
         if !self.lock_armed {
             self.lock_armed = true;
-            self.engage_lock();
+            if has_pin || ask {
+                self.engage_lock();
+            }
         }
         let now = Instant::now();
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
@@ -73,8 +96,8 @@ impl App {
                 self.engage_lock();
             }
         }
-        if self.lock_ui || self.cfg.app_lock_for(&self.account_email()).is_none() {
-            if self.cfg.app_lock_for(&self.account_email()).is_none() {
+        if self.lock_ui || !has_pin {
+            if !has_pin && ask {
                 self.lock_ui = true;
             }
             return;
@@ -87,7 +110,7 @@ impl App {
     }
 
     pub(super) fn lock_from_tray(&mut self) {
-        if self.signed_in() {
+        if self.pin_required() {
             tracing::info!("The window is locked. A tray open or a second launch does not skip the PIN.");
             self.engage_lock();
         }
@@ -314,6 +337,42 @@ impl App {
                 self.clear_pin_form();
                 self.pin_note = "Set a new PIN to open this window.".into();
             }
+            LockMsg::SignedIn(mut session) => {
+                let key = session.vault_key.take();
+                if let Some(key) = key {
+                    crate::vault::set_session_key(key);
+                    if self.temp.is_none() {
+                        self.cfg.password_vault_key = Some(crate::secure::protect(&hex::encode(key)));
+                    }
+                }
+                if session.email.is_empty() {
+                    session.email = self.pin_email.trim().to_lowercase();
+                }
+                self.note_enrolled(&session.computers);
+                self.cfg.apply_network_session(&session);
+                self.net_email = self.cfg.network_email.clone().unwrap_or_default();
+                self.settings.set_server_text(&self.cfg.effective_server());
+                self.save_cfg();
+                crate::network::copy_to_service(&self.cfg);
+                self.engine.retarget(&self.cfg);
+                self.sync_passwords(true);
+                self.reauth_until = Instant::now() + Duration::from_secs(10 * 60);
+                self.lock_busy = false;
+                let pin_ready = pjdesk_proto::applock::pin_acceptable(&self.pin_new) && self.pin_new == self.pin_confirm;
+                if self.cfg.joined_by_code_or_key() || self.account_email().is_empty() {
+                    self.lock_ui = false;
+                    self.lock_armed = true;
+                    self.pin_note.clear();
+                    self.toast.show("Signed in. This computer is not asked to set a PIN.");
+                } else if pin_ready {
+                    self.pin_password.clear();
+                    self.start_save(false);
+                } else {
+                    self.lock_ui = true;
+                    self.lock_armed = true;
+                    self.pin_note = "Signed in. Enter a PIN and choose Save PIN, or Skip for now.".into();
+                }
+            }
             LockMsg::Failed(err) => {
                 self.lock_error = err.clone();
                 self.pin_note = err;
@@ -465,10 +524,17 @@ impl App {
                     ui.add_space(6.0);
                     ui.label(widgets::muted(
                         ui,
-                        "This window stays here until the PIN is saved to the PJDesk account. Incoming connections and updates keep running.",
+                        "Set a PIN for this PJDesk account, or choose Skip for now. Incoming connections and updates keep running.",
                     ));
                     ui.add_space(16.0);
-                    if need_password {
+                    if self.account_email().is_empty() {
+                        ui.label("Account email");
+                        let mut email = self.pin_email.clone();
+                        widgets::account_email_field(ui, &mut email);
+                        self.pin_email = email;
+                        ui.add_space(8.0);
+                    }
+                    if need_password || self.account_email().is_empty() {
                         ui.label("Account password");
                         let mut pass = self.pin_password.clone();
                         let pass_box = widgets::password_field(ui, &mut pass, "pjdesk.com password", &mut self.pin_show_password);
@@ -507,6 +573,19 @@ impl App {
                         && self.pin_new == self.pin_confirm;
                     if widgets::accent_button(ui, if self.lock_busy { "Saving…" } else { "Save PIN" }, egui::Vec2::new(420.0, 40.0)) && can {
                         self.start_save(false);
+                    }
+                    ui.add_space(8.0);
+                    let can_sign = !self.lock_busy && !self.pin_password.is_empty();
+                    if widgets::accent_button(ui, "Sign in", egui::Vec2::new(420.0, 36.0)) && can_sign {
+                        if can {
+                            self.start_save(false);
+                        } else {
+                            self.start_pin_sign_in();
+                        }
+                    }
+                    ui.add_space(4.0);
+                    if ui.button("Skip for now").clicked() && !self.lock_busy {
+                        self.skip_pin_for_now();
                     }
                 });
             });
@@ -681,10 +760,104 @@ impl App {
         ui.add_space(12.0);
     }
 
+    fn skip_pin_for_now(&mut self) {
+        self.cfg.pin_declined = true;
+        if self.cfg.pin_prompt.is_empty() {
+            self.cfg.pin_prompt = pjdesk_proto::applock::PIN_PROMPT_VERSION.into();
+        }
+        if let Err(err) = self.cfg.save() {
+            self.pin_note = format!("Could not save that choice: {err}");
+            return;
+        }
+        self.lock_ui = false;
+        self.lock_armed = true;
+        self.lock_resetting = false;
+        self.pin_note.clear();
+        self.toast.show("PIN skipped. You can set one later in Settings.");
+    }
+
+    /// Uses the password on this screen. A session that is already signed in
+    /// checks that password. Otherwise this signs in, then saves a complete PIN.
+    fn start_pin_sign_in(&mut self) {
+        let known = self.account_email();
+        let email = if !known.is_empty() { known } else { self.pin_email.trim().to_lowercase() };
+        if email.is_empty() {
+            self.pin_note = "Enter the account email and password on this screen, or choose Skip for now.".into();
+            return;
+        }
+        if self.pin_password.is_empty() {
+            self.pin_note = "Enter the account password, or choose Skip for now.".into();
+            return;
+        }
+        let refresh = self.cfg.network_refresh_token();
+        let device = self.cfg.network_device_id.clone().unwrap_or_default();
+        let same = !self.account_email().is_empty() && self.account_email().eq_ignore_ascii_case(&email);
+        let pin_ready = pjdesk_proto::applock::pin_acceptable(&self.pin_new) && self.pin_new == self.pin_confirm;
+        if !refresh.is_empty() && !device.is_empty() && same {
+            if pin_ready {
+                self.start_save(false);
+            } else {
+                self.start_reauth_from_pin();
+            }
+            return;
+        }
+        let password = self.pin_password.clone();
+        let device_for_sign = if device.is_empty() { self.cfg.network_device() } else { device };
+        let name = crate::hostname();
+        self.lock_busy = true;
+        self.pin_note = "Signing in…".into();
+        let (tx, rx) = mpsc::channel();
+        self.lock_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("app-lock".into())
+            .spawn(move || {
+                let msg = match crate::network::sign_in(&email, &password, &device_for_sign, &name) {
+                    Ok(crate::network::SignIn::Ready(session)) => LockMsg::SignedIn(session),
+                    Ok(crate::network::SignIn::Added { email }) => {
+                        LockMsg::Failed(format!("Added this computer to {email}. That sign-in was not kept. Choose Skip for now."))
+                    }
+                    Ok(crate::network::SignIn::NoServer { .. }) => {
+                        LockMsg::Failed(format!("{}. Choose Skip for now.", crate::network::NO_SERVER))
+                    }
+                    Err(err) => LockMsg::Failed(format!("{err}. Choose Skip for now.")),
+                };
+                let _ = tx.send(msg);
+            })
+            .ok();
+    }
+
+    fn start_reauth_from_pin(&mut self) {
+        let email = self.account_email();
+        let password = self.pin_password.clone();
+        if email.is_empty() || password.is_empty() {
+            self.pin_note = "Enter the account email and password on this screen, or choose Skip for now.".into();
+            return;
+        }
+        self.lock_busy = true;
+        self.pin_note = "Signing in…".into();
+        let (tx, rx) = mpsc::channel();
+        self.lock_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("app-lock".into())
+            .spawn(move || {
+                let msg = match crate::network::confirm_account_password(&email, &password) {
+                    Ok(key) => LockMsg::Reauthed(key),
+                    Err(err) => LockMsg::Failed(format!("{err}. Choose Skip for now.")),
+                };
+                let _ = tx.send(msg);
+            })
+            .ok();
+    }
+
     fn start_save(&mut self, remove: bool) {
         let email = self.account_email();
         if email.is_empty() {
-            self.pin_note = "Sign in to set a PIN.".into();
+            let typed = self.pin_email.trim();
+            if typed.is_empty() || self.pin_password.is_empty() {
+                self.pin_note = "Enter the account email and password on this screen, or choose Skip for now.".into();
+                return;
+            }
+            self.start_pin_sign_in();
             return;
         }
         let current = self.pin_current.clone();

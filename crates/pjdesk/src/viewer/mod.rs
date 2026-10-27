@@ -72,6 +72,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let mut waiting = false;
     let mut prefer_standby = false;
+    let mut move_to: Option<String> = None;
     let mut tries = 0u32;
     loop {
         let link = if let Some(addr) = direct.clone() {
@@ -86,10 +87,14 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
                 args.force_relay,
                 waiting,
                 prefer_standby,
+                move_to.as_deref(),
             ))
         };
         let link = match link {
-            Ok(link) => link,
+            Ok(link) => {
+                move_to = None;
+                link
+            }
             Err(e) if waiting && tries < 40 => {
                 let text = format!("{e:#}");
                 if pjdesk_proto::signal::is_standby_refusal(&text) {
@@ -135,7 +140,6 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         if args.headless {
             return runtime.block_on(headless(link, args.frames));
         }
-        let was_relay = matches!(link.path, crate::p2p::LinkPath::Relay(_));
         match window::run(&runtime, link)? {
             window::ViewerStop::UserClosed => break,
             window::ViewerStop::HostRestart => {
@@ -147,20 +151,20 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
                 tracing::info!("Waiting for the computer to come back");
                 std::thread::sleep(Duration::from_secs(5));
             }
-            window::ViewerStop::RelayResume => {
+            window::ViewerStop::RelayResume { primary } => {
                 waiting = true;
-                prefer_standby = was_relay;
-                let standby = config.network_standby.clone().unwrap_or_default();
-                if prefer_standby && !standby.trim().is_empty() {
+                prefer_standby = false;
+                move_to = if primary.trim().is_empty() { None } else { Some(primary.clone()) };
+                if primary.trim().is_empty() {
                     tracing::info!(
-                        "failover: relayed session lost the rendezvous server; reconnecting through the standby {standby}"
+                        "failover: relayed session moving to the current primary; reconnecting with the password already entered"
                     );
                 } else {
                     tracing::info!(
-                        "failover: relayed session lost the rendezvous server; reconnecting with the password already entered"
+                        "failover: relayed session moving to the primary {primary}; reconnecting with the password already entered"
                     );
                 }
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(200));
             }
         }
     }
@@ -208,6 +212,7 @@ async fn connect(
     force_relay: bool,
     waiting_retry: bool,
     prefer_standby: bool,
+    move_to: Option<&str>,
 ) -> Result<Link> {
     tracing::info!("Connecting to {} through the advertised servers", format_id(target));
     let _ = (server, prefer_standby);
@@ -221,7 +226,12 @@ async fn connect(
     let access_key = pjdesk_proto::access::is_access_key(&access);
     let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s);
     let mine = mine.await.unwrap_or_default();
-    let mut signal = SignalClient::connect_catalog(config, &mine).await?;
+    let mut signal = if let Some(addr) = move_to.filter(|addr| !addr.trim().is_empty()) {
+        tracing::info!("failover: dialing the new primary {addr}");
+        SignalClient::connect_endpoint(addr, config, pjdesk_proto::routes::dial_budget(addr)).await?
+    } else {
+        SignalClient::connect_catalog(config, &mine).await?
+    };
     let mut followed_redirect = false;
     tracing::info!("Reached the server via {}", signal.via);
     if !access.is_empty() {

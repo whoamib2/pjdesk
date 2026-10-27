@@ -68,6 +68,9 @@ pub struct State {
     /// still-open one here takes over, so the computer doesn't look offline.
     pub standby: HashMap<String, Vec<OnlineHost>>,
     pub sessions: HashMap<SessionId, Session>,
+    /// Set while relayed sessions are moving to the new primary.
+    /// Step-down is written only after they have followed, or after a short wait.
+    pub pending_move: Option<PendingMove>,
     pub limiter: RateLimiter,
     pub udp_port: u16,
     /// Data folder, so accounts can be re-read when they change out-of-process.
@@ -112,6 +115,25 @@ pub struct Session {
     pub controller: PeerSlot,
     pub info_sent: bool,
     pub created: Instant,
+    /// Both peers bound, so the UDP relay is carrying this session.
+    pub relayed: bool,
+    /// [`ServerMsg::MoveRelay`] was sent to the host.
+    pub move_told: bool,
+    /// The host reported [`ClientMsg::RelayMoved`].
+    pub move_acked: bool,
+}
+
+/// A role change that is waiting for relayed sessions to leave.
+pub struct PendingMove {
+    pub primary: String,
+    pub since: Instant,
+    pub kind: StepKind,
+}
+
+/// Demote from the window, or yield because the other server was promoted.
+pub enum StepKind {
+    Demote,
+    Yield { epoch: u64, instance: String, name: String },
 }
 
 /// What we know about one side of a session.
@@ -250,6 +272,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         online: HashMap::new(),
         standby: HashMap::new(),
         sessions: HashMap::new(),
+        pending_move: None,
         limiter: RateLimiter::default(),
         udp_port: opts.port,
         data_dir: data_dir.clone(),
@@ -752,6 +775,9 @@ fn start_session(st: &mut State, ctrl: &ControllerSide, target: &str, controller
         controller: PeerSlot::default(),
         info_sent: false,
         created: Instant::now(),
+        relayed: false,
+        move_told: false,
+        move_acked: false,
     };
     st.sessions.insert(session_id, session);
     crate::audit::AuditLog::open(&st.data_dir).record(
@@ -1177,6 +1203,13 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             },
             None => conn.error(ErrorCode::Unauthorized, "please sign in again"),
         },
+
+        ClientMsg::RelayMoved { session_id } => {
+            if let Some(session) = st.sessions.get_mut(&session_id) {
+                session.move_acked = true;
+                info!("failover: session {session_id:016x} is moving to the new primary");
+            }
+        }
     }
 }
 
@@ -1256,6 +1289,103 @@ fn drop_access_key(st: &mut State, key_id: &str) -> bool {
         disconnect_device(st, id, "This access key is no longer valid.");
     }
     any
+}
+
+/// How long a role change waits for relayed sessions to follow.
+const MOVE_WAIT: Duration = Duration::from_secs(8);
+
+/// Tells relayed sessions to open again on `primary`. Returns true when the
+/// role change may be written: nothing is waiting, or every told session has
+/// followed, or the wait ran out (the crash path drops the relay).
+fn step_down_ready(state: &Shared, primary: &str, kind: StepKind) -> bool {
+    let mut st = state.lock().unwrap();
+    if st.pending_move.is_none() {
+        let target = if primary.is_empty() { "the current primary".to_string() } else { primary.to_string() };
+        info!("failover: role change started; relayed sessions move to {target} before this server steps down");
+        st.pending_move = Some(PendingMove { primary: primary.to_string(), since: Instant::now(), kind });
+    }
+    let (primary, since) = {
+        let pending = st.pending_move.as_ref().unwrap();
+        (pending.primary.clone(), pending.since)
+    };
+    let pending_ids: Vec<(SessionId, String)> = st
+        .sessions
+        .iter()
+        .filter(|(_, session)| session.relayed && !session.move_told)
+        .map(|(id, session)| (*id, session.host_id.clone()))
+        .collect();
+    let host_versions: Vec<(SessionId, String)> = pending_ids
+        .into_iter()
+        .map(|(id, host_id)| {
+            let version = st.online.get(&host_id).map(|host| host.app_version.clone()).unwrap_or_default();
+            (id, version)
+        })
+        .collect();
+    for (id, version) in host_versions {
+        let Some(session) = st.sessions.get_mut(&id) else { continue };
+        session.move_told = true;
+        if !pjdesk_proto::update::version_at_least(&version, "0.6.47") {
+            session.move_acked = true;
+            info!("failover: session {id:016x} is on an older client; it reconnects when the relay stops");
+            continue;
+        }
+        let msg = ServerMsg::MoveRelay { session_id: id, primary: primary.clone() };
+        let _ = session.host_tx.send(msg);
+        info!("failover: told session {id:016x} to reconnect through {primary}");
+    }
+    let waiting = st.sessions.values().any(|session| session.relayed && !session.move_acked);
+    let timed_out = since.elapsed() > MOVE_WAIT;
+    if waiting && !timed_out {
+        return false;
+    }
+    if waiting && timed_out {
+        warn!("failover: relayed sessions did not confirm the move; finishing step-down. A lost relay reconnects through the primary.");
+    }
+    true
+}
+
+/// Writes the standby role, then drops every relayed session.
+async fn commit_step_down(state: &Shared, acceptor: &RwLock<TlsAcceptor>) {
+    let pending = {
+        let mut st = state.lock().unwrap();
+        st.pending_move.take()
+    };
+    let Some(pending) = pending else { return };
+    let data_dir = state.lock().unwrap().data_dir.clone();
+    match pending.kind {
+        StepKind::Demote => {
+            let dir = data_dir.clone();
+            match tokio::task::spawn_blocking(move || crate::cloud::demote(&dir)).await {
+                Ok(Ok(())) => info!("failover: this server stepped down after its relayed sessions were told to move"),
+                Ok(Err(e)) => warn!("could not step down: {e:#}"),
+                Err(e) => warn!("could not step down: {e}"),
+            }
+        }
+        StepKind::Yield { epoch, instance, name } => {
+            let dir = data_dir.clone();
+            let label = name.clone();
+            let _ = tokio::task::spawn_blocking(move || crate::cloud::yield_to_epoch(&dir, epoch, &instance, &name)).await;
+            warn!("failover: generation {epoch} belongs to {label}; this server is now the standby");
+        }
+    }
+    drop_relayed_sessions(state);
+    release_hosts_for_failover(state);
+    let data_dir = state.lock().unwrap().data_dir.clone();
+    reload_from_disk(state, acceptor, &data_dir);
+}
+
+/// A standby carries no relay routes. Removing the session makes the relay
+/// task drop the forwarding entries.
+fn drop_relayed_sessions(state: &Shared) {
+    let mut st = state.lock().unwrap();
+    let ids: Vec<SessionId> = st.sessions.iter().filter(|(_, session)| session.relayed).map(|(id, _)| *id).collect();
+    let n = ids.len();
+    for id in ids {
+        st.sessions.remove(&id);
+    }
+    if n > 0 {
+        info!("failover: dropped {n} relayed session(s); this standby carries none");
+    }
 }
 
 /// Closes live registrations so those computers connect to the new primary.
@@ -1522,12 +1652,24 @@ async fn failover_watch(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
                     Err(e) => warn!("failover: could not take over: {e}"),
                 }
             }
-            crate::failover::Step::Yielded { epoch, name } => {
-                misses = 0;
-                last_log.clear();
-                warn!("failover: generation {epoch} belongs to {name}; this server is now the standby");
-                release_hosts_for_failover(&state);
-                reload_from_disk(&state, &acceptor, &data_dir);
+            crate::failover::Step::YieldPending { epoch, name, instance, primary } => {
+                let primary = if primary.is_empty() {
+                    let dir = data_dir.clone();
+                    tokio::task::spawn_blocking(move || crate::cloud::migration_target(&dir))
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    primary
+                };
+                if step_down_ready(
+                    &state,
+                    &primary,
+                    StepKind::Yield { epoch, instance, name },
+                ) {
+                    misses = 0;
+                    last_log.clear();
+                    commit_step_down(&state, &acceptor).await;
+                }
             }
         }
         if let Some(routes) = crate::cloud::take_routes_push(&data_dir, &mut routes_gen) {
@@ -1551,12 +1693,13 @@ fn push_routes(state: &Shared, routes: &pjdesk_proto::routes::ServerRoutes) {
 /// the main server if it is on standby — then reloads the key, accounts and
 /// computer list so it is ready to take over.
 async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
-    use crate::cloud::{demote, promote, sync_once, Role};
+    use crate::cloud::{promote, sync_once, Role};
     use crate::requests::{take, DEMOTE_FILE, PROMOTE_FILE, RELOAD_FILE, SYNC_FILE};
     const PASS_EVERY: u32 = 15; // ticks of 2 s
     let data_dir = state.lock().unwrap().data_dir.clone();
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let mut ticks: u32 = 0;
+    let mut want_demote = false;
     loop {
         tick.tick().await;
         ticks = ticks.wrapping_add(1);
@@ -1564,8 +1707,11 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
             reload_from_disk(&state, &acceptor, &data_dir);
         }
         let promote_now = !take(&data_dir, PROMOTE_FILE).is_empty();
-        let demote_now = !take(&data_dir, DEMOTE_FILE).is_empty();
+        if !take(&data_dir, DEMOTE_FILE).is_empty() {
+            want_demote = true;
+        }
         if promote_now {
+            want_demote = false;
             let dir = data_dir.clone();
             match tokio::task::spawn_blocking(move || promote(&dir)).await {
                 Ok(Ok(())) => info!("This server is now the cloud primary"),
@@ -1573,12 +1719,14 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
                 Err(e) => warn!("could not become the cloud primary: {e}"),
             }
             reload_from_disk(&state, &acceptor, &data_dir);
-        } else if demote_now {
+        } else if want_demote {
             let dir = data_dir.clone();
-            match tokio::task::spawn_blocking(move || demote(&dir)).await {
-                Ok(Ok(())) => info!("This server stepped down to cloud standby"),
-                Ok(Err(e)) => warn!("could not step down: {e:#}"),
-                Err(e) => warn!("could not step down: {e}"),
+            let primary = tokio::task::spawn_blocking(move || crate::cloud::migration_target(&dir))
+                .await
+                .unwrap_or_default();
+            if step_down_ready(&state, &primary, StepKind::Demote) {
+                commit_step_down(&state, &acceptor).await;
+                want_demote = false;
             }
         }
         let forced = !take(&data_dir, SYNC_FILE).is_empty();
@@ -1694,6 +1842,7 @@ mod tests {
             online: HashMap::new(),
             standby: HashMap::new(),
             sessions: HashMap::new(),
+            pending_move: None,
             limiter: RateLimiter::default(),
             udp_port: 21200,
             data_dir: dir.to_path_buf(),

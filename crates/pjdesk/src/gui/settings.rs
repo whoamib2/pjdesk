@@ -298,6 +298,23 @@ impl App {
         };
 
         let key_text = d.access_key.trim().to_string();
+        if !key_text.is_empty() {
+            match pjdesk_proto::netkey::classify_paste(&key_text) {
+                pjdesk_proto::netkey::PasteKind::Network => {
+                    self.status = pjdesk_proto::netkey::NETWORK_KEY_GOES.into();
+                    return false;
+                }
+                pjdesk_proto::netkey::PasteKind::Access => {}
+                pjdesk_proto::netkey::PasteKind::AccessIncomplete => {
+                    self.status = pjdesk_proto::netkey::ACCESS_KEY_INCOMPLETE.into();
+                    return false;
+                }
+                pjdesk_proto::netkey::PasteKind::Neither => {
+                    self.status = "That is not a server access key. A server access key starts with pjdesk-key1. A network key starts with pjdesk-net1 and goes in Use a network key.".into();
+                    return false;
+                }
+            }
+        }
         let key_changed = key_text != self.cfg.server_access_key();
         let server_changed = self.cfg.server != new_server;
         if server_changed {
@@ -627,7 +644,7 @@ impl App {
         widgets::text_field(ui, &mut self.settings.server, "desk.example.com  or  192.168.1.10", false);
         ui.add_space(6.0);
         widgets::field_label(ui, "Access key");
-        widgets::password_field(ui, &mut self.settings.access_key, "Optional", &mut self.settings.show_access_key);
+        widgets::password_field(ui, &mut self.settings.access_key, "pjdesk-key1.…", &mut self.settings.show_access_key);
         ui.label(widgets::muted(
             ui,
             "From the person who runs the server. With this key, this computer can register when signed-in accounts are required.",

@@ -83,6 +83,12 @@ pub struct Config {
     /// Unix time until which more PIN tries wait. 0 when there is no wait.
     #[serde(default)]
     pub app_lock_until: u64,
+    /// Skip for now on Set a PIN. The blocking screen stays off.
+    #[serde(default)]
+    pub pin_declined: bool,
+    /// `0.6.47` after this build has decided whether an older session was stuck on Set a PIN.
+    #[serde(default)]
+    pub pin_prompt: String,
     /// PJDesk account that owns the private server this client uses.
     #[serde(default)]
     pub network_email: Option<String>,
@@ -814,6 +820,49 @@ impl Config {
         self.app_lock_until = 0;
     }
 
+    /// A code, a support key, a network key, or a server access key.
+    /// Those computers are not asked to set an account PIN.
+    pub fn joined_by_code_or_key(&self) -> bool {
+        if self.support_grant.is_some() {
+            return true;
+        }
+        if self.network_key.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            return true;
+        }
+        if self.server_access_key.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            return true;
+        }
+        if self.network_role == "support" {
+            return true;
+        }
+        let email = self.network_email.as_deref().unwrap_or("").trim();
+        let refresh = self.network_refresh.as_deref().is_some_and(|s| !s.trim().is_empty());
+        refresh && email.is_empty()
+    }
+
+    fn has_saved_pin_material(&self) -> bool {
+        self.app_lock_verifier.as_deref().is_some_and(|s| !s.is_empty()) || !self.app_lock_sealed.trim().is_empty()
+    }
+
+    /// A session that already existed, with no PIN, was the stuck Set a PIN screen.
+    /// Record that once so the next launch does not show it again.
+    /// Returns true when the config should be saved.
+    pub fn release_stuck_pin_prompt(&mut self) -> bool {
+        let had_session = self.network_refresh.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let (declined, save) = pjdesk_proto::applock::pin_prompt_on_launch(
+            &self.pin_prompt,
+            self.pin_declined,
+            had_session,
+            self.has_saved_pin_material(),
+        );
+        if !save {
+            return false;
+        }
+        self.pin_declined = declined;
+        self.pin_prompt = pjdesk_proto::applock::PIN_PROMPT_VERSION.into();
+        true
+    }
+
     pub fn leave_network_sign_in(&mut self) {
         self.network_email = None;
         self.network_refresh = None;
@@ -1091,6 +1140,41 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_code_join_and_an_older_session_skip_the_pin_screen() {
+        let mut c = Config::default();
+        assert!(!c.joined_by_code_or_key());
+        assert!(c.release_stuck_pin_prompt());
+        assert!(!c.pin_declined);
+        assert_eq!(c.pin_prompt, "0.6.47");
+        assert!(!c.release_stuck_pin_prompt());
+
+        let mut stuck = Config::default();
+        stuck.network_refresh = Some("plain:refresh".into());
+        assert!(stuck.joined_by_code_or_key());
+        assert!(stuck.release_stuck_pin_prompt());
+        assert!(stuck.pin_declined);
+
+        let mut kept = Config::default();
+        kept.network_refresh = Some("plain:refresh".into());
+        kept.network_email = Some("ben@spader.us".into());
+        kept.app_lock_sealed = "blob".into();
+        assert!(!kept.joined_by_code_or_key());
+        assert!(kept.release_stuck_pin_prompt());
+        assert!(!kept.pin_declined);
+
+        let mut keyed = Config::default();
+        keyed.network_email = Some("ben@spader.us".into());
+        keyed.network_key = Some("pjdesk-net1:abc".into());
+        assert!(keyed.joined_by_code_or_key());
+        keyed.network_key = None;
+        keyed.server_access_key = Some("sealed".into());
+        assert!(keyed.joined_by_code_or_key());
+        keyed.server_access_key = None;
+        keyed.network_role = "support".into();
+        assert!(keyed.joined_by_code_or_key());
+    }
 
     #[test]
     fn remembered_password_roundtrips() {

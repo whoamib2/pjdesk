@@ -28,6 +28,28 @@ pub fn is_relay_resume(message: &str) -> bool {
     message.contains("relayed session lost the rendezvous server")
 }
 
+/// Same reconnect, naming the primary the session must use.
+/// The first line stays [`RELAY_RESUME`] so an older check still matches.
+pub fn relay_resume_message(primary: &str) -> String {
+    let primary = primary.trim();
+    if primary.is_empty() {
+        RELAY_RESUME.to_string()
+    } else {
+        format!("{RELAY_RESUME}\nprimary {primary}")
+    }
+}
+
+/// Primary address carried by [`relay_resume_message`]. Empty when the
+/// session should use the account's current primary.
+pub fn primary_from_resume(message: &str) -> String {
+    message
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("primary "))
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 /// What the latest direct probe of the primary saw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Probe {
@@ -160,6 +182,148 @@ pub fn session_fate(path: MediaPath) -> SessionFate {
         MediaPath::Direct | MediaPath::Lan | MediaPath::HolePunched => SessionFate::Survives,
         MediaPath::Relayed => SessionFate::Reconnect,
     }
+}
+
+/// Why a relayed session is leaving the server that was carrying it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveCause {
+    /// This server is being demoted, or the other server was promoted.
+    /// The move happens before the role change is finished.
+    RoleChange,
+    /// The relay or the process died. Backup for a crash.
+    ServerGone,
+}
+
+/// Where one session goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionHop {
+    /// Direct, LAN, or hole-punched. The server is not on the path.
+    Keep,
+    /// Open the session again on this primary. The password is already known.
+    ToPrimary { address: String, cause: MoveCause },
+}
+
+/// A relayed session moves to the primary. Every other path stays up.
+pub fn hop_session(path: MediaPath, cause: MoveCause, primary: &str) -> SessionHop {
+    match session_fate(path) {
+        SessionFate::Survives => SessionHop::Keep,
+        SessionFate::Reconnect => SessionHop::ToPrimary {
+            address: primary.trim().to_string(),
+            cause,
+        },
+    }
+}
+
+/// Address to name in the move. A public endpoint, then a LAN endpoint, then a hostname.
+pub fn move_target(public_addrs: &[String], lan_addrs: &[String], names: &[String]) -> String {
+    for list in [public_addrs, lan_addrs, names] {
+        if let Some(addr) = list.iter().map(|item| item.trim()).find(|item| !item.is_empty()) {
+            return addr.to_string();
+        }
+    }
+    String::new()
+}
+
+/// This server's role while relayed sessions are handed to the new primary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RolePhase {
+    /// Still relaying. No role change has started.
+    Primary,
+    /// Sessions have been told. Step-down is not finished.
+    Moving,
+    /// Step-down is recorded. This server carries no relayed sessions.
+    Standby,
+}
+
+/// One live session from the point of view of the server that is leaving.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveSession {
+    pub id: u64,
+    pub path: MediaPath,
+    /// `"here"` while this server carries it. The primary address after it moves.
+    pub server: String,
+}
+
+/// A demotion or a promotion of the other server.
+///
+/// [`RoleChange::begin`] tells relayed sessions and does not finish.
+/// [`RoleChange::followed`] records that a session is on the new primary.
+/// Only then is the phase [`RolePhase::Standby`]. Shutting the old server
+/// down after that does not end those sessions.
+#[derive(Clone, Debug)]
+pub struct RoleChange {
+    pub phase: RolePhase,
+    pub primary: String,
+    told: Vec<u64>,
+}
+
+impl RoleChange {
+    pub fn new(primary: impl Into<String>) -> Self {
+        Self { phase: RolePhase::Primary, primary: primary.into(), told: Vec::new() }
+    }
+
+    /// Tell every relayed session still on this server. Returns their ids.
+    /// Direct sessions are not told. An empty tell finishes at once.
+    pub fn begin(&mut self, sessions: &[LiveSession]) -> Vec<u64> {
+        if self.phase == RolePhase::Standby {
+            return Vec::new();
+        }
+        let ids: Vec<u64> = sessions
+            .iter()
+            .filter(|session| {
+                session.server == "here"
+                    && matches!(
+                        hop_session(session.path, MoveCause::RoleChange, &self.primary),
+                        SessionHop::ToPrimary { .. }
+                    )
+            })
+            .map(|session| session.id)
+            .collect();
+        if ids.is_empty() {
+            self.phase = RolePhase::Standby;
+            self.told.clear();
+            return Vec::new();
+        }
+        self.phase = RolePhase::Moving;
+        self.told = ids.clone();
+        ids
+    }
+
+    /// That session is now on the new primary. The last one finishes the role change.
+    pub fn followed(&mut self, sessions: &mut [LiveSession], id: u64) -> bool {
+        if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
+            if matches!(
+                hop_session(session.path, MoveCause::RoleChange, &self.primary),
+                SessionHop::ToPrimary { .. }
+            ) {
+                session.server = self.primary.clone();
+            }
+        }
+        self.told.retain(|told| *told != id);
+        if self.phase == RolePhase::Moving && self.told.is_empty() {
+            self.phase = RolePhase::Standby;
+        }
+        self.phase == RolePhase::Standby
+    }
+
+    pub fn finished(&self) -> bool {
+        self.phase == RolePhase::Standby
+    }
+
+    /// True when every relayed session already runs on the new primary, so
+    /// stopping the old server does not end it.
+    pub fn survives_old_shutdown(&self, sessions: &[LiveSession]) -> bool {
+        self.finished()
+            && sessions
+                .iter()
+                .filter(|session| session.path == MediaPath::Relayed)
+                .all(|session| session.server == self.primary)
+    }
+}
+
+/// A standby does not keep relay routes.
+pub fn standby_relays(phase: RolePhase, relayed_here: usize) -> bool {
+    phase == RolePhase::Standby && relayed_here > 0
 }
 
 pub fn classify_link(relayed: bool, lan: bool, direct_ip: bool) -> MediaPath {
@@ -526,5 +690,51 @@ mod tests {
         assert!(own_row_online(true, false));
         assert!(own_row_online(false, true));
         assert!(!own_row_online(false, false));
+    }
+
+    #[test]
+    fn demote_moves_relayed_sessions_before_step_down_and_shutdown_leaves_them_on_the_primary() {
+        let primary = "203.0.113.10:21200";
+        let mut sessions = vec![
+            LiveSession { id: 1, path: MediaPath::Relayed, server: "here".into() },
+            LiveSession { id: 2, path: MediaPath::Direct, server: "here".into() },
+            LiveSession { id: 3, path: MediaPath::HolePunched, server: "here".into() },
+        ];
+        let mut change = RoleChange::new(primary);
+
+        let told = change.begin(&sessions);
+        assert_eq!(told, vec![1], "only the relayed session is told to move");
+        assert_eq!(change.phase, RolePhase::Moving);
+        assert!(!change.finished(), "step-down waits until that session is on the new primary");
+        assert_eq!(sessions[0].server, "here", "the move is not finished at the moment of the tell");
+        assert!(!change.survives_old_shutdown(&sessions), "shutting down now would still drop the relay");
+
+        assert!(change.followed(&mut sessions, 1));
+        assert!(change.finished());
+        assert_eq!(sessions[0].server, primary);
+        assert_eq!(sessions[1].server, "here", "a direct session never used the relay");
+        assert_eq!(sessions[2].server, "here");
+        assert!(!standby_relays(change.phase, 0));
+        assert!(standby_relays(RolePhase::Standby, 1));
+
+        // The old server can stop. The session is already on the new primary.
+        assert!(change.survives_old_shutdown(&sessions));
+        assert_eq!(
+            sessions.iter().filter(|session| session.path == MediaPath::Relayed && session.server == "here").count(),
+            0
+        );
+
+        // A crash, with no role change, still reconnects through the primary.
+        assert_eq!(
+            hop_session(MediaPath::Relayed, MoveCause::ServerGone, primary),
+            SessionHop::ToPrimary { address: primary.into(), cause: MoveCause::ServerGone }
+        );
+        assert!(matches!(hop_session(MediaPath::Lan, MoveCause::RoleChange, primary), SessionHop::Keep));
+        assert_eq!(primary_from_resume(&relay_resume_message(primary)), primary);
+        assert!(is_relay_resume(&relay_resume_message(primary)));
+        assert_eq!(
+            move_target(&["203.0.113.10:21200".into()], &["192.0.2.5:21200".into()], &["pjdesk.example".into()]),
+            "203.0.113.10:21200"
+        );
     }
 }

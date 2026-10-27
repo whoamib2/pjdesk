@@ -68,19 +68,31 @@ pub async fn run(socket: Arc<UdpSocket>, state: Shared) -> Result<()> {
                     }
                 }
             }
-        } else if routes.get(&src).is_some_and(|route| route.bytes.saturating_add(len as u64) > ROUTE_MAX_BYTES) {
-            info!("relay route from {src} hit the {} MiB cap; closing it", ROUTE_MAX_BYTES / (1024 * 1024));
-            routes.remove(&src);
-        } else if let Some(to) = routes.get_mut(&src).map(|route| {
-            route.last_seen = Instant::now();
-            route.bytes += len as u64;
-            route.to
-        }) {
-            // `routes` is not borrowed across this await.
-            if let Err(e) = socket.send_to(packet, to).await {
-                if last_forward_error.elapsed() > Duration::from_secs(10) {
-                    last_forward_error = Instant::now();
-                    tracing::warn!("Relay could not forward a packet to {to}: {e}");
+        } else if routes.contains_key(&src) {
+            let (to, session_id, over_cap) = {
+                let route = routes.get(&src).unwrap();
+                (
+                    route.to,
+                    route.session_id,
+                    route.bytes.saturating_add(len as u64) > ROUTE_MAX_BYTES,
+                )
+            };
+            let alive = state.lock().unwrap().sessions.contains_key(&session_id);
+            if !alive {
+                routes.remove(&src);
+            } else if over_cap {
+                info!("relay route from {src} hit the {} MiB cap; closing it", ROUTE_MAX_BYTES / (1024 * 1024));
+                routes.remove(&src);
+            } else {
+                if let Some(route) = routes.get_mut(&src) {
+                    route.last_seen = Instant::now();
+                    route.bytes += len as u64;
+                }
+                if let Err(e) = socket.send_to(packet, to).await {
+                    if last_forward_error.elapsed() > Duration::from_secs(10) {
+                        last_forward_error = Instant::now();
+                        tracing::warn!("Relay could not forward a packet to {to}: {e}");
+                    }
                 }
             }
         }
@@ -92,7 +104,8 @@ pub async fn run(socket: Arc<UdpSocket>, state: Shared) -> Result<()> {
                 binds.clear();
             }
             routes.retain(|addr, route| {
-                let keep = route.last_seen.elapsed() < ROUTE_IDLE;
+                let alive = state.lock().unwrap().sessions.contains_key(&route.session_id);
+                let keep = alive && route.last_seen.elapsed() < ROUTE_IDLE;
                 if !keep && route.bytes > 0 {
                     info!(
                         "Session {:016x}: relay route {addr} → {} closed after {:.1} MB",
@@ -146,6 +159,7 @@ fn handle_bind(
     session.slot_mut(role).public = Some(src);
 
     if let (Some(host), Some(ctrl)) = (session.host.public, session.controller.public) {
+        session.relayed = true;
         if first_time {
             let now = Instant::now();
             routes.insert(host, Route { to: ctrl, session_id, last_seen: now, bytes: 0 });

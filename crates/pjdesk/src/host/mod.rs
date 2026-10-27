@@ -88,6 +88,10 @@ pub struct HostShared {
     /// Lines for a transfer list. Nothing in the window reads them yet.
     #[allow(dead_code)]
     transfers: Mutex<Vec<String>>,
+    /// Primary address for a relayed session the server asked to move.
+    pub relay_move: Mutex<Option<String>>,
+    /// The host has forwarded that move to the controller.
+    pub relay_sent: AtomicBool,
 }
 
 /// Shown when someone wants to connect and approval is set to prompt.
@@ -307,6 +311,10 @@ pub(crate) struct HostState {
     /// Refresh token and key id for the connection log. Absent when this computer
     /// has no support key. The digits are not here.
     support_log: Mutex<Option<SupportLog>>,
+    /// New primary from [`ServerMsg::MoveRelay`]. The next registration dials it.
+    follow: Mutex<Option<String>>,
+    /// Session the server asked to move.
+    moving: Mutex<Option<SessionId>>,
 }
 
 #[derive(Clone)]
@@ -515,6 +523,8 @@ async fn host_main(
         server_proto: AtomicU16::new(pjdesk_proto::PROTOCOL_VERSION),
         device_id: Mutex::new(String::new()),
         support_log: Mutex::new(None),
+        follow: Mutex::new(None),
+        moving: Mutex::new(None),
     });
     if args.allow_direct {
         let direct = state.clone();
@@ -553,7 +563,7 @@ async fn host_main(
                 }
                 return Ok(());
             }
-            Ok(SignalEnd::Again) => None,
+            Ok(SignalEnd::Again) | Ok(SignalEnd::Follow) => None,
             Ok(SignalEnd::Lost) => Some(pjdesk_proto::failover::RegFail::Unreachable),
             Err(e) if format!("{e:#}").contains("SERVER KEY MISMATCH") => {
                 if let Some(shared) = &state.shared {
@@ -635,6 +645,8 @@ enum SignalEnd {
     Again,
     /// The server stopped answering.
     Lost,
+    /// Register with the primary named by a relay move.
+    Follow,
 }
 
 /// Dials the fresh advertised IPs, then a saved hostname, and registers.
@@ -651,9 +663,17 @@ async fn register_catalog(
     let device_secret = config.device_secret()?;
     let mut without_token = false;
     let mut redirects = 0u8;
-    let mut signal = SignalClient::connect_catalog(config, &mine).await.map_err(|err| {
-        anyhow::anyhow!("could not reach the primary or the standby; retrying. {err:#}")
-    })?;
+    let follow = state.follow.lock().unwrap().clone().filter(|addr| !addr.trim().is_empty());
+    let mut signal = if let Some(addr) = follow {
+        info!("failover: registering with the new primary at {addr}");
+        SignalClient::connect_endpoint(&addr, config, pjdesk_proto::routes::dial_budget(&addr)).await.map_err(|err| {
+            anyhow::anyhow!("could not reach the new primary at {addr}; retrying. {err:#}")
+        })?
+    } else {
+        SignalClient::connect_catalog(config, &mine).await.map_err(|err| {
+            anyhow::anyhow!("could not reach the primary or the standby; retrying. {err:#}")
+        })?
+    };
     loop {
         let register_proto = state.server_proto.load(Ordering::SeqCst);
         let server = ServerAddr { host: signal.server_addr.ip().to_string(), port: signal.server_addr.port() };
@@ -671,7 +691,10 @@ async fn register_catalog(
         })?;
         loop {
             match timeout(Duration::from_secs(10), signal.recv()).await {
-                Ok(Some(ServerMsg::Registered { device_id })) => return Ok((signal, server, device_id)),
+                Ok(Some(ServerMsg::Registered { device_id })) => {
+                    *state.follow.lock().unwrap() = None;
+                    return Ok((signal, server, device_id));
+                }
                 Ok(Some(ServerMsg::Routes(routes))) => {
                     if !routes.is_empty() {
                         config.network_routes = routes;
@@ -811,6 +834,17 @@ async fn signaling_loop(
                     return Ok(SignalEnd::Stop);
                 }
                 state.apply_ui_requests();
+                let sent = state.shared.as_ref().is_some_and(|s| s.relay_sent.load(Ordering::SeqCst));
+                if sent && !state.streaming.load(Ordering::SeqCst) {
+                    if let Some(id) = state.moving.lock().unwrap().take() {
+                        let _ = signal.send(ClientMsg::RelayMoved { session_id: id });
+                    }
+                    if let Some(shared) = &state.shared {
+                        shared.relay_sent.store(false, Ordering::SeqCst);
+                    }
+                    info!("failover: relayed session left; registering with the new primary");
+                    return Ok(SignalEnd::Follow);
+                }
             }
             _ = ping.tick() => {
                 if awaiting_pong {
@@ -922,6 +956,19 @@ async fn signaling_loop(
                             config.network_routes = routes;
                             let _ = config.save();
                             info!("Updated server addresses from the primary");
+                        }
+                    }
+                    ServerMsg::MoveRelay { session_id, primary } => {
+                        info!("failover: moving relayed session {session_id:016x} to the primary {primary}");
+                        *state.follow.lock().unwrap() = Some(primary.clone());
+                        *state.moving.lock().unwrap() = Some(session_id);
+                        if let Some(shared) = &state.shared {
+                            *shared.relay_move.lock().unwrap() = Some(primary);
+                            shared.relay_sent.store(false, Ordering::SeqCst);
+                        }
+                        if !state.streaming.load(Ordering::SeqCst) {
+                            let _ = signal.send(ClientMsg::RelayMoved { session_id });
+                            return Ok(SignalEnd::Follow);
                         }
                     }
                     ServerMsg::WantHostReport => {

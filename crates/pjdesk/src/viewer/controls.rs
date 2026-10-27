@@ -81,6 +81,8 @@ pub struct Live {
     pub relayed: bool,
     /// That relay path dropped. The window reconnects without asking again.
     pub resume_relay: bool,
+    /// Primary the relayed session should open on. Empty uses the account's current primary.
+    pub move_primary: String,
     pub closed: Option<String>,
     /// The phone's accessibility service is off, so clicks do not land.
     pub control_off: bool,
@@ -115,6 +117,7 @@ impl Live {
             restart: false,
             relayed: false,
             resume_relay: false,
+            move_primary: String::new(),
             closed: None,
             control_off: false,
             paths: HashMap::new(),
@@ -158,6 +161,7 @@ impl Live {
             restart: self.restart,
             relayed: self.relayed,
             resume_relay: self.resume_relay,
+            move_primary: self.move_primary.clone(),
             closed: self.closed.clone(),
             control_off: self.control_off,
             paths: HashMap::new(),
@@ -453,6 +457,12 @@ fn on_host(
                 }
                 let _ = control.send(ControlMsg::File(FileMsg::Accept { id, resume_from: resume }));
             }
+        }
+        HostMsg::MoveRelay { primary } => {
+            g.move_primary = primary;
+            g.note("Reconnecting…");
+            note_relay_resume(&mut g);
+            wake();
         }
         HostMsg::AskVisitor => {
             let _ = control.send(this_visitor());

@@ -158,6 +158,14 @@ struct State {
     /// uses a new value, so an older session ending cannot clear it.
     host_live: AtomicU64,
     host_live_seq: AtomicU64,
+    /// Primary a relayed session was told to use. Tried before the catalog.
+    move_primary: Mutex<String>,
+    /// Session the server asked this phone to move, and the primary address.
+    relay_move: Mutex<Option<(u64, String)>>,
+    /// Wakes registration so this phone follows that primary.
+    moved: Notify,
+    /// Set with [`State::moved`] so a notify that arrives early is not lost.
+    leave_primary: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -301,6 +309,10 @@ impl Engine {
             file_seq: AtomicU64::new(1),
             host_live: AtomicU64::new(0),
             host_live_seq: AtomicU64::new(0),
+            move_primary: Mutex::new(String::new()),
+            relay_move: Mutex::new(None),
+            moved: Notify::new(),
+            leave_primary: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let engine = Self { state: state.clone(), cmds: tx };
@@ -699,15 +711,15 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                                 break;
                             }
                             resumes += 1;
-                            prefer_standby = !state.standby.lock().unwrap().trim().is_empty();
-                            let standby = state.standby.lock().unwrap().clone();
+                            prefer_standby = false;
+                            let primary = state.move_primary.lock().unwrap().clone();
                             log_line(
                                 &cb,
-                                if standby.trim().is_empty() {
-                                    "failover: relayed session lost the rendezvous server; reconnecting".into()
+                                if primary.trim().is_empty() {
+                                    "failover: relayed session moving to the current primary; reconnecting".into()
                                 } else {
                                     format!(
-                                        "failover: relayed session lost the rendezvous server; reconnecting through the standby {standby}"
+                                        "failover: relayed session moving to the primary {primary}; reconnecting"
                                     )
                                 },
                             );
@@ -1018,8 +1030,13 @@ fn routes_from_command(cmd: &Value) -> pjdesk_proto::routes::ServerRoutes {
 async fn open_ordered(state: &State, cb: &Arc<dyn Callbacks>, pinned: Option<pjdesk_proto::tls::Fingerprint>) -> Result<SignalClient> {
     let routes = state.routes.lock().unwrap().clone();
     let saved = state.server.lock().unwrap().clone();
+    let told = state.move_primary.lock().unwrap().clone();
     let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
-    let targets = pjdesk_proto::routes::dial_targets(&routes, &mine, &saved);
+    let mut targets = pjdesk_proto::routes::dial_targets(&routes, &mine, &saved);
+    if !told.trim().is_empty() {
+        targets.retain(|target| target != &told);
+        targets.insert(0, told);
+    }
     if targets.is_empty() {
         bail!("This phone has no server address yet. Sign in again, or set the server in Settings.");
     }
@@ -1250,7 +1267,18 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
         if state.app_stop.load(Ordering::SeqCst) {
             return Ok(PhoneHost::Stop);
         }
+        if state.leave_primary.swap(false, Ordering::SeqCst) {
+            log_line(&cb, "failover: registering with the new primary");
+            emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
+            return Ok(PhoneHost::Lost);
+        }
         tokio::select! {
+            _ = state.moved.notified() => {
+                state.leave_primary.store(false, Ordering::SeqCst);
+                log_line(&cb, "failover: registering with the new primary");
+                emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
+                return Ok(PhoneHost::Lost);
+            }
             _ = ping.tick() => {
                 if state.access_epoch.load(Ordering::SeqCst) != epoch {
                     return Ok(PhoneHost::Again);
@@ -1449,6 +1477,17 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                                 &cb,
                                 format!("heartbeat from {server} via {} ({}) (phone)", signal.via, signal.server_addr),
                             );
+                        }
+                    }
+                    ServerMsg::MoveRelay { session_id, primary } => {
+                        log_line(&cb, format!("failover: moving the relayed session to the primary {primary}"));
+                        *state.move_primary.lock().unwrap() = primary.clone();
+                        if routes.contains_key(&session_id) {
+                            *state.relay_move.lock().unwrap() = Some((session_id, primary));
+                            state.session_wake.notify_waiters();
+                        } else {
+                            state.leave_primary.store(true, Ordering::SeqCst);
+                            state.moved.notify_waiters();
                         }
                     }
                     ServerMsg::UpdateNow => {
@@ -1826,6 +1865,19 @@ async fn host_session(
         emit(&cb, &json!({"event":"keyframe"}));
     }
     let result = loop {
+        let pending_move = state.relay_move.lock().unwrap().clone();
+        if let Some((sid, primary)) = pending_move {
+            if sid == session_id {
+                *state.relay_move.lock().unwrap() = None;
+                let _ = write_msg(&mut control_send, &HostMsg::MoveRelay { primary: primary.clone() }).await;
+                let _ = signal.send(ClientMsg::RelayMoved { session_id });
+                *state.move_primary.lock().unwrap() = primary;
+                log_line(&cb, "failover: told the other computer to move; registering with the new primary");
+                state.leave_primary.store(true, Ordering::SeqCst);
+                state.moved.notify_waiters();
+                break Err(anyhow!("relayed session moving to the new primary"));
+            }
+        }
         if connection.close_reason().is_some() {
             break Err(anyhow!("the other computer closed the session"));
         }
@@ -2399,6 +2451,7 @@ async fn controller_session(
         }
         match tokio::time::timeout(Duration::from_secs(90), signal.recv()).await {
             Ok(Some(ServerMsg::SessionReady { session_id, token, udp_port, host_name })) => {
+                *state.move_primary.lock().unwrap() = String::new();
                 log_line(&cb, format!("the other computer accepted, session {session_id:x}"));
                 break (session_id, token, udp_port, host_name);
             }
@@ -2675,6 +2728,11 @@ async fn controller_session(
                 );
             }
             Ok(HostMsg::Notice(text)) => emit(&cb, &json!({"event":"status","text": text})),
+            Ok(HostMsg::MoveRelay { primary }) => {
+                *state.move_primary.lock().unwrap() = primary.clone();
+                log_line(&cb, format!("failover: moving this relayed session to the primary {primary}"));
+                break pjdesk_proto::failover::relay_resume_message(&primary);
+            }
             Ok(HostMsg::AskVisitor) => {
                 let _ = control_tx.send(android_visitor(&state));
             }
@@ -2736,11 +2794,17 @@ async fn controller_session(
     let still_watching = state.view_gen.load(Ordering::SeqCst) == view_mark
         && state.gen.load(Ordering::SeqCst) == gen
         && !state.app_stop.load(Ordering::SeqCst);
-    if relayed && still_watching && pjdesk_proto::failover::session_fate(pjdesk_proto::failover::MediaPath::Relayed)
-        == pjdesk_proto::failover::SessionFate::Reconnect
+    if relayed && still_watching && (pjdesk_proto::failover::is_relay_resume(&end_reason)
+        || pjdesk_proto::failover::session_fate(pjdesk_proto::failover::MediaPath::Relayed)
+            == pjdesk_proto::failover::SessionFate::Reconnect)
     {
-        log_line(&cb, pjdesk_proto::failover::RELAY_RESUME);
-        bail!(pjdesk_proto::failover::RELAY_RESUME);
+        let message = if pjdesk_proto::failover::is_relay_resume(&end_reason) {
+            end_reason.clone()
+        } else {
+            pjdesk_proto::failover::RELAY_RESUME.to_string()
+        };
+        log_line(&cb, message.clone());
+        bail!(message);
     }
     log_line(&cb, format!("controller session ended: {end_reason}"));
     emit(&cb, &json!({"event":"disconnected","role":"controller","reason": end_reason}));
@@ -3108,6 +3172,10 @@ mod tests {
             file_seq: AtomicU64::new(1),
             host_live: AtomicU64::new(0),
             host_live_seq: AtomicU64::new(0),
+            move_primary: Mutex::new(String::new()),
+            relay_move: Mutex::new(None),
+            moved: Notify::new(),
+            leave_primary: AtomicBool::new(false),
         })
     }
 

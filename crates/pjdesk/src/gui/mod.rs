@@ -352,9 +352,11 @@ pub struct App {
     net_show: bool,
     net_code: String,
     net_consent: bool,
-    /// 0 account, 1 enrollment code, 2 network key.
+    /// 0 account, 1 enrollment code, 2 network key, 3 server access key.
     net_mode: u8,
     net_blob: String,
+    /// Server address typed with a server access key. The key itself has no address.
+    net_server: String,
     net_key_pass: String,
     net_key_show: bool,
     /// The key is limited to one account, so email and password are shown too.
@@ -450,6 +452,8 @@ pub struct App {
     pin_new: String,
     pin_confirm: String,
     pin_password: String,
+    /// Typed on Set a PIN when this computer has no account email yet.
+    pin_email: String,
     pin_show_current: bool,
     pin_show_new: bool,
     pin_show_confirm: bool,
@@ -559,6 +563,7 @@ impl App {
             net_consent: false,
             net_mode: 0,
             net_blob: String::new(),
+            net_server: String::new(),
             net_key_pass: String::new(),
             net_key_show: false,
             net_key_account: false,
@@ -639,6 +644,7 @@ impl App {
             pin_new: String::new(),
             pin_confirm: String::new(),
             pin_password: String::new(),
+            pin_email: String::new(),
             pin_show_current: false,
             pin_show_new: false,
             pin_show_confirm: false,
@@ -655,6 +661,11 @@ impl App {
         }
         if app.cfg.account.is_some() {
             app.start_token_refresh();
+        }
+        if !preview && app.cfg.release_stuck_pin_prompt() {
+            if let Err(err) = app.cfg.save() {
+                tracing::info!("Could not record the PIN prompt: {err}");
+            }
         }
         if !preview {
             crate::host::direct::set_lan_discovery(app.cfg.settings.discover_lan);
@@ -1516,6 +1527,9 @@ impl App {
         if self.net_busy {
             return;
         }
+        if (self.net_mode == 2 || self.net_mode == 3) && self.route_pasted_key() {
+            return;
+        }
         let enroll_only = self.net_enroll_only;
         self.net_enroll_only = false;
         let pjdesk_id = self.visible_id();
@@ -1599,6 +1613,85 @@ impl App {
         }
     }
 
+    /// An access key enrolls here. A network key pasted on the access-key form is sent back.
+    /// Returns true when redeem must not run.
+    fn route_pasted_key(&mut self) -> bool {
+        let kind = pjdesk_proto::netkey::classify_paste(&self.net_blob);
+        match (self.net_mode, kind) {
+            (_, pjdesk_proto::netkey::PasteKind::Access) => {
+                let key = self.net_blob.clone();
+                self.apply_server_access_key(&key);
+                true
+            }
+            (_, pjdesk_proto::netkey::PasteKind::AccessIncomplete) => {
+                self.net_mode = 3;
+                self.show_net_sign_in = true;
+                self.net_error = pjdesk_proto::netkey::ACCESS_KEY_INCOMPLETE.into();
+                true
+            }
+            (2, pjdesk_proto::netkey::PasteKind::Neither) => {
+                self.net_error = pjdesk_proto::netkey::KEY_NOT_EITHER.into();
+                true
+            }
+            (3, pjdesk_proto::netkey::PasteKind::Network) => {
+                self.net_mode = 2;
+                self.net_error = pjdesk_proto::netkey::NETWORK_KEY_GOES.into();
+                true
+            }
+            (3, pjdesk_proto::netkey::PasteKind::Neither) => {
+                self.net_error = "This is not a server access key. A server access key starts with pjdesk-key1. A network key starts with pjdesk-net1 and goes in Use a network key.".into();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Saves a server access key and registers this computer without a PJDesk account.
+    /// Expiry and the computer limit are enforced by the server when it registers.
+    fn apply_server_access_key(&mut self, raw: &str) {
+        let Some(key) = pjdesk_proto::netkey::access_key_from_text(raw) else {
+            self.net_mode = 3;
+            self.show_net_sign_in = true;
+            self.net_error = pjdesk_proto::netkey::ACCESS_KEY_INCOMPLETE.into();
+            return;
+        };
+        let typed = self.net_server.trim();
+        let address = if !typed.is_empty() { typed.to_string() } else { self.cfg.effective_server() };
+        if address.is_empty() {
+            self.net_mode = 3;
+            self.net_blob = key;
+            self.show_net_sign_in = true;
+            self.net_error = pjdesk_proto::netkey::ACCESS_KEY_NEEDS_SERVER.into();
+            return;
+        }
+        let parsed = match ServerAddr::parse(&address) {
+            Ok(addr) => addr.to_string(),
+            Err(err) => {
+                self.net_mode = 3;
+                self.net_blob = key;
+                self.show_net_sign_in = true;
+                self.net_error = format!("Server address: {err}");
+                return;
+            }
+        };
+        if self.cfg.server.as_deref().map(str::trim) != Some(parsed.as_str()) {
+            self.cfg.server_fingerprint = None;
+            self.cfg.server = Some(parsed);
+        }
+        self.cfg.set_server_access_key(&key);
+        if let Err(err) = self.cfg.save() {
+            self.net_error = format!("Could not save the access key: {err}");
+            return;
+        }
+        crate::network::copy_to_service(&self.cfg);
+        self.engine.retarget(&self.cfg);
+        self.net_busy = false;
+        self.net_blob.clear();
+        self.net_error.clear();
+        self.show_net_sign_in = false;
+        self.toast.show("Using this server access key. This computer registers without a PJDesk account.");
+    }
+
     fn claim_current_server(&mut self) {
         if self.net_busy || self.net_login.is_empty() {
             return;
@@ -1673,11 +1766,25 @@ impl App {
 
     fn import_server_config(&mut self) {
         let text = crate::clip::get_text().unwrap_or_default();
-        let Some(blob) = pjdesk_proto::netkey::blob_from_text(&text) else {
-            self.toast.show(if text.trim().is_empty() { "Clipboard is empty" } else { "Invalid server configuration" });
-            return;
-        };
-        self.queue_import(blob, true);
+        match pjdesk_proto::netkey::classify_paste(&text) {
+            pjdesk_proto::netkey::PasteKind::Access => self.apply_server_access_key(&text),
+            pjdesk_proto::netkey::PasteKind::AccessIncomplete => {
+                self.toast.show(pjdesk_proto::netkey::ACCESS_KEY_INCOMPLETE);
+            }
+            pjdesk_proto::netkey::PasteKind::Network => {
+                if let Some(blob) = pjdesk_proto::netkey::blob_from_text(&text) {
+                    self.queue_import(blob, true);
+                }
+            }
+            pjdesk_proto::netkey::PasteKind::Neither => {
+                let message = if text.trim().is_empty() {
+                    "Clipboard is empty"
+                } else {
+                    pjdesk_proto::netkey::KEY_NOT_EITHER
+                };
+                self.toast.show(message);
+            }
+        }
     }
 
     fn export_server_config(&mut self) {
@@ -1732,17 +1839,33 @@ impl App {
         if !self.showing_sign_in() {
             return;
         }
-        let found = ctx.input(|input| {
+        let pasted = ctx.input(|input| {
             input.events.iter().find_map(|event| match event {
-                egui::Event::Paste(text) => pjdesk_proto::netkey::blob_from_text(text),
+                egui::Event::Paste(text) => Some(text.clone()),
                 _ => None,
             })
         });
-        let Some(blob) = found else { return };
-        if self.dismissed_paste.as_deref() == Some(blob.as_str()) {
-            return;
+        let Some(text) = pasted else { return };
+        match pjdesk_proto::netkey::classify_paste(&text) {
+            pjdesk_proto::netkey::PasteKind::Access | pjdesk_proto::netkey::PasteKind::AccessIncomplete => {
+                self.net_blob = text;
+                self.net_mode = 3;
+                self.show_net_sign_in = true;
+                if self.net_server.trim().is_empty() {
+                    self.net_server = self.cfg.effective_server();
+                }
+                let key = self.net_blob.clone();
+                self.apply_server_access_key(&key);
+            }
+            pjdesk_proto::netkey::PasteKind::Network => {
+                let Some(blob) = pjdesk_proto::netkey::blob_from_text(&text) else { return };
+                if self.dismissed_paste.as_deref() == Some(blob.as_str()) {
+                    return;
+                }
+                self.queue_import(blob, false);
+            }
+            pjdesk_proto::netkey::PasteKind::Neither => {}
         }
-        self.queue_import(blob, false);
     }
 
     fn dismiss_import(&mut self) {

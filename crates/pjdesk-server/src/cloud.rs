@@ -2030,7 +2030,53 @@ pub fn yield_to_epoch(data_dir: &Path, remote_epoch: u64, remote_instance: &str,
     true
 }
 
+/// True when this server already recorded that generation as someone else's.
+pub fn already_fenced(data_dir: &Path, epoch: u64, instance: &str) -> bool {
+    let st = SyncState::load(data_dir);
+    st.desired == "standby" && st.fenced_epoch == epoch && st.fenced_instance == instance
+}
+
 const PEER_FILE: &str = "failover-peer.txt";
+
+/// The other server's address. When this server is the published primary,
+/// that is the standby. Otherwise it is the primary. Empty when the account
+/// has no other address.
+pub fn migration_target(data_dir: &Path) -> String {
+    let cached = std::fs::read_to_string(data_dir.join(PEER_FILE))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let Some(cfg) = CloudConfig::load(data_dir) else {
+        return cached.unwrap_or_default();
+    };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return cached.unwrap_or_default();
+    }
+    let mine = crate::public_addr::load(data_dir).map(|record| record.address).unwrap_or_default();
+    match network_addresses(&cfg) {
+        Ok((active, standby)) => {
+            let active = active.trim();
+            let standby = standby.trim();
+            let other = if !active.is_empty() && !pjdesk_proto::failover::same_server(&mine, active) {
+                active
+            } else if !standby.is_empty() && !pjdesk_proto::failover::same_server(&mine, standby) {
+                standby
+            } else {
+                ""
+            };
+            if other.is_empty() {
+                cached.unwrap_or_default()
+            } else {
+                let _ = std::fs::write(data_dir.join(PEER_FILE), other);
+                other.to_string()
+            }
+        }
+        Err(e) => {
+            tracing::debug!("failover: could not read the account server list: {e:#}");
+            cached.unwrap_or_default()
+        }
+    }
+}
 
 /// Address of the account's active server, when it is not this server.
 /// A failed lookup keeps the last address this server learned.

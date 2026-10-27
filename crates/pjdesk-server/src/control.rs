@@ -92,6 +92,10 @@ pub struct Response {
     /// It is not written to the audit log.
     #[serde(default)]
     pub secret: String,
+    /// Access keys after create or revoke, so the window can list them immediately.
+    /// The secret and its hash are not in this list.
+    #[serde(default)]
+    pub keys: Vec<pjdesk_proto::signal::AccessKeyBrief>,
     /// Account email from `session` or a sign-in that kept the saved session.
     /// The token stays in the service. This field is not a secret.
     #[serde(default)]
@@ -350,6 +354,7 @@ fn finish_sign_in(data_dir: &Path, cfg: CloudConfig, choice: Option<crate::cloud
                 readable,
                 secret: String::new(),
                 email: String::new(),
+                ..Response::default()
             }
         }
         Ok(done) => {
@@ -521,6 +526,7 @@ fn create_access_key(data_dir: &Path, req: &Request) -> Response {
             ok: true,
             message: "Copy this key now. It is shown once.".into(),
             secret,
+            keys: crate::access_keys::Store::public_list(data_dir),
             ..Response::default()
         },
         Err(e) => fail(e),
@@ -529,7 +535,12 @@ fn create_access_key(data_dir: &Path, req: &Request) -> Response {
 
 fn revoke_access_key_cmd(data_dir: &Path, id: &str) -> Response {
     match crate::requests::revoke_access_key(data_dir, id.trim()) {
-        Ok(()) => ok("Revoked. Every computer that used it will be disconnected and removed."),
+        Ok(()) => Response {
+            ok: true,
+            message: "Revoked. Every computer that used it will be disconnected and removed.".into(),
+            keys: crate::access_keys::Store::public_list(data_dir),
+            ..Response::default()
+        },
         Err(e) => fail(format!("Could not revoke that key: {e}")),
     }
 }

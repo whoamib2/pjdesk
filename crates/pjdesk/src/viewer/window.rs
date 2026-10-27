@@ -68,8 +68,9 @@ pub enum ViewerStop {
     UserClosed,
     /// The host is restarting. Wait, then connect again.
     HostRestart,
-    /// A relayed session lost the server. Connect again with the same password.
-    RelayResume,
+    /// A relayed session is moving to the primary. Connect again with the same password.
+    /// `primary` is empty when the account's current primary should be used.
+    RelayResume { primary: String },
 }
 
 pub fn run(runtime: &Runtime, link: Link) -> Result<ViewerStop> {
@@ -147,6 +148,7 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<ViewerStop> {
         panel: super::panel::Panel::default(),
         restarting: false,
         relay_resume: false,
+        relay_primary: String::new(),
         peer_id: host_id.clone(),
         host_name,
         extra: Vec::new(),
@@ -233,13 +235,13 @@ pub fn run(runtime: &Runtime, link: Link) -> Result<ViewerStop> {
     }
 
     let stop = if app.relay_resume {
-        ViewerStop::RelayResume
+        ViewerStop::RelayResume { primary: app.relay_primary }
     } else if app.restarting {
         ViewerStop::HostRestart
     } else {
         ViewerStop::UserClosed
     };
-    if !matches!(stop, ViewerStop::HostRestart | ViewerStop::RelayResume) {
+    if !matches!(stop, ViewerStop::HostRestart | ViewerStop::RelayResume { .. }) {
         connection.close(0u32.into(), b"viewer closed");
     }
     runtime.block_on(async {
@@ -389,6 +391,7 @@ struct App {
     panel: super::panel::Panel,
     restarting: bool,
     relay_resume: bool,
+    relay_primary: String,
     peer_id: String,
     host_name: String,
     extra: Vec<ExtraPane>,
@@ -1811,6 +1814,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if resume {
                     self.relay_resume = true;
+                    self.relay_primary = self.live.lock().unwrap().move_primary.clone();
                     info!("{}", pjdesk_proto::failover::RELAY_RESUME);
                     event_loop.exit();
                     return;
@@ -1838,6 +1842,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Closed(reason) => {
                 if self.live.lock().unwrap().resume_relay || pjdesk_proto::failover::is_relay_resume(&reason) {
                     self.relay_resume = true;
+                    self.relay_primary = self.live.lock().unwrap().move_primary.clone();
+                    if self.relay_primary.is_empty() {
+                        self.relay_primary = pjdesk_proto::failover::primary_from_resume(&reason);
+                    }
                     info!("{}", pjdesk_proto::failover::RELAY_RESUME);
                     event_loop.exit();
                     return;

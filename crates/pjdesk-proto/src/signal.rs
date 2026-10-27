@@ -154,6 +154,11 @@ pub enum ClientMsg {
         #[serde(default)]
         key_id: String,
     },
+    /// 0.6.47+. The host has told this relayed session to open again on the
+    /// new primary. The server finishes stepping down after these arrive.
+    RelayMoved {
+        session_id: SessionId,
+    },
 }
 
 /// What a signed-in account is allowed to do on the server.
@@ -349,6 +354,13 @@ pub enum ServerMsg {
     /// registration, and again when an address changes. Older clients are not
     /// sent this variant.
     Routes(crate::routes::ServerRoutes),
+    /// 0.6.47+. This server is leaving the primary role. A relayed session
+    /// opens again on `primary` now, before the role change finishes.
+    /// Sent only to a client whose version can decode it.
+    MoveRelay {
+        session_id: SessionId,
+        primary: String,
+    },
 }
 
 /// One server access key, safe to list. The secret and its hash are not here.
