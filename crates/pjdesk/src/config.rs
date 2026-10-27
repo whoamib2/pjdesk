@@ -763,6 +763,22 @@ impl Config {
         String::new()
     }
 
+    /// Advertised routes, or the older LAN and public fields when the catalog has no IP.
+    /// A saved hostname stays last.
+    pub fn dial_routes(&self) -> pjdesk_proto::routes::ServerRoutes {
+        let standby = self.network_standby.clone().unwrap_or_default();
+        let standby_public = self.network_routes.standby_public.first().cloned().unwrap_or_default();
+        pjdesk_proto::routes::routes_with_legacy(
+            &self.network_routes,
+            &self.effective_server(),
+            &self.network_lan,
+            &self.network_public_ip,
+            &standby,
+            &self.network_routes.standby_lan,
+            &standby_public,
+        )
+    }
+
     pub fn network_access_token(&self) -> String {
         self.network_access.as_deref().and_then(secure::reveal).filter(|s| !s.is_empty()).unwrap_or_default()
     }

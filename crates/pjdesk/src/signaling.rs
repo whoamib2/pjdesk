@@ -264,7 +264,7 @@ impl SignalClient {
     pub async fn connect_catalog(config: &mut Config, mine: &[std::net::Ipv4Addr]) -> Result<Self> {
         crate::routes_store::absorb(config);
         let saved = config.effective_server();
-        let targets = pjdesk_proto::routes::dial_targets(&config.network_routes, mine, &saved);
+        let targets = pjdesk_proto::routes::dial_targets(&config.dial_routes(), mine, &saved);
         if targets.is_empty() {
             bail!("the server address is empty");
         }

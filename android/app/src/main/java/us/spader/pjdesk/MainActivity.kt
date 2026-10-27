@@ -541,11 +541,6 @@ class MainActivity : FragmentActivity() {
                 withoutPassword: Boolean = false,
             ) {
                 val pjdeskId = state.id.filter { it.isDigit() }
-                if (enrollOnlyNow && pjdeskId.length != 9) {
-                    netBusy = false
-                    netError = "This computer does not have an ID yet. Wait until Your ID appears, then try again."
-                    return
-                }
                 val syncing = app.store.syncsSavedComputers()
                 val uploadLocal = syncing && !temporaryNow && !enrollOnlyNow
                 val hostname = engine.deviceLabel()
@@ -2683,7 +2678,6 @@ class MainActivity : FragmentActivity() {
             val pause = reply?.optLong("pause") ?: 0L
             val finalAnswer = message.contains("Wrong email or password")
                 || message.contains("Too many sign-in attempts")
-                || message.contains("does not have the account yet")
                 || message.contains("Enter your email")
                 || pause > 0L
             if (finalAnswer) {

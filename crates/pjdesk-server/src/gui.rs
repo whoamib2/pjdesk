@@ -203,6 +203,10 @@ struct App {
     service_session_known: bool,
     /// The last `session` ask got no answer. The saved account is left as it is.
     service_session_failed: bool,
+    /// `Account copy: synced …` or `Account copy: error …` from the service or the data folder.
+    account_copy: String,
+    /// Redacted service log from the session pipe, when the status snapshot has none.
+    session_log: String,
     session_rx: Option<std::sync::mpsc::Receiver<Option<crate::control::Response>>>,
     session_at: Option<Instant>,
     own_bucket: bool,
@@ -384,6 +388,8 @@ impl App {
             service_email: String::new(),
             service_session_known: false,
             service_session_failed: false,
+            account_copy: String::new(),
+            session_log: String::new(),
             session_rx: None,
             session_at: None,
             own_bucket: false,
@@ -587,6 +593,9 @@ impl App {
         self.cloud_token = view.cloud_token;
         self.cloud_api = view.cloud_api;
         self.own_bucket = view.own_bucket;
+        if view.access == Access::Readable && !view.account_copy.is_empty() {
+            self.account_copy = view.account_copy.clone();
+        }
         if view.access != Access::Readable {
             self.can_write = false;
             return;
@@ -1722,6 +1731,10 @@ impl App {
                 self.service_email = email;
                 self.service_session_known = true;
                 self.service_session_failed = false;
+                if !response.account_copy.is_empty() {
+                    self.account_copy = response.account_copy;
+                }
+                self.session_log = response.log_tail;
             }
             _ => {
                 self.service_session_failed = true;
@@ -1796,6 +1809,7 @@ impl App {
             }
             if !readable && !self.control_ready && !email.is_empty() {
                 ui.label(RichText::new(format!("Signed in as {email}")).strong().size(18.0).color(p(ui).text));
+                self.paint_account_copy(ui);
                 if !role_line.is_empty() {
                     ui.label(&role_line);
                 }
@@ -1831,6 +1845,7 @@ impl App {
             }
             if !email.is_empty() && cloud_on {
                 ui.label(RichText::new(format!("Signed in as {email}")).strong().size(20.0).color(p(ui).text));
+                self.paint_account_copy(ui);
                 if !role_line.is_empty() {
                     ui.add_space(2.0);
                     ui.label(&role_line);
@@ -1979,6 +1994,7 @@ impl App {
                 ui.label(RichText::new("Sign in with your pjdesk.com account.").strong().color(p(ui).text));
             } else {
                 ui.label(RichText::new(format!("Signed in as {}", self.signed_in_email())).strong().color(p(ui).text));
+                self.paint_account_copy(ui);
             }
             ui.label(
                 RichText::new(
@@ -3841,16 +3857,25 @@ impl App {
         }
     }
 
+    fn paint_account_copy(&self, ui: &mut egui::Ui) {
+        let line = self.account_copy.trim();
+        if line.is_empty() {
+            return;
+        }
+        ui.label(RichText::new(line).color(p(ui).muted).size(12.0));
+    }
+
     fn log_card(&mut self, ui: &mut egui::Ui) {
         let from_service = self.access != Access::Readable;
-        let service_log = if from_service {
+        let snapshot = if from_service {
             self.live.as_ref().map(|s| s.log_tail.clone()).unwrap_or_default()
         } else {
             self.log_tail.clone()
         };
+        let service_log = if !snapshot.trim().is_empty() { snapshot } else { self.session_log.clone() };
         card(ui, |ui| {
             heading(ui, "LOG");
-            if from_service && service_log.is_empty() {
+            if from_service && service_log.is_empty() && !self.service_session_known {
                 self.locked_line(ui);
             } else if service_log.is_empty() {
                 ui.label(
@@ -4058,6 +4083,7 @@ struct FolderView {
     blocked: Vec<BlockedRow>,
     online: HashMap<String, String>,
     log_tail: String,
+    account_copy: String,
     cloud_on: bool,
     cloud: Option<crate::cloud::CloudStatus>,
     access_keys: Vec<pjdesk_proto::signal::AccessKeyBrief>,
@@ -4113,6 +4139,7 @@ fn read_folder(dir: &std::path::Path) -> FolderView {
         blocked: Vec::new(),
         online: HashMap::new(),
         log_tail: String::new(),
+        account_copy: String::new(),
         cloud_on: false,
         cloud: None,
         access_keys: Vec::new(),
@@ -4133,6 +4160,7 @@ fn read_folder(dir: &std::path::Path) -> FolderView {
     }
     view.online = read_online(dir);
     view.log_tail = status_view::redacted_log_tail(&dir.join("server.log"));
+    view.account_copy = crate::account_mirror::status_line(dir);
     view.access_keys = crate::access_keys::Store::public_list(dir);
     view.cloud_on = dir.join(crate::cloud::CONFIG_FILE).exists();
     view.cloud = crate::cloud::CloudStatus::load(dir);

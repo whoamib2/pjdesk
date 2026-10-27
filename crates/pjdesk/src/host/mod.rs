@@ -821,14 +821,14 @@ async fn register_catalog(
     // The last registration's catalog, even when this process has no live session.
     crate::routes_store::absorb(config);
     let mut pulled = false;
-    if !config.network_routes.has_advertised_ip() {
+    if !config.dial_routes().has_advertised_ip() {
         info!("No advertised server addresses saved. Asking pjdesk.com before DNS.");
         pulled = true;
         let _ = pull_cloud_routes(config).await;
     }
     let targets = pjdesk_proto::routes::registration_targets(
         follow.as_deref().unwrap_or(""),
-        &config.network_routes,
+        &config.dial_routes(),
         &mine,
         &config.effective_server(),
     );
@@ -841,7 +841,7 @@ async fn register_catalog(
     if signal.is_none() && !pulled && pull_cloud_routes(config).await {
         let more = pjdesk_proto::routes::registration_targets(
             follow.as_deref().unwrap_or(""),
-            &config.network_routes,
+            &config.dial_routes(),
             &mine,
             &config.effective_server(),
         );
@@ -879,6 +879,14 @@ async fn register_catalog(
                     config.device_id = None;
                     config.save()?;
                     bail!("{message}; a new ID will be requested");
+                }
+                Ok(Some(ServerMsg::Error { message, .. }))
+                    if message.contains("Sign in required") && !token.is_empty() && !without_token =>
+                {
+                    without_token = true;
+                    info!("registration was refused until this computer is signed in; trying once without the saved access");
+                    signal = SignalClient::connect_catalog(config, &mine).await?;
+                    break;
                 }
                 Ok(Some(ServerMsg::Error { message, .. }))
                     if pjdesk_proto::signal::is_standby_refusal(&message) && redirects < 1 =>
