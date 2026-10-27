@@ -667,7 +667,7 @@ impl App {
 
     /// ID, one-time password, whether a permanent password is set, and whether
     /// this process (rather than the background service) is hosting.
-    fn share_secrets(&self) -> (Option<String>, Option<String>, bool, bool) {
+    pub(super) fn share_secrets(&self) -> (Option<String>, Option<String>, bool, bool) {
         if self.engine.service_running {
             let pw = self.svc_status.password.clone().filter(|p| !p.is_empty());
             (self.svc_status.id.clone(), pw, self.svc_status.permanent_set, false)

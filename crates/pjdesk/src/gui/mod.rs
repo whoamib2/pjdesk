@@ -3536,6 +3536,7 @@ impl eframe::App for App {
             adopt_service_notice();
             adopt_service_chat();
             self.poll_lan();
+            self.toast.render(&ctx);
             return;
         }
 

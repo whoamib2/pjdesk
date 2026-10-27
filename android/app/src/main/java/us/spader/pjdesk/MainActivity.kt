@@ -1796,6 +1796,12 @@ class MainActivity : FragmentActivity() {
                         onPeek = { peekPin(it) },
                         onEdit = { notePinEdit() },
                         onBiometric = { tryBio() },
+                        computerId = state.idFormatted.ifBlank { state.id },
+                        oneTimePassword = state.password,
+                        permanentSet = state.hasPermanent,
+                        onCopyId = { copy(state.id.ifBlank { state.idFormatted.filter { !it.isWhitespace() } }) },
+                        onCopyPassword = { copy(state.password) },
+                        onRefreshPassword = { engine.regenerate() },
                         onForgot = {
                             if (noPassword) {
                                 app.store.clearAccountPin()

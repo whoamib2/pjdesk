@@ -451,6 +451,70 @@ impl App {
         Instant::now() < self.reauth_until
     }
 
+    /// Ask the host for a new one-time password. This does not unlock the window.
+    fn refresh_one_time_password(&mut self) {
+        if self.engine.service_running {
+            let path = crate::syspaths::service_dir().join("password.refresh");
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, b"1\n");
+        } else {
+            self.engine.shared.request_regenerate();
+        }
+        self.toast.show("New one-time password");
+    }
+
+    /// ID and one-time password for someone helping this person. Copy and
+    /// refresh stay on this screen; they do not open saved computers, settings,
+    /// or an outgoing connection.
+    fn lock_help_card(&mut self, ui: &mut egui::Ui) {
+        let p = theme::paint(ui);
+        let (id, password, permanent, _) = self.share_secrets();
+        let raw_id = id.as_deref().unwrap_or("");
+        let raw_pw = password.as_deref().unwrap_or("");
+        let help = lock_help(raw_id, raw_pw, one_time_withheld(raw_pw, permanent, false));
+        ui.label(RichText::new("Get help").strong().size(16.0).color(p.text));
+        ui.add_space(6.0);
+        ui.label(RichText::new("Your ID").color(p.muted).size(12.5));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let shown = if help.id.is_empty() { "— — —".into() } else { help.id.clone() };
+            ui.label(RichText::new(shown).size(28.0).strong().color(p.text));
+            if !help.id.is_empty()
+                && widgets::icon_button(ui, super::icons::Icon::Copy, "Copy ID").clicked()
+                && widgets::copy_to_clipboard(&pjdesk_proto::normalize_id(&help.id))
+            {
+                self.toast.show("ID copied");
+            }
+        });
+        if help.password.is_none() && !help.refresh {
+            return;
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new("One-time password").color(p.muted).size(12.5));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            match &help.password {
+                Some(pw) => {
+                    ui.label(RichText::new(pw).size(20.0).monospace().color(p.text));
+                    if widgets::icon_button(ui, super::icons::Icon::Copy, "Copy password").clicked()
+                        && widgets::copy_to_clipboard(pw)
+                    {
+                        self.toast.show("Password copied");
+                    }
+                }
+                None => {
+                    widgets::spinner(ui, p.muted);
+                    ui.label(RichText::new("Waiting for a password").color(p.muted));
+                }
+            }
+            if help.refresh && widgets::icon_button(ui, super::icons::Icon::Refresh, "New one-time password").clicked() {
+                self.refresh_one_time_password();
+            }
+        });
+    }
+
     pub(super) fn lock_screen(&mut self, ui: &mut egui::Ui) {
         let now = super::unix_now();
         let until = self.cfg.app_lock_until;
@@ -463,9 +527,12 @@ impl App {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::same(24)))
             .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.set_max_width(420.0);
-                    ui.add_space(72.0);
+                    ui.add_space(28.0);
+                    self.lock_help_card(ui);
+                    ui.add_space(28.0);
                     ui.label(RichText::new("Enter your PIN").strong().size(22.0));
                     ui.add_space(6.0);
                     ui.label(widgets::muted(
@@ -526,6 +593,7 @@ impl App {
                             self.start_reauth();
                         }
                     }
+                });
                 });
             });
     }
@@ -1175,6 +1243,47 @@ fn user_activity(ctx: &egui::Context) -> bool {
     })
 }
 
+/// What the PIN screen may show so someone can get help without unlocking.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LockHelp {
+    /// This computer's ID, spaced for reading. Empty when it has none yet.
+    id: String,
+    /// The current one-time password, when it is the password to read out.
+    password: Option<String>,
+    /// A new one-time password can be requested. Off when that password is withheld.
+    refresh: bool,
+}
+
+/// `withheld` is true when the one-time password is permanent-only or hidden.
+/// The screen then keeps the ID and leaves the password off.
+fn lock_help(id: &str, one_time: &str, withheld: bool) -> LockHelp {
+    let digits = pjdesk_proto::normalize_id(id);
+    let id = if pjdesk_proto::is_valid_id(&digits) {
+        pjdesk_proto::format_id(&digits)
+    } else {
+        id.trim().to_string()
+    };
+    let password = if withheld {
+        None
+    } else {
+        let pw = one_time.trim();
+        if pw.is_empty() {
+            None
+        } else {
+            Some(pw.to_string())
+        }
+    };
+    LockHelp { id, password, refresh: !withheld }
+}
+
+/// The one-time password stays off the lock screen when it is hidden, or when
+/// a permanent password is set and no one-time password is published.
+/// A permanent password that sits beside a shown one-time password does not
+/// hide that one-time password.
+fn one_time_withheld(one_time: &str, permanent_set: bool, hidden: bool) -> bool {
+    hidden || (one_time.trim().is_empty() && permanent_set)
+}
+
 fn wait_label(secs: u64) -> String {
     if secs >= 60 {
         let minutes = secs.div_ceil(60);
@@ -1185,5 +1294,41 @@ fn wait_label(secs: u64) -> String {
         }
     } else {
         format!("Too many tries. Try again in {secs} seconds.")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lock_help, one_time_withheld};
+
+    #[test]
+    fn the_lock_screen_shows_the_id_and_one_time_password_unless_it_is_hidden() {
+        let shown = lock_help("386626882", "k7mq2w9p", false);
+        assert_eq!(shown.id, "386 626 882");
+        assert_eq!(shown.password.as_deref(), Some("k7mq2w9p"));
+        assert!(shown.refresh);
+
+        assert!(
+            one_time_withheld("", true, false),
+            "a permanent password with no one-time password is permanent-only"
+        );
+        let permanent_only = lock_help("386 626 882", "k7mq2w9p", true);
+        assert_eq!(permanent_only.id, "386 626 882");
+        assert_eq!(permanent_only.password, None);
+        assert!(!permanent_only.refresh, "refresh stays off when the one-time password is withheld");
+
+        assert!(one_time_withheld("k7mq2w9p", false, true), "a hidden one-time password is withheld");
+        assert!(
+            !one_time_withheld("k7mq2w9p", true, false),
+            "a published one-time password is still shown when a permanent password is also set"
+        );
+
+        let waiting = lock_help("386626882", "  ", false);
+        assert_eq!(waiting.password, None);
+        assert!(waiting.refresh, "a password that has not arrived yet can still be refreshed");
+        assert!(
+            !one_time_withheld("", false, false),
+            "no password yet is not permanent-only until a permanent password is set"
+        );
     }
 }

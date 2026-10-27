@@ -51,6 +51,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.R
@@ -218,6 +219,13 @@ fun UnlockScreen(
     onEdit: () -> Unit = {},
     onBiometric: () -> Unit,
     onForgot: () -> Unit = {},
+    computerId: String = "",
+    oneTimePassword: String = "",
+    permanentSet: Boolean = false,
+    passwordHidden: Boolean = false,
+    onCopyId: () -> Unit = {},
+    onCopyPassword: () -> Unit = {},
+    onRefreshPassword: () -> Unit = {},
 ) {
     var pin by remember { mutableStateOf("") }
     var peeked by remember { mutableStateOf("") }
@@ -243,9 +251,12 @@ fun UnlockScreen(
     LaunchedEffect(biometrics) {
         if (!biometrics) runCatching { focus.requestFocus() }
     }
+    val withheld = oneTimeWithheld(oneTimePassword, permanentSet, passwordHidden)
+    val help = lockHelp(computerId, oneTimePassword, withheld)
     Column(
         Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .focusRequester(focus)
             .focusable()
             .onPreviewKeyEvent { event ->
@@ -268,8 +279,15 @@ fun UnlockScreen(
             }
             .padding(horizontal = 24.dp, vertical = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
     ) {
+        Spacer(Modifier.size(8.dp))
+        LockHelpCard(
+            help = help,
+            onCopyId = onCopyId,
+            onCopyPassword = onCopyPassword,
+            onRefreshPassword = onRefreshPassword,
+        )
+        Spacer(Modifier.size(24.dp))
         LockMark()
         Spacer(Modifier.size(16.dp))
         Text("Enter PIN", style = MaterialTheme.typography.headlineMedium)
@@ -303,6 +321,67 @@ fun UnlockScreen(
             modifier = Modifier.fillMaxWidth(),
         ) { Text(if (busy) "Checking…" else "Unlock") }
         TextButton(onClick = onForgot, enabled = !busy) { Text("Forgot PIN? Sign in again") }
+    }
+}
+
+/** ID and one-time password the PIN screen may show. Same rule as the Windows lock screen. */
+data class LockHelp(val id: String, val password: String?, val refresh: Boolean)
+
+fun lockHelp(id: String, oneTime: String, withheld: Boolean): LockHelp {
+    val trimmed = id.trim()
+    val digits = trimmed.filter { !it.isWhitespace() }
+    val shown = if (digits.length == 9 && digits.all { it.isDigit() }) {
+        "${digits.substring(0, 3)} ${digits.substring(3, 6)} ${digits.substring(6)}"
+    } else {
+        trimmed
+    }
+    val password = if (withheld) null else oneTime.trim().ifEmpty { null }
+    return LockHelp(shown, password, refresh = !withheld)
+}
+
+/** Permanent-only (no one-time password published) or an explicit hide. */
+fun oneTimeWithheld(oneTime: String, permanentSet: Boolean, hidden: Boolean): Boolean {
+    return hidden || (oneTime.isBlank() && permanentSet)
+}
+
+@Composable
+private fun LockHelpCard(
+    help: LockHelp,
+    onCopyId: () -> Unit,
+    onCopyPassword: () -> Unit,
+    onRefreshPassword: () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("Get help", style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.size(8.dp))
+        Text("Your ID", color = pjMuted(), style = MaterialTheme.typography.labelMedium)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                help.id.ifBlank { "— — —" },
+                style = MaterialTheme.typography.headlineSmall,
+                fontFamily = FontFamily.Monospace,
+            )
+            if (help.id.isNotBlank()) {
+                TextButton(onClick = onCopyId) { Text("Copy") }
+            }
+        }
+        if (help.password != null || help.refresh) {
+            Spacer(Modifier.size(8.dp))
+            Text("One-time password", color = pjMuted(), style = MaterialTheme.typography.labelMedium)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    help.password ?: "Waiting for a password",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontFamily = FontFamily.Monospace,
+                )
+                if (help.password != null) {
+                    TextButton(onClick = onCopyPassword) { Text("Copy") }
+                }
+                if (help.refresh) {
+                    TextButton(onClick = onRefreshPassword) { Text("New") }
+                }
+            }
+        }
     }
 }
 
