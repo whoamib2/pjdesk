@@ -40,6 +40,14 @@ impl ServerRoutes {
             && self.names.is_empty()
     }
 
+    /// True when a server published an IP. A hostname alone is not enough:
+    /// dialing must try those IPs before DNS.
+    pub fn has_advertised_ip(&self) -> bool {
+        self.primary_lan.iter().chain(self.primary_public.iter()).chain(self.standby_lan.iter()).chain(self.standby_public.iter()).any(
+            |addr| is_ip_endpoint(addr),
+        )
+    }
+
     /// Builds a catalog from the account fields older servers already publish.
     /// A hostname goes into `names`. An IP goes into the public list.
     pub fn from_legacy(
@@ -185,6 +193,24 @@ pub fn registration_miss(attempts: &[(&str, &str)]) -> String {
 /// The per-address lines under the registration banner. The first line is the banner.
 pub fn registration_detail_lines(text: &str) -> Vec<String> {
     text.lines().skip(1).map(str::trim).filter(|line| !line.is_empty()).map(str::to_string).collect()
+}
+
+/// LAN addresses of a peer that share a /24 with this computer, on the
+/// direct-connect port. Other subnets and hostnames are left out so a relay
+/// is not required for two computers on the same network.
+pub fn same_subnet_direct(addrs: &[String], mine: &[Ipv4Addr]) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in addrs {
+        if !on_subnet(raw, mine) {
+            continue;
+        }
+        let Some(ip) = endpoint_v4(raw) else { continue };
+        if ip.is_unspecified() || ip.is_loopback() || ip.is_broadcast() || ip.is_multicast() {
+            continue;
+        }
+        push_unique(&mut out, format!("{ip}:{}", crate::DIRECT_PORT));
+    }
+    out
 }
 
 /// The address a server named, then the advertised order.
@@ -568,6 +594,43 @@ mod tests {
     fn an_empty_catalog_still_dials_the_saved_address() {
         let order = dial_targets(&ServerRoutes::default(), &[], "office.example:21100");
         assert_eq!(order, vec!["office.example:21100".to_string()]);
+        assert!(!ServerRoutes::default().has_advertised_ip());
+    }
+
+    #[test]
+    fn a_cached_catalog_is_dialed_before_the_saved_hostname() {
+        let cached = ServerRoutes {
+            primary_lan: vec!["10.1.1.8:21200".into()],
+            primary_public: vec!["198.51.100.8:21200".into()],
+            standby_public: vec!["204.248.122.44:21200".into()],
+            ..ServerRoutes::default()
+        };
+        assert!(cached.has_advertised_ip());
+        let house = [v4(192, 168, 0, 10)];
+        let order = dial_targets(&cached, &house, "pjdesk.spader.us:21200");
+        assert_eq!(order[0], "198.51.100.8:21200");
+        assert!(order.iter().any(|addr| addr == "204.248.122.44:21200"));
+        assert!(!order.iter().any(|addr| addr.starts_with("10.1.1.8")), "cabin LAN is a different subnet");
+        assert_eq!(order.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
+        let cabin = [v4(10, 1, 1, 50)];
+        let from_cabin = dial_targets(&cached, &cabin, "pjdesk.spader.us:21200");
+        assert_eq!(from_cabin[0], "10.1.1.8:21200");
+        assert_eq!(from_cabin.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
+    }
+
+    #[test]
+    fn a_peer_on_this_subnet_is_dialed_on_the_direct_port() {
+        let mine = [v4(192, 168, 1, 10)];
+        let got = same_subnet_direct(
+            &[
+                "192.168.1.20:40000".into(),
+                "192.168.1.20:21201".into(),
+                "10.1.1.5:21201".into(),
+                "pjdesk.spader.us:21200".into(),
+            ],
+            &mine,
+        );
+        assert_eq!(got, vec!["192.168.1.20:21201".to_string()]);
     }
 
     #[test]

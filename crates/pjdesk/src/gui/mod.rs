@@ -2691,10 +2691,11 @@ impl App {
     fn note_lan_names(&mut self) {
         let mut changed = false;
         let found = self.lan.clone();
-        for (name, id, _) in found {
+        for (name, id, addr) in found {
             let id = normalize_id(&id);
             let name = name.trim();
-            if name.is_empty() || name == "Computer" || !is_valid_id(&id) {
+            let addr = addr.trim();
+            if !is_valid_id(&id) {
                 continue;
             }
             let known = self.cfg.address_book.iter().any(|e| e.id == id) || self.cfg.settings.peers.contains_key(&id);
@@ -2702,8 +2703,16 @@ impl App {
                 continue;
             }
             let note = self.cfg.settings.peers.entry(id).or_default();
-            if note.hostname.is_empty() {
+            if !name.is_empty() && name != "Computer" && note.hostname.is_empty() {
                 note.hostname = name.to_string();
+                changed = true;
+            }
+            if !addr.is_empty() && !note.lan_addrs.iter().any(|have| pjdesk_proto::routes::same_endpoint(have, addr)) {
+                note.lan_addrs.push(addr.to_string());
+                if note.lan_addrs.len() > 8 {
+                    let drop = note.lan_addrs.len() - 8;
+                    note.lan_addrs.drain(0..drop);
+                }
                 changed = true;
             }
         }

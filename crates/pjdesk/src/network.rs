@@ -1147,6 +1147,8 @@ pub fn copy_to_service(user: &Config) {
     cfg.network_standby_fingerprint = user.network_standby_fingerprint.clone();
     cfg.network_lan = user.network_lan.clone();
     cfg.network_public_ip = user.network_public_ip.clone();
+    cfg.network_routes = pjdesk_proto::routes::keep_other_server(&cfg.network_routes, &user.network_routes);
+    crate::routes_store::store(&cfg.network_routes);
     cfg.server_access_key = user.server_access_key.clone();
     cfg.network_role = user.network_role.clone();
     let grant_changed = cfg.support_grant != user.support_grant;

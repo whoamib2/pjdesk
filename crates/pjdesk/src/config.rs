@@ -286,6 +286,13 @@ pub struct PeerNote {
     /// PJDesk version reported for this computer. Empty until the account list has one.
     #[serde(default)]
     pub app_version: String,
+    /// LAN addresses this computer advertised. A controller on the same subnet
+    /// dials these on the direct port and does not need a relay.
+    #[serde(default)]
+    pub lan_addrs: Vec<String>,
+    /// QUIC certificate from a previous session or a LAN beacon.
+    #[serde(default)]
+    pub host_fingerprint: String,
     /// 0 = one display, 1 = all displays, 2 = a window per display.
     #[serde(default)]
     pub view_mode: u8,
@@ -492,6 +499,52 @@ impl Config {
                 note.view_mode = src.view_mode;
                 note.last_display = src.last_display;
             }
+            for addr in &src.lan_addrs {
+                if !note.lan_addrs.iter().any(|have| pjdesk_proto::routes::same_endpoint(have, addr)) {
+                    note.lan_addrs.push(addr.clone());
+                }
+            }
+            if note.host_fingerprint.trim().is_empty() && !src.host_fingerprint.trim().is_empty() {
+                note.host_fingerprint = src.host_fingerprint.clone();
+            }
+        }
+    }
+
+    /// Remembers LAN addresses and the host certificate so the next session
+    /// can connect directly. Reloads first so a window save is not overwritten.
+    pub fn remember_lan(id: &str, addrs: &[String], fingerprint: Option<&str>) {
+        let id = pjdesk_proto::normalize_id(id);
+        if !pjdesk_proto::is_valid_id(&id) {
+            return;
+        }
+        let path = Self::path();
+        let mut cfg = Self::load_from(&path).unwrap_or_default();
+        let note = cfg.settings.peers.entry(id).or_default();
+        let mut changed = false;
+        for addr in addrs {
+            let addr = addr.trim();
+            if addr.is_empty() {
+                continue;
+            }
+            if note.lan_addrs.iter().any(|have| pjdesk_proto::routes::same_endpoint(have, addr)) {
+                continue;
+            }
+            note.lan_addrs.push(addr.to_string());
+            changed = true;
+        }
+        if note.lan_addrs.len() > 8 {
+            let drop = note.lan_addrs.len() - 8;
+            note.lan_addrs.drain(0..drop);
+            changed = true;
+        }
+        if let Some(fp) = fingerprint.map(str::trim).filter(|fp| !fp.is_empty()) {
+            if note.host_fingerprint != fp {
+                note.host_fingerprint = fp.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = cfg.save_to(&path);
         }
     }
 
@@ -762,6 +815,9 @@ impl Config {
         // other server. Re-registering after that primary stops has to work
         // from the addresses already saved.
         self.network_routes = pjdesk_proto::routes::keep_other_server(&self.network_routes, &session.routes);
+        if self.network_routes.has_advertised_ip() {
+            crate::routes_store::store(&self.network_routes);
+        }
         if let Ok(fp) = parse_fingerprint(&session.fingerprint) {
             self.server_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
         }

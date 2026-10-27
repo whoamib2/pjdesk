@@ -273,12 +273,12 @@ pub(crate) async fn resume_session(
 ) -> Result<Link> {
     if !admit.force_relay {
         if let Some(fp) = fingerprint {
-            match try_direct_resume(&admit.password, targets, fp, &admit.id, &admit.label).await {
+            match try_direct_resume(&admit.password, targets, Some(fp), &admit.id, &admit.label).await {
                 Ok(Some(link)) => return Ok(link),
                 Ok(None) => {}
                 Err(e) if already_in_session(&e) => {
                     tokio::time::sleep(Duration::from_millis(400)).await;
-                    if let Ok(Some(link)) = try_direct_resume(&admit.password, targets, fp, &admit.id, &admit.label).await {
+                    if let Ok(Some(link)) = try_direct_resume(&admit.password, targets, Some(fp), &admit.id, &admit.label).await {
                         return Ok(link);
                     }
                 }
@@ -320,7 +320,7 @@ fn already_in_session(err: &anyhow::Error) -> bool {
 async fn try_direct_resume(
     password: &str,
     targets: &[SocketAddr],
-    fingerprint: pjdesk_proto::tls::Fingerprint,
+    fingerprint: Option<pjdesk_proto::tls::Fingerprint>,
     host_id: &str,
     host_label: &str,
 ) -> Result<Option<Link>> {
@@ -328,7 +328,7 @@ async fn try_direct_resume(
         return Ok(None);
     }
     let udp = std::net::UdpSocket::bind("0.0.0.0:0").context("opening a UDP socket")?;
-    let endpoint = p2p::controller_endpoint(udp, fingerprint)?;
+    let (endpoint, verifier) = p2p::controller_endpoint_pin(udp, fingerprint)?;
     let mut attempts = tokio::task::JoinSet::new();
     for (addr, delay) in p2p::dial_order(targets) {
         let endpoint = endpoint.clone();
@@ -388,8 +388,59 @@ async fn try_direct_resume(
         path: LinkPath::Direct(addr),
         peer_proto: auth.peer_proto,
         direct_targets: targets.to_vec(),
-        host_fingerprint: Some(fingerprint),
+        host_fingerprint: verifier.observed().or(fingerprint),
     }))
+}
+
+/// Dials a saved LAN address for this computer before opening a relay session.
+/// Same-subnet peers connect on UDP 21201 and do not need the server's relay.
+async fn try_cached_lan(config: &Config, target: &str, password: &str, mine: &[std::net::Ipv4Addr]) -> Result<Option<Link>> {
+    let target = normalize_id(target);
+    if password.is_empty() || !is_valid_id(&target) {
+        return Ok(None);
+    }
+    let Some(note) = config.settings.peers.get(&target) else {
+        return Ok(None);
+    };
+    let listed = pjdesk_proto::routes::same_subnet_direct(&note.lan_addrs, mine);
+    if listed.is_empty() {
+        return Ok(None);
+    }
+    let targets: Vec<SocketAddr> = listed.iter().filter_map(|addr| addr.parse().ok()).collect();
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    let fingerprint = pjdesk_proto::tls::parse_fingerprint(&note.host_fingerprint).ok();
+    tracing::info!("Trying the host on this network before the relay: {}", listed.join(", "));
+    let found = try_direct_resume(password, &targets, fingerprint, &target, "").await?;
+    if let Some(link) = &found {
+        let addrs: Vec<String> = link.direct_targets.iter().map(|addr| addr.to_string()).collect();
+        let fp = link.host_fingerprint.map(|fp| pjdesk_proto::tls::format_fingerprint(&fp));
+        Config::remember_lan(&target, &addrs, fp.as_deref());
+    }
+    Ok(found)
+}
+
+/// Listens briefly for a LAN beacon from `target` and stores its address.
+fn note_lan_beacon(target: &str) {
+    let want = normalize_id(target);
+    if !is_valid_id(&want) {
+        return;
+    }
+    let found = crate::host::direct::discover_for(Duration::from_millis(800));
+    let mut addrs = Vec::new();
+    let mut fingerprint = None;
+    for (beacon, src) in found {
+        if normalize_id(&beacon.id) != want || !pjdesk_proto::discover::accept_lan_ip(src.ip()) {
+            continue;
+        }
+        addrs.push(SocketAddr::new(src.ip(), beacon.port).to_string());
+        fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&beacon.fingerprint));
+    }
+    if !addrs.is_empty() {
+        tracing::info!("Heard {} on this network at {}", format_id(&want), addrs.join(", "));
+        Config::remember_lan(&want, &addrs, fingerprint.as_deref());
+    }
 }
 
 /// Signaling → UDP binding → hole punching / relay → QUIC → password check.
@@ -417,6 +468,17 @@ async fn connect(
     let access_key = pjdesk_proto::access::is_access_key(&access);
     let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s);
     let mine = mine.await.unwrap_or_default();
+    if !force_relay {
+        match try_cached_lan(config, target, password, &mine).await {
+            Ok(Some(link)) => {
+                tracing::info!("Connected over the LAN; the relay was not used");
+                return Ok(link);
+            }
+            Ok(None) => {}
+            Err(e) if e.is::<WrongPassword>() || already_in_session(&e) => return Err(e),
+            Err(e) => tracing::info!("LAN connection did not start: {e:#}"),
+        }
+    }
     let mut signal = if let Some(addr) = move_to.filter(|addr| !addr.trim().is_empty()) {
         tracing::info!("failover: dialing the new primary {addr}");
         SignalClient::connect_endpoint(addr, config, pjdesk_proto::routes::dial_budget(addr)).await?
@@ -454,6 +516,7 @@ async fn connect(
                 };
                 if !routes.is_empty() {
                     config.network_routes = pjdesk_proto::routes::keep_other_server(&config.network_routes, &routes);
+                    crate::routes_store::store(&config.network_routes);
                     let _ = config.save();
                 }
                 if addr.is_empty() {
@@ -478,6 +541,7 @@ async fn connect(
             Ok(Some(ServerMsg::Routes(routes))) => {
                 if !routes.is_empty() {
                     config.network_routes = pjdesk_proto::routes::keep_other_server(&config.network_routes, &routes);
+                    crate::routes_store::store(&config.network_routes);
                     let _ = config.save();
                 }
             }
@@ -489,7 +553,34 @@ async fn connect(
     };
 
     let server_udp = SocketAddr::new(signal.server_addr.ip(), udp_port);
-    let binding = p2p::bind_udp(server_udp, session_id, token, Role::Controller).await?;
+    let binding = match p2p::bind_udp(server_udp, session_id, token, Role::Controller).await {
+        Ok(binding) => binding,
+        Err(e) => {
+            tracing::info!("UDP to the relay failed: {e:#}. Trying the host on this network.");
+            if !force_relay && !password.is_empty() {
+                let heard = tokio::task::spawn_blocking({
+                    let id = target.to_string();
+                    move || note_lan_beacon(&id)
+                })
+                .await;
+                if heard.is_ok() {
+                    if let Ok(disk) = Config::load() {
+                        config.fill_peer_facts_from(&disk);
+                    }
+                    match try_cached_lan(config, target, password, &mine).await {
+                        Ok(Some(link)) => {
+                            tracing::info!("Connected over the LAN after the relay's UDP handshake failed");
+                            return Ok(link);
+                        }
+                        Ok(None) => {}
+                        Err(err) if err.is::<WrongPassword>() || already_in_session(&err) => return Err(err),
+                        Err(err) => tracing::info!("LAN connection did not start: {err:#}"),
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
     tracing::debug!("our public address for this session: {}", binding.observed);
     signal.send(ClientMsg::UdpReady {
         session_id,
@@ -508,6 +599,14 @@ async fn connect(
                         local_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
                     }
                 );
+                if let Some(fp) = cert_fingerprint {
+                    let lan: Vec<String> = local_addrs
+                        .iter()
+                        .filter(|addr| p2p::is_lan_ip(addr.ip()))
+                        .map(|addr| addr.to_string())
+                        .collect();
+                    Config::remember_lan(target, &lan, Some(&pjdesk_proto::tls::format_fingerprint(&fp)));
+                }
                 break (public_addr, local_addrs, cert_fingerprint.context("the server didn't send the host's key")?)
             }
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),

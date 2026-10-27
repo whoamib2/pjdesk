@@ -29,6 +29,7 @@ mod identity;
 mod idfmt;
 mod network;
 mod p2p;
+mod routes_store;
 mod platform;
 mod secure;
 mod service;
