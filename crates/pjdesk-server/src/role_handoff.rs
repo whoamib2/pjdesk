@@ -317,7 +317,7 @@ fn ask_and_confirm(data_dir: &Path, before: u64, peer: &str) -> Result<Accepted>
     bail!("{last_error} This server stayed the primary (generation {before}).");
 }
 
-fn resolve_target(address: &str) -> Option<SocketAddr> {
+pub(crate) fn resolve_target(address: &str) -> Option<SocketAddr> {
     let text = address.trim();
     if text.is_empty() {
         return None;
@@ -332,7 +332,7 @@ fn resolve_target(address: &str) -> Option<SocketAddr> {
     with_port.to_socket_addrs().ok()?.next()
 }
 
-fn dial(addr: SocketAddr, fingerprint: pjdesk_proto::tls::Fingerprint, msg: &ClientMsg, budget: Duration) -> Result<ServerMsg> {
+pub(crate) fn dial(addr: SocketAddr, fingerprint: pjdesk_proto::tls::Fingerprint, msg: &ClientMsg, budget: Duration) -> Result<ServerMsg> {
     let connect_for = budget.min(Duration::from_secs(4));
     if connect_for.is_zero() {
         bail!("timed out");

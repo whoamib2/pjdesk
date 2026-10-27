@@ -3,6 +3,7 @@
 //! The service, incoming connections, and update checks keep running. This
 //! module only decides what the window is allowed to draw.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +32,7 @@ pub struct Gate {
     email: String,
     token: String,
     api: String,
+    data_dir: PathBuf,
     pin: String,
     pin_show: bool,
     confirm: String,
@@ -73,6 +75,7 @@ impl Gate {
             email: String::new(),
             token: String::new(),
             api: crate::cloud::default_api(),
+            data_dir: PathBuf::new(),
             pin: String::new(),
             pin_show: false,
             confirm: String::new(),
@@ -176,24 +179,22 @@ impl Gate {
         }
     }
 
-    pub fn poll(&mut self, ctx: &egui::Context, email: &str, token: &str, api: &str) {
+    pub fn poll(&mut self, ctx: &egui::Context, email: &str, token: &str, api: &str, data_dir: &std::path::Path) {
         self.note_account(email, token, api);
+        self.data_dir = data_dir.to_path_buf();
         self.refresh_lockout();
         self.poll_jobs();
-        if self.email.is_empty() || self.rx.is_some() || Instant::now() < self.next_pull || self.token.is_empty() {
+        if self.email.is_empty() || self.rx.is_some() || Instant::now() < self.next_pull || self.data_dir.as_os_str().is_empty() {
             return;
         }
         self.next_pull = Instant::now() + Duration::from_secs(45);
-        let token = self.token.clone();
-        let api = self.api.clone();
+        let dir = self.data_dir.clone();
         let (tx, rx) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("app-lock-pull".into())
             .spawn(move || {
-                let msg = fetch_lock(&api, &token)
-                    .map(|remote| Msg::Remote(Ok(remote)))
-                    .unwrap_or_else(|e| Msg::Remote(Err(e)));
-                let _ = tx.send(msg);
+                let (sealed, updated) = crate::account_mirror::read_owner_lock(&dir);
+                let _ = tx.send(Msg::Remote(Ok(Remote { sealed, updated })));
             })
             .is_ok();
         if spawned {
@@ -421,10 +422,10 @@ impl Gate {
     fn start_reauth(&mut self) {
         let email = self.email.clone();
         let password = self.password.clone();
-        let api = self.api.clone();
+        let dir = self.data_dir.clone();
         self.busy = true;
         self.error.clear();
-        self.spawn(move || match confirm_password(&api, &email, &password) {
+        self.spawn(move || match confirm_password(&dir, &email, &password) {
             Ok(key) => Msg::Reauthed(key),
             Err(err) => Msg::Failed(err),
         });
@@ -444,20 +445,19 @@ impl Gate {
             self.note = "Enter your pjdesk.com password.".into();
             return;
         }
-        if self.token.is_empty() {
-            self.note = "Open this window as administrator once so the PIN can be saved to the account.".into();
+        if !crate::account_mirror::has_owner_copy(&self.data_dir) {
+            self.note = "This server does not have the account yet.".into();
             return;
         }
         let pin = self.pin.clone();
         let password = self.password.clone();
         let email = self.email.clone();
-        let api = self.api.clone();
-        let token = self.token.clone();
+        let dir = self.data_dir.clone();
         let existing = self.key;
         let idle = self.verifier.as_ref().map(|v| v.idle_sec).unwrap_or(applock::IDLE_DEFAULT);
         self.busy = true;
         self.note = "Saving…".into();
-        self.spawn(move || save_pin(&api, &token, &email, &password, existing, recent, &pin, idle));
+        self.spawn(move || save_pin(&dir, &email, &password, existing, recent, &pin, idle));
     }
 
     fn spawn(&mut self, job: impl FnOnce() -> Msg + Send + 'static) {
@@ -682,8 +682,7 @@ fn open_cached(file: &WindowLockFile) -> Option<Verifier> {
 }
 
 fn save_pin(
-    api: &str,
-    token: &str,
+    dir: &std::path::Path,
     email: &str,
     password: &str,
     existing: Option<[u8; 32]>,
@@ -692,7 +691,7 @@ fn save_pin(
     idle: u64,
 ) -> Msg {
     let key = if !password.is_empty() {
-        match confirm_password(api, email, password) {
+        match confirm_password(dir, email, password) {
             Ok(key) => key,
             Err(err) => return Msg::Failed(err),
         }
@@ -712,83 +711,18 @@ fn save_pin(
         Ok(s) => s,
         Err(err) => return Msg::Failed(err),
     };
-    match put_lock(api, token, &sealed) {
+    match put_lock(dir, &sealed) {
         Ok(updated) => Msg::Stored { sealed, updated, verifier, key },
         Err(err) => Msg::Failed(err),
     }
 }
 
-fn fetch_lock(api: &str, token: &str) -> Result<Remote, String> {
-    let url = format!("{}/api/network/app-lock", api.trim_end_matches('/'));
-    let text = post(&url, token, "{}")?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| "the account sent an unexpected app lock".to_string())?;
-    Ok(Remote {
-        sealed: parsed.get("lock").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        updated: parsed.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0),
-    })
+fn put_lock(dir: &std::path::Path, lock: &str) -> Result<u64, String> {
+    crate::account_mirror::write_owner_lock(dir, lock)
 }
 
-fn put_lock(api: &str, token: &str, lock: &str) -> Result<u64, String> {
-    let url = format!("{}/api/network/app-lock", api.trim_end_matches('/'));
-    let body = serde_json::json!({ "lock": lock }).to_string();
-    let text = post(&url, token, &body)?;
-    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-    Ok(parsed.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0).max(1))
-}
-
-fn post(url: &str, token: &str, body: &str) -> Result<String, String> {
-    match crate::cloud::agent()
-        .post(url)
-        .set("authorization", &format!("Bearer {token}"))
-        .set("content-type", "application/json")
-        .send_string(body)
-    {
-        Ok(resp) => resp.into_string().map_err(|e| e.to_string()),
-        Err(ureq::Error::Status(code, resp)) => {
-            let msg = resp
-                .into_string()
-                .ok()
-                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                .and_then(|v| v.get("error").and_then(|m| m.as_str()).map(str::to_string))
-                .unwrap_or_else(|| format!("PJDesk Cloud error (HTTP {code})"));
-            Err(msg)
-        }
-        Err(ureq::Error::Transport(err)) => Err(format!("Could not reach pjdesk.com. {err}")),
-    }
-}
-
-fn confirm_password(api: &str, email: &str, password: &str) -> Result<[u8; 32], String> {
-    let email = email.trim().to_lowercase();
-    if email.is_empty() || password.is_empty() {
-        return Err("Enter your account password.".into());
-    }
-    let keys = crate::cloud::derive_account_keys(&email, password);
-    let body = serde_json::json!({
-        "email": email,
-        "auth_key": hex::encode(keys.auth),
-        "device": "PJDesk Server PIN check",
-    })
-    .to_string();
-    let url = format!("{}/api/login", api.trim_end_matches('/'));
-    let text = match crate::cloud::agent().post(&url).set("content-type", "application/json").send_string(&body) {
-        Ok(resp) => resp.into_string().map_err(|e| e.to_string())?,
-        Err(ureq::Error::Status(code, resp)) => {
-            let text = resp.into_string().unwrap_or_default();
-            return Err(crate::cloud::cloud_error_text(code, &text));
-        }
-        Err(ureq::Error::Transport(err)) => return Err(format!("Could not reach pjdesk.com. {err}")),
-    };
-    let parsed: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| "unexpected reply from PJDesk".to_string())?;
-    let token = parsed.get("token").and_then(|v| v.as_str()).unwrap_or("");
-    if !token.is_empty() {
-        let _ = crate::cloud::agent()
-            .post(&format!("{}/api/logout", api.trim_end_matches('/')))
-            .set("authorization", &format!("Bearer {token}"))
-            .send_string("{}");
-    }
-    Ok(pjdesk_proto::access::derive_password_vault_key(&email, password))
+fn confirm_password(dir: &std::path::Path, email: &str, password: &str) -> Result<[u8; 32], String> {
+    crate::account_mirror::confirm_owner(dir, email, password)
 }
 
 fn submitted(ui: &egui::Ui, response: &egui::Response) -> bool {

@@ -32,7 +32,10 @@
 //   GET  /api/admin/audit       (Bearer, admin)
 //   POST /api/admin/plan        (Bearer, admin) {email, plan, expires_at, note}
 //   POST /api/admin/sync        (Bearer, admin) {email, enabled}  (audited; same as a plan grant)
-//   GET  /api/release           latest release info (from GitHub)
+//   GET  /api/release           latest release info (from GitHub); ETag
+//   GET  /api/account/mirror    (Bearer) synced account copy for the primary
+//   PUT  /api/account/mirror    (Bearer) {base_revision, changes}; 412 + mirror
+//                               This route is not deployed until cloud\deploy.cmd.
 //   GET  /download/{client,server,sums}  → the latest release's files
 // Everything else is the static website in ./public.
 
@@ -40,6 +43,7 @@ import { effectivePlan, isPlan } from "./plans.js";
 import { route as networkRoute } from "./network.js";
 import { probeQuery, shapeHealth } from "./health.js";
 import { LOGIN_FAILS, LOGIN_IP, loginRetryAfter, retryAfterSeconds, signInLimitMessage } from "./login-limit.js";
+import { accountMirror } from "./account-mirror.js";
 
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 const AUTH_HASH_ITERATIONS = 100000; // the Workers PBKDF2 maximum
@@ -244,8 +248,18 @@ async function api(request, env, url, ctx) {
     const handled = await networkRoute(request, env, url);
     if (handled) return handled;
   }
+  if (p === "/api/account/mirror" && (m === "GET" || m === "PUT")) {
+    return accountMirror(request, env, await session(request, env));
+  }
   if (p === "/api/release" && m === "GET") {
-    return json(await latestRelease(env), 200, { "cache-control": "public, max-age=300" });
+    const info = await latestRelease(env);
+    const etag = `"${await sha256Hex(JSON.stringify(info))}"`;
+    const headers = { etag, "cache-control": "public, max-age=300" };
+    const inm = request.headers.get("if-none-match") || "";
+    if (inm.split(",").some((part) => part.trim() === etag || part.trim() === `W/${etag}`)) {
+      return new Response(null, { status: 304, headers });
+    }
+    return json(info, 200, headers);
   }
   throw new HttpError(404, "Not found.");
 }

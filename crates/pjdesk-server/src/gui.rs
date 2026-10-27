@@ -814,7 +814,7 @@ impl eframe::App for App {
 
         let email = self.signed_in_email();
         let (token, api) = self.cloud_session();
-        self.gate.poll(&ctx, &email, &token, &api);
+        self.gate.poll(&ctx, &email, &token, &api, &self.data_dir);
         let hidden = ctx.input(|i| i.viewport().minimized == Some(true) || i.viewport().visible() == Some(false));
         self.gate.note_visibility(&ctx, hidden);
         if self.gate.blocking() {
@@ -3788,15 +3788,20 @@ impl App {
         if !self.check_release || self.release_rx.is_some() {
             return;
         }
-        let due = self.release_at.map(|t| t.elapsed() > Duration::from_secs(600)).unwrap_or(true);
+        let due = self.release_at.map(|t| t.elapsed() > Duration::from_secs(pjdesk_proto::failover::RELEASE_CHECK_SECS)).unwrap_or(true);
         if !due {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.release_rx = Some(rx);
         self.release_at = Some(Instant::now());
+        let dir = self.data_dir.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(pjdesk_proto::update::site_version().ok());
+            let version = crate::account_mirror::release_message(&dir).and_then(|msg| match msg {
+                pjdesk_proto::signal::ServerMsg::Release { version, .. } => Some(version),
+                _ => None,
+            });
+            let _ = tx.send(version);
         });
     }
 

@@ -403,17 +403,9 @@ fn my_public_ip() -> Option<String> {
 }
 
 fn fetch_my_public_ip() -> Option<String> {
-    let base = std::env::var("PJDESK_CLOUD_API")
-        .ok()
-        .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "https://pjdesk.com".into());
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(3)).build();
-    let text = agent.get(&format!("{base}/api/ip")).call().ok()?.into_string().ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let ip = value.get("ip")?.as_str()?.trim().to_string();
-    ip.parse::<IpAddr>().ok()?;
-    Some(ip)
+    // The server already knows the public addresses. A client does not ask
+    // pjdesk.com which IP it sees.
+    None
 }
 
 /// LAN and the public address in parallel. Each path has its own fingerprint check.

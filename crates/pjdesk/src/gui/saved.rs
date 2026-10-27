@@ -1750,22 +1750,9 @@ fn version_on_tile(ui: &egui::Ui, version: &str) -> egui::Color32 {
 }
 
 fn cached_latest() -> Option<String> {
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    static STARTED: OnceLock<()> = OnceLock::new();
-    let slot = CACHE.get_or_init(|| Mutex::new(None));
-    STARTED.get_or_init(|| {
-        std::thread::spawn(|| {
-            if let Ok(version) = pjdesk_proto::update::site_version() {
-                if let Some(lock) = CACHE.get() {
-                    if let Ok(mut guard) = lock.lock() {
-                        *guard = Some(version);
-                    }
-                }
-            }
-        });
-    });
-    slot.lock().ok().and_then(|guard| guard.clone())
+    // The primary fetches the release and tells connected clients. This window
+    // does not call pjdesk.com to color a version.
+    None
 }
 
 fn status_color(ui: &egui::Ui, row: &SavedRow) -> egui::Color32 {

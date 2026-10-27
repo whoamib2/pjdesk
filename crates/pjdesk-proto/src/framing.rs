@@ -9,8 +9,9 @@ use anyhow::{bail, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Largest signaling message accepted (they are all tiny).
-pub const MAX_SIGNAL_FRAME: usize = 64 * 1024;
+/// Largest signaling message accepted. Account replies carry a sealed
+/// password vault, which is larger than a session setup message.
+pub const MAX_SIGNAL_FRAME: usize = 256 * 1024;
 /// Largest control/auth message accepted on the peer connection.
 pub const MAX_CONTROL_FRAME: usize = 256 * 1024;
 

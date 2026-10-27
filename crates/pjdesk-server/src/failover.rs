@@ -57,11 +57,21 @@ pub fn watch_once(data_dir: &Path, misses: u32) -> Step {
     if cloud::CloudConfig::load(data_dir).is_none() {
         return Step::Stay { misses: 0, log: String::new() };
     }
-    cloud::publish_heartbeat(data_dir);
+    // The 3-second probe stays on the LAN. pjdesk.com is the 5-minute batch.
+    if !cloud::accepts_host_registrations(data_dir) {
+        crate::account_mirror::pull_replica(data_dir);
+    }
     let mine = cloud::instance_of(data_dir);
     let local_epoch = cloud::local_epoch(data_dir);
     let primary = cloud::accepts_host_registrations(data_dir);
-    let (read_ok, peers) = cloud::peer_health_result(data_dir);
+    // The primary reads cloud health on the batch cadence. The standby reads
+    // it only after the direct probe has already failed, and then at most
+    // once a minute.
+    let (read_ok, peers) = if primary {
+        cloud::peer_health_cached(data_dir, pjdesk_proto::failover::CLOUD_BATCH_SECS, true)
+    } else {
+        cloud::peer_health_cached(data_dir, u64::MAX, false)
+    };
     if primary {
         // A standby is supposed to see a higher generation on the primary.
         // Only the server that is currently accepting computers steps down.
@@ -95,6 +105,11 @@ pub fn watch_once(data_dir: &Path, misses: u32) -> Step {
     };
     let probe = probe_primary(addr);
     let counted = next_misses(misses, probe);
+    let (read_ok, peers) = if counted >= MISSES_TO_PROMOTE && matches!(probe, Probe::Silent) {
+        cloud::peer_health_cached(data_dir, 60, true)
+    } else {
+        (read_ok, peers)
+    };
     let now = cloud::unix_now();
     let mine_name = cloud::computer_name();
     let other = newest_other(&peers, &mine, &mine_name);

@@ -346,7 +346,7 @@ pub struct IpWatch {
 }
 
 const WATCH_FILE: &str = "ip-watch.json";
-pub const IP_CHECK_EVERY: u64 = 300;
+pub const IP_CHECK_EVERY: u64 = 15 * 60;
 
 impl IpWatch {
     pub fn load(dir: &Path) -> Self {
@@ -635,6 +635,10 @@ pub fn stored_address_warning(data_dir: &Path) -> String {
 /// Checks the public IP at most every five minutes. Returns true when a
 /// confirmed change should be published.
 pub fn poll_public_ip(data_dir: &Path, now: u64) -> bool {
+    // Only the primary asks pjdesk.com which address it sees.
+    if !crate::cloud::accepts_host_registrations(data_dir) {
+        return false;
+    }
     let mut watch = IpWatch::load(data_dir);
     if watch.checked_at != 0 && now.saturating_sub(watch.checked_at) < IP_CHECK_EVERY {
         return false;

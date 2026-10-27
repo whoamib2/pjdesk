@@ -1,0 +1,854 @@
+//! The primary's copy of the pjdesk.com account, and the standby's mirror.
+//!
+//! Sign-in, token refresh, and saved-list edits are answered from this file.
+//! pjdesk.com is called from the batch, not from each client request. The
+//! password is never written. See `pjdesk_proto::account_mirror`.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Result};
+use hmac::{Hmac, Mac};
+use pjdesk_proto::account_mirror::{
+    self, apply_change, ensure_sign_key, for_replica, has_verifier, merge, sign_in, vault_for, AccountChange,
+    AccountCopy, AuthError, DeviceRow, SavedComputer, SealedRow,
+};
+use pjdesk_proto::failover::{cloud_edge_limited, next_cloud_wait, CLOUD_BATCH_SECS};
+use pjdesk_proto::signal::{ClientMsg, FleetComputer, ServerMsg};
+use pjdesk_proto::update::version_at_least;
+use serde::Deserialize;
+use sha2::Sha256;
+
+use crate::cloud::{self, CloudConfig};
+
+type HmacSha256 = Hmac<Sha256>;
+
+const MIRROR_FILE: &str = "account-mirror.json";
+const JOURNAL_FILE: &str = "account-journal.json";
+const PAUSE_FILE: &str = "cloud-pause.json";
+const BATCH_FILE: &str = "account-batch-at.txt";
+const REPLICA_FILE: &str = "account-replica-at.txt";
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Pause {
+    #[serde(default)]
+    until: u64,
+    #[serde(default)]
+    wait: u64,
+}
+
+pub fn load(dir: &Path) -> AccountCopy {
+    std::fs::read(dir.join(MIRROR_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save(dir: &Path, copy: &AccountCopy) {
+    let Ok(bytes) = serde_json::to_vec_pretty(copy) else { return };
+    let path = dir.join(MIRROR_FILE);
+    if std::fs::write(&path, bytes).is_ok() {
+        cloud::protect(&path);
+    }
+}
+
+fn journal(dir: &Path) -> Vec<AccountChange> {
+    std::fs::read(dir.join(JOURNAL_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn store_journal(dir: &Path, changes: &[AccountChange]) {
+    let path = dir.join(JOURNAL_FILE);
+    if changes.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(changes) {
+        if std::fs::write(&path, bytes).is_ok() {
+            cloud::protect(&path);
+        }
+    }
+}
+
+fn remember(dir: &Path, change: AccountChange) {
+    let mut copy = load(dir);
+    apply_change(&mut copy, &change);
+    ensure_sign_key(&mut copy);
+    save(dir, &copy);
+    let mut pending = journal(dir);
+    pending.push(change);
+    if pending.len() > 400 {
+        pending.drain(0..pending.len() - 400);
+    }
+    store_journal(dir, &pending);
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn pause(dir: &Path) -> Pause {
+    std::fs::read(dir.join(PAUSE_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn cloud_paused(dir: &Path) -> bool {
+    pause(dir).until > now()
+}
+
+fn note_edge(dir: &Path) {
+    let mut row = pause(dir);
+    row.wait = next_cloud_wait(row.wait);
+    row.until = now().saturating_add(row.wait);
+    if let Ok(bytes) = serde_json::to_vec(&row) {
+        let _ = std::fs::write(dir.join(PAUSE_FILE), bytes);
+    }
+    tracing::warn!("pjdesk.com is rate limited; the account copy stays local for {}s", row.wait);
+}
+
+fn note_cloud_ok(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(PAUSE_FILE));
+}
+
+fn stamp(path: &Path) -> u64 {
+    std::fs::read_to_string(path).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0)
+}
+
+fn write_stamp(path: &Path, at: u64) {
+    let _ = std::fs::write(path, format!("{at}\n"));
+}
+
+/// One batch. The standby does not call pjdesk.com here.
+pub fn batch(dir: &Path, force: bool) -> bool {
+    if !cloud::accepts_host_registrations(dir) {
+        return false;
+    }
+    let at = now();
+    if !force && at.saturating_sub(stamp(&dir.join(BATCH_FILE))) < CLOUD_BATCH_SECS && journal(dir).is_empty() {
+        return false;
+    }
+    if cloud_paused(dir) && !force {
+        return false;
+    }
+    write_stamp(&dir.join(BATCH_FILE), at);
+    let Some(cfg) = CloudConfig::load(dir) else { return false };
+    if !cfg.is_account() || cfg.token.is_empty() {
+        return false;
+    }
+    let mut local = load(dir);
+    ensure_sign_key(&mut local);
+    let pending = journal(dir);
+    if !pending.is_empty() {
+        match push(&cfg, &local.revision, &pending) {
+            Ok(fresh) => {
+                note_cloud_ok(dir);
+                local = merge(&fresh, &local, &[]);
+                store_journal(dir, &[]);
+            }
+            Err(Push::Conflict(fresh)) => {
+                local = merge(&fresh, &local, &pending);
+                if let Ok(again) = push(&cfg, &local.revision, &journal_from_merge(&fresh, &local)) {
+                    local = merge(&again, &local, &[]);
+                    store_journal(dir, &[]);
+                }
+            }
+            Err(Push::Paused) => {
+                note_edge(dir);
+            }
+            Err(Push::Missing) => {
+                tracing::info!("account mirror is not on pjdesk.com yet; this server keeps the local copy");
+            }
+            Err(Push::Other(err)) => tracing::warn!("account mirror push: {err}"),
+        }
+    }
+    match pull(&cfg) {
+        Ok(fresh) => {
+            note_cloud_ok(dir);
+            let pending = journal(dir);
+            local = merge(&fresh, &local, &pending);
+        }
+        Err(Pull::Paused) => note_edge(dir),
+        Err(Pull::Missing) => {}
+        Err(Pull::Other(err)) => tracing::warn!("account mirror pull: {err}"),
+    }
+    ensure_sign_key(&mut local);
+    save(dir, &local);
+    true
+}
+
+/// Changes that are in `local` and not already the cloud row. Used after a
+/// conflict so a website password change is not pushed back.
+fn journal_from_merge(cloud: &AccountCopy, local: &AccountCopy) -> Vec<AccountChange> {
+    let mut out = Vec::new();
+    for computer in &local.computers {
+        let cloud_row = cloud.computers.iter().find(|row| row.id == computer.id && row.account_id == computer.account_id);
+        if cloud_row.map(|row| row.updated_at < computer.updated_at).unwrap_or(true) {
+            out.push(AccountChange::Computer { computer: computer.clone() });
+        }
+    }
+    for device in &local.devices {
+        let cloud_row = cloud.devices.iter().find(|row| row.device_id == device.device_id);
+        if cloud_row.map(|row| row.enrolled_at < device.enrolled_at && row.revoked_at == 0).unwrap_or(true) {
+            out.push(AccountChange::Device { device: device.clone() });
+        }
+    }
+    out
+}
+
+enum Push {
+    Conflict(AccountCopy),
+    Paused,
+    Missing,
+    Other(String),
+}
+
+enum Pull {
+    Paused,
+    Missing,
+    Other(String),
+}
+
+fn endpoint(cfg: &CloudConfig) -> String {
+    format!("{}/api/account/mirror", cfg.api.trim_end_matches('/'))
+}
+
+fn pull(cfg: &CloudConfig) -> std::result::Result<AccountCopy, Pull> {
+    let response = cloud::agent().get(&endpoint(cfg)).set("authorization", &format!("Bearer {}", cfg.token)).call();
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(404, _)) => return Err(Pull::Missing),
+        Err(err) => return Err(classify_pull(err)),
+    };
+    let text = response.into_string().map_err(|err| Pull::Other(err.to_string()))?;
+    serde_json::from_str(&text).map_err(|err| Pull::Other(err.to_string()))
+}
+
+fn push(cfg: &CloudConfig, revision: &str, changes: &[AccountChange]) -> std::result::Result<AccountCopy, Push> {
+    let body = serde_json::json!({ "base_revision": revision, "changes": changes });
+    let response = cloud::agent()
+        .put(&endpoint(cfg))
+        .set("authorization", &format!("Bearer {}", cfg.token))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string());
+    match response {
+        Ok(response) => {
+            let text = response.into_string().map_err(|err| Push::Other(err.to_string()))?;
+            serde_json::from_str(&text).map_err(|err| Push::Other(err.to_string()))
+        }
+        Err(ureq::Error::Status(412, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            let fresh = serde_json::from_str::<ConflictBody>(&text)
+                .ok()
+                .and_then(|body| body.mirror)
+                .ok_or_else(|| Push::Other("the account changed".into()))?;
+            Err(Push::Conflict(fresh))
+        }
+        Err(ureq::Error::Status(404, _)) => Err(Push::Missing),
+        Err(err) => Err(classify_push(err)),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConflictBody {
+    #[serde(default)]
+    mirror: Option<AccountCopy>,
+}
+
+fn classify_pull(err: ureq::Error) -> Pull {
+    if is_edge(&err) {
+        Pull::Paused
+    } else {
+        Pull::Other(err.to_string())
+    }
+}
+
+fn classify_push(err: ureq::Error) -> Push {
+    if is_edge(&err) {
+        Push::Paused
+    } else {
+        Push::Other(err.to_string())
+    }
+}
+
+fn is_edge(err: &ureq::Error) -> bool {
+    let ureq::Error::Status(status, response) = err else {
+        return false;
+    };
+    let ctype = response.header("content-type").unwrap_or("");
+    // The body was not read. Status 429 with an HTML content type is the edge.
+    *status == 429 && ctype.to_ascii_lowercase().contains("text/html")
+        || cloud_edge_limited(*status, ctype, "")
+}
+
+pub fn has_owner_copy(dir: &Path) -> bool {
+    account_mirror::has_verifier(&load(dir))
+}
+
+pub fn read_owner_lock(dir: &Path) -> (String, u64) {
+    let copy = load(dir);
+    let id = copy.account_id.clone();
+    copy.locks
+        .into_iter()
+        .find(|row| row.account_id == id)
+        .map(|row| (row.ciphertext, row.updated_at))
+        .unwrap_or_default()
+}
+
+pub fn write_owner_lock(dir: &Path, ciphertext: &str) -> Result<u64, String> {
+    let copy = load(dir);
+    if copy.account_id.is_empty() {
+        return Err("This server does not have the account yet, and pjdesk.com did not answer.".into());
+    }
+    let at = now();
+    remember(
+        dir,
+        AccountChange::Lock {
+            row: SealedRow { account_id: copy.account_id, ciphertext: ciphertext.to_string(), updated_at: at },
+        },
+    );
+    Ok(at)
+}
+
+pub fn confirm_owner(dir: &Path, email: &str, password: &str) -> Result<[u8; 32], String> {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() || password.is_empty() {
+        return Err("Enter your account password.".into());
+    }
+    let keys = crate::cloud::derive_account_keys(&email, password);
+    let mut copy = load(dir);
+    match account_mirror::verify_auth(&mut copy, &email, &hex::encode(keys.auth), now()) {
+        Ok(()) => {
+            save(dir, &copy);
+            Ok(pjdesk_proto::access::derive_password_vault_key(&email, password))
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Answers one client account request from the local copy.
+pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
+    let ClientMsg::Account {
+        op,
+        email,
+        auth_key,
+        refresh,
+        device_id,
+        device_name,
+        vault,
+        app_lock,
+        computers,
+        proof,
+    } = msg
+    else {
+        return fail("sign-in", "That was not understood.");
+    };
+    if op == "replica" {
+        return replica(dir, &proof);
+    }
+    if !has_verifier(&load(dir)) && !cloud_paused(dir) {
+        batch(dir, true);
+    }
+    let mut copy = load(dir);
+    ensure_sign_key(&mut copy);
+    save(dir, &copy);
+    match op.as_str() {
+        "sign-in" => answer_sign_in(dir, &email, &auth_key, &device_id, &device_name),
+        "verify" => answer_verify(dir, &email, &auth_key),
+        "refresh" => answer_refresh(dir, &refresh, &device_id, &computers),
+        "vault-read" => answer_sealed(dir, &refresh, &device_id, true, None),
+        "vault-write" => answer_sealed(dir, &refresh, &device_id, true, Some(vault)),
+        "lock-read" => answer_sealed(dir, &refresh, &device_id, false, None),
+        "lock-write" => answer_sealed(dir, &refresh, &device_id, false, Some(app_lock)),
+        "saved-write" => answer_saved(dir, &refresh, &device_id, &computers),
+        _ => fail(&op, "That was not understood."),
+    }
+}
+
+fn answer_sign_in(dir: &Path, email: &str, auth_key: &str, device_id: &str, device_name: &str) -> ServerMsg {
+    // Reject a body that is not an auth key before touching the verifier.
+    if auth_key.len() != 64 || !auth_key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return fail("sign-in", "Enter your email and password.");
+    }
+    let mut copy = load(dir);
+    let refresh = random_hex(32);
+    let result = sign_in(&mut copy, email, auth_key, device_id, device_name, &refresh, now());
+    match result {
+        Ok(session) => {
+            if let Some(device) = copy.devices.iter().find(|row| row.device_id == session.device_id).cloned() {
+                save(dir, &copy);
+                remember_device(dir, device);
+            }
+            session_msg(&copy, "sign-in", &session, &refresh)
+        }
+        Err(AuthError::Pause(secs)) => {
+            save(dir, &copy);
+            paused("sign-in", account_mirror::sign_in_limit_message(secs), secs)
+        }
+        Err(err) => {
+            save(dir, &copy);
+            fail("sign-in", &err.to_string())
+        }
+    }
+}
+
+fn answer_verify(dir: &Path, email: &str, auth_key: &str) -> ServerMsg {
+    if auth_key.len() != 64 || !auth_key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return fail("verify", "Enter your email and password.");
+    }
+    let mut copy = load(dir);
+    match account_mirror::verify_auth(&mut copy, email, auth_key, now()) {
+        Ok(()) => {
+            save(dir, &copy);
+            let mut msg = empty_result();
+            if let ServerMsg::AccountResult { ok, op, .. } = &mut msg {
+                *ok = true;
+                *op = "verify".into();
+            }
+            msg
+        }
+        Err(AuthError::Pause(secs)) => {
+            save(dir, &copy);
+            paused("verify", account_mirror::sign_in_limit_message(secs), secs)
+        }
+        Err(err) => {
+            save(dir, &copy);
+            fail("verify", &err.to_string())
+        }
+    }
+}
+
+fn remember_device(dir: &Path, device: DeviceRow) {
+    let mut pending = journal(dir);
+    pending.push(AccountChange::Device { device });
+    store_journal(dir, &pending);
+}
+
+fn answer_refresh(dir: &Path, refresh: &str, device_id: &str, computers: &[FleetComputer]) -> ServerMsg {
+    let copy = load(dir);
+    match account_mirror::refresh_session(&copy, refresh, device_id, now()) {
+        Ok(session) => {
+            if !computers.is_empty() {
+                write_computers(dir, &session.account_id, computers);
+            }
+            let copy = load(dir);
+            session_msg(&copy, "refresh", &session, refresh)
+        }
+        Err(err) => fail("refresh", &err.to_string()),
+    }
+}
+
+fn answer_saved(dir: &Path, refresh: &str, device_id: &str, computers: &[FleetComputer]) -> ServerMsg {
+    let copy = load(dir);
+    let Ok(session) = account_mirror::refresh_session(&copy, refresh, device_id, now()) else {
+        return fail("saved-write", "Sign in required.");
+    };
+    write_computers(dir, &session.account_id, computers);
+    let copy = load(dir);
+    session_msg(&copy, "saved-write", &session, refresh)
+}
+
+fn write_computers(dir: &Path, account_id: &str, computers: &[FleetComputer]) {
+    let at = now();
+    for computer in computers {
+        let id = computer.id.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+        if id.len() != 9 {
+            continue;
+        }
+        remember(
+            dir,
+            AccountChange::Computer {
+                computer: SavedComputer {
+                    id,
+                    account_id: account_id.to_string(),
+                    name: computer.name.clone(),
+                    hostname: computer.hostname.clone(),
+                    os_family: computer.os_family.clone(),
+                    os_version: computer.os_version.clone(),
+                    display_name: computer.display_name.clone(),
+                    starred: computer.starred,
+                    position: computer.position,
+                    hidden: computer.hidden,
+                    group: computer.group.clone(),
+                    updated_at: at,
+                },
+            },
+        );
+    }
+}
+
+fn answer_sealed(dir: &Path, refresh: &str, device_id: &str, vault: bool, write: Option<String>) -> ServerMsg {
+    let copy = load(dir);
+    let Ok(session) = account_mirror::refresh_session(&copy, refresh, device_id, now()) else {
+        return fail(if vault { "vault-read" } else { "lock-read" }, "Sign in required.");
+    };
+    if let Some(text) = write {
+        let row = SealedRow { account_id: session.account_id.clone(), ciphertext: text, updated_at: now() };
+        remember(
+            dir,
+            if vault { AccountChange::Vault { row } } else { AccountChange::Lock { row } },
+        );
+    }
+    let copy = load(dir);
+    let mut msg = session_msg(&copy, if vault { "vault-read" } else { "lock-read" }, &session, refresh);
+    if let ServerMsg::AccountResult { vault: slot, app_lock, vault_updated, app_lock_updated, .. } = &mut msg {
+        if vault {
+            *slot = vault_for(&copy, &session.account_id).to_string();
+            *vault_updated = copy
+                .vaults
+                .iter()
+                .find(|row| row.account_id == session.account_id)
+                .map(|row| row.updated_at)
+                .unwrap_or(0);
+        } else {
+            *app_lock = copy
+                .locks
+                .iter()
+                .find(|row| row.account_id == session.account_id)
+                .map(|row| row.ciphertext.clone())
+                .unwrap_or_default();
+            *app_lock_updated = copy
+                .locks
+                .iter()
+                .find(|row| row.account_id == session.account_id)
+                .map(|row| row.updated_at)
+                .unwrap_or(0);
+        }
+    }
+    msg
+}
+
+fn session_msg(copy: &AccountCopy, op: &str, session: &account_mirror::SessionOut, refresh: &str) -> ServerMsg {
+    let computers = copy
+        .computers
+        .iter()
+        .filter(|row| row.account_id == session.account_id)
+        .map(fleet_computer)
+        .collect();
+    let removed = copy.removed.iter().map(|row| row.id.clone()).collect();
+    ServerMsg::AccountResult {
+        ok: true,
+        op: op.into(),
+        message: String::new(),
+        access: session.access.clone(),
+        exp: session.exp,
+        refresh: refresh.to_string(),
+        email: session.email.clone(),
+        role: session.role.clone(),
+        device_id: session.device_id.clone(),
+        computers,
+        removed,
+        active_address: copy.network.active_address.clone(),
+        active_fingerprint: copy.network.active_fingerprint.clone(),
+        standby_address: copy.network.standby_address.clone(),
+        standby_fingerprint: copy.network.standby_fingerprint.clone(),
+        active_lan: copy.network.active_lan.clone(),
+        standby_lan: copy.network.standby_lan.clone(),
+        active_public_ip: copy.network.active_public_ip.clone(),
+        standby_public_ip: copy.network.standby_public_ip.clone(),
+        vault: String::new(),
+        vault_updated: 0,
+        app_lock: String::new(),
+        app_lock_updated: 0,
+        pause_secs: 0,
+    }
+}
+
+fn fleet_computer(row: &SavedComputer) -> FleetComputer {
+    FleetComputer {
+        id: row.id.clone(),
+        name: row.name.clone(),
+        hostname: row.hostname.clone(),
+        os_family: row.os_family.clone(),
+        os_version: row.os_version.clone(),
+        display_name: row.display_name.clone(),
+        starred: row.starred,
+        position: row.position,
+        hidden: row.hidden,
+        group: row.group.clone(),
+    }
+}
+
+fn empty_result() -> ServerMsg {
+    ServerMsg::AccountResult {
+        ok: false,
+        op: String::new(),
+        message: String::new(),
+        access: String::new(),
+        exp: 0,
+        refresh: String::new(),
+        email: String::new(),
+        role: String::new(),
+        device_id: String::new(),
+        vault: String::new(),
+        vault_updated: 0,
+        app_lock: String::new(),
+        app_lock_updated: 0,
+        computers: Vec::new(),
+        removed: Vec::new(),
+        pause_secs: 0,
+        active_address: String::new(),
+        active_fingerprint: String::new(),
+        standby_address: String::new(),
+        standby_fingerprint: String::new(),
+        active_lan: String::new(),
+        standby_lan: String::new(),
+        active_public_ip: String::new(),
+        standby_public_ip: String::new(),
+    }
+}
+
+fn paused(op: &str, message: String, secs: u64) -> ServerMsg {
+    let mut msg = empty_result();
+    if let ServerMsg::AccountResult { op: slot, message: text, pause_secs, .. } = &mut msg {
+        *slot = op.to_string();
+        *text = message;
+        *pause_secs = secs;
+    }
+    msg
+}
+
+fn fail(op: &str, message: &str) -> ServerMsg {
+    let mut msg = empty_result();
+    if let ServerMsg::AccountResult { op: slot, message: text, .. } = &mut msg {
+        *slot = op.to_string();
+        *text = message.to_string();
+    }
+    msg
+}
+
+fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    let rng = ring::rand::SystemRandom::new();
+    let _ = ring::rand::SecureRandom::fill(&rng, &mut buf);
+    hex::encode(buf)
+}
+
+pub fn replica_proof(key: &[u8; 32], at: u64) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC takes any key length");
+    mac.update(b"pjdesk-replica-1\n");
+    mac.update(&(at / 60).to_string().as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+fn proof_ok(dir: &Path, proof: &str) -> bool {
+    let Some(key) = cloud::sync_key(dir) else { return false };
+    let at = now();
+    let proof = proof.trim();
+    replica_proof(&key, at) == proof || replica_proof(&key, at.saturating_sub(60)) == proof
+}
+
+fn replica(dir: &Path, proof: &str) -> ServerMsg {
+    if !proof_ok(dir, proof) {
+        return fail("replica", "Sign in required.");
+    }
+    let copy = for_replica(&load(dir));
+    let Ok(body) = serde_json::to_vec(&copy) else {
+        return fail("replica", "The account copy could not be sent.");
+    };
+    if body.len() > 200_000 {
+        return fail("replica", "The account copy is too large to send.");
+    }
+    ServerMsg::Replica { revision: copy.revision.clone(), body }
+}
+
+/// The standby asks the primary for the account copy. This is not a pjdesk.com call.
+pub fn pull_replica(dir: &Path) {
+    if cloud::accepts_host_registrations(dir) {
+        return;
+    }
+    let at = now();
+    if at.saturating_sub(stamp(&dir.join(REPLICA_FILE))) < CLOUD_BATCH_SECS {
+        return;
+    }
+    let Some(key) = cloud::sync_key(dir) else { return };
+    let Some(fingerprint) = crate::server::read_identity(dir).map(|id| id.fingerprint()) else { return };
+    let targets = cloud::peer_dial_targets(dir);
+    if targets.is_empty() {
+        return;
+    }
+    write_stamp(&dir.join(REPLICA_FILE), at);
+    let proof = replica_proof(&key, at);
+    let msg = ClientMsg::Account {
+        op: "replica".into(),
+        proof,
+        email: String::new(),
+        auth_key: String::new(),
+        refresh: String::new(),
+        device_id: String::new(),
+        device_name: String::new(),
+        vault: String::new(),
+        app_lock: String::new(),
+        computers: Vec::new(),
+    };
+    for target in targets {
+        let Some(addr) = crate::role_handoff::resolve_target(&target) else { continue };
+        match crate::role_handoff::dial(addr, fingerprint, &msg, Duration::from_secs(8)) {
+            Ok(ServerMsg::Replica { body, .. }) => {
+                if let Ok(fresh) = serde_json::from_slice::<AccountCopy>(&body) {
+                    let local = load(dir);
+                    let merged = merge(&fresh, &local, &journal(dir));
+                    save(dir, &merged);
+                    tracing::info!("account copy mirrored from the primary");
+                }
+                return;
+            }
+            Ok(_) => return,
+            Err(err) => tracing::debug!("account mirror from {target}: {err:#}"),
+        }
+    }
+}
+
+pub fn apply_replica_body(dir: &Path, body: &[u8]) {
+    let Ok(fresh) = serde_json::from_slice::<AccountCopy>(body) else { return };
+    let local = load(dir);
+    save(dir, &merge(&fresh, &local, &journal(dir)));
+}
+
+pub fn fleet_for(dir: &Path, account_email: &str) -> Option<ServerMsg> {
+    let copy = load(dir);
+    if !has_verifier(&copy) && copy.computers.is_empty() {
+        return None;
+    }
+    let account_id = if account_email.is_empty() {
+        copy.account_id.clone()
+    } else {
+        copy.credentials
+            .iter()
+            .find(|row| row.email.eq_ignore_ascii_case(account_email))
+            .map(|row| row.account_id.clone())
+            .unwrap_or_else(|| copy.account_id.clone())
+    };
+    let computers = copy.computers.iter().filter(|row| row.account_id == account_id).map(fleet_computer).collect();
+    let removed = copy.removed.iter().map(|row| row.id.clone()).collect();
+    let lock = copy.locks.iter().find(|row| row.account_id == account_id);
+    Some(ServerMsg::Fleet {
+        presence: Vec::new(),
+        computers,
+        removed,
+        app_lock: lock.map(|row| row.ciphertext.clone()).unwrap_or_default(),
+        app_lock_updated: lock.map(|row| row.updated_at).unwrap_or(0),
+    })
+}
+
+pub fn client_can_account(version: &str) -> bool {
+    version_at_least(version, "0.6.48")
+}
+
+pub fn release_message(dir: &Path) -> Option<ServerMsg> {
+    let path = dir.join("release-cache.json");
+    let bytes = std::fs::read(path).ok()?;
+    #[derive(Deserialize)]
+    struct Cached {
+        #[serde(default)]
+        version: String,
+        #[serde(default)]
+        client: String,
+        #[serde(default)]
+        server: String,
+        #[serde(default)]
+        sums: String,
+        #[serde(default)]
+        notes: String,
+        #[serde(default)]
+        at: u64,
+    }
+    let cached: Cached = serde_json::from_slice(&bytes).ok()?;
+    if cached.version.is_empty() {
+        return None;
+    }
+    Some(ServerMsg::Release {
+        version: cached.version,
+        client_url: cached.client,
+        server_url: cached.server,
+        sums_url: cached.sums,
+        notes: cached.notes,
+        checked_at: cached.at,
+    })
+}
+
+/// The primary fetches the release feed at most every few hours.
+pub fn refresh_release(dir: &Path) {
+    if !cloud::accepts_host_registrations(dir) {
+        return;
+    }
+    let path = dir.join("release-cache.json");
+    #[derive(serde::Serialize, Deserialize)]
+    struct Cached {
+        #[serde(default)]
+        version: String,
+        #[serde(default)]
+        client: String,
+        #[serde(default)]
+        server: String,
+        #[serde(default)]
+        sums: String,
+        #[serde(default)]
+        notes: String,
+        #[serde(default)]
+        at: u64,
+    }
+    let existing: Cached = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Cached {
+        version: String::new(),
+        client: String::new(),
+        server: String::new(),
+        sums: String::new(),
+        notes: String::new(),
+        at: 0,
+    });
+    if existing.at > 0 && now().saturating_sub(existing.at) < pjdesk_proto::failover::RELEASE_CHECK_SECS {
+        return;
+    }
+    let Ok(body) = (|| -> Result<Vec<u8>> {
+        let response = cloud::agent().get("https://pjdesk.com/api/release").call().map_err(|err| anyhow!("{err}"))?;
+        Ok(response.into_string().unwrap_or_default().into_bytes())
+    })() else {
+        return;
+    };
+    #[derive(Deserialize)]
+    struct Feed {
+        #[serde(default)]
+        version: String,
+        #[serde(default)]
+        client: String,
+        #[serde(default)]
+        server: String,
+        #[serde(default)]
+        sums: String,
+        #[serde(default)]
+        notes: String,
+    }
+    let Ok(feed) = serde_json::from_slice::<Feed>(&body) else { return };
+    if feed.version.is_empty() {
+        return;
+    }
+    let cached = Cached {
+        version: feed.version,
+        client: feed.client,
+        server: feed.server,
+        sums: feed.sums,
+        notes: feed.notes,
+        at: now(),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&cached) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+pub fn mirror_path(dir: &Path) -> PathBuf {
+    dir.join(MIRROR_FILE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_replica_proof_matches_this_minute_and_not_an_empty_key() {
+        let key = [7u8; 32];
+        let proof = replica_proof(&key, 1_700_000_000);
+        assert_eq!(proof, replica_proof(&key, 1_700_000_030));
+        assert_ne!(proof, replica_proof(&key, 1_700_000_060));
+        assert_ne!(proof, replica_proof(&[8u8; 32], 1_700_000_000));
+    }
+}

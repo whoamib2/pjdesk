@@ -8,13 +8,58 @@
 
 use std::time::Duration;
 
-/// How often a server publishes health and how often the standby probes.
+/// How often the standby probes the primary on the local network.
+/// This is not a pjdesk.com call.
 pub const BEAT_SECS: u64 = 3;
 /// Missed direct probes before a takeover is even considered.
 pub const MISSES_TO_PROMOTE: u32 = 3;
+/// How often the primary uploads one batch to pjdesk.com when the cloud is up.
+pub const CLOUD_BATCH_SECS: u64 = 5 * 60;
+/// First wait after pjdesk.com fails, or after a client cannot find a server.
+/// Later waits double until the cap.
+pub const CLOUD_BACKOFF_START_SECS: u64 = 60;
+/// Upper bound on a pjdesk.com retry. Half an hour.
+pub const CLOUD_BACKOFF_CAP_SECS: u64 = 30 * 60;
+/// Saved list and account policy are not fetched on the health cadence.
+pub const CLOUD_CATALOG_SECS: u64 = 15 * 60;
+/// Presence is posted again even when nobody came or went, so last-seen moves.
+pub const CLOUD_PRESENCE_REFRESH_SECS: u64 = 30 * 60;
+/// The primary checks the release feed this often, then serves it to clients.
+pub const RELEASE_CHECK_SECS: u64 = 6 * 60 * 60;
 /// Cloud health older than this confirms the primary stopped publishing.
-/// Three beats is 9 s; 10 s still treats one slow write as alive.
-pub const CONFIRM_STALE_SECS: u64 = 10;
+/// Three batches is 15 minutes, so one slow upload still looks alive.
+pub const CONFIRM_STALE_SECS: u64 = 15 * 60;
+
+/// Next wait after a failed pjdesk.com call. `previous` is 0 on the first failure.
+pub fn next_cloud_wait(previous: u64) -> u64 {
+    if previous == 0 {
+        CLOUD_BACKOFF_START_SECS
+    } else {
+        previous.saturating_mul(2).min(CLOUD_BACKOFF_CAP_SECS)
+    }
+}
+
+/// Cloudflare's HTML 429 (error 1027, "temporarily rate limited").
+/// A JSON 429 from `/api/login` is not this.
+pub fn cloud_edge_limited(status: u16, content_type: &str, body: &str) -> bool {
+    let ctype = content_type.to_ascii_lowercase();
+    let lower = body.to_ascii_lowercase();
+    let html = ctype.contains("text/html") || lower.contains("<html") || lower.contains("<!doctype");
+    let marker = lower.contains("temporarily rate limited")
+        || lower.contains("error 1027")
+        || lower.contains("error code: 1027")
+        || lower.contains("error code 1027");
+    marker || (status == 429 && html)
+}
+
+/// Shown when pjdesk.com answers with Cloudflare's rate-limit page.
+/// The computer stays signed in and keeps using the local server.
+pub const CLOUD_UNAVAILABLE: &str =
+    "PJDesk Cloud is temporarily unavailable. This computer keeps working on the local network.";
+
+pub fn cloud_unavailable_message(message: &str) -> bool {
+    message.contains("temporarily unavailable") || message.contains("temporarily rate limited")
+}
 /// First reconnects after a primary loss wait this long, not the long backoff.
 pub const FAST_REGISTER_SECS: u64 = 1;
 /// How many of those fast tries happen before the normal backoff starts.
@@ -613,9 +658,17 @@ mod tests {
             takeover(&watch(misses, Probe::Silent, SecondPath::Fresh)),
             Takeover::Stay("primary is still publishing health; not taking over")
         );
-        assert_eq!(second_path(true, Some(1_000), 1_008), SecondPath::Fresh);
-        assert_eq!(second_path(true, Some(1_000), 1_011), SecondPath::Stale);
+        assert_eq!(second_path(true, Some(1_000), 1_000 + CONFIRM_STALE_SECS), SecondPath::Fresh);
+        assert_eq!(second_path(true, Some(1_000), 1_000 + CONFIRM_STALE_SECS + 1), SecondPath::Stale);
         assert_eq!(second_path(false, None, 1_011), SecondPath::Unknown);
+        assert_eq!(next_cloud_wait(0), 60);
+        assert_eq!(next_cloud_wait(60), 120);
+        assert_eq!(next_cloud_wait(CLOUD_BACKOFF_CAP_SECS), CLOUD_BACKOFF_CAP_SECS);
+        let page = "<!DOCTYPE html><title>Error 1027</title> temporarily rate limited";
+        assert!(cloud_edge_limited(429, "text/html", page));
+        assert!(cloud_edge_limited(429, "", page));
+        assert!(!cloud_edge_limited(429, "application/json", r#"{"error":"Too many sign-in attempts. Try again in 15 minutes."}"#));
+        assert!(cloud_unavailable_message(CLOUD_UNAVAILABLE));
     }
 
     #[test]
@@ -728,7 +781,10 @@ mod tests {
         assert_eq!(peer_role_label(true), "standby");
         assert_eq!(peer_role_label(false), "active");
         assert_eq!(confirming_path(true, Some(1_000), 2_000, 1_050), SecondPath::Fresh);
-        assert_eq!(confirming_path(true, Some(1_000), 0, 1_020), SecondPath::Stale);
+        assert_eq!(
+            confirming_path(true, Some(1_000), 0, 1_000 + CONFIRM_STALE_SECS + 1),
+            SecondPath::Stale
+        );
         assert_eq!(unhealthy_hold_until(1_000), 1_000 + MAINTENANCE_HOLD_SECS);
     }
 
