@@ -74,6 +74,7 @@ fun SettingsScreen(
     onTempIdleMinutes: (Int) -> Unit = {},
     onCheckUpdate: () -> Unit = {},
     signedIn: Boolean = false,
+    localPin: Boolean = false,
     hasPin: Boolean = false,
     biometricsOn: Boolean = false,
     biometricsAvailable: Boolean = false,
@@ -230,10 +231,14 @@ fun SettingsScreen(
                 }
             }
         }
-        if (signedIn) {
+        if (signedIn || localPin) {
             Section("App lock") {
                 Text(
-                    "PJDesk asks for this PIN when you open it. It is saved to your account as a slow hash, so your other signed-in computers ask for the same PIN. Incoming connections keep working.",
+                    if (localPin) {
+                        "A PIN is optional on this computer. You joined with a code or a key, so this does not ask for the account password."
+                    } else {
+                        "PJDesk asks for this PIN when you open it. It is saved to your account as a slow hash, so your other signed-in computers ask for the same PIN. Incoming connections keep working."
+                    },
                     color = pjMuted(),
                 )
                 var editing by rememberSaveable { mutableStateOf(false) }
@@ -265,6 +270,7 @@ fun SettingsScreen(
                     AccountPinDialog(
                         title = if (hasPin) "Change PIN" else "Set PIN",
                         hasPin = hasPin,
+                        localOnly = localPin,
                         busy = pinBusy,
                         error = pinError,
                         biometrics = biometricsAvailable,
@@ -279,6 +285,7 @@ fun SettingsScreen(
                     AccountPinDialog(
                         title = "Remove PIN",
                         hasPin = true,
+                        localOnly = localPin,
                         busy = pinBusy,
                         error = pinError,
                         biometrics = false,
@@ -334,6 +341,7 @@ fun SettingsScreen(
 private fun AccountPinDialog(
     title: String,
     hasPin: Boolean,
+    localOnly: Boolean = false,
     busy: Boolean,
     error: String,
     biometrics: Boolean,
@@ -354,8 +362,9 @@ private fun AccountPinDialog(
     val confirmFocus = remember { FocusRequester() }
     fun save() {
         localError = when {
-            hasPin && current.isBlank() && password.isBlank() -> "Enter the current PIN or your account password."
-            !hasPin && password.isBlank() -> "Enter your account password."
+            localOnly && hasPin && current.isBlank() -> "Enter the current PIN."
+            !localOnly && hasPin && current.isBlank() && password.isBlank() -> "Enter the current PIN or your account password."
+            !localOnly && !hasPin && password.isBlank() -> "Enter your account password."
             !remove && !AppLockPolicy.pinAcceptable(pin) -> "Use 4 to 8 digits."
             !remove && pin != confirm -> "Those PINs do not match."
             else -> ""
@@ -378,7 +387,11 @@ private fun AccountPinDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    if (hasPin) "Enter the current PIN or your account password." else "Enter your account password.",
+                    when {
+                        localOnly -> "Choose a PIN for this computer. This does not ask for an account password."
+                        hasPin -> "Enter the current PIN or your account password."
+                        else -> "Enter your account password."
+                    },
                     color = pjMuted(),
                 )
                 if (hasPin) {
@@ -386,13 +399,15 @@ private fun AccountPinDialog(
                         if (!remove) runCatching { pinFocus.requestFocus() } else save()
                     }
                 }
-                AccountPasswordField(
-                    value = password,
-                    onValueChange = { password = it },
-                    label = "Account password",
-                    autofocus = !hasPin,
-                    onSubmit = { if (remove) save() else runCatching { pinFocus.requestFocus() } },
-                )
+                if (!localOnly) {
+                    AccountPasswordField(
+                        value = password,
+                        onValueChange = { password = it },
+                        label = "Account password",
+                        autofocus = !hasPin,
+                        onSubmit = { if (remove) save() else runCatching { pinFocus.requestFocus() } },
+                    )
+                }
                 if (!remove) {
                     PinEntry(
                         pin,

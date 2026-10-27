@@ -90,10 +90,26 @@ pub const PIN_PROMPT_VERSION: &str = "0.6.47";
 
 /// Whether to show the blocking Set a PIN screen.
 ///
-/// A computer that joined with a code or a key is not asked. Skip for now is
-/// remembered. An account that already has a PIN uses the unlock screen instead.
+/// A computer that joined with a code or a key is not asked, even when the
+/// account email is known. Skip for now is remembered. An account that already
+/// has a PIN uses the unlock screen instead.
 pub fn should_ask_for_pin(signed_in: bool, has_pin: bool, code_or_key: bool, declined: bool) -> bool {
     signed_in && !has_pin && !code_or_key && !declined
+}
+
+/// After a code or a key join. The main window follows this sentence.
+/// The account password and a PIN are not part of it.
+pub fn connected_confirmation(account: &str, network: &str) -> String {
+    let account = account.trim();
+    let network = network.trim();
+    let who = if !account.is_empty() {
+        account
+    } else if !network.is_empty() {
+        network
+    } else {
+        "this network"
+    };
+    format!("You are now connected to {who}.")
 }
 
 /// First launch of this build. `had_session` with no PIN means the previous
@@ -340,6 +356,9 @@ mod tests {
         assert!(!should_ask_for_pin(true, false, true, false));
         assert!(!should_ask_for_pin(true, false, false, true));
         assert!(should_ask_for_pin(true, false, false, false));
+        assert_eq!(connected_confirmation("ben@spader.us", "desk.example.com"), "You are now connected to ben@spader.us.");
+        assert_eq!(connected_confirmation("", "desk.example.com:21200"), "You are now connected to desk.example.com:21200.");
+        assert_eq!(connected_confirmation("  ", ""), "You are now connected to this network.");
         assert_eq!(pin_prompt_on_launch("", false, true, false), (true, true));
         assert_eq!(pin_prompt_on_launch("", false, true, true), (false, true));
         assert_eq!(pin_prompt_on_launch("", false, false, false), (false, true));

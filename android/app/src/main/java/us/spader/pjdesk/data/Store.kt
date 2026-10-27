@@ -333,6 +333,11 @@ class Store(context: Context) {
         get() = prefs.getString("networkEmail", "") ?: ""
         set(value) { prefs.edit().putString("networkEmail", value).apply() }
 
+    /** Joined with a code or a key. The account email may be known. The password was not typed here. */
+    var joinedWithoutPassword: Boolean
+        get() = prefs.getBoolean("joinedWithoutPassword", false)
+        set(value) { prefs.edit().putBoolean("joinedWithoutPassword", value).apply() }
+
     /** The encrypted network key last applied here. The passphrase is not stored. */
     var networkKey: String
         get() = prefs.getString("networkKey", "") ?: ""
@@ -458,9 +463,12 @@ class Store(context: Context) {
         set(value) { prefs.edit().putString("accountPinEmail", value).commit() }
 
     fun hasAccountPin(): Boolean {
-        val email = networkEmail.trim().lowercase()
+        val stored = accountPinEmail.trim().lowercase()
+        val email = networkEmail.trim().lowercase().ifBlank {
+            if (joinedWithoutPassword) stored else ""
+        }
         return email.isNotEmpty()
-            && email == accountPinEmail.trim().lowercase()
+            && email == stored
             && accountPinHash.length == 64
             && accountPinSalt.isNotBlank()
             && accountPinIters > 0

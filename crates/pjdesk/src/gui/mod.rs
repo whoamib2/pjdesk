@@ -383,6 +383,8 @@ pub struct App {
     net_enroll_only: bool,
     pending_temporary: bool,
     pending_enroll_only: bool,
+    /// The join in flight used a code or a key, not an email and password.
+    pending_without_password: bool,
     /// Set while a temporary sign-in is in this process. The refresh token is not on disk.
     temp: Option<TempHold>,
     session_end: Option<Receiver<()>>,
@@ -583,6 +585,7 @@ impl App {
             net_enroll_only: false,
             pending_temporary: false,
             pending_enroll_only: false,
+            pending_without_password: false,
             temp: None,
             session_end: if preview { None } else { Some(crate::temp_sign::watch_session_end()) },
             temp_left: 0,
@@ -1391,6 +1394,7 @@ impl App {
                 self.show_net_sign_in = false;
                 self.pending_temporary = false;
                 self.pending_enroll_only = false;
+                self.pending_without_password = false;
                 let who = if email.is_empty() { self.net_email.trim().to_string() } else { email };
                 self.toast.show(format!(
                     "Added this computer to {who}. Nothing from that sign-in was kept on this computer."
@@ -1401,6 +1405,8 @@ impl App {
                 self.net_rx = None;
                 self.net_offer = false;
                 self.net_login.clear();
+                let without_password = self.pending_without_password;
+                self.pending_without_password = false;
                 if let Some(blob) =
                     self.pending_blob.take().or_else(|| pjdesk_proto::netkey::blob_from_text(&self.net_blob))
                 {
@@ -1422,14 +1428,14 @@ impl App {
                 self.import_pass.clear();
                 self.net_error.clear();
                 self.show_net_sign_in = false;
-                if session.email.is_empty() {
-                    if self.cfg.network_email.is_none() {
+                let mut session = session;
+                if !without_password {
+                    if session.email.is_empty() && self.cfg.network_email.is_none() {
                         self.cfg.network_email = Some(self.net_email.trim().to_string());
                     }
-                }
-                let mut session = session;
-                if session.email.is_empty() {
-                    session.email = self.net_email.trim().to_lowercase();
+                    if session.email.is_empty() {
+                        session.email = self.net_email.trim().to_lowercase();
+                    }
                 }
                 let temporary = self.pending_temporary;
                 self.pending_temporary = false;
@@ -1443,7 +1449,12 @@ impl App {
                 if temporary {
                     self.begin_temporary(session);
                     self.sync_passwords(false);
+                    if without_password {
+                        self.cfg.joined_without_password = true;
+                        self.arrive_without_password();
+                    }
                 } else {
+                    self.cfg.joined_without_password = without_password;
                     self.note_enrolled(&session.computers);
                     self.cfg.apply_network_session(&session);
                     self.net_email = self.cfg.network_email.clone().unwrap_or_default();
@@ -1452,7 +1463,9 @@ impl App {
                     crate::network::copy_to_service(&self.cfg);
                     self.engine.retarget(&self.cfg);
                     self.sync_passwords(true);
-                    if imported {
+                    if without_password {
+                        self.arrive_without_password();
+                    } else if imported {
                         self.toast.show("Import server configuration successfully");
                     } else {
                         self.toast.show(format!("Signed in as {}", self.net_email));
@@ -1464,6 +1477,7 @@ impl App {
                 self.net_rx = None;
                 self.net_importing = false;
                 self.pending_blob = None;
+                self.pending_without_password = false;
                 if e.contains("specific account") {
                     self.show_net_sign_in = true;
                     self.net_mode = 2;
@@ -1540,6 +1554,7 @@ impl App {
         }
         self.pending_temporary = self.net_temporary && !enroll_only;
         self.pending_enroll_only = enroll_only;
+        self.pending_without_password = self.net_mode == 1 || self.net_mode == 2;
         let this = crate::network::ThisComputer::local(&pjdesk_id);
         let local = if self.pending_temporary || enroll_only {
             Vec::new()
@@ -1679,6 +1694,9 @@ impl App {
             self.cfg.server = Some(parsed);
         }
         self.cfg.set_server_access_key(&key);
+        if crate::vault::key_from(&self.cfg).is_none() || self.cfg.joined_without_password {
+            self.cfg.joined_without_password = true;
+        }
         if let Err(err) = self.cfg.save() {
             self.net_error = format!("Could not save the access key: {err}");
             return;
@@ -1689,7 +1707,19 @@ impl App {
         self.net_blob.clear();
         self.net_error.clear();
         self.show_net_sign_in = false;
-        self.toast.show("Using this server access key. This computer registers without a PJDesk account.");
+        self.arrive_without_password();
+    }
+
+    /// A code or a key is connected. The main window follows. No account password and no PIN.
+    fn arrive_without_password(&mut self) {
+        self.lock_ui = false;
+        self.lock_armed = true;
+        self.lock_resetting = false;
+        self.pin_note.clear();
+        self.toast.show(pjdesk_proto::applock::connected_confirmation(
+            &self.account_email(),
+            &self.cfg.effective_server(),
+        ));
     }
 
     fn claim_current_server(&mut self) {
@@ -3101,8 +3131,11 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(if pending { 50 } else { 400 }));
         }
 
-        if self.lock_ui && self.signed_in() {
-            if self.lock_resetting || self.cfg.app_lock_for(&self.account_email()).is_none() {
+        if self.lock_ui && self.cfg.joined_by_code_or_key() && self.saved_pin().is_none() && !self.lock_resetting {
+            self.lock_ui = false;
+        }
+        if self.lock_ui && (self.signed_in() || self.pin_required()) {
+            if self.lock_resetting || self.saved_pin().is_none() {
                 self.setup_screen(ui);
             } else {
                 self.lock_screen(ui);

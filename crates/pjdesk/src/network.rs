@@ -486,8 +486,13 @@ fn session_from(email: &str, device_id: &str, reply: NetworkReply) -> Result<Ses
         bail!(NO_SERVER);
     }
     let routes = session_routes(&network);
+    let email = if email.trim().is_empty() {
+        pjdesk_proto::access::email_from_access_token(&reply.access).unwrap_or_default()
+    } else {
+        email.trim().to_lowercase()
+    };
     Ok(Session {
-        email: email.to_string(),
+        email,
         access: reply.access,
         exp: reply.exp,
         refresh: reply.refresh,

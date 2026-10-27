@@ -89,6 +89,10 @@ pub struct Config {
     /// `0.6.47` after this build has decided whether an older session was stuck on Set a PIN.
     #[serde(default)]
     pub pin_prompt: String,
+    /// This computer joined with a code or a key. The account email may still be known.
+    /// The account password was not typed here, so a PIN stays optional.
+    #[serde(default)]
+    pub joined_without_password: bool,
     /// PJDesk account that owns the private server this client uses.
     #[serde(default)]
     pub network_email: Option<String>,
@@ -571,6 +575,7 @@ impl Config {
             writing.network_routes = disk.network_routes;
             writing.lan_path_cache = disk.lan_path_cache;
             writing.network_key = disk.network_key;
+            writing.joined_without_password = disk.joined_without_password;
             writing.server = disk.server;
             writing.server_fingerprint = disk.server_fingerprint;
             writing.address_book = disk.address_book;
@@ -617,6 +622,7 @@ impl Config {
             writing.server = None;
             writing.server_fingerprint = None;
             writing.network_key = None;
+            writing.joined_without_password = false;
         }
         writing
     }
@@ -821,8 +827,12 @@ impl Config {
     }
 
     /// A code, a support key, a network key, or a server access key.
-    /// Those computers are not asked to set an account PIN.
+    /// The account email can still be known. Those computers are not asked
+    /// for the account password or a blocking PIN.
     pub fn joined_by_code_or_key(&self) -> bool {
+        if self.joined_without_password {
+            return true;
+        }
         if self.support_grant.is_some() {
             return true;
         }
@@ -870,6 +880,7 @@ impl Config {
         self.network_access_exp = 0;
         self.network_list_merged = false;
         self.password_vault_key = None;
+        self.joined_without_password = false;
         self.support_grant = None;
         if self.network_role == "support" {
             self.network_role.clear();
@@ -1174,6 +1185,18 @@ mod tests {
         keyed.server_access_key = None;
         keyed.network_role = "support".into();
         assert!(keyed.joined_by_code_or_key());
+
+        let mut invite = Config::default();
+        invite.network_refresh = Some("plain:refresh".into());
+        invite.network_email = Some("ben@spader.us".into());
+        assert!(!invite.joined_by_code_or_key());
+        invite.joined_without_password = true;
+        assert!(invite.joined_by_code_or_key());
+        assert!(!pjdesk_proto::applock::should_ask_for_pin(true, false, invite.joined_by_code_or_key(), false));
+        assert_eq!(
+            pjdesk_proto::applock::connected_confirmation(invite.network_email.as_deref().unwrap_or(""), "pjdesk.spader.us"),
+            "You are now connected to ben@spader.us."
+        );
     }
 
     #[test]

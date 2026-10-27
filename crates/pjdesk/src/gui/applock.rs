@@ -36,37 +36,43 @@ impl App {
     }
 
     pub(super) fn pin_required(&self) -> bool {
-        self.signed_in() && self.cfg.app_lock_for(&self.account_email()).is_some()
+        self.saved_pin().is_some() && (self.signed_in() || self.cfg.joined_by_code_or_key())
+    }
+
+    /// Email when this computer has one. A code or key with no email still has a local PIN subject.
+    fn lock_subject(&self) -> String {
+        let email = self.account_email();
+        if !email.is_empty() {
+            return email;
+        }
+        if self.cfg.joined_by_code_or_key() { "local".into() } else { String::new() }
+    }
+
+    pub(super) fn saved_pin(&self) -> Option<pjdesk_proto::applock::Verifier> {
+        self.cfg.app_lock_for(&self.lock_subject())
     }
 
     fn lock_idle(&self) -> Duration {
-        let secs = self
-            .cfg
-            .app_lock_for(&self.account_email())
-            .map(|v| v.idle_sec)
-            .unwrap_or(pjdesk_proto::applock::IDLE_DEFAULT);
+        let secs = self.saved_pin().map(|v| v.idle_sec).unwrap_or(pjdesk_proto::applock::IDLE_DEFAULT);
         Duration::from_secs(pjdesk_proto::applock::clamp_idle(secs))
     }
 
     fn pin_screen_wanted(&self) -> bool {
-        let email = self.account_email();
-        let has_pin = self.cfg.app_lock_for(&email).is_some();
         pjdesk_proto::applock::should_ask_for_pin(
             self.signed_in(),
-            has_pin,
-            self.cfg.joined_by_code_or_key() || email.is_empty(),
+            self.saved_pin().is_some(),
+            self.cfg.joined_by_code_or_key(),
             self.cfg.pin_declined,
         )
     }
 
     pub(super) fn note_lock_visibility(&mut self, ctx: &egui::Context) {
-        if !self.signed_in() {
+        if !self.signed_in() && !self.cfg.joined_by_code_or_key() {
             self.lock_armed = false;
             self.lock_ui = false;
             return;
         }
-        let email = self.account_email();
-        let has_pin = self.cfg.app_lock_for(&email).is_some();
+        let has_pin = self.saved_pin().is_some();
         let ask = self.pin_screen_wanted() || self.lock_resetting;
         if !has_pin && !ask {
             self.lock_ui = false;
@@ -97,7 +103,7 @@ impl App {
             }
         }
         if self.lock_ui || !has_pin {
-            if !has_pin && ask {
+            if !has_pin && ask && !self.cfg.joined_by_code_or_key() {
                 self.lock_ui = true;
             }
             return;
@@ -169,7 +175,8 @@ impl App {
                 }
             }
         }
-        if self.lock_pull_rx.is_some() || !self.signed_in() || Instant::now() < self.next_lock_pull {
+        if self.lock_pull_rx.is_some() || !self.signed_in() || self.cfg.joined_by_code_or_key() || Instant::now() < self.next_lock_pull
+        {
             return;
         }
         let refresh = self.cfg.network_refresh_token();
@@ -192,6 +199,9 @@ impl App {
     }
 
     fn apply_remote_lock(&mut self, remote: LockRemote) {
+        if self.cfg.joined_by_code_or_key() {
+            return;
+        }
         if remote.updated < self.cfg.app_lock_updated {
             return;
         }
@@ -487,11 +497,20 @@ impl App {
                         self.start_unlock();
                     }
                     ui.add_space(8.0);
-                    if ui.link("Forgot PIN? Sign in again").clicked() && !self.lock_busy {
+                    if self.cfg.joined_by_code_or_key() {
+                        if ui.link("Forgot PIN? Continue without it").clicked() && !self.lock_busy {
+                            self.cfg.clear_app_lock();
+                            let _ = self.cfg.save();
+                            self.lock_ui = false;
+                            self.lock_armed = true;
+                            self.lock_error.clear();
+                            self.toast.show("PIN removed. You can set one later in Settings.");
+                        }
+                    } else if ui.link("Forgot PIN? Sign in again").clicked() && !self.lock_busy {
                         self.lock_forgot = !self.lock_forgot;
                         self.lock_error.clear();
                     }
-                    if self.lock_forgot {
+                    if self.lock_forgot && !self.cfg.joined_by_code_or_key() {
                         ui.add_space(8.0);
                         ui.label(widgets::muted(ui, "This is your pjdesk.com password. After it is accepted you choose a new PIN."));
                         let mut pass = self.lock_password.clone();
@@ -527,14 +546,15 @@ impl App {
                         "Set a PIN for this PJDesk account, or choose Skip for now. Incoming connections and updates keep running.",
                     ));
                     ui.add_space(16.0);
-                    if self.account_email().is_empty() {
+                    let local = self.cfg.joined_by_code_or_key();
+                    if self.account_email().is_empty() && !local {
                         ui.label("Account email");
                         let mut email = self.pin_email.clone();
                         widgets::account_email_field(ui, &mut email);
                         self.pin_email = email;
                         ui.add_space(8.0);
                     }
-                    if need_password || self.account_email().is_empty() {
+                    if !local && (need_password || self.account_email().is_empty()) {
                         ui.label("Account password");
                         let mut pass = self.pin_password.clone();
                         let pass_box = widgets::password_field(ui, &mut pass, "pjdesk.com password", &mut self.pin_show_password);
@@ -604,7 +624,7 @@ impl App {
         if !pjdesk_proto::applock::pin_acceptable(&self.lock_pin) || self.lock_pin == self.lock_peeked {
             return;
         }
-        let Some(verifier) = self.cfg.app_lock_for(&self.account_email()) else {
+        let Some(verifier) = self.saved_pin() else {
             return;
         };
         let pin = self.lock_pin.clone();
@@ -651,7 +671,7 @@ impl App {
     }
 
     fn start_unlock(&mut self) {
-        let Some(verifier) = self.cfg.app_lock_for(&self.account_email()) else {
+        let Some(verifier) = self.saved_pin() else {
             self.lock_error = "No PIN is set for this account.".into();
             return;
         };
@@ -691,18 +711,33 @@ impl App {
 
     pub(super) fn app_lock_settings(&mut self, ui: &mut egui::Ui) {
         widgets::heading(ui, "APP LOCK");
+        let local = self.cfg.joined_by_code_or_key();
         let have = self.pin_required();
-        ui.label(widgets::muted(
-            ui,
-            "A PIN is required for this PJDesk account. Opening this window asks for it, and so does PJDesk Server, the tray, and starting the program again. Restoring a minimized window, or leaving it idle, asks again after the time below. The background service, incoming connections, and updates keep running.",
-        ));
+        if local {
+            ui.label(widgets::muted(
+                ui,
+                "A PIN is optional on this computer. You joined with a code or a key, so this does not ask for the account password. You can set one here.",
+            ));
+        } else {
+            ui.label(widgets::muted(
+                ui,
+                "A PIN is required for this PJDesk account. Opening this window asks for it, and so does PJDesk Server, the tray, and starting the program again. Restoring a minimized window, or leaving it idle, asks again after the time below. The background service, incoming connections, and updates keep running.",
+            ));
+        }
         ui.add_space(6.0);
-        if !self.signed_in() {
+        if !self.signed_in() && !local {
             ui.label(widgets::muted(ui, "Sign in to set a PIN for this account."));
             ui.add_space(12.0);
             return;
         }
-        if !have {
+        if local {
+            if have {
+                ui.label("Current PIN");
+                let mut current = self.pin_current.clone();
+                widgets::password_field(ui, &mut current, "Current PIN", &mut self.pin_show_current);
+                self.pin_current = digits_only(&current);
+            }
+        } else if !have {
             ui.label("Account password");
             let mut pass = self.pin_password.clone();
             widgets::password_field(ui, &mut pass, "Account password", &mut self.pin_show_password);
@@ -850,6 +885,10 @@ impl App {
     }
 
     fn start_save(&mut self, remove: bool) {
+        if self.cfg.joined_by_code_or_key() {
+            self.save_local_pin(remove);
+            return;
+        }
         let email = self.account_email();
         if email.is_empty() {
             let typed = self.pin_email.trim();
@@ -909,6 +948,10 @@ impl App {
     }
 
     fn start_idle(&mut self) {
+        if self.cfg.joined_by_code_or_key() {
+            self.save_local_idle();
+            return;
+        }
         let email = self.account_email();
         let Some(have) = self.cfg.app_lock_for(&email) else {
             return;
@@ -945,6 +988,73 @@ impl App {
             recent: false,
             existing_key,
         });
+    }
+
+    /// A PIN kept on this computer. It is not sealed with the account password and it is not uploaded.
+    fn save_local_pin(&mut self, remove: bool) {
+        let subject = self.lock_subject();
+        if subject.is_empty() {
+            self.pin_note = "This computer is not connected.".into();
+            return;
+        }
+        if remove {
+            self.cfg.clear_app_lock();
+            self.save_cfg();
+            self.publish_shared();
+            self.clear_pin_form();
+            self.lock_ui = false;
+            self.lock_armed = true;
+            self.pin_note = "PIN removed.".into();
+            return;
+        }
+        if let Some(have) = self.saved_pin() {
+            if !pjdesk_proto::applock::matches(&have, &self.pin_current) {
+                self.pin_note = "That PIN is wrong.".into();
+                return;
+            }
+        }
+        if !pjdesk_proto::applock::pin_acceptable(&self.pin_new) {
+            self.pin_note = "Use 4 to 8 digits.".into();
+            return;
+        }
+        if self.pin_new != self.pin_confirm {
+            self.pin_note = "Those PINs do not match.".into();
+            return;
+        }
+        let idle = pjdesk_proto::applock::clamp_idle(u64::from(self.pin_idle_minutes.max(1)) * 60);
+        let verifier = match pjdesk_proto::applock::create(&self.pin_new, idle, super::unix_now().max(1)) {
+            Ok(v) => v,
+            Err(err) => {
+                self.pin_note = err;
+                return;
+            }
+        };
+        self.cfg.write_app_lock(&subject, "", super::unix_now().max(1), Some(&verifier));
+        self.cfg.clear_app_lock_fails();
+        self.pin_idle_minutes = (verifier.idle_sec / 60).clamp(1, 24 * 60) as u32;
+        self.save_cfg();
+        self.publish_shared();
+        self.clear_pin_form();
+        self.lock_ui = false;
+        self.lock_armed = true;
+        self.lock_resetting = false;
+        self.pin_note = "PIN saved for this computer.".into();
+        self.toast.show("PIN saved. This window will ask for it.");
+    }
+
+    fn save_local_idle(&mut self) {
+        let Some(mut verifier) = self.saved_pin() else { return };
+        let idle = pjdesk_proto::applock::clamp_idle(u64::from(self.pin_idle_minutes.max(1)) * 60);
+        if verifier.idle_sec == idle {
+            return;
+        }
+        verifier.idle_sec = idle;
+        verifier.updated = super::unix_now().max(1);
+        let subject = self.lock_subject();
+        self.cfg.write_app_lock(&subject, "", verifier.updated, Some(&verifier));
+        self.save_cfg();
+        self.publish_shared();
+        self.pin_note = "Saved.".into();
     }
 
     fn spawn_save(&mut self, job: SaveJob) {

@@ -262,9 +262,11 @@ class MainActivity : FragmentActivity() {
             var signOutWhenDone by remember { mutableStateOf(false) }
             var changingPin by remember { mutableStateOf(false) }
             var forgotPin by remember { mutableStateOf(false) }
+            var visitWithoutPassword by remember { mutableStateOf(false) }
             var pinPending by remember {
                 mutableStateOf(
-                    app.store.appLockSealed.isNotBlank() && app.store.appLockUpdated > 0L
+                    !app.store.joinedWithoutPassword
+                        && app.store.appLockSealed.isNotBlank() && app.store.appLockUpdated > 0L
                         && !app.store.hasAccountPin() && !app.store.hasPin(),
                 )
             }
@@ -289,6 +291,7 @@ class MainActivity : FragmentActivity() {
             fun signOutTemporary() {
                 tempFlag.set(false)
                 temporarySession = false
+                visitWithoutPassword = false
                 memoryRefresh = ""
                 app.store.endTemporaryVisit()
                 app.clearVaultKey()
@@ -446,6 +449,7 @@ class MainActivity : FragmentActivity() {
                 enrollOnlyNow: Boolean,
                 notice: String? = null,
                 accountPassword: String = "",
+                withoutPassword: Boolean = false,
             ) {
                 val pjdeskId = state.id.filter { it.isDigit() }
                 if (enrollOnlyNow && pjdeskId.length != 9) {
@@ -519,6 +523,14 @@ class MainActivity : FragmentActivity() {
                             }
                             app.markUnlocked()
                         }
+                        if (withoutPassword) {
+                            if (temporaryNow) visitWithoutPassword = true else app.store.joinedWithoutPassword = true
+                            pinPending = false
+                            app.markUnlocked()
+                        } else if (!temporaryNow) {
+                            app.store.joinedWithoutPassword = false
+                            visitWithoutPassword = false
+                        }
                         accountComputers = enrolled.computers
                         enrolledFor = if (pjdeskId.length == 9) pjdeskId else ""
                         rememberAccountServer(enrolled.address, enrolled.fingerprint, enrolled.lan, enrolled.publicIp, enrolled.standbyAddress, enrolled.routes, enrolled.standbyLan, enrolled.standbyPublicIp)
@@ -528,7 +540,10 @@ class MainActivity : FragmentActivity() {
                         signingIn = false
                         saved = app.store.saved()
                         if (!enrollOnlyNow) holdDerivedKey(who, accountPassword, upload = !temporaryNow)
-                        if (temporaryNow) {
+                        val connected = enrolled.email.ifBlank { enrolled.address }.ifBlank { "this network" }
+                        if (withoutPassword && !enrollOnlyNow) {
+                            scope.launch { snackbar.showSnackbar("You are now connected to $connected.") }
+                        } else if (temporaryNow) {
                             scope.launch { snackbar.showSnackbar("Signed in until you close PJDesk") }
                         } else if (!notice.isNullOrBlank()) {
                             scope.launch { snackbar.showSnackbar(notice) }
@@ -801,7 +816,7 @@ class MainActivity : FragmentActivity() {
                         }
                     }
                     result.onSuccess { session ->
-                        applySignedIn(session, email, blob, signOutWhenDone, false, "Import server configuration successfully", if (bound) pass else "")
+                        applySignedIn(session, email, blob, signOutWhenDone, false, "Import server configuration successfully", if (bound) pass else "", withoutPassword = true)
                     }.onFailure {
                         netBusy = false
                         val message = it.message ?: "Could not sign in."
@@ -1414,6 +1429,7 @@ class MainActivity : FragmentActivity() {
                 tryBio()
             }
             fun pullAppLock() {
+                if (app.store.joinedWithoutPassword || visitWithoutPassword) return
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                 val device = app.store.networkDeviceId
                 if (refresh.isBlank() || device.isBlank()) return
@@ -1473,7 +1489,31 @@ class MainActivity : FragmentActivity() {
                 if (app.uiUnlocked.value && !app.bioPrompt) app.lockUi()
             }
             fun saveAccountPin(current: String, password: String, newPin: String, idleSec: Int, enableBio: Boolean) {
-                val email = netEmail.ifBlank { account }.trim()
+                val email = netEmail.ifBlank { account }.trim().ifBlank { "local" }
+                if (app.store.joinedWithoutPassword || visitWithoutPassword) {
+                    lockBusy = true
+                    pinFormError = ""
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) {
+                            runCatching {
+                                val have = app.store.hasAccountPin()
+                                if (have && (current.isBlank() || !AccountPin.matches(current, app.store.accountPinSalt, app.store.accountPinHash, app.store.accountPinIters))) {
+                                    error("That PIN is wrong.")
+                                }
+                                AccountPin.create(newPin, idleSec, System.currentTimeMillis() / 1000)
+                            }
+                        }
+                        lockBusy = false
+                        result.onSuccess { verifier ->
+                            app.store.saveAccountPin(email, verifier, "", verifier.updated)
+                            pinFormError = ""
+                            app.markUnlocked()
+                        }.onFailure {
+                            pinFormError = it.message ?: "Could not save the PIN."
+                        }
+                    }
+                    return
+                }
                 lockBusy = true
                 pinFormError = ""
                 scope.launch {
@@ -1535,6 +1575,19 @@ class MainActivity : FragmentActivity() {
                 }
             }
             fun removeAccountPin(current: String, password: String) {
+                if (app.store.joinedWithoutPassword || visitWithoutPassword) {
+                    if (app.store.hasAccountPin() && !AccountPin.matches(current, app.store.accountPinSalt, app.store.accountPinHash, app.store.accountPinIters)) {
+                        pinFormError = "That PIN is wrong."
+                        return
+                    }
+                    app.store.clearAccountPin()
+                    app.store.clearPinMaterial()
+                    BioVault.forget()
+                    pinFormError = ""
+                    pinPending = false
+                    app.markUnlocked()
+                    return
+                }
                 val email = netEmail.ifBlank { account }.trim()
                 lockBusy = true
                 pinFormError = ""
@@ -1566,14 +1619,16 @@ class MainActivity : FragmentActivity() {
             PjTheme(theme.value) {
                 val session = state.session
                 val persistent = account.isNotEmpty() && !temporarySession
+                val noPassword = app.store.joinedWithoutPassword || visitWithoutPassword
                 val bioAvailable = BioVault.available(this@MainActivity)
                 val pinWait = app.store.pinLockedUntil > System.currentTimeMillis()
                 val gate = when {
-                    !persistent -> null
-                    forgotPin -> "reauth"
+                    !persistent && !noPassword -> null
+                    noPassword && !app.store.hasAccountPin() && !app.store.hasPin() -> null
+                    forgotPin && !noPassword -> "reauth"
                     changingPin -> "change"
                     (app.store.hasAccountPin() || app.store.hasPin()) && !uiUnlocked -> "unlock"
-                    pinPending && !uiUnlocked -> "reauth"
+                    pinPending && !uiUnlocked && !noPassword -> "reauth"
                     else -> null
                 }
                 if (gate == "pin" || gate == "change") {
@@ -1611,7 +1666,19 @@ class MainActivity : FragmentActivity() {
                         onPeek = { peekPin(it) },
                         onEdit = { notePinEdit() },
                         onBiometric = { tryBio() },
-                        onForgot = { forgotPin = true; lockError = "" },
+                        onForgot = {
+                            if (noPassword) {
+                                app.store.clearAccountPin()
+                                app.store.clearPinMaterial()
+                                BioVault.forget()
+                                pinPending = false
+                                lockError = ""
+                                app.markUnlocked()
+                            } else {
+                                forgotPin = true
+                                lockError = ""
+                            }
+                        },
                     )
                 } else if (gate == "reauth") {
                     ReauthScreen(
@@ -1799,7 +1866,15 @@ class MainActivity : FragmentActivity() {
                                         useCode -> ""
                                         else -> pass
                                     }
-                                    applySignedIn(session, email, if (useKey) blob else null, signOutWhenDone, false, accountPassword = accountPassword)
+                                    applySignedIn(
+                                        session,
+                                        email,
+                                        if (useKey) blob else null,
+                                        signOutWhenDone,
+                                        false,
+                                        accountPassword = accountPassword,
+                                        withoutPassword = useCode || useKey,
+                                    )
                                 }.onFailure { err ->
                                     netBusy = false
                                     val cloud = err as? CloudAuthException
@@ -2046,6 +2121,7 @@ class MainActivity : FragmentActivity() {
                                     onShareLogs = { AppLog.share(this@MainActivity) },
                                     onCheckUpdate = { engine.checkForUpdate() },
                                     signedIn = account.isNotEmpty() && !temporarySession,
+                                    localPin = app.store.joinedWithoutPassword || visitWithoutPassword,
                                     hasPin = app.store.hasPin() || app.store.hasAccountPin(),
                                     biometricsOn = app.store.biometricsOn,
                                     biometricsAvailable = BioVault.available(this@MainActivity),
@@ -2124,6 +2200,7 @@ class MainActivity : FragmentActivity() {
                                                 scope.launch { snackbar.showSnackbar("Signed out") }
                                             } else {
                                                 app.store.networkEmail = ""
+                                                app.store.joinedWithoutPassword = false
                                                 app.store.saveNetworkRefresh("")
                                                 app.lockUi()
                                                 cloudAccess = ""
