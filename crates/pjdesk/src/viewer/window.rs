@@ -82,6 +82,16 @@ pub(crate) struct Seed {
     pub from_store: bool,
     pub files: bool,
     pub label: String,
+    /// Addresses that reached this computer without the relay.
+    pub direct_targets: Vec<std::net::SocketAddr>,
+    pub host_fingerprint: Option<pjdesk_proto::tls::Fingerprint>,
+}
+
+#[derive(Clone)]
+enum SessionCover {
+    Reconnecting,
+    Lost,
+    Ended(String),
 }
 
 pub enum ViewerStop {
@@ -133,7 +143,7 @@ fn arm_link(
     let stats = Arc::new(Stats::default());
     let (control_tx, control_rx) = mpsc::unbounded_channel::<ControlMsg>();
     let (frame_tx, frame_rx) = std::sync::mpsc::channel::<(VideoHeader, Vec<u8>)>();
-    let Link { connection, endpoint, control_send, control_recv, host_name, host_id, path, peer_proto } = link;
+    let Link { connection, endpoint, control_send, control_recv, host_name, host_id, path, peer_proto, .. } = link;
     let relayed = matches!(path, crate::p2p::LinkPath::Relay(_));
     let title = format!("{host_name} ({}) — PJDesk, {path}", format_id(&host_id));
     let retire = Arc::new(AtomicBool::new(false));
@@ -288,12 +298,16 @@ fn serve_admits(
     crate::session_window::take_down_listener(port);
 }
 
-pub fn run(runtime: &Runtime, link: Link, seed: Seed) -> Result<ViewerStop> {
+pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> {
     crate::note_status("Opening the viewer window");
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().context("could not create the viewer window")?;
     let proxy = event_loop.create_proxy();
     let view = seed.view;
     let display = seed.display;
+    if !link.direct_targets.is_empty() {
+        seed.direct_targets = link.direct_targets.clone();
+    }
+    seed.host_fingerprint = link.host_fingerprint.or(seed.host_fingerprint);
     let armed = arm_link(runtime.handle(), link, &proxy, 1, view, display)?;
     let loaded = crate::config::Config::load().ok();
     let theme_name = loaded.as_ref().map(|c| c.settings.theme.clone()).unwrap_or_default();
@@ -367,6 +381,8 @@ pub fn run(runtime: &Runtime, link: Link, seed: Seed) -> Result<ViewerStop> {
         connecting: Vec::new(),
         cancelled: HashSet::new(),
         relinking: HashSet::new(),
+        cover: HashMap::new(),
+        resume_stop: Arc::new(Mutex::new(HashSet::new())),
         confirm_close: false,
         queue,
         rt: runtime.handle().clone(),
@@ -660,6 +676,8 @@ struct App {
     connecting: Vec<(u64, String)>,
     cancelled: HashSet<u64>,
     relinking: HashSet<u64>,
+    cover: HashMap<u64, SessionCover>,
+    resume_stop: Arc<Mutex<HashSet<u64>>>,
     confirm_close: bool,
     queue: Arc<Mutex<Vec<Queued>>>,
     rt: tokio::runtime::Handle,
@@ -868,6 +886,14 @@ impl App {
         self.panel.draw(&mut buffer, win_w, win_h, &snap);
         if confirm {
             toolbar::draw_confirm_close(&mut buffer, win_w, win_h, open.max(2), light);
+        }
+        if let Some(cover) = self.cover.get(&self.sid) {
+            let (kind, detail) = match cover {
+                SessionCover::Reconnecting => (toolbar::SessionCover::Reconnecting, ""),
+                SessionCover::Lost => (toolbar::SessionCover::Lost, ""),
+                SessionCover::Ended(text) => (toolbar::SessionCover::Ended, text.as_str()),
+            };
+            toolbar::draw_session_cover(&mut buffer, win_w, win_h, kind, detail, light);
         }
         if snap.restart {
             self.restarting = true;
@@ -1158,6 +1184,12 @@ impl App {
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
+            }
+            return;
+        }
+        if self.cover.contains_key(&self.sid) {
+            if down && code == KeyCode::Escape && matches!(self.cover.get(&self.sid), Some(SessionCover::Reconnecting)) {
+                self.cancel_resume(self.sid);
             }
             return;
         }
@@ -1880,6 +1912,8 @@ impl App {
         }
         let toast = self.toast.clone();
         let background = self.toolbar.letterbox();
+        let cover = self.cover.get(&self.sid).cloned();
+        let light = self.light;
         let pane = &mut self.extra[i];
         let size = pane.window.inner_size();
         let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
@@ -1901,6 +1935,14 @@ impl App {
                 if at.elapsed() < Duration::from_secs(4) {
                     toolbar::draw_toast(&mut buffer, win_w, win_h, text);
                 }
+            }
+            if let Some(cover) = &cover {
+                let (kind, detail) = match cover {
+                    SessionCover::Reconnecting => (toolbar::SessionCover::Reconnecting, ""),
+                    SessionCover::Lost => (toolbar::SessionCover::Lost, ""),
+                    SessionCover::Ended(text) => (toolbar::SessionCover::Ended, text.as_str()),
+                };
+                toolbar::draw_session_cover(&mut buffer, win_w, win_h, kind, detail, light);
             }
             let _ = buffer.present();
             layout
@@ -1956,6 +1998,33 @@ impl App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(cover) = self.cover.get(&self.sid).cloned() {
+                    let size = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.window.inner_size());
+                    let cursor = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.cursor).unwrap_or((0.0, 0.0));
+                    if let Some(size) = size {
+                        let (w, h) = (size.width as usize, size.height as usize);
+                        if state == ElementState::Pressed && button == winit::event::MouseButton::Left {
+                            let kind = match cover {
+                                SessionCover::Reconnecting => toolbar::SessionCover::Reconnecting,
+                                SessionCover::Lost => toolbar::SessionCover::Lost,
+                                SessionCover::Ended(_) => toolbar::SessionCover::Ended,
+                            };
+                            if let Some(hit) = toolbar::session_cover_hit(kind, cursor.0, cursor.1, w, h) {
+                                let sid = self.sid;
+                                match hit {
+                                    toolbar::SessionCoverAction::Cancel => self.cancel_resume(sid),
+                                    toolbar::SessionCoverAction::Reconnect => self.begin_relink(sid, String::new(), false),
+                                    toolbar::SessionCoverAction::Close => {
+                                        if self.end_sid(sid) {
+                                            event_loop.exit();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 let size = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.window.inner_size());
                 let cursor = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.cursor).unwrap_or((0.0, 0.0));
                 let Some(size) = size else { return };
@@ -2154,6 +2223,8 @@ impl App {
             }
             self.others.retain(|held| held.sid != sid);
             self.relinking.remove(&sid);
+            self.cover.remove(&sid);
+            self.resume_stop.lock().unwrap().insert(sid);
             self.apply_tab_strip();
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -2171,64 +2242,59 @@ impl App {
         drop(previous);
         show_panes(&self.extra);
         self.relinking.remove(&sid);
+        self.cover.remove(&sid);
+        self.resume_stop.lock().unwrap().insert(sid);
         self.apply_tab_strip();
         self.reveal();
         false
     }
 
-    fn drop_parked(&mut self, sid: u64, reason: &str) {
-        if !self.others.iter().any(|held| held.sid == sid) {
-            return;
-        }
-        info!("Session tab closed: {reason}");
-        let _ = self.end_sid(sid);
-        self.show_toast(reason);
-    }
-
     /// True when this frame already switched the window (exit or an in-window reconnect).
     fn note_transport(&mut self, event_loop: &ActiveEventLoop, session: u64) -> bool {
-        let Some((restart, resume, primary)) = self.transport_flags(session) else { return false };
+        let Some((restart, resume, primary, ended)) = self.transport_flags(session) else { return false };
         if restart {
             return self.leave_or_relink(event_loop, session, String::new(), true);
         }
         if resume {
             return self.leave_or_relink(event_loop, session, primary, false);
         }
+        if let Some(text) = ended {
+            self.show_cover(session, SessionCover::Ended(text));
+            return true;
+        }
         false
     }
 
     fn relay_or_restart(&mut self, event_loop: &ActiveEventLoop, session: u64, reason: &str) -> bool {
         let relay = pjdesk_proto::failover::is_relay_resume(reason)
-            || self.transport_flags(session).is_some_and(|(_, resume, _)| resume);
+            || self.transport_flags(session).is_some_and(|(_, resume, _, _)| resume);
         if !relay {
             return false;
         }
-        let mut primary = self.transport_flags(session).map(|(_, _, primary)| primary).unwrap_or_default();
+        let mut primary = self.transport_flags(session).map(|(_, _, primary, _)| primary).unwrap_or_default();
         if primary.is_empty() {
             primary = pjdesk_proto::failover::primary_from_resume(reason);
         }
         self.leave_or_relink(event_loop, session, primary, false)
     }
 
-    fn transport_flags(&self, session: u64) -> Option<(bool, bool, String)> {
+    fn transport_flags(&self, session: u64) -> Option<(bool, bool, String, Option<String>)> {
+        let pack = |live: &super::controls::Live| {
+            let ended = if live.host_ended { live.closed.clone() } else { None };
+            (live.restart, live.resume_relay, live.move_primary.clone(), ended)
+        };
         if session == self.sid {
             let live = self.live.lock().unwrap();
-            return Some((live.restart, live.resume_relay, live.move_primary.clone()));
+            return Some(pack(&live));
         }
         let held = self.others.iter().find(|held| held.sid == session)?;
         let live = held.live.lock().unwrap();
-        Some((live.restart, live.resume_relay, live.move_primary.clone()))
+        Some(pack(&live))
     }
 
     fn leave_or_relink(&mut self, event_loop: &ActiveEventLoop, session: u64, primary: String, restart: bool) -> bool {
-        if self.live_ids().len() <= 1 {
-            if restart {
-                self.restarting = true;
-            } else {
-                self.relay_resume = true;
-                self.relay_primary = primary;
-                info!("{}", pjdesk_proto::failover::RELAY_RESUME);
-            }
+        if restart && self.live_ids().len() <= 1 {
+            self.restarting = true;
             event_loop.exit();
             return true;
         }
@@ -2236,42 +2302,73 @@ impl App {
         true
     }
 
+    fn show_cover(&mut self, sid: u64, cover: SessionCover) {
+        self.cover.insert(sid, cover);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn cancel_resume(&mut self, sid: u64) {
+        self.resume_stop.lock().unwrap().insert(sid);
+        self.relinking.remove(&sid);
+        self.show_cover(sid, SessionCover::Lost);
+    }
+
     fn begin_relink(&mut self, sid: u64, primary: String, restart: bool) {
         if !self.relinking.insert(sid) {
             return;
         }
+        self.resume_stop.lock().unwrap().remove(&sid);
+        self.show_cover(sid, SessionCover::Reconnecting);
         let seed = if sid == self.sid {
             self.retire.store(true, Ordering::SeqCst);
-            self.show_toast("Reconnecting…");
+            self.connection.close(0u32.into(), b"reconnecting");
             self.seed.clone()
         } else if let Some(held) = self.others.iter_mut().find(|held| held.sid == sid) {
             held.retire.store(true, Ordering::SeqCst);
+            held.connection.close(0u32.into(), b"reconnecting");
             held.seed.clone()
         } else {
             self.relinking.remove(&sid);
+            self.cover.remove(&sid);
             return;
         };
         let rt = self.rt.clone();
         let queue = self.queue.clone();
         let proxy = self.proxy.clone();
+        let stop = self.resume_stop.clone();
+        let targets = seed.direct_targets.clone();
+        let fingerprint = seed.host_fingerprint;
         rt.spawn(async move {
             if restart {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             } else {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            if stop.lock().unwrap().contains(&sid) {
+                return;
             }
             let admit = admit_from_seed(&seed);
             let moved = if primary.trim().is_empty() { None } else { Some(primary) };
-            let msg = match super::open_admitted(&admit, moved.as_deref(), restart).await {
-                Ok(link) => Queued::Relinked { sid, link },
-                Err(e) => Queued::RelinkFailed { sid, error: format!("{e:#}") },
+            let msg = match super::resume_session(&admit, moved.as_deref(), &targets, fingerprint).await {
+                Ok(link) => {
+                    if stop.lock().unwrap().contains(&sid) {
+                        link.connection.close(0u32.into(), b"cancelled");
+                        return;
+                    }
+                    Queued::Relinked { sid, link }
+                }
+                Err(e) => {
+                    if stop.lock().unwrap().contains(&sid) {
+                        return;
+                    }
+                    Queued::RelinkFailed { sid, error: format!("{e:#}") }
+                }
             };
             queue.lock().unwrap().push(msg);
             let _ = proxy.send_event(UserEvent::Work);
         });
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
     }
 
     fn drain_queue(&mut self) {
@@ -2378,6 +2475,8 @@ impl App {
 
     fn finish_relink(&mut self, sid: u64, link: Link) {
         self.relinking.remove(&sid);
+        self.cover.remove(&sid);
+        self.remember_route(sid, &link);
         let pair = if sid == self.sid {
             Some((self.seed.view, self.seed.display))
         } else {
@@ -2398,20 +2497,33 @@ impl App {
 
     fn fail_relink(&mut self, sid: u64, error: String) {
         self.relinking.remove(&sid);
-        self.show_toast(format!("Could not reconnect: {error}"));
-        if self.live_ids().len() > 1 {
-            let _ = self.end_sid(sid);
-        } else {
-            self.closed = true;
-            crate::note_status(&format!("Session stopped: {error}"));
-            if let Some(window) = &self.window {
-                window.set_title(&format!("{} — {error}", self.title));
-                window.request_redraw();
+        info!("Could not reconnect: {error}");
+        self.show_cover(sid, SessionCover::Lost);
+    }
+
+    fn remember_route(&mut self, sid: u64, link: &Link) {
+        let apply = |seed: &mut Seed| {
+            if !link.direct_targets.is_empty() {
+                seed.direct_targets = link.direct_targets.clone();
             }
+            if let Some(fp) = link.host_fingerprint {
+                seed.host_fingerprint = Some(fp);
+            }
+        };
+        if sid == self.sid {
+            apply(&mut self.seed);
+        } else if let Some(held) = self.others.iter_mut().find(|held| held.sid == sid) {
+            apply(&mut held.seed);
         }
     }
 
-    fn hold(&self, link: Link, seed: Seed, sid: u64) -> Result<Held> {
+    fn hold(&self, link: Link, mut seed: Seed, sid: u64) -> Result<Held> {
+        if !link.direct_targets.is_empty() {
+            seed.direct_targets = link.direct_targets.clone();
+        }
+        if link.host_fingerprint.is_some() {
+            seed.host_fingerprint = link.host_fingerprint;
+        }
         let armed = arm_link(&self.rt, link, &self.proxy, sid, seed.view, seed.display)?;
         let places = crate::config::Config::load()
             .ok()
@@ -2480,7 +2592,6 @@ impl App {
             self.cmds = armed.cmds;
             self.saw_picture = armed.saw_picture;
             self.retire = armed.retire;
-            self.current = None;
             self.closed = false;
             self.restarting = false;
             self.relay_resume = false;
@@ -2500,7 +2611,6 @@ impl App {
             held.cmds = armed.cmds;
             held.saw_picture = armed.saw_picture;
             held.retire = armed.retire;
-            held.current = None;
             held.closed = false;
             held.restarting = false;
             held.relay_resume = false;
@@ -2556,6 +2666,8 @@ fn seed_from_admit(admit: &crate::session_window::Admit) -> Seed {
         from_store: admit.from_store,
         files: admit.files,
         label: admit.label.clone(),
+        direct_targets: Vec::new(),
+        host_fingerprint: None,
     }
 }
 
@@ -2681,16 +2793,14 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.relay_or_restart(event_loop, session, &reason) {
                     return;
                 }
-                if session != self.sid {
-                    self.drop_parked(session, &reason);
-                    return;
-                }
-                let Some(window) = self.window.clone() else { return };
-                self.closed = true;
                 info!("Disconnected: {reason}");
                 crate::note_status(&format!("Session stopped: {reason}"));
-                window.set_title(&format!("{} — {reason}", self.title));
-                window.request_redraw();
+                self.show_cover(session, SessionCover::Ended(reason.clone()));
+                if session == self.sid {
+                    if let Some(window) = self.window.clone() {
+                        window.set_title(&format!("{} — {reason}", self.title));
+                    }
+                }
             }
         }
     }
@@ -2754,6 +2864,28 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.confirm_close = false;
                                 if let Some(window) = &self.window {
                                     window.request_redraw();
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                if let Some(cover) = self.cover.get(&self.sid).cloned() {
+                    if state == ElementState::Pressed && button == winit::event::MouseButton::Left {
+                        let kind = match cover {
+                            SessionCover::Reconnecting => toolbar::SessionCover::Reconnecting,
+                            SessionCover::Lost => toolbar::SessionCover::Lost,
+                            SessionCover::Ended(_) => toolbar::SessionCover::Ended,
+                        };
+                        if let Some(hit) = toolbar::session_cover_hit(kind, self.cursor_px.0, self.cursor_px.1, win_w, win_h) {
+                            let sid = self.sid;
+                            match hit {
+                                toolbar::SessionCoverAction::Cancel => self.cancel_resume(sid),
+                                toolbar::SessionCoverAction::Reconnect => self.begin_relink(sid, String::new(), false),
+                                toolbar::SessionCoverAction::Close => {
+                                    if self.end_sid(sid) {
+                                        event_loop.exit();
+                                    }
                                 }
                             }
                         }

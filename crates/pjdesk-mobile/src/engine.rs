@@ -1899,7 +1899,7 @@ async fn host_session(
         if let Some(deadline) = share_deadline {
             consent_ticks = consent_ticks.saturating_add(1);
             if consent_ticks % CONSENT_KEEPALIVE_TICKS == 0 {
-                // Pong is ignored by the viewer. The packet keeps a 15s idle
+                // Pong is ignored by the viewer. The packet keeps the idle
                 // timeout from closing the session during the minute we wait.
                 let _ = write_msg(&mut control_send, &HostMsg::Pong { t_us: 0 }).await;
                 log_line(&cb, "still waiting for screen sharing");
@@ -2073,8 +2073,8 @@ async fn deliver_control(state: &State, send: &mut quinn::SendStream, warned: &m
 const SCREEN_WAIT: &str = "Waiting for the phone to allow screen sharing";
 /// How long the host keeps the session while Android's share dialog is up.
 const SHARE_WAIT: Duration = Duration::from_secs(60);
-/// A write on the control stream inside the 15 second QUIC idle timeout.
-const CONSENT_KEEPALIVE_TICKS: u32 = 20;
+/// A write on the control stream inside the 5 second QUIC idle timeout.
+const CONSENT_KEEPALIVE_TICKS: u32 = 8;
 
 /// A replaced Connect (`stopped`) or a dismissed password (`cancelled`) is not a failure to show.
 fn surfaced_connect_error(raw: &str) -> Option<String> {
@@ -2969,7 +2969,7 @@ mod tests {
     #[test]
     fn the_consent_wait_sends_a_packet_inside_the_idle_timeout() {
         assert_eq!(SHARE_WAIT, Duration::from_secs(60));
-        assert!(CONSENT_KEEPALIVE_TICKS * 250 < 15_000);
+        assert!(CONSENT_KEEPALIVE_TICKS * 250 < 5_000);
     }
 
     #[test]

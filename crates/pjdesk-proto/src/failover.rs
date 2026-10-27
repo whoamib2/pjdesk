@@ -203,6 +203,25 @@ pub enum SessionHop {
     ToPrimary { address: String, cause: MoveCause },
 }
 
+/// No packet and no pong for this long means the path is dead.
+pub const TRANSPORT_DEAD: Duration = Duration::from_secs(4);
+
+/// True once the path has been silent long enough to reconnect.
+pub fn path_is_dead(silent_for: Duration) -> bool {
+    silent_for >= TRANSPORT_DEAD
+}
+
+/// A dead path reconnects. A host restart and a person ending the session do not.
+pub fn resume_after_drop(restarting: bool, host_ended: bool) -> bool {
+    !restarting && !host_ended
+}
+
+/// The person at the computer, or the phone, ended the session on purpose.
+pub fn host_ended_the_session(notice: &str) -> bool {
+    let lower = notice.to_ascii_lowercase();
+    lower.contains("disconnected") || lower.contains("stopped sharing")
+}
+
 /// A relayed session moves to the primary. Every other path stays up.
 pub fn hop_session(path: MediaPath, cause: MoveCause, primary: &str) -> SessionHop {
     match session_fate(path) {
@@ -775,6 +794,15 @@ mod tests {
         assert!(!peer_took_the_epoch(6, 7, "lenovo", "lenovo"));
         assert!(!peer_took_the_epoch(6, 7, "", "lenovo"));
         assert!(peer_took_the_epoch(6, 7, "chip", "lenovo"));
+        assert!(path_is_dead(TRANSPORT_DEAD));
+        assert!(path_is_dead(Duration::from_secs(5)));
+        assert!(!path_is_dead(Duration::from_secs(3)));
+        assert!(resume_after_drop(false, false));
+        assert!(!resume_after_drop(true, false));
+        assert!(!resume_after_drop(false, true));
+        assert!(host_ended_the_session("The person at this computer disconnected"));
+        assert!(host_ended_the_session("The phone stopped sharing"));
+        assert!(!host_ended_the_session("Reconnecting…"));
         assert_eq!(standby_result("CHIP20", 7), "Now standby; CHIP20 is primary, gen 7");
         assert_eq!(standby_result("  ", 7), "Now standby; the other server is primary, gen 7");
         assert_eq!(primary_result(7, "BENLENOVODESK"), "Now primary, gen 7. BENLENOVODESK is standby.");

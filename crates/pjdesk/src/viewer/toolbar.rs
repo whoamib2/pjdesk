@@ -1400,6 +1400,92 @@ pub fn draw_confirm_close(buf: &mut [u32], win_w: usize, win_h: usize, sessions:
     );
 }
 
+/// What the session window draws over a picture that is no longer live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionCover {
+    Reconnecting,
+    Lost,
+    Ended,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionCoverAction {
+    Cancel,
+    Reconnect,
+    Close,
+}
+
+fn cover_buttons(kind: SessionCover) -> &'static [(&'static str, SessionCoverAction)] {
+    match kind {
+        SessionCover::Reconnecting => &[("Cancel", SessionCoverAction::Cancel)],
+        SessionCover::Lost => &[("Reconnect", SessionCoverAction::Reconnect), ("Close", SessionCoverAction::Close)],
+        SessionCover::Ended => &[("Close", SessionCoverAction::Close)],
+    }
+}
+
+fn cover_boxes(win_w: usize, win_h: usize, buttons: usize) -> (f32, f32, f32, f32, Vec<(f32, f32, f32, f32)>) {
+    let card_w = 440.0_f32.min((win_w as f32 - 32.0).max(280.0));
+    let card_h = 156.0;
+    let x = ((win_w as f32 - card_w) / 2.0).max(8.0);
+    let y = ((win_h as f32 - card_h) / 2.0).max(8.0);
+    let btn_h = 36.0;
+    let by = y + card_h - btn_h - 22.0;
+    let mut boxes = Vec::new();
+    if buttons <= 1 {
+        let btn_w = 160.0;
+        boxes.push((x + (card_w - btn_w) / 2.0, by, btn_w, btn_h));
+    } else {
+        let btn_w = 150.0;
+        let gap = 16.0;
+        let start = x + (card_w - (btn_w * 2.0 + gap)) / 2.0;
+        boxes.push((start, by, btn_w, btn_h));
+        boxes.push((start + btn_w + gap, by, btn_w, btn_h));
+    }
+    (x, y, card_w, card_h, boxes)
+}
+
+pub fn session_cover_hit(kind: SessionCover, px: f64, py: f64, win_w: usize, win_h: usize) -> Option<SessionCoverAction> {
+    let buttons = cover_buttons(kind);
+    let (_, _, _, _, boxes) = cover_boxes(win_w, win_h, buttons.len());
+    for (button, (x, y, w, h)) in buttons.iter().zip(boxes) {
+        if Toolbar::hit(px, py, x, y, w, h) {
+            return Some(button.1);
+        }
+    }
+    None
+}
+
+pub fn draw_session_cover(buf: &mut [u32], win_w: usize, win_h: usize, kind: SessionCover, detail: &str, light: bool) {
+    let c = chrome(light);
+    let ended = detail.lines().next().unwrap_or(detail).trim();
+    let ended = if ended.is_empty() { "The session ended" } else { ended };
+    let title = match kind {
+        SessionCover::Reconnecting => "Reconnecting…",
+        SessionCover::Lost => "Connection lost",
+        SessionCover::Ended => ended,
+    };
+    let buttons = cover_buttons(kind);
+    fill_rect(buf, win_w, win_h, 0.0, 0.0, win_w as f32, win_h as f32, 0x88_10_13_18);
+    let (x, y, card_w, card_h, boxes) = cover_boxes(win_w, win_h, buttons.len());
+    fill_round(buf, win_w, win_h, x, y, card_w, card_h, 12.0, c.card);
+    let shown = if title.chars().count() > 48 {
+        let end = title.char_indices().nth(48).map(|(i, _)| i).unwrap_or(title.len());
+        &title[..end]
+    } else {
+        title
+    };
+    draw_text(buf, win_w, win_h, x + 24.0, y + 42.0, shown, c.text);
+    if kind == SessionCover::Lost {
+        draw_text(buf, win_w, win_h, x + 24.0, y + 70.0, "Every route failed.", c.muted);
+    }
+    for (button, (bx, by, bw, bh)) in buttons.iter().zip(boxes) {
+        let fill = if button.1 == SessionCoverAction::Reconnect { c.accent } else { c.elev };
+        let ink = if button.1 == SessionCoverAction::Reconnect { 0xFF_ff_ff_ff } else { c.text };
+        fill_round(buf, win_w, win_h, bx, by, bw, bh, 8.0, fill);
+        draw_text(buf, win_w, win_h, bx + (bw - text_width(button.0)) / 2.0, by + 24.0, button.0, ink);
+    }
+}
+
 const COMPACT_H: f32 = 36.0;
 
 /// Bottom bar on a separate screen window: the screen name, fullscreen, and close.
@@ -2044,6 +2130,20 @@ mod tests {
         assert!(bar.menus[3].items.iter().any(|(label, action)| label == "Show navigation bar" && *action == Action::ToggleAndroidBar));
         bar.toggle_android_nav();
         assert!(bar.shows_android_nav());
+    }
+
+    #[test]
+    fn reconnect_overlay_has_cancel_and_the_lost_overlay_has_two_buttons() {
+        let w = 800;
+        let h = 600;
+        let mut buf = vec![0u32; w * h];
+        draw_session_cover(&mut buf, w, h, SessionCover::Reconnecting, "", false);
+        assert!(buf.iter().any(|px| *px != 0));
+        assert_eq!(session_cover_hit(SessionCover::Reconnecting, 400.0, 338.0, w, h), Some(SessionCoverAction::Cancel));
+        assert_eq!(session_cover_hit(SessionCover::Lost, 400.0, 20.0, w, h), None);
+        assert_eq!(session_cover_hit(SessionCover::Lost, 317.0, 338.0, w, h), Some(SessionCoverAction::Reconnect));
+        assert_eq!(session_cover_hit(SessionCover::Lost, 483.0, 338.0, w, h), Some(SessionCoverAction::Close));
+        assert_eq!(session_cover_hit(SessionCover::Ended, 400.0, 338.0, w, h), Some(SessionCoverAction::Close));
     }
 
     fn button(buttons: &[AndroidButton], which: u8) -> AndroidButton {

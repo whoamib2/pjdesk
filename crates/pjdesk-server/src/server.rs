@@ -335,7 +335,10 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
 
     tokio::select! {
         _ = accept_loop => {}
-        _ = shutdown => info!("Shutting down"),
+        _ = shutdown => {
+            info!("Shutting down");
+            release_relays_on_stop(&state).await;
+        }
         r = relay => warn!("UDP relay stopped: {r:?}"),
     }
     janitor.abort();
@@ -1315,20 +1318,9 @@ fn drop_access_key(st: &mut State, key_id: &str) -> bool {
 /// How long a role change waits for relayed sessions to follow.
 const MOVE_WAIT: Duration = Duration::from_secs(8);
 
-/// Tells relayed sessions to open again on `primary`. Returns true when the
-/// role change may be written: nothing is waiting, or every told session has
-/// followed, or the wait ran out (the crash path drops the relay).
-fn step_down_ready(state: &Shared, primary: &str, kind: StepKind) -> bool {
-    let mut st = state.lock().unwrap();
-    if st.pending_move.is_none() {
-        let target = if primary.is_empty() { "the current primary".to_string() } else { primary.to_string() };
-        info!("failover: role change started; relayed sessions move to {target} before this server steps down");
-        st.pending_move = Some(PendingMove { primary: primary.to_string(), since: Instant::now(), kind });
-    }
-    let (primary, since) = {
-        let pending = st.pending_move.as_ref().unwrap();
-        (pending.primary.clone(), pending.since)
-    };
+/// Tells every relayed session that has not been told yet. An older host is
+/// marked done so this server does not wait for a message it cannot read.
+fn tell_open_relays(st: &mut State, primary: &str) {
     let pending_ids: Vec<(SessionId, String)> = st
         .sessions
         .iter()
@@ -1350,10 +1342,55 @@ fn step_down_ready(state: &Shared, primary: &str, kind: StepKind) -> bool {
             info!("failover: session {id:016x} is on an older client; it reconnects when the relay stops");
             continue;
         }
-        let msg = ServerMsg::MoveRelay { session_id: id, primary: primary.clone() };
+        let msg = ServerMsg::MoveRelay { session_id: id, primary: primary.to_string() };
         let _ = session.host_tx.send(msg);
-        info!("failover: told session {id:016x} to reconnect through {primary}");
+        let where_next = if primary.is_empty() { "the current primary" } else { primary };
+        info!("failover: told session {id:016x} to reconnect through {where_next}");
     }
+}
+
+/// Before the process exits, ask relayed sessions to open on the other server.
+/// Direct sessions are not on this path. The wait is short so a stop still finishes.
+async fn release_relays_on_stop(state: &Shared) {
+    let carrying = state.lock().unwrap().sessions.values().any(|session| session.relayed);
+    if !carrying {
+        return;
+    }
+    let already = state.lock().unwrap().pending_move.is_some();
+    if !already {
+        let data_dir = state.lock().unwrap().data_dir.clone();
+        let primary = crate::cloud::cached_peer_address(&data_dir);
+        let where_next = if primary.is_empty() { "the current primary".to_string() } else { primary.clone() };
+        info!("failover: shutting down; telling relayed sessions to move to {where_next}");
+        tell_open_relays(&mut state.lock().unwrap(), &primary);
+    }
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(4) {
+        let waiting = state.lock().unwrap().sessions.values().any(|session| session.relayed && !session.move_acked);
+        if !waiting {
+            info!("failover: relayed sessions left before this server stopped");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    warn!("failover: stopping with a relayed session still here; that session reconnects through the next server");
+}
+
+/// Tells relayed sessions to open again on `primary`. Returns true when the
+/// role change may be written: nothing is waiting, or every told session has
+/// followed, or the wait ran out (the crash path drops the relay).
+fn step_down_ready(state: &Shared, primary: &str, kind: StepKind) -> bool {
+    let mut st = state.lock().unwrap();
+    if st.pending_move.is_none() {
+        let target = if primary.is_empty() { "the current primary".to_string() } else { primary.to_string() };
+        info!("failover: role change started; relayed sessions move to {target} before this server steps down");
+        st.pending_move = Some(PendingMove { primary: primary.to_string(), since: Instant::now(), kind });
+    }
+    let (primary, since) = {
+        let pending = st.pending_move.as_ref().unwrap();
+        (pending.primary.clone(), pending.since)
+    };
+    tell_open_relays(&mut st, &primary);
     let waiting = st.sessions.values().any(|session| session.relayed && !session.move_acked);
     let timed_out = since.elapsed() > MOVE_WAIT;
     if waiting && !timed_out {

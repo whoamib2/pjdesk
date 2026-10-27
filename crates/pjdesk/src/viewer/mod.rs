@@ -42,6 +42,10 @@ pub struct Link {
     pub host_id: String,
     pub path: LinkPath,
     pub peer_proto: u16,
+    /// LAN and public addresses from the last introduction. Tried before the relay.
+    pub direct_targets: Vec<SocketAddr>,
+    /// Host certificate from that introduction.
+    pub host_fingerprint: Option<pjdesk_proto::tls::Fingerprint>,
 }
 
 pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<()> {
@@ -88,6 +92,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
                 waiting,
                 prefer_standby,
                 move_to.as_deref(),
+                Duration::from_secs(90),
             ))
         };
         let link = match link {
@@ -154,6 +159,8 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
             from_store: std::env::var("PJDESK_SAVED").ok().as_deref() == Some("1"),
             files: std::env::var("PJDESK_OPEN_PANEL").ok().as_deref() == Some("files"),
             label: String::new(),
+            direct_targets: Vec::new(),
+            host_fingerprint: None,
         };
         match window::run(&runtime, link, seed)? {
             window::ViewerStop::UserClosed => break,
@@ -223,6 +230,16 @@ pub(crate) async fn open_admitted(
     move_to: Option<&str>,
     waiting_retry: bool,
 ) -> Result<Link> {
+    open_for(admit, move_to, waiting_retry, Duration::from_secs(90)).await
+}
+
+/// Same as [`open_admitted`], with a shorter wait for the host to answer.
+async fn open_for(
+    admit: &crate::session_window::Admit,
+    move_to: Option<&str>,
+    waiting_retry: bool,
+    host_wait: Duration,
+) -> Result<Link> {
     let mut config = Config::load().context("reading settings")?;
     if !admit.direct.trim().is_empty() {
         return connect_direct(&mut config, admit.direct.trim(), &admit.password, None, false).await;
@@ -241,8 +258,138 @@ pub(crate) async fn open_admitted(
         waiting_retry,
         false,
         move_to,
+        host_wait,
     )
     .await
+}
+
+/// Direct first, then the current primary, then the other server. The password
+/// already entered is reused. `move_to` is the primary a role change named.
+pub(crate) async fn resume_session(
+    admit: &crate::session_window::Admit,
+    move_to: Option<&str>,
+    targets: &[SocketAddr],
+    fingerprint: Option<pjdesk_proto::tls::Fingerprint>,
+) -> Result<Link> {
+    if !admit.force_relay {
+        if let Some(fp) = fingerprint {
+            match try_direct_resume(&admit.password, targets, fp, &admit.id, &admit.label).await {
+                Ok(Some(link)) => return Ok(link),
+                Ok(None) => {}
+                Err(e) if already_in_session(&e) => {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    if let Ok(Some(link)) = try_direct_resume(&admit.password, targets, fp, &admit.id, &admit.label).await {
+                        return Ok(link);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    let wait = Duration::from_secs(8);
+    let mut last = None;
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        match open_for(admit, move_to, false, wait).await {
+            Ok(link) => return Ok(link),
+            Err(e) if already_in_session(&e) => last = Some(e),
+            Err(e) => {
+                let wrong = e.to_string().to_ascii_lowercase().contains("wrong password");
+                last = Some(e);
+                if wrong {
+                    break;
+                }
+            }
+        }
+    }
+    if move_to.is_some() {
+        if let Ok(link) = open_for(admit, None, false, wait).await {
+            return Ok(link);
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("could not reconnect")))
+}
+
+fn already_in_session(err: &anyhow::Error) -> bool {
+    format!("{err:#}").to_ascii_lowercase().contains("already connected")
+}
+
+/// QUIC straight to an address this session already reached, with the same key.
+async fn try_direct_resume(
+    password: &str,
+    targets: &[SocketAddr],
+    fingerprint: pjdesk_proto::tls::Fingerprint,
+    host_id: &str,
+    host_label: &str,
+) -> Result<Option<Link>> {
+    if targets.is_empty() || password.is_empty() {
+        return Ok(None);
+    }
+    let udp = std::net::UdpSocket::bind("0.0.0.0:0").context("opening a UDP socket")?;
+    let endpoint = p2p::controller_endpoint(udp, fingerprint)?;
+    let mut attempts = tokio::task::JoinSet::new();
+    for (addr, delay) in p2p::dial_order(targets) {
+        let endpoint = endpoint.clone();
+        attempts.spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let connection = endpoint.connect(addr, pjdesk_proto::PEER_SERVER_NAME)?.await?;
+            Ok::<_, anyhow::Error>((connection, addr))
+        });
+    }
+    let winner = timeout(Duration::from_secs(3), async {
+        while let Some(result) = attempts.join_next().await {
+            if let Ok(Ok(found)) = result {
+                return Some(found);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    attempts.abort_all();
+    let Some((connection, addr)) = winner else {
+        return Ok(None);
+    };
+    let auth = match session::controller_auth(&connection, password, &crate::hostname()).await {
+        Ok(auth) => auth,
+        Err(e) if e.is::<session::WrongPassword>() || already_in_session(&e) => {
+            connection.close(1u32.into(), b"resume");
+            return Err(e);
+        }
+        Err(e) => {
+            tracing::info!("direct resume did not stay up: {e:#}");
+            connection.close(1u32.into(), b"resume");
+            return Ok(None);
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    if let Some(reason) = connection.close_reason() {
+        let text = reason.to_string();
+        connection.close(1u32.into(), b"resume");
+        if already_in_session(&anyhow!(text.clone())) {
+            bail!(text);
+        }
+        tracing::info!("direct resume closed: {text}");
+        return Ok(None);
+    }
+    tracing::info!("Reconnected directly to {addr}");
+    Ok(Some(Link {
+        connection,
+        endpoint,
+        control_send: auth.send,
+        control_recv: auth.recv,
+        host_name: if auth.peer_name.trim().is_empty() { host_label.trim().to_string() } else { auth.peer_name },
+        host_id: host_id.to_string(),
+        path: LinkPath::Direct(addr),
+        peer_proto: auth.peer_proto,
+        direct_targets: targets.to_vec(),
+        host_fingerprint: Some(fingerprint),
+    }))
 }
 
 /// Signaling → UDP binding → hole punching / relay → QUIC → password check.
@@ -256,6 +403,7 @@ async fn connect(
     waiting_retry: bool,
     prefer_standby: bool,
     move_to: Option<&str>,
+    host_wait: Duration,
 ) -> Result<Link> {
     tracing::info!("Connecting to {} through the advertised servers", format_id(target));
     let _ = (server, prefer_standby);
@@ -290,7 +438,7 @@ async fn connect(
     tracing::info!("Waiting for {} to answer", format_id(target));
     let mut retried_without_token = false;
     let (session_id, token, udp_port, host_name) = loop {
-        match timeout(Duration::from_secs(90), signal.recv()).await {
+        match timeout(host_wait, signal.recv()).await {
             Ok(None) if !access.is_empty() && !access_key && !retried_without_token => {
                 retried_without_token = true;
                 signal = SignalClient::connect_catalog(config, &mine).await?;
@@ -350,7 +498,7 @@ async fn connect(
     })?;
 
     let (peer_public, peer_local, fingerprint) = loop {
-        match timeout(Duration::from_secs(20), signal.recv()).await {
+        match timeout(host_wait.min(Duration::from_secs(20)), signal.recv()).await {
             Ok(Some(ServerMsg::PeerInfo { public_addr, local_addrs, cert_fingerprint, .. })) => {
                 tracing::info!(
                     "Host addresses: public {public_addr}, on this network {}",
@@ -489,6 +637,8 @@ async fn connect(
         host_id: target.to_string(),
         path,
         peer_proto: auth.peer_proto,
+        direct_targets: candidates,
+        host_fingerprint: Some(fingerprint),
     })
 }
 
@@ -650,6 +800,8 @@ async fn connect_direct(
         host_id: "000000000".into(),
         path: LinkPath::Direct(socket_addr),
         peer_proto: auth.peer_proto,
+        direct_targets: vec![socket_addr],
+        host_fingerprint: verifier.observed(),
     })
 }
 

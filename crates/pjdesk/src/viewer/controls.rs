@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pjdesk_proto::filesafe::{self, MAX_TRANSFER_BYTES};
 use pjdesk_proto::framing::{read_msg, MAX_CONTROL_FRAME};
@@ -87,6 +87,8 @@ pub struct Live {
     pub resume_relay: bool,
     /// Primary the relayed session should open on. Empty uses the account's current primary.
     pub move_primary: String,
+    /// The person at the computer ended the session. Do not open it again.
+    pub host_ended: bool,
     pub closed: Option<String>,
     /// The phone's accessibility service is off, so clicks do not land.
     pub control_off: bool,
@@ -124,6 +126,7 @@ impl Live {
             relayed: false,
             resume_relay: false,
             move_primary: String::new(),
+            host_ended: false,
             closed: None,
             control_off: false,
             paths: HashMap::new(),
@@ -170,6 +173,7 @@ impl Live {
             relayed: self.relayed,
             resume_relay: self.resume_relay,
             move_primary: self.move_primary.clone(),
+            host_ended: self.host_ended,
             closed: self.closed.clone(),
             control_off: self.control_off,
             paths: HashMap::new(),
@@ -287,6 +291,12 @@ pub fn start(
 }
 
 fn note_relay_resume(live: &mut Live) {
+    if !pjdesk_proto::failover::resume_after_drop(live.restart, live.host_ended) {
+        return;
+    }
+    if live.resume_relay {
+        return;
+    }
     live.resume_relay = true;
     live.closed = Some(pjdesk_proto::failover::RELAY_RESUME.into());
     live.note("Reconnecting…");
@@ -304,22 +314,26 @@ async fn run_loop(
     wake: Arc<dyn Fn() + Send + Sync>,
     host_id: String,
 ) {
+    let mut last_heard = Instant::now();
+    let mut ping = tokio::time::interval(Duration::from_secs(1));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             msg = read_msg::<_, HostMsg>(&mut control_recv, MAX_CONTROL_FRAME) => {
                 match msg {
-                    Ok(msg) => on_host(msg, &connection, &control, &live, &tunnels, &wake, &host_id),
+                    Ok(msg) => {
+                        last_heard = Instant::now();
+                        on_host(msg, &connection, &control, &live, &tunnels, &wake, &host_id);
+                    }
                     Err(e) => {
                         let mut g = live.lock().unwrap();
-                        if g.closed.is_none() && !g.restart {
-                            if g.relayed {
-                                note_relay_resume(&mut g);
-                            } else {
-                                let text = format!("The host closed the session: {e:#}");
-                                tracing::error!("{text}");
-                                crate::note_failure(&text);
-                                g.closed = Some(text);
-                            }
+                        if g.closed.is_none() && resume_after_drop_live(&g) {
+                            note_relay_resume(&mut g);
+                        } else if g.closed.is_none() && !g.restart {
+                            let text = format!("The host closed the session: {e:#}");
+                            tracing::error!("{text}");
+                            crate::note_failure(&text);
+                            g.closed = Some(text);
                         }
                         wake();
                         break;
@@ -330,27 +344,42 @@ async fn run_loop(
                 let Some(cmd) = cmd else { break };
                 on_cmd(cmd, &connection, &control, &live, &tunnels, &recorder, &wake).await;
             }
+            _ = ping.tick() => {
+                let silent = last_heard.elapsed();
+                let mut g = live.lock().unwrap();
+                if pjdesk_proto::failover::path_is_dead(silent) && g.closed.is_none() && resume_after_drop_live(&g) {
+                    tracing::info!("failover: no packet from the host for {} ms", silent.as_millis());
+                    note_relay_resume(&mut g);
+                    drop(g);
+                    wake();
+                    break;
+                }
+                drop(g);
+                let _ = control.send(ControlMsg::Ping { t_us: 0 });
+            }
             _ = connection.closed() => {
                 let mut g = live.lock().unwrap();
-                if g.closed.is_none() && !g.restart {
-                    if g.relayed {
-                        note_relay_resume(&mut g);
-                    } else {
-                        let why = connection
-                            .close_reason()
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "the connection ended".into());
-                        let text = session_end_message(&why);
-                        tracing::error!("{text}");
-                        crate::note_failure(&text);
-                        g.closed = Some(text);
-                    }
+                if g.closed.is_none() && resume_after_drop_live(&g) {
+                    note_relay_resume(&mut g);
+                } else if g.closed.is_none() && !g.restart {
+                    let why = connection
+                        .close_reason()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "the connection ended".into());
+                    let text = session_end_message(&why);
+                    tracing::error!("{text}");
+                    crate::note_failure(&text);
+                    g.closed = Some(text);
                 }
                 wake();
                 break;
             }
         }
     }
+}
+
+fn resume_after_drop_live(live: &Live) -> bool {
+    pjdesk_proto::failover::resume_after_drop(live.restart, live.host_ended)
 }
 
 fn on_host(
@@ -412,6 +441,10 @@ fn on_host(
                 g.control_off = false;
                 crate::note_status(&text);
                 g.note(text);
+            } else if pjdesk_proto::failover::host_ended_the_session(&text) {
+                g.host_ended = true;
+                crate::note_status(&text);
+                g.closed = Some(text);
             } else if screen_share_failure_text(&text) || phone_stopped_sharing(&text) {
                 crate::note_failure(&text);
                 g.closed = Some(text);

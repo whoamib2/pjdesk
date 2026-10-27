@@ -2133,6 +2133,15 @@ pub fn migration_target(data_dir: &Path) -> String {
     }
 }
 
+/// The other server's address from the last successful lookup. No network call.
+pub fn cached_peer_address(data_dir: &Path) -> String {
+    std::fs::read_to_string(data_dir.join(PEER_FILE))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_default()
+}
+
 /// Address of the account's active server, when it is not this server.
 /// A failed lookup keeps the last address this server learned.
 pub fn peer_target(data_dir: &Path) -> Option<String> {
