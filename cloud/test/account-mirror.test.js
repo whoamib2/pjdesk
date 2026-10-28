@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyChange, assembleMirror, decidePut, revisionOf } from "../src/account-mirror.js";
+import { applyChange, assembleMirror, decidePut, revisionOf, signingKeyUsable } from "../src/account-mirror.js";
 
 const owner = {
   id: "acct",
@@ -68,6 +68,16 @@ test("a newer removal sticks, and a revocation newer than the enroll is kept", (
   });
   assert.equal(mirror.devices[0].revoked_at, 30);
   assert.equal(mirror.devices[0].refresh_hash, "");
+});
+
+test("a placeholder signing key is not usable and a real pkcs8 key is", async () => {
+  assert.equal(await signingKeyUsable(""), false);
+  assert.equal(await signingKeyUsable("net-private"), false);
+  assert.equal(await signingKeyUsable("ab".repeat(32)), false);
+  const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  const raw = new Uint8Array(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
+  const hex = [...raw].map((b) => b.toString(16).padStart(2, "0")).join("");
+  assert.equal(await signingKeyUsable(hex), true);
 });
 
 test("a sign key change replaces the exposed key", () => {

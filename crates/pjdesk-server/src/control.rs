@@ -351,7 +351,7 @@ fn sign_in(data_dir: &Path, req: &Request) -> Response {
     // Keep that session. A new login would replace the token and can fail.
     if let Some(saved) = same_saved_account(data_dir, &email) {
         let copy_line = crate::account_mirror::pull_now(data_dir);
-        let rejected = copy_line == crate::account_mirror::SERVER_SIGN_IN_NEEDED;
+        let rejected = copy_line.contains(crate::account_mirror::SERVER_SIGN_IN_NEEDED);
         if !rejected && crate::account_mirror::has_owner_copy(data_dir) {
             tracing::info!("sign-in: {email}: already signed in; the saved session stays");
             let mut response = ok(format!("Signed in as {saved}. Syncing as before."));
@@ -971,6 +971,10 @@ pub const ROLE_WAIT: Duration = Duration::from_secs(50);
 /// Sign-in derives the auth key (PBKDF2) and then talks to pjdesk.com.
 /// That is longer than a local file change, so it does not use [`CALL_TIMEOUT`].
 pub const SIGN_IN_WAIT: Duration = Duration::from_secs(45);
+
+/// A release check talks to pjdesk.com. Eight seconds is not enough, and a
+/// hung pipe must still finish with a timeout instead of spinning.
+pub const CHECK_WAIT: Duration = Duration::from_secs(45);
 
 /// Runs `job` and returns its response. If it is still going when `timeout` elapses,
 /// returns a failed response with `code` `timeout`. `None` from `job` is preserved

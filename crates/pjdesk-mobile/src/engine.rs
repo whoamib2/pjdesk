@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.62";
+pub const APP_VERSION: &str = "0.6.63";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -2298,8 +2298,9 @@ async fn account_on_address(
     }
 }
 
-/// The primary said its account copy is empty. Dial the standby, LAN on this /24 first.
-/// A public standby address is skipped unless its fingerprint is already saved.
+/// The primary said its account copy is empty. Dial the account standby.
+/// A public address uses the standby fingerprint from the primary's routes.
+/// Skipping one for a missing fingerprint is not a failed sign-in.
 async fn account_on_standby(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, msg: ClientMsg) -> Result<(ServerMsg, String)> {
     let routes = state.routes.lock().unwrap().clone();
     let saved = state.standby.lock().unwrap().clone();
@@ -2308,21 +2309,28 @@ async fn account_on_standby(state: &State, cb: &Arc<dyn Callbacks>, asked: &str,
     let targets = pjdesk_proto::routes::standby_account_order(&routes, &mine, &saved);
     sign_in_log(cb, &saved, "standby", &format!("op={asked} targets={}", targets.len()));
     if targets.is_empty() {
-        bail!("{}", sign_in_step_failure("standby", "", "no standby address is saved"));
+        bail!("The standby address is not saved.");
     }
     let mut last_addr = String::new();
     let mut last_why = String::new();
+    let mut empty: Option<(ServerMsg, String)> = None;
+    let mut dialed = false;
     for target in targets {
-        let Some(pin) = standby_pin(state, &target) else {
+        let Some(pin) = standby_pin(state, &target, &routes) else {
             sign_in_log(cb, &target, "standby", "reply=skipped public address without a fingerprint");
             continue;
         };
+        dialed = true;
         sign_in_log(cb, &target, "standby", "dialing");
         match SignalClient::connect_endpoint(&target, pin, pjdesk_proto::routes::dial_budget(&target)).await {
             Ok(mut signal) => {
                 if let Some(fp) = signal.observed {
-                    *state.standby_fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&fp));
-                    persist(state);
+                    let mut slot = state.standby_fingerprint.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(pjdesk_proto::tls::format_fingerprint(&fp));
+                        drop(slot);
+                        persist(state);
+                    }
                 }
                 let addr = signal.server_addr.to_string();
                 sign_in_log(cb, &addr, "standby", "transport=tcp");
@@ -2332,6 +2340,10 @@ async fn account_on_standby(state: &State, cb: &Arc<dyn Callbacks>, asked: &str,
                     continue;
                 }
                 match await_account(&mut signal, state, cb, &addr, "standby", Duration::from_secs(12)).await {
+                    AccountRead::Reply(reply) if copy_is_empty(&reply) => {
+                        sign_in_log(cb, &addr, "standby", "reply=empty-copy");
+                        empty = Some((reply, addr));
+                    }
                     AccountRead::Reply(reply) => return Ok((reply, addr)),
                     AccountRead::Timeout | AccountRead::Closed => {
                         last_addr = addr;
@@ -2348,19 +2360,43 @@ async fn account_on_standby(state: &State, cb: &Arc<dyn Callbacks>, asked: &str,
             }
         }
     }
+    if let Some(found) = empty {
+        return Ok(found);
+    }
+    if !dialed {
+        bail!("The standby public address was not dialed because its fingerprint is not saved yet.");
+    }
     bail!("{}", sign_in_step_failure("standby", &last_addr, &last_why));
 }
 
-/// `Some(None)` trusts a private LAN address once and remembers the certificate.
-/// A public address needs the saved standby fingerprint.
-fn standby_pin(state: &State, target: &str) -> Option<Option<pjdesk_proto::tls::Fingerprint>> {
-    if let Some(text) = state.standby_fingerprint.lock().unwrap().clone() {
-        if let Ok(fp) = pjdesk_proto::tls::parse_fingerprint(&text) {
-            return Some(Some(fp));
+/// The standby fingerprint from the primary covers every standby address,
+/// including the public one. A private address can be trusted once.
+fn standby_pin(
+    state: &State,
+    target: &str,
+    routes: &pjdesk_proto::routes::ServerRoutes,
+) -> Option<Option<pjdesk_proto::tls::Fingerprint>> {
+    let on_standby = routes.standby_lan.iter().chain(routes.standby_public.iter()).any(|addr| pjdesk_proto::routes::same_endpoint(addr, target))
+        || state.standby.lock().unwrap().split(',').any(|addr| pjdesk_proto::routes::same_endpoint(addr, target));
+    if on_standby {
+        if let Some(text) = state.standby_fingerprint.lock().unwrap().clone() {
+            if let Ok(fp) = pjdesk_proto::tls::parse_fingerprint(&text) {
+                return Some(Some(fp));
+            }
         }
     }
     let private = pjdesk_proto::routes::endpoint_v4(target).is_some_and(|ip| ip.is_private() || ip.is_loopback() || ip.is_link_local());
     if private { Some(None) } else { None }
+}
+
+fn copy_is_empty(msg: &ServerMsg) -> bool {
+    let ServerMsg::AccountResult { ok: false, message, .. } = msg else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    lower.contains("account copy is empty")
+        || lower.contains("does not have the account")
+        || lower.contains("server sign-in needed")
 }
 
 async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, msg: ClientMsg) -> Result<(ServerMsg, String)> {

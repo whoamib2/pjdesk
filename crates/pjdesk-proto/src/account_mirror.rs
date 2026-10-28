@@ -539,9 +539,16 @@ pub fn merge(cloud: &AccountCopy, local: &AccountCopy, pending: &[AccountChange]
     let mut next = cloud.clone();
     next.server_keys = local.server_keys.clone();
     next.login_fails = local.login_fails.clone();
-    if next.sign_pkcs8.is_empty() {
-        next.sign_pkcs8 = local.sign_pkcs8.clone();
-        next.sign_public = local.sign_public.clone();
+    // A non-empty cloud value is not a key unless it can sign. An unusable
+    // value must not replace a local key, and must not block creating one.
+    if !signing_key_usable(&next.sign_pkcs8) {
+        if signing_key_usable(&local.sign_pkcs8) {
+            next.sign_pkcs8 = local.sign_pkcs8.clone();
+            next.sign_public = local.sign_public.clone();
+        } else {
+            next.sign_pkcs8.clear();
+            next.sign_public.clear();
+        }
     }
     if next.cloud_public.is_empty() {
         next.cloud_public = local.cloud_public.clone();
@@ -650,10 +657,18 @@ pub fn vault_for<'a>(copy: &'a AccountCopy, account_id: &str) -> &'a str {
         .unwrap_or("")
 }
 
-/// Generates a per-network signing key when the cloud has not sent one.
-/// The service-wide key is never created here.
+/// True when `pkcs8_hex` is an Ed25519 PKCS#8 private key this server can sign with.
+pub fn signing_key_usable(pkcs8_hex: &str) -> bool {
+    let Ok(bytes) = hex::decode(pkcs8_hex.trim()) else {
+        return false;
+    };
+    ring::signature::Ed25519KeyPair::from_pkcs8(&bytes).is_ok()
+}
+
+/// Generates a per-network signing key when the copy does not have a usable one.
+/// A non-empty value that cannot sign is replaced. The service-wide key is never created here.
 pub fn ensure_sign_key(copy: &mut AccountCopy) {
-    if !copy.sign_pkcs8.is_empty() {
+    if signing_key_usable(&copy.sign_pkcs8) {
         return;
     }
     if let Some((pkcs8, public_key)) = generate_sign_key() {
@@ -778,6 +793,29 @@ mod tests {
         assert_eq!(merged.computers[0].name, "Server", "a newer saved-list edit is kept");
         assert!(!merged.sign_pkcs8.is_empty());
         assert!(merged.login_fails.len() == copy.login_fails.len());
+    }
+
+    #[test]
+    fn a_copy_with_a_bad_signing_key_can_still_sign_in() {
+        let mut copy = owner_copy();
+        assert!(signing_key_usable(&copy.sign_pkcs8));
+        copy.sign_pkcs8 = "not-a-pkcs8-key".into();
+        copy.sign_public = "ab".repeat(32);
+        assert!(!signing_key_usable(&copy.sign_pkcs8));
+        ensure_sign_key(&mut copy);
+        assert!(signing_key_usable(&copy.sign_pkcs8), "an unusable key is replaced");
+        let refresh = "cd".repeat(32);
+        let session = sign_in(&mut copy, "ben@spader.us", &"11".repeat(32), "phone", "Android", &refresh, 1_700_000_000)
+            .expect("sign-in");
+        assert!(session.access.contains('.'));
+        assert!(!session.access.to_ascii_lowercase().contains("pkcs8"));
+
+        let mut cloud = copy.clone();
+        cloud.sign_pkcs8 = "00".into();
+        cloud.sign_public.clear();
+        let kept = merge(&cloud, &copy, &[]);
+        assert_eq!(kept.sign_pkcs8, copy.sign_pkcs8);
+        assert!(signing_key_usable(&kept.sign_pkcs8));
     }
 
     #[test]

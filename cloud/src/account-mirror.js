@@ -139,7 +139,7 @@ export function applyChange(copy, change) {
     }
   } else if (op === "sign_key") {
     const pub = text(change.public_key, 128);
-    const pkcs8 = text(change.pkcs8, 400);
+    const pkcs8 = text(change.pkcs8, 4096);
     if (pub && pkcs8) {
       copy.sign_public = pub;
       copy.sign_pkcs8 = pkcs8;
@@ -260,14 +260,34 @@ async function rows(env, sql, ...binds) {
   return result.results || [];
 }
 
+function fromHex(hex) {
+  const text = String(hex || "").trim();
+  if (!/^[0-9a-fA-F]+$/.test(text) || text.length % 2 !== 0) return null;
+  const out = new Uint8Array(text.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(text.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+/** A stored value counts only when WebCrypto can sign with it. Placeholders do not. */
+export async function signingKeyUsable(pkcs8Hex) {
+  const bytes = fromHex(pkcs8Hex);
+  if (!bytes || bytes.length < 32) return false;
+  try {
+    await crypto.subtle.importKey("pkcs8", bytes, { name: "Ed25519" }, false, ["sign"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function ensureSignKey(env, networkId, mirror) {
-  if (mirror.sign_pkcs8) return mirror;
+  if (await signingKeyUsable(mirror.sign_pkcs8)) return mirror;
   const existing = await env.DB.prepare(
     "SELECT public_key, private_pkcs8 FROM network_sign_keys WHERE network_id = ?",
   )
     .bind(networkId)
     .first();
-  if (existing) {
+  if (existing && (await signingKeyUsable(existing.private_pkcs8))) {
     mirror.sign_public = existing.public_key;
     mirror.sign_pkcs8 = existing.private_pkcs8;
     return mirror;
@@ -277,7 +297,11 @@ async function ensureSignKey(env, networkId, mirror) {
   const pkcs8 = toHex(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
   const now = Math.floor(Date.now() / 1000);
   await env.DB.prepare(
-    "INSERT INTO network_sign_keys (network_id, public_key, private_pkcs8, created_at) VALUES (?, ?, ?, ?)",
+    `INSERT INTO network_sign_keys (network_id, public_key, private_pkcs8, created_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(network_id) DO UPDATE SET
+       public_key = excluded.public_key,
+       private_pkcs8 = excluded.private_pkcs8,
+       created_at = excluded.created_at`,
   )
     .bind(networkId, pub, pkcs8, now)
     .run();
@@ -457,7 +481,7 @@ async function persist(env, networkId, change) {
       .run();
   } else if (op === "sign_key") {
     const pub = text(change.public_key, 128);
-    const pkcs8 = text(change.pkcs8, 400);
+    const pkcs8 = text(change.pkcs8, 4096);
     if (!pub || !pkcs8) return;
     const now = Math.floor(Date.now() / 1000);
     await env.DB.prepare(

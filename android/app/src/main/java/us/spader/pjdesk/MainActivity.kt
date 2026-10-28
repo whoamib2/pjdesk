@@ -2911,6 +2911,21 @@ class MainActivity : FragmentActivity() {
         if (signed != null) return CloudAuth.sessionFromServer(email, device, signed)
         if (reply != null && us.spader.pjdesk.core.serverHasNoAccountCopy(message)) {
             signInNote(server, "standby", "primary account copy empty")
+            val learnedFp = reply.optString("standbyFingerprint")
+            if (learnedFp.isNotBlank()) {
+                app.store.accountStandbyFingerprint = learnedFp
+                val learnedStandby = reply.optString("standby").ifBlank { app.store.accountStandby }
+                if (learnedStandby.isNotBlank()) app.store.accountStandby = learnedStandby
+                app.engine.applyAccountServer(
+                    app.store.accountServer.ifBlank { server },
+                    app.store.accountFingerprint,
+                    quiet = true,
+                    standby = app.store.accountStandby,
+                    standbyLan = reply.optString("standbyLan"),
+                    standbyPublicIp = reply.optString("standbyPublicIp"),
+                    standbyFingerprint = learnedFp,
+                )
+            }
             val standbyReply = CloudGate.request(JSONObject(body.toString()).put("role", "standby"))
             val standbyServer = standbyReply?.optString("server").orEmpty().ifBlank { "standby" }
             val standbyMessage = standbyReply?.optString("message").orEmpty()
@@ -2918,7 +2933,7 @@ class MainActivity : FragmentActivity() {
             val standbyDetail = if (standbyReply == null) "ok=false message=timeout" else "ok=$standbyOk message=$standbyMessage"
             signInNote(standbyServer, "reply", standbyDetail)
             if (standbyReply?.optBoolean("ok") == true) return CloudAuth.sessionFromServer(email, device, standbyReply)
-            if (standbyReply != null && !us.spader.pjdesk.core.serverHasNoAccountCopy(standbyMessage)) {
+            if (standbyReply != null && !us.spader.pjdesk.core.standbyMissFallsThrough(standbyMessage)) {
                 reply = standbyReply
                 server = standbyServer
                 message = standbyMessage

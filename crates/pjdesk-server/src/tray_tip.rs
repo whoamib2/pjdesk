@@ -11,6 +11,8 @@ pub struct Tip<'a> {
     pub active: &'a str,
     pub available: &'a str,
     pub last_result: &'a str,
+    /// Set when pjdesk.com rejected this server's token.
+    pub notice: &'a str,
 }
 
 pub fn format(tip: &Tip<'_>) -> String {
@@ -39,6 +41,9 @@ pub fn format(tip: &Tip<'_>) -> String {
     } else if !tip.last_result.is_empty() {
         lines.push(format!("Updates: {}", tip.last_result));
     }
+    if !tip.notice.is_empty() {
+        lines.push(tip.notice.to_string());
+    }
     lines.join("\n")
 }
 
@@ -57,6 +62,7 @@ mod tests {
             active: "cabin",
             available: "0.4.1",
             last_result: "update available",
+            notice: "",
         });
         assert!(text.contains("Service: running"));
         assert!(text.contains("2 computers connected"));
@@ -72,7 +78,9 @@ mod tests {
             active: "",
             available: "",
             last_result: "up to date",
+            notice: "Server sign-in needed",
         });
+        assert!(one.contains("Server sign-in needed"));
         assert!(text.starts_with("PJDesk Server"));
         assert!(one.contains("1 computer connected"));
         assert!(one.contains("Service: not installed"));

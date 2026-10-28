@@ -10,7 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
 use pjdesk_proto::account_mirror::{
-    self, apply_change, ensure_sign_key, for_replica, generate_sign_key, has_verifier, merge, sign_in, vault_for,
+    self, apply_change, ensure_sign_key, for_replica, generate_sign_key, has_verifier, merge, sign_in,
+    signing_key_usable, vault_for,
     AccountChange,
     AccountCopy, AuthError, DeviceRow, SavedComputer, SealedRow,
 };
@@ -57,6 +58,7 @@ fn save(dir: &Path, copy: &AccountCopy) {
     if std::fs::write(&path, bytes).is_ok() {
         cloud::protect(&path);
     }
+    remember_standby_pin(dir, copy);
 }
 
 fn journal(dir: &Path) -> Vec<AccountChange> {
@@ -188,12 +190,13 @@ pub fn batch(dir: &Path, force: bool) -> bool {
             let _ = record_status(dir, 0, "HTTP 404: pjdesk.com has no account copy for this sign-in");
         }
         Err(Pull::Other(err)) => {
-            tracing::warn!("account mirror pull: {err}");
+            note_pull_failure(&err);
             let _ = record_status(dir, 0, &err);
         }
     }
     ensure_sign_key(&mut local);
     save(dir, &local);
+    let _ = install_sign_key(dir);
     if has_verifier(&local) {
         record_status(dir, now(), "");
     }
@@ -220,6 +223,7 @@ pub fn pull_now(dir: &Path) -> String {
             let mut local = merge(&fresh, &load(dir), &journal(dir));
             ensure_sign_key(&mut local);
             save(dir, &local);
+            let _ = install_sign_key(dir);
             let _ = crate::access::restore_grace(dir);
             record_status(dir, now(), "")
         }
@@ -228,10 +232,34 @@ pub fn pull_now(dir: &Path) -> String {
             record_status(dir, 0, "pjdesk.com is rate limited")
         }
         Err(Pull::Missing) => record_status(dir, 0, "HTTP 404: pjdesk.com has no account copy for this sign-in"),
-        Err(Pull::Other(err)) => record_status(dir, 0, &err),
+        Err(Pull::Other(err)) => {
+            note_pull_failure(&err);
+            record_status(dir, 0, &err)
+        }
     };
     tracing::info!("{line}");
     line
+}
+
+/// Startup and an empty copy. Pulls from pjdesk.com, then from the account standby
+/// when this server still has no password check.
+pub fn recover_if_empty(dir: &Path) -> String {
+    if has_owner_copy(dir) {
+        return status_line(dir);
+    }
+    let line = pull_now(dir);
+    if !has_owner_copy(dir) {
+        seed_from_peer(dir);
+    }
+    if has_owner_copy(dir) { status_line(dir) } else { line }
+}
+
+fn note_pull_failure(err: &str) {
+    if auth_rejected(err) {
+        tracing::info!("account mirror pull failed: {err}. Server sign-in needed");
+    } else {
+        tracing::info!("account mirror pull failed: {err}");
+    }
 }
 
 /// Shown when pjdesk.com rejected this server's token. A password sign-in replaces it.
@@ -241,7 +269,8 @@ pub const SERVER_SIGN_IN_NEEDED: &str = "Server sign-in needed";
 pub fn status_line(dir: &Path) -> String {
     let status = read_status(dir);
     if auth_rejected(&status.error) {
-        return SERVER_SIGN_IN_NEEDED.into();
+        let code = if status.error.to_ascii_lowercase().contains("http 403") { "403" } else { "401" };
+        return format!("{SERVER_SIGN_IN_NEEDED} (HTTP {code})");
     }
     if !status.error.is_empty() {
         format!("Account copy: error {}", one_line(&status.error))
@@ -531,6 +560,42 @@ pub fn open_before_registration(op: &str) -> bool {
 }
 
 /// Answers one client account request from the local copy.
+/// Replaces a missing or unusable signing key and queues it for pjdesk.com.
+/// The private key is not logged. Sign-in can use the new key before the cloud accepts it.
+fn install_sign_key(dir: &Path) -> std::result::Result<(), String> {
+    let mut copy = load(dir);
+    let before = copy.sign_pkcs8.clone();
+    let had = signing_key_usable(&before);
+    ensure_sign_key(&mut copy);
+    if !signing_key_usable(&copy.sign_pkcs8) {
+        save(dir, &copy);
+        tracing::info!("account signing key could not be created");
+        return Err("This server could not create a signing key for the account copy.".into());
+    }
+    if had && copy.sign_pkcs8 == before {
+        return Ok(());
+    }
+    let public_key = copy.sign_public.clone();
+    let pkcs8 = copy.sign_pkcs8.clone();
+    let queued = journal(dir).iter().any(|change| {
+        matches!(change, AccountChange::SignKey { public_key: have, .. } if have == &public_key)
+    });
+    tracing::info!("account signing key replaced unusable_before={had} queued={queued}");
+    if queued {
+        save(dir, &copy);
+        return Ok(());
+    }
+    remember(dir, AccountChange::SignKey { public_key, pkcs8 });
+    let dir_bg = dir.to_path_buf();
+    std::thread::Builder::new()
+        .name("account-sign-key".into())
+        .spawn(move || {
+            let _ = batch(&dir_bg, true);
+        })
+        .ok();
+    Ok(())
+}
+
 pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
     let started = std::time::Instant::now();
     let ClientMsg::Account {
@@ -570,9 +635,11 @@ pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
             }
         }
     }
-    let mut copy = load(dir);
-    ensure_sign_key(&mut copy);
-    save(dir, &copy);
+    if let Err(err) = install_sign_key(dir) {
+        let reply = name_account_failure(dir, fail(&op, &err));
+        log_sign_in(&op, &reply, started);
+        return reply;
+    }
     let reply = match op.as_str() {
         "sign-in" => answer_sign_in(dir, &email, &auth_key, &device_id, &device_name),
         "verify" => answer_verify(dir, &email, &auth_key),
@@ -698,15 +765,53 @@ fn unfinished_sign_keys(pending: &[AccountChange], fresh: &AccountCopy) -> Vec<A
         .collect()
 }
 
-/// Puts the answering server's name on a failed account reply.
+/// Puts the answering server's name on a failed account reply, and the standby
+/// fingerprint the primary already knows so a phone can dial that server.
 fn name_account_failure(dir: &Path, mut msg: ServerMsg) -> ServerMsg {
-    if let ServerMsg::AccountResult { ok: false, message, .. } = &mut msg {
+    if let ServerMsg::AccountResult {
+        ok: false,
+        message,
+        standby_address,
+        standby_fingerprint,
+        standby_lan,
+        standby_public_ip,
+        ..
+    } = &mut msg
+    {
         if !message.contains(" answered") {
             let who = crate::cloud::role_label(dir);
             *message = format!("{who} answered. {message}");
         }
+        let copy = load(dir);
+        if standby_address.is_empty() {
+            *standby_address = copy.network.standby_address.clone();
+        }
+        if standby_lan.is_empty() {
+            *standby_lan = copy.network.standby_lan.clone();
+        }
+        if standby_public_ip.is_empty() {
+            *standby_public_ip = copy.network.standby_public_ip.clone();
+        }
+        if standby_fingerprint.is_empty() {
+            let fp = copy.network.standby_fingerprint.trim();
+            *standby_fingerprint = if fp.is_empty() { saved_standby_pin(dir) } else { fp.to_string() };
+        }
     }
     msg
+}
+
+const STANDBY_FP_FILE: &str = "standby-fingerprint.txt";
+
+fn remember_standby_pin(dir: &Path, copy: &AccountCopy) {
+    let fp = copy.network.standby_fingerprint.trim();
+    if fp.is_empty() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(STANDBY_FP_FILE), fp);
+}
+
+fn saved_standby_pin(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join(STANDBY_FP_FILE)).unwrap_or_default().trim().to_string()
 }
 
 /// The server has no copy. Sign in to pjdesk.com with the client's auth key
@@ -749,6 +854,8 @@ fn proxy_login_seed(dir: &Path, email: &str, auth_key: &str) -> Result<(), Strin
             note_cloud_ok(dir);
             let mut local = merge(&fresh, &load(dir), &journal(dir));
             ensure_sign_key(&mut local);
+            save(dir, &local);
+            let _ = install_sign_key(dir);
             if !has_verifier(&local) {
                 let _ = record_status(dir, 0, "pjdesk.com sent an account copy with no password check");
                 return Err(format!(
@@ -1104,7 +1211,7 @@ fn fetch_peer_copy(dir: &Path, force: bool, budget: Duration) {
     if !force {
         write_stamp(&dir.join(REPLICA_FILE), at);
     }
-    let pin = peer_pin(dir);
+    let pin = peer_pin(dir).or_else(|| pjdesk_proto::tls::parse_fingerprint(&saved_standby_pin(dir)).ok());
     let proof = replica_proof(&key, at);
     let msg = ClientMsg::Account {
         op: "replica".into(),
@@ -1118,39 +1225,49 @@ fn fetch_peer_copy(dir: &Path, force: bool, budget: Duration) {
         app_lock: String::new(),
         computers: Vec::new(),
     };
+    tracing::info!("account copy seed targets={}", targets.len());
     for target in targets {
         let Some(addr) = crate::role_handoff::resolve_target(&target) else { continue };
         let private = pjdesk_proto::routes::endpoint_v4(&target).is_some_and(|ip| ip.is_private() || ip.is_loopback());
-        if pin.is_none() && !private {
-            continue;
+        let use_pin = pin.or_else(|| pjdesk_proto::tls::parse_fingerprint(&saved_standby_pin(dir)).ok());
+        let use_pin = if private { None } else { use_pin };
+        if use_pin.is_none() && !private {
+            tracing::info!("account copy seed dial {target} without a saved fingerprint");
         }
-        match crate::role_handoff::dial_observed(addr, pin, &msg, budget) {
+        tracing::info!("account copy seed dial {target}");
+        match crate::role_handoff::dial_observed(addr, use_pin, &msg, budget) {
             Ok((ServerMsg::Replica { body, .. }, observed)) => {
                 if let Some(fp) = observed {
                     let _ = std::fs::write(dir.join(PEER_FP_FILE), pjdesk_proto::tls::format_fingerprint(&fp));
                 }
                 if let Ok(fresh) = serde_json::from_slice::<AccountCopy>(&body) {
-                    store_peer_copy(dir, primary, &fresh);
+                    if store_peer_copy(dir, primary, &fresh) {
+                        return;
+                    }
+                    tracing::info!("account copy seed {target} had no password check");
                 }
-                return;
             }
-            Ok(_) => return,
-            Err(err) => tracing::debug!("account mirror from {target}: {err:#}"),
+            Ok(_) => tracing::info!("account copy seed {target} did not send a copy"),
+            Err(err) => tracing::info!("account copy seed {target} failed: {err:#}"),
         }
     }
 }
 
-fn store_peer_copy(dir: &Path, primary: bool, fresh: &AccountCopy) {
+fn store_peer_copy(dir: &Path, primary: bool, fresh: &AccountCopy) -> bool {
     let local = load(dir);
     if primary {
-        let Some(merged) = adopt_peer_copy(&local, fresh) else { return };
+        let Some(merged) = adopt_peer_copy(&local, fresh) else { return false };
         save(dir, &merged);
         let _ = record_status(dir, now(), "");
-        tracing::info!("account copy seeded from the standby");
-        return;
+        tracing::info!("account copy seeded from another server");
+        return true;
+    }
+    if !has_verifier(fresh) && !has_verifier(&local) {
+        return false;
     }
     save(dir, &merge(fresh, &local, &journal(dir)));
     tracing::info!("account copy mirrored from the primary");
+    true
 }
 
 fn standby_targets(dir: &Path) -> Vec<String> {
@@ -1167,7 +1284,8 @@ fn standby_targets(dir: &Path) -> Vec<String> {
     if !extra.is_empty() && !out.iter().any(|have| pjdesk_proto::failover::same_server(have, &extra)) {
         out.push(extra);
     }
-    out
+    let own = crate::public_addr::lan_endpoints(crate::public_addr::remembered_port(dir));
+    out.into_iter().filter(|addr| !own.iter().any(|mine| pjdesk_proto::failover::same_server(mine, addr))).collect()
 }
 
 fn peer_pin(dir: &Path) -> Option<pjdesk_proto::tls::Fingerprint> {
@@ -1368,9 +1486,9 @@ mod tests {
         std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":1700000000,"error":""}"#).unwrap();
         assert_eq!(status_line(&dir), "Account copy: synced 2023-11-14 22:13:20 UTC");
         std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":1700000000,"error":"HTTP 401 auth: Please sign in."}"#).unwrap();
-        assert_eq!(status_line(&dir), "Server sign-in needed");
+        assert_eq!(status_line(&dir), "Server sign-in needed (HTTP 401)");
         std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":1700000000,"error":"HTTP 403 auth: Please sign in."}"#).unwrap();
-        assert_eq!(status_line(&dir), "Server sign-in needed");
+        assert_eq!(status_line(&dir), "Server sign-in needed (HTTP 403)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1484,7 +1602,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":0,"error":"HTTP 401 auth: Please sign in."}"#).unwrap();
-        assert_eq!(status_line(&dir), SERVER_SIGN_IN_NEEDED);
+        assert_eq!(status_line(&dir), "Server sign-in needed (HTTP 401)");
         let msg = empty_copy_message(&dir);
         assert!(msg.contains("account copy is empty"), "{msg}");
         assert!(msg.contains("Server sign-in needed"), "{msg}");

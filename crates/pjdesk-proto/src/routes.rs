@@ -1219,4 +1219,20 @@ mod tests {
         let dropped = adopt_advertised(&quiet, &half);
         assert!(!dropped.standby_lan.iter().any(|addr| addr.starts_with("10.9.9.9")));
     }
+
+    #[test]
+    fn the_cabin_standby_is_not_replaced_by_a_stale_lan_address() {
+        let routes = ServerRoutes {
+            primary_lan: vec!["192.168.0.193:21200".into()],
+            standby_lan: vec!["10.0.0.20:21200".into(), "10.5.0.21:21200".into(), "192.168.192.1:21200".into()],
+            standby_public: vec!["68.234.75.68:21200".into()],
+            ..ServerRoutes::default()
+        };
+        let phone = [v4(192, 168, 0, 245)];
+        let order = standby_account_order(&routes, &phone, "68.234.75.68:21200");
+        assert!(order.iter().any(|addr| addr.starts_with("68.234.75.68")), "{order:?}");
+        assert!(order.iter().any(|addr| addr.starts_with("10.0.0.20")), "{order:?}");
+        assert!(!order.iter().any(|addr| addr.starts_with("192.168.0.169")), "{order:?}");
+        assert!(!order.iter().any(|addr| addr.starts_with("192.168.0.193")), "{order:?}");
+    }
 }
