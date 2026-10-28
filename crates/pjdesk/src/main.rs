@@ -227,6 +227,10 @@ pub struct HostArgs {
     /// without Allow. Direct connections still ask.
     #[arg(skip)]
     pub support_unattended: bool,
+    /// The permanent password came from the saved config, so the host re-reads
+    /// it from that file on every connection instead of keeping a startup copy.
+    #[arg(skip)]
+    pub permanent_from_config: bool,
 }
 
 impl Default for HostArgs {
@@ -248,6 +252,7 @@ impl Default for HostArgs {
             tunnel_ports: Vec::new(),
             service_host: false,
             support_unattended: false,
+            permanent_from_config: false,
         }
     }
 }
@@ -278,6 +283,7 @@ impl HostArgs {
     pub fn from_settings(settings: &config::Settings) -> Self {
         Self {
             permanent_password: settings.permanent_password(),
+            permanent_from_config: true,
             display: 0,
             fps: settings.fps,
             bitrate: settings.bitrate_kbps,

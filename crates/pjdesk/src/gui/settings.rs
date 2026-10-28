@@ -437,6 +437,26 @@ impl App {
             crate::network::copy_to_service(&self.cfg);
         }
 
+        // The service hosts this computer whenever it is installed, and it
+        // checks its own config, not this user's. A permanent password set
+        // here must reach it, or the phone's saved password is refused.
+        if let Some(change) = service_password_change(
+            old.permanent_password.is_some(),
+            self.cfg.settings.permanent_password(),
+            old.permanent_password() != self.cfg.settings.permanent_password(),
+            self.scm_known && self.scm_installed,
+        ) {
+            match change {
+                ServicePassword::Set(pw) => {
+                    crate::platform::run_elevated_with_password(&["service", "configure"], &pw);
+                }
+                ServicePassword::Clear => {
+                    crate::platform::run_elevated(&["service", "configure", "--clear-password"]);
+                }
+            }
+            self.toast.show("Approve the administrator prompt so the PJDesk service uses the new password");
+        }
+
         if server_changed && self.scm_known && self.scm_installed {
             if let Some(addr) = self.cfg.server.clone() {
                 crate::platform::run_elevated(&["service", "configure", "--server", &addr]);
@@ -471,6 +491,45 @@ fn header(ui: &mut egui::Ui, p: &theme::Paint, cancel: &mut bool) {
             });
         });
     });
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ServicePassword {
+    Set(String),
+    Clear,
+}
+
+/// What the installed service needs after Settings changed the permanent password.
+fn service_password_change(
+    had: bool,
+    now: Option<String>,
+    changed: bool,
+    service_installed: bool,
+) -> Option<ServicePassword> {
+    if !changed || !service_installed {
+        return None;
+    }
+    match now.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+        Some(pw) => Some(ServicePassword::Set(pw)),
+        None if had => Some(ServicePassword::Clear),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod service_password_tests {
+    use super::*;
+
+    #[test]
+    fn a_permanent_password_set_in_settings_reaches_the_installed_service() {
+        assert_eq!(
+            service_password_change(false, Some("correct horse".into()), true, true),
+            Some(ServicePassword::Set("correct horse".into()))
+        );
+        assert_eq!(service_password_change(true, None, true, true), Some(ServicePassword::Clear));
+        assert_eq!(service_password_change(true, Some("x".repeat(8)), false, true), None, "unchanged");
+        assert_eq!(service_password_change(false, Some("x".repeat(8)), true, false), None, "no service");
+    }
 }
 
 const SAVE_ON_ENTER: &str = "pjdesk-settings-save-on-enter";

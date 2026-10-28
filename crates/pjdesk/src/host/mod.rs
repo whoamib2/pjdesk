@@ -139,6 +139,16 @@ fn one_line(err: &anyhow::Error) -> String {
     }
 }
 
+/// The permanent password after reading the config. A stored value this
+/// process cannot open (another user's DPAPI blob) keeps the one in use.
+fn fresh_permanent(current: Option<String>, stored: bool, revealed: Option<String>) -> Option<String> {
+    match (stored, revealed.filter(|p| !p.trim().is_empty())) {
+        (_, Some(pw)) => Some(pw),
+        (false, None) => None,
+        (true, None) => current,
+    }
+}
+
 fn unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -410,9 +420,30 @@ impl HostState {
         }
     }
 
+    /// One source of truth: the permanent password in the saved config file.
+    /// A host started from settings re-reads it before each check, so a
+    /// password saved, synced, or migrated after startup is the one checked,
+    /// and the window never shows one password while the host checks another.
+    fn reload_permanent(&self) {
+        if !self.args.permanent_from_config {
+            return;
+        }
+        let Ok(cfg) = crate::config::Config::load() else { return };
+        let stored = cfg.settings.permanent_password.is_some();
+        let next = fresh_permanent(self.permanent.lock().unwrap().clone(), stored, cfg.settings.permanent_password());
+        let mut current = self.permanent.lock().unwrap();
+        if *current != next {
+            info!("host: the permanent password changed on disk; using the saved one");
+            *current = next;
+            drop(current);
+            self.publish_password();
+        }
+    }
+
     /// The passwords a controller may authenticate with: the one-time password,
     /// the permanent one when set, and the temporary support password.
     fn auth_passwords(&self) -> Vec<String> {
+        self.reload_permanent();
         let mut pws = vec![self.password.lock().unwrap().clone()];
         if let Some(p) = self.permanent.lock().unwrap().clone() {
             if !p.trim().is_empty() && !pws.contains(&p) {
@@ -496,6 +527,12 @@ impl HostState {
 
     /// Counts a wrong password. Returns the text to send the controller.
     fn note_wrong_password(&self, source: &str) -> String {
+        let permanent_set = self.permanent.lock().unwrap().as_deref().is_some_and(|p| !p.trim().is_empty());
+        warn!(
+            "wrong password from {source}; this host accepts the one-time password{}{}",
+            if permanent_set { " and its permanent password" } else { " only (no permanent password is set for this host)" },
+            if std::env::var_os("PJDESK_CONFIG").is_some() { " [service config]" } else { " [user config]" }
+        );
         let status = self.lockout.lock().unwrap().fail(source, Instant::now());
         let misses = self.otp_misses.fetch_add(1, Ordering::SeqCst) + 1;
         if misses % 3 == 0 {
@@ -1930,5 +1967,17 @@ async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) 
     match consent_grant(&state.policy.lock().unwrap(), reply) {
         Some(answer) => Person::Yes(answer.0, answer.1),
         None => Person::No,
+    }
+}
+
+#[cfg(test)]
+mod permanent_tests {
+    #[test]
+    fn the_host_checks_the_saved_permanent_password_not_a_startup_copy() {
+        let old = Some("old-password".to_string());
+        assert_eq!(super::fresh_permanent(old.clone(), true, Some("new-password".into())).as_deref(), Some("new-password"));
+        assert_eq!(super::fresh_permanent(old.clone(), false, None), None, "removed in settings");
+        assert_eq!(super::fresh_permanent(old.clone(), true, None), old, "unreadable blob keeps the current one");
+        assert_eq!(super::fresh_permanent(None, true, Some("  ".into())), None);
     }
 }

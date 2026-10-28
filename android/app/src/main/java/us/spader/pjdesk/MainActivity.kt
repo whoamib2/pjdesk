@@ -90,6 +90,8 @@ import us.spader.pjdesk.core.VaultKeyRejected
 import us.spader.pjdesk.core.connectFailureText
 import us.spader.pjdesk.core.connectStatusLabel
 import us.spader.pjdesk.core.shouldRetryNotOnline
+import us.spader.pjdesk.ui.ConnectPasswordDialog
+import us.spader.pjdesk.ui.connectPasswordMessage
 import us.spader.pjdesk.ui.ReauthScreen
 import us.spader.pjdesk.ui.SecretField
 import us.spader.pjdesk.ui.submitKeyboard
@@ -2772,58 +2774,36 @@ class MainActivity : FragmentActivity() {
                                     launchConnect(id, connectComputerName(saved, id), typed)
                                 }
 }
-                    AlertDialog(
-                        onDismissRequest = {
-                            if (state.askPassword) engine.cancelPassword()
-                            promptBeforeConnect = false
+                    val cancelAsked: () -> Unit = {
+                        if (state.askPassword) engine.cancelPassword()
+                        promptBeforeConnect = false
+                        askedPassword = ""
+                        connecting = false
+                        if (state.status.startsWith("Connecting")) engine.showStatus("Ready")
+                    }
+                    ConnectPasswordDialog(
+                        computerName = titleName,
+                        message = connectPasswordMessage(
+                            state.askNote,
+                            state.askRejected,
+                            app.store.computerPassword(connectId.filter { it.isDigit() }).isNotBlank(),
+                        ),
+                        password = askedPassword,
+                        onPasswordChange = { askedPassword = it },
+                        remember = savePassword,
+                        onRememberChange = { savePassword = it },
+                        onConnect = submitAsked,
+                        onCancel = cancelAsked,
+                        onAsk = {
+                            val id = connectId.filter { it.isDigit() }
                             askedPassword = ""
-                            connecting = false
-                            if (state.status.startsWith("Connecting")) engine.showStatus("Ready")
-                        },
-                        title = { Text("Password for $titleName") },
-                        text = {
-                            Column {
-                                if (state.askNote.isNotBlank()) {
-                                    Text(state.askNote)
-                                } else if (state.askRejected) {
-                                    Text("Incorrect password. Enter the current one for this computer.")
-                                }
-                                SecretField(
-                                    value = askedPassword,
-                                    onValueChange = { askedPassword = it },
-                                    label = "Computer password",
-                                    onSubmit = submitAsked,
-                                )
-                                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                                    Checkbox(checked = savePassword, onCheckedChange = { savePassword = it })
-                                    Text("Save password for this computer")
-                                }
+                            if (state.askPassword) {
+                                engine.askPerson()
+                            } else {
+                                launchConnect(id, connectComputerName(saved, id), "", askPerson = true)
                             }
-                        },
-                        confirmButton = {
-                            TextButton(onClick = { submitAsked() }) { Text("Connect") }
-                        },
-                        dismissButton = {
-                            Row {
-                                TextButton(onClick = {
-                                    val id = connectId.filter { it.isDigit() }
-                                    askedPassword = ""
-                                    if (state.askPassword) {
-                                        engine.askPerson()
-                                    } else {
-                                        launchConnect(id, connectComputerName(saved, id), "", askPerson = true)
-                                    }
-                                    askWaiting = true
-                                    promptBeforeConnect = false
-                                }) { Text("Ask to connect instead") }
-                                TextButton(onClick = {
-                                    if (state.askPassword) engine.cancelPassword()
-                                    promptBeforeConnect = false
-                                    askedPassword = ""
-                                    connecting = false
-                                    if (state.status.startsWith("Connecting")) engine.showStatus("Ready")
-                                }) { Text("Cancel") }
-                            }
+                            askWaiting = true
+                            promptBeforeConnect = false
                         },
                     )
                 }

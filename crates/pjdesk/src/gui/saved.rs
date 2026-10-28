@@ -1214,6 +1214,8 @@ impl App {
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
+            .default_width(340.0)
+            .max_width(360.0)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 let id_line = if let Some(addr) = &direct_addr {
@@ -1225,49 +1227,29 @@ impl App {
                 } else {
                     format_id(&self.prompt_id)
                 };
-                ui.label(RichText::new(id_line).monospace().color(theme::paint(ui).muted));
-                if self.prompt_rejected {
-                    ui.add_space(4.0);
-                    let line = if self.status.starts_with("Incorrect password") {
-                        self.status.clone()
-                    } else {
-                        format!("Incorrect password for {}.", format_id(&self.prompt_id))
-                    };
-                    ui.label(RichText::new(line).color(theme::paint(ui).warn));
-                }
-                if self.prompt_checking {
-                    ui.add_space(4.0);
-                    ui.label("Checking the password…");
-                }
+                let message = connect_prompt_message(self.prompt_rejected, self.prompt_checking, &self.status);
+                let paint = theme::paint(ui);
+                let color = if self.prompt_rejected { paint.warn } else { paint.muted };
+                ui.label(RichText::new(id_line).monospace().size(12.0).color(paint.muted));
+                ui.label(RichText::new(message).size(12.5).color(color));
                 ui.add_space(8.0);
-                let label = format!("Password for {name}");
-                widgets::field_label(ui, &label);
-                let resp = widgets::password_field(ui, &mut self.prompt_password, "Computer password", &mut self.prompt_show);
+                let resp = widgets::password_field(ui, &mut self.prompt_password, "Password", &mut self.prompt_show);
                 ui.add_space(4.0);
-                widgets::checkbox(ui, &mut self.prompt_remember, "Save password for this computer");
-                if direct_addr.is_some() {
-                    ui.label(widgets::muted(
-                        ui,
-                        "That computer's permanent password, or a one-time support code. No PJDesk account is required. The connection stays on this network, and discovery never includes the password.",
-                    ));
-                } else {
-                    ui.label(widgets::muted(
-                        ui,
-                        "The password on this computer, not your PJDesk account. Saved on this computer only, and not uploaded.",
-                    ));
-                }
+                widgets::checkbox(ui, &mut self.prompt_remember, "Remember");
                 ui.add_space(8.0);
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        close = true;
-                    }
-                    if !self.prompt_checking && !named_peer && ui.button("Ask to connect instead").clicked() {
+                    if !self.prompt_checking && !named_peer && ui.link(RichText::new("Ask to connect instead").size(12.0)).clicked() {
                         ask_person = true;
                     }
-                    if !self.prompt_checking && (widgets::accent_button(ui, "Connect", Vec2::new(120.0, 36.0)) || enter) {
-                        go = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !self.prompt_checking && (widgets::accent_button(ui, "Connect", Vec2::new(96.0, 32.0)) || enter) {
+                            go = true;
+                        }
+                        if ui.add(egui::Button::new("Cancel").frame(false)).clicked() {
+                            close = true;
+                        }
+                    });
                 });
             });
         if close {
@@ -2181,5 +2163,28 @@ mod tests {
             direct: direct.map(str::to_string),
             app_version: String::new(),
         }
+    }
+}
+
+/// The one line under the computer's ID in the password prompt.
+fn connect_prompt_message(rejected: bool, checking: bool, status: &str) -> String {
+    if checking {
+        "Checking the password…".into()
+    } else if rejected && status.starts_with("Saved password") {
+        status.lines().next().unwrap_or_default().to_string()
+    } else if rejected {
+        "That password didn't work. Enter it again.".into()
+    } else {
+        "Enter the password set on that computer.".into()
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    #[test]
+    fn the_password_prompt_has_one_short_line() {
+        assert_eq!(super::connect_prompt_message(false, true, ""), "Checking the password…");
+        assert_eq!(super::connect_prompt_message(true, false, "Incorrect password"), "That password didn't work. Enter it again.");
+        assert_eq!(super::connect_prompt_message(false, false, ""), "Enter the password set on that computer.");
     }
 }
