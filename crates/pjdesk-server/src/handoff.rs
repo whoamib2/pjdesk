@@ -194,12 +194,15 @@ mod tests {
     fn installers_restart_after_the_file_swap_and_keep_server_data() {
         let server = include_str!("../../../installer/pjdesk-server.nsi");
         let client = include_str!("../../../installer/pjdesk-client.nsi");
+        let swap = include_str!("../../../installer/replace.nsh");
         for (name, src) in [("server", server), ("client", client)] {
-            let kill = src.find("taskkill").unwrap_or_else(|| panic!("{name} never stops the old process"));
+            let replace = src.find("SwapLockedExe").unwrap_or_else(|| panic!("{name} never swaps the locked exe"));
             let handoff = src.rfind("update-handoff").unwrap_or_else(|| panic!("{name} never restarts"));
-            assert!(kill < handoff, "{name} kills the process after the restart");
+            assert!(replace < handoff, "{name} restarts before the file is replaced");
             assert!(src.contains("net start"), "{name} has no service start fallback");
-            for line in src.lines() {
+            assert!(src.contains("AllowSkipFiles off"), "{name} can skip a locked file in a silent install");
+            assert!(src.contains("un.PjStopImage"), "{name} uninstall does not wait for the process");
+            for line in src.lines().chain(swap.lines()) {
                 let lower = line.to_ascii_lowercase();
                 let deletes = lower.contains("rmdir") || lower.trim_start().to_ascii_lowercase().starts_with("delete ");
                 if deletes {
@@ -210,10 +213,21 @@ mod tests {
                 }
             }
         }
+        assert!(swap.contains("taskkill"), "the swap never ends the running program");
+        assert!(swap.contains("fc /b"), "the swap does not compare the installed file");
+        assert!(swap.contains(">nul"), "fc output has to go to the NUL device");
+        assert!(!swap.contains("> $null"), "a cmd redirect to $null creates a file with that name");
+        assert!(!swap.contains("> $$null"), "a cmd redirect to $null creates a file with that name");
+        let fail = swap.find("did not replace").unwrap_or_else(|| panic!("a failed swap must say so"));
+        let abort_at = swap[fail..].find("Abort ").map(|at| fail + at).unwrap_or_else(|| panic!("a failed swap must abort"));
+        let failed = &swap[fail..abort_at];
+        assert!(failed.contains("net start"), "a failed swap must start the service before it exits");
+        assert!(failed.contains("SetErrorLevel 1"), "a failed swap must exit non-zero");
         assert!(
             !server.contains("Exec '\"$INSTDIR\\${EXE}\" --tray'"),
             "the installer must not start the tray as itself"
         );
         assert!(!client.to_ascii_lowercase().contains("appdata"), "the client installer touches the saved sign-in");
+        assert!(!swap.to_ascii_lowercase().contains("appdata"), "the swap touches the saved sign-in");
     }
 }

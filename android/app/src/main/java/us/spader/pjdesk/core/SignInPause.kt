@@ -35,6 +35,37 @@ fun signInLogLine(address: String, step: String, detail: String): String {
     return if (extra.isEmpty()) "sign-in address=$where step=$step" else "sign-in address=$where step=$step $extra"
 }
 
+/**
+ * The last sign-in steps. The Sign in button records the first line before any
+ * network call. Copy diagnostics sends this text. The password is not stored.
+ */
+open class SignInTrace(private val limit: Int = 50) {
+    private val lines = ArrayDeque<String>()
+
+    fun note(line: String) {
+        val text = line.trim()
+        if (text.isEmpty()) return
+        synchronized(lines) {
+            lines.addLast(text)
+            while (lines.size > limit) lines.removeFirst()
+        }
+    }
+
+    fun snapshot(): List<String> = synchronized(lines) { lines.toList() }
+
+    fun copyText(): String = snapshot().joinToString("\n")
+}
+
+/** The trace the sign-in screen and the account request share. */
+object SignInSteps : SignInTrace()
+
+/** The Sign in button's first action. Returns the line it recorded. */
+fun signInScreenPressed(trace: SignInTrace, heartbeat: String, op: String): String {
+    val line = signInLogLine(heartbeat, "screen", "op=$op")
+    trace.note(line)
+    return line
+}
+
 /** Names the server that answered, unless the sentence already does. */
 fun namedServerSignInFailure(server: String, message: String): String {
     val detail = message.trim().ifBlank { "did not accept the sign-in" }
@@ -66,14 +97,31 @@ fun signInPageError(message: String, pauseSecs: Long = 0): String {
     }
     if (text.isEmpty()) return "The sign-in did not finish."
     if (
-        lower.contains("could not reach") ||
-        lower.contains("timed out connecting") ||
-        lower.contains("connection refused") ||
-        lower.contains("network is unreachable")
+        !lower.contains("answered") &&
+        !lower.contains("is connected") &&
+        (
+            lower.contains("could not reach") ||
+            lower.contains("timed out connecting") ||
+            lower.contains("connection refused") ||
+            lower.contains("network is unreachable")
+        )
     ) {
         return "Could not reach the PJDesk server."
     }
     return text
+}
+
+/**
+ * The sentence on the Sign in screen. A heartbeat means this phone already
+ * reached that server, so a failed dial is not "could not reach".
+ */
+fun signInShownError(message: String, pauseSecs: Long = 0, heartbeat: String = ""): String {
+    val page = signInPageError(message, pauseSecs)
+    val where = heartbeat.trim()
+    if (where.isNotEmpty() && page == "Could not reach the PJDesk server.") {
+        return "The PJDesk server at $where is connected. The sign-in did not get an answer on that connection."
+    }
+    return page
 }
 
 /** The sentence on the Sign in screen. Minutes are the remaining time, rounded up. */

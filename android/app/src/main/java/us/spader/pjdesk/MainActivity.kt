@@ -670,7 +670,7 @@ class MainActivity : FragmentActivity() {
                             state.fingerprint,
                         )
                         netLogin = if (netOffer) cloud?.loginToken.orEmpty() else ""
-                        if (!noteSignInPause(err)) netError = us.spader.pjdesk.core.signInPageError(err.message ?: "Could not sign in.")
+                        if (!noteSignInPause(err)) netError = showSignInError(err.message ?: "Could not sign in.")
                     }
                 }
             }
@@ -2019,6 +2019,14 @@ class MainActivity : FragmentActivity() {
                         } else {
                             null
                         },
+                        serverAddress = state.server.ifBlank { app.store.accountServer },
+                        signInTrace = us.spader.pjdesk.core.SignInSteps,
+                        onSignInTrace = { AppLog.i(it) },
+                        onCopyDiagnostics = {
+                            val text = us.spader.pjdesk.core.SignInSteps.copyText().ifBlank { "No sign-in steps were recorded." }
+                            copy(text)
+                            scope.launch { snackbar.showSnackbar("Copied the last sign-in steps") }
+                        },
                         onEnrollOnly = {
                             val device = app.store.networkDeviceId.ifBlank {
                                 UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
@@ -2035,7 +2043,7 @@ class MainActivity : FragmentActivity() {
                                     applySignedIn(session, email, null, false, true)
                                 }.onFailure { err ->
                                     netBusy = false
-                                    if (!noteSignInPause(err)) netError = us.spader.pjdesk.core.signInPageError(err.message ?: "Could not sign in.")
+                                    if (!noteSignInPause(err)) netError = showSignInError(err.message ?: "Could not sign in.")
                                 }
                             }
                         },
@@ -2058,7 +2066,7 @@ class MainActivity : FragmentActivity() {
                                     applySignedIn(session, netEmail, null, signOutWhenDone, false, accountPassword = netPass)
                                 }.onFailure {
                                     netBusy = false
-                                    netError = us.spader.pjdesk.core.signInPageError(it.message ?: "Could not sign in.")
+                                    netError = showSignInError(it.message ?: "Could not sign in.")
                                 }
                             }
                         },
@@ -2117,7 +2125,7 @@ class MainActivity : FragmentActivity() {
                                         state.fingerprint,
                                     )
                                     netLogin = if (netOffer) cloud?.loginToken.orEmpty() else ""
-                                    if (!noteSignInPause(err)) netError = us.spader.pjdesk.core.signInPageError(err.message ?: "Could not sign in.")
+                                    if (!noteSignInPause(err)) netError = showSignInError(err.message ?: "Could not sign in.")
                                 }
                             }
                         },
@@ -2851,8 +2859,22 @@ class MainActivity : FragmentActivity() {
         super.onDestroy()
     }
 
+    private fun signInHeartbeat(): String =
+        app.engine.state.value.server.ifBlank { app.store.accountServer }
+
+    private fun signInNote(address: String, step: String, detail: String) {
+        val line = us.spader.pjdesk.core.signInLogLine(address, step, detail)
+        us.spader.pjdesk.core.SignInSteps.note(line)
+        AppLog.i(line)
+    }
+
+    private fun showSignInError(message: String, pauseSecs: Long = 0): String =
+        us.spader.pjdesk.core.signInShownError(message, pauseSecs, signInHeartbeat())
+
     private fun signInAccount(email: String, password: String, device: String): us.spader.pjdesk.core.Session {
-        val known = app.engine.state.value.server.ifBlank { app.store.accountServer }
+        val known = signInHeartbeat()
+        // Before the password derivation, so a failure there still has a step line.
+        signInNote(known, "account", "op=sign-in")
         if (known.isNotBlank() && app.engine.state.value.server.isBlank()) {
             app.engine.applyAccountServer(known, app.store.accountFingerprint, quiet = true)
         }
@@ -2865,7 +2887,7 @@ class MainActivity : FragmentActivity() {
         val tried = ArrayList<String>()
         for (target in targets) {
             if (target.isNotBlank() && tried.any { sameServer(it, target) }) continue
-            AppLog.i(us.spader.pjdesk.core.signInLogLine(target, "request", "op=sign-in"))
+            signInNote(target, "request", "op=sign-in")
             val body = JSONObject()
                 .put("op", "sign-in")
                 .put("email", email.trim().lowercase())
@@ -2877,16 +2899,19 @@ class MainActivity : FragmentActivity() {
             val server = reply?.optString("server").orEmpty().ifBlank { target.ifBlank { known } }
             val message = reply?.optString("message").orEmpty()
             val ok = reply?.optBoolean("ok") == true
-            AppLog.i(us.spader.pjdesk.core.signInLogLine(server, "reply", "ok=$ok message=$message"))
+            val replyDetail = if (reply == null) "ok=false message=timeout" else "ok=$ok message=$message"
+            signInNote(server, "reply", replyDetail)
             if (reply == null) continue
             if (ok) return CloudAuth.sessionFromServer(email, device, reply)
             if (server.isNotBlank()) tried.add(server)
             if (!us.spader.pjdesk.core.serverHasNoAccountCopy(message)) {
                 val pause = reply.optLong("pause")
-                val mapped = us.spader.pjdesk.core.namedServerSignInFailure(
-                    server,
-                    us.spader.pjdesk.core.signInPageError(message, pause),
-                )
+                val shown = showSignInError(message, pause)
+                val mapped = if (shown.contains("is connected") || shown.contains(" answered")) {
+                    shown
+                } else {
+                    us.spader.pjdesk.core.namedServerSignInFailure(server, shown)
+                }
                 val secs = us.spader.pjdesk.core.signInPauseSeconds(
                     if (pause > 0L) 429 else 0,
                     message.ifBlank { mapped },
@@ -2896,7 +2921,7 @@ class MainActivity : FragmentActivity() {
             }
         }
         val who = tried.joinToString(", ").ifBlank { known.ifBlank { "the PJDesk server" } }
-        AppLog.i(us.spader.pjdesk.core.signInLogLine("pjdesk.com", "cloud", "after=$who"))
+        signInNote("pjdesk.com", "cloud", "after=$who")
         return try {
             CloudAuth.signIn(email, password, device, "Android", forceCloud = true)
         } catch (err: CloudAuthException) {

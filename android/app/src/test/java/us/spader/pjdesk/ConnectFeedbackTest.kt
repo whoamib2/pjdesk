@@ -13,8 +13,11 @@ import us.spader.pjdesk.core.sessionAfterRefreshFailure
 import us.spader.pjdesk.core.shouldRetryNotOnline
 import us.spader.pjdesk.core.namedServerSignInFailure
 import us.spader.pjdesk.core.serverHasNoAccountCopy
+import us.spader.pjdesk.core.SignInTrace
 import us.spader.pjdesk.core.signInLogLine
 import us.spader.pjdesk.core.signInPageError
+import us.spader.pjdesk.core.signInScreenPressed
+import us.spader.pjdesk.core.signInShownError
 
 class ConnectFeedbackTest {
     @Test
@@ -138,6 +141,24 @@ class ConnectFeedbackTest {
             signInLogLine("192.168.0.193:21200", "reply", "ok=false message=no copy"),
         )
         assertFalse(signInLogLine("192.168.0.193:21200", "request", "op=sign-in").contains("auth_key"))
+        assertEquals(
+            "The PJDesk server at 192.168.0.193:21200 is connected. The sign-in did not get an answer on that connection.",
+            signInShownError("Could not reach the PJDesk server.", heartbeat = "192.168.0.193:21200"),
+        )
+        assertEquals(
+            "The PJDesk server at 192.168.0.193:21200 is connected. The sign-in did not get an answer on that connection.",
+            signInShownError("Could not reach the PJDesk server at 192.168.0.193:21200.", heartbeat = "192.168.0.193:21200"),
+        )
+        assertEquals("Could not reach the PJDesk server.", signInShownError("connection refused"))
+        val trace = SignInTrace()
+        val pressed = signInScreenPressed(trace, "192.168.0.193:21200", "sign-in")
+        assertTrue(pressed.contains("step=screen"))
+        assertTrue(trace.copyText().contains("step=screen"))
+        assertFalse(trace.copyText().contains("secret-password"))
+        repeat(60) { trace.note(signInLogLine("192.168.0.193:21200", "request", "n=$it")) }
+        assertEquals(50, trace.snapshot().size)
+        assertTrue(trace.copyText().contains("n=59"))
+        assertFalse(trace.snapshot().any { it.endsWith("n=0") })
         assertEquals(
             "This server is too old to accept a sign-in while Require signed-in accounts is on. Update the server.",
             signInPageError("Sign in required."),
