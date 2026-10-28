@@ -2117,8 +2117,14 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
         if !promote_now && !forced && ticks % PASS_EVERY != 1 {
             continue;
         }
-        // The standby mirrors the account from the primary. It does not poll pjdesk.com.
+        // The standby does not upload. It still downloads the account copy so a
+        // phone can sign in against either server.
         if !crate::cloud::accepts_host_registrations(&data_dir) && !forced {
+            let dir = data_dir.clone();
+            match tokio::task::spawn_blocking(move || crate::account_mirror::pull_now(&dir)).await {
+                Ok(line) => info!("standby account copy: {line}"),
+                Err(err) => warn!("standby account copy: {err}"),
+            }
             continue;
         }
         // An empty table after a restart is not a demotion. Treating it as

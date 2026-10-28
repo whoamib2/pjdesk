@@ -173,8 +173,15 @@ object CloudAuth {
         return mac.doFinal(data.toByteArray())
     }
 
-    fun signIn(email: String, password: String, deviceId: String, deviceName: String): Session {
-        if (CloudGate.serverUp) throw CloudAuthException("The PJDesk server has this account.")
+    fun signIn(email: String, password: String, deviceId: String, deviceName: String): Session =
+        signIn(email, password, deviceId, deviceName, forceCloud = false)
+
+    /**
+     * Asks pjdesk.com even when a local server is up. Used when that server
+     * answered and still has no account copy. Backoff still applies.
+     */
+    fun signIn(email: String, password: String, deviceId: String, deviceName: String, forceCloud: Boolean): Session {
+        if (CloudGate.serverUp && !forceCloud) throw CloudAuthException("The PJDesk server has this account.")
         if (!CloudGate.allowCloud()) throw CloudAuthException("Waiting before asking pjdesk.com again.")
         val auth = authKeyHex(email, password)
         val login = try {

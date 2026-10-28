@@ -1202,6 +1202,12 @@ fn effective_role(st: &SyncState, mine: &str, heuristic: Role) -> Role {
 /// restart the live table is empty, and an older sync wrote that file from
 /// the empty table. The server that owns the cloud copy, and a server with
 /// no owner recorded yet, still accepts hosts so the table can fill again.
+/// "The primary BENLENOVODESK" or "The standby CHIP20", for a sentence a person reads.
+pub fn role_label(data_dir: &Path) -> String {
+    let role = if accepts_host_registrations(data_dir) { "primary" } else { "standby" };
+    format!("The {role} {}", computer_name())
+}
+
 pub fn accepts_host_registrations(data_dir: &Path) -> bool {
     if CloudConfig::load(data_dir).is_none() {
         return true;
