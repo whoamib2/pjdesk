@@ -294,6 +294,34 @@ pub fn host_endpoint(socket: UdpSocket, identity: &TlsIdentity) -> Result<quinn:
     make_endpoint(Some(server), socket)
 }
 
+/// QUIC endpoint on any socket, such as [`crate::tcp_relay::TcpTunnelSocket`].
+fn endpoint_on(server: Option<quinn::ServerConfig>, socket: Arc<dyn quinn::AsyncUdpSocket>) -> Result<quinn::Endpoint> {
+    quinn::Endpoint::new_with_abstract_socket(endpoint_config(), server, socket, Arc::new(quinn::TokioRuntime))
+        .context("starting QUIC on the server connection")
+}
+
+/// Host endpoint whose packets travel over the server connection.
+pub fn host_endpoint_on(socket: Arc<dyn quinn::AsyncUdpSocket>, identity: &TlsIdentity) -> Result<quinn::Endpoint> {
+    let crypto = QuicServerConfig::try_from(tls::server_config(identity, ALPN_PEER)?)?;
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    server.transport_config(transport_config());
+    endpoint_on(Some(server), socket)
+}
+
+/// Controller endpoint whose packets travel over the server connection.
+pub fn controller_endpoint_on(
+    socket: Arc<dyn quinn::AsyncUdpSocket>,
+    host_fingerprint: Option<Fingerprint>,
+) -> Result<(quinn::Endpoint, Arc<PinnedCertVerifier>)> {
+    let verifier = PinnedCertVerifier::new(host_fingerprint);
+    let tls_config = tls::client_config(verifier.clone(), ALPN_PEER)?;
+    let mut client = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config)?));
+    client.transport_config(transport_config());
+    let mut endpoint = endpoint_on(None, socket)?;
+    endpoint.set_default_client_config(client);
+    Ok((endpoint, verifier))
+}
+
 /// QUIC endpoint for the controller, pinned to the host's certificate.
 pub fn controller_endpoint(socket: UdpSocket, host_fingerprint: Fingerprint) -> Result<quinn::Endpoint> {
     Ok(controller_endpoint_pin(socket, Some(host_fingerprint))?.0)

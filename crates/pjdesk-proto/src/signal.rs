@@ -233,6 +233,26 @@ pub enum ClientMsg {
         on: bool,
         password: String,
     },
+    /// 0.6.67+. UDP to the server's relay did not work for this side of the
+    /// session. Relay this side's QUIC packets over this TLS connection.
+    /// Sent only to a server whose [`ServerMsg::ServerVersion`] is 0.6.67 or
+    /// newer, or whose version is unknown (an older server closes the
+    /// connection, which ends the session the same way the timeout would).
+    RelayOverTcp { session_id: SessionId },
+    /// 0.6.67+. One QUIC datagram for the other side of the session.
+    RelayData {
+        session_id: SessionId,
+        data: Vec<u8>,
+    },
+}
+
+/// The first server version that relays a session over the TLS connection.
+pub const TCP_RELAY_MIN_VERSION: &str = "0.6.67";
+
+/// Whether to ask this server for the TCP relay. An unknown version (an
+/// older client never stored one) is tried: the session is failing anyway.
+pub fn server_relays_over_tcp(server_version: &str) -> bool {
+    server_version.trim().is_empty() || crate::update::version_at_least(server_version, TCP_RELAY_MIN_VERSION)
 }
 
 /// Shown when this computer is not allowed to start a session.
@@ -565,6 +585,15 @@ pub enum ServerMsg {
     /// client can name the server that refused it. Sent only to a client whose
     /// Register app_version can decode it. Older clients are not sent this variant.
     ServerVersion { version: String },
+    /// 0.6.67+. Answer to [`ClientMsg::RelayOverTcp`]. Sent only to a client
+    /// that asked, so older clients never see it.
+    TcpRelayReady { session_id: SessionId },
+    /// 0.6.67+. One QUIC datagram from the other side of the session. Sent
+    /// only to a client that asked for [`ClientMsg::RelayOverTcp`].
+    RelayData {
+        session_id: SessionId,
+        data: Vec<u8>,
+    },
 }
 
 /// One computer the primary can see, for the Saved list.
@@ -999,6 +1028,21 @@ mod tests {
         assert_eq!(only[0], release[0] + 1, "IncomingOnly is appended after Release");
         let version = postcard::to_stdvec(&ServerMsg::ServerVersion { version: "0.6.52".into() }).unwrap();
         assert_eq!(version[0], only[0] + 1, "ServerVersion is appended after IncomingOnly");
+        let sid = SessionId::default();
+        let over = postcard::to_stdvec(&ClientMsg::RelayOverTcp { session_id: sid }).unwrap();
+        assert_eq!(over[0], set[0] + 1, "RelayOverTcp is appended after SetIncomingOnly");
+        let cdata = postcard::to_stdvec(&ClientMsg::RelayData { session_id: sid, data: vec![1, 2] }).unwrap();
+        assert_eq!(cdata[0], over[0] + 1, "client RelayData is appended after RelayOverTcp");
+        let ready = postcard::to_stdvec(&ServerMsg::TcpRelayReady { session_id: sid }).unwrap();
+        assert_eq!(ready[0], version[0] + 1, "TcpRelayReady is appended after ServerVersion");
+        let sdata = postcard::to_stdvec(&ServerMsg::RelayData { session_id: sid, data: vec![3] }).unwrap();
+        assert_eq!(sdata[0], ready[0] + 1, "server RelayData is appended after TcpRelayReady");
+        let back: ServerMsg = postcard::from_bytes(&sdata).unwrap();
+        assert!(matches!(back, ServerMsg::RelayData { data, .. } if data == vec![3]));
+        assert!(server_relays_over_tcp(""));
+        assert!(server_relays_over_tcp("0.6.67"));
+        assert!(server_relays_over_tcp("0.7.0"));
+        assert!(!server_relays_over_tcp("0.6.66"));
         let named = sign_in_required_notice("192.168.0.193:21200", "0.6.48");
         assert_eq!(
             named,

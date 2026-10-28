@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.67
+- New: TCP relay fallback. When a computer or phone cannot register its UDP socket with the server's relay (UDP 21200 blocked, or the bind never finishes), it now relays the session's QUIC packets over the TLS connection it already has to the server (TCP 21200) automatically. Encryption, the host key pin and the password check are unchanged. Either side, or both, can fall back; a 0.6.66 peer that has UDP still works with a 0.6.67 peer on TCP.
+- The fallback needs PJDesk Server 0.6.67 (CHIP23 and CHIP20) and 0.6.67 on the computer whose UDP fails. A client only asks a server that reported 0.6.67 or newer (or whose version is unknown); against an older server the old error stays.
+- Relay over TCP is capped at about 16 Mbit/s per side (24 Mbit/s at the server), dropping excess packets so QUIC slows down instead of queuing behind TCP.
+- PJDesk Server: the installer creates inbound Windows Firewall allow rules for TCP and UDP 21200 on all profiles: "PJDesk Server TCP" and "PJDesk Server UDP" scoped to pjdesk-server.exe, plus port rules "PJDesk Server Port TCP" and "PJDesk Server Port UDP". Every install or upgrade, and every service start (including after an auto-update), checks that each rule exists, is enabled, allows inbound and has the right port; a missing or wrong rule is recreated. The result is logged, written to firewall-status.txt and shown in the server window. The uninstaller removes the rules. netsh runs only from the elevated installer or the service, never from the window.
+
+Windows is 0.6.67. Android is 0.6.67 (versionCode 63136). Protocol stays 3 (new messages are appended and only sent to a peer that can read them). No tag, no release, no GitHub Actions, no cloud deploy.
+
 ## 0.6.66
 - PIN boxes on the Windows lock, set and confirm screens are now a visible rounded box, with the dots growing out from the middle (no slots, no length hint).
 - Backspace in a PIN box removes the last digit typed; Delete or Esc clears it. The phone's set and confirm screens now take hardware keys the same way.

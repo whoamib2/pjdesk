@@ -75,6 +75,11 @@ pub struct State {
     pub udp_port: u16,
     /// Data folder, so accounts can be re-read when they change out-of-process.
     pub data_dir: PathBuf,
+    /// The relay's UDP socket, so packets from a peer relaying over TCP can be
+    /// sent on to a peer that uses UDP. `None` in tests.
+    pub udp_socket: Option<Arc<UdpSocket>>,
+    /// UDP address of a peer whose other side relays over TCP → its session.
+    pub tcp_routes: HashMap<SocketAddr, SessionId>,
 }
 
 pub type Shared = Arc<Mutex<State>>;
@@ -147,7 +152,20 @@ pub struct PeerSlot {
     pub local: Option<Vec<SocketAddr>>,
     /// Host only: QUIC certificate fingerprint.
     pub fingerprint: Option<[u8; 32]>,
+    /// 0.6.67+: this side relays its QUIC packets over its TLS connection.
+    pub tcp: bool,
+    /// Bytes relayed toward this side over TCP, and the current one-second
+    /// window, so a fast UDP sender cannot queue without bound.
+    pub tcp_bytes: u64,
+    pub tcp_window: Option<(Instant, u64)>,
 }
+
+/// The public address recorded for a side that relays over TCP. Peers skip it
+/// as a direct candidate (QUIC refuses port 0) and use the relay.
+pub const TCP_PLACEHOLDER: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+/// Most a TCP side may be sent per second before packets are dropped (QUIC
+/// then slows down). About 24 Mbit/s.
+pub const TCP_RELAY_BYTES_PER_SEC: u64 = 3 * 1024 * 1024;
 
 impl Session {
     pub fn token_for(&self, role: Role) -> [u8; 16] {
@@ -213,6 +231,19 @@ impl Session {
             "Session {session_id:016x}: host {} at {host_pub}, controller at {ctrl_pub}; peers may now connect",
             format_id(&self.host_id)
         );
+    }
+}
+
+/// When one side of a session relays over TCP and the other has bound UDP,
+/// packets from that UDP address go to the TCP side.
+pub fn link_tcp_route(st: &mut State, session_id: SessionId) {
+    let Some(session) = st.sessions.get(&session_id) else { return };
+    for (tcp_side, udp_side) in [(&session.host, &session.controller), (&session.controller, &session.host)] {
+        if tcp_side.tcp && !udp_side.tcp {
+            if let Some(addr) = udp_side.public.filter(|a| *a != TCP_PLACEHOLDER) {
+                st.tcp_routes.insert(addr, session_id);
+            }
+        }
     }
 }
 
@@ -300,6 +331,8 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         limiter: RateLimiter::default(),
         udp_port: opts.port,
         data_dir: data_dir.clone(),
+        udp_socket: None,
+        tcp_routes: HashMap::new(),
     }));
     // Swappable, so a standby server can take on the key it syncs from the cloud.
     let acceptor = Arc::new(RwLock::new(TlsAcceptor::from(Arc::new(tls::server_config(&identity, ALPN_SIGNAL)?))));
@@ -311,7 +344,9 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         crate::public_addr::announce_lan(beacon_port, beacon_fp, beacon_dir);
     });
 
-    let relay = tokio::spawn(crate::relay::run(Arc::new(udp), state.clone()));
+    let udp = Arc::new(udp);
+    state.lock().unwrap().udp_socket = Some(udp.clone());
+    let relay = tokio::spawn(crate::relay::run(udp, state.clone()));
     let janitor = tokio::spawn(janitor(state.clone()));
     let fleet = tokio::spawn(fleet_sync(state.clone()));
     let cloud = tokio::spawn(cloud_sync(state.clone(), acceptor.clone()));
@@ -485,6 +520,11 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
                     }
                 }
             };
+            // Relayed QUIC packets are many per second and rate-limited by bytes.
+            if let ClientMsg::RelayData { session_id, data } = msg {
+                crate::relay::from_tcp(&state, conn.id, session_id, data);
+                continue;
+            }
             // A single connection that sprays messages holds the process-wide
             // lock on every one of them. Drop it instead of queuing forever.
             if burst_start.elapsed() >= Duration::from_secs(1) {
@@ -1371,6 +1411,42 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             }
             session.maybe_send_peer_info(session_id);
         }
+
+        ClientMsg::RelayOverTcp { session_id } => {
+            if gate(st, conn).is_err() {
+                conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
+                return;
+            }
+            let Some(session) = st.sessions.get_mut(&session_id) else { return };
+            if !session.accepted {
+                return;
+            }
+            let role = if session.host_conn == conn.id {
+                Role::Host
+            } else if session.controller_conn == conn.id {
+                Role::Controller
+            } else {
+                return;
+            };
+            let slot = session.slot_mut(role);
+            slot.tcp = true;
+            slot.public = Some(TCP_PLACEHOLDER);
+            if slot.local.is_none() {
+                slot.local = Some(Vec::new());
+            }
+            session.relayed = true;
+            info!(
+                "Session {session_id:016x}: host {} — the {} could not use UDP; relaying it over its TCP connection",
+                format_id(&session.host_id),
+                if role == Role::Host { "host" } else { "controller" }
+            );
+            conn.send(ServerMsg::TcpRelayReady { session_id });
+            session.maybe_send_peer_info(session_id);
+            link_tcp_route(st, session_id);
+        }
+
+        // Handled before the burst limit in the connection loop.
+        ClientMsg::RelayData { .. } => {}
 
         ClientMsg::Logout { token } => st.accounts.logout(&token),
 
@@ -2320,6 +2396,8 @@ mod tests {
             limiter: RateLimiter::default(),
             udp_port: 21200,
             data_dir: dir.to_path_buf(),
+            udp_socket: None,
+            tcp_routes: HashMap::new(),
         }))
     }
 
@@ -2809,6 +2887,112 @@ mod tests {
             other => panic!("a blank password must not turn incoming only off, got {other:?}"),
         }
         assert!(state.lock().unwrap().registry.incoming_only(&id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn relay_session(host_tx: mpsc::UnboundedSender<ServerMsg>, ctrl_tx: mpsc::UnboundedSender<ServerMsg>) -> Session {
+        Session {
+            host_token: [1; 16],
+            controller_token: [2; 16],
+            host_id: "902488771".into(),
+            host_name: "Cabin Desk".into(),
+            host_conn: 11,
+            host_tx,
+            controller_conn: 12,
+            controller_ip: "192.168.0.169".parse().unwrap(),
+            controller_tx: ctrl_tx,
+            accepted: true,
+            host: PeerSlot::default(),
+            controller: PeerSlot::default(),
+            info_sent: false,
+            created: Instant::now(),
+            relayed: false,
+            move_told: false,
+            move_acked: false,
+            wait_logged: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_host_without_udp_relays_over_its_tcp_connection() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-tcprelay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = state_in(&dir);
+        let (host_conn, mut host_rx) = conn_pair();
+        let (ctrl_conn, mut ctrl_rx) = conn_pair();
+        let mut host_conn = host_conn;
+        host_conn.id = 11;
+        let sid = 0x6850_2bbe_0593_e5b0;
+        // The controller (0.6.66) bound UDP and sent UdpReady as before.
+        let ctrl_udp: SocketAddr = "203.0.113.9:50000".parse().unwrap();
+        {
+            let mut session = relay_session(host_conn.tx.clone(), ctrl_conn.tx.clone());
+            session.controller.public = Some(ctrl_udp);
+            session.controller.local = Some(vec!["192.168.0.169:50000".parse().unwrap()]);
+            state.lock().unwrap().sessions.insert(sid, session);
+        }
+        handle_message(&state, &mut host_conn, ClientMsg::UdpReady { session_id: sid, local_addrs: vec![], cert_fingerprint: Some([7; 32]) });
+        assert!(ctrl_rx.try_recv().is_err(), "nothing until the host has a transport");
+        handle_message(&state, &mut host_conn, ClientMsg::RelayOverTcp { session_id: sid });
+        assert!(matches!(host_rx.try_recv().unwrap(), ServerMsg::TcpRelayReady { session_id } if session_id == sid));
+        match host_rx.try_recv().unwrap() {
+            ServerMsg::PeerInfo { public_addr, .. } => assert_eq!(public_addr, ctrl_udp),
+            other => panic!("{other:?}"),
+        }
+        match ctrl_rx.try_recv().unwrap() {
+            ServerMsg::PeerInfo { public_addr, cert_fingerprint, .. } => {
+                assert_eq!(public_addr, TCP_PLACEHOLDER);
+                assert_eq!(cert_fingerprint, Some([7; 32]));
+            }
+            other => panic!("{other:?}"),
+        }
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.tcp_routes.get(&ctrl_udp), Some(&sid), "UDP from the controller goes to the host's TCP");
+            assert!(st.sessions[&sid].relayed);
+        }
+        // A packet from a connection that is not in the session goes nowhere.
+        crate::relay::from_tcp(&state, 99, sid, vec![0x40; 100]);
+        // Both sides on TCP: packets go straight across.
+        let mut ctrl_conn = ctrl_conn;
+        ctrl_conn.id = 12;
+        handle_message(&state, &mut ctrl_conn, ClientMsg::RelayOverTcp { session_id: sid });
+        assert!(matches!(ctrl_rx.try_recv().unwrap(), ServerMsg::TcpRelayReady { .. }));
+        crate::relay::from_tcp(&state, 11, sid, vec![0x41; 1200]);
+        match ctrl_rx.try_recv().unwrap() {
+            ServerMsg::RelayData { session_id, data } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(data.len(), 1200);
+            }
+            other => panic!("{other:?}"),
+        }
+        crate::relay::from_tcp(&state, 12, sid, vec![0x42; 10]);
+        assert!(matches!(host_rx.try_recv().unwrap(), ServerMsg::RelayData { data, .. } if data == vec![0x42; 10]));
+        // Over the per-second budget, packets are dropped so QUIC slows down.
+        for _ in 0..(TCP_RELAY_BYTES_PER_SEC / 1200 + 10) {
+            crate::relay::from_tcp(&state, 11, sid, vec![0x41; 1200]);
+        }
+        let mut got = 0u64;
+        while let Ok(ServerMsg::RelayData { data, .. }) = ctrl_rx.try_recv() {
+            got += data.len() as u64;
+        }
+        assert!(got + 1200 <= TCP_RELAY_BYTES_PER_SEC, "{got}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relay_over_tcp_is_ignored_before_the_host_accepts() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-tcprelay2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = state_in(&dir);
+        let (mut conn, mut rx) = conn_pair();
+        conn.id = 12;
+        let mut session = relay_session(conn.tx.clone(), conn.tx.clone());
+        session.accepted = false;
+        state.lock().unwrap().sessions.insert(5, session);
+        handle_message(&state, &mut conn, ClientMsg::RelayOverTcp { session_id: 5 });
+        assert!(rx.try_recv().is_err());
+        assert!(!state.lock().unwrap().sessions[&5].controller.tcp);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

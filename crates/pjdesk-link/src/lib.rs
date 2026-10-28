@@ -9,4 +9,5 @@ pub mod lockout;
 pub mod p2p;
 pub mod session;
 pub mod signal;
+pub mod tcp_relay;
 pub mod udp_fallback;

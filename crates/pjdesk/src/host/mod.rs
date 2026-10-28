@@ -327,6 +327,8 @@ pub(crate) struct HostState {
     pending: AtomicUsize,
     /// Routes the server's PeerInfo messages to the session waiting for them.
     peer_info_routes: Mutex<HashMap<SessionId, mpsc::UnboundedSender<ServerMsg>>>,
+    /// The version the server reported at registration. Empty when unknown.
+    server_version: Mutex<String>,
     /// Permission ceiling and receive folder chosen when the session was approved.
     ceilings: Mutex<HashMap<SessionId, (u32, String)>>,
     lockout: Mutex<Lockout>,
@@ -553,6 +555,7 @@ async fn host_main(
         streaming: AtomicBool::new(false),
         pending: AtomicUsize::new(0),
         peer_info_routes: Mutex::new(HashMap::new()),
+        server_version: Mutex::new(String::new()),
         ceilings: Mutex::new(HashMap::new()),
         lockout: Mutex::new(Lockout::default()),
         otp_misses: AtomicUsize::new(0),
@@ -955,6 +958,7 @@ async fn register_catalog(
                 }
                 Ok(Some(ServerMsg::ServerVersion { version })) => {
                     server_version = version.clone();
+                    *state.server_version.lock().unwrap() = version.clone();
                     crate::routes_store::note_version(config, &version);
                 }
                 Ok(Some(ServerMsg::Routes(routes))) => {
@@ -1234,7 +1238,9 @@ async fn signaling_loop(
                             controller_ip,
                         ));
                     }
-                    ServerMsg::PeerInfo { session_id, .. } => {
+                    ServerMsg::PeerInfo { session_id, .. }
+                    | ServerMsg::TcpRelayReady { session_id }
+                    | ServerMsg::RelayData { session_id, .. } => {
                         if let Some(tx) = state.peer_info_routes.lock().unwrap().get(&session_id) {
                             let _ = tx.send(msg);
                         }
@@ -1454,7 +1460,15 @@ async fn session_inner(
         });
     }
     let binding = match p2p::bind_udp(server_udp, session_id, token, Role::Host).await {
-        Ok(binding) => binding,
+        Ok(binding) => Some(binding),
+        Err(e) if pjdesk_proto::signal::server_relays_over_tcp(&state.server_version.lock().unwrap()) => {
+            // 0.6.67: relay this session over the TLS connection instead.
+            tracing::warn!(
+                "Session {session_id:016x}: UDP registration with the relay at {server_udp} failed ({e:#}); relaying over the TCP connection to the server"
+            );
+            signal.send(ClientMsg::RelayOverTcp { session_id })?;
+            None
+        }
         Err(e) => {
             // Tell the server now, so the controller hears which side failed
             // instead of waiting out its own relay timeout.
@@ -1472,27 +1486,49 @@ async fn session_inner(
             return Ok(());
         }
     };
-    debug!("our public address for this session: {}", binding.observed);
-    let endpoint = p2p::host_endpoint(binding.socket, &state.identity)?;
     let mut locals = lan_direct;
-    for addr in binding.local_addrs.clone() {
-        if !locals.contains(&addr) {
-            locals.push(addr);
+    let (endpoint, punch_socket, tunnel_feed) = match binding {
+        Some(binding) => {
+            debug!("our public address for this session: {}", binding.observed);
+            for addr in binding.local_addrs.clone() {
+                if !locals.contains(&addr) {
+                    locals.push(addr);
+                }
+            }
+            (p2p::host_endpoint(binding.socket, &state.identity)?, Some(binding.punch_socket), None)
         }
-    }
+        None => {
+            let (socket, feed) = pjdesk_link::tcp_relay::TcpTunnelSocket::new(session_id, signal.clone(), server_udp);
+            (p2p::host_endpoint_on(socket, &state.identity)?, None, Some(feed))
+        }
+    };
     signal.send(ClientMsg::UdpReady {
         session_id,
         local_addrs: locals,
         cert_fingerprint: Some(state.identity.fingerprint()),
     })?;
 
-    let (peer_public, peer_local) = match timeout(Duration::from_secs(15), peer_info.recv()).await {
-        Ok(Some(ServerMsg::PeerInfo { public_addr, local_addrs, .. })) => (public_addr, local_addrs),
+    let wait_peer = async {
+        loop {
+            match peer_info.recv().await {
+                Some(ServerMsg::PeerInfo { public_addr, local_addrs, .. }) => return Some((public_addr, local_addrs)),
+                Some(ServerMsg::TcpRelayReady { .. }) => info!("The server is relaying this session over TCP"),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+    };
+    let (peer_public, peer_local) = match timeout(Duration::from_secs(15), wait_peer).await {
+        Ok(Some(found)) => found,
         _ => bail!("the controller never finished setting up the connection"),
     };
+    // Relayed packets reach this session through the same route as PeerInfo.
+    if let Some(feed) = tunnel_feed {
+        tokio::spawn(pjdesk_link::tcp_relay::pump(peer_info, feed));
+    }
     let targets = p2p::candidates(peer_public, &peer_local);
     debug!("controller candidates: {targets:?}");
-    let punching = p2p::spawn_punching(binding.punch_socket, targets, session_id, Duration::from_secs(8));
+    let punching = punch_socket.map(|socket| p2p::spawn_punching(socket, targets, session_id, Duration::from_secs(8)));
 
     let passwords = state.auth_passwords();
     let permanent = state.permanent.lock().unwrap().clone();
@@ -1507,7 +1543,9 @@ async fn session_inner(
         Duration::from_secs(90),
     )
     .await;
-    punching.abort();
+    if let Some(punching) = punching {
+        punching.abort();
+    }
     if state.streaming.load(Ordering::SeqCst) {
         info!("A computer on this network connected directly; the relay is not used");
         return Ok(());

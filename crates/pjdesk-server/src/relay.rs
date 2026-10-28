@@ -68,6 +68,8 @@ pub async fn run(socket: Arc<UdpSocket>, state: Shared) -> Result<()> {
                     }
                 }
             }
+        } else if !routes.contains_key(&src) && state.lock().unwrap().tcp_routes.contains_key(&src) {
+            to_tcp(&state, src, packet);
         } else if routes.contains_key(&src) {
             let (to, session_id, over_cap) = {
                 let route = routes.get(&src).unwrap();
@@ -102,6 +104,12 @@ pub async fn run(socket: Arc<UdpSocket>, state: Shared) -> Result<()> {
             binds.retain(|_, (start, _)| start.elapsed() < Duration::from_secs(60));
             if binds.len() > 8192 {
                 binds.clear();
+            }
+            {
+                let mut st = state.lock().unwrap();
+                let st = &mut *st;
+                let sessions = &st.sessions;
+                st.tcp_routes.retain(|_, sid| sessions.contains_key(sid));
             }
             routes.retain(|addr, route| {
                 let alive = state.lock().unwrap().sessions.contains_key(&route.session_id);
@@ -158,6 +166,12 @@ fn handle_bind(
     let first_time = session.slot_mut(role).public != Some(src);
     session.slot_mut(role).public = Some(src);
 
+    if session.host.tcp || session.controller.tcp {
+        session.relayed = true;
+        session.maybe_send_peer_info(session_id);
+        crate::server::link_tcp_route(&mut st, session_id);
+        return Some(udp::encode(&UdpMsg::BindAck { session_id, observed: src }));
+    }
     if let (Some(host), Some(ctrl)) = (session.host.public, session.controller.public) {
         session.relayed = true;
         if first_time {
@@ -170,6 +184,91 @@ fn handle_bind(
     session.maybe_send_peer_info(session_id);
 
     Some(udp::encode(&UdpMsg::BindAck { session_id, observed: src }))
+}
+
+/// The side of `session` that relays over TCP and that `from` is not.
+fn other_role(session: &crate::server::Session, from: Role) -> Role {
+    let _ = session;
+    match from {
+        Role::Host => Role::Controller,
+        Role::Controller => Role::Host,
+    }
+}
+
+/// Charges `len` bytes to a TCP side. False when its session or per-second
+/// budget is used up, so the packet is dropped.
+fn charge(slot: &mut crate::server::PeerSlot, len: usize) -> bool {
+    let now = Instant::now();
+    let window = slot.tcp_window.get_or_insert((now, 0));
+    if window.0.elapsed() >= Duration::from_secs(1) {
+        *window = (now, 0);
+    }
+    if window.1 + len as u64 > crate::server::TCP_RELAY_BYTES_PER_SEC
+        || slot.tcp_bytes + len as u64 > ROUTE_MAX_BYTES
+    {
+        return false;
+    }
+    window.1 += len as u64;
+    slot.tcp_bytes += len as u64;
+    true
+}
+
+/// A QUIC packet arrived over UDP for a peer that relays over TCP.
+fn to_tcp(state: &Shared, src: SocketAddr, packet: &[u8]) {
+    let mut st = state.lock().unwrap();
+    let Some(&session_id) = st.tcp_routes.get(&src) else { return };
+    let Some(session) = st.sessions.get_mut(&session_id) else {
+        st.tcp_routes.remove(&src);
+        return;
+    };
+    let from = if session.host.public == Some(src) { Role::Host } else { Role::Controller };
+    let to = other_role(session, from);
+    let tx = match to {
+        Role::Host => session.host_tx.clone(),
+        Role::Controller => session.controller_tx.clone(),
+    };
+    let slot = session.slot_mut(to);
+    if !slot.tcp || !charge(slot, packet.len()) {
+        return;
+    }
+    let _ = tx.send(pjdesk_proto::signal::ServerMsg::RelayData { session_id, data: packet.to_vec() });
+}
+
+/// A QUIC packet arrived over a TLS connection. Sends it to the other side
+/// by UDP, or by its TLS connection when that side relays over TCP too.
+pub fn from_tcp(state: &Shared, conn_id: u64, session_id: SessionId, data: Vec<u8>) {
+    if data.is_empty() || data.len() > 2048 {
+        return;
+    }
+    let mut st = state.lock().unwrap();
+    let socket = st.udp_socket.clone();
+    let Some(session) = st.sessions.get_mut(&session_id) else { return };
+    let from = if session.host_conn == conn_id {
+        Role::Host
+    } else if session.controller_conn == conn_id {
+        Role::Controller
+    } else {
+        return;
+    };
+    {
+        let slot = session.slot_mut(from);
+        if !slot.tcp || !charge(slot, data.len()) {
+            return;
+        }
+    }
+    let to = other_role(session, from);
+    let tx = match to {
+        Role::Host => session.host_tx.clone(),
+        Role::Controller => session.controller_tx.clone(),
+    };
+    let target = session.slot_mut(to);
+    if target.tcp {
+        let _ = tx.send(pjdesk_proto::signal::ServerMsg::RelayData { session_id, data });
+    } else if let (Some(addr), Some(socket)) = (target.public, socket) {
+        drop(st);
+        // The socket is non-blocking; a full send buffer drops the packet and QUIC resends.
+        let _ = socket.try_send_to(&data, addr);
+    }
 }
 
 /// Compares tokens without revealing (through timing) how many bytes matched.

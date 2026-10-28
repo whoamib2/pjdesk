@@ -556,7 +556,7 @@ async fn connect(
 
     let server_udp = SocketAddr::new(signal.server_addr.ip(), udp_port);
     let binding = match p2p::bind_udp(server_udp, session_id, token, Role::Controller).await {
-        Ok(binding) => binding,
+        Ok(binding) => Some(binding),
         Err(e) => {
             tracing::info!("UDP to the relay failed: {e:#}. Trying the host on this network.");
             if !force_relay && !password.is_empty() {
@@ -580,13 +580,20 @@ async fn connect(
                     }
                 }
             }
-            return Err(e);
+            if !pjdesk_proto::signal::server_relays_over_tcp(&config.network_routes.server_version) {
+                return Err(e);
+            }
+            tracing::info!("Relaying this session over the TCP connection to the server instead");
+            signal.send(ClientMsg::RelayOverTcp { session_id })?;
+            None
         }
     };
-    tracing::debug!("our public address for this session: {}", binding.observed);
+    if let Some(binding) = &binding {
+        tracing::debug!("our public address for this session: {}", binding.observed);
+    }
     signal.send(ClientMsg::UdpReady {
         session_id,
-        local_addrs: binding.local_addrs.clone(),
+        local_addrs: binding.as_ref().map(|b| b.local_addrs.clone()).unwrap_or_default(),
         cert_fingerprint: None,
     })?;
 
@@ -617,11 +624,21 @@ async fn connect(
             Err(_) => bail!("the host did not finish setting up the connection"),
         }
     };
-    // Signaling is done; everything else goes peer to peer.
-    drop(signal);
-
-    let endpoint = p2p::controller_endpoint(binding.socket, fingerprint)?;
-    let candidates = p2p::candidates(peer_public, &peer_local);
+    // Signaling is done; everything else goes peer to peer, or over this
+    // connection when UDP did not work.
+    let (endpoint, candidates, punch_socket, force_relay) = match binding {
+        Some(binding) => {
+            drop(signal);
+            let endpoint = p2p::controller_endpoint(binding.socket, fingerprint)?;
+            (endpoint, p2p::candidates(peer_public, &peer_local), Some(binding.punch_socket), force_relay)
+        }
+        None => {
+            let (socket, feed) = pjdesk_link::tcp_relay::TcpTunnelSocket::new(session_id, signal.sender(), server_udp);
+            tokio::spawn(pjdesk_link::tcp_relay::pump(signal, feed));
+            let endpoint = p2p::controller_endpoint_on(socket, Some(fingerprint))?.0;
+            (endpoint, Vec::new(), None, true)
+        }
+    };
     let ask_person = std::env::var("PJDESK_ASK_PERSON").ok().as_deref() == Some("1");
     let ask_view = std::env::var("PJDESK_ASK_VIEW").ok().as_deref() == Some("1");
     let mut attempt = if ask_view {
@@ -639,7 +656,7 @@ async fn connect(
     let mut from_store = std::env::var("PJDESK_SAVED").ok().as_deref() == Some("1");
     let mut tries = 0u32;
     let (connection, path, auth) = loop {
-        let punching = binding.punch_socket.try_clone().ok().map(|sock| {
+        let punching = punch_socket.as_ref().and_then(|s| s.try_clone().ok()).map(|sock| {
             p2p::spawn_punching(sock, candidates.clone(), session_id, Duration::from_secs(8))
         });
         let connected = p2p::connect_to_host(&endpoint, &candidates, server_udp, force_relay).await;

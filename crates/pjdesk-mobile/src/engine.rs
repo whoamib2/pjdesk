@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.66";
+pub const APP_VERSION: &str = "0.6.67";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -1866,6 +1866,20 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                             routes.remove(&session_id);
                         }
                     }
+                    ServerMsg::TcpRelayReady { session_id } => {
+                        let msg = ServerMsg::TcpRelayReady { session_id };
+                        let failed = routes.get(&session_id).is_some_and(|tx| tx.send(msg).is_err());
+                        if failed {
+                            routes.remove(&session_id);
+                        }
+                    }
+                    ServerMsg::RelayData { session_id, data } => {
+                        let msg = ServerMsg::RelayData { session_id, data };
+                        let failed = routes.get(&session_id).is_some_and(|tx| tx.send(msg).is_err());
+                        if failed {
+                            routes.remove(&session_id);
+                        }
+                    }
                     ServerMsg::ServerVersion { version } => {
                         pjdesk_proto::routes::note_server_version(&mut state.routes.lock().unwrap(), &version);
                         persist(&state);
@@ -2779,8 +2793,14 @@ async fn host_session(
     controller_ip: String,
 ) -> Result<()> {
     let gen = state.gen.load(Ordering::SeqCst);
+    let server_version = state.routes.lock().unwrap().server_version.clone();
     let binding = match p2p::bind_udp(server_udp, session_id, token, Role::Host).await {
-        Ok(binding) => binding,
+        Ok(binding) => Some(binding),
+        Err(e) if pjdesk_proto::signal::server_relays_over_tcp(&server_version) => {
+            log_line(&cb, format!("UDP to the relay at {server_udp} failed ({e:#}); relaying over the TCP connection to the server"));
+            signal.send(ClientMsg::RelayOverTcp { session_id })?;
+            None
+        }
         Err(e) => {
             let reason = pjdesk_proto::signal::host_udp_failure(&server_udp.to_string(), &format!("{e:#}"));
             log_line(&cb, reason.clone());
@@ -2788,18 +2808,38 @@ async fn host_session(
             return Err(e);
         }
     };
-    let endpoint = p2p::host_endpoint(binding.socket, &state.identity)?;
+    let (endpoint, locals, punch_socket, feed) = match binding {
+        Some(binding) => {
+            (p2p::host_endpoint(binding.socket, &state.identity)?, binding.local_addrs.clone(), Some(binding.punch_socket), None)
+        }
+        None => {
+            let (socket, feed) = pjdesk_link::tcp_relay::TcpTunnelSocket::new(session_id, signal.clone(), server_udp);
+            (p2p::host_endpoint_on(socket, &state.identity)?, Vec::new(), None, Some(feed))
+        }
+    };
     signal.send(ClientMsg::UdpReady {
         session_id,
-        local_addrs: binding.local_addrs.clone(),
+        local_addrs: locals,
         cert_fingerprint: Some(state.identity.fingerprint()),
     })?;
-    let (peer_public, peer_local) = match tokio::time::timeout(Duration::from_secs(15), peer_info.recv()).await {
-        Ok(Some(ServerMsg::PeerInfo { public_addr, local_addrs, .. })) => (public_addr, local_addrs),
+    let wait_peer = async {
+        loop {
+            match peer_info.recv().await {
+                Some(ServerMsg::PeerInfo { public_addr, local_addrs, .. }) => return Some((public_addr, local_addrs)),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+    };
+    let (peer_public, peer_local) = match tokio::time::timeout(Duration::from_secs(15), wait_peer).await {
+        Ok(Some(found)) => found,
         _ => bail!("the controller never finished setting up the connection"),
     };
+    if let Some(feed) = feed {
+        tokio::spawn(pjdesk_link::tcp_relay::pump(peer_info, feed));
+    }
     let targets = p2p::candidates(peer_public, &peer_local);
-    let punching = p2p::spawn_punching(binding.punch_socket, targets, session_id, Duration::from_secs(8));
+    let punching = punch_socket.map(|socket| p2p::spawn_punching(socket, targets, session_id, Duration::from_secs(8)));
     let passwords = auth_passwords(&state);
     let permanent = state.permanent.lock().unwrap().clone();
     log_line(
@@ -2818,7 +2858,9 @@ async fn host_session(
         &controller_name,
     )
     .await;
-    punching.abort();
+    if let Some(punching) = punching {
+        punching.abort();
+    }
     let (connection, mut auth, ask) = match accepted {
         Ok(done) => done,
         Err(e) if e.is::<WrongPassword>() => bail!("Wrong password"),
@@ -3817,12 +3859,18 @@ async fn controller_session(
         }
     };
     let server_udp = SocketAddr::new(signal.server_addr.ip(), udp_port);
-    let binding = p2p::bind_udp(server_udp, session_id, token, Role::Controller)
-        .await
-        .map_err(|e| anyhow::anyhow!("This phone's UDP setup failed (server {server_udp}): {e:#}"))?;
+    let binding = match p2p::bind_udp(server_udp, session_id, token, Role::Controller).await {
+        Ok(binding) => Some(binding),
+        Err(e) if pjdesk_proto::signal::server_relays_over_tcp(&state.routes.lock().unwrap().server_version) => {
+            log_line(&cb, format!("This phone's UDP setup failed (server {server_udp}): {e:#}. Relaying over the TCP connection instead."));
+            signal.send(ClientMsg::RelayOverTcp { session_id })?;
+            None
+        }
+        Err(e) => bail!("This phone's UDP setup failed (server {server_udp}): {e:#}"),
+    };
     signal.send(ClientMsg::UdpReady {
         session_id,
-        local_addrs: binding.local_addrs.clone(),
+        local_addrs: binding.as_ref().map(|b| b.local_addrs.clone()).unwrap_or_default(),
         cert_fingerprint: None,
     })?;
     let (peer_public, peer_local, fingerprint) = loop {
@@ -3836,8 +3884,18 @@ async fn controller_session(
             Err(_) => bail!("the computer did not finish the relay setup (server UDP {server_udp})"),
         }
     };
-    drop(signal);
-    let endpoint = p2p::controller_endpoint(binding.socket, fingerprint)?;
+    let tcp_relay = binding.is_none();
+    let (endpoint, punch_socket) = match binding {
+        Some(binding) => {
+            drop(signal);
+            (p2p::controller_endpoint(binding.socket, fingerprint)?, Some(binding.punch_socket))
+        }
+        None => {
+            let (socket, feed) = pjdesk_link::tcp_relay::TcpTunnelSocket::new(session_id, signal.sender(), server_udp);
+            tokio::spawn(pjdesk_link::tcp_relay::pump(signal, feed));
+            (p2p::controller_endpoint_on(socket, Some(fingerprint))?.0, None)
+        }
+    };
     let extra = state.phone_mine.lock().unwrap().clone();
     let mine = tokio::task::spawn_blocking(move || merged_mine(&extra)).await.unwrap_or_default();
     let direct = p2p::candidates(peer_public, &peer_local);
@@ -3871,13 +3929,12 @@ async fn controller_session(
                 TypedAuth::Cancel => bail!("cancelled"),
             }
         }
-        let punching = binding
-            .punch_socket
-            .try_clone()
-            .ok()
+        let punching = punch_socket
+            .as_ref()
+            .and_then(|s| s.try_clone().ok())
             .map(|sock| p2p::spawn_punching(sock, candidates.clone(), session_id, Duration::from_secs(8)));
         log_line(&cb, "Trying a direct connection on this network first (UDP 21201), then the relay");
-        let connected = p2p::connect_to_host(&endpoint, &candidates, server_udp, false).await;
+        let connected = p2p::connect_to_host(&endpoint, &candidates, server_udp, tcp_relay).await;
         if let Some(punching) = punching {
             punching.abort();
         }

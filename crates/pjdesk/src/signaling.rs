@@ -553,3 +553,9 @@ mod tests {
         assert_eq!(path_label("203.0.113.8:21200".parse().unwrap()), "Internet");
     }
 }
+
+impl pjdesk_link::tcp_relay::ServerMessages for SignalClient {
+    async fn next_msg(&mut self) -> Option<ServerMsg> {
+        self.recv().await
+    }
+}
