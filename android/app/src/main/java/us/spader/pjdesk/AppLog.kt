@@ -15,10 +15,12 @@ object AppLog {
     const val TAG = "PJDesk"
     private const val MAX_BYTES = 512 * 1024
     private lateinit var file: File
+    private lateinit var signInFile: File
 
     fun init(context: Context) {
         val dir = File(context.applicationContext.filesDir, "logs").apply { mkdirs() }
         file = File(dir, "pjdesk.log")
+        signInFile = File(dir, "signin.log")
         i("PJDesk log opened")
     }
 
@@ -28,6 +30,7 @@ object AppLog {
         // devices still keep. ERROR is used when WARN is refused too. The file
         // keeps the I mark, and Share logs sends the file.
         write("I", message)
+        if (message.contains("sign-in ")) appendSignIn(message)
         if (Log.isLoggable(TAG, Log.WARN)) Log.w(TAG, message) else Log.e(TAG, message)
     }
 
@@ -41,6 +44,11 @@ object AppLog {
 
     /** Sign-in lines kept in the app log, including the previous file after a roll. */
     fun recentSignIn(limit: Int = 50): String {
+        if (::signInFile.isInitialized && signInFile.exists()) {
+            val text = runCatching { signInFile.readText() }.getOrDefault("")
+            val lines = us.spader.pjdesk.core.signInLinesFromLog(text, limit)
+            if (lines.isNotBlank()) return lines
+        }
         if (!::file.isInitialized) return ""
         val older = File(file.parentFile, "pjdesk.log.1")
         val text = buildString {
@@ -49,6 +57,19 @@ object AppLog {
             if (file.exists()) append(runCatching { file.readText() }.getOrDefault(""))
         }
         return us.spader.pjdesk.core.signInLinesFromLog(text, limit)
+    }
+
+    @Synchronized
+    private fun appendSignIn(message: String) {
+        if (!::signInFile.isInitialized) return
+        runCatching {
+            if (signInFile.length() > 64 * 1024) {
+                val previous = File(signInFile.parentFile, "signin.log.1")
+                if (previous.exists()) previous.delete()
+                signInFile.renameTo(previous)
+            }
+            signInFile.appendText("${Instant.now()} $message\n")
+        }
     }
 
     fun share(context: Context) {

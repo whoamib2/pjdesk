@@ -105,6 +105,15 @@ private fun redactJson(line: String, name: String): String {
     return line.substring(0, start) + "\"[redacted]\"" + line.substring(i + 1)
 }
 
+/**
+ * Addresses the sign-in screen dials itself. Empty: the engine resolves the
+ * primary and standby, with a same-subnet LAN address ahead of the public one.
+ */
+fun signInRequestAddresses(storedPublic: List<String>): List<String> {
+    if (storedPublic.any { it.isBlank() }) return emptyList()
+    return emptyList()
+}
+
 /** Sign-in lines from a log file, newest last, with secrets removed. */
 fun signInLinesFromLog(text: String, limit: Int = 50): String {
     val lines = text.lineSequence().map { redactDiagnostics(it) }.filter { it.contains("sign-in ") }.toList()

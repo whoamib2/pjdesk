@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.60";
+pub const APP_VERSION: &str = "0.6.61";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -207,6 +207,8 @@ struct State {
     pending_account: Mutex<Option<(String, oneshot::Sender<ServerMsg>)>>,
     /// A sign-in connection registered this phone. The heartbeat connection should dial again.
     sign_in_reregister: AtomicBool,
+    /// Bumped each time a registration connection is ready. Sign-in waits for the next one.
+    host_gen: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -393,6 +395,7 @@ impl Engine {
             host_at: Mutex::new(String::new()),
             pending_account: Mutex::new(None),
             sign_in_reregister: AtomicBool::new(false),
+            host_gen: AtomicU64::new(0),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let engine = Self { state: state.clone(), cmds: tx };
@@ -1473,6 +1476,8 @@ async fn open_signal(
 enum PhoneHost {
     Stop,
     Again,
+    /// Sign-in asked for a new registration now, without the long outage backoff.
+    Soon,
     Lost,
 }
 
@@ -1490,6 +1495,12 @@ async fn host_loop(state: Arc<State>, cb: Arc<dyn Callbacks>) {
                 public_only = false;
                 fast_tries = 0;
                 wait = Duration::from_secs(1);
+            }
+            Ok(PhoneHost::Soon) => {
+                public_only = false;
+                fast_tries = 0;
+                wait = Duration::from_millis(200);
+                advance = false;
             }
             Ok(PhoneHost::Lost) => {
                 emit(&cb, &json!({"event":"serverLink","up": false}));
@@ -1671,18 +1682,19 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
             return Ok(PhoneHost::Lost);
         }
         if state.sign_in_reregister.swap(false, Ordering::SeqCst) {
-            log_line(&cb, "sign-in address={server} step=reregister reply=the sign-in connection registered this phone");
+            log_line(&cb, format!("sign-in address={server} step=reconnect reply=dialing again now"));
             emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
-            return Ok(PhoneHost::Lost);
+            return Ok(PhoneHost::Soon);
         }
         tokio::select! {
             _ = state.moved.notified() => {
                 state.leave_primary.store(false, Ordering::SeqCst);
                 if state.sign_in_reregister.swap(false, Ordering::SeqCst) {
-                    log_line(&cb, "sign-in address={server} step=reregister reply=the sign-in connection registered this phone");
-                } else {
-                    log_line(&cb, "failover: registering with the new primary");
+                    log_line(&cb, format!("sign-in address={server} step=reconnect reply=dialing again now"));
+                    emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
+                    return Ok(PhoneHost::Soon);
                 }
+                log_line(&cb, "failover: registering with the new primary");
                 emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
                 return Ok(PhoneHost::Lost);
             }
@@ -1767,6 +1779,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                         saw_registered = true;
                         *state.host_tx.lock().unwrap() = Some(signal.sender());
                         *state.host_at.lock().unwrap() = signal.server_addr.to_string();
+                        state.host_gen.fetch_add(1, Ordering::SeqCst);
                         *state.device_id.lock().unwrap() = Some(device_id.clone());
                         persist(&state);
                         publish(&state, &cb);
@@ -2112,15 +2125,50 @@ fn sign_in_attempts(heartbeat_up: bool) -> &'static [SignInAttempt] {
 /// How long a sign-in waits on the connection that is already heartbeating.
 const HEARTBEAT_SIGN_IN_WAIT: Duration = Duration::from_secs(20);
 
-/// The sentence for a sign-in step that failed. It names the step and the real error.
-fn sign_in_step_failure(step: &str, detail: &str) -> String {
-    let detail = detail.trim().replace(['\n', '\r'], " ");
-    let detail: String = detail.chars().take(180).collect();
-    if detail.is_empty() {
-        format!("The sign-in timed out at step={step}.")
+/// A failed dial. Says "answered" only when the caller received a server message,
+/// which this helper never has. Names the address and whether it is LAN or public.
+fn sign_in_step_failure(step: &str, address: &str, detail: &str) -> String {
+    let address = address.trim();
+    let kind = match pjdesk_proto::routes::endpoint_v4(address) {
+        Some(ip) if ip.is_private() || ip.is_loopback() || ip.is_link_local() => "LAN",
+        Some(_) => "public",
+        None => "",
+    };
+    let place = if address.is_empty() {
+        "the server".to_string()
+    } else if kind.is_empty() {
+        address.to_string()
     } else {
-        format!("The sign-in failed at step={step}. {detail}")
+        format!("the {kind} address {address}")
+    };
+    let detail = detail.trim().replace(['\n', '\r'], " ");
+    let detail: String = detail.chars().take(160).collect();
+    if detail.is_empty() {
+        format!("Could not connect to {place} at step={step}.")
+    } else {
+        format!("Could not connect to {place} at step={step}. {detail}")
     }
+}
+
+async fn wait_fresh_host(
+    state: &State,
+    generation: u64,
+    budget: Duration,
+) -> Option<(mpsc::UnboundedSender<ClientMsg>, String)> {
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        if state.host_gen.load(Ordering::SeqCst) != generation {
+            let tx = state.host_tx.lock().unwrap().clone();
+            let at = state.host_at.lock().unwrap().clone();
+            if let Some(tx) = tx {
+                if !at.is_empty() {
+                    return Some((tx, at));
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
 }
 
 fn sign_in_log(cb: &Arc<dyn Callbacks>, address: &str, step: &str, detail: &str) {
@@ -2209,26 +2257,28 @@ async fn account_on_address(
     msg: ClientMsg,
 ) -> Result<(ServerMsg, String)> {
     sign_in_log(cb, prefer, "dial-one", &format!("op={asked}"));
-    let budget = pjdesk_proto::routes::dial_budget(prefer);
-    let mut signal = match SignalClient::connect_endpoint(prefer, None, budget).await {
+    let pinned = state.fingerprint.lock().unwrap().clone().and_then(|text| pjdesk_proto::tls::parse_fingerprint(&text).ok());
+    // The saved address may be the public active address. open_ordered walks the
+    // route list and puts a same-subnet LAN address first. The fingerprint stays pinned.
+    let mut signal = match open_ordered(state, cb, pinned).await {
         Ok(opened) => opened,
         Err(err) => {
             let why = err.to_string();
             let why = why.lines().next().unwrap_or("failed").trim();
             sign_in_log(cb, prefer, "dial-one", &format!("reply=no-transport {why}"));
-            bail!("{}", sign_in_step_failure("dial-one", &why));
+            bail!("{}", sign_in_step_failure("dial-one", prefer, &why));
         }
     };
     let addr = signal.server_addr.to_string();
     sign_in_log(cb, &addr, "connected", "transport=tcp");
     if signal.send(msg).is_err() {
         sign_in_log(cb, &addr, "dial-one", "reply=send-failed");
-        bail!("{}", sign_in_step_failure("dial-one", "the sign-in was not sent"));
+        bail!("{}", sign_in_step_failure("dial-one", &addr, "the sign-in was not sent"));
     }
     match await_account(&mut signal, state, cb, &addr, "dial-one", Duration::from_secs(12)).await {
         AccountRead::Reply(reply) => Ok((reply, addr)),
         AccountRead::Timeout | AccountRead::Closed => {
-            bail!("{}", sign_in_step_failure("dial-one", "timed out"));
+            bail!("{}", sign_in_step_failure("dial-one", &addr, "timed out"));
         }
     }
 }
@@ -2256,15 +2306,40 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                     }
                     Ok(Err(_)) => {
                         sign_in_log(cb, &addr, "heartbeat", "reply=closed");
-                        bail!("{}", sign_in_step_failure("heartbeat", "the connection closed"));
+                        bail!("{}", sign_in_step_failure("heartbeat", &addr, "the connection closed"));
                     }
                     Err(_) => {
                         state.pending_account.lock().unwrap().take();
                         sign_in_log(cb, &addr, "heartbeat", "reply=timeout");
-                        bail!(
-                            "{}",
-                            sign_in_step_failure("heartbeat", &format!("no answer from {addr} within 20s"))
-                        );
+                        let generation = state.host_gen.load(Ordering::SeqCst);
+                        state.sign_in_reregister.store(true, Ordering::SeqCst);
+                        state.moved.notify_waiters();
+                        sign_in_log(cb, &addr, "reconnect", "forcing a new connection");
+                        match wait_fresh_host(state, generation, Duration::from_secs(15)).await {
+                            Some((tx, new_addr)) => {
+                                sign_in_log(cb, &new_addr, "heartbeat", "op=retry");
+                                let (rtx, rrx) = oneshot::channel();
+                                *state.pending_account.lock().unwrap() = Some((asked.to_string(), rtx));
+                                if tx.send(msg.clone()).is_err() {
+                                    state.pending_account.lock().unwrap().take();
+                                    bail!("{}", sign_in_step_failure("heartbeat", &new_addr, "the sign-in was not sent"));
+                                }
+                                match tokio::time::timeout(HEARTBEAT_SIGN_IN_WAIT, rrx).await {
+                                    Ok(Ok(reply)) => {
+                                        sign_in_log(cb, &new_addr, "heartbeat", &reply_note(&reply));
+                                        return Ok((reply, new_addr));
+                                    }
+                                    Ok(Err(_)) => {
+                                        bail!("{}", sign_in_step_failure("heartbeat", &new_addr, "the connection closed"));
+                                    }
+                                    Err(_) => {
+                                        state.pending_account.lock().unwrap().take();
+                                        bail!("{}", sign_in_step_failure("heartbeat", &new_addr, "no answer within 20s"));
+                                    }
+                                }
+                            }
+                            None => bail!("{}", sign_in_step_failure("reconnect", &addr, "the new connection did not come up")),
+                        }
                     }
                 }
             }
@@ -2289,7 +2364,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                             let why = err.to_string();
                             let why = why.lines().next().unwrap_or("failed").trim();
                             sign_in_log(cb, "", "dial", &format!("reply=no-transport {why}"));
-                            bail!("{}", sign_in_step_failure("dial", &why));
+                            bail!("{}", sign_in_step_failure("dial", "", &why));
                         }
                     }
                 }
@@ -2320,7 +2395,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                             let why = err.to_string();
                             let why = why.lines().next().unwrap_or("failed").trim();
                             sign_in_log(cb, "", "dial", &format!("reply=no-transport {why}"));
-                            bail!("{}", sign_in_step_failure("dial", &why));
+                            bail!("{}", sign_in_step_failure("dial", "", &why));
                         }
                     }
                 }
@@ -2329,7 +2404,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                 sign_in_log(cb, &addr, "register-then-account", &format!("op={asked}"));
                 if send_host_register(opened, state).is_err() {
                     sign_in_log(cb, &addr, "register-then-account", "reply=send-failed");
-                    bail!("{}", sign_in_step_failure("register-then-account", "the register was not sent"));
+                    bail!("{}", sign_in_step_failure("register-then-account", &addr, "the register was not sent"));
                 }
                 state.sign_in_reregister.store(true, Ordering::SeqCst);
                 state.moved.notify_waiters();
@@ -2355,7 +2430,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                         Ok(Some(_)) => sign_in_log(cb, &addr, "register-then-account", "reply=other"),
                         Ok(None) => {
                             sign_in_log(cb, &addr, "register-then-account", "reply=closed");
-                            bail!("{}", sign_in_step_failure("register-then-account", "the connection closed"));
+                            bail!("{}", sign_in_step_failure("register-then-account", &addr, "the connection closed"));
                         }
                         Err(_) => {
                             sign_in_log(cb, &addr, "register-then-account", "reply=timeout");
@@ -2368,18 +2443,18 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                 }
                 if opened.send(msg.clone()).is_err() {
                     sign_in_log(cb, &addr, "register-then-account", "reply=send-failed");
-                    bail!("{}", sign_in_step_failure("register-then-account", "the sign-in was not sent"));
+                    bail!("{}", sign_in_step_failure("register-then-account", &addr, "the sign-in was not sent"));
                 }
                 match await_account(opened, state, cb, &addr, "register-then-account", Duration::from_secs(12)).await {
                     AccountRead::Reply(reply) => return Ok((reply, addr)),
                     AccountRead::Timeout | AccountRead::Closed => {
-                        bail!("{}", sign_in_step_failure("register-then-account", "timed out"));
+                        bail!("{}", sign_in_step_failure("register-then-account", &addr, "timed out"));
                     }
                 }
             }
         }
     }
-    bail!("{}", sign_in_step_failure("register-then-account", "no answer"))
+    bail!("{}", sign_in_step_failure("register-then-account", "", "no answer"))
 }
 
 fn account_event(asked: &str, msg: &ServerMsg) -> Value {
@@ -3910,12 +3985,17 @@ mod tests {
     #[test]
     fn a_live_heartbeat_is_not_reported_as_unreachable() {
         assert_eq!(HEARTBEAT_SIGN_IN_WAIT.as_secs(), 20);
-        let timed = sign_in_step_failure("heartbeat", "no answer from 192.168.0.193:21200 within 20s");
+        let timed = sign_in_step_failure("heartbeat", "192.168.0.193:21200", "no answer within 20s");
         assert!(timed.contains("step=heartbeat"));
         assert!(timed.contains("192.168.0.193:21200"));
-        let dial = sign_in_step_failure("dial", "connection refused");
-        assert!(dial.contains("step=dial"));
-        assert!(dial.contains("connection refused"));
+        assert!(timed.contains("LAN"));
+        assert!(!timed.contains("answered"));
+        let dial = sign_in_step_failure("dial-one", "204.248.122.44:21200", "timed out");
+        assert!(dial.contains("step=dial-one"));
+        assert!(dial.contains("public"));
+        assert!(dial.contains("204.248.122.44:21200"));
+        assert!(dial.contains("Could not connect"));
+        assert!(!dial.contains("answered"));
         assert!(!dial.to_ascii_lowercase().contains("password"));
     }
 
@@ -4320,6 +4400,7 @@ mod tests {
             host_at: Mutex::new(String::new()),
             pending_account: Mutex::new(None),
             sign_in_reregister: AtomicBool::new(false),
+            host_gen: AtomicU64::new(0),
         })
     }
 

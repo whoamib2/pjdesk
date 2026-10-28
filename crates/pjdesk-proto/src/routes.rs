@@ -186,6 +186,34 @@ pub fn dial_targets(routes: &ServerRoutes, mine: &[Ipv4Addr], saved: &str) -> Ve
     promote_same_lan(order, routes, mine)
 }
 
+/// Account sign-in targets for one saved address.
+///
+/// `prefer` may be the public active address. A LAN address on `mine`'s /24
+/// is still first. The result is never only that public address when such a
+/// LAN address is known.
+pub fn account_dial_order(prefer: &str, routes: &ServerRoutes, mine: &[Ipv4Addr]) -> Vec<String> {
+    let mut order = dial_targets(routes, mine, prefer);
+    let prefer = canonical(prefer);
+    if order.is_empty() && !prefer.is_empty() {
+        order.push(prefer.clone());
+    }
+    let mut lan = Vec::new();
+    for raw in routes.primary_lan.iter().chain(routes.standby_lan.iter()) {
+        let addr = canonical(raw);
+        if on_subnet(&addr, mine) {
+            push_unique(&mut lan, addr);
+        }
+    }
+    if lan.is_empty() {
+        return order;
+    }
+    let mut out = lan;
+    for addr in order {
+        push_unique(&mut out, addr);
+    }
+    out
+}
+
 /// The banner, then one `address: error` line for every dial that failed.
 pub fn registration_miss(attempts: &[(&str, &str)]) -> String {
     let last = attempts
@@ -1107,6 +1135,17 @@ mod tests {
         };
         let without_phone_ip = dial_targets(&remembered, &[], "");
         assert_eq!(without_phone_ip[0], "192.168.0.193:21200", "{without_phone_ip:?}");
+        let both = ServerRoutes {
+            primary_lan: vec!["192.168.0.193:21200".into()],
+            primary_public: vec!["204.248.122.44:21200".into()],
+            standby_lan: vec!["192.168.0.169:21200".into()],
+            ..ServerRoutes::default()
+        };
+        let expanded = account_dial_order("204.248.122.44:21200", &both, &phone);
+        assert_eq!(expanded[0], "192.168.0.193:21200", "{expanded:?}");
+        assert!(expanded.iter().any(|addr| addr.starts_with("192.168.0.169")), "{expanded:?}");
+        assert!(expanded.len() > 1, "{expanded:?}");
+        assert_ne!(expanded, vec!["204.248.122.44:21200".to_string()]);
     }
 
     #[test]
