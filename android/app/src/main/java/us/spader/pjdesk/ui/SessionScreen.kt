@@ -122,6 +122,7 @@ fun SessionScreen(
     onStay: () -> Unit = {},
     onActivity: () -> Unit = {},
     chatReady: Boolean = false,
+    chatTooOld: Boolean = false,
     chatLines: List<ChatLine> = emptyList(),
     chatUnread: Int = 0,
     onChat: (String) -> Unit = {},
@@ -573,7 +574,7 @@ fun SessionScreen(
                 Column(horizontalAlignment = Alignment.End) {
                     Box {
                         HitButton(
-                            description = if (chatReady) "Chat" else CHAT_NEEDS_TIP,
+                            description = if (chatTooOld) CHAT_NEEDS_TIP else "Chat",
                             space = space,
                             padId = "chat",
                             color = if (chatReady) {
@@ -600,7 +601,7 @@ fun SessionScreen(
                             }
                         }
                     }
-                    if (!chatReady) {
+                    if (chatTooOld) {
                         Text(
                             CHAT_NEEDS_TIP,
                             modifier = Modifier.widthIn(max = 220.dp),
@@ -673,7 +674,7 @@ fun SessionScreen(
                                 }
                             },
                             enabled = chatReady,
-                        ) { Text(if (chatReady) "Chat" else CHAT_NEEDS_TIP) }
+                        ) { Text(if (chatTooOld) CHAT_NEEDS_TIP else "Chat") }
                         RemoteOptionsForm(
                             options = remote,
                             onChange = onRemote,
@@ -709,6 +710,7 @@ fun SessionScreen(
                 ChatSheet(
                     lines = chatLines,
                     ready = chatReady,
+                    tooOld = chatTooOld,
                     onSend = onChat,
                     onClose = { chatSheet = false },
                 )

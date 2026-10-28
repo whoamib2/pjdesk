@@ -559,6 +559,11 @@ fn on_host(
         HostMsg::AskVisitor => {
             let _ = control.send(this_visitor());
         }
+        HostMsg::PeerVersion { version } => {
+            if pjdesk_proto::peer::chat_gate(&version, "", false) == pjdesk_proto::peer::ChatGate::Ready {
+                g.chat_ready = true;
+            }
+        }
         HostMsg::Pong { .. } | HostMsg::Tunnel(TunnelMsg::Open { .. }) => {}
     }
     drop(g);

@@ -819,6 +819,8 @@ class Engine(context: Context) : EngineListener {
                     askPassword = false,
                     reconnecting = false,
                     reconnectSeconds = 0,
+                    peerHandshakeVersion = "",
+                    peerPresenceVersion = event.optString("presenceVersion"),
                     session = SessionInfo(
                         peer = peer,
                         id = event.optString("id"),
@@ -888,6 +890,7 @@ class Engine(context: Context) : EngineListener {
                 onFiles?.invoke(list)
             }
             "incomingOnly" -> update { it.copy(incomingOnly = event.optBoolean("on")) }
+            "peerVersion" -> update { it.copy(peerHandshakeVersion = event.optString("version")) }
             "chatReady" -> update { it.copy(chatReady = true) }
             "chatSeen" -> update { it.copy(chatUnread = 0, chatAlert = false) }
             "chat" -> update {
@@ -937,6 +940,8 @@ class Engine(context: Context) : EngineListener {
                         reconnectSeconds = if (role == "controller" || role == "session") 0 else it.reconnectSeconds,
                         session = if (role == "controller" || role == "session") null else it.session,
                         chatReady = false,
+                        peerHandshakeVersion = "",
+                        peerPresenceVersion = "",
                         chatLines = emptyList(),
                         chatUnread = 0,
                         chatAlert = false,

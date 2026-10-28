@@ -69,6 +69,10 @@ data class DeskState(
     val reconnectSeconds: Int = 0,
     /** The other computer speaks in-session chat (PJDesk 0.6.50). */
     val chatReady: Boolean = false,
+    /** PJDesk version from the session handshake. Empty until the peer sends one. */
+    val peerHandshakeVersion: String = "",
+    /** PJDesk version from a fresh presence report. A stored saved-list version is not this. */
+    val peerPresenceVersion: String = "",
     val chatLines: List<ChatLine> = emptyList(),
     val chatUnread: Int = 0,
     /** Bumps on every chat line so the host can open its sheet. */

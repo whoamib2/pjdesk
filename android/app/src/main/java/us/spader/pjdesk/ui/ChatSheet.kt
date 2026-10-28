@@ -29,6 +29,45 @@ import us.spader.pjdesk.core.ChatLine
 
 const val CHAT_NEEDS_TIP = "The other computer needs PJDesk 0.6.50 or newer"
 
+enum class ChatGate { Ready, TooOld, Unknown }
+
+/** A PJDesk release is 0.x. Windows 10 and 11 are not. A pre-release is returned with the dash. */
+fun pjdeskAppVersion(raw: String): String? {
+    val trimmed = raw.trim().removePrefix("v")
+    val core = trimmed.substringBefore('-').substringBefore('+')
+    val parts = core.split('.')
+    if (parts.size < 2 || parts.any { it.toIntOrNull() == null }) return null
+    if (parts[0].toIntOrNull() != 0) return null
+    return trimmed
+}
+
+fun chatVersionAtLeast(version: String): Boolean {
+    if (version.contains('-')) return false
+    val parts = version.substringBefore('+').split('.')
+    val have = intArrayOf(
+        parts.getOrNull(0)?.toIntOrNull() ?: return false,
+        parts.getOrNull(1)?.toIntOrNull() ?: 0,
+        parts.getOrNull(2)?.toIntOrNull() ?: 0,
+    )
+    val need = intArrayOf(0, 6, 50)
+    val index = (0..2).firstOrNull { have[it] != need[it] } ?: return true
+    return have[index] > need[index]
+}
+
+/**
+ * Handshake version wins. Fresh presence is the fallback. A saved version that
+ * is not fresh does not count. The old-version warning is [ChatGate.TooOld] only.
+ */
+fun chatGate(handshake: String, presence: String, presenceFresh: Boolean): ChatGate {
+    val version = pjdeskAppVersion(handshake) ?: if (presenceFresh) pjdeskAppVersion(presence) else null
+    if (version == null) return ChatGate.Unknown
+    return if (chatVersionAtLeast(version)) ChatGate.Ready else ChatGate.TooOld
+}
+
+fun chatButtonOn(chatReady: Boolean, gate: ChatGate): Boolean = gate != ChatGate.TooOld && (chatReady || gate == ChatGate.Ready)
+
+fun showChatNeedsTip(chatReady: Boolean, gate: ChatGate): Boolean = gate == ChatGate.TooOld && !chatReady
+
 fun formatChatLine(line: ChatLine): String {
     val secs = (line.unix % 86_400).toInt().coerceAtLeast(0)
     val h = secs / 3600
@@ -41,6 +80,7 @@ fun formatChatLine(line: ChatLine): String {
 fun ChatSheet(
     lines: List<ChatLine>,
     ready: Boolean,
+    tooOld: Boolean = false,
     onSend: (String) -> Unit,
     onClose: () -> Unit,
 ) {
@@ -56,7 +96,7 @@ fun ChatSheet(
                 Text("Chat", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                 TextButton(onClick = onClose) { Text("Close") }
             }
-            if (!ready) {
+            if (tooOld) {
                 Text(CHAT_NEEDS_TIP, color = MaterialTheme.colorScheme.tertiary)
             } else {
                 Column(
