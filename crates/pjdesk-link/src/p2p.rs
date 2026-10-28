@@ -410,11 +410,75 @@ pub async fn connect_to_host(
     Ok((connection, LinkPath::Relay(relay)))
 }
 
+/// Listens on the LAN discovery port (UDP 21202) for `target_id`'s beacon.
+/// Returns its direct address (UDP 21201) and QUIC key. The socket shares the
+/// port with any other listener on this device, so the Android list keeps working.
+pub fn hear_host_beacon(target_id: &str, limit: Duration) -> Option<(SocketAddr, Fingerprint)> {
+    let want: String = target_id.chars().filter(|c| c.is_ascii_digit()).collect();
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)).ok()?;
+    let _ = socket.set_reuse_address(true);
+    #[cfg(unix)]
+    let _ = socket.set_reuse_port(true);
+    let _ = socket.set_broadcast(true);
+    socket
+        .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, pjdesk_proto::DISCOVERY_PORT)).into())
+        .ok()?;
+    let socket: UdpSocket = socket.into();
+    socket.set_read_timeout(Some(Duration::from_millis(300))).ok()?;
+    let deadline = Instant::now() + limit;
+    let mut buf = [0u8; 512];
+    while Instant::now() < deadline {
+        let Ok((n, src)) = socket.recv_from(&mut buf) else { continue };
+        if let Some(found) = beacon_match(&buf[..n], src, &want) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The direct address and key in a beacon from `src`, when it is `want`'s.
+pub fn beacon_match(packet: &[u8], src: SocketAddr, want: &str) -> Option<(SocketAddr, Fingerprint)> {
+    if !pjdesk_proto::discover::accept_lan_ip(src.ip()) {
+        return None;
+    }
+    let beacon = pjdesk_proto::discover::decode(packet).ok()?;
+    let id: String = beacon.id.chars().filter(|c| c.is_ascii_digit()).collect();
+    (id == want && !want.is_empty()).then(|| (SocketAddr::new(src.ip(), beacon.port), beacon.fingerprint))
+}
+
+/// Connects straight to a host on this network (no relay).
+pub async fn connect_direct(endpoint: &quinn::Endpoint, addr: SocketAddr) -> Result<(quinn::Connection, LinkPath)> {
+    let connecting = endpoint.connect(addr, PEER_SERVER_NAME)?;
+    let connection = tokio::time::timeout(RELAY_TIMEOUT, connecting)
+        .await
+        .map_err(|_| anyhow!("the computer on this network did not answer on {addr}"))??;
+    Ok((connection, LinkPath::Direct(addr)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use super::*;
+
+    #[test]
+    fn a_beacon_from_the_wanted_computer_gives_its_direct_address() {
+        let beacon = pjdesk_proto::discover::LanBeacon {
+            proto: 3,
+            id: "692996394".into(),
+            port: 21201,
+            name: "BENLENOVODESK".into(),
+            fingerprint: [9; 32],
+        };
+        let packet = pjdesk_proto::discover::encode(&beacon).unwrap();
+        let src: SocketAddr = "192.168.0.169:50000".parse().unwrap();
+        let got = beacon_match(&packet, src, "692996394").unwrap();
+        assert_eq!(got.0, "192.168.0.169:21201".parse::<SocketAddr>().unwrap());
+        assert_eq!(got.1, [9; 32]);
+        assert!(beacon_match(&packet, src, "482636105").is_none(), "another computer's beacon is ignored");
+        let public: SocketAddr = "203.0.113.5:50000".parse().unwrap();
+        assert!(beacon_match(&packet, public, "692996394").is_none(), "only LAN senders count");
+    }
 
     #[test]
     fn lan_candidates_are_tried_before_the_public_address() {

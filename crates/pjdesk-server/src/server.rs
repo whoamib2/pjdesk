@@ -857,6 +857,29 @@ fn registration_is_blocked(st: &mut State, conn: &Conn, secrets: &[&[u8; 32]], r
     true
 }
 
+/// Which side of `session_id` this connection is, if either.
+fn session_role(st: &State, session_id: SessionId, conn: &Conn) -> Option<Role> {
+    let session = st.sessions.get(&session_id)?;
+    if session.host_conn == conn.id {
+        Some(Role::Host)
+    } else if session.controller_conn == conn.id {
+        Some(Role::Controller)
+    } else {
+        None
+    }
+}
+
+/// Whether a session's UDP/relay setup message is allowed. Only the controller
+/// is gated: the host is the registered computer the (already gated) controller
+/// asked for, and registration needs no sign-in. Gating the host stranded every
+/// session to a computer whose service had no usable token (0.6.68 fix).
+fn setup_allowed(st: &State, conn: &Conn, role: Role) -> bool {
+    match role {
+        Role::Host => true,
+        Role::Controller => gate(st, conn).is_ok(),
+    }
+}
+
 /// Require signed-in accounts does not refuse registration. A computer with no
 /// token is given an ID (pending, not signed in) so it can sign in afterwards.
 /// Connect still requires a token when the switch is on.
@@ -1392,18 +1415,12 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         ClientMsg::UdpReady { session_id, local_addrs, cert_fingerprint } => {
             // The UDP bind that follows is authorized by the session token issued
             // here, so refusing this message refuses punch and relay as well.
-            if gate(st, conn).is_err() {
+            let Some(role) = session_role(st, session_id, conn) else { return };
+            if !setup_allowed(st, conn, role) {
                 conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
                 return;
             }
             let Some(session) = st.sessions.get_mut(&session_id) else { return };
-            let role = if session.host_conn == conn.id {
-                Role::Host
-            } else if session.controller_conn == conn.id {
-                Role::Controller
-            } else {
-                return;
-            };
             let slot = session.slot_mut(role);
             slot.local = Some(local_addrs.into_iter().take(8).collect());
             if role == Role::Host {
@@ -1413,7 +1430,8 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::RelayOverTcp { session_id } => {
-            if gate(st, conn).is_err() {
+            let Some(role) = session_role(st, session_id, conn) else { return };
+            if !setup_allowed(st, conn, role) {
                 conn.error(ErrorCode::Unauthorized, crate::access::peer_message());
                 return;
             }
@@ -1421,13 +1439,6 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             if !session.accepted {
                 return;
             }
-            let role = if session.host_conn == conn.id {
-                Role::Host
-            } else if session.controller_conn == conn.id {
-                Role::Controller
-            } else {
-                return;
-            };
             let slot = session.slot_mut(role);
             slot.tcp = true;
             slot.public = Some(TCP_PLACEHOLDER);
@@ -2993,6 +3004,38 @@ mod tests {
         handle_message(&state, &mut conn, ClientMsg::RelayOverTcp { session_id: 5 });
         assert!(rx.try_recv().is_err());
         assert!(!state.lock().unwrap().sessions[&5].controller.tcp);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_host_without_a_sign_in_still_finishes_relay_setup_when_accounts_are_required() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-hostgate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::access::Policy { require_accounts: true, ..crate::access::Policy::default() }.save(&dir).unwrap();
+        let state = state_in(&dir);
+        let (mut host_conn, mut host_rx) = conn_pair();
+        host_conn.id = 11;
+        let (mut ctrl_conn, mut ctrl_rx) = conn_pair();
+        ctrl_conn.id = 12;
+        let sid = 0x0068_0001;
+        state.lock().unwrap().sessions.insert(sid, relay_session(host_conn.tx.clone(), ctrl_conn.tx.clone()));
+        // The host (a service with no usable token) advertises its LAN address and key.
+        handle_message(
+            &state,
+            &mut host_conn,
+            ClientMsg::UdpReady { session_id: sid, local_addrs: vec!["192.168.0.169:21201".parse().unwrap()], cert_fingerprint: Some([7; 32]) },
+        );
+        assert!(host_rx.try_recv().is_err(), "the host is not told to sign in");
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.sessions[&sid].host.fingerprint, Some([7; 32]));
+        }
+        handle_message(&state, &mut host_conn, ClientMsg::RelayOverTcp { session_id: sid });
+        assert!(matches!(host_rx.try_recv().unwrap(), ServerMsg::TcpRelayReady { .. }));
+        // An unsigned controller connection is still refused.
+        handle_message(&state, &mut ctrl_conn, ClientMsg::UdpReady { session_id: sid, local_addrs: vec![], cert_fingerprint: None });
+        assert!(matches!(ctrl_rx.try_recv().unwrap(), ServerMsg::Error { code: ErrorCode::Unauthorized, .. }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

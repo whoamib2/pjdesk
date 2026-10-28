@@ -441,7 +441,8 @@ private fun LockHelpCard(
             Text("Get help", color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.size(10.dp))
             Text("Your ID", color = scheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            // Each line is centered as a group (value plus icons) under its label.
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
                 Text(
                     help.id.ifBlank { "— — —" },
                     color = scheme.onSurface,
@@ -451,13 +452,13 @@ private fun LockHelpCard(
                     letterSpacing = 1.sp,
                 )
                 if (help.id.isNotBlank()) {
-                    TextButton(onClick = onCopyId) { Text("Copy") }
+                    CopyIconButton(onClick = onCopyId, description = "Copy ID")
                 }
             }
             if (help.password != null || help.refresh) {
                 Spacer(Modifier.size(8.dp))
                 Text("One-time password", color = scheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
                     Text(
                         help.password ?: "Waiting for a password",
                         color = if (help.password != null) scheme.onSurface else scheme.onSurfaceVariant,
@@ -466,10 +467,10 @@ private fun LockHelpCard(
                         fontSize = 22.sp,
                     )
                     if (help.password != null) {
-                        TextButton(onClick = onCopyPassword) { Text("Copy") }
+                        CopyIconButton(onClick = onCopyPassword, description = "Copy password")
                     }
                     if (help.refresh) {
-                        TextButton(onClick = onRefreshPassword) { Text("New") }
+                        RefreshPasswordButton(onClick = onRefreshPassword)
                     }
                 }
             }

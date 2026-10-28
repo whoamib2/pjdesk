@@ -92,6 +92,7 @@ import us.spader.pjdesk.core.connectStatusLabel
 import us.spader.pjdesk.core.shouldRetryNotOnline
 import us.spader.pjdesk.ui.ReauthScreen
 import us.spader.pjdesk.ui.SecretField
+import us.spader.pjdesk.ui.submitKeyboard
 import us.spader.pjdesk.ui.SetPinScreen
 import us.spader.pjdesk.ui.SignInScreen
 import us.spader.pjdesk.ui.UnlockScreen
@@ -2636,7 +2637,17 @@ class MainActivity : FragmentActivity() {
                                     onValueChange = { unattendedPin = it.filter { ch -> ch.isDigit() }.take(8) },
                                     label = { Text("PIN") },
                                     singleLine = true,
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                                    keyboardOptions = submitKeyboard(KeyboardType.NumberPassword),
+                                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = {
+                                        if (AppLockPolicy.pinAcceptable(unattendedPin)) {
+                                            if (pinMatches(unattendedPin)) {
+                                                confirmUnattended = false
+                                                engine.setUnattendedAccess(true)
+                                            } else {
+                                                scope.launch { snackbar.showSnackbar("Wrong PIN.") }
+                                            }
+                                        }
+                                    }),
                                 )
                             }
                         },
@@ -2741,6 +2752,26 @@ class MainActivity : FragmentActivity() {
                     val titleName = state.askName.ifBlank {
                         connectComputerName(saved, connectId).ifBlank { "this computer" }
                     }
+                    // Enter in the password field connects, like the Connect button.
+                    val submitAsked: () -> Unit = submitAsked@{
+                                val typed = askedPassword
+                                if (typed.isBlank()) return@submitAsked
+                                val id = connectId.filter { it.isDigit() }
+                                if (savePassword) {
+                                    app.store.stampPassword(id, typed)
+                                    if (temporarySession) app.store.noteTemporaryPassword(id)
+                                    showSaved()
+                                    syncPasswords(true)
+                                }
+                                askedPassword = ""
+                                if (state.askPassword) {
+                                    connecting = true
+                                    engine.showStatus(connectStatusLabel(connectComputerName(saved, id), id))
+                                    engine.submitPassword(typed)
+                                } else {
+                                    launchConnect(id, connectComputerName(saved, id), typed)
+                                }
+}
                     AlertDialog(
                         onDismissRequest = {
                             if (state.askPassword) engine.cancelPassword()
@@ -2761,6 +2792,7 @@ class MainActivity : FragmentActivity() {
                                     value = askedPassword,
                                     onValueChange = { askedPassword = it },
                                     label = "Computer password",
+                                    onSubmit = submitAsked,
                                 )
                                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                                     Checkbox(checked = savePassword, onCheckedChange = { savePassword = it })
@@ -2769,25 +2801,7 @@ class MainActivity : FragmentActivity() {
                             }
                         },
                         confirmButton = {
-                            TextButton(onClick = {
-                                val typed = askedPassword
-                                if (typed.isBlank()) return@TextButton
-                                val id = connectId.filter { it.isDigit() }
-                                if (savePassword) {
-                                    app.store.stampPassword(id, typed)
-                                    if (temporarySession) app.store.noteTemporaryPassword(id)
-                                    showSaved()
-                                    syncPasswords(true)
-                                }
-                                askedPassword = ""
-                                if (state.askPassword) {
-                                    connecting = true
-                                    engine.showStatus(connectStatusLabel(connectComputerName(saved, id), id))
-                                    engine.submitPassword(typed)
-                                } else {
-                                    launchConnect(id, connectComputerName(saved, id), typed)
-                                }
-                            }) { Text("Connect") }
+                            TextButton(onClick = { submitAsked() }) { Text("Connect") }
                         },
                         dismissButton = {
                             Row {

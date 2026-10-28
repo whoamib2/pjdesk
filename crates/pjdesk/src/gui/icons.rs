@@ -59,12 +59,7 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::Eye => eye(painter, c, s, color, stroke, false),
         Icon::EyeOff => eye(painter, c, s, color, stroke, true),
-        Icon::Refresh => {
-            let r = s * 0.32;
-            arc(painter, c, r, 0.6, 5.4, stroke);
-            let tip = c + Vec2::new(r * 0.6_f32.cos(), r * 0.6_f32.sin());
-            painter.arrow(tip, Vec2::new(s * 0.16, -s * 0.02), stroke);
-        }
+        Icon::Refresh => refresh(painter, c, s, 0.0, color, stroke),
         Icon::Gear => {
             let r = s * 0.18;
             painter.circle_stroke(c, r, stroke);
@@ -252,6 +247,40 @@ fn eye(painter: &egui::Painter, c: Pos2, s: f32, color: Color32, stroke: Stroke,
     }
 }
 
+/// Start and end of the refresh arc, in radians, before rotation: a 300° sweep
+/// clockwise from the upper right, leaving a gap where the arrowhead points.
+pub const REFRESH_ARC: (f32, f32) = (-1.05, 4.2);
+
+/// A circular-arrow refresh mark: one smooth arc and a filled arrowhead on its
+/// end, tangent to the arc. `turn` rotates the whole mark (the click spin).
+pub fn refresh(painter: &egui::Painter, c: Pos2, s: f32, turn: f32, color: Color32, stroke: Stroke) {
+    let r = s * 0.30;
+    let (a0, a1) = (REFRESH_ARC.0 + turn, REFRESH_ARC.1 + turn);
+    let steps = 40;
+    let points: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let t = a0 + (a1 - a0) * (i as f32 / steps as f32);
+            c + Vec2::new(t.cos(), t.sin()) * r
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, stroke));
+    let (tip, _, (w1, w2)) = refresh_head(c, r, a1, s);
+    painter.add(egui::Shape::convex_polygon(vec![tip, w1, w2], color, Stroke::NONE));
+}
+
+/// The arrowhead at angle `a` on a circle of radius `r`: tip, base center, and
+/// the two wings. The tip leads along the arc's clockwise tangent.
+pub fn refresh_head(c: Pos2, r: f32, a: f32, s: f32) -> (Pos2, Pos2, (Pos2, Pos2)) {
+    let on = c + Vec2::new(a.cos(), a.sin()) * r;
+    let tangent = Vec2::new(-a.sin(), a.cos());
+    let radial = Vec2::new(a.cos(), a.sin());
+    let len = s * 0.20;
+    let half = s * 0.14;
+    let tip = on + tangent * (len * 0.55);
+    let base = on - tangent * (len * 0.45);
+    (tip, base, (base + radial * half, base - radial * half))
+}
+
 fn arc(painter: &egui::Painter, c: Pos2, r: f32, a0: f32, a1: f32, stroke: Stroke) {
     let steps = 14;
     let mut prev = c + Vec2::new(a0.cos(), a0.sin()) * r;
@@ -271,4 +300,27 @@ fn star_points(c: Pos2, outer: f32, inner: f32) -> Vec<Pos2> {
         pts.push(c + Vec2::new(a.cos(), a.sin()) * r);
     }
     pts
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    #[test]
+    fn the_refresh_arrowhead_sits_on_the_arc_and_points_along_it() {
+        let c = Pos2::new(50.0, 50.0);
+        let s = 18.0;
+        let r = s * 0.30;
+        let a = REFRESH_ARC.1;
+        let (tip, base, (w1, w2)) = refresh_head(c, r, a, s);
+        // The wings straddle the circle, one inside and one outside.
+        assert!((w1.distance(c) - r) * (w2.distance(c) - r) < 0.0);
+        // The tip leads the base in the drawing direction (increasing angle).
+        let ang = |p: Pos2| (p.y - c.y).atan2(p.x - c.x);
+        let d = (ang(tip) - ang(base)).rem_euclid(std::f32::consts::TAU);
+        assert!(d > 0.0 && d < 1.0, "{d}");
+        // A 300° sweep leaves a clear gap for the head.
+        let sweep = REFRESH_ARC.1 - REFRESH_ARC.0;
+        assert!(sweep > 4.9 && sweep < 5.4);
+    }
 }

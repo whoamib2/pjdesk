@@ -234,6 +234,8 @@ impl App {
             theme::apply(ctx, &self.cfg.settings.theme);
             self.show_settings = false;
         }
+        // Enter in a Settings password field saves, like the Save button.
+        save |= self.ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new(SAVE_ON_ENTER)).unwrap_or(false));
         if save && self.apply_settings() {
             self.show_settings = false;
         }
@@ -471,6 +473,15 @@ fn header(ui: &mut egui::Ui, p: &theme::Paint, cancel: &mut bool) {
     });
 }
 
+const SAVE_ON_ENTER: &str = "pjdesk-settings-save-on-enter";
+
+/// Enter in this Settings field saves the dialog at the end of the frame.
+fn save_on_enter(ui: &egui::Ui, response: &egui::Response) {
+    if widgets::submitted(ui, response) {
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(SAVE_ON_ENTER), true));
+    }
+}
+
 fn footer(ui: &mut egui::Ui, save: &mut bool, cancel: &mut bool) {
     let p = theme::paint(ui);
     egui::Frame::NONE.inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
@@ -572,7 +583,8 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
     widgets::heading(ui, "UNATTENDED ACCESS");
     widgets::checkbox(ui, &mut d.use_permanent, "Set a permanent password for this computer");
     ui.add_enabled_ui(d.use_permanent, |ui| {
-        widgets::password_field(ui, &mut d.permanent_password, widgets::PERMANENT_PASSWORD_HINT, &mut d.show_permanent);
+        let r = widgets::password_field(ui, &mut d.permanent_password, widgets::PERMANENT_PASSWORD_HINT, &mut d.show_permanent);
+        save_on_enter(ui, &r);
     });
     ui.label(widgets::muted(
         ui,
@@ -645,13 +657,14 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
         ui.add_space(6.0);
         ui.label(widgets::muted(ui, "Set the service's unattended password"));
         ui.horizontal(|ui| {
-            widgets::password_field(
+            let r = widgets::password_field(
                 ui,
                 &mut d.service_password,
                 widgets::PERMANENT_PASSWORD_HINT,
                 &mut d.show_service_password,
             );
-            if ui.button("Apply").clicked() && !d.service_password.trim().is_empty() {
+            let enter = widgets::submitted(ui, &r);
+            if (ui.button("Apply").clicked() || enter) && !d.service_password.trim().is_empty() {
                 let pw = d.service_password.trim().to_string();
                 if pw.chars().count() < 8 {
                     d.service_note = "Use at least 8 characters.".into();
@@ -692,7 +705,8 @@ impl App {
         widgets::text_field(ui, &mut self.settings.server, "desk.example.com  or  192.168.1.10", false);
         ui.add_space(6.0);
         widgets::field_label(ui, "Access key");
-        widgets::password_field(ui, &mut self.settings.access_key, "pjdesk-key1.…", &mut self.settings.show_access_key);
+        let r = widgets::password_field(ui, &mut self.settings.access_key, "pjdesk-key1.…", &mut self.settings.show_access_key);
+        save_on_enter(ui, &r);
         ui.label(widgets::muted(
             ui,
             "From the person who runs the server. With this key, this computer can register when signed-in accounts are required.",
@@ -969,7 +983,9 @@ impl App {
         ));
         ui.add_space(6.0);
         widgets::field_label(ui, "Support key");
-        widgets::password_field(ui, &mut self.support_keys.enter_code, "1234 5678", &mut self.support_keys.enter_show);
+        let key_box =
+            widgets::password_field(ui, &mut self.support_keys.enter_code, "1234 5678", &mut self.support_keys.enter_show);
+        let key_enter = widgets::submitted(ui, &key_box);
         if self.support_keys.need_consent {
             ui.add_space(6.0);
             let owner = self.support_keys.enter_owner.clone();
@@ -980,7 +996,7 @@ impl App {
             }
         }
         let busy = self.net_busy;
-        if ui.add_enabled(!busy, egui::Button::new(if busy { "Checking…" } else { "Use this key" })).clicked() {
+        if ui.add_enabled(!busy, egui::Button::new(if busy { "Checking…" } else { "Use this key" })).clicked() || (key_enter && !busy) {
             self.submit_support_key();
         }
         if !self.support_keys.enter_note.is_empty() && !self.support_keys.need_consent {

@@ -2284,6 +2284,8 @@ impl App {
             return;
         }
         let mut act: Option<CloudAct> = None;
+        let mut secret_enter = false;
+        let mut code_enter = false;
         let busy = self.cloud_job.is_some();
         let dns = "your server's name".to_string();
         let online = self.online.len();
@@ -2462,7 +2464,8 @@ impl App {
                                 ui.end_row();
                                 ui.label("Secret access key");
                                 ui.horizontal(|ui| {
-                                    ui.add(egui::TextEdit::singleline(&mut f.secret).password(!f.show_secret).desired_width(300.0));
+                                    let r = ui.add(egui::TextEdit::singleline(&mut f.secret).password(!f.show_secret).desired_width(300.0));
+                                    secret_enter = enter_pressed(ui, &r);
                                     reveal_toggle(ui, &mut f.show_secret);
                                 });
                                 ui.end_row();
@@ -2478,18 +2481,19 @@ impl App {
                                         f.confirm_replace = false;
                                     }
                                 });
-                            } else if ui.add(egui::Button::new("Start syncing").fill(p(ui).accent)).clicked() {
+                            } else if ui.add(egui::Button::new("Start syncing").fill(p(ui).accent)).clicked() || secret_enter {
                                 act = Some(CloudAct::Setup { replace: false });
                             }
                         } else {
                             ui.horizontal(|ui| {
                                 ui.label("Join code");
-                                ui.add(
+                                let r = ui.add(
                                     egui::TextEdit::singleline(&mut f.code)
                                         .password(!f.show_code)
                                         .hint_text("pjdesk-sync-1:…")
                                         .desired_width(330.0),
                                 );
+                                code_enter = enter_pressed(ui, &r);
                                 reveal_toggle(ui, &mut f.show_code);
                             });
                             ui.label(
@@ -2508,7 +2512,7 @@ impl App {
                                         f.confirm_join = false;
                                     }
                                 });
-                            } else if ui.add(egui::Button::new("Join").fill(p(ui).accent)).clicked() {
+                            } else if ui.add(egui::Button::new("Join").fill(p(ui).accent)).clicked() || code_enter {
                                 if online > 0 {
                                     f.confirm_join = true;
                                 } else {
@@ -3343,12 +3347,15 @@ impl App {
                         ui.add_space(6.0);
                         ui.label("Passphrase");
                         ui.horizontal(|ui| {
-                            ui.add(
+                            let r = ui.add(
                                 egui::TextEdit::singleline(&mut self.nk_pass)
                                     .password(!self.nk_show)
                                     .hint_text("At least 8 characters")
                                     .desired_width(280.0),
                             );
+                            if enter_pressed(ui, &r) && !self.nk_busy {
+                                create = true;
+                            }
                             let label = if self.nk_show { "Hide" } else { "Show" };
                             if ui.button(label).clicked() {
                                 self.nk_show = !self.nk_show;
@@ -4032,7 +4039,10 @@ impl App {
                     "Enter the account owner's password to let {shown} connect to other computers."
                 ));
                 ui.add_space(8.0);
-                ui.add(egui::TextEdit::singleline(&mut self.incoming_pass).password(!self.incoming_show).hint_text("Account password"));
+                let r = ui.add(egui::TextEdit::singleline(&mut self.incoming_pass).password(!self.incoming_show).hint_text("Account password"));
+                if enter_pressed(ui, &r) {
+                    submit = true;
+                }
                 ui.checkbox(&mut self.incoming_show, "Show password");
                 if ui.button("Allow outgoing").clicked() {
                     submit = true;
@@ -5027,4 +5037,9 @@ mod tests {
         assert!(facts.contains("Last IP 203.0.113.8"));
         assert!(computer_facts("", 0, 0, 0).contains("Last IP unknown"));
     }
+}
+
+/// True when Enter left this single-line field: the same as clicking its button.
+fn enter_pressed(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
 }

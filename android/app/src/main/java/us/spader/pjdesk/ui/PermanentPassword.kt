@@ -87,11 +87,12 @@ internal fun PermanentPasswordFields(
     confirm: String,
     onConfirm: (String) -> Unit,
     issue: String?,
+    onSubmit: (() -> Unit)? = null,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SecretField(value = password, onValueChange = onPassword, label = "Password")
         Text(permanentHint(password), color = pjMuted(), style = MaterialTheme.typography.bodySmall)
-        SecretField(value = confirm, onValueChange = onConfirm, label = "Confirm password")
+        SecretField(value = confirm, onValueChange = onConfirm, label = "Confirm password", onSubmit = onSubmit)
         if (issue != null) {
             Text(issue, color = MaterialTheme.colorScheme.error)
         }
@@ -118,6 +119,7 @@ private fun PermanentPasswordDialog(
                 confirm = confirm,
                 onConfirm = { confirm = it },
                 issue = issue,
+                onSubmit = { if (issue == null && password.isNotEmpty()) onSave(password, confirm) },
             )
         },
         confirmButton = {

@@ -446,6 +446,38 @@ fn note_lan_beacon(target: &str) {
     }
 }
 
+/// When the server never pairs the two sides (an older server refused the
+/// host's setup), a host heard on this network is reached directly.
+async fn lan_after_relay_setup(
+    config: &mut Config,
+    target: &str,
+    password: &str,
+    mine: &[std::net::Ipv4Addr],
+    force_relay: bool,
+) -> Result<Option<Link>> {
+    if force_relay || password.is_empty() {
+        return Ok(None);
+    }
+    tracing::info!("The relay setup did not finish; trying the host on this network");
+    let id = target.to_string();
+    let _ = tokio::task::spawn_blocking(move || note_lan_beacon(&id)).await;
+    if let Ok(disk) = Config::load() {
+        config.fill_peer_facts_from(&disk);
+    }
+    match try_cached_lan(config, target, password, mine).await {
+        Ok(Some(link)) => {
+            tracing::info!("Connected over the LAN after the relay setup did not finish");
+            Ok(Some(link))
+        }
+        Ok(None) => Ok(None),
+        Err(err) if err.is::<WrongPassword>() || already_in_session(&err) => Err(err),
+        Err(err) => {
+            tracing::info!("LAN connection did not start: {err:#}");
+            Ok(None)
+        }
+    }
+}
+
 /// Signaling → UDP binding → hole punching / relay → QUIC → password check.
 async fn connect(
     server: &ServerAddr,
@@ -618,10 +650,20 @@ async fn connect(
                 }
                 break (public_addr, local_addrs, cert_fingerprint.context("the server didn't send the host's key")?)
             }
-            Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
+            Ok(Some(ServerMsg::Error { message, .. })) => {
+                if let Some(link) = lan_after_relay_setup(config, target, password, &mine, force_relay).await? {
+                    return Ok(link);
+                }
+                bail!("{message}")
+            }
             Ok(Some(_)) => continue,
             Ok(None) => bail!("the server closed the connection"),
-            Err(_) => bail!("the host did not finish setting up the connection"),
+            Err(_) => {
+                if let Some(link) = lan_after_relay_setup(config, target, password, &mine, force_relay).await? {
+                    return Ok(link);
+                }
+                bail!("the host did not finish setting up the connection")
+            }
         }
     };
     // Signaling is done; everything else goes peer to peer, or over this

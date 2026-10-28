@@ -625,10 +625,13 @@ impl App {
                 ui.label(RichText::new("Get help").strong().size(16.0).color(p.text));
                 ui.add_space(8.0);
                 ui.label(RichText::new("Your ID").color(p.muted).size(12.5));
-                ui.horizontal(|ui| {
+                // Each line is centered as a group (value plus icons) under its label.
+                let shown = if help.id.is_empty() { "— — —".to_string() } else { help.id.clone() };
+                let id_icons = if help.id.is_empty() { 0 } else { 1 };
+                let id_w = widgets::text_width(ui, &shown, egui::FontId::proportional(32.0)) + id_icons as f32 * (32.0 + 8.0);
+                widgets::centered_row(ui, id_w, |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    let shown = if help.id.is_empty() { "— — —".into() } else { help.id.clone() };
-                    ui.label(RichText::new(shown).size(32.0).strong().color(p.text));
+                    ui.label(RichText::new(&shown).size(32.0).strong().color(p.text));
                     if !help.id.is_empty()
                         && widgets::icon_button(ui, super::icons::Icon::Copy, "Copy ID").clicked()
                         && widgets::copy_to_clipboard(&pjdesk_proto::normalize_id(&help.id))
@@ -641,8 +644,14 @@ impl App {
                 }
                 ui.add_space(10.0);
                 ui.label(RichText::new("One-time password").color(p.muted).size(12.5));
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
+                let gap = 4.0;
+                let value_w = match &help.password {
+                    Some(pw) => widgets::text_width(ui, pw, egui::FontId::monospace(24.0)) + gap + 32.0,
+                    None => 20.0 + gap + widgets::text_width(ui, "Waiting for a password", egui::FontId::proportional(14.0)),
+                };
+                let pw_w = value_w + if help.refresh { gap + 32.0 } else { 0.0 };
+                widgets::centered_row(ui, pw_w, |ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
                     match &help.password {
                         Some(pw) => {
                             ui.label(RichText::new(pw).size(24.0).strong().monospace().color(p.text));
@@ -657,8 +666,7 @@ impl App {
                             ui.label(RichText::new("Waiting for a password").color(p.muted));
                         }
                     }
-                    if help.refresh && widgets::icon_button(ui, super::icons::Icon::Refresh, "New one-time password").clicked()
-                    {
+                    if help.refresh && widgets::refresh_button(ui, "New password").clicked() {
                         self.refresh_one_time_password();
                     }
                 });
@@ -1005,33 +1013,46 @@ impl App {
             ui.add_space(12.0);
             return;
         }
+        let mut to_new = false;
         if local {
             if have {
                 ui.label("Current PIN");
                 let mut current = self.pin_current.clone();
-                pin_entry(ui, &mut current, "current", "Current PIN", &mut self.pin_show_current);
+                let current_box = pin_entry(ui, &mut current, "current", "Current PIN", &mut self.pin_show_current);
                 self.pin_current = digits_only(&current);
+                to_new = widgets::submitted(ui, &current_box);
             }
         } else if !have {
             ui.label("Account password");
             let mut pass = self.pin_password.clone();
-            widgets::password_field(ui, &mut pass, "Account password", &mut self.pin_show_password);
+            let pass_box = widgets::password_field(ui, &mut pass, "Account password", &mut self.pin_show_password);
             self.pin_password = pass;
+            to_new = widgets::submitted(ui, &pass_box);
         } else {
             ui.label("Current PIN");
             let mut current = self.pin_current.clone();
-            pin_entry(ui, &mut current, "current", "Current PIN", &mut self.pin_show_current);
+            let current_box = pin_entry(ui, &mut current, "current", "Current PIN", &mut self.pin_show_current);
             self.pin_current = digits_only(&current);
             ui.label(widgets::muted(ui, "Or your account password, if you don't have the PIN."));
             let mut pass = self.pin_password.clone();
-            widgets::password_field(ui, &mut pass, "Account password", &mut self.pin_show_password);
+            let pass_box = widgets::password_field(ui, &mut pass, "Account password", &mut self.pin_show_password);
             self.pin_password = pass;
+            to_new = widgets::submitted(ui, &current_box) || widgets::submitted(ui, &pass_box);
         }
         ui.add_space(4.0);
         ui.label("New PIN");
         let mut new_pin = self.pin_new.clone();
         let new_box = pin_entry(ui, &mut new_pin, "new", "4 to 8 digits", &mut self.pin_show_new);
         self.pin_new = digits_only(&new_pin);
+        // Enter in the current PIN or password saves when the new PIN is ready,
+        // otherwise moves on to it, like the button.
+        if to_new {
+            if pin_save_ready(&self.pin_new, &self.pin_confirm) && !self.lock_busy {
+                self.start_save(false);
+            } else {
+                new_box.request_focus();
+            }
+        }
         let advance = widgets::submitted(ui, &new_box);
         ui.label("Confirm PIN");
         let mut confirm = self.pin_confirm.clone();
@@ -1654,8 +1675,21 @@ fn wait_label(secs: u64) -> String {
     }
 }
 
+/// Whether the new PIN and its confirmation are ready to save.
+pub(crate) fn pin_save_ready(new_pin: &str, confirm: &str) -> bool {
+    pjdesk_proto::applock::pin_acceptable(new_pin) && new_pin == confirm
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enter_saves_only_a_complete_matching_pin() {
+        assert!(super::pin_save_ready("4821", "4821"));
+        assert!(!super::pin_save_ready("4821", "4822"));
+        assert!(!super::pin_save_ready("48", "48"));
+        assert!(!super::pin_save_ready("", ""));
+    }
+
     use std::time::{Duration, Instant};
 
     use super::{lock_help, one_time_withheld, pin_mark_xs, pin_shake_offset};

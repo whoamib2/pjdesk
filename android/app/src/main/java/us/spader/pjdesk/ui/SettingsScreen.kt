@@ -197,6 +197,11 @@ fun SettingsScreen(
                 singleLine = true,
                 label = { Text("Access key") },
                 visualTransformation = if (showAccessKey) VisualTransformation.None else PasswordVisualTransformation(),
+                keyboardOptions = submitKeyboard(),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = {
+                    onAccessKey(accessKey.trim())
+                    onServer(server.trim())
+                }),
                 trailingIcon = {
                     TextButton(onClick = { showAccessKey = !showAccessKey }) {
                         Text(if (showAccessKey) "Hide" else "Show")
@@ -398,7 +403,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.67", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.68", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }

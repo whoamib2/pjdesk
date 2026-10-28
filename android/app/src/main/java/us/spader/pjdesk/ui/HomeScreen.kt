@@ -169,7 +169,7 @@ fun HomeScreen(
                         IconButton(onClick = { showSupport = !showSupport }, enabled = state.supportPassword.isNotEmpty()) {
                             Glyph(if (showSupport) "hide" else "show")
                         }
-                        IconButton(onClick = onRefreshSupport) { Glyph("refresh") }
+                        RefreshPasswordButton(onClick = onRefreshSupport)
                     }
                     Text("Temporary password", color = pjMuted(), style = MaterialTheme.typography.labelMedium)
                     Text(
@@ -247,7 +247,7 @@ fun HomeScreen(
                         Glyph(if (showPassword) "hide" else "show")
                     }
                     IconButton(onClick = onCopyPassword, enabled = state.password.isNotEmpty()) { Glyph("copy") }
-                    IconButton(onClick = onRegenerate) { Glyph("refresh") }
+                    RefreshPasswordButton(onClick = onRegenerate)
                 }
                 Text("One-time password", color = pjMuted(), style = MaterialTheme.typography.labelMedium)
             }
@@ -274,6 +274,11 @@ fun HomeScreen(
                 singleLine = true,
                 label = { Text("Account owner's password") },
                 visualTransformation = if (ownerShow) VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                keyboardOptions = submitKeyboard(),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = {
+                    onIncomingOnly(false, ownerPass)
+                    ownerPass = ""
+                }),
                 trailingIcon = {
                     IconButton(onClick = { ownerShow = !ownerShow }) { Glyph(if (ownerShow) "hide" else "show") }
                 },
@@ -295,6 +300,8 @@ fun HomeScreen(
                 label = { Text(if (connectName.isBlank()) "Partner ID" else connectName) },
                 visualTransformation = IdGroupTransformation,
                 textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace),
+                keyboardOptions = submitKeyboard(androidx.compose.ui.text.input.KeyboardType.Number),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { onConnect() }),
             )
             Button(onClick = onConnect, modifier = Modifier.widthIn(min = 108.dp)) { Text("Connect") }
         }
@@ -314,6 +321,10 @@ fun HomeScreen(
             singleLine = true,
             label = { Text("Temporary password") },
             visualTransformation = if (helpShow) VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
+            keyboardOptions = submitKeyboard(),
+            keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = {
+                onSupportConnect(helpCode.filter { it.isDigit() }.take(8), helpPass)
+            }),
             trailingIcon = {
                 IconButton(onClick = { helpShow = !helpShow }) { Glyph(if (helpShow) "hide" else "show") }
             },

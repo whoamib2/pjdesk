@@ -1,7 +1,9 @@
 package us.spader.pjdesk.ui
 
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -22,6 +24,7 @@ fun SecretField(
     label: String,
     modifier: Modifier = Modifier,
     readOnly: Boolean = false,
+    onSubmit: (() -> Unit)? = null,
 ) {
     var shown by rememberSaveable(label) { mutableStateOf(false) }
     OutlinedTextField(
@@ -32,7 +35,8 @@ fun SecretField(
         singleLine = true,
         label = { Text(label) },
         visualTransformation = if (shown) VisualTransformation.None else PasswordVisualTransformation(),
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+        keyboardOptions = if (onSubmit != null) submitKeyboard() else KeyboardOptions(keyboardType = KeyboardType.Password),
+        keyboardActions = KeyboardActions(onDone = { onSubmit?.invoke() }),
         trailingIcon = {
             TextButton(onClick = { shown = !shown }) {
                 Text(if (shown) "Hide" else "Show")
@@ -40,3 +44,10 @@ fun SecretField(
         },
     )
 }
+
+/**
+ * Keyboard for a password or PIN field whose Enter (the IME action) submits,
+ * just like tapping the button under it.
+ */
+fun submitKeyboard(type: KeyboardType = KeyboardType.Password): KeyboardOptions =
+    KeyboardOptions(keyboardType = type, imeAction = ImeAction.Done)

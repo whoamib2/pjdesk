@@ -185,6 +185,77 @@ pub fn icon_button_active(ui: &mut egui::Ui, icon: Icon, tip: &str, active: bool
     resp.on_hover_text(tip)
 }
 
+/// How long the refresh mark spins after a click.
+pub const REFRESH_SPIN_SECS: f32 = 0.45;
+
+/// Rotation of the refresh mark `t` seconds after a click: one eased turn.
+pub fn refresh_spin(t: f32) -> f32 {
+    if !(0.0..REFRESH_SPIN_SECS).contains(&t) {
+        return 0.0;
+    }
+    let x = t / REFRESH_SPIN_SECS;
+    let eased = 1.0 - (1.0 - x).powi(3);
+    eased * std::f32::consts::TAU
+}
+
+/// The "new password" button: a vector circular arrow the same size and
+/// weight as the copy icon, a hover highlight and tooltip, and a short spin
+/// when clicked.
+pub fn refresh_button(ui: &mut egui::Ui, tip: &str) -> egui::Response {
+    let p = theme::paint(ui);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), Sense::click());
+    let key = resp.id.with("spin");
+    let now = ui.input(|i| i.time);
+    if resp.clicked() {
+        ui.data_mut(|d| d.insert_temp(key, now));
+    }
+    let started: Option<f64> = ui.data(|d| d.get_temp(key));
+    let turn = started.map(|t0| refresh_spin((now - t0) as f32)).unwrap_or(0.0);
+    if let Some(t0) = started {
+        if ((now - t0) as f32) < REFRESH_SPIN_SECS {
+            ui.ctx().request_repaint();
+        } else {
+            ui.data_mut(|d| d.remove::<f64>(key));
+        }
+    }
+    let bg = if resp.is_pointer_button_down_on() {
+        p.accent.linear_multiply(0.35)
+    } else if resp.hovered() {
+        p.elev
+    } else {
+        Color32::TRANSPARENT
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
+    }
+    let color = if resp.hovered() { p.text } else { p.muted };
+    let inner = rect.shrink(7.0);
+    let s = inner.width().min(inner.height());
+    let stroke = egui::Stroke::new((s * 0.09).clamp(1.2, 1.8), color);
+    icons::refresh(ui.painter(), inner.center(), s, turn, color, stroke);
+    resp.on_hover_text(tip)
+}
+
+/// Left padding that centers a row `content` wide in `available`.
+pub fn center_pad(available: f32, content: f32) -> f32 {
+    ((available - content) / 2.0).max(0.0)
+}
+
+/// Lays out one row centered as a group. `content` is the row's measured width.
+pub fn centered_row<R>(ui: &mut egui::Ui, content: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        let pad = center_pad(ui.available_width(), content);
+        ui.add_space(pad);
+        add(ui)
+    })
+    .inner
+}
+
+/// Width of `text` drawn in `font`, for [`centered_row`].
+pub fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
+    ui.painter().layout_no_wrap(text.to_string(), font, Color32::WHITE).size().x
+}
+
 /// Checkbox drawn by us, so the check mark is not a missing font glyph.
 pub fn checkbox(ui: &mut egui::Ui, on: &mut bool, label: &str) -> bool {
     let p = theme::paint(ui);
@@ -262,4 +333,23 @@ pub fn muted(ui: &egui::Ui, text: &str) -> RichText {
 
 pub fn status_dot(ui: &mut egui::Ui, color: Color32, label: &str) {
     theme::pill(ui, color, label);
+}
+
+#[cfg(test)]
+mod refresh_button_tests {
+    #[test]
+    fn the_refresh_spin_is_one_short_eased_turn() {
+        assert_eq!(super::refresh_spin(-0.1), 0.0);
+        assert_eq!(super::refresh_spin(super::REFRESH_SPIN_SECS), 0.0);
+        let mid = super::refresh_spin(super::REFRESH_SPIN_SECS / 2.0);
+        assert!(mid > std::f32::consts::PI && mid < std::f32::consts::TAU);
+        assert!(super::refresh_spin(super::REFRESH_SPIN_SECS * 0.99) > 6.2);
+        assert!(super::REFRESH_SPIN_SECS <= 0.6, "short");
+    }
+
+    #[test]
+    fn a_row_is_centered_as_a_group() {
+        assert_eq!(super::center_pad(400.0, 200.0), 100.0);
+        assert_eq!(super::center_pad(100.0, 300.0), 0.0);
+    }
 }

@@ -196,7 +196,7 @@ impl App {
                                 self.show_support_password = !self.show_support_password;
                             }
                         }
-                        if widgets::icon_button(ui, Icon::Refresh, "New code and password").clicked() {
+                        if widgets::refresh_button(ui, "New password").clicked() {
                             self.refresh_support_pair();
                         }
                     });
@@ -269,7 +269,7 @@ impl App {
                         {
                             self.toast.show("Password copied");
                         }
-                        if in_process && widgets::icon_button(ui, Icon::Refresh, "New one-time password").clicked() {
+                        if in_process && widgets::refresh_button(ui, "New password").clicked() {
                             self.engine.shared.request_regenerate();
                             self.toast.show("New one-time password");
                         }
@@ -321,6 +321,7 @@ impl App {
     fn sign_in_panel(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
         let mut go = false;
+        let mut net_enter = false;
         let mut enroll_only = false;
         let mut cancel = false;
         ui.vertical_centered(|ui| {
@@ -375,7 +376,8 @@ impl App {
                     if !embedded {
                         ui.add_space(8.0);
                         widgets::field_label(ui, "Passphrase");
-                        widgets::password_field(ui, &mut self.net_key_pass, "Passphrase", &mut self.net_key_show);
+                        let r = widgets::password_field(ui, &mut self.net_key_pass, "Passphrase", &mut self.net_key_show);
+                        net_enter |= widgets::submitted(ui, &r);
                         ui.label(widgets::muted(
                             ui,
                             "Only if the key was created with a passphrase. Leave this empty for a self-contained key.",
@@ -392,17 +394,20 @@ impl App {
                         widgets::account_email_field(ui, &mut self.net_email);
                         ui.add_space(8.0);
                         widgets::field_label(ui, "Account password");
-                        widgets::account_password_field(ui, &mut self.net_pass, &mut self.net_show);
+                        let r = widgets::account_password_field(ui, &mut self.net_pass, &mut self.net_show);
+                        net_enter |= widgets::submitted(ui, &r);
                     }
                 } else if self.net_mode == 0 {
                     widgets::field_label(ui, "Email");
                     widgets::account_email_field(ui, &mut self.net_email);
                     ui.add_space(8.0);
                     widgets::field_label(ui, "PJDesk account password");
-                    widgets::account_password_field(ui, &mut self.net_pass, &mut self.net_show);
+                    let r = widgets::account_password_field(ui, &mut self.net_pass, &mut self.net_show);
+                    net_enter |= widgets::submitted(ui, &r);
                 } else {
                     widgets::field_label(ui, "8-digit code");
-                    widgets::text_field(ui, &mut self.net_code, "1234 5678", true);
+                    let r = widgets::text_field(ui, &mut self.net_code, "1234 5678", true);
+                    net_enter |= widgets::submitted(ui, &r);
                     ui.label(widgets::muted(
                         ui,
                         "An invite from a signed-in PJDesk works once, for one hour. A support key works for as long as that key allows. An older enrollment code still works here.",
@@ -472,7 +477,7 @@ impl App {
                         widgets::accent_button(ui, label, egui::vec2(ui.available_width(), 40.0))
                     })
                     .inner;
-                if clicked && sign_in_open {
+                if (clicked || net_enter) && sign_in_open {
                     go = true;
                 }
                 if self.net_mode == 0 && sign_in_open {
@@ -572,7 +577,10 @@ impl App {
                 if needs {
                     ui.add_space(8.0);
                     widgets::field_label(ui, "Passphrase");
-                    widgets::password_field(ui, &mut self.import_pass, "Passphrase", &mut self.import_show);
+                    let r = widgets::password_field(ui, &mut self.import_pass, "Passphrase", &mut self.import_show);
+                    if widgets::submitted(ui, &r) {
+                        go = true;
+                    }
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -703,13 +711,14 @@ impl App {
             });
         } else {
             ui.label(widgets::muted(ui, "Permanent password (optional, for unattended access)"));
-            widgets::password_field(
+            let r = widgets::password_field(
                 ui,
                 &mut self.perm_input,
                 widgets::PERMANENT_PASSWORD_HINT,
                 &mut self.show_perm_input,
             );
-            if ui.add_sized([88.0, 36.0], egui::Button::new("Set")).on_hover_text("At least 8 characters").clicked()
+            let enter = widgets::submitted(ui, &r);
+            if (ui.add_sized([88.0, 36.0], egui::Button::new("Set")).on_hover_text("At least 8 characters").clicked() || enter)
                 && !self.perm_input.trim().is_empty()
             {
                 let pw = self.perm_input.clone();
@@ -826,14 +835,15 @@ impl App {
 
             ui.add_space(12.0);
             widgets::field_label(ui, "Or use their support code");
-            widgets::text_field(ui, &mut self.support_code_in, "1234 5678", true);
+            let code_box = widgets::text_field(ui, &mut self.support_code_in, "1234 5678", true);
             ui.add_space(6.0);
-            widgets::password_field(ui, &mut self.support_pass_in, "Temporary password", &mut self.support_pass_show);
+            let pass_box = widgets::password_field(ui, &mut self.support_pass_in, "Temporary password", &mut self.support_pass_show);
+            let support_enter = widgets::submitted(ui, &code_box) || widgets::submitted(ui, &pass_box);
             if !self.support_error.is_empty() {
                 ui.colored_label(p.warn, &self.support_error);
             }
             let support_label = if self.support_busy { "Connecting…" } else { "Connect with code" };
-            if widgets::accent_button(ui, support_label, Vec2::new(ui.available_width(), 36.0)) && !self.support_busy {
+            if (widgets::accent_button(ui, support_label, Vec2::new(ui.available_width(), 36.0)) || support_enter) && !self.support_busy {
                 self.start_support_connect();
             }
             ui.label(widgets::muted(
@@ -1047,16 +1057,18 @@ impl App {
                 ui.label(RichText::new(&self.password_notice).color(p.warn));
                 ui.add_space(8.0);
                 ui.label("New password");
-                widgets::password_field(
+                let first = widgets::password_field(
                     ui,
                     &mut self.change_pass,
                     "At least 12 characters, mixed case, a digit, and a symbol",
                     &mut self.show_change_pass,
                 );
+                submit |= widgets::submitted(ui, &first) && !self.change_pass2.is_empty();
                 ui.add_space(8.0);
                 ui.label("Type it again");
                 let mut shown = self.show_change_pass;
-                widgets::password_field(ui, &mut self.change_pass2, "Repeat the password", &mut shown);
+                let second = widgets::password_field(ui, &mut self.change_pass2, "Repeat the password", &mut shown);
+                submit |= widgets::submitted(ui, &second);
                 self.show_change_pass = shown;
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {

@@ -67,6 +67,20 @@ fun SignInScreen(
     onSignInTrace: (String) -> Unit = {},
     onCopyDiagnostics: () -> Unit = {},
 ) {
+    // Enter (the keyboard's Done) in a password, passphrase or code field does
+    // what the Sign in button does.
+    fun keyboardSubmit() {
+        val emailSignIn = !useCode && !useKey
+        if (busy || (signInPaused && emailSignIn)) return
+        val op = if (useKey) "key" else if (useCode) "code" else "sign-in"
+        val line = if (signInTrace != null) {
+            signInScreenPressed(signInTrace, serverAddress, op)
+        } else {
+            signInLogLine(serverAddress, "screen", "op=$op")
+        }
+        onSignInTrace(line)
+        onSubmit()
+    }
     PjPage {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -110,7 +124,7 @@ fun SignInScreen(
                         label = { Text("Network key") },
                     )
                     if (NetKey.kind(blob) != "embedded") {
-                        SecretField(value = keyPass, onValueChange = onKeyPass, label = "Passphrase")
+                        SecretField(value = keyPass, onValueChange = onKeyPass, label = "Passphrase", onSubmit = { keyboardSubmit() })
                         Text("Only if the key was created with a passphrase.", color = pjMuted())
                     } else {
                         Text("Anyone who has this network key can join.", color = MaterialTheme.colorScheme.error)
@@ -120,11 +134,11 @@ fun SignInScreen(
                     }
                     if (accountForKey || error.contains("specific account")) {
                     AccountEmailField(value = email, onValueChange = onEmail, label = "Account email")
-                    AccountPasswordField(value = password, onValueChange = onPassword, label = "Account password")
+                    AccountPasswordField(value = password, onValueChange = onPassword, label = "Account password", onSubmit = { keyboardSubmit() })
                     }
                 } else if (!useCode) {
                     AccountEmailField(value = email, onValueChange = onEmail, label = "Email")
-                    AccountPasswordField(value = password, onValueChange = onPassword, label = "PJDesk account password")
+                    AccountPasswordField(value = password, onValueChange = onPassword, label = "PJDesk account password", onSubmit = { keyboardSubmit() })
                 } else {
                     OutlinedTextField(
                         value = code,
@@ -133,6 +147,8 @@ fun SignInScreen(
                         singleLine = true,
                         label = { Text("8-digit code") },
                         placeholder = { Text("1234 5678") },
+                        keyboardOptions = submitKeyboard(androidx.compose.ui.text.input.KeyboardType.Number),
+                        keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { keyboardSubmit() }),
                     )
                     Text(
                         "From Invite on a signed-in PJDesk. One use, one hour. An older enrollment code from pjdesk.com still works here.",
@@ -239,7 +255,7 @@ fun ServerConfigOffer(
             )
             when (NetKey.kind(blob)) {
                 "embedded" -> Text("Anyone who has this network key can join.", color = MaterialTheme.colorScheme.error)
-                "passphrase" -> SecretField(value = pass, onValueChange = onPass, label = "Passphrase")
+                "passphrase" -> SecretField(value = pass, onValueChange = onPass, label = "Passphrase", onSubmit = onImport)
             }
             Button(onClick = onImport, modifier = Modifier.fillMaxWidth()) { Text("Import server config") }
             TextButton(onClick = onCancel) { Text("Cancel") }

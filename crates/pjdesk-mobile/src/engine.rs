@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.67";
+pub const APP_VERSION: &str = "0.6.68";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -3753,6 +3753,10 @@ async fn wait_typed_password(state: &State) -> Result<TypedAuth> {
     }
 }
 
+/// How long the phone waits for the server to pair it with the computer
+/// before using a computer it heard on this Wi-Fi.
+const LAN_FALLBACK_AFTER: Duration = Duration::from_secs(6);
+
 async fn controller_session(
     state: Arc<State>,
     cb: Arc<dyn Callbacks>,
@@ -3873,19 +3877,60 @@ async fn controller_session(
         local_addrs: binding.as_ref().map(|b| b.local_addrs.clone()).unwrap_or_default(),
         cert_fingerprint: None,
     })?;
+    // Listens for the computer's LAN beacon meanwhile. When the server never
+    // pairs the two sides (an older server refused the host's setup, 0.6.68 fix),
+    // a computer on this Wi-Fi is reached directly instead.
+    let want = target.to_string();
+    let beacon = tokio::task::spawn_blocking(move || p2p::hear_host_beacon(&want, LAN_FALLBACK_AFTER));
+    tokio::pin!(beacon);
+    let mut heard: Option<Option<(SocketAddr, pjdesk_proto::tls::Fingerprint)>> = None;
+    let waited = std::time::Instant::now();
+    let mut lan_direct: Option<SocketAddr> = None;
     let (peer_public, peer_local, fingerprint) = loop {
-        match tokio::time::timeout(Duration::from_secs(20), signal.recv()).await {
-            Ok(Some(ServerMsg::PeerInfo { public_addr, local_addrs, cert_fingerprint, .. })) => {
+        let got = tokio::select! {
+            msg = tokio::time::timeout(Duration::from_millis(500), signal.recv()) => Some(msg),
+            done = &mut beacon, if heard.is_none() => {
+                heard = Some(done.ok().flatten());
+                None
+            }
+        };
+        match got {
+            Some(Ok(Some(ServerMsg::PeerInfo { public_addr, local_addrs, cert_fingerprint, .. }))) => {
                 break (public_addr, local_addrs, cert_fingerprint.context("the server didn't send the host's key")?)
             }
-            Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
-            Ok(Some(_)) => continue,
-            Ok(None) => bail!("the server closed the connection"),
-            Err(_) => bail!("the computer did not finish the relay setup (server UDP {server_udp})"),
+            Some(Ok(Some(ServerMsg::Error { message, .. }))) => {
+                if let Some(Some((addr, fp))) = heard {
+                    log_line(&cb, format!("the server stopped the relay setup ({message}); connecting on this network to {addr}"));
+                    lan_direct = Some(addr);
+                    break (addr, Vec::new(), fp);
+                }
+                bail!("{message}")
+            }
+            Some(Ok(Some(_))) => continue,
+            Some(Ok(None)) => bail!("the server closed the connection"),
+            Some(Err(_)) | None => {}
+        }
+        if waited.elapsed() >= LAN_FALLBACK_AFTER {
+            if let Some(Some((addr, fp))) = heard {
+                log_line(
+                    &cb,
+                    format!("the computer did not finish the relay setup; it is on this network at {addr}, connecting directly"),
+                );
+                lan_direct = Some(addr);
+                break (addr, Vec::new(), fp);
+            }
+        }
+        if waited.elapsed() >= Duration::from_secs(20) {
+            bail!("the computer did not finish the relay setup (server UDP {server_udp})")
         }
     };
-    let tcp_relay = binding.is_none();
+    let tcp_relay = binding.is_none() && lan_direct.is_none();
     let (endpoint, punch_socket) = match binding {
+        _ if lan_direct.is_some() => {
+            drop(signal);
+            let udp = std::net::UdpSocket::bind("0.0.0.0:0").context("opening a UDP socket")?;
+            (p2p::controller_endpoint(udp, fingerprint)?, None)
+        }
         Some(binding) => {
             drop(signal);
             (p2p::controller_endpoint(binding.socket, fingerprint)?, Some(binding.punch_socket))
@@ -3934,7 +3979,10 @@ async fn controller_session(
             .and_then(|s| s.try_clone().ok())
             .map(|sock| p2p::spawn_punching(sock, candidates.clone(), session_id, Duration::from_secs(8)));
         log_line(&cb, "Trying a direct connection on this network first (UDP 21201), then the relay");
-        let connected = p2p::connect_to_host(&endpoint, &candidates, server_udp, tcp_relay).await;
+        let connected = match lan_direct {
+            Some(addr) => p2p::connect_direct(&endpoint, addr).await,
+            None => p2p::connect_to_host(&endpoint, &candidates, server_udp, tcp_relay).await,
+        };
         if let Some(punching) = punching {
             punching.abort();
         }
