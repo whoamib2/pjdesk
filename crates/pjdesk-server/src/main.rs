@@ -126,6 +126,9 @@ enum Command {
     /// Let a blocked computer register again.
     #[command(hide = true)]
     UnblockDevice { id: String },
+    /// Replace the account-mirror signing key. The new private key is not printed.
+    #[command(name = "rotate-sign-key")]
+    RotateSignKey,
     /// Manage user accounts (sign-in for the address book and saved logins).
     #[command(subcommand)]
     Account(AccountCommand),
@@ -366,6 +369,16 @@ fn main() -> Result<()> {
         Some(Command::UnblockDevice { id }) => {
             std::fs::create_dir_all(&data_dir)?;
             requests::unblock_device(&data_dir, &id)
+        }
+        Some(Command::RotateSignKey) => {
+            std::fs::create_dir_all(&data_dir)?;
+            match account_mirror::rotate_sign_key(&data_dir) {
+                Ok(sentence) => {
+                    println!("{sentence}");
+                    Ok(())
+                }
+                Err(err) => anyhow::bail!("{err}"),
+            }
         }
         Some(Command::Account(cmd)) => account_command(cmd, &data_dir),
         Some(Command::Cloud(cmd)) => cloud_command(cmd, &data_dir),

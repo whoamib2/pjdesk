@@ -236,6 +236,8 @@ pub enum AccountChange {
         active_fingerprint: String,
         at: u64,
     },
+    /// Replaces the per-network signing key. The previous private key is discarded.
+    SignKey { public_key: String, pkcs8: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -618,6 +620,14 @@ pub fn apply_change(copy: &mut AccountCopy, change: &AccountChange) {
                 copy.network.active_fingerprint = active_fingerprint.clone();
             }
         }
+        AccountChange::SignKey { public_key, pkcs8 } => {
+            let public_key = public_key.trim();
+            let pkcs8 = pkcs8.trim();
+            if public_key.len() == 64 && !pkcs8.is_empty() {
+                copy.sign_public = public_key.to_string();
+                copy.sign_pkcs8 = pkcs8.to_string();
+            }
+        }
     }
 }
 
@@ -646,11 +656,18 @@ pub fn ensure_sign_key(copy: &mut AccountCopy) {
     if !copy.sign_pkcs8.is_empty() {
         return;
     }
+    if let Some((pkcs8, public_key)) = generate_sign_key() {
+        copy.sign_pkcs8 = pkcs8;
+        copy.sign_public = public_key;
+    }
+}
+
+/// A new Ed25519 key, as `(pkcs8 hex, public hex)`. Nothing is logged.
+pub fn generate_sign_key() -> Option<(String, String)> {
     let rng = ring::rand::SystemRandom::new();
-    let Ok(doc) = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng) else { return };
-    let Ok(pair) = ring::signature::Ed25519KeyPair::from_pkcs8(doc.as_ref()) else { return };
-    copy.sign_pkcs8 = hex::encode(doc.as_ref());
-    copy.sign_public = hex::encode(pair.public_key().as_ref());
+    let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).ok()?;
+    let pair = ring::signature::Ed25519KeyPair::from_pkcs8(doc.as_ref()).ok()?;
+    Some((hex::encode(doc.as_ref()), hex::encode(pair.public_key().as_ref())))
 }
 
 fn upsert_sealed(list: &mut Vec<SealedRow>, row: &SealedRow) {
@@ -761,6 +778,27 @@ mod tests {
         assert_eq!(merged.computers[0].name, "Server", "a newer saved-list edit is kept");
         assert!(!merged.sign_pkcs8.is_empty());
         assert!(merged.login_fails.len() == copy.login_fails.len());
+    }
+
+    #[test]
+    fn a_rotated_sign_key_replaces_the_key_from_the_cloud() {
+        let mut cloud = owner_copy();
+        ensure_sign_key(&mut cloud);
+        let old = cloud.sign_pkcs8.clone();
+        let mut local = cloud.clone();
+        local.sign_pkcs8.clear();
+        local.sign_public.clear();
+        ensure_sign_key(&mut local);
+        let public_key = local.sign_public.clone();
+        let pkcs8 = local.sign_pkcs8.clone();
+        let merged = merge(
+            &cloud,
+            &local,
+            &[AccountChange::SignKey { public_key: public_key.clone(), pkcs8: pkcs8.clone() }],
+        );
+        assert_eq!(merged.sign_public, public_key);
+        assert_eq!(merged.sign_pkcs8, pkcs8);
+        assert_ne!(merged.sign_pkcs8, old);
     }
 
     #[test]

@@ -284,7 +284,60 @@ fn redact_line(line: &str) -> String {
     if upper.contains("PRIVATE KEY") || upper.contains("BEGIN CERTIFICATE") || upper.contains("BEGIN RSA") {
         return "[redacted]".into();
     }
+    let line = redact_field(&line, "sign_pkcs8");
+    let line = redact_field(&line, "support_password");
+    let line = redact_field(&line, "supportPassword");
+    let line = redact_field(&line, "password");
     line.split_inclusive(char::is_whitespace).map(redact_word).collect()
+}
+
+/// Replaces `name=value` and `"name":"value"` with a redacted value.
+fn redact_field(line: &str, name: &str) -> String {
+    let mut out = redact_assigned(line, name);
+    out = redact_json(out, name);
+    out
+}
+
+fn redact_assigned(line: &str, name: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let key = format!("{}=", name.to_ascii_lowercase());
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find(&key) {
+        let at = from + rel;
+        let boundary = at == 0 || !lower.as_bytes()[at - 1].is_ascii_alphanumeric();
+        if boundary {
+            let value_at = at + key.len();
+            let rest = &line[value_at..];
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            return format!("{}[redacted]{}", &line[..value_at], &rest[end..]);
+        }
+        from = at + key.len();
+    }
+    line.to_string()
+}
+
+fn redact_json(line: String, name: &str) -> String {
+    let pattern = format!("\"{name}\"");
+    let Some(at) = line.find(&pattern) else { return line };
+    let after = at + pattern.len();
+    let Some(colon) = line[after..].find(':') else { return line };
+    let mut i = after + colon + 1;
+    let bytes = line.as_bytes();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'"' {
+        return line;
+    }
+    let start = i;
+    i += 1;
+    while i < bytes.len() && bytes[i] != b'"' {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return line;
+    }
+    format!("{}\"[redacted]\"{}", &line[..start], &line[i + 1..])
 }
 
 fn redact_word(word: &str) -> String {
@@ -506,6 +559,15 @@ mod tests {
         assert!(!snap.log_tail.contains("hunter2"), "{}", snap.log_tail);
         assert!(!snap.log_tail.contains("SUPERSECRETTOKENVALUE"), "{}", snap.log_tail);
         assert!(!snap.log_tail.contains("PRIVATE KEY"), "{}", snap.log_tail);
+        let exposed = redact_secrets(
+            "sign_pkcs8=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff support_password=temp-pass {\"password\":\"hunter2\",\"sign_pkcs8\":\"abcdef\"}",
+        );
+        assert!(!exposed.contains("00112233445566778899aabbccddeeff"));
+        assert!(!exposed.contains("temp-pass"));
+        assert!(!exposed.contains("hunter2"));
+        assert!(!exposed.contains("abcdef"));
+        assert!(exposed.contains("sign_pkcs8="));
+        assert!(redact_secrets("Wrong email or password.").contains("password"));
 
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("DEVICESECRETSHA"));

@@ -15,6 +15,8 @@ import us.spader.pjdesk.core.namedServerSignInFailure
 import us.spader.pjdesk.core.serverHasNoAccountCopy
 import us.spader.pjdesk.core.SignInTrace
 import us.spader.pjdesk.core.liveSignInServer
+import us.spader.pjdesk.core.redactDiagnostics
+import us.spader.pjdesk.core.signInLinesFromLog
 import us.spader.pjdesk.core.signInLogLine
 import us.spader.pjdesk.core.signInPageError
 import us.spader.pjdesk.core.signInScreenPressed
@@ -153,6 +155,18 @@ class ConnectFeedbackTest {
         assertEquals("Could not reach the PJDesk server.", signInShownError("connection refused"))
         assertEquals("192.168.0.193:21200", liveSignInServer("192.168.0.193:21200", true))
         assertEquals("", liveSignInServer("204.248.122.44:21200", false))
+        val logged = """
+            noise
+            sign-in address=192.168.0.193:21200 step=heartbeat op=sign-in password=hunter2 sign_pkcs8=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff support_password=temp-pass
+            sign-in address=192.168.0.193:21200 step=reply ok=false message=loading
+        """.trimIndent()
+        val kept = signInLinesFromLog(logged, 50)
+        assertTrue(kept.contains("step=heartbeat"))
+        assertTrue(kept.contains("step=reply"))
+        assertFalse(kept.contains("hunter2"))
+        assertFalse(kept.contains("00112233445566778899"))
+        assertFalse(kept.contains("temp-pass"))
+        assertTrue(redactDiagnostics("Wrong email or password.").contains("password"))
         assertEquals(
             "The PJDesk server at 192.168.0.193:21200 is connected. The sign-in did not get an answer on that connection.",
             signInShownError(

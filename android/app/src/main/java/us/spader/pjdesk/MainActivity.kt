@@ -2024,7 +2024,9 @@ class MainActivity : FragmentActivity() {
                         signInTrace = us.spader.pjdesk.core.SignInSteps,
                         onSignInTrace = { AppLog.i(it) },
                         onCopyDiagnostics = {
-                            val text = us.spader.pjdesk.core.SignInSteps.copyText().ifBlank { "No sign-in steps were recorded." }
+                            val text = AppLog.recentSignIn(50).ifBlank {
+                                us.spader.pjdesk.core.SignInSteps.copyText()
+                            }.ifBlank { "No sign-in steps were recorded." }
                             copy(text)
                             scope.launch { snackbar.showSnackbar("Copied the last sign-in steps") }
                         },
