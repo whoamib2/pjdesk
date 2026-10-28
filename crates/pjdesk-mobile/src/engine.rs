@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.61";
+pub const APP_VERSION: &str = "0.6.62";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -101,6 +101,8 @@ struct State {
     public_ip: Mutex<String>,
     /// Standby server from the account, used when the primary stops answering.
     standby: Mutex<String>,
+    /// Certificate of the standby. Empty until a sign-in or an unpinned LAN dial learns it.
+    standby_fingerprint: Mutex<Option<String>>,
     /// This phone's public IP from pjdesk.com, used to decide the LAN path.
     my_public_ip: Mutex<String>,
     /// IPv4 addresses the phone reported for the network it is on now.
@@ -228,6 +230,8 @@ struct Disk {
     #[serde(default)]
     standby: String,
     #[serde(default)]
+    standby_fingerprint: String,
+    #[serde(default)]
     my_public_ip: String,
     #[serde(default)]
     fingerprint: String,
@@ -333,6 +337,7 @@ impl Engine {
             lan: Mutex::new(split_lan(&stored.lan)),
             public_ip: Mutex::new(stored.public_ip),
             standby: Mutex::new(stored.standby),
+            standby_fingerprint: Mutex::new((!stored.standby_fingerprint.is_empty()).then_some(stored.standby_fingerprint)),
             my_public_ip: Mutex::new(stored.my_public_ip),
             phone_mine: Mutex::new(Vec::new()),
             lan_shift: AtomicBool::new(false),
@@ -559,6 +564,7 @@ fn persist(state: &State) {
         lan: state.lan.lock().unwrap().join(","),
         public_ip: state.public_ip.lock().unwrap().clone(),
         standby: state.standby.lock().unwrap().clone(),
+        standby_fingerprint: state.standby_fingerprint.lock().unwrap().clone().unwrap_or_default(),
         my_public_ip: state.my_public_ip.lock().unwrap().clone(),
         fingerprint: state.fingerprint.lock().unwrap().clone().unwrap_or_default(),
         device_id: state.device_id.lock().unwrap().clone().unwrap_or_default(),
@@ -770,6 +776,7 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 *state.account_device.lock().unwrap() = device_id.clone();
             }
             let prefer = cmd.get("address").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let role = cmd.get("role").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
             let state = state.clone();
             let cb = cb.clone();
             tokio::spawn(async move {
@@ -786,7 +793,9 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                     computers,
                     proof: String::new(),
                 };
-                let outcome = if prefer.is_empty() {
+                let outcome = if role == "standby" {
+                    account_on_standby(&state, &cb, &asked, msg).await
+                } else if prefer.is_empty() {
                     exchange_account(&state, &cb, &asked, msg).await
                 } else {
                     account_on_address(&state, &cb, &asked, &prefer, msg).await
@@ -849,6 +858,12 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 }
                 if let Some(standby) = cmd.get("standby").and_then(|v| v.as_str()) {
                     *state.standby.lock().unwrap() = standby.trim().to_string();
+                }
+                if let Some(fp) = cmd.get("standbyFingerprint").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+                {
+                    if let Ok(parsed) = pjdesk_proto::tls::parse_fingerprint(fp) {
+                        *state.standby_fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&parsed));
+                    }
                 }
                 if let Some(ip) = cmd.get("myPublicIp").and_then(|v| v.as_str()) {
                     *state.my_public_ip.lock().unwrap() = ip.trim().to_string();
@@ -2281,6 +2296,71 @@ async fn account_on_address(
             bail!("{}", sign_in_step_failure("dial-one", &addr, "timed out"));
         }
     }
+}
+
+/// The primary said its account copy is empty. Dial the standby, LAN on this /24 first.
+/// A public standby address is skipped unless its fingerprint is already saved.
+async fn account_on_standby(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, msg: ClientMsg) -> Result<(ServerMsg, String)> {
+    let routes = state.routes.lock().unwrap().clone();
+    let saved = state.standby.lock().unwrap().clone();
+    let extra = state.phone_mine.lock().unwrap().clone();
+    let mine = tokio::task::spawn_blocking(move || merged_mine(&extra)).await.unwrap_or_default();
+    let targets = pjdesk_proto::routes::standby_account_order(&routes, &mine, &saved);
+    sign_in_log(cb, &saved, "standby", &format!("op={asked} targets={}", targets.len()));
+    if targets.is_empty() {
+        bail!("{}", sign_in_step_failure("standby", "", "no standby address is saved"));
+    }
+    let mut last_addr = String::new();
+    let mut last_why = String::new();
+    for target in targets {
+        let Some(pin) = standby_pin(state, &target) else {
+            sign_in_log(cb, &target, "standby", "reply=skipped public address without a fingerprint");
+            continue;
+        };
+        sign_in_log(cb, &target, "standby", "dialing");
+        match SignalClient::connect_endpoint(&target, pin, pjdesk_proto::routes::dial_budget(&target)).await {
+            Ok(mut signal) => {
+                if let Some(fp) = signal.observed {
+                    *state.standby_fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&fp));
+                    persist(state);
+                }
+                let addr = signal.server_addr.to_string();
+                sign_in_log(cb, &addr, "standby", "transport=tcp");
+                if signal.send(msg.clone()).is_err() {
+                    last_addr = addr;
+                    last_why = "the sign-in was not sent".into();
+                    continue;
+                }
+                match await_account(&mut signal, state, cb, &addr, "standby", Duration::from_secs(12)).await {
+                    AccountRead::Reply(reply) => return Ok((reply, addr)),
+                    AccountRead::Timeout | AccountRead::Closed => {
+                        last_addr = addr;
+                        last_why = "timed out".into();
+                    }
+                }
+            }
+            Err(err) => {
+                let why = err.to_string();
+                let why = why.lines().next().unwrap_or("failed").trim().to_string();
+                sign_in_log(cb, &target, "standby", &format!("reply=no-transport {why}"));
+                last_addr = target;
+                last_why = why;
+            }
+        }
+    }
+    bail!("{}", sign_in_step_failure("standby", &last_addr, &last_why));
+}
+
+/// `Some(None)` trusts a private LAN address once and remembers the certificate.
+/// A public address needs the saved standby fingerprint.
+fn standby_pin(state: &State, target: &str) -> Option<Option<pjdesk_proto::tls::Fingerprint>> {
+    if let Some(text) = state.standby_fingerprint.lock().unwrap().clone() {
+        if let Ok(fp) = pjdesk_proto::tls::parse_fingerprint(&text) {
+            return Some(Some(fp));
+        }
+    }
+    let private = pjdesk_proto::routes::endpoint_v4(target).is_some_and(|ip| ip.is_private() || ip.is_loopback() || ip.is_link_local());
+    if private { Some(None) } else { None }
 }
 
 async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, msg: ClientMsg) -> Result<(ServerMsg, String)> {
@@ -4338,6 +4418,7 @@ mod tests {
             lan: Mutex::new(Vec::new()),
             public_ip: Mutex::new(String::new()),
             standby: Mutex::new(String::new()),
+            standby_fingerprint: Mutex::new(None),
             my_public_ip: Mutex::new(String::new()),
             phone_mine: Mutex::new(Vec::new()),
             lan_shift: AtomicBool::new(false),

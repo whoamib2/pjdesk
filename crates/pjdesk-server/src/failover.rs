@@ -58,7 +58,8 @@ pub fn watch_once(data_dir: &Path, misses: u32) -> Step {
         return Step::Stay { misses: 0, log: String::new() };
     }
     // The 3-second probe stays on the LAN. pjdesk.com is the 5-minute batch.
-    if !cloud::accepts_host_registrations(data_dir) {
+    // A standby mirrors the primary. A primary with an empty copy asks the standby.
+    if !cloud::accepts_host_registrations(data_dir) || !crate::account_mirror::has_owner_copy(data_dir) {
         crate::account_mirror::pull_replica(data_dir);
     }
     let mine = cloud::instance_of(data_dir);

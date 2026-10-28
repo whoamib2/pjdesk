@@ -1978,6 +1978,9 @@ mod tests {
         assert!(!account_answer_is_final(
             "This server does not have the account yet, and pjdesk.com did not answer."
         ));
+        assert!(!account_answer_is_final(
+            "The primary CHIP23 answered. This server's account copy is empty. Its pjdesk.com sign-in was rejected. Server sign-in needed."
+        ));
         assert!(account_answer_is_final("Wrong email or password."));
         assert!(account_answer_is_final("Too many sign-in attempts. Try again in 1 minute."));
         assert!(account_answer_is_final("Enter your email and password."));

@@ -214,6 +214,41 @@ pub fn account_dial_order(prefer: &str, routes: &ServerRoutes, mine: &[Ipv4Addr]
     out
 }
 
+/// Standby addresses for a sign-in the primary could not check.
+/// A same-subnet LAN address is first. The primary's public address is not included.
+pub fn standby_account_order(routes: &ServerRoutes, mine: &[Ipv4Addr], saved_standby: &str) -> Vec<String> {
+    let mut lan = Vec::new();
+    let mut rest = Vec::new();
+    for raw in &routes.standby_lan {
+        let addr = canonical(raw);
+        if addr.is_empty() {
+            continue;
+        }
+        if on_subnet(&addr, mine) {
+            push_unique(&mut lan, addr);
+        } else {
+            push_unique(&mut rest, addr);
+        }
+    }
+    let saved = canonical(saved_standby);
+    if !saved.is_empty() {
+        if on_subnet(&saved, mine) {
+            push_unique(&mut lan, saved);
+        } else {
+            push_unique(&mut rest, saved);
+        }
+    }
+    for raw in &routes.standby_public {
+        let addr = canonical(raw);
+        if !addr.is_empty() {
+            push_unique(&mut rest, addr);
+        }
+    }
+    let mut out = lan;
+    out.extend(rest);
+    out
+}
+
 /// The banner, then one `address: error` line for every dial that failed.
 pub fn registration_miss(attempts: &[(&str, &str)]) -> String {
     let last = attempts
@@ -1146,6 +1181,10 @@ mod tests {
         assert!(expanded.iter().any(|addr| addr.starts_with("192.168.0.169")), "{expanded:?}");
         assert!(expanded.len() > 1, "{expanded:?}");
         assert_ne!(expanded, vec!["204.248.122.44:21200".to_string()]);
+        let standby = standby_account_order(&both, &phone, "");
+        assert_eq!(standby[0], "192.168.0.169:21200", "{standby:?}");
+        assert!(!standby.iter().any(|addr| addr.starts_with("204.248.122.44")), "{standby:?}");
+        assert!(!standby.iter().any(|addr| addr.starts_with("192.168.0.193")), "{standby:?}");
     }
 
     #[test]

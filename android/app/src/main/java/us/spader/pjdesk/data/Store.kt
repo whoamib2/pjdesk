@@ -376,6 +376,11 @@ class Store(context: Context) {
         get() = prefs.getString("accountStandby", "") ?: ""
         set(value) { prefs.edit().putString("accountStandby", value).apply() }
 
+    /** Certificate of the standby, so a sign-in there is pinned. */
+    var accountStandbyFingerprint: String
+        get() = prefs.getString("accountStandbyFingerprint", "") ?: ""
+        set(value) { prefs.edit().putString("accountStandbyFingerprint", value).apply() }
+
     var accountFingerprint: String
         get() = prefs.getString("accountFingerprint", "") ?: ""
         set(value) { prefs.edit().putString("accountFingerprint", value).apply() }

@@ -214,7 +214,13 @@ class MainActivity : FragmentActivity() {
         AppLog.i("main activity created task=$taskId")
         if (app.store.temporaryActive() && !tempFlag.get()) app.store.endTemporaryVisit()
         if (app.store.accountServer.isNotBlank()) {
-            app.engine.applyAccountServer(app.store.accountServer, app.store.accountFingerprint, quiet = true, standby = app.store.accountStandby)
+            app.engine.applyAccountServer(
+                app.store.accountServer,
+                app.store.accountFingerprint,
+                quiet = true,
+                standby = app.store.accountStandby,
+                standbyFingerprint = app.store.accountStandbyFingerprint,
+            )
         }
         CloudGate.exchange = exchange@{ body ->
             if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) return@exchange null
@@ -489,6 +495,7 @@ class MainActivity : FragmentActivity() {
                 routes: String = "",
                 standbyLan: List<String> = emptyList(),
                 standbyPublicIp: String = "",
+                standbyFingerprint: String = "",
             ) {
                 if (address.isBlank()) return
                 app.store.accountServer = address
@@ -496,6 +503,7 @@ class MainActivity : FragmentActivity() {
                 app.store.accountLan = lan.joinToString(",")
                 app.store.accountPublicIp = publicIp
                 if (standby.isNotBlank()) app.store.accountStandby = standby
+                if (standbyFingerprint.isNotBlank()) app.store.accountStandbyFingerprint = standbyFingerprint
                 engine.applyAccountServer(
                     address,
                     fingerprint,
@@ -504,6 +512,7 @@ class MainActivity : FragmentActivity() {
                     routes = routes,
                     standbyLan = standbyLan.joinToString(","),
                     standbyPublicIp = standbyPublicIp,
+                    standbyFingerprint = app.store.accountStandbyFingerprint,
                 )
                 AppLog.i(
                     "account server $address lan=${lan.joinToString(",").ifBlank { "none" }} " +
@@ -548,7 +557,7 @@ class MainActivity : FragmentActivity() {
                         cloudAccess = session.access
                         engine.presentAccess(session.access, session.refresh, session.deviceId)
                     }
-                    rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
+                    rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp, session.standbyFingerprint)
                     syncPasswords(false)
                 }
             }
@@ -648,7 +657,7 @@ class MainActivity : FragmentActivity() {
                         }
                         accountComputers = enrolled.computers
                         enrolledFor = if (pjdeskId.length == 9) pjdeskId else ""
-                        rememberAccountServer(enrolled.address, enrolled.fingerprint, enrolled.lan, enrolled.publicIp, enrolled.standbyAddress, enrolled.routes, enrolled.standbyLan, enrolled.standbyPublicIp)
+                        rememberAccountServer(enrolled.address, enrolled.fingerprint, enrolled.lan, enrolled.publicIp, enrolled.standbyAddress, enrolled.routes, enrolled.standbyLan, enrolled.standbyPublicIp, enrolled.standbyFingerprint)
                         cloudAccess = enrolled.access
                         engine.presentAccess(enrolled.access, enrolled.refresh, enrolled.deviceId)
                         account = who
@@ -808,7 +817,7 @@ class MainActivity : FragmentActivity() {
                             cloudAccess = session.access
                             engine.presentAccess(session.access, session.refresh, session.deviceId)
                         }
-                        rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
+                        rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp, session.standbyFingerprint)
                         if (app.store.syncsSavedComputers() && !state.incomingOnly) {
                             app.store.mergeCloud(session.computers)
                             saved = app.store.saved()
@@ -879,7 +888,7 @@ class MainActivity : FragmentActivity() {
                                 AppLog.e(connectError.orEmpty())
                                 return@launch
                             }
-                            rememberAccountServer(fetched.address, fetched.fingerprint, fetched.lan, fetched.publicIp, fetched.standbyAddress, fetched.routes, fetched.standbyLan, fetched.standbyPublicIp)
+                            rememberAccountServer(fetched.address, fetched.fingerprint, fetched.lan, fetched.publicIp, fetched.standbyAddress, fetched.routes, fetched.standbyLan, fetched.standbyPublicIp, fetched.standbyFingerprint)
                             cloudAccess = fetched.access
                             engine.presentAccess(fetched.access, fetched.refresh, fetched.deviceId)
                             beginConnect(rawId, ignoreOffline)
@@ -1088,7 +1097,7 @@ class MainActivity : FragmentActivity() {
                     cloudAccess = session.access
                     engine.presentAccess(session.access, session.refresh, session.deviceId)
                     if (!temporarySession) {
-                        rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp)
+                        rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp, session.standbyFingerprint)
                         if (app.store.syncsSavedComputers()) {
                             app.store.mergeCloud(session.computers)
                             saved = app.store.saved()
@@ -1510,7 +1519,7 @@ class MainActivity : FragmentActivity() {
                             account = who
                             netEmail = who
                             if (signed.refresh.isNotBlank()) app.store.saveNetworkRefresh(signed.refresh)
-                            rememberAccountServer(signed.address, signed.fingerprint, signed.lan, signed.publicIp, signed.standbyAddress, signed.routes, signed.standbyLan, signed.standbyPublicIp)
+                            rememberAccountServer(signed.address, signed.fingerprint, signed.lan, signed.publicIp, signed.standbyAddress, signed.routes, signed.standbyLan, signed.standbyPublicIp, signed.standbyFingerprint)
                             cloudAccess = signed.access
                             engine.presentAccess(signed.access, signed.refresh, signed.deviceId)
                             commitAutofill()
@@ -2881,8 +2890,9 @@ class MainActivity : FragmentActivity() {
         if (known.isNotBlank() && app.engine.state.value.server.isBlank()) {
             app.engine.applyAccountServer(known, app.store.accountFingerprint, quiet = true)
         }
-        // One engine attempt. Stored public and standby addresses are not dialed
-        // raw; the engine resolves LAN addresses on this phone's subnet first.
+        // The engine resolves LAN addresses on this phone's subnet first.
+        // A raw stored public address is not dialed. If the primary's copy is empty,
+        // a second attempt asks the engine for the standby.
         val auth = CloudAuth.authKeyHex(email, password)
         signInNote("", "request", "op=sign-in")
         val body = JSONObject()
@@ -2891,14 +2901,29 @@ class MainActivity : FragmentActivity() {
             .put("auth_key", auth)
             .put("device_id", device)
             .put("device_name", "Android")
-        val reply = CloudGate.request(body)
-        val server = reply?.optString("server").orEmpty().ifBlank { known }
-        val message = reply?.optString("message").orEmpty()
+        var reply = CloudGate.request(body)
+        var server = reply?.optString("server").orEmpty().ifBlank { known }
+        var message = reply?.optString("message").orEmpty()
         val ok = reply?.optBoolean("ok") == true
         val replyDetail = if (reply == null) "ok=false message=timeout" else "ok=$ok message=$message"
         signInNote(server, "reply", replyDetail)
         val signed = reply?.takeIf { it.optBoolean("ok") }
         if (signed != null) return CloudAuth.sessionFromServer(email, device, signed)
+        if (reply != null && us.spader.pjdesk.core.serverHasNoAccountCopy(message)) {
+            signInNote(server, "standby", "primary account copy empty")
+            val standbyReply = CloudGate.request(JSONObject(body.toString()).put("role", "standby"))
+            val standbyServer = standbyReply?.optString("server").orEmpty().ifBlank { "standby" }
+            val standbyMessage = standbyReply?.optString("message").orEmpty()
+            val standbyOk = standbyReply?.optBoolean("ok") == true
+            val standbyDetail = if (standbyReply == null) "ok=false message=timeout" else "ok=$standbyOk message=$standbyMessage"
+            signInNote(standbyServer, "reply", standbyDetail)
+            if (standbyReply?.optBoolean("ok") == true) return CloudAuth.sessionFromServer(email, device, standbyReply)
+            if (standbyReply != null && !us.spader.pjdesk.core.serverHasNoAccountCopy(standbyMessage)) {
+                reply = standbyReply
+                server = standbyServer
+                message = standbyMessage
+            }
+        }
         if (reply != null && !us.spader.pjdesk.core.serverHasNoAccountCopy(message)) {
             val pause = reply.optLong("pause")
             val shown = showSignInError(message, pause)
@@ -2925,7 +2950,7 @@ class MainActivity : FragmentActivity() {
             CloudAuth.signIn(email, password, device, "Android", forceCloud = true)
         } catch (err: CloudAuthException) {
             throw CloudAuthException(
-                "The server at $who answered and does not have the account yet. ${err.message ?: "pjdesk.com did not answer."}",
+                "The server at $who answered. Its account copy is empty. ${err.message ?: "pjdesk.com did not answer."}",
             )
         }
     }

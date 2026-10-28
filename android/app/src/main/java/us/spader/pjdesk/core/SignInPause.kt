@@ -23,6 +23,8 @@ fun signInPauseSeconds(status: Int, message: String, retryAfter: Long? = null): 
 fun serverHasNoAccountCopy(message: String): Boolean {
     val lower = message.lowercase()
     return lower.contains("does not have the account") ||
+        lower.contains("account copy is empty") ||
+        lower.contains("server sign-in needed") ||
         lower.contains("pjdesk.com did not answer") ||
         lower.contains("no password check") ||
         lower.contains("not signed in")
