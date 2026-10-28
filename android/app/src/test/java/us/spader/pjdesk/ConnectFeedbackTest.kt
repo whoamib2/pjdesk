@@ -118,8 +118,9 @@ class ConnectFeedbackTest {
             "Too many sign-in attempts. Try again in 3 minutes.",
             signInPageError("Too many sign-in attempts. Try again in 3 minutes.", 150),
         )
-        assertEquals("Could not reach the PJDesk server.", signInPageError("the server did not answer"))
-        assertEquals("Could not reach the PJDesk server.", signInPageError(""))
+        assertEquals("The PJDesk server did not answer the sign-in.", signInPageError("The PJDesk server did not answer the sign-in."))
+        assertEquals("Could not reach the PJDesk server.", signInPageError("could not reach the primary or the standby; retrying"))
+        assertEquals("The sign-in did not finish.", signInPageError(""))
         assertEquals(
             "This server is too old to accept a sign-in while Require signed-in accounts is on. Update the server.",
             signInPageError("Sign in required."),

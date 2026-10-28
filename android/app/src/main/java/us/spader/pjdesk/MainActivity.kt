@@ -220,7 +220,7 @@ class MainActivity : FragmentActivity() {
             val gen = CloudGate.accountGen.get()
             val want = body.optString("op")
             app.engine.command(JSONObject(body.toString()).put("cmd", "accountOp").toString())
-            val deadline = System.currentTimeMillis() + 20_000
+            val deadline = System.currentTimeMillis() + 45_000
             while (System.currentTimeMillis() < deadline) {
                 if (CloudGate.accountGen.get() != gen) {
                     val parsed = runCatching { JSONObject(CloudGate.accountJson) }.getOrNull()
@@ -2866,7 +2866,7 @@ class MainActivity : FragmentActivity() {
                     .put("device_id", device)
                     .put("device_name", "Android"),
             )
-            if (reply == null) throw CloudAuthException("Could not reach the PJDesk server.")
+            if (reply == null) throw CloudAuthException("The sign-in did not finish.")
             if (reply.optBoolean("ok")) return CloudAuth.sessionFromServer(email, device, reply)
             val message = reply.optString("message")
             val pause = reply.optLong("pause")
