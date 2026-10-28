@@ -484,11 +484,13 @@ pub fn put_app_lock(refresh: &str, device_id: &str, lock: &str) -> Result<u64> {
             msg: pjdesk_proto::signal::ServerMsg::AccountResult { message, .. },
             host,
             version,
+            ..
         })
         | Ok(AccountRpc {
             msg: pjdesk_proto::signal::ServerMsg::Error { message, .. },
             host,
             version,
+            ..
         }) => bail!("{}", account_refusal(&host, &version, &message)),
         Ok(_) => bail!("No PJDesk server answered."),
         Err(err) => {
@@ -815,7 +817,7 @@ fn account_answer_is_final(message: &str) -> bool {
 }
 
 fn server_sign_in(email: &str, auth_hex: &str, device_id: &str, device_name: &str, password: &str) -> Result<SignIn> {
-    let reply = account_rpc(pjdesk_proto::signal::ClientMsg::Account {
+    let rpc = account_rpc_meta(pjdesk_proto::signal::ClientMsg::Account {
         op: "sign-in".into(),
         email: email.to_string(),
         auth_key: auth_hex.to_string(),
@@ -827,6 +829,7 @@ fn server_sign_in(email: &str, auth_hex: &str, device_id: &str, device_name: &st
         computers: Vec::new(),
         proof: String::new(),
     })?;
+    let reply = rpc.msg;
     let pjdesk_proto::signal::ServerMsg::AccountResult { ok, message, pause_secs, .. } = &reply else {
         bail!("the server did not answer the sign-in");
     };
@@ -837,7 +840,7 @@ fn server_sign_in(email: &str, auth_hex: &str, device_id: &str, device_name: &st
         bail!("{message}");
     }
     note_server_answered();
-    let mut session = session_from_account(&reply, device_id)?;
+    let mut session = session_from_account(&reply, device_id, &rpc.presence)?;
     session.vault_key = Some(pjdesk_proto::access::derive_password_vault_key(email, password));
     if session.address.trim().is_empty() {
         return Ok(SignIn::NoServer { role: session.role, login_token: String::new() });
@@ -846,7 +849,7 @@ fn server_sign_in(email: &str, auth_hex: &str, device_id: &str, device_name: &st
 }
 
 fn server_refresh(refresh: &str, device_id: &str, computers: Option<&serde_json::Value>) -> Result<Session> {
-    let reply = account_rpc(pjdesk_proto::signal::ClientMsg::Account {
+    let rpc = account_rpc_meta(pjdesk_proto::signal::ClientMsg::Account {
         op: "refresh".into(),
         email: String::new(),
         auth_key: String::new(),
@@ -858,17 +861,19 @@ fn server_refresh(refresh: &str, device_id: &str, computers: Option<&serde_json:
         computers: fleet_from_json(computers),
         proof: String::new(),
     })?;
+    let reply = rpc.msg;
     if let pjdesk_proto::signal::ServerMsg::AccountResult { ok: false, message, .. } = &reply {
         bail!("{message}");
     }
     note_server_answered();
-    session_from_account(&reply, device_id)
+    session_from_account(&reply, device_id, &rpc.presence)
 }
 
 struct AccountRpc {
     msg: pjdesk_proto::signal::ServerMsg,
     host: String,
     version: String,
+    presence: Vec<pjdesk_proto::signal::FleetPeer>,
 }
 
 fn account_rpc(msg: pjdesk_proto::signal::ClientMsg) -> Result<pjdesk_proto::signal::ServerMsg> {
@@ -893,6 +898,7 @@ fn account_rpc_meta(msg: pjdesk_proto::signal::ClientMsg) -> Result<AccountRpc> 
         let host = signal.server_addr.ip().to_string();
         signal.send(msg)?;
         let mut version = cached_version;
+        let mut presence = Vec::new();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -905,8 +911,11 @@ fn account_rpc_meta(msg: pjdesk_proto::signal::ClientMsg) -> Result<AccountRpc> 
                         version = reported;
                     }
                 }
+                Ok(Some(pjdesk_proto::signal::ServerMsg::Fleet { presence: rows, .. })) => {
+                    presence = rows;
+                }
                 Ok(Some(reply)) => {
-                    return Ok(AccountRpc { msg: reply, host, version });
+                    return Ok(AccountRpc { msg: reply, host, version, presence });
                 }
                 Ok(None) => bail!("the server closed the connection"),
                 Err(_) => bail!("the server did not answer"),
@@ -947,7 +956,28 @@ fn fleet_from_json(computers: Option<&serde_json::Value>) -> Vec<pjdesk_proto::s
         .collect()
 }
 
-fn session_from_account(reply: &pjdesk_proto::signal::ServerMsg, device_id: &str) -> Result<Session> {
+pub fn presence_rows(peers: &[pjdesk_proto::signal::FleetPeer]) -> Vec<HostPresence> {
+    peers
+        .iter()
+        .map(|row| HostPresence {
+            id: row.id.clone(),
+            hostname: row.hostname.clone(),
+            os_family: row.os_family.clone(),
+            os_version: row.os_version.clone(),
+            console_user: row.console_user.clone(),
+            display_name: if row.display_name.trim().is_empty() { None } else { Some(row.display_name.clone()) },
+            last_seen: row.last_seen,
+            online: row.online,
+            app_version: row.version.clone(),
+        })
+        .collect()
+}
+
+fn session_from_account(
+    reply: &pjdesk_proto::signal::ServerMsg,
+    device_id: &str,
+    presence: &[pjdesk_proto::signal::FleetPeer],
+) -> Result<Session> {
     let pjdesk_proto::signal::ServerMsg::AccountResult {
         ok,
         message,
@@ -1018,7 +1048,7 @@ fn session_from_account(reply: &pjdesk_proto::signal::ServerMsg, device_id: &str
                 group: c.group.clone(),
             })
             .collect(),
-        presence: Vec::new(),
+        presence: presence_rows(presence),
         removed: removed.clone(),
         vault_key: None,
         role: role.clone(),

@@ -37,7 +37,21 @@ object AppLog {
     fun e(message: String, error: Throwable? = null) {
         val detail = error?.message?.let { ": $it" }.orEmpty()
         write("E", message + detail)
+        if (message.startsWith("connect failed")) noteConnectError(message.removePrefix("connect failed:").trim())
         Log.e(TAG, message, error)
+    }
+
+    /**
+     * The last Connect failure, in the app's private files. One short line.
+     * It is overwritten, so it is still there after logcat rotates.
+     * Passwords, tokens, and keys are not written.
+     */
+    fun noteConnectError(message: String) {
+        if (!::file.isInitialized) return
+        val text = us.spader.pjdesk.core.redactConnectError(message).trim()
+        if (text.isEmpty()) return
+        val dest = File(file.parentFile, "last-connect.txt")
+        runCatching { dest.writeText("${Instant.now()} $text\n") }
     }
 
     fun logFile(): File? = if (::file.isInitialized && file.exists()) file else null

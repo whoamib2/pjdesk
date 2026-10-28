@@ -16,7 +16,7 @@ use pjdesk_proto::account_mirror::{
     AccountCopy, AuthError, DeviceRow, SavedComputer, SealedRow,
 };
 use pjdesk_proto::failover::{cloud_edge_limited, next_cloud_wait, CLOUD_BATCH_SECS};
-use pjdesk_proto::signal::{ClientMsg, FleetComputer, ServerMsg};
+use pjdesk_proto::signal::{ClientMsg, FleetComputer, FleetPeer, ServerMsg};
 use pjdesk_proto::update::version_at_least;
 use serde::Deserialize;
 use sha2::Sha256;
@@ -559,6 +559,29 @@ pub fn open_before_registration(op: &str) -> bool {
     matches!(op.trim(), "sign-in" | "verify" | "refresh" | "join" | "enroll")
 }
 
+/// The account copy's current Ed25519 public key, hex, or empty when it is not a key.
+pub fn current_sign_public(dir: &Path) -> String {
+    let key = load(dir).sign_public.trim().to_string();
+    if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) { key } else { String::new() }
+}
+
+/// Records `public_key` on the access policy as soon as this server has it.
+/// The private key is not written here and is not logged.
+fn trust_sign_public(dir: &Path, public_key: &str) {
+    let key = public_key.trim();
+    if key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return;
+    }
+    let mut policy = crate::access::Policy::load(dir);
+    if policy.public_key.eq_ignore_ascii_case(key) || policy.trusted_keys.iter().any(|have| have.eq_ignore_ascii_case(key)) {
+        return;
+    }
+    policy.trusted_keys.push(key.to_string());
+    if policy.save(dir).is_err() {
+        tracing::info!("account signing key was created but could not be saved as a trusted key");
+    }
+}
+
 /// Answers one client account request from the local copy.
 /// Replaces a missing or unusable signing key and queues it for pjdesk.com.
 /// The private key is not logged. Sign-in can use the new key before the cloud accepts it.
@@ -572,6 +595,7 @@ fn install_sign_key(dir: &Path) -> std::result::Result<(), String> {
         tracing::info!("account signing key could not be created");
         return Err("This server could not create a signing key for the account copy.".into());
     }
+    trust_sign_public(dir, &copy.sign_public);
     if had && copy.sign_pkcs8 == before {
         return Ok(());
     }
@@ -585,6 +609,7 @@ fn install_sign_key(dir: &Path) -> std::result::Result<(), String> {
         save(dir, &copy);
         return Ok(());
     }
+    trust_sign_public(dir, &public_key);
     remember(dir, AccountChange::SignKey { public_key, pkcs8 });
     let dir_bg = dir.to_path_buf();
     std::thread::Builder::new()
@@ -1075,6 +1100,34 @@ fn session_msg(copy: &AccountCopy, op: &str, session: &account_mirror::SessionOu
     }
 }
 
+/// Online and version from a fresh `online.json`. The registry supplies the
+/// computer and its last registered version when the live file has none.
+fn fleet_presence(dir: &Path) -> Vec<FleetPeer> {
+    let Ok(reg) = crate::registry::Registry::load(dir.join("devices.json")) else {
+        return Vec::new();
+    };
+    let online = crate::cloud::online_ids(dir).unwrap_or_default();
+    let versions = crate::cloud::live_versions(dir);
+    reg.presence()
+        .into_iter()
+        .map(|row| {
+            let live = online.contains(&row.id);
+            let version = versions.get(&row.id).cloned().filter(|v| !v.is_empty()).unwrap_or(row.app_version);
+            FleetPeer {
+                id: row.id,
+                hostname: row.hostname,
+                online: live,
+                version,
+                last_seen: row.last_seen,
+                display_name: row.display_name,
+                os_family: row.os_family,
+                os_version: row.os_version,
+                console_user: row.console_user,
+            }
+        })
+        .collect()
+}
+
 fn fleet_computer(row: &SavedComputer) -> FleetComputer {
     FleetComputer {
         id: row.id.clone(),
@@ -1326,7 +1379,7 @@ pub fn fleet_for(dir: &Path, account_email: &str) -> Option<ServerMsg> {
     let removed = copy.removed.iter().map(|row| row.id.clone()).collect();
     let lock = copy.locks.iter().find(|row| row.account_id == account_id);
     Some(ServerMsg::Fleet {
-        presence: Vec::new(),
+        presence: fleet_presence(dir),
         computers,
         removed,
         app_lock: lock.map(|row| row.ciphertext.clone()).unwrap_or_default(),
@@ -1445,6 +1498,41 @@ pub fn mirror_path(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_presence_comes_from_the_registry_and_online_json() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-fleet-presence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut copy = AccountCopy::default();
+        copy.auth_hash = "11".repeat(32);
+        save(&dir, &copy);
+        std::fs::write(
+            dir.join("devices.json"),
+            r#"{"devices":{"123456789":{"secret_sha256":"aa","hostname":"CHIP23","app_version":"0.6.60","first_seen":1,"last_seen":2,"group":""}}}"#,
+        )
+        .unwrap();
+        let Some(ServerMsg::Fleet { presence, .. }) = fleet_for(&dir, "") else {
+            panic!("fleet");
+        };
+        let row = presence.iter().find(|peer| peer.id == "123456789").unwrap();
+        assert!(!row.online);
+        assert_eq!(row.version, "0.6.60");
+        let at = now();
+        std::fs::write(
+            dir.join("online.json"),
+            format!(r#"[{{"id":"123456789","hostname":"CHIP23","version":"0.6.64","at":{at}}}]"#),
+        )
+        .unwrap();
+        let Some(ServerMsg::Fleet { presence, .. }) = fleet_for(&dir, "") else {
+            panic!("fleet");
+        };
+        let row = presence.iter().find(|peer| peer.id == "123456789").unwrap();
+        assert!(row.online);
+        assert_eq!(row.version, "0.6.64");
+        assert_eq!(row.hostname, "CHIP23");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn mirror_http_error_names_auth_and_the_signing_key() {

@@ -58,6 +58,12 @@ object CloudGate {
         if (runCatching { JSONObject(json).optBoolean("ok") }.getOrDefault(false)) noteOk()
     }
 
+    @Volatile var fleetJson: String = ""
+
+    fun noteFleet(json: String) {
+        fleetJson = json
+    }
+
     fun request(body: JSONObject): JSONObject? = exchange?.invoke(body)
 }
 
@@ -260,7 +266,13 @@ object CloudAuth {
         if (id.length == 9) body.put("pjdesk_id", id)
         if (hardwareId.isNotBlank()) body.put("hardware_id", hardwareId.take(64))
         if (hostname.isNotBlank()) body.put("hostname", hostname.take(64))
-        if (CloudGate.serverUp) throw CloudAuthException("The PJDesk server has this account.")
+        if (CloudGate.serverUp) {
+            val ask = JSONObject(body.toString()).put("op", "refresh")
+            val reply = CloudGate.request(ask)
+            if (reply?.optBoolean("ok") == true) return sessionFromServer("", deviceId, reply)
+            val message = reply?.optString("message").orEmpty()
+            throw CloudAuthException(message.ifBlank { "The PJDesk server has this account." })
+        }
         if (!CloudGate.allowCloud()) throw CloudAuthException("Waiting before asking pjdesk.com again.")
         val reply = try {
             post("$API/api/network/refresh", null, body)
@@ -326,6 +338,7 @@ object CloudAuth {
                 )
             }
         }
+        val presence = presenceReports(reply.optJSONArray("presence"))
         return Session(
             email = reply.optString("email").ifBlank { email.trim().lowercase() },
             access = reply.optString("access"),
@@ -338,9 +351,10 @@ object CloudAuth {
             standbyFingerprint = reply.optString("standbyFingerprint"),
             lan = reply.optString("lan").split(',').map { it.trim() }.filter { it.isNotEmpty() },
             publicIp = reply.optString("publicIp"),
-            computers = computers,
+            computers = mergePresence(computers, presence),
             standbyLan = reply.optString("standbyLan").split(',').map { it.trim() }.filter { it.isNotEmpty() },
             standbyPublicIp = reply.optString("standbyPublicIp"),
+            presence = presence,
         )
     }
 
@@ -541,26 +555,7 @@ object CloudAuth {
                 )
             }
         }
-        val presence = mutableListOf<SavedComputer>()
-        val seen = reply.optJSONArray("presence")
-        if (seen != null) {
-            for (i in 0 until seen.length()) {
-                val o = seen.getJSONObject(i)
-                presence.add(
-                    SavedComputer(
-                        id = o.optString("id").filter { it.isDigit() },
-                        hostname = o.optString("hostname"),
-                        osFamily = o.optString("os_family"),
-                        osVersion = o.optString("os_version"),
-                        consoleUser = o.optString("console_user"),
-                        lastSeen = o.optLong("last_seen"),
-                        online = presenceOnlineFlag(if (o.has("online") && !o.isNull("online")) o.get("online") else null),
-                        displayName = o.optString("display_name"),
-                        appVersion = o.optString("app_version"),
-                    ),
-                )
-            }
-        }
+        val presence = presenceReports(reply.optJSONArray("presence"))
         return Session(
             email = email.trim().ifBlank { emailFromAccessToken(reply.optString("access")) },
             access = reply.optString("access"),
@@ -577,27 +572,13 @@ object CloudAuth {
             standbyLan = network.optString("standby_lan").split(',').map { it.trim() }.filter { it.isNotEmpty() },
             standbyPublicIp = network.optString("standby_public_ip"),
             computers = mergePresence(computers, presence),
+            presence = presence,
         )
     }
 
     /** Presence fills a saved row and adds computers that were never saved by hand. */
-    private fun mergePresence(computers: List<SavedComputer>, presence: List<SavedComputer>): List<SavedComputer> {
-        return applyPresence(
-            computers,
-            presence.map {
-                PresenceReport(
-                    id = it.id,
-                    hostname = it.hostname,
-                    osFamily = it.osFamily,
-                    osVersion = it.osVersion,
-                    consoleUser = it.consoleUser,
-                    displayName = it.displayName,
-                    lastSeen = it.lastSeen,
-                    online = it.online,
-                    appVersion = it.appVersion,
-                )
-            },
-        )
+    private fun mergePresence(computers: List<SavedComputer>, presence: List<PresenceReport>): List<SavedComputer> {
+        return applyPresence(computers, presence)
     }
 
     private fun get(url: String, bearer: String, deviceId: String): JSONObject {
@@ -688,4 +669,6 @@ data class Session(
     val routes: String = "",
     val standbyLan: List<String> = emptyList(),
     val standbyPublicIp: String = "",
+    /** Live online flag and version from the server or pjdesk.com. Empty when this reply had none. */
+    val presence: List<PresenceReport> = emptyList(),
 )

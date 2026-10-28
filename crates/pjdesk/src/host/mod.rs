@@ -1271,8 +1271,18 @@ async fn signaling_loop(
                             info!("Updated server addresses from the primary");
                         }
                     }
-                    ServerMsg::Fleet { .. } => {
-                        info!("Account list updated from the server");
+                    ServerMsg::Fleet { presence, .. } => {
+                        let rows = crate::network::presence_rows(&presence);
+                        if rows.is_empty() {
+                            info!("Account list updated from the server");
+                        } else {
+                            let online = rows.iter().filter(|row| row.online).count();
+                            config.merge_presence(&rows);
+                            if let Err(err) = config.save() {
+                                info!("could not save presence from the server: {err}");
+                            }
+                            info!("Account list updated from the server: {} computer(s), {online} online", rows.len());
+                        }
                     }
                     ServerMsg::Release { version, .. } => {
                         info!("Server says the latest PJDesk release is {version}");
