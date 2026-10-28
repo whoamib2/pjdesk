@@ -25,6 +25,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.NetKey
+import us.spader.pjdesk.core.signInLogLine
+import us.spader.pjdesk.core.signInScreenPressed
+import us.spader.pjdesk.core.SignInTrace
 
 @Composable
 fun SignInScreen(
@@ -59,6 +62,10 @@ fun SignInScreen(
     onEnrollOnly: () -> Unit = {},
     signInPaused: Boolean = false,
     onClose: (() -> Unit)? = null,
+    serverAddress: String = "",
+    signInTrace: SignInTrace? = null,
+    onSignInTrace: (String) -> Unit = {},
+    onCopyDiagnostics: () -> Unit = {},
 ) {
     PjPage {
     Column(
@@ -140,7 +147,10 @@ fun SignInScreen(
                     "This computer is added to your account either way. When this is checked, the sign-in ends when you close PJDesk and is not kept on this phone.",
                     color = pjMuted(),
                 )
-                if (error.isNotEmpty()) Text(error, color = MaterialTheme.colorScheme.error)
+                if (error.isNotEmpty()) {
+                    Text(error, color = MaterialTheme.colorScheme.error)
+                    TextButton(onClick = onCopyDiagnostics) { Text("Copy diagnostics") }
+                }
                 if (offerCurrent) {
                     Button(onClick = onUseCurrent, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
                         Text("Use this computer's current server for my network")
@@ -148,7 +158,21 @@ fun SignInScreen(
                 }
                 val emailSignIn = !useCode && !useKey
                 val canSignIn = !busy && !(signInPaused && emailSignIn)
-                Button(onClick = onSubmit, enabled = canSignIn, modifier = Modifier.fillMaxWidth()) {
+                val signInOp = if (useKey) "key" else if (useCode) "code" else "sign-in"
+                Button(
+                    onClick = {
+                        // First action of this button, before the password derivation or the network.
+                        val line = if (signInTrace != null) {
+                            signInScreenPressed(signInTrace, serverAddress, signInOp)
+                        } else {
+                            signInLogLine(serverAddress, "screen", "op=$signInOp")
+                        }
+                        onSignInTrace(line)
+                        onSubmit()
+                    },
+                    enabled = canSignIn,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
                     Text(
                         if (busy) "Signing in…"
                         else if (useKey) "Use network key"
@@ -157,7 +181,18 @@ fun SignInScreen(
                     )
                 }
                 if (!useCode && !useKey) {
-                    TextButton(onClick = onEnrollOnly, enabled = canSignIn) {
+                    TextButton(
+                        onClick = {
+                            val line = if (signInTrace != null) {
+                                signInScreenPressed(signInTrace, serverAddress, "enroll")
+                            } else {
+                                signInLogLine(serverAddress, "screen", "op=enroll")
+                            }
+                            onSignInTrace(line)
+                            onEnrollOnly()
+                        },
+                        enabled = canSignIn,
+                    ) {
                         Text("Just add this computer to my account")
                     }
                 }

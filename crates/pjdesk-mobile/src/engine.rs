@@ -2041,6 +2041,17 @@ fn sign_in_attempts(heartbeat_up: bool) -> &'static [SignInAttempt] {
     }
 }
 
+/// A new dial can fail while the heartbeat connection is still up. That is not
+/// "could not reach": the phone is already talking to that server.
+fn sign_in_dial_failure(heartbeat_up: bool, heartbeat_addr: &str) -> String {
+    let addr = heartbeat_addr.trim();
+    if heartbeat_up && !addr.is_empty() {
+        format!("The PJDesk server at {addr} is connected. The sign-in did not get an answer on that connection.")
+    } else {
+        "Could not reach the PJDesk server.".into()
+    }
+}
+
 fn sign_in_log(cb: &Arc<dyn Callbacks>, address: &str, step: &str, detail: &str) {
     let address = if address.trim().is_empty() { "none" } else { address.trim() };
     let detail = detail.replace(['\n', '\r'], " ");
@@ -2151,8 +2162,9 @@ async fn account_on_address(
 }
 
 async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, msg: ClientMsg) -> Result<(ServerMsg, String)> {
-    sign_in_log(cb, &state.host_at.lock().unwrap().clone(), "start", &format!("op={asked}"));
+    let heartbeat_addr = state.host_at.lock().unwrap().clone();
     let heartbeat_up = state.host_tx.lock().unwrap().is_some();
+    sign_in_log(cb, &heartbeat_addr, "start", &format!("op={asked}"));
     let mut signal: Option<SignalClient> = None;
     for attempt in sign_in_attempts(heartbeat_up) {
         match attempt {
@@ -2196,7 +2208,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                             let why = err.to_string();
                             let why = why.lines().next().unwrap_or("failed").trim();
                             sign_in_log(cb, "", "dial", &format!("reply=no-transport {why}"));
-                            bail!("Could not reach the PJDesk server.");
+                            bail!("{}", sign_in_dial_failure(heartbeat_up, &heartbeat_addr));
                         }
                     }
                 }
@@ -2227,7 +2239,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                             let why = err.to_string();
                             let why = why.lines().next().unwrap_or("failed").trim();
                             sign_in_log(cb, "", "dial", &format!("reply=no-transport {why}"));
-                            bail!("Could not reach the PJDesk server.");
+                            bail!("{}", sign_in_dial_failure(heartbeat_up, &heartbeat_addr));
                         }
                     }
                 }
@@ -3812,6 +3824,17 @@ use tokio::io::AsyncWriteExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_heartbeat_is_not_reported_as_unreachable() {
+        let down = sign_in_dial_failure(false, "");
+        assert_eq!(down, "Could not reach the PJDesk server.");
+        let up = sign_in_dial_failure(true, "192.168.0.193:21200");
+        assert!(up.contains("192.168.0.193:21200"));
+        assert!(up.contains("is connected"));
+        assert!(!up.to_ascii_lowercase().contains("could not reach"));
+        assert_eq!(sign_in_dial_failure(true, "  "), "Could not reach the PJDesk server.");
+    }
 
     #[test]
     fn custom_quality_is_clamped_and_aliases_map() {

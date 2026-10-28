@@ -631,7 +631,11 @@ class Engine(context: Context) : EngineListener {
             AppLog.i("event $kind ${event.optString("text")} ${event.optString("reason")}")
         }
         when (kind) {
-            "log" -> AppLog.i(event.optString("text"))
+            "log" -> {
+                val text = event.optString("text")
+                AppLog.i(text)
+                if (text.startsWith("sign-in ")) SignInSteps.note(text)
+            }
             "release" -> update { it.copy(latestRelease = event.optString("version").ifBlank { it.latestRelease }) }
             "serverLink" -> CloudGate.noteServer(event.optBoolean("up"))
             "account" -> CloudGate.noteAccount(event.toString())
