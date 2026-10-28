@@ -405,6 +405,95 @@ fn record(data_dir: &Path, result: &str, available: &str, error: &str) -> Result
     Ok(())
 }
 
+/// Shown before the installer starts, and while the service is restarting.
+pub fn updating_line(version: &str) -> String {
+    format!("Updating to {version}; the service will restart")
+}
+
+/// The version the running service reported. The window's own build is not a substitute.
+pub fn service_version_text(reported: &str) -> String {
+    let reported = reported.trim();
+    if reported.is_empty() { "unknown".into() } else { reported.to_string() }
+}
+
+/// A service-down sentence. It is not an update result while an install is in progress.
+pub fn service_down_notice(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("did not answer") || message.contains("installed, not running")
+}
+
+/// How long to wait for the service to come back after the installer starts.
+pub const INSTALL_WAIT_SECS: u64 = 5 * 60;
+
+/// What the window should do while an install is in progress.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallWatchResult {
+    Keep,
+    Updated(String),
+    Failed(String),
+}
+
+/// `launched` is set once the installer has been started, or the service has
+/// gone away while starting it. Success is the service running again and
+/// `server-update-status.json` reading as up to date. [`UpdateStatus::settled`]
+/// is what turns `Installing X` into that line once X is the running service.
+pub fn watch_install(
+    target: &str,
+    launched: bool,
+    service_up: bool,
+    service_version: &str,
+    status: &UpdateStatus,
+    elapsed_secs: u64,
+) -> InstallWatchResult {
+    let target = target.trim();
+    let version = service_version.trim();
+    let settled = if version.is_empty() { status.clone() } else { status.clone().settled(version) };
+    if launched && service_up && status_is_settled(&settled) {
+        let running_new = !version.is_empty() && !pjdesk_proto::update::is_newer(version, target);
+        let shown = if running_new { version } else { target };
+        if !shown.is_empty() && (running_new || settled.last_result.starts_with("Up to date")) {
+            return InstallWatchResult::Updated(shown.to_string());
+        }
+    }
+    if launched {
+        if let Some(err) = install_failure(status, target) {
+            return InstallWatchResult::Failed(err);
+        }
+    }
+    if elapsed_secs >= INSTALL_WAIT_SECS {
+        let err = if !service_up {
+            "The update did not finish. The PJDesk service did not come back.".into()
+        } else if !version.is_empty() && pjdesk_proto::update::is_newer(version, target) {
+            format!("The update to {target} did not finish. This server is still {version}.")
+        } else if !status.error.trim().is_empty() {
+            status.error.trim().to_string()
+        } else {
+            format!("The update to {target} did not finish.")
+        };
+        return InstallWatchResult::Failed(err);
+    }
+    InstallWatchResult::Keep
+}
+
+fn status_is_settled(status: &UpdateStatus) -> bool {
+    status.last_result.starts_with("Up to date") && status.available.trim().is_empty() && status.error.trim().is_empty()
+}
+
+/// An error recorded after the offer. The offer itself is not a failure.
+fn install_failure(status: &UpdateStatus, target: &str) -> Option<String> {
+    let err = status.error.trim();
+    if err.is_empty() {
+        return None;
+    }
+    if status.last_result.starts_with("Installing ") || status.last_result.starts_with("Up to date") {
+        return None;
+    }
+    if status.last_result.starts_with("Update ") && status.available.trim() == target {
+        return None;
+    }
+    Some(err.to_string())
+}
+
 /// The sentence the window shows after a check.
 pub fn check_sentence(current: &str, available: Option<&str>, error: Option<&str>) -> (String, String, String) {
     if let Some(err) = error.map(str::trim).filter(|s| !s.is_empty()) {
@@ -706,6 +795,44 @@ mod tests {
             error: String::new(),
         };
         assert_eq!(newer.clone().settled("0.6.33"), newer);
+
+        let installing = UpdateStatus {
+            last_check_at: 1,
+            last_result: "Installing 0.6.65".into(),
+            available: "0.6.65".into(),
+            error: String::new(),
+        };
+        assert_eq!(
+            watch_install("0.6.65", true, false, "", &installing, 10),
+            InstallWatchResult::Keep,
+            "the service is down while the installer runs"
+        );
+        assert_eq!(
+            watch_install("0.6.65", true, true, "0.6.64", &installing, 10),
+            InstallWatchResult::Keep,
+            "the old service version has not settled the new install"
+        );
+        let settled = installing.settled("0.6.65");
+        assert_eq!(settled.last_result, "Up to date");
+        assert_eq!(
+            watch_install("0.6.65", true, true, "0.6.65", &settled, 10),
+            InstallWatchResult::Updated("0.6.65".into())
+        );
+        assert_eq!(service_version_text(""), "unknown");
+        assert_eq!(service_version_text("0.6.65"), "0.6.65");
+        assert!(service_down_notice("The PJDesk service did not answer."));
+        assert!(!service_down_notice("Updated to 0.6.65"));
+        assert_eq!(updating_line("0.6.65"), "Updating to 0.6.65; the service will restart");
+        let failed = UpdateStatus {
+            last_check_at: 1,
+            last_result: "checksum mismatch".into(),
+            available: String::new(),
+            error: "checksum mismatch".into(),
+        };
+        assert_eq!(
+            watch_install("0.6.65", true, true, "0.6.64", &failed, 1),
+            InstallWatchResult::Failed("checksum mismatch".into())
+        );
 
         let failed = UpdateStatus {
             last_check_at: 2,
