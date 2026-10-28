@@ -11,6 +11,9 @@ import us.spader.pjdesk.core.connectFailureText
 import us.spader.pjdesk.core.connectStatusLabel
 import us.spader.pjdesk.core.sessionAfterRefreshFailure
 import us.spader.pjdesk.core.shouldRetryNotOnline
+import us.spader.pjdesk.core.namedServerSignInFailure
+import us.spader.pjdesk.core.serverHasNoAccountCopy
+import us.spader.pjdesk.core.signInLogLine
 import us.spader.pjdesk.core.signInPageError
 
 class ConnectFeedbackTest {
@@ -121,6 +124,20 @@ class ConnectFeedbackTest {
         assertEquals("The PJDesk server did not answer the sign-in.", signInPageError("The PJDesk server did not answer the sign-in."))
         assertEquals("Could not reach the PJDesk server.", signInPageError("could not reach the primary or the standby; retrying"))
         assertEquals("The sign-in did not finish.", signInPageError(""))
+        assertTrue(serverHasNoAccountCopy("This server does not have the account yet, and pjdesk.com did not answer."))
+        assertFalse(serverHasNoAccountCopy("Wrong email or password."))
+        assertEquals(
+            "The server at 192.168.0.193:21200 answered. This server does not have the account yet, and pjdesk.com did not answer.",
+            namedServerSignInFailure(
+                "192.168.0.193:21200",
+                "This server does not have the account yet, and pjdesk.com did not answer.",
+            ),
+        )
+        assertEquals(
+            "sign-in address=192.168.0.193:21200 step=reply ok=false message=no copy",
+            signInLogLine("192.168.0.193:21200", "reply", "ok=false message=no copy"),
+        )
+        assertFalse(signInLogLine("192.168.0.193:21200", "request", "op=sign-in").contains("auth_key"))
         assertEquals(
             "This server is too old to accept a sign-in while Require signed-in accounts is on. Update the server.",
             signInPageError("Sign in required."),

@@ -19,6 +19,30 @@ fun signInPauseSeconds(status: Int, message: String, retryAfter: Long? = null): 
     return (waitMinutes(message) ?: (SIGN_IN_PAUSE_SECS / 60)) * 60
 }
 
+/** True when this server answered but could not check the account password. */
+fun serverHasNoAccountCopy(message: String): Boolean {
+    val lower = message.lowercase()
+    return lower.contains("does not have the account") ||
+        lower.contains("pjdesk.com did not answer") ||
+        lower.contains("no password check") ||
+        lower.contains("not signed in")
+}
+
+/** One PJDesk logcat line. Address, step, and reply. No password or token. */
+fun signInLogLine(address: String, step: String, detail: String): String {
+    val where = address.trim().ifBlank { "none" }
+    val extra = detail.trim()
+    return if (extra.isEmpty()) "sign-in address=$where step=$step" else "sign-in address=$where step=$step $extra"
+}
+
+/** Names the server that answered, unless the sentence already does. */
+fun namedServerSignInFailure(server: String, message: String): String {
+    val detail = message.trim().ifBlank { "did not accept the sign-in" }
+    val who = server.trim()
+    if (who.isEmpty() || detail.contains(" answered")) return detail
+    return "The server at $who answered. $detail"
+}
+
 /**
  * The sentence on the Sign in screen. A raw "Sign in required" is the server
  * refusing the request before it checked the password.

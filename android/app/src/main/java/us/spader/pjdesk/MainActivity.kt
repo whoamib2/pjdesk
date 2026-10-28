@@ -2853,32 +2853,64 @@ class MainActivity : FragmentActivity() {
 
     private fun signInAccount(email: String, password: String, device: String): us.spader.pjdesk.core.Session {
         val known = app.engine.state.value.server.ifBlank { app.store.accountServer }
-        if (known.isNotBlank()) {
-            if (app.engine.state.value.server.isBlank()) {
-                app.engine.applyAccountServer(known, app.store.accountFingerprint, quiet = true)
-            }
-            val auth = CloudAuth.authKeyHex(email, password)
-            val reply = CloudGate.request(
-                JSONObject()
-                    .put("op", "sign-in")
-                    .put("email", email.trim().lowercase())
-                    .put("auth_key", auth)
-                    .put("device_id", device)
-                    .put("device_name", "Android"),
-            )
-            if (reply == null) throw CloudAuthException("The sign-in did not finish.")
-            if (reply.optBoolean("ok")) return CloudAuth.sessionFromServer(email, device, reply)
-            val message = reply.optString("message")
-            val pause = reply.optLong("pause")
-            val mapped = us.spader.pjdesk.core.signInPageError(message, pause)
-            val secs = us.spader.pjdesk.core.signInPauseSeconds(
-                if (pause > 0L) 429 else 0,
-                message.ifBlank { mapped },
-                pause.takeIf { it > 0L },
-            )
-            throw CloudAuthException(mapped, status = if (secs != null) 429 else 401, retryAfter = secs)
+        if (known.isNotBlank() && app.engine.state.value.server.isBlank()) {
+            app.engine.applyAccountServer(known, app.store.accountFingerprint, quiet = true)
         }
-        return CloudAuth.signIn(email, password, device, "Android")
+        val targets = LinkedHashSet<String>()
+        targets.add("")
+        listOf(app.engine.state.value.server, app.store.accountServer, app.store.accountStandby)
+            .filter { it.isNotBlank() }
+            .forEach { targets.add(it) }
+        val auth = CloudAuth.authKeyHex(email, password)
+        val tried = ArrayList<String>()
+        for (target in targets) {
+            if (target.isNotBlank() && tried.any { sameServer(it, target) }) continue
+            AppLog.i(us.spader.pjdesk.core.signInLogLine(target, "request", "op=sign-in"))
+            val body = JSONObject()
+                .put("op", "sign-in")
+                .put("email", email.trim().lowercase())
+                .put("auth_key", auth)
+                .put("device_id", device)
+                .put("device_name", "Android")
+            if (target.isNotBlank()) body.put("address", target)
+            val reply = CloudGate.request(body)
+            val server = reply?.optString("server").orEmpty().ifBlank { target.ifBlank { known } }
+            val message = reply?.optString("message").orEmpty()
+            val ok = reply?.optBoolean("ok") == true
+            AppLog.i(us.spader.pjdesk.core.signInLogLine(server, "reply", "ok=$ok message=$message"))
+            if (reply == null) continue
+            if (ok) return CloudAuth.sessionFromServer(email, device, reply)
+            if (server.isNotBlank()) tried.add(server)
+            if (!us.spader.pjdesk.core.serverHasNoAccountCopy(message)) {
+                val pause = reply.optLong("pause")
+                val mapped = us.spader.pjdesk.core.namedServerSignInFailure(
+                    server,
+                    us.spader.pjdesk.core.signInPageError(message, pause),
+                )
+                val secs = us.spader.pjdesk.core.signInPauseSeconds(
+                    if (pause > 0L) 429 else 0,
+                    message.ifBlank { mapped },
+                    pause.takeIf { it > 0L },
+                )
+                throw CloudAuthException(mapped, status = if (secs != null) 429 else 401, retryAfter = secs)
+            }
+        }
+        val who = tried.joinToString(", ").ifBlank { known.ifBlank { "the PJDesk server" } }
+        AppLog.i(us.spader.pjdesk.core.signInLogLine("pjdesk.com", "cloud", "after=$who"))
+        return try {
+            CloudAuth.signIn(email, password, device, "Android", forceCloud = true)
+        } catch (err: CloudAuthException) {
+            throw CloudAuthException(
+                "The server at $who answered and does not have the account yet. ${err.message ?: "pjdesk.com did not answer."}",
+            )
+        }
+    }
+
+    private fun sameServer(left: String, right: String): Boolean {
+        fun host(text: String) = text.trim().substringBefore(':').lowercase()
+        val a = host(left)
+        val b = host(right)
+        return a.isNotEmpty() && a == b
     }
 
     private fun refreshAccount(

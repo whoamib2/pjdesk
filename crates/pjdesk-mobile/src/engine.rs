@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.56";
+pub const APP_VERSION: &str = "0.6.57";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -760,6 +760,7 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             if !device_id.is_empty() {
                 *state.account_device.lock().unwrap() = device_id.clone();
             }
+            let prefer = cmd.get("address").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
             let state = state.clone();
             let cb = cb.clone();
             tokio::spawn(async move {
@@ -776,9 +777,17 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                     computers,
                     proof: String::new(),
                 };
-                let outcome = exchange_account(&state, &cb, &asked, msg).await;
+                let outcome = if prefer.is_empty() {
+                    exchange_account(&state, &cb, &asked, msg).await
+                } else {
+                    account_on_address(&state, &cb, &asked, &prefer, msg).await
+                };
                 match outcome {
-                    Ok(reply) => emit(&cb, &account_event(&asked, &reply)),
+                    Ok((reply, addr)) => {
+                        let mut ev = account_event(&asked, &reply);
+                        ev["server"] = json!(addr);
+                        emit(&cb, &ev);
+                    }
                     Err(err) => {
                         let message = err.to_string();
                         let message = message.lines().next().unwrap_or(&message).trim();
@@ -2111,7 +2120,37 @@ async fn await_account(signal: &mut SignalClient, state: &State, cb: &Arc<dyn Ca
     }
 }
 
-async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, msg: ClientMsg) -> Result<ServerMsg> {
+async fn account_on_address(
+    state: &State,
+    cb: &Arc<dyn Callbacks>,
+    asked: &str,
+    prefer: &str,
+    msg: ClientMsg,
+) -> Result<(ServerMsg, String)> {
+    sign_in_log(cb, prefer, "dial-one", &format!("op={asked}"));
+    let budget = pjdesk_proto::routes::dial_budget(prefer);
+    let mut signal = match SignalClient::connect_endpoint(prefer, None, budget).await {
+        Ok(opened) => opened,
+        Err(err) => {
+            let why = err.to_string();
+            let why = why.lines().next().unwrap_or("failed").trim();
+            sign_in_log(cb, prefer, "dial-one", &format!("reply=no-transport {why}"));
+            bail!("Could not reach the PJDesk server at {prefer}.");
+        }
+    };
+    let addr = signal.server_addr.to_string();
+    sign_in_log(cb, &addr, "connected", "transport=tcp");
+    if signal.send(msg).is_err() {
+        sign_in_log(cb, &addr, "dial-one", "reply=send-failed");
+        bail!("The PJDesk server did not answer the sign-in.");
+    }
+    match await_account(&mut signal, state, cb, &addr, "dial-one", Duration::from_secs(12)).await {
+        AccountRead::Reply(reply) => Ok((reply, addr)),
+        AccountRead::Timeout | AccountRead::Closed => bail!("The PJDesk server did not answer the sign-in."),
+    }
+}
+
+async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, msg: ClientMsg) -> Result<(ServerMsg, String)> {
     sign_in_log(cb, &state.host_at.lock().unwrap().clone(), "start", &format!("op={asked}"));
     let heartbeat_up = state.host_tx.lock().unwrap().is_some();
     let mut signal: Option<SignalClient> = None;
@@ -2135,7 +2174,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                 match tokio::time::timeout(Duration::from_secs(8), rrx).await {
                     Ok(Ok(reply)) => {
                         sign_in_log(cb, &addr, "heartbeat", &reply_note(&reply));
-                        return Ok(reply);
+                        return Ok((reply, addr));
                     }
                     Ok(Err(_)) => sign_in_log(cb, &addr, "heartbeat", "reply=closed"),
                     Err(_) => {
@@ -2170,7 +2209,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                     continue;
                 }
                 match await_account(opened, state, cb, &addr, "account-before-register", Duration::from_secs(4)).await {
-                    AccountRead::Reply(reply) => return Ok(reply),
+                    AccountRead::Reply(reply) => return Ok((reply, addr)),
                     AccountRead::Timeout => {}
                     AccountRead::Closed => signal = None,
                 }
@@ -2213,7 +2252,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                         }
                         Ok(Some(reply @ ServerMsg::AccountResult { .. })) | Ok(Some(reply @ ServerMsg::Error { .. })) => {
                             sign_in_log(cb, &addr, "register-then-account", &reply_note(&reply));
-                            return Ok(reply);
+                            return Ok((reply, addr));
                         }
                         Ok(Some(ServerMsg::ServerVersion { version })) => {
                             pjdesk_proto::routes::note_server_version(&mut state.routes.lock().unwrap(), &version);
@@ -2239,7 +2278,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                     bail!("The PJDesk server did not answer the sign-in.");
                 }
                 match await_account(opened, state, cb, &addr, "register-then-account", Duration::from_secs(12)).await {
-                    AccountRead::Reply(reply) => return Ok(reply),
+                    AccountRead::Reply(reply) => return Ok((reply, addr)),
                     AccountRead::Timeout | AccountRead::Closed => {
                         bail!("The PJDesk server did not answer the sign-in.");
                     }

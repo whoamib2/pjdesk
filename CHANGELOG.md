@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.57
+
+Windows is 0.6.57. Android is 0.6.57 (versionCode 63126). The installer reads that version from Cargo.toml, so the files are PJDesk-Client-Setup-0.6.57.exe and PJDesk-Server-Setup-0.6.57.exe. This build does not redeploy the worker and does not run `cloud\deploy.cmd`. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off until the computers you want to keep have signed in. Do not delete cloud-sync.json, cloud-state.json, or account-mirror.json. The phone needs 63126. The PJDesk client and PJDesk Server both need this build. A computer already on 0.6.56 will take this build from auto-update once v0.6.57 is the latest release. This machine has no Windows PC and no wine, so the windows were not clicked through here. The phone was not clicked through here.
+
+* The primary downloads the account copy from pjdesk.com when it starts and again on the regular cloud pass. The standby downloads that copy too, so a phone that reaches the standby can still check the password. A cloud reply with no password check is not treated as success. A failed sign-in names the server that answered, primary or standby, and its computer name.
+* When the server that answered has no account copy, the phone tries the other saved server, then pjdesk.com, with the same wait after a cloud failure. The sentence names the server address that answered. Sign-in steps are also written from the app itself to the PJDesk log, so a release build shows them in logcat. The password and tokens are not written.
+
 ## 0.6.56
 
 Windows is 0.6.56. Android is 0.6.56 (versionCode 63125). The installer reads that version from Cargo.toml, so the files are PJDesk-Client-Setup-0.6.56.exe and PJDesk-Server-Setup-0.6.56.exe. This build does not redeploy the worker and does not run `cloud\deploy.cmd`. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off until the computers you want to keep have signed in. Do not delete cloud-sync.json, cloud-state.json, or account-mirror.json. The phone needs 63125. The PJDesk client and PJDesk Server both need this build. A computer already on 0.6.55 will take this build from auto-update once v0.6.56 is the latest release. This machine has no Windows PC and no wine, so the windows were not clicked through here. The phone was not clicked through here.

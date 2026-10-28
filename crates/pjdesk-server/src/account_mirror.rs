@@ -125,6 +125,8 @@ fn write_stamp(path: &Path, at: u64) {
 /// One batch. The standby does not call pjdesk.com here.
 pub fn batch(dir: &Path, force: bool) -> bool {
     if !cloud::accepts_host_registrations(dir) {
+        // The standby does not upload, but it still needs the password check.
+        let _ = pull_now(dir);
         return false;
     }
     let at = now();
@@ -505,14 +507,14 @@ pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
         if let Err(err) = proxy_login_seed(dir, &email, &auth_key) {
             tracing::warn!("account copy proxy: {err}");
             if !has_verifier(&load(dir)) {
-                return fail(&op, &err);
+                return name_account_failure(dir, fail(&op, &err));
             }
         }
     }
     let mut copy = load(dir);
     ensure_sign_key(&mut copy);
     save(dir, &copy);
-    match op.as_str() {
+    let reply = match op.as_str() {
         "sign-in" => answer_sign_in(dir, &email, &auth_key, &device_id, &device_name),
         "verify" => answer_verify(dir, &email, &auth_key),
         "refresh" => answer_refresh(dir, &refresh, &device_id, &computers),
@@ -522,7 +524,19 @@ pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
         "lock-write" => answer_sealed(dir, &refresh, &device_id, false, Some(app_lock)),
         "saved-write" => answer_saved(dir, &refresh, &device_id, &computers),
         _ => fail(&op, "That was not understood."),
+    };
+    name_account_failure(dir, reply)
+}
+
+/// Puts the answering server's name on a failed account reply.
+fn name_account_failure(dir: &Path, mut msg: ServerMsg) -> ServerMsg {
+    if let ServerMsg::AccountResult { ok: false, message, .. } = &mut msg {
+        if !message.contains(" answered") {
+            let who = crate::cloud::role_label(dir);
+            *message = format!("{who} answered. {message}");
+        }
     }
+    msg
 }
 
 /// The server has no copy. Sign in to pjdesk.com with the client's auth key
@@ -557,7 +571,7 @@ fn proxy_login_seed(dir: &Path, email: &str, auth_key: &str) -> Result<(), Strin
         Err(err) => return Err(format!("login: {err}")),
     };
     let mut cfg = CloudConfig::load(dir).unwrap_or_else(CloudConfig::blank_account);
-    cfg.api = api;
+    cfg.api = api.clone();
     cfg.token = token;
     cfg.mode = "account".into();
     match pull(&cfg) {
@@ -565,6 +579,12 @@ fn proxy_login_seed(dir: &Path, email: &str, auth_key: &str) -> Result<(), Strin
             note_cloud_ok(dir);
             let mut local = merge(&fresh, &load(dir), &journal(dir));
             ensure_sign_key(&mut local);
+            if !has_verifier(&local) {
+                let _ = record_status(dir, 0, "pjdesk.com sent an account copy with no password check");
+                return Err(format!(
+                    "{api}/api/account/mirror answered, but the copy has no password check for this account"
+                ));
+            }
             save(dir, &local);
             let _ = crate::access::restore_grace(dir);
             let line = record_status(dir, now(), "");
@@ -1141,8 +1161,9 @@ mod tests {
             ServerMsg::AccountResult { ok, op, message, .. } => {
                 assert!(!ok);
                 assert_eq!(op, "sign-in");
-                assert_eq!(message, "Enter your email and password.");
-                assert!(!crate::access::peer_message().eq_ignore_ascii_case(message.trim_end_matches('.')));
+                assert!(message.contains("Enter your email and password."), "{message}");
+                assert!(message.contains("answered"), "{message}");
+                assert!(!message.contains(crate::access::peer_message()));
             }
             other => panic!("{other:?}"),
         }
@@ -1165,6 +1186,24 @@ mod tests {
             ServerMsg::AccountResult { message, .. } => assert_ne!(message, crate::access::peer_message()),
             other => panic!("{other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_standby_still_downloads_the_account_copy() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-standby-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::cloud::CONFIG_FILE),
+            r#"{"mode":"account","api":"https://pjdesk.com","email":"ben@spader.us","token":"","endpoint":"","bucket":"","access_key_id":"","secret_access_key":"","key":"","region":"auto"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("cloud-state.json"), r#"{"desired":"standby","epoch":4,"active_instance":"other"}"#).unwrap();
+        assert!(!crate::cloud::accepts_host_registrations(&dir));
+        assert!(!batch(&dir, false));
+        let status = std::fs::read_to_string(dir.join("account-copy-status.json")).unwrap_or_default();
+        assert!(status.contains("not signed in"), "{status}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
