@@ -10,6 +10,7 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -59,6 +60,7 @@ fun SignInScreen(
     signInPaused: Boolean = false,
     onClose: (() -> Unit)? = null,
 ) {
+    PjPage {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -74,9 +76,16 @@ fun SignInScreen(
             )
         }
         if (onClose != null) {
-            TextButton(onClick = onClose) { Text("Back") }
+            TextButton(
+                onClick = onClose,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onBackground),
+            ) { Text("Back") }
         }
-        Text("Sign in to your network", style = MaterialTheme.typography.headlineMedium)
+        Text(
+            "Sign in to your network",
+            style = MaterialTheme.typography.headlineMedium,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
         Text(
             if (useKey) "Paste a network key, or scan its QR code. This phone enrolls and stays signed in after a restart."
             else if (useCode) "Enter an 8-digit code from someone on this network. It works once, lasts one hour, and you do not need a PJDesk account. An older enrollment code still works in this box."
@@ -169,6 +178,7 @@ fun SignInScreen(
                 }
             }
         }
+    }
     }
 }
 

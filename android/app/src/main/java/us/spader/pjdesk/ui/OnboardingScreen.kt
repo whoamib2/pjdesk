@@ -34,6 +34,7 @@ fun OnboardingScreen(
     onComputerName: (String) -> Unit = {},
 ) {
     var name by rememberSaveable { mutableStateOf(computerName) }
+    PjPage {
     Column(
         Modifier
             .fillMaxSize()
@@ -89,6 +90,7 @@ fun OnboardingScreen(
             enabled = notificationsGranted && accessibilityEnabled && captureReady,
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Continue") }
+    }
     }
 }
 

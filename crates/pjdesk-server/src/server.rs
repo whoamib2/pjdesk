@@ -530,6 +530,8 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
                 continue;
             }
             if let ClientMsg::Account { .. } = &msg {
+                // Before registration and before the Require gate. A 0.6.52 server
+                // already answers Account on a connection that has not registered.
                 let dir = state.lock().unwrap().data_dir.clone();
                 let request = msg;
                 let reply = tokio::task::spawn_blocking(move || crate::account_mirror::answer(&dir, request))
@@ -1482,7 +1484,10 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             // so an older draft of that message does not stall the connection.
         }
 
-        ClientMsg::Account { .. } => {}
+        ClientMsg::Account { .. } => {
+            // The connection task answers this before the lock. Do not turn it
+            // into "Sign in required".
+        }
 
         ClientMsg::SetIncomingOnly { on, password } => {
             let Some(id) = conn.host_id.clone() else {
@@ -2291,6 +2296,36 @@ mod tests {
         };
         assert_eq!(id, "123456789");
         assert!(!state.lock().unwrap().registry.is_signed_in(&id), "the ID is pending until the account signs in");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_account_sign_in_is_not_turned_into_sign_in_required() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-account-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::access::Policy { require_accounts: true, require_chosen: true, ..crate::access::Policy::default() }
+            .save(&dir)
+            .unwrap();
+        let state = state_in(&dir);
+        let (mut conn, mut rx) = conn_pair();
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::Account {
+                op: "sign-in".into(),
+                email: "ben@spader.us".into(),
+                auth_key: "zz".into(),
+                refresh: String::new(),
+                device_id: "phone".into(),
+                device_name: "Android".into(),
+                vault: String::new(),
+                app_lock: String::new(),
+                computers: Vec::new(),
+                proof: String::new(),
+            },
+        );
+        assert!(rx.try_recv().is_err(), "sign-in is answered before the require gate, not refused here");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

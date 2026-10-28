@@ -19,6 +19,36 @@ fun signInPauseSeconds(status: Int, message: String, retryAfter: Long? = null): 
     return (waitMinutes(message) ?: (SIGN_IN_PAUSE_SECS / 60)) * 60
 }
 
+/**
+ * The sentence on the Sign in screen. A raw "Sign in required" is the server
+ * refusing the request before it checked the password.
+ */
+fun signInPageError(message: String, pauseSecs: Long = 0): String {
+    val text = message.trim()
+    val lower = text.lowercase()
+    if (pauseSecs > 0 || lower.contains("too many sign-in attempts") || lower.contains("too many failed sign-ins")) {
+        val secs = when {
+            pauseSecs > 0 -> pauseSecs
+            else -> signInPauseSeconds(429, text, null) ?: SIGN_IN_PAUSE_SECS
+        }
+        return signInPauseText(secs)
+    }
+    if (lower.contains("wrong email") || lower.contains("wrong password")) return "Wrong email or password."
+    if (lower.contains("sign in required") || lower.contains("requires sign-in")) {
+        return "This server is too old to accept a sign-in while Require signed-in accounts is on. Update the server."
+    }
+    if (
+        text.isEmpty() ||
+        lower.contains("did not answer") ||
+        lower.contains("could not reach") ||
+        lower.contains("timed out") ||
+        lower.contains("closed the connection")
+    ) {
+        return "Could not reach the PJDesk server."
+    }
+    return text
+}
+
 /** The sentence on the Sign in screen. Minutes are the remaining time, rounded up. */
 fun signInPauseText(remainingSecs: Long): String {
     val secs = remainingSecs.coerceAtLeast(0L)
