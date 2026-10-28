@@ -10,7 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
 use pjdesk_proto::account_mirror::{
-    self, apply_change, ensure_sign_key, for_replica, has_verifier, merge, sign_in, vault_for, AccountChange,
+    self, apply_change, ensure_sign_key, for_replica, generate_sign_key, has_verifier, merge, sign_in, vault_for,
+    AccountChange,
     AccountCopy, AuthError, DeviceRow, SavedComputer, SealedRow,
 };
 use pjdesk_proto::failover::{cloud_edge_limited, next_cloud_wait, CLOUD_BATCH_SECS};
@@ -22,6 +23,9 @@ use sha2::Sha256;
 use crate::cloud::{self, CloudConfig};
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Sign-in may wait this long for a cloud copy, then it answers and the copy finishes later.
+pub const SIGN_IN_SEED_BUDGET: Duration = Duration::from_secs(5);
 
 const MIRROR_FILE: &str = "account-mirror.json";
 const JOURNAL_FILE: &str = "account-journal.json";
@@ -148,14 +152,17 @@ pub fn batch(dir: &Path, force: bool) -> bool {
         match push(&cfg, &local.revision, &pending) {
             Ok(fresh) => {
                 note_cloud_ok(dir);
-                local = merge(&fresh, &local, &[]);
-                store_journal(dir, &[]);
+                let kept = unfinished_sign_keys(&pending, &fresh);
+                local = merge(&fresh, &local, &kept);
+                store_journal(dir, &kept);
             }
             Err(Push::Conflict(fresh)) => {
                 local = merge(&fresh, &local, &pending);
-                if let Ok(again) = push(&cfg, &local.revision, &journal_from_merge(&fresh, &local)) {
-                    local = merge(&again, &local, &[]);
-                    store_journal(dir, &[]);
+                let again_changes = journal_from_merge(&fresh, &local);
+                if let Ok(again) = push(&cfg, &local.revision, &again_changes) {
+                    let kept = unfinished_sign_keys(&pending, &again);
+                    local = merge(&again, &local, &kept);
+                    store_journal(dir, &kept);
                 }
             }
             Err(Push::Paused) => {
@@ -482,6 +489,7 @@ pub fn open_before_registration(op: &str) -> bool {
 
 /// Answers one client account request from the local copy.
 pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
+    let started = std::time::Instant::now();
     let ClientMsg::Account {
         op,
         email,
@@ -500,14 +508,22 @@ pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
     if op == "replica" {
         return replica(dir, &proof);
     }
-    if !has_verifier(&load(dir)) && !cloud_paused(dir) {
-        let _ = pull_now(dir);
-    }
     if !has_verifier(&load(dir)) && (op == "sign-in" || op == "verify") {
-        if let Err(err) = proxy_login_seed(dir, &email, &auth_key) {
-            tracing::warn!("account copy proxy: {err}");
-            if !has_verifier(&load(dir)) {
-                return name_account_failure(dir, fail(&op, &err));
+        match seed_for_sign_in(dir, &email, &auth_key, SIGN_IN_SEED_BUDGET) {
+            SeedWait::Ready => {}
+            SeedWait::Failed(err) => {
+                tracing::warn!("account copy proxy: {err}");
+                let reply = name_account_failure(dir, fail(&op, &err));
+                log_sign_in(&op, &reply, started);
+                return reply;
+            }
+            SeedWait::Loading => {
+                let reply = name_account_failure(
+                    dir,
+                    fail(&op, "The account copy is still loading from pjdesk.com; try again in a moment."),
+                );
+                log_sign_in(&op, &reply, started);
+                return reply;
             }
         }
     }
@@ -525,7 +541,110 @@ pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
         "saved-write" => answer_saved(dir, &refresh, &device_id, &computers),
         _ => fail(&op, "That was not understood."),
     };
-    name_account_failure(dir, reply)
+    let reply = name_account_failure(dir, reply);
+    log_sign_in(&op, &reply, started);
+    reply
+}
+
+enum SeedWait {
+    Ready,
+    Failed(String),
+    Loading,
+}
+
+/// Pulls or seeds the account copy, but the sign-in reply does not wait past `budget`.
+/// A seed that is still running keeps going after this returns [`SeedWait::Loading`].
+fn seed_for_sign_in(dir: &Path, email: &str, auth_key: &str, budget: Duration) -> SeedWait {
+    if has_verifier(&load(dir)) {
+        return SeedWait::Ready;
+    }
+    let dir_bg = dir.to_path_buf();
+    let email_bg = email.to_string();
+    let auth_bg = auth_key.to_string();
+    let started = std::time::Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("account-seed".into())
+        .spawn(move || {
+            let result = seed_blocking(&dir_bg, &email_bg, &auth_bg);
+            let ms = started.elapsed().as_millis();
+            match &result {
+                Ok(()) => tracing::info!("account copy seed finished ok=true ms={ms}"),
+                Err(err) => tracing::info!("account copy seed finished ok=false ms={ms} message={}", one_line(err)),
+            }
+            let _ = tx.send(result);
+        })
+        .ok();
+    match rx.recv_timeout(budget) {
+        Ok(Ok(())) => SeedWait::Ready,
+        Ok(Err(err)) => {
+            if has_verifier(&load(dir)) {
+                SeedWait::Ready
+            } else {
+                SeedWait::Failed(err)
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => SeedWait::Loading,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if has_verifier(&load(dir)) {
+                SeedWait::Ready
+            } else {
+                SeedWait::Failed("The account copy could not be loaded.".into())
+            }
+        }
+    }
+}
+
+fn seed_blocking(dir: &Path, email: &str, auth_key: &str) -> std::result::Result<(), String> {
+    if !has_verifier(&load(dir)) && !cloud_paused(dir) {
+        let _ = pull_now(dir);
+    }
+    if has_verifier(&load(dir)) {
+        return Ok(());
+    }
+    if cloud_paused(dir) {
+        return Err("pjdesk.com is rate limited".into());
+    }
+    proxy_login_seed(dir, email, auth_key)
+}
+
+fn log_sign_in(op: &str, reply: &ServerMsg, started: std::time::Instant) {
+    if op != "sign-in" {
+        return;
+    }
+    let ms = started.elapsed().as_millis();
+    match reply {
+        ServerMsg::AccountResult { ok, message, .. } => {
+            tracing::info!("account op=sign-in ok={ok} ms={ms} message={}", one_line(message));
+        }
+        _ => tracing::info!("account op=sign-in ok=false ms={ms} message=no account result"),
+    }
+}
+
+/// Replaces the account-mirror signing key. The new private key is not returned.
+pub fn rotate_sign_key(dir: &Path) -> std::result::Result<String, String> {
+    let copy = load(dir);
+    if copy.sign_pkcs8.is_empty() && copy.account_id.is_empty() && !has_verifier(&copy) {
+        return Err("This server does not have an account copy yet.".into());
+    }
+    let (pkcs8, public_key) = generate_sign_key().ok_or_else(|| "Could not generate a signing key.".to_string())?;
+    remember(
+        dir,
+        AccountChange::SignKey { public_key, pkcs8 },
+    );
+    let _ = batch(dir, true);
+    Ok("Replaced the account signing key on this server. New sessions use the new key.".into())
+}
+
+fn unfinished_sign_keys(pending: &[AccountChange], fresh: &AccountCopy) -> Vec<AccountChange> {
+    pending
+        .iter()
+        .filter(|change| match change {
+            AccountChange::SignKey { public_key, .. } => fresh.sign_public != *public_key,
+            _ => false,
+        })
+        .cloned()
+        .collect()
 }
 
 /// Puts the answering server's name on a failed account reply.
@@ -1088,6 +1207,26 @@ mod tests {
         assert!(key.contains("HTTP 500 signing key"), "{key}");
         let server = mirror_http_error(500, r#"{"error":"Something went wrong."}"#);
         assert!(server.contains("HTTP 500 server"), "{server}");
+    }
+
+    #[test]
+    fn rotate_sign_key_replaces_the_key_and_does_not_return_it() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut copy = AccountCopy::default();
+        copy.account_id = "acct".into();
+        ensure_sign_key(&mut copy);
+        let old = copy.sign_pkcs8.clone();
+        save(&dir, &copy);
+        let sentence = rotate_sign_key(&dir).unwrap();
+        assert!(!sentence.contains(&old), "{sentence}");
+        assert!(!sentence.to_ascii_lowercase().contains("pkcs8"));
+        let now = load(&dir);
+        assert_ne!(now.sign_pkcs8, old);
+        assert!(!now.sign_pkcs8.is_empty());
+        assert!(!sentence.contains(&now.sign_pkcs8));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

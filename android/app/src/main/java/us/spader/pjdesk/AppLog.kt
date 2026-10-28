@@ -39,6 +39,18 @@ object AppLog {
 
     fun logFile(): File? = if (::file.isInitialized && file.exists()) file else null
 
+    /** Sign-in lines kept in the app log, including the previous file after a roll. */
+    fun recentSignIn(limit: Int = 50): String {
+        if (!::file.isInitialized) return ""
+        val older = File(file.parentFile, "pjdesk.log.1")
+        val text = buildString {
+            if (older.exists()) append(runCatching { older.readText() }.getOrDefault(""))
+            if (isNotEmpty()) append('\n')
+            if (file.exists()) append(runCatching { file.readText() }.getOrDefault(""))
+        }
+        return us.spader.pjdesk.core.signInLinesFromLog(text, limit)
+    }
+
     fun share(context: Context) {
         val log = logFile()
         if (log == null) {

@@ -137,6 +137,13 @@ export function applyChange(copy, change) {
       copy.network.active_address = address;
       copy.network.active_fingerprint = text(change.active_fingerprint, 80);
     }
+  } else if (op === "sign_key") {
+    const pub = text(change.public_key, 128);
+    const pkcs8 = text(change.pkcs8, 400);
+    if (pub && pkcs8) {
+      copy.sign_public = pub;
+      copy.sign_pkcs8 = pkcs8;
+    }
   }
   return copy;
 }
@@ -447,6 +454,20 @@ async function persist(env, networkId, change) {
         WHERE id = ? AND active_address = ''`,
     )
       .bind(text(change.active_address, 200), text(change.active_fingerprint, 80), networkId)
+      .run();
+  } else if (op === "sign_key") {
+    const pub = text(change.public_key, 128);
+    const pkcs8 = text(change.pkcs8, 400);
+    if (!pub || !pkcs8) return;
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.prepare(
+      `INSERT INTO network_sign_keys (network_id, public_key, private_pkcs8, created_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(network_id) DO UPDATE SET
+         public_key = excluded.public_key,
+         private_pkcs8 = excluded.private_pkcs8,
+         created_at = excluded.created_at`,
+    )
+      .bind(networkId, pub, pkcs8, now)
       .run();
   }
 }

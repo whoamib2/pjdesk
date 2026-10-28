@@ -70,6 +70,14 @@ test("a newer removal sticks, and a revocation newer than the enroll is kept", (
   assert.equal(mirror.devices[0].refresh_hash, "");
 });
 
+test("a sign key change replaces the exposed key", () => {
+  const mirror = copy();
+  applyChange(mirror, { op: "sign_key", public_key: "ab".repeat(32), pkcs8: "cd".repeat(48) });
+  assert.equal(mirror.sign_public, "ab".repeat(32));
+  assert.equal(mirror.sign_pkcs8, "cd".repeat(48));
+  assert.equal(mirror.sign_pkcs8.includes("net-private"), false);
+});
+
 test("an empty or stale base revision conflicts, and a matching one applies", () => {
   assert.equal(decidePut("abc", ""), "conflict");
   assert.equal(decidePut("abc", "zzz"), "conflict");

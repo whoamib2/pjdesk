@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.59";
+pub const APP_VERSION: &str = "0.6.60";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -2109,14 +2109,17 @@ fn sign_in_attempts(heartbeat_up: bool) -> &'static [SignInAttempt] {
     }
 }
 
-/// A new dial can fail while the heartbeat connection is still up. That is not
-/// "could not reach": the phone is already talking to that server.
-fn sign_in_dial_failure(heartbeat_up: bool, heartbeat_addr: &str) -> String {
-    let addr = heartbeat_addr.trim();
-    if heartbeat_up && !addr.is_empty() {
-        format!("The PJDesk server at {addr} is connected. The sign-in did not get an answer on that connection.")
+/// How long a sign-in waits on the connection that is already heartbeating.
+const HEARTBEAT_SIGN_IN_WAIT: Duration = Duration::from_secs(20);
+
+/// The sentence for a sign-in step that failed. It names the step and the real error.
+fn sign_in_step_failure(step: &str, detail: &str) -> String {
+    let detail = detail.trim().replace(['\n', '\r'], " ");
+    let detail: String = detail.chars().take(180).collect();
+    if detail.is_empty() {
+        format!("The sign-in timed out at step={step}.")
     } else {
-        "Could not reach the PJDesk server.".into()
+        format!("The sign-in failed at step={step}. {detail}")
     }
 }
 
@@ -2154,8 +2157,7 @@ fn deliver_pending_account(state: &State, msg: &ServerMsg) -> bool {
         return false;
     }
     if let Some((_, tx)) = slot.take() {
-        let _ = tx.send(msg.clone());
-        true
+        tx.send(msg.clone()).is_ok()
     } else {
         false
     }
@@ -2214,18 +2216,20 @@ async fn account_on_address(
             let why = err.to_string();
             let why = why.lines().next().unwrap_or("failed").trim();
             sign_in_log(cb, prefer, "dial-one", &format!("reply=no-transport {why}"));
-            bail!("Could not reach the PJDesk server at {prefer}.");
+            bail!("{}", sign_in_step_failure("dial-one", &why));
         }
     };
     let addr = signal.server_addr.to_string();
     sign_in_log(cb, &addr, "connected", "transport=tcp");
     if signal.send(msg).is_err() {
         sign_in_log(cb, &addr, "dial-one", "reply=send-failed");
-        bail!("The PJDesk server did not answer the sign-in.");
+        bail!("{}", sign_in_step_failure("dial-one", "the sign-in was not sent"));
     }
     match await_account(&mut signal, state, cb, &addr, "dial-one", Duration::from_secs(12)).await {
         AccountRead::Reply(reply) => Ok((reply, addr)),
-        AccountRead::Timeout | AccountRead::Closed => bail!("The PJDesk server did not answer the sign-in."),
+        AccountRead::Timeout | AccountRead::Closed => {
+            bail!("{}", sign_in_step_failure("dial-one", "timed out"));
+        }
     }
 }
 
@@ -2233,36 +2237,45 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
     let heartbeat_addr = state.host_at.lock().unwrap().clone();
     let heartbeat_up = state.host_tx.lock().unwrap().is_some();
     sign_in_log(cb, &heartbeat_addr, "start", &format!("op={asked}"));
-    let mut signal: Option<SignalClient> = None;
-    for attempt in sign_in_attempts(heartbeat_up) {
-        match attempt {
-            SignInAttempt::Heartbeat => {
-                let tx = state.host_tx.lock().unwrap().clone();
-                let addr = state.host_at.lock().unwrap().clone();
-                let Some(tx) = tx else {
-                    sign_in_log(cb, &addr, "heartbeat", "reply=no-connection");
-                    continue;
-                };
-                sign_in_log(cb, &addr, "heartbeat", &format!("op={asked}"));
-                let (rtx, rrx) = oneshot::channel();
-                *state.pending_account.lock().unwrap() = Some((asked.to_string(), rtx));
-                if tx.send(msg.clone()).is_err() {
-                    state.pending_account.lock().unwrap().take();
-                    sign_in_log(cb, &addr, "heartbeat", "reply=send-failed");
-                    continue;
-                }
-                match tokio::time::timeout(Duration::from_secs(8), rrx).await {
+    if heartbeat_up {
+        let tx = state.host_tx.lock().unwrap().clone();
+        let addr = state.host_at.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            sign_in_log(cb, &addr, "heartbeat", &format!("op={asked}"));
+            let (rtx, rrx) = oneshot::channel();
+            *state.pending_account.lock().unwrap() = Some((asked.to_string(), rtx));
+            if tx.send(msg.clone()).is_err() {
+                state.pending_account.lock().unwrap().take();
+                sign_in_log(cb, &addr, "heartbeat", "reply=send-failed");
+            } else {
+                // Stay on this connection. A second dial would race the reply.
+                match tokio::time::timeout(HEARTBEAT_SIGN_IN_WAIT, rrx).await {
                     Ok(Ok(reply)) => {
                         sign_in_log(cb, &addr, "heartbeat", &reply_note(&reply));
                         return Ok((reply, addr));
                     }
-                    Ok(Err(_)) => sign_in_log(cb, &addr, "heartbeat", "reply=closed"),
+                    Ok(Err(_)) => {
+                        sign_in_log(cb, &addr, "heartbeat", "reply=closed");
+                        bail!("{}", sign_in_step_failure("heartbeat", "the connection closed"));
+                    }
                     Err(_) => {
                         state.pending_account.lock().unwrap().take();
                         sign_in_log(cb, &addr, "heartbeat", "reply=timeout");
+                        bail!(
+                            "{}",
+                            sign_in_step_failure("heartbeat", &format!("no answer from {addr} within 20s"))
+                        );
                     }
                 }
             }
+        } else {
+            sign_in_log(cb, &addr, "heartbeat", "reply=no-connection");
+        }
+    }
+    let mut signal: Option<SignalClient> = None;
+    for attempt in sign_in_attempts(false) {
+        match attempt {
+            SignInAttempt::Heartbeat => {}
             SignInAttempt::AccountFirst => {
                 if signal.is_none() {
                     sign_in_log(cb, "", "dial", "op=account-before-register");
@@ -2276,7 +2289,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                             let why = err.to_string();
                             let why = why.lines().next().unwrap_or("failed").trim();
                             sign_in_log(cb, "", "dial", &format!("reply=no-transport {why}"));
-                            bail!("{}", sign_in_dial_failure(heartbeat_up, &heartbeat_addr));
+                            bail!("{}", sign_in_step_failure("dial", &why));
                         }
                     }
                 }
@@ -2290,7 +2303,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                 }
                 match await_account(opened, state, cb, &addr, "account-before-register", Duration::from_secs(4)).await {
                     AccountRead::Reply(reply) => return Ok((reply, addr)),
-                    AccountRead::Timeout => {}
+                    AccountRead::Timeout => sign_in_log(cb, &addr, "account-before-register", "reply=timeout"),
                     AccountRead::Closed => signal = None,
                 }
             }
@@ -2307,7 +2320,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                             let why = err.to_string();
                             let why = why.lines().next().unwrap_or("failed").trim();
                             sign_in_log(cb, "", "dial", &format!("reply=no-transport {why}"));
-                            bail!("{}", sign_in_dial_failure(heartbeat_up, &heartbeat_addr));
+                            bail!("{}", sign_in_step_failure("dial", &why));
                         }
                     }
                 }
@@ -2316,7 +2329,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                 sign_in_log(cb, &addr, "register-then-account", &format!("op={asked}"));
                 if send_host_register(opened, state).is_err() {
                     sign_in_log(cb, &addr, "register-then-account", "reply=send-failed");
-                    bail!("The PJDesk server did not answer the sign-in.");
+                    bail!("{}", sign_in_step_failure("register-then-account", "the register was not sent"));
                 }
                 state.sign_in_reregister.store(true, Ordering::SeqCst);
                 state.moved.notify_waiters();
@@ -2342,7 +2355,7 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                         Ok(Some(_)) => sign_in_log(cb, &addr, "register-then-account", "reply=other"),
                         Ok(None) => {
                             sign_in_log(cb, &addr, "register-then-account", "reply=closed");
-                            bail!("The PJDesk server did not answer the sign-in.");
+                            bail!("{}", sign_in_step_failure("register-then-account", "the connection closed"));
                         }
                         Err(_) => {
                             sign_in_log(cb, &addr, "register-then-account", "reply=timeout");
@@ -2355,18 +2368,18 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
                 }
                 if opened.send(msg.clone()).is_err() {
                     sign_in_log(cb, &addr, "register-then-account", "reply=send-failed");
-                    bail!("The PJDesk server did not answer the sign-in.");
+                    bail!("{}", sign_in_step_failure("register-then-account", "the sign-in was not sent"));
                 }
                 match await_account(opened, state, cb, &addr, "register-then-account", Duration::from_secs(12)).await {
                     AccountRead::Reply(reply) => return Ok((reply, addr)),
                     AccountRead::Timeout | AccountRead::Closed => {
-                        bail!("The PJDesk server did not answer the sign-in.");
+                        bail!("{}", sign_in_step_failure("register-then-account", "timed out"));
                     }
                 }
             }
         }
     }
-    bail!("The PJDesk server did not answer the sign-in.")
+    bail!("{}", sign_in_step_failure("register-then-account", "no answer"))
 }
 
 fn account_event(asked: &str, msg: &ServerMsg) -> Value {
@@ -3896,13 +3909,14 @@ mod tests {
 
     #[test]
     fn a_live_heartbeat_is_not_reported_as_unreachable() {
-        let down = sign_in_dial_failure(false, "");
-        assert_eq!(down, "Could not reach the PJDesk server.");
-        let up = sign_in_dial_failure(true, "192.168.0.193:21200");
-        assert!(up.contains("192.168.0.193:21200"));
-        assert!(up.contains("is connected"));
-        assert!(!up.to_ascii_lowercase().contains("could not reach"));
-        assert_eq!(sign_in_dial_failure(true, "  "), "Could not reach the PJDesk server.");
+        assert_eq!(HEARTBEAT_SIGN_IN_WAIT.as_secs(), 20);
+        let timed = sign_in_step_failure("heartbeat", "no answer from 192.168.0.193:21200 within 20s");
+        assert!(timed.contains("step=heartbeat"));
+        assert!(timed.contains("192.168.0.193:21200"));
+        let dial = sign_in_step_failure("dial", "connection refused");
+        assert!(dial.contains("step=dial"));
+        assert!(dial.contains("connection refused"));
+        assert!(!dial.to_ascii_lowercase().contains("password"));
     }
 
     #[test]

@@ -68,6 +68,49 @@ fun liveSignInServer(signalReached: String, serverUp: Boolean): String {
     return signalReached.trim()
 }
 
+/** Drops signing keys and passwords from a diagnostics line. Ordinary sentences stay. */
+fun redactDiagnostics(line: String): String {
+    var out = line
+    for (name in listOf("sign_pkcs8", "support_password", "supportPassword", "password", "auth_key")) {
+        out = redactAssigned(out, name)
+        out = redactJson(out, name)
+    }
+    return out
+}
+
+private fun redactAssigned(line: String, name: String): String {
+    val key = "$name="
+    val at = line.indexOf(key, ignoreCase = true)
+    if (at < 0) return line
+    val boundary = at == 0 || !line[at - 1].isLetterOrDigit()
+    if (!boundary) return line
+    val valueAt = at + key.length
+    val end = line.indexOfAny(charArrayOf(' ', '\t'), valueAt).let { if (it < 0) line.length else it }
+    return line.substring(0, valueAt) + "[redacted]" + line.substring(end)
+}
+
+private fun redactJson(line: String, name: String): String {
+    val pattern = "\"$name\""
+    val at = line.indexOf(pattern)
+    if (at < 0) return line
+    val colon = line.indexOf(':', at + pattern.length)
+    if (colon < 0) return line
+    var i = colon + 1
+    while (i < line.length && line[i].isWhitespace()) i++
+    if (i >= line.length || line[i] != '"') return line
+    val start = i
+    i++
+    while (i < line.length && line[i] != '"') i++
+    if (i >= line.length) return line
+    return line.substring(0, start) + "\"[redacted]\"" + line.substring(i + 1)
+}
+
+/** Sign-in lines from a log file, newest last, with secrets removed. */
+fun signInLinesFromLog(text: String, limit: Int = 50): String {
+    val lines = text.lineSequence().map { redactDiagnostics(it) }.filter { it.contains("sign-in ") }.toList()
+    return lines.takeLast(limit).joinToString("\n")
+}
+
 /** The Sign in button's first action. Returns the line it recorded. */
 fun signInScreenPressed(trace: SignInTrace, heartbeat: String, op: String): String {
     val line = signInLogLine(heartbeat, "screen", "op=$op")
@@ -104,6 +147,7 @@ fun signInPageError(message: String, pauseSecs: Long = 0): String {
     if (lower.contains("did not answer the sign-in")) {
         return "The PJDesk server did not answer the sign-in."
     }
+    if (lower.contains("step=")) return text
     if (text.isEmpty()) return "The sign-in did not finish."
     if (
         !lower.contains("answered") &&
