@@ -1,6 +1,10 @@
 # Changelog
 
 ## 0.6.65
+- Relay setup errors now say which side failed (this phone, or the host), with the relay address and UDP port. A host whose UDP bind fails tells the server, and the server tells the controller right away. The server logs what it is waiting for and drops the session after 17 s.
+- Android: the last connect error goes to logcat tag PJDeskConnect, and Settings has a "Share last error" button (secrets redacted).
+- The service watchdog only starts the service in the 15 minutes after an update.
+- TCP relay fallback is deferred; see docs/tcp-relay-fallback.md.
 
 Windows is 0.6.65. Android is 0.6.65 (versionCode 63134). The installer reads that version from Cargo.toml, so the files are PJDesk-Client-Setup-0.6.65.exe and PJDesk-Server-Setup-0.6.65.exe. This build does not redeploy the worker and does not run `cloud\deploy.cmd`. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off until the computers you want to keep have signed in. Do not delete cloud-sync.json, cloud-state.json, or account-mirror.json. The phone needs 63134. The PJDesk client and PJDesk Server both need this build. A computer already on 0.6.64 will take this build from auto-update once v0.6.65 is the latest release. This machine has no Windows PC and no wine, so the windows were not clicked through here. The phone was not clicked through here.
 
