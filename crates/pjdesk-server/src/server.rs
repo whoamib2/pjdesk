@@ -2049,7 +2049,7 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
     const PASS_EVERY: u32 = 150; // ticks of 2 s: one cloud batch every 5 minutes
     let data_dir = state.lock().unwrap().data_dir.clone();
     let startup = data_dir.clone();
-    match tokio::task::spawn_blocking(move || crate::account_mirror::pull_now(&startup)).await {
+    match tokio::task::spawn_blocking(move || crate::account_mirror::recover_if_empty(&startup)).await {
         Ok(line) => info!("{line}"),
         Err(err) => warn!("account copy: {err}"),
     }
@@ -2136,6 +2136,9 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
         let applied = tokio::task::spawn_blocking(move || {
             let applied = sync_once(&dir, role, forced);
             crate::account_mirror::batch(&dir, forced);
+            if !crate::account_mirror::has_owner_copy(&dir) {
+                let _ = crate::account_mirror::recover_if_empty(&dir);
+            }
             crate::account_mirror::refresh_release(&dir);
             applied
         })

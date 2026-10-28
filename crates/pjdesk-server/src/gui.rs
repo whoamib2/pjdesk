@@ -820,6 +820,11 @@ impl eframe::App for App {
                 )
             };
             let reported = shown_update(0, &last_result, &available, "");
+            let notice = if self.account_copy.contains(crate::account_mirror::SERVER_SIGN_IN_NEEDED) {
+                crate::account_mirror::SERVER_SIGN_IN_NEEDED
+            } else {
+                ""
+            };
             tray.set_tooltip(&crate::tray_tip::format(&crate::tray_tip::Tip {
                 installed,
                 running,
@@ -829,6 +834,7 @@ impl eframe::App for App {
                 active: &who,
                 available: &reported.available,
                 last_result: &reported.last_result,
+                notice,
             }));
         }
 
@@ -1867,7 +1873,8 @@ impl App {
                 );
                 return;
             }
-            if !email.is_empty() && cloud_on {
+            let needs_server_sign_in = self.account_copy.contains(crate::account_mirror::SERVER_SIGN_IN_NEEDED);
+            if !email.is_empty() && cloud_on && !needs_server_sign_in {
                 ui.label(RichText::new(format!("Signed in as {email}")).strong().size(20.0).color(p(ui).text));
                 self.paint_account_copy(ui);
                 if !role_line.is_empty() {
@@ -1909,6 +1916,10 @@ impl App {
                     );
                 }
                 return;
+            }
+            if needs_server_sign_in {
+                self.paint_account_copy(ui);
+                ui.add_space(6.0);
             }
             ui.label(
                 RichText::new(
@@ -3967,6 +3978,15 @@ impl App {
     fn paint_account_copy(&self, ui: &mut egui::Ui) {
         let line = self.account_copy.trim();
         if line.is_empty() {
+            return;
+        }
+        if line.contains(crate::account_mirror::SERVER_SIGN_IN_NEEDED) {
+            ui.label(RichText::new(line).strong().size(16.0).color(p(ui).warn));
+            ui.label(
+                RichText::new("Sign in again below. The saved cloud token was rejected, so this server cannot load the account copy.")
+                    .color(p(ui).text)
+                    .size(13.0),
+            );
             return;
         }
         ui.label(RichText::new(line).color(p(ui).muted).size(12.0));

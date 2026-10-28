@@ -2298,39 +2298,29 @@ async fn account_on_address(
     }
 }
 
-/// The primary said its account copy is empty. Try every known server.
-/// A LAN address on this phone's /24 is first. Discovery and the heartbeat
-/// are included, not only the one stored standby.
+/// The primary said its account copy is empty. Dial the account standby.
+/// A public address uses the standby fingerprint from the primary's routes.
+/// Skipping one for a missing fingerprint is not a failed sign-in.
 async fn account_on_standby(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, msg: ClientMsg) -> Result<(ServerMsg, String)> {
     let routes = state.routes.lock().unwrap().clone();
     let saved = state.standby.lock().unwrap().clone();
-    let heartbeat = state.host_at.lock().unwrap().clone();
     let extra = state.phone_mine.lock().unwrap().clone();
-    let (mine, heard) = tokio::task::spawn_blocking(move || {
-        let mine = merged_mine(&extra);
-        let heard = pjdesk_proto::discover::listen_servers(Duration::from_millis(1200));
-        (mine, heard)
-    })
-    .await
-    .unwrap_or_else(|_| (Vec::new(), Vec::new()));
-    let mut extras = vec![saved.clone(), heartbeat.clone()];
-    for (addr, beacon) in heard {
-        extras.push(format!("{}:{}", addr.ip(), beacon.port));
-        sign_in_log(cb, &format!("{}:{}", addr.ip(), beacon.port), "standby", "discovered");
-    }
-    let targets = pjdesk_proto::routes::sign_in_peer_order(&routes, &mine, &extras, &heartbeat);
+    let mine = tokio::task::spawn_blocking(move || merged_mine(&extra)).await.unwrap_or_default();
+    let targets = pjdesk_proto::routes::standby_account_order(&routes, &mine, &saved);
     sign_in_log(cb, &saved, "standby", &format!("op={asked} targets={}", targets.len()));
     if targets.is_empty() {
-        bail!("{}", sign_in_step_failure("standby", "", "no other server address is known"));
+        bail!("The standby address is not saved.");
     }
     let mut last_addr = String::new();
     let mut last_why = String::new();
     let mut empty: Option<(ServerMsg, String)> = None;
+    let mut dialed = false;
     for target in targets {
-        let Some(pin) = standby_pin(state, &target, &saved) else {
+        let Some(pin) = standby_pin(state, &target, &routes) else {
             sign_in_log(cb, &target, "standby", "reply=skipped public address without a fingerprint");
             continue;
         };
+        dialed = true;
         sign_in_log(cb, &target, "standby", "dialing");
         match SignalClient::connect_endpoint(&target, pin, pjdesk_proto::routes::dial_budget(&target)).await {
             Ok(mut signal) => {
@@ -2373,14 +2363,22 @@ async fn account_on_standby(state: &State, cb: &Arc<dyn Callbacks>, asked: &str,
     if let Some(found) = empty {
         return Ok(found);
     }
+    if !dialed {
+        bail!("The standby public address was not dialed because its fingerprint is not saved yet.");
+    }
     bail!("{}", sign_in_step_failure("standby", &last_addr, &last_why));
 }
 
-/// `Some(None)` trusts a private address. The saved fingerprint is only for the
-/// stored standby, so it is not pinned onto a different server.
-fn standby_pin(state: &State, target: &str, saved_standby: &str) -> Option<Option<pjdesk_proto::tls::Fingerprint>> {
-    let on_saved = !saved_standby.trim().is_empty() && pjdesk_proto::routes::same_endpoint(target, saved_standby);
-    if on_saved {
+/// The standby fingerprint from the primary covers every standby address,
+/// including the public one. A private address can be trusted once.
+fn standby_pin(
+    state: &State,
+    target: &str,
+    routes: &pjdesk_proto::routes::ServerRoutes,
+) -> Option<Option<pjdesk_proto::tls::Fingerprint>> {
+    let on_standby = routes.standby_lan.iter().chain(routes.standby_public.iter()).any(|addr| pjdesk_proto::routes::same_endpoint(addr, target))
+        || state.standby.lock().unwrap().split(',').any(|addr| pjdesk_proto::routes::same_endpoint(addr, target));
+    if on_standby {
         if let Some(text) = state.standby_fingerprint.lock().unwrap().clone() {
             if let Ok(fp) = pjdesk_proto::tls::parse_fingerprint(&text) {
                 return Some(Some(fp));

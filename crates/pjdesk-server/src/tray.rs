@@ -553,12 +553,23 @@ fn build_icon() -> Option<TrayIcon> {
         .ok()
 }
 
+/// Tooltip from the service session. `None` when the service did not answer.
+fn tray_sign_in_notice() -> Option<String> {
+    let resp = crate::control::call(&crate::control::Request { cmd: "session".into(), ..Default::default() })?;
+    if resp.account_copy.contains(crate::account_mirror::SERVER_SIGN_IN_NEEDED) {
+        Some(format!("PJDesk Server\n{}", crate::account_mirror::SERVER_SIGN_IN_NEEDED))
+    } else {
+        Some("PJDesk Server".into())
+    }
+}
+
 /// Pumps the tray window on this thread. There is no eframe loop here.
 fn pump(icon: TrayIcon) {
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT, WM_QUIT,
     };
     let mut logged_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    let mut sign_in_at = std::time::Instant::now() - std::time::Duration::from_secs(30);
     loop {
         if STOP.load(Ordering::SeqCst) {
             return;
@@ -566,6 +577,12 @@ fn pump(icon: TrayIcon) {
         let tip = TOOLTIP.try_lock().ok().and_then(|mut slot| slot.take());
         if let Some(tip) = tip {
             let _ = icon.set_tooltip(Some(tip));
+        }
+        if sign_in_at.elapsed() >= std::time::Duration::from_secs(15) {
+            sign_in_at = std::time::Instant::now();
+            if let Some(notice) = tray_sign_in_notice() {
+                let _ = icon.set_tooltip(Some(notice));
+            }
         }
         if tray_show_requested() {
             ask_open("second launch");

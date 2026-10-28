@@ -19,6 +19,19 @@ fun signInPauseSeconds(status: Int, message: String, retryAfter: Long? = null): 
     return (waitMinutes(message) ?: (SIGN_IN_PAUSE_SECS / 60)) * 60
 }
 
+/** A standby miss still lets the phone ask pjdesk.com. A wrong password does not. */
+fun standbyMissFallsThrough(message: String): Boolean {
+    if (message.isBlank()) return true
+    if (serverHasNoAccountCopy(message)) return true
+    val lower = message.lowercase()
+    if (lower.contains("wrong email") || lower.contains("too many")) return false
+    return lower.contains("without a fingerprint") ||
+        lower.contains("could not connect") ||
+        lower.contains("step=") ||
+        lower.contains("timed out") ||
+        lower.contains("not saved")
+}
+
 /** True when this server answered but could not check the account password. */
 fun serverHasNoAccountCopy(message: String): Boolean {
     val lower = message.lowercase()

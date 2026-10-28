@@ -249,52 +249,6 @@ pub fn standby_account_order(routes: &ServerRoutes, mine: &[Ipv4Addr], saved_sta
     out
 }
 
-/// Every known server, for a sign-in the primary could not check.
-///
-/// `extras` are addresses from discovery and the live heartbeat. A LAN address
-/// on `mine`'s /24 comes first, except `answered`, which already failed and
-/// is tried after the other servers. The stored standby is not the only target.
-pub fn sign_in_peer_order(routes: &ServerRoutes, mine: &[Ipv4Addr], extras: &[String], answered: &str) -> Vec<String> {
-    let mut all = Vec::new();
-    for raw in routes
-        .primary_lan
-        .iter()
-        .chain(routes.standby_lan.iter())
-        .chain(routes.primary_public.iter())
-        .chain(routes.standby_public.iter())
-        .chain(routes.names.iter())
-        .chain(extras.iter())
-    {
-        let addr = canonical(raw);
-        if !addr.is_empty() {
-            push_unique(&mut all, addr);
-        }
-    }
-    let answered = canonical(answered);
-    let mut same = Vec::new();
-    let mut same_answered = Vec::new();
-    let mut private = Vec::new();
-    let mut public = Vec::new();
-    for addr in all {
-        let on = on_subnet(&addr, mine);
-        let already = !answered.is_empty() && same_endpoint(&addr, &answered);
-        if on && !already {
-            same.push(addr);
-        } else if on && already {
-            same_answered.push(addr);
-        } else if endpoint_v4(&addr).is_some_and(|ip| ip.is_private() || ip.is_loopback() || ip.is_link_local()) {
-            private.push(addr);
-        } else {
-            public.push(addr);
-        }
-    }
-    let mut out = same;
-    out.extend(private);
-    out.extend(same_answered);
-    out.extend(public);
-    out
-}
-
 /// The banner, then one `address: error` line for every dial that failed.
 pub fn registration_miss(attempts: &[(&str, &str)]) -> String {
     let last = attempts
@@ -401,14 +355,6 @@ pub fn keep_other_server(previous: &ServerRoutes, incoming: &ServerRoutes) -> Se
     let fill_primary = next.primary_lan.is_empty() && next.primary_public.is_empty();
     let fill_standby = next.standby_lan.is_empty() && next.standby_public.is_empty();
     if !fill_primary && !fill_standby {
-        // A newer catalog can name one standby and leave out another server
-        // on the same account. Keep every address already learned.
-        for addr in previous_addrs {
-            if listed(&next, &addr) {
-                continue;
-            }
-            classify_kept(&addr, &mut next.standby_lan, &mut next.standby_public, &mut next.names);
-        }
         return next;
     }
     for addr in previous_addrs {
@@ -1275,32 +1221,18 @@ mod tests {
     }
 
     #[test]
-    fn the_lenovo_on_this_subnet_is_tried_before_the_cabin() {
+    fn the_cabin_standby_is_not_replaced_by_a_stale_lan_address() {
         let routes = ServerRoutes {
             primary_lan: vec!["192.168.0.193:21200".into()],
-            primary_public: vec!["204.248.122.44:21200".into()],
             standby_lan: vec!["10.0.0.20:21200".into(), "10.5.0.21:21200".into(), "192.168.192.1:21200".into()],
             standby_public: vec!["68.234.75.68:21200".into()],
             ..ServerRoutes::default()
         };
         let phone = [v4(192, 168, 0, 245)];
-        let discovered = ["192.168.0.169:21200".to_string()];
-        let order = sign_in_peer_order(&routes, &phone, &discovered, "192.168.0.193:21200");
-        assert_eq!(order[0], "192.168.0.169:21200", "{order:?}");
-        let lenovo = order.iter().position(|addr| addr.starts_with("192.168.0.169")).unwrap();
-        let cabin = order.iter().position(|addr| addr.starts_with("10.0.0.20")).unwrap();
-        let cabin_public = order.iter().position(|addr| addr.starts_with("68.234.75.68")).unwrap();
-        let primary = order.iter().position(|addr| addr.starts_with("192.168.0.193")).unwrap();
-        assert!(lenovo < cabin, "{order:?}");
-        assert!(cabin < cabin_public, "{order:?}");
-        assert!(lenovo < primary, "{order:?}");
-        let previous = ServerRoutes {
-            primary_lan: vec!["192.168.0.193:21200".into()],
-            standby_lan: vec!["192.168.0.169:21200".into()],
-            ..ServerRoutes::default()
-        };
-        let kept = keep_other_server(&previous, &routes);
-        assert!(kept.standby_lan.iter().any(|addr| addr.starts_with("192.168.0.169")), "{kept:?}");
-        assert!(kept.standby_lan.iter().any(|addr| addr.starts_with("10.0.0.20")), "{kept:?}");
+        let order = standby_account_order(&routes, &phone, "68.234.75.68:21200");
+        assert!(order.iter().any(|addr| addr.starts_with("68.234.75.68")), "{order:?}");
+        assert!(order.iter().any(|addr| addr.starts_with("10.0.0.20")), "{order:?}");
+        assert!(!order.iter().any(|addr| addr.starts_with("192.168.0.169")), "{order:?}");
+        assert!(!order.iter().any(|addr| addr.starts_with("192.168.0.193")), "{order:?}");
     }
 }

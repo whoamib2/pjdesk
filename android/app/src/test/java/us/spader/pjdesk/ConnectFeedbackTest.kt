@@ -13,6 +13,7 @@ import us.spader.pjdesk.core.sessionAfterRefreshFailure
 import us.spader.pjdesk.core.shouldRetryNotOnline
 import us.spader.pjdesk.core.namedServerSignInFailure
 import us.spader.pjdesk.core.serverHasNoAccountCopy
+import us.spader.pjdesk.core.standbyMissFallsThrough
 import us.spader.pjdesk.core.SignInTrace
 import us.spader.pjdesk.core.liveSignInServer
 import us.spader.pjdesk.core.redactDiagnostics
@@ -134,6 +135,9 @@ class ConnectFeedbackTest {
         assertTrue(serverHasNoAccountCopy("This server does not have the account yet, and pjdesk.com did not answer."))
         assertTrue(serverHasNoAccountCopy("This server's account copy is empty. Its pjdesk.com sign-in was rejected. Server sign-in needed."))
         assertFalse(serverHasNoAccountCopy("Wrong email or password."))
+        assertTrue(standbyMissFallsThrough("The standby public address was not dialed because its fingerprint is not saved yet."))
+        assertTrue(standbyMissFallsThrough("Could not connect to the LAN address 10.0.0.20:21200 at step=standby. timed out"))
+        assertFalse(standbyMissFallsThrough("Wrong email or password."))
         assertEquals(
             "The server at 192.168.0.193:21200 answered. This server does not have the account yet, and pjdesk.com did not answer.",
             namedServerSignInFailure(

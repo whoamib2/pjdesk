@@ -33,6 +33,9 @@ object CloudGate {
 
     fun allowCloud(): Boolean = !serverUp && System.currentTimeMillis() >= nextAt
 
+    /** Direct pjdesk.com sign-in while a server is up. The backoff still applies. */
+    fun allowDirectCloud(): Boolean = System.currentTimeMillis() >= nextAt
+
     fun noteOk() {
         waitMs = 0
         nextAt = 0
@@ -182,7 +185,8 @@ object CloudAuth {
      */
     fun signIn(email: String, password: String, deviceId: String, deviceName: String, forceCloud: Boolean): Session {
         if (CloudGate.serverUp && !forceCloud) throw CloudAuthException("The PJDesk server has this account.")
-        if (!CloudGate.allowCloud()) throw CloudAuthException("Waiting before asking pjdesk.com again.")
+        val cloudAllowed = if (forceCloud) CloudGate.allowDirectCloud() else CloudGate.allowCloud()
+        if (!cloudAllowed) throw CloudAuthException("Waiting before asking pjdesk.com again.")
         val auth = authKeyHex(email, password)
         val login = try {
             post(

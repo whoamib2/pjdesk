@@ -382,12 +382,6 @@ pub fn announce_lan(port: u16, fingerprint: [u8; 32], data_dir: std::path::PathB
     let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else { return };
     let _ = socket.set_broadcast(true);
     let dest = std::net::SocketAddr::from(([255, 255, 255, 255], pjdesk_proto::DISCOVERY_PORT));
-    // Hear the other servers on this LAN. The account's standby slot is only
-    // one of them; a beacon is how the Lenovo stays known when the cabin is newer.
-    let listen = pjdesk_proto::discover::bind_discovery();
-    if let Some(sock) = &listen {
-        let _ = sock.set_nonblocking(true);
-    }
     loop {
         let role = if crate::cloud::accepts_host_registrations(&data_dir) {
             pjdesk_proto::discover::BeaconRole::Primary
@@ -397,48 +391,7 @@ pub fn announce_lan(port: u16, fingerprint: [u8; 32], data_dir: std::path::PathB
         let packet =
             pjdesk_proto::discover::encode_server(&pjdesk_proto::discover::ServerBeacon { port, fingerprint, role });
         let _ = socket.send_to(&packet, dest);
-        if let Some(sock) = &listen {
-            note_heard_beacons(sock, &data_dir, fingerprint);
-        }
         std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-}
-
-const LAN_PEERS_FILE: &str = "lan-peers.json";
-
-/// Servers heard on UDP 21202. Not the single standby slot from the account.
-pub fn lan_peer_addrs(dir: &std::path::Path) -> Vec<String> {
-    std::fs::read(dir.join(LAN_PEERS_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
-fn note_heard_beacons(sock: &std::net::UdpSocket, dir: &std::path::Path, own: [u8; 32]) {
-    let mut buf = [0u8; 128];
-    let mut list = lan_peer_addrs(dir);
-    let mut changed = false;
-    loop {
-        let Ok((n, src)) = sock.recv_from(&mut buf) else { break };
-        let Ok(beacon) = pjdesk_proto::discover::decode_server(&buf[..n]) else { continue };
-        if beacon.fingerprint == own {
-            continue;
-        }
-        let std::net::IpAddr::V4(ip) = src.ip() else { continue };
-        if !ip.is_private() && !ip.is_link_local() {
-            continue;
-        }
-        let addr = format!("{ip}:{}", beacon.port);
-        if list.iter().any(|have| pjdesk_proto::failover::same_server(have, &addr)) {
-            continue;
-        }
-        list.push(addr);
-        changed = true;
-    }
-    if changed {
-        if let Ok(bytes) = serde_json::to_vec(&list) {
-            let _ = std::fs::write(dir.join(LAN_PEERS_FILE), bytes);
-        }
     }
 }
 

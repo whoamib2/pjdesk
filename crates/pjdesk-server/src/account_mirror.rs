@@ -57,6 +57,7 @@ fn save(dir: &Path, copy: &AccountCopy) {
     if std::fs::write(&path, bytes).is_ok() {
         cloud::protect(&path);
     }
+    remember_standby_pin(dir, copy);
 }
 
 fn journal(dir: &Path) -> Vec<AccountChange> {
@@ -235,6 +236,19 @@ pub fn pull_now(dir: &Path) -> String {
     };
     tracing::info!("{line}");
     line
+}
+
+/// Startup and an empty copy. Pulls from pjdesk.com, then from the account standby
+/// when this server still has no password check.
+pub fn recover_if_empty(dir: &Path) -> String {
+    if has_owner_copy(dir) {
+        return status_line(dir);
+    }
+    let line = pull_now(dir);
+    if !has_owner_copy(dir) {
+        seed_from_peer(dir);
+    }
+    if has_owner_copy(dir) { status_line(dir) } else { line }
 }
 
 fn note_pull_failure(err: &str) {
@@ -710,15 +724,53 @@ fn unfinished_sign_keys(pending: &[AccountChange], fresh: &AccountCopy) -> Vec<A
         .collect()
 }
 
-/// Puts the answering server's name on a failed account reply.
+/// Puts the answering server's name on a failed account reply, and the standby
+/// fingerprint the primary already knows so a phone can dial that server.
 fn name_account_failure(dir: &Path, mut msg: ServerMsg) -> ServerMsg {
-    if let ServerMsg::AccountResult { ok: false, message, .. } = &mut msg {
+    if let ServerMsg::AccountResult {
+        ok: false,
+        message,
+        standby_address,
+        standby_fingerprint,
+        standby_lan,
+        standby_public_ip,
+        ..
+    } = &mut msg
+    {
         if !message.contains(" answered") {
             let who = crate::cloud::role_label(dir);
             *message = format!("{who} answered. {message}");
         }
+        let copy = load(dir);
+        if standby_address.is_empty() {
+            *standby_address = copy.network.standby_address.clone();
+        }
+        if standby_lan.is_empty() {
+            *standby_lan = copy.network.standby_lan.clone();
+        }
+        if standby_public_ip.is_empty() {
+            *standby_public_ip = copy.network.standby_public_ip.clone();
+        }
+        if standby_fingerprint.is_empty() {
+            let fp = copy.network.standby_fingerprint.trim();
+            *standby_fingerprint = if fp.is_empty() { saved_standby_pin(dir) } else { fp.to_string() };
+        }
     }
     msg
+}
+
+const STANDBY_FP_FILE: &str = "standby-fingerprint.txt";
+
+fn remember_standby_pin(dir: &Path, copy: &AccountCopy) {
+    let fp = copy.network.standby_fingerprint.trim();
+    if fp.is_empty() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(STANDBY_FP_FILE), fp);
+}
+
+fn saved_standby_pin(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join(STANDBY_FP_FILE)).unwrap_or_default().trim().to_string()
 }
 
 /// The server has no copy. Sign in to pjdesk.com with the client's auth key
@@ -1116,7 +1168,7 @@ fn fetch_peer_copy(dir: &Path, force: bool, budget: Duration) {
     if !force {
         write_stamp(&dir.join(REPLICA_FILE), at);
     }
-    let pin = peer_pin(dir);
+    let pin = peer_pin(dir).or_else(|| pjdesk_proto::tls::parse_fingerprint(&saved_standby_pin(dir)).ok());
     let proof = replica_proof(&key, at);
     let msg = ClientMsg::Account {
         op: "replica".into(),
@@ -1134,12 +1186,10 @@ fn fetch_peer_copy(dir: &Path, force: bool, budget: Duration) {
     for target in targets {
         let Some(addr) = crate::role_handoff::resolve_target(&target) else { continue };
         let private = pjdesk_proto::routes::endpoint_v4(&target).is_some_and(|ip| ip.is_private() || ip.is_loopback());
-        // A saved fingerprint belongs to one server. A private peer on this LAN
-        // is dialed without that pin, or the Lenovo is rejected as the cabin.
-        let use_pin = if private { None } else { pin };
+        let use_pin = pin.or_else(|| pjdesk_proto::tls::parse_fingerprint(&saved_standby_pin(dir)).ok());
+        let use_pin = if private { None } else { use_pin };
         if use_pin.is_none() && !private {
-            tracing::info!("account copy seed skip {target}: public address without a fingerprint");
-            continue;
+            tracing::info!("account copy seed dial {target} without a saved fingerprint");
         }
         tracing::info!("account copy seed dial {target}");
         match crate::role_handoff::dial_observed(addr, use_pin, &msg, budget) {
@@ -1179,21 +1229,20 @@ fn store_peer_copy(dir: &Path, primary: bool, fresh: &AccountCopy) -> bool {
 
 fn standby_targets(dir: &Path) -> Vec<String> {
     let routes = cloud::advertised_routes(dir);
-    let mut extras = crate::public_addr::lan_peer_addrs(dir);
-    let mine = crate::public_addr::discover_gateway_lans();
-    let have_local = extras.iter().any(|addr| pjdesk_proto::routes::on_subnet(addr, &mine));
-    if !have_local {
-        for (addr, beacon) in pjdesk_proto::discover::listen_servers(Duration::from_millis(1000)) {
-            extras.push(format!("{}:{}", addr.ip(), beacon.port));
+    let mut out = Vec::new();
+    for raw in routes.standby_lan.iter().chain(routes.standby_public.iter()) {
+        let addr = raw.trim().to_string();
+        if addr.is_empty() || out.iter().any(|have: &String| have.eq_ignore_ascii_case(&addr)) {
+            continue;
         }
+        out.push(addr);
     }
-    let cached = cloud::cached_peer_address(dir);
-    if !cached.is_empty() {
-        extras.push(cached);
+    let extra = cloud::cached_peer_address(dir);
+    if !extra.is_empty() && !out.iter().any(|have| pjdesk_proto::failover::same_server(have, &extra)) {
+        out.push(extra);
     }
     let own = crate::public_addr::lan_endpoints(crate::public_addr::remembered_port(dir));
-    let order = pjdesk_proto::routes::sign_in_peer_order(&routes, &mine, &extras, "");
-    order.into_iter().filter(|addr| !own.iter().any(|mine| pjdesk_proto::failover::same_server(mine, addr))).collect()
+    out.into_iter().filter(|addr| !own.iter().any(|mine| pjdesk_proto::failover::same_server(mine, addr))).collect()
 }
 
 fn peer_pin(dir: &Path) -> Option<pjdesk_proto::tls::Fingerprint> {
