@@ -234,9 +234,15 @@ pub fn pull_now(dir: &Path) -> String {
     line
 }
 
-/// `Account copy: synced <time>` or `Account copy: error <reason>`.
+/// Shown when pjdesk.com rejected this server's token. A password sign-in replaces it.
+pub const SERVER_SIGN_IN_NEEDED: &str = "Server sign-in needed";
+
+/// `Account copy: synced <time>`, `Account copy: error <reason>`, or [`SERVER_SIGN_IN_NEEDED`].
 pub fn status_line(dir: &Path) -> String {
     let status = read_status(dir);
+    if auth_rejected(&status.error) {
+        return SERVER_SIGN_IN_NEEDED.into();
+    }
     if !status.error.is_empty() {
         format!("Account copy: error {}", one_line(&status.error))
     } else if status.synced_at > 0 {
@@ -244,6 +250,43 @@ pub fn status_line(dir: &Path) -> String {
     } else {
         "Account copy: error not synced yet".into()
     }
+}
+
+fn auth_rejected(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("http 401") || lower.contains("http 403")
+}
+
+/// The account file has no password check. Names the last copy failure instead of
+/// claiming pjdesk.com was silent when this server never called it, or when it rejected the token.
+pub fn empty_copy_message(dir: &Path) -> String {
+    let status = read_status(dir);
+    let why = if auth_rejected(&status.error) {
+        "Its pjdesk.com sign-in was rejected. Server sign-in needed.".to_string()
+    } else if status.error.contains("not signed in") || !server_has_cloud_token(dir) {
+        "This server is not signed in to pjdesk.com. Server sign-in needed.".to_string()
+    } else if status.error.contains("404") {
+        "pjdesk.com has no account copy for this sign-in.".to_string()
+    } else if status.error.contains("rate limited") || cloud_paused(dir) {
+        "pjdesk.com is rate limited.".to_string()
+    } else if !status.error.is_empty() {
+        format!("The last copy failed ({}).", one_line(&status.error))
+    } else {
+        "No copy has been loaded.".to_string()
+    };
+    format!("This server's account copy is empty. {why}")
+}
+
+fn server_has_cloud_token(dir: &Path) -> bool {
+    CloudConfig::load(dir).is_some_and(|cfg| cfg.is_account() && !cfg.token.trim().is_empty())
+}
+
+fn sign_in_failure_is_final(err: &str) -> bool {
+    err.contains("Wrong email or password")
+        || err.contains("Enter your email")
+        || err.contains("Too many sign-in")
+        || err.contains("Too many failed")
+        || err.contains("Too many tries")
 }
 
 /// The owner just signed in with email and password. A blocked computer may
@@ -451,7 +494,7 @@ pub fn read_owner_lock(dir: &Path) -> (String, u64) {
 pub fn write_owner_lock(dir: &Path, ciphertext: &str) -> Result<u64, String> {
     let copy = load(dir);
     if copy.account_id.is_empty() {
-        return Err("This server does not have the account yet, and pjdesk.com did not answer.".into());
+        return Err(empty_copy_message(dir));
     }
     let at = now();
     remember(
@@ -599,13 +642,21 @@ fn seed_blocking(dir: &Path, email: &str, auth_key: &str) -> std::result::Result
     if !has_verifier(&load(dir)) && !cloud_paused(dir) {
         let _ = pull_now(dir);
     }
+    if !has_verifier(&load(dir)) {
+        seed_from_peer(dir);
+    }
     if has_verifier(&load(dir)) {
         return Ok(());
     }
     if cloud_paused(dir) {
         return Err("pjdesk.com is rate limited".into());
     }
-    proxy_login_seed(dir, email, auth_key)
+    match proxy_login_seed(dir, email, auth_key) {
+        Ok(()) => Ok(()),
+        Err(_) if has_verifier(&load(dir)) => Ok(()),
+        Err(err) if sign_in_failure_is_final(&err) => Err(err),
+        Err(_) => Err(empty_copy_message(dir)),
+    }
 }
 
 fn log_sign_in(op: &str, reply: &ServerMsg, started: std::time::Instant) {
@@ -742,7 +793,11 @@ fn answer_sign_in(dir: &Path, email: &str, auth_key: &str, device_id: &str, devi
         }
         Err(err) => {
             save(dir, &copy);
-            fail("sign-in", &err.to_string())
+            let text = match &err {
+                AuthError::NoCopy if !has_verifier(&copy) => empty_copy_message(dir),
+                other => other.to_string(),
+            };
+            fail("sign-in", &text)
         }
     }
 }
@@ -768,7 +823,11 @@ fn answer_verify(dir: &Path, email: &str, auth_key: &str) -> ServerMsg {
         }
         Err(err) => {
             save(dir, &copy);
-            fail("verify", &err.to_string())
+            let text = match &err {
+                AuthError::NoCopy if !has_verifier(&copy) => empty_copy_message(dir),
+                other => other.to_string(),
+            };
+            fail("verify", &text)
         }
     }
 }
@@ -1007,22 +1066,45 @@ fn replica(dir: &Path, proof: &str) -> ServerMsg {
     ServerMsg::Replica { revision: copy.revision.clone(), body }
 }
 
-/// The standby asks the primary for the account copy. This is not a pjdesk.com call.
+/// Takes a peer copy only when this server has no password check and the peer does.
+pub fn adopt_peer_copy(local: &AccountCopy, peer: &AccountCopy) -> Option<AccountCopy> {
+    if has_verifier(local) || !has_verifier(peer) {
+        return None;
+    }
+    Some(merge(peer, local, &[]))
+}
+
+const PEER_FP_FILE: &str = "peer-fingerprint.txt";
+
+/// The standby asks the primary for the account copy. A primary whose copy is
+/// empty asks the standby. This is not a pjdesk.com call.
 pub fn pull_replica(dir: &Path) {
-    if cloud::accepts_host_registrations(dir) {
+    fetch_peer_copy(dir, false, Duration::from_secs(8));
+}
+
+/// Sign-in calls this without waiting for the five-minute replica cadence.
+pub fn seed_from_peer(dir: &Path) {
+    fetch_peer_copy(dir, true, Duration::from_secs(2));
+}
+
+fn fetch_peer_copy(dir: &Path, force: bool, budget: Duration) {
+    let primary = cloud::accepts_host_registrations(dir);
+    if primary && has_verifier(&load(dir)) {
         return;
     }
     let at = now();
-    if at.saturating_sub(stamp(&dir.join(REPLICA_FILE))) < CLOUD_BATCH_SECS {
+    if !force && at.saturating_sub(stamp(&dir.join(REPLICA_FILE))) < CLOUD_BATCH_SECS {
         return;
     }
     let Some(key) = cloud::sync_key(dir) else { return };
-    let Some(fingerprint) = crate::server::read_identity(dir).map(|id| id.fingerprint()) else { return };
-    let targets = cloud::peer_dial_targets(dir);
+    let targets = if primary { standby_targets(dir) } else { cloud::peer_dial_targets(dir) };
     if targets.is_empty() {
         return;
     }
-    write_stamp(&dir.join(REPLICA_FILE), at);
+    if !force {
+        write_stamp(&dir.join(REPLICA_FILE), at);
+    }
+    let pin = peer_pin(dir);
     let proof = replica_proof(&key, at);
     let msg = ClientMsg::Account {
         op: "replica".into(),
@@ -1038,13 +1120,17 @@ pub fn pull_replica(dir: &Path) {
     };
     for target in targets {
         let Some(addr) = crate::role_handoff::resolve_target(&target) else { continue };
-        match crate::role_handoff::dial(addr, fingerprint, &msg, Duration::from_secs(8)) {
-            Ok(ServerMsg::Replica { body, .. }) => {
+        let private = pjdesk_proto::routes::endpoint_v4(&target).is_some_and(|ip| ip.is_private() || ip.is_loopback());
+        if pin.is_none() && !private {
+            continue;
+        }
+        match crate::role_handoff::dial_observed(addr, pin, &msg, budget) {
+            Ok((ServerMsg::Replica { body, .. }, observed)) => {
+                if let Some(fp) = observed {
+                    let _ = std::fs::write(dir.join(PEER_FP_FILE), pjdesk_proto::tls::format_fingerprint(&fp));
+                }
                 if let Ok(fresh) = serde_json::from_slice::<AccountCopy>(&body) {
-                    let local = load(dir);
-                    let merged = merge(&fresh, &local, &journal(dir));
-                    save(dir, &merged);
-                    tracing::info!("account copy mirrored from the primary");
+                    store_peer_copy(dir, primary, &fresh);
                 }
                 return;
             }
@@ -1052,6 +1138,50 @@ pub fn pull_replica(dir: &Path) {
             Err(err) => tracing::debug!("account mirror from {target}: {err:#}"),
         }
     }
+}
+
+fn store_peer_copy(dir: &Path, primary: bool, fresh: &AccountCopy) {
+    let local = load(dir);
+    if primary {
+        let Some(merged) = adopt_peer_copy(&local, fresh) else { return };
+        save(dir, &merged);
+        let _ = record_status(dir, now(), "");
+        tracing::info!("account copy seeded from the standby");
+        return;
+    }
+    save(dir, &merge(fresh, &local, &journal(dir)));
+    tracing::info!("account copy mirrored from the primary");
+}
+
+fn standby_targets(dir: &Path) -> Vec<String> {
+    let routes = cloud::advertised_routes(dir);
+    let mut out = Vec::new();
+    for raw in routes.standby_lan.iter().chain(routes.standby_public.iter()) {
+        let addr = raw.trim().to_string();
+        if addr.is_empty() || out.iter().any(|have: &String| have.eq_ignore_ascii_case(&addr)) {
+            continue;
+        }
+        out.push(addr);
+    }
+    let extra = cloud::cached_peer_address(dir);
+    if !extra.is_empty() && !out.iter().any(|have| pjdesk_proto::failover::same_server(have, &extra)) {
+        out.push(extra);
+    }
+    out
+}
+
+fn peer_pin(dir: &Path) -> Option<pjdesk_proto::tls::Fingerprint> {
+    let mine = crate::server::read_identity(dir).map(|id| id.fingerprint());
+    let copy = load(dir);
+    for text in [&copy.network.standby_fingerprint, &copy.network.active_fingerprint] {
+        if let Ok(fp) = pjdesk_proto::tls::parse_fingerprint(text) {
+            if mine.is_none_or(|mine| mine != fp) {
+                return Some(fp);
+            }
+        }
+    }
+    let saved = std::fs::read_to_string(dir.join(PEER_FP_FILE)).unwrap_or_default();
+    pjdesk_proto::tls::parse_fingerprint(saved.trim()).ok()
 }
 
 pub fn apply_replica_body(dir: &Path, body: &[u8]) {
@@ -1238,7 +1368,9 @@ mod tests {
         std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":1700000000,"error":""}"#).unwrap();
         assert_eq!(status_line(&dir), "Account copy: synced 2023-11-14 22:13:20 UTC");
         std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":1700000000,"error":"HTTP 401 auth: Please sign in."}"#).unwrap();
-        assert_eq!(status_line(&dir), "Account copy: error HTTP 401 auth: Please sign in.");
+        assert_eq!(status_line(&dir), "Server sign-in needed");
+        std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":1700000000,"error":"HTTP 403 auth: Please sign in."}"#).unwrap();
+        assert_eq!(status_line(&dir), "Server sign-in needed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1343,6 +1475,31 @@ mod tests {
         assert!(!batch(&dir, false));
         let status = std::fs::read_to_string(dir.join("account-copy-status.json")).unwrap_or_default();
         assert!(status.contains("not signed in"), "{status}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_primary_takes_the_standby_copy_and_names_a_rejected_sign_in() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-empty-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":0,"error":"HTTP 401 auth: Please sign in."}"#).unwrap();
+        assert_eq!(status_line(&dir), SERVER_SIGN_IN_NEEDED);
+        let msg = empty_copy_message(&dir);
+        assert!(msg.contains("account copy is empty"), "{msg}");
+        assert!(msg.contains("Server sign-in needed"), "{msg}");
+        assert!(!msg.contains("did not answer"), "{msg}");
+        let err = write_owner_lock(&dir, "sealed").unwrap_err();
+        assert_eq!(err, msg);
+        let mut peer = AccountCopy::default();
+        peer.account_id = "acct".into();
+        peer.email = "ben@spader.us".into();
+        peer.auth_hash = "ab".repeat(32);
+        peer.auth_salt = "cd".repeat(16);
+        let adopted = adopt_peer_copy(&AccountCopy::default(), &peer).expect("standby copy");
+        assert!(has_verifier(&adopted));
+        assert_eq!(adopted.email, "ben@spader.us");
+        assert!(adopt_peer_copy(&adopted, &peer).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

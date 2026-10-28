@@ -267,9 +267,7 @@ impl std::fmt::Display for AuthError {
         match self {
             AuthError::BadPassword => f.write_str("Wrong email or password."),
             AuthError::Pause(secs) => write!(f, "{}", sign_in_limit_message(*secs)),
-            AuthError::NoCopy => f.write_str(
-                "This server does not have the account yet, and pjdesk.com did not answer.",
-            ),
+            AuthError::NoCopy => f.write_str("This server's account copy is empty."),
             AuthError::BadRequest(msg) => f.write_str(msg),
         }
     }
@@ -498,7 +496,8 @@ fn role_of(copy: &AccountCopy, email: &str) -> String {
 }
 
 fn issue_access(copy: &AccountCopy, email: &str, device_id: &str, now: u64) -> Result<(String, u64), AuthError> {
-    let pkcs8 = hex::decode(copy.sign_pkcs8.trim()).map_err(|_| AuthError::NoCopy)?;
+    let pkcs8 = hex::decode(copy.sign_pkcs8.trim())
+        .map_err(|_| AuthError::BadRequest("This server's account copy cannot sign a session."))?;
     let exp = now.saturating_add(access::TOKEN_TTL_SECS);
     let mut fps = Vec::new();
     if !copy.network.active_fingerprint.is_empty() {
@@ -514,7 +513,8 @@ fn issue_access(copy: &AccountCopy, email: &str, device_id: &str, now: u64) -> R
         device_id: device_id.to_string(),
         exp,
     };
-    let (token, _) = access::sign_pkcs8(&pkcs8, &claims).map_err(|_| AuthError::NoCopy)?;
+    let (token, _) = access::sign_pkcs8(&pkcs8, &claims)
+        .map_err(|_| AuthError::BadRequest("This server's account copy cannot sign a session."))?;
     Ok((token, exp))
 }
 

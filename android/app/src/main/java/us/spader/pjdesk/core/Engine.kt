@@ -273,6 +273,7 @@ class Engine(context: Context) : EngineListener {
         routes: String = "",
         standbyLan: String = "",
         standbyPublicIp: String = "",
+        standbyFingerprint: String = "",
     ) {
         if (address.isBlank()) return
         val body = JSONObject().put("cmd", "server").put("address", address).put("quiet", quiet)
@@ -281,6 +282,7 @@ class Engine(context: Context) : EngineListener {
         if (routes.isNotBlank()) body.put("routes", routes)
         if (standbyLan.isNotBlank()) body.put("standbyLan", standbyLan)
         if (standbyPublicIp.isNotBlank()) body.put("standbyPublicIp", standbyPublicIp)
+        if (standbyFingerprint.isNotBlank()) body.put("standbyFingerprint", standbyFingerprint)
         if (quiet) {
             body.put("lan", lanForEngine())
             body.put("publicIp", store.accountPublicIp)

@@ -203,6 +203,8 @@ struct App {
     service_session_known: bool,
     /// The last `session` ask got no answer. The saved account is left as it is.
     service_session_failed: bool,
+    /// Why the last session ask failed. Empty until it fails.
+    service_session_fault: String,
     /// `Account copy: synced …` or `Account copy: error …` from the service or the data folder.
     account_copy: String,
     /// Redacted service log from the session pipe, when the status snapshot has none.
@@ -392,6 +394,7 @@ impl App {
             service_email: String::new(),
             service_session_known: false,
             service_session_failed: false,
+            service_session_fault: String::new(),
             account_copy: String::new(),
             session_log: String::new(),
             session_rx: None,
@@ -637,6 +640,7 @@ impl App {
                 self.service_email.clear();
                 self.service_session_known = true;
                 self.service_session_failed = false;
+                self.service_session_fault.clear();
                 self.session_at = Some(Instant::now());
             }
             self.status = msg;
@@ -1738,13 +1742,21 @@ impl App {
                 self.service_email = email;
                 self.service_session_known = true;
                 self.service_session_failed = false;
+                self.service_session_fault.clear();
                 if !response.account_copy.is_empty() {
                     self.account_copy = response.account_copy;
                 }
                 self.session_log = response.log_tail;
             }
+            Some(response) if response.code == "bad reply" => {
+                self.service_session_failed = true;
+                self.service_session_fault = response.message;
+                tracing::info!("session: {}", self.service_session_fault);
+            }
             _ => {
                 self.service_session_failed = true;
+                self.service_session_fault =
+                    "The PJDesk service did not answer. The saved sign-in was left on the service. Trying again.".into();
                 tracing::info!("session: the PJDesk service did not answer. The saved sign-in was left on the service.");
             }
         }
@@ -1810,7 +1822,12 @@ impl App {
                     ui.label("Reading the saved sign-in from the service…");
                 });
                 if self.service_session_failed {
-                    ui.label("The PJDesk service did not answer. The saved sign-in was left on the service. Trying again.");
+                    let line = if self.service_session_fault.is_empty() {
+                        "The PJDesk service did not answer. The saved sign-in was left on the service. Trying again."
+                    } else {
+                        self.service_session_fault.as_str()
+                    };
+                    ui.label(line);
                 }
                 return;
             }
@@ -2552,6 +2569,7 @@ impl App {
                     self.service_email = email;
                     self.service_session_known = true;
                     self.service_session_failed = false;
+                    self.service_session_fault.clear();
                     self.session_at = Some(Instant::now());
                     tracing::info!("sign-in: the window is showing {}", self.service_email);
                 }

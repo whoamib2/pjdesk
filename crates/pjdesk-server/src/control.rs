@@ -293,6 +293,19 @@ fn session_status(data_dir: &Path) -> Response {
     response
 }
 
+/// The session reply's log. A longer tail made the JSON larger than the first
+/// 4,096 bytes the window read, so the reply did not parse.
+const SESSION_LOG_CHARS: usize = 3_000;
+
+fn cap_log_tail(text: &str) -> String {
+    let count = text.chars().count();
+    if count <= SESSION_LOG_CHARS {
+        text.to_string()
+    } else {
+        text.chars().skip(count - SESSION_LOG_CHARS).collect()
+    }
+}
+
 fn session_log_tail(data_dir: &Path) -> String {
     let service = crate::status_view::redacted_log_tail(&data_dir.join("server.log"));
     let text = if service.trim().is_empty() {
@@ -300,12 +313,35 @@ fn session_log_tail(data_dir: &Path) -> String {
     } else {
         service
     };
-    let max = 6_000;
-    let count = text.chars().count();
-    if count <= max {
-        text
-    } else {
-        text.chars().skip(count - max).collect()
+    cap_log_tail(&text)
+}
+
+/// Writes every byte. A short write continues from the next offset.
+pub(crate) fn write_all_chunks(bytes: &[u8], mut write: impl FnMut(&[u8]) -> std::io::Result<usize>) -> std::io::Result<()> {
+    let mut off = 0;
+    while off < bytes.len() {
+        let n = write(&bytes[off..])?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pipe write wrote nothing"));
+        }
+        off += n;
+    }
+    Ok(())
+}
+
+/// Empty means the service is not listening. Bytes that are not JSON are a bad reply.
+pub(crate) fn decode_pipe_reply(buf: &[u8]) -> Option<Response> {
+    if buf.is_empty() {
+        return None;
+    }
+    match serde_json::from_slice::<Response>(buf) {
+        Ok(response) => Some(response),
+        Err(_) => Some(Response {
+            ok: false,
+            code: "bad reply".into(),
+            message: "The PJDesk service sent a reply that could not be read.".into(),
+            ..Response::default()
+        }),
     }
 }
 
@@ -314,11 +350,16 @@ fn sign_in(data_dir: &Path, req: &Request) -> Response {
     // A fresh window can ask again while the service already holds this account.
     // Keep that session. A new login would replace the token and can fail.
     if let Some(saved) = same_saved_account(data_dir, &email) {
-        tracing::info!("sign-in: {email}: already signed in; the saved session stays");
-        let mut response = ok(format!("Signed in as {saved}. Syncing as before."));
-        response.email = saved;
-        response.account_copy = crate::account_mirror::pull_now(data_dir);
-        return response;
+        let copy_line = crate::account_mirror::pull_now(data_dir);
+        let rejected = copy_line == crate::account_mirror::SERVER_SIGN_IN_NEEDED;
+        if !rejected && crate::account_mirror::has_owner_copy(data_dir) {
+            tracing::info!("sign-in: {email}: already signed in; the saved session stays");
+            let mut response = ok(format!("Signed in as {saved}. Syncing as before."));
+            response.email = saved;
+            response.account_copy = copy_line;
+            return response;
+        }
+        tracing::info!("sign-in: {email}: saved session cannot load the account copy; signing in again");
     }
     let password = req.password.clone();
     if email.is_empty() || password.is_empty() {
@@ -687,7 +728,7 @@ fn serve_once(data_dir: &Path) -> bool {
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-    use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile, PIPE_ACCESS_DUPLEX};
+    use windows::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, PIPE_ACCESS_DUPLEX};
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
         PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -742,7 +783,8 @@ fn serve_once(data_dir: &Path) -> bool {
             }
         };
         if let Ok(bytes) = serde_json::to_vec(&response) {
-            let _ = WriteFile(pipe, Some(&bytes), None, None);
+            let _ = write_pipe_all(pipe, &bytes);
+            let _ = FlushFileBuffers(pipe);
         }
         let _ = DisconnectNamedPipe(pipe);
         let _ = windows::Win32::Foundation::CloseHandle(pipe);
@@ -979,7 +1021,7 @@ fn call_pipe(req: &Request) -> Option<Response> {
     use windows::core::w;
     use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, ReadFile, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows::Win32::System::Pipes::WaitNamedPipeW;
 
@@ -1001,8 +1043,7 @@ fn call_pipe(req: &Request) -> Option<Response> {
             None,
         )
         .ok()?;
-        let wrote = WriteFile(handle, Some(&bytes), None, None);
-        if wrote.is_err() {
+        if !write_pipe_all(handle, &bytes) {
             let _ = CloseHandle(handle);
             return None;
         }
@@ -1019,8 +1060,23 @@ fn call_pipe(req: &Request) -> Option<Response> {
             }
         }
         let _ = CloseHandle(handle);
-        serde_json::from_slice(&buf).ok()
+        decode_pipe_reply(&buf)
     }
+}
+
+#[cfg(windows)]
+fn write_pipe_all(pipe: windows::Win32::Foundation::HANDLE, bytes: &[u8]) -> bool {
+    use windows::Win32::Storage::FileSystem::{FlushFileBuffers, WriteFile};
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let mut wrote = 0u32;
+        let ok = unsafe { WriteFile(pipe, Some(&bytes[off..]), Some(&mut wrote), None) };
+        if ok.is_err() || wrote == 0 {
+            return false;
+        }
+        off += wrote as usize;
+    }
+    unsafe { FlushFileBuffers(pipe).is_ok() }
 }
 
 /// Ping with the signed-in account token, so the owner is allowed without elevation.
@@ -1326,5 +1382,40 @@ mod tests {
         assert!(off.ok, "{}", off.message);
         assert!(crate::requests::take(&dir, crate::requests::REQUIRE_DISCONNECT_FILE).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reply_over_4kb_is_written_in_full_and_a_short_read_is_a_bad_reply() {
+        let huge = "y".repeat(6_000);
+        assert_eq!(cap_log_tail(&huge).chars().count(), SESSION_LOG_CHARS);
+        let response = Response {
+            ok: true,
+            message: "Signed in as ben@spader.us.".into(),
+            email: "ben@spader.us".into(),
+            account_copy: "Account copy: synced 2023-11-14 22:13:20 UTC".into(),
+            log_tail: huge,
+            ..Response::default()
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        assert!(bytes.len() > 4_096, "session reply was {} bytes", bytes.len());
+        let mut sent = Vec::new();
+        write_all_chunks(&bytes, |chunk| {
+            let n = chunk.len().min(4_096);
+            sent.extend_from_slice(&chunk[..n]);
+            Ok(n)
+        })
+        .unwrap();
+        assert_eq!(sent, bytes);
+        let full = decode_pipe_reply(&sent).unwrap();
+        assert!(full.ok);
+        assert_eq!(full.log_tail.len(), 6_000);
+        let short = decode_pipe_reply(&bytes[..4_096]).unwrap();
+        assert!(!short.ok);
+        assert_eq!(short.code, "bad reply");
+        assert!(!short.message.to_ascii_lowercase().contains("did not answer"));
+        assert!(decode_pipe_reply(&[]).is_none());
+        let capped = Response { log_tail: cap_log_tail(&response.log_tail), ..response };
+        assert!(capped.log_tail.chars().count() <= SESSION_LOG_CHARS);
+        assert!(serde_json::to_vec(&capped).unwrap().len() < bytes.len());
     }
 }

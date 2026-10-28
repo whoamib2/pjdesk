@@ -333,6 +333,17 @@ pub(crate) fn resolve_target(address: &str) -> Option<SocketAddr> {
 }
 
 pub(crate) fn dial(addr: SocketAddr, fingerprint: pjdesk_proto::tls::Fingerprint, msg: &ClientMsg, budget: Duration) -> Result<ServerMsg> {
+    Ok(dial_observed(addr, Some(fingerprint), msg, budget)?.0)
+}
+
+/// `fingerprint` of `None` accepts the certificate this address presents.
+/// The observed fingerprint is returned so the caller can pin it next time.
+pub(crate) fn dial_observed(
+    addr: SocketAddr,
+    fingerprint: Option<pjdesk_proto::tls::Fingerprint>,
+    msg: &ClientMsg,
+    budget: Duration,
+) -> Result<(ServerMsg, Option<pjdesk_proto::tls::Fingerprint>)> {
     let connect_for = budget.min(Duration::from_secs(4));
     if connect_for.is_zero() {
         bail!("timed out");
@@ -342,13 +353,15 @@ pub(crate) fn dial(addr: SocketAddr, fingerprint: pjdesk_proto::tls::Fingerprint
     let read_for = budget.min(Duration::from_secs(20));
     tcp.set_read_timeout(Some(read_for)).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(8))).ok();
-    let config = tls::client_config(PinnedCertVerifier::new(Some(fingerprint)), ALPN_SIGNAL)?;
+    let verifier = PinnedCertVerifier::new(fingerprint);
+    let config = tls::client_config(verifier.clone(), ALPN_SIGNAL)?;
     let name = ServerName::try_from(SIGNAL_SERVER_NAME).map_err(|_| anyhow!("bad server name"))?;
     let mut conn = ClientConnection::new(Arc::new(config), name)?;
     let mut tcp = tcp;
     let mut stream = Stream::new(&mut conn, &mut tcp);
     write_frame(&mut stream, msg)?;
-    read_frame(&mut stream)
+    let reply = read_frame(&mut stream)?;
+    Ok((reply, verifier.observed()))
 }
 
 fn write_frame(stream: &mut impl Write, msg: &ClientMsg) -> Result<()> {

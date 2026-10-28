@@ -478,7 +478,7 @@ impl Gate {
             return;
         }
         if !crate::account_mirror::has_owner_copy(&self.data_dir) {
-            self.note = "This server does not have the account yet.".into();
+            self.note = crate::account_mirror::empty_copy_message(&self.data_dir);
             return;
         }
         let pin = self.pin.clone();

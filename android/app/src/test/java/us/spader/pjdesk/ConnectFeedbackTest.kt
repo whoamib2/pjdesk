@@ -132,6 +132,7 @@ class ConnectFeedbackTest {
         assertEquals("Could not reach the PJDesk server.", signInPageError("could not reach the primary or the standby; retrying"))
         assertEquals("The sign-in did not finish.", signInPageError(""))
         assertTrue(serverHasNoAccountCopy("This server does not have the account yet, and pjdesk.com did not answer."))
+        assertTrue(serverHasNoAccountCopy("This server's account copy is empty. Its pjdesk.com sign-in was rejected. Server sign-in needed."))
         assertFalse(serverHasNoAccountCopy("Wrong email or password."))
         assertEquals(
             "The server at 192.168.0.193:21200 answered. This server does not have the account yet, and pjdesk.com did not answer.",
