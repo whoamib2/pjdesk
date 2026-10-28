@@ -699,11 +699,10 @@ impl App {
                     ui.add_space(16.0);
                     let mut pin = self.lock_pin.clone();
                     let shook = self.lock_shook;
-                    pin_marks(ui, pin.chars().count(), pin_shake_offset(shook));
                     if shook.is_some_and(|at| at.elapsed() < Duration::from_millis(320)) {
                         ui.ctx().request_repaint_after(Duration::from_millis(16));
                     }
-                    let pin_box = pin_key_field(ui, &mut pin);
+                    let pin_box = pin_box(ui, &mut pin, egui::Id::new("lock-pin-entry"), false, pin_shake_offset(shook), "");
                     if !self.lock_pin_armed {
                         pin_box.request_focus();
                         self.lock_pin_armed = true;
@@ -806,7 +805,7 @@ impl App {
                     }
                     ui.label("PIN");
                     let mut pin = self.pin_new.clone();
-                    let pin_box = widgets::password_field(ui, &mut pin, "4 to 8 digits", &mut self.pin_show_new);
+                    let pin_box = pin_entry(ui, &mut pin, "setup-new", "4 to 8 digits", &mut self.pin_show_new);
                     if !self.setup_pin_focused {
                         pin_box.request_focus();
                         self.setup_pin_focused = true;
@@ -815,7 +814,7 @@ impl App {
                     let advance = widgets::submitted(ui, &pin_box);
                     ui.label("Confirm PIN");
                     let mut confirm = self.pin_confirm.clone();
-                    let confirm_box = widgets::password_field(ui, &mut confirm, "Repeat the PIN", &mut self.pin_show_confirm);
+                    let confirm_box = pin_entry(ui, &mut confirm, "confirm", "Repeat the PIN", &mut self.pin_show_confirm);
                     if advance {
                         confirm_box.request_focus();
                     }
@@ -1010,7 +1009,7 @@ impl App {
             if have {
                 ui.label("Current PIN");
                 let mut current = self.pin_current.clone();
-                widgets::password_field(ui, &mut current, "Current PIN", &mut self.pin_show_current);
+                pin_entry(ui, &mut current, "current", "Current PIN", &mut self.pin_show_current);
                 self.pin_current = digits_only(&current);
             }
         } else if !have {
@@ -1021,7 +1020,7 @@ impl App {
         } else {
             ui.label("Current PIN");
             let mut current = self.pin_current.clone();
-            widgets::password_field(ui, &mut current, "Current PIN", &mut self.pin_show_current);
+            pin_entry(ui, &mut current, "current", "Current PIN", &mut self.pin_show_current);
             self.pin_current = digits_only(&current);
             ui.label(widgets::muted(ui, "Or your account password, if you don't have the PIN."));
             let mut pass = self.pin_password.clone();
@@ -1031,12 +1030,12 @@ impl App {
         ui.add_space(4.0);
         ui.label("New PIN");
         let mut new_pin = self.pin_new.clone();
-        let new_box = widgets::password_field(ui, &mut new_pin, "4 to 8 digits", &mut self.pin_show_new);
+        let new_box = pin_entry(ui, &mut new_pin, "new", "4 to 8 digits", &mut self.pin_show_new);
         self.pin_new = digits_only(&new_pin);
         let advance = widgets::submitted(ui, &new_box);
         ui.label("Confirm PIN");
         let mut confirm = self.pin_confirm.clone();
-        let confirm_box = widgets::password_field(ui, &mut confirm, "Repeat the PIN", &mut self.pin_show_confirm);
+        let confirm_box = pin_entry(ui, &mut confirm, "confirm", "Repeat the PIN", &mut self.pin_show_confirm);
         if advance {
             confirm_box.request_focus();
         }
@@ -1463,50 +1462,128 @@ fn pin_shake_offset(started: Option<Instant>) -> f32 {
     (t * 48.0).sin() * 7.0 * damp
 }
 
-/// Centered dots for the digits typed so far, or a single line when none are.
-/// Empty places are not drawn.
-fn pin_marks(ui: &mut egui::Ui, count: usize, shake: f32) {
-    let p = theme::paint(ui);
-    let width = ui.available_width().min(420.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::hover());
-    let center = rect.center() + egui::vec2(shake, 0.0);
-    if count == 0 {
-        let line = egui::Rect::from_center_size(center, egui::vec2(56.0, 2.0));
-        ui.painter().rect_filled(line, egui::CornerRadius::same(1), p.line);
-        return;
-    }
-    for (i, x) in pin_mark_xs(count, 18.0).into_iter().enumerate() {
-        let appear = ui.ctx().animate_bool_with_time(egui::Id::new(("lock-pin-dot", i)), true, 0.16);
-        let radius = 5.0 * (0.7 + 0.3 * appear);
-        ui.painter().circle_filled(center + egui::vec2(x, 0.0), radius, p.text.linear_multiply(0.35 + 0.65 * appear));
-    }
-    // Drop animation state for dots that were deleted, without painting them.
-    for i in count..8 {
-        ui.ctx().animate_bool_with_time(egui::Id::new(("lock-pin-dot", i)), false, 0.01);
+/// Keyboard entry for the lock screen PIN, as the tests drive it.
+#[cfg(test)]
+fn pin_key_field(ui: &mut egui::Ui, pin: &mut String) -> egui::Response {
+    pin_box(ui, pin, egui::Id::new("lock-pin-entry"), false, 0.0, "")
+}
+
+/// What a key does to a PIN entry before the text field sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinKey {
+    /// Remove the last digit typed.
+    Back,
+    /// Clear the whole entry.
+    Clear,
+}
+
+fn apply_pin_key(pin: &mut String, key: PinKey) {
+    match key {
+        PinKey::Back => {
+            pin.pop();
+        }
+        PinKey::Clear => pin.clear(),
     }
 }
 
-/// Keyboard entry for the PIN. The field itself draws no bullets and no hint,
-/// so it does not show how long the PIN is.
-fn pin_key_field(ui: &mut egui::Ui, pin: &mut String) -> egui::Response {
-    // Lay out the real (masked) text, only invisible. An empty layout pins the
-    // cursor at 0, so every digit went in front of the last one and "1234"
-    // was checked as "4321" (0.6.50 to 0.6.65).
+/// A visible rounded PIN box. The dots (or digits, when shown) grow out from
+/// the middle; there are no slots or placeholder digits, so it never hints at
+/// the length. Backspace removes the last digit typed, Delete or Esc clears it.
+fn pin_box(ui: &mut egui::Ui, pin: &mut String, id: egui::Id, shown: bool, shake: f32, hint: &str) -> egui::Response {
+    let p = theme::paint(ui);
+    // egui drops focus on Esc before widgets run, so remember last frame's focus.
+    let had = ui.data(|d| d.get_temp::<bool>(id.with("focus"))).unwrap_or(false);
+    let escaped = had && ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let focused = ui.memory(|m| m.has_focus(id)) || escaped;
+    if focused {
+        let keys = ui.input_mut(|i| {
+            let mut keys = Vec::new();
+            i.events.retain(|event| match event {
+                egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                    keys.push(PinKey::Back);
+                    false
+                }
+                egui::Event::Key { key: egui::Key::Delete | egui::Key::Escape, pressed: true, .. } => {
+                    keys.push(PinKey::Clear);
+                    false
+                }
+                egui::Event::Key { key: egui::Key::Backspace | egui::Key::Delete | egui::Key::Escape, .. } => false,
+                _ => true,
+            });
+            keys
+        });
+        for key in keys {
+            apply_pin_key(pin, key);
+        }
+    }
+    let width = ui.available_width().min(420.0).max(48.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 48.0), egui::Sense::hover());
+    let box_rect = rect.translate(egui::vec2(shake, 0.0));
+    let stroke = if focused { egui::Stroke::new(2.0, p.accent) } else { egui::Stroke::new(1.5, p.line) };
+    ui.painter().rect(box_rect, egui::CornerRadius::same(12), p.elev, stroke, egui::StrokeKind::Inside);
+    // Lay out the real text, only invisible. An empty layout pins the cursor at
+    // 0, so every digit went in front of the last one and "1234" was checked
+    // as "4321" (0.6.50 to 0.6.65).
     let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap: f32| {
-        ui.fonts_mut(|fonts| {
-            fonts.layout(text.as_str().to_owned(), egui::FontId::proportional(14.0), egui::Color32::TRANSPARENT, wrap)
-        })
+        ui.fonts_mut(|fonts| fonts.layout(text.as_str().to_owned(), egui::FontId::proportional(14.0), egui::Color32::TRANSPARENT, wrap))
     };
-    ui.add(
+    let saved = ui.visuals().text_cursor.stroke;
+    ui.visuals_mut().text_cursor.stroke = egui::Stroke::NONE;
+    let resp = ui.put(
+        rect.shrink2(egui::vec2(12.0, 12.0)),
         egui::TextEdit::singleline(pin)
-            .id(egui::Id::new("lock-pin-entry"))
+            .id(id)
             .password(true)
             .frame(egui::Frame::NONE)
             .margin(egui::Margin::ZERO)
-            .desired_width(ui.available_width())
+            .desired_width(rect.width() - 24.0)
             .char_limit(8)
             .layouter(&mut layouter),
-    )
+    );
+    ui.visuals_mut().text_cursor.stroke = saved;
+    if escaped {
+        resp.request_focus();
+    }
+    let keep = resp.has_focus() || escaped;
+    ui.data_mut(|d| d.insert_temp(id.with("focus"), keep));
+    let count = pin.chars().count();
+    let center = box_rect.center();
+    if count == 0 {
+        if !hint.is_empty() {
+            ui.painter().text(center, egui::Align2::CENTER_CENTER, hint, egui::FontId::proportional(14.0), p.muted);
+        }
+    } else if shown {
+        ui.painter().text(center, egui::Align2::CENTER_CENTER, pin.as_str(), egui::FontId::monospace(18.0), p.text);
+    } else {
+        for (i, x) in pin_mark_xs(count, 18.0).into_iter().enumerate() {
+            let appear = ui.ctx().animate_bool_with_time(id.with(("dot", i)), true, 0.16);
+            let radius = 5.0 * (0.7 + 0.3 * appear);
+            ui.painter().circle_filled(center + egui::vec2(x, 0.0), radius, p.text.linear_multiply(0.35 + 0.65 * appear));
+        }
+    }
+    for i in count..8 {
+        ui.ctx().animate_bool_with_time(id.with(("dot", i)), false, 0.01);
+    }
+    resp
+}
+
+/// A PIN box with a Show button, for the set and confirm screens.
+fn pin_entry(ui: &mut egui::Ui, pin: &mut String, key: &str, hint: &str, shown: &mut bool) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let show_w = 64.0;
+        let resp = ui
+            .allocate_ui(egui::vec2((ui.available_width() - show_w - 8.0).max(48.0), 48.0), |ui| {
+                pin_box(ui, pin, egui::Id::new(("pin-entry", key)), *shown, 0.0, hint)
+            })
+            .inner;
+        let label = if *shown { "Hide" } else { "Show" };
+        if ui.add_sized([show_w, 36.0], egui::Button::new(label)).on_hover_text(label).clicked() {
+            *shown = !*shown;
+        }
+        resp
+    })
+    .inner
 }
 
 fn user_activity(ctx: &egui::Context) -> bool {
@@ -1648,7 +1725,48 @@ mod tests {
 
     fn setup_field(ui: &mut eframe::egui::Ui, text: &mut String) -> eframe::egui::Response {
         let mut shown = false;
-        crate::gui::widgets::password_field(ui, text, "4 to 8 digits", &mut shown)
+        super::pin_entry(ui, text, "setup-new", "4 to 8 digits", &mut shown)
+    }
+
+    fn key(key: eframe::egui::Key) -> eframe::egui::Event {
+        eframe::egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }
+    }
+
+    /// Type a script: digits are typed, '<' is Backspace, 'x' is Delete, 'e' is Esc.
+    fn script(field: fn(&mut eframe::egui::Ui, &mut String) -> eframe::egui::Response, keys: &str) -> String {
+        use eframe::egui;
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        let mut step = |event: Option<egui::Event>, text: &mut String| {
+            let mut input = egui::RawInput::default();
+            input.events.extend(event);
+            let mut out = ctx.run_ui(input, |ui| field(ui, text).request_focus());
+            out.textures_delta.clear();
+        };
+        step(None, &mut text);
+        step(None, &mut text);
+        for c in keys.chars() {
+            let event = match c {
+                '<' => key(egui::Key::Backspace),
+                'x' => key(egui::Key::Delete),
+                'e' => key(egui::Key::Escape),
+                c => egui::Event::Text(c.to_string()),
+            };
+            step(Some(event), &mut text);
+        }
+        text
+    }
+
+    #[test]
+    fn backspace_removes_the_last_digit_typed_and_delete_or_esc_clears() {
+        for field in [super::pin_key_field as fn(&mut eframe::egui::Ui, &mut String) -> eframe::egui::Response, setup_field] {
+            assert_eq!(script(field, "1234<"), "123", "Backspace removes the last digit typed");
+            assert_eq!(script(field, "1234<<5"), "125");
+            assert_eq!(script(field, "<"), "", "Backspace on an empty box does nothing");
+            assert_eq!(script(field, "1234x"), "", "Delete clears");
+            assert_eq!(script(field, "1234e"), "", "Esc clears");
+            assert_eq!(script(field, "12e34"), "34", "the box keeps focus after Esc");
+        }
     }
 
     #[test]

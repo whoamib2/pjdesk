@@ -17,6 +17,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -538,6 +541,7 @@ private fun PinEntry(
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword, imeAction = ime),
         keyboardActions = KeyboardActions(onNext = { onIme() }, onDone = { onIme() }),
         trailingIcon = { TextButton(onClick = onToggle) { Text(if (shown) "Hide" else "Show") } },
+        textStyle = LocalTextStyle.current.copy(textAlign = TextAlign.Center, letterSpacing = 4.sp),
         modifier = modifier.fillMaxWidth(),
     )
 }

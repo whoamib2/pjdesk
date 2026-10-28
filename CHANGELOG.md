@@ -1,7 +1,9 @@
 # Changelog
 
 ## 0.6.66
-
+- PIN boxes on the Windows lock, set and confirm screens are now a visible rounded box, with the dots growing out from the middle (no slots, no length hint).
+- Backspace in a PIN box removes the last digit typed; Delete or Esc clears it. The phone's set and confirm screens now take hardware keys the same way.
+- The phone's PIN dots sit in the same visible rounded box, and the Settings PIN fields center what you type.
 - Fixed: the PIN lock screen reversed the digits as they were typed, so the right PIN was always "Wrong PIN" (for example, 1234 was checked as 4321). This affected 0.6.50 to 0.6.65. The PIN saved on each computer is unchanged and now unlocks.
 - New: a Lock now button in the window header and the tray menu (also Ctrl+L). It shows the PIN screen at once. Without a PIN, it opens App lock so you can set one.
 - After a wrong PIN, the lock screen says when the PIN last changed.

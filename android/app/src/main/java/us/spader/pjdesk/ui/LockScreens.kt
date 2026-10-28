@@ -8,6 +8,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -137,8 +138,21 @@ fun SetPinScreen(
             .focusable()
             .onPreviewKeyEvent { event ->
                 val enter = event.key == Key.Enter || event.key == Key.NumPadEnter
-                if (!enter || busy) return@onPreviewKeyEvent false
-                if (event.type == KeyEventType.KeyUp) advance()
+                if (busy) return@onPreviewKeyEvent false
+                if (enter) {
+                    if (event.type == KeyEventType.KeyUp) advance()
+                    return@onPreviewKeyEvent true
+                }
+                if (needPassword || event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                val digit = pinDigit(event.key)
+                val edit = pinEditFor(event.key)
+                if (digit == null && edit == null) return@onPreviewKeyEvent false
+                localError = ""
+                if (confirming) {
+                    confirm = if (digit != null) (confirm + digit).take(8) else applyPinEdit(confirm, edit!!)
+                } else {
+                    pin = if (digit != null) (pin + digit).take(8) else applyPinEdit(pin, edit!!)
+                }
                 true
             }
             .verticalScroll(rememberScrollState())
@@ -319,8 +333,10 @@ fun UnlockScreen(
                     if (pin.length < 8) changePin(pin + digit)
                     return@onPreviewKeyEvent true
                 }
-                if (event.key == Key.Backspace || event.key == Key.Delete) {
-                    if (pin.isNotEmpty()) changePin(pin.dropLast(1))
+                val edit = pinEditFor(event.key)
+                if (edit != null) {
+                    val next = applyPinEdit(pin, edit)
+                    if (next != pin) changePin(next)
                     return@onPreviewKeyEvent true
                 }
                 false
@@ -510,6 +526,20 @@ private fun LockMark() {
     )
 }
 
+/** What a hardware key does to a PIN: Backspace drops the last digit typed, Delete or Esc clears. */
+internal enum class PinEdit { Back, Clear }
+
+internal fun applyPinEdit(pin: String, edit: PinEdit): String = when (edit) {
+    PinEdit.Back -> pin.dropLast(1)
+    PinEdit.Clear -> ""
+}
+
+private fun pinEditFor(key: Key): PinEdit? = when (key) {
+    Key.Backspace -> PinEdit.Back
+    Key.Delete, Key.Escape -> PinEdit.Clear
+    else -> null
+}
+
 /** Center-to-center offsets. An empty PIN has none, so no slots show the length. */
 internal fun pinMarkOffsets(count: Int, gap: Float): FloatArray {
     if (count <= 0) return FloatArray(0)
@@ -517,25 +547,21 @@ internal fun pinMarkOffsets(count: Int, gap: Float): FloatArray {
     return FloatArray(count) { index -> start + index * gap }
 }
 
+/** A visible rounded box; the dots grow out from its middle. No slots, no length hint. */
 @Composable
 private fun PinMarks(count: Int, shakeToken: Int) {
     val shift = shakeOffset(shakeToken)
     Box(
         Modifier
             .fillMaxWidth()
-            .height(28.dp)
-            .offset(x = shift.dp),
+            .height(56.dp)
+            .offset(x = shift.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
+            .border(1.5.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(14.dp)),
         contentAlignment = Alignment.Center,
     ) {
-        if (count <= 0) {
-            Box(
-                Modifier
-                    .width(56.dp)
-                    .height(2.dp)
-                    .clip(RoundedCornerShape(1.dp))
-                    .background(MaterialTheme.colorScheme.outline),
-            )
-        } else {
+        if (count > 0) {
             val offsets = pinMarkOffsets(count, 18f)
             repeat(count) { index ->
                 key(index) {
