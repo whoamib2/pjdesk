@@ -10,7 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
 use pjdesk_proto::account_mirror::{
-    self, apply_change, ensure_sign_key, for_replica, generate_sign_key, has_verifier, merge, sign_in, vault_for,
+    self, apply_change, ensure_sign_key, for_replica, generate_sign_key, has_verifier, merge, sign_in,
+    signing_key_usable, vault_for,
     AccountChange,
     AccountCopy, AuthError, DeviceRow, SavedComputer, SealedRow,
 };
@@ -195,6 +196,7 @@ pub fn batch(dir: &Path, force: bool) -> bool {
     }
     ensure_sign_key(&mut local);
     save(dir, &local);
+    let _ = install_sign_key(dir);
     if has_verifier(&local) {
         record_status(dir, now(), "");
     }
@@ -221,6 +223,7 @@ pub fn pull_now(dir: &Path) -> String {
             let mut local = merge(&fresh, &load(dir), &journal(dir));
             ensure_sign_key(&mut local);
             save(dir, &local);
+            let _ = install_sign_key(dir);
             let _ = crate::access::restore_grace(dir);
             record_status(dir, now(), "")
         }
@@ -557,6 +560,42 @@ pub fn open_before_registration(op: &str) -> bool {
 }
 
 /// Answers one client account request from the local copy.
+/// Replaces a missing or unusable signing key and queues it for pjdesk.com.
+/// The private key is not logged. Sign-in can use the new key before the cloud accepts it.
+fn install_sign_key(dir: &Path) -> std::result::Result<(), String> {
+    let mut copy = load(dir);
+    let before = copy.sign_pkcs8.clone();
+    let had = signing_key_usable(&before);
+    ensure_sign_key(&mut copy);
+    if !signing_key_usable(&copy.sign_pkcs8) {
+        save(dir, &copy);
+        tracing::info!("account signing key could not be created");
+        return Err("This server could not create a signing key for the account copy.".into());
+    }
+    if had && copy.sign_pkcs8 == before {
+        return Ok(());
+    }
+    let public_key = copy.sign_public.clone();
+    let pkcs8 = copy.sign_pkcs8.clone();
+    let queued = journal(dir).iter().any(|change| {
+        matches!(change, AccountChange::SignKey { public_key: have, .. } if have == &public_key)
+    });
+    tracing::info!("account signing key replaced unusable_before={had} queued={queued}");
+    if queued {
+        save(dir, &copy);
+        return Ok(());
+    }
+    remember(dir, AccountChange::SignKey { public_key, pkcs8 });
+    let dir_bg = dir.to_path_buf();
+    std::thread::Builder::new()
+        .name("account-sign-key".into())
+        .spawn(move || {
+            let _ = batch(&dir_bg, true);
+        })
+        .ok();
+    Ok(())
+}
+
 pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
     let started = std::time::Instant::now();
     let ClientMsg::Account {
@@ -596,9 +635,11 @@ pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
             }
         }
     }
-    let mut copy = load(dir);
-    ensure_sign_key(&mut copy);
-    save(dir, &copy);
+    if let Err(err) = install_sign_key(dir) {
+        let reply = name_account_failure(dir, fail(&op, &err));
+        log_sign_in(&op, &reply, started);
+        return reply;
+    }
     let reply = match op.as_str() {
         "sign-in" => answer_sign_in(dir, &email, &auth_key, &device_id, &device_name),
         "verify" => answer_verify(dir, &email, &auth_key),
@@ -813,6 +854,8 @@ fn proxy_login_seed(dir: &Path, email: &str, auth_key: &str) -> Result<(), Strin
             note_cloud_ok(dir);
             let mut local = merge(&fresh, &load(dir), &journal(dir));
             ensure_sign_key(&mut local);
+            save(dir, &local);
+            let _ = install_sign_key(dir);
             if !has_verifier(&local) {
                 let _ = record_status(dir, 0, "pjdesk.com sent an account copy with no password check");
                 return Err(format!(
