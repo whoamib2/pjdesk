@@ -95,6 +95,8 @@ data class DeskState(
     val incomingOnly: Boolean = false,
     /** "valid", "expired", or blank when the account session has not been checked. */
     val accountSession: String = "",
+    /** Bumps when the server sends a fleet, so the saved list can apply that presence. */
+    val fleetNote: Int = 0,
 )
 
 data class SavedComputer(
@@ -114,6 +116,8 @@ data class SavedComputer(
     val displayName: String = "",
     /** PJDesk version that computer registered. Empty when the account has not reported one. */
     val appVersion: String = "",
+    /** True when online and appVersion came from presence on this run, or from a computer just heard on the LAN. */
+    val presenceFresh: Boolean = false,
 )
 
 fun compactId(text: String): String = text.filter { !it.isWhitespace() }

@@ -23,7 +23,9 @@ import us.spader.pjdesk.core.savedComputerCountLine
 import us.spader.pjdesk.core.savedSyncChoiceOnUpdate
 import us.spader.pjdesk.core.signInPauseSeconds
 import us.spader.pjdesk.core.signInPauseText
+import us.spader.pjdesk.core.redactConnectError
 import us.spader.pjdesk.core.savedSubtitle
+import us.spader.pjdesk.core.shownSaved
 import us.spader.pjdesk.core.shownVersion
 import us.spader.pjdesk.core.versionBehind
 
@@ -182,14 +184,40 @@ class SavedOrderTest {
         val threeDaysMs = 3L * 24 * 60 * 60 * 1000
         val seen = (1_700_000_000_000L - threeDaysMs) / 1000
         val row = cabin.copy(online = false, lastSeen = seen)
-        assertEquals("902 488 771 · Win 11 · 3d ago · —", savedSubtitle(row, nowMs = 1_700_000_000_000L))
-        assertEquals("902 488 771 · Win 11 · now · —", savedSubtitle(cabin, nowMs = 1_700_000_000_000L))
+        assertEquals("902 488 771 · Win 11 · 3d ago", savedSubtitle(row, nowMs = 1_700_000_000_000L))
+        val stale = cabin.copy(appVersion = "0.6.43")
+        val staleLine = savedSubtitle(stale, nowMs = 1_700_000_000_000L)
+        assertFalse(staleLine.contains("now"))
+        assertFalse(staleLine.contains("0.6.43"))
+        val fresh = cabin.copy(presenceFresh = true, appVersion = "0.6.64")
+        assertEquals("902 488 771 · Win 11 · now · 0.6.64", savedSubtitle(fresh, nowMs = 1_700_000_000_000L))
         assertEquals("902 488 771 · Win 11 · now · 0.6.43", savedSubtitle(row.copy(appVersion = "0.6.43"), nowMs = 1_700_000_000_000L, mine = true))
         assertEquals("0.6.46", shownVersion("0.6.43", mine = true, selfVersion = "0.6.46"))
         assertEquals("0.6.43", shownVersion("0.6.43", mine = false, selfVersion = "0.6.46"))
         assertEquals("0.6.43", shownVersion("0.6.43", mine = true, selfVersion = ""))
         assertTrue(versionBehind("0.6.43", "0.6.44"))
         assertFalse(versionBehind("0.6.44", ""))
+    }
+
+    @Test
+    fun aStoredOnlineFlagIsNotShownUntilPresenceArrives() {
+        val stored = listOf(cabin.copy(online = true, appVersion = "0.6.1"))
+        val cleared = shownSaved(stored, emptyList())
+        assertFalse(cleared[0].online)
+        assertEquals("", cleared[0].appVersion)
+        assertFalse(savedSubtitle(cleared[0], nowMs = 1_700_000_000_000L).contains("now"))
+        val live = shownSaved(
+            stored,
+            listOf(PresenceReport(id = "902488771", online = true, appVersion = "0.6.64", lastSeen = 1_700_000_000)),
+        )
+        assertTrue(live[0].online)
+        assertTrue(live[0].presenceFresh)
+        assertEquals("0.6.64", live[0].appVersion)
+        assertTrue(savedSubtitle(live[0], nowMs = 1_700_000_000_000L).contains("now"))
+        assertTrue(savedSubtitle(live[0], nowMs = 1_700_000_000_000L).contains("0.6.64"))
+        val hidden = redactConnectError("connect failed token=abcdef0123456789abcdef0123456789 password=secret")
+        assertFalse(hidden.contains("secret"))
+        assertFalse(hidden.contains("abcdef"))
     }
 
     @Test

@@ -2475,7 +2475,7 @@ pub const ONLINE_FRESH_SECS: u64 = 45;
 
 /// Versions from a fresh `online.json`. The connected process wrote these.
 /// A stale file contributes nothing, so an old version cannot win.
-fn live_versions(data_dir: &Path) -> std::collections::HashMap<String, String> {
+pub(crate) fn live_versions(data_dir: &Path) -> std::collections::HashMap<String, String> {
     let path = data_dir.join("online.json");
     if !online_file_is_fresh(&path) {
         return std::collections::HashMap::new();
@@ -2500,7 +2500,7 @@ fn live_versions(data_dir: &Path) -> std::collections::HashMap<String, String> {
 /// Ids in a fresh `online.json`. `None` means the file was there but could not
 /// be read, so the caller must leave the published list alone. An empty set
 /// means nothing is online. `last_seen` in the registry is not read.
-fn online_ids(data_dir: &Path) -> Option<std::collections::HashSet<String>> {
+pub(crate) fn online_ids(data_dir: &Path) -> Option<std::collections::HashSet<String>> {
     let path = data_dir.join("online.json");
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,

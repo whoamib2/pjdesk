@@ -650,6 +650,10 @@ class Engine(context: Context) : EngineListener {
                 if (text.startsWith("sign-in ")) SignInSteps.note(text)
             }
             "release" -> update { it.copy(latestRelease = event.optString("version").ifBlank { it.latestRelease }) }
+            "fleet" -> {
+                CloudGate.noteFleet(event.optJSONArray("presence")?.toString().orEmpty())
+                update { it.copy(fleetNote = it.fleetNote + 1) }
+            }
             "serverLink" -> CloudGate.noteServer(event.optBoolean("up"))
             "account" -> CloudGate.noteAccount(event.toString())
             "registered" -> {

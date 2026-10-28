@@ -37,6 +37,11 @@ pub struct Policy {
     pub allowed_accounts: Vec<String>,
     #[serde(default)]
     pub revoked_devices: Vec<String>,
+    /// Extra Ed25519 public keys, hex. A key this server creates for the account
+    /// copy is added here immediately, so a session it just signed is accepted
+    /// before pjdesk.com has that key.
+    #[serde(default)]
+    pub trusted_keys: Vec<String>,
 }
 
 impl Default for Policy {
@@ -48,6 +53,7 @@ impl Default for Policy {
             fingerprint: String::new(),
             allowed_accounts: Vec::new(),
             revoked_devices: Vec::new(),
+            trusted_keys: Vec::new(),
         }
     }
 }
@@ -150,29 +156,57 @@ pub fn now_unix() -> u64 {
 }
 
 /// Decides one Register, Connect, or UdpReady.
+/// The policy key and any key in [`Policy::trusted_keys`] are both accepted.
 pub fn admit(policy: &Policy, token: &str, now: u64) -> Result<Decision, Deny> {
+    admit_keys(policy, token, now, "")
+}
+
+/// Same as [`admit`], and also accepts a token signed by `mirror_sign_public`.
+/// That is the account copy's current key, which may not be in the policy file yet.
+pub fn admit_keys(policy: &Policy, token: &str, now: u64, mirror_sign_public: &str) -> Result<Decision, Deny> {
     let token = token.trim();
     if token.is_empty() {
         return if policy.require_accounts { Err(Deny::Missing) } else { Ok(Decision::Open) };
     }
-    let key = match hex::decode(policy.public_key.trim()) {
-        Ok(bytes) if bytes.len() == 32 => bytes,
-        _ => {
-            return if policy.require_accounts { Err(Deny::Bad) } else { Ok(Decision::Open) };
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    if let Some(key) = decode_key(&policy.public_key) {
+        keys.push(key);
+    }
+    for hex_key in policy.trusted_keys.iter().map(String::as_str).chain(std::iter::once(mirror_sign_public)) {
+        let Some(key) = decode_key(hex_key) else { continue };
+        if keys.iter().any(|have| have == &key) {
+            continue;
         }
-    };
-    let claims = match access::verify(&key, token, now, &policy.fingerprint) {
-        Ok(claims) => claims,
-        Err(VerifyError::Expired) => {
-            return if policy.require_accounts { Err(Deny::Expired) } else { Ok(Decision::Open) };
+        keys.push(key);
+    }
+    if keys.is_empty() {
+        return if policy.require_accounts { Err(Deny::Bad) } else { Ok(Decision::Open) };
+    }
+    let mut expired = false;
+    let mut wrong = false;
+    for key in &keys {
+        match access::verify(key, token, now, &policy.fingerprint) {
+            Ok(claims) => return decide_claims(policy, claims),
+            Err(VerifyError::Expired) => expired = true,
+            Err(VerifyError::WrongServer) => wrong = true,
+            Err(VerifyError::Bad) => {}
         }
-        Err(VerifyError::WrongServer) => {
-            return if policy.require_accounts { Err(Deny::WrongServer) } else { Ok(Decision::Open) };
-        }
-        Err(VerifyError::Bad) => {
-            return if policy.require_accounts { Err(Deny::Bad) } else { Ok(Decision::Open) };
-        }
-    };
+    }
+    if expired {
+        return if policy.require_accounts { Err(Deny::Expired) } else { Ok(Decision::Open) };
+    }
+    if wrong {
+        return if policy.require_accounts { Err(Deny::WrongServer) } else { Ok(Decision::Open) };
+    }
+    if policy.require_accounts { Err(Deny::Bad) } else { Ok(Decision::Open) }
+}
+
+fn decode_key(hex_key: &str) -> Option<Vec<u8>> {
+    let bytes = hex::decode(hex_key.trim()).ok()?;
+    if bytes.len() == 32 { Some(bytes) } else { None }
+}
+
+fn decide_claims(policy: &Policy, claims: Claims) -> Result<Decision, Deny> {
     if policy.revoked_devices.iter().any(|d| d == &claims.device_id) {
         return Err(Deny::Revoked);
     }
@@ -214,6 +248,7 @@ mod tests {
             fingerprint: "aabb".into(),
             allowed_accounts: Vec::new(),
             revoked_devices: Vec::new(),
+            trusted_keys: Vec::new(),
         };
         (policy, token, public)
     }
@@ -284,6 +319,28 @@ mod tests {
         assert_eq!(admit(&allowed, &token, now), Err(Deny::Account));
         allowed.allowed_accounts.push("ben@spader.us".into());
         assert!(matches!(admit(&allowed, &token, now), Ok(Decision::Signed(_))));
+    }
+
+    #[test]
+    fn a_token_from_the_mirror_key_is_admitted_when_the_policy_key_is_different() {
+        let now = 1_700_000_000u64;
+        let (policy, cloud_token, _) = policy_with(true);
+        let seed = [4u8; 32];
+        let claims = Claims {
+            email: "ben@spader.us".into(),
+            network_id: "net_1".into(),
+            servers: vec!["aabb".into()],
+            device_id: "dev-1".into(),
+            exp: 1_800_000_000,
+        };
+        let (token, public) = sign_seed(&seed, &claims).unwrap();
+        let mirror = hex::encode(public);
+        assert!(matches!(admit(&policy, &cloud_token, now), Ok(Decision::Signed(_))));
+        assert_eq!(admit(&policy, &token, now), Err(Deny::Bad));
+        assert!(matches!(admit_keys(&policy, &token, now, &mirror), Ok(Decision::Signed(_))));
+        let mut trusted = policy.clone();
+        trusted.trusted_keys.push(mirror);
+        assert!(matches!(admit(&trusted, &token, now), Ok(Decision::Signed(_))));
     }
 
     #[test]

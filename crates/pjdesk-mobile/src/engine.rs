@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.63";
+pub const APP_VERSION: &str = "0.6.64";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -207,6 +207,8 @@ struct State {
     host_at: Mutex<String>,
     /// Sign-in waiting for an AccountResult on [`State::host_tx`].
     pending_account: Mutex<Option<(String, oneshot::Sender<ServerMsg>)>>,
+    /// Latest presence from the server. Empty means this connection has not sent one.
+    last_fleet: Mutex<Vec<pjdesk_proto::signal::FleetPeer>>,
     /// A sign-in connection registered this phone. The heartbeat connection should dial again.
     sign_in_reregister: AtomicBool,
     /// Bumped each time a registration connection is ready. Sign-in waits for the next one.
@@ -399,6 +401,7 @@ impl Engine {
             host_tx: Mutex::new(None),
             host_at: Mutex::new(String::new()),
             pending_account: Mutex::new(None),
+            last_fleet: Mutex::new(Vec::new()),
             sign_in_reregister: AtomicBool::new(false),
             host_gen: AtomicU64::new(0),
         });
@@ -802,7 +805,8 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 };
                 match outcome {
                     Ok((reply, addr)) => {
-                        let mut ev = account_event(&asked, &reply);
+                        let presence = state.last_fleet.lock().unwrap().clone();
+                        let mut ev = account_event(&asked, &reply, &presence);
                         ev["server"] = json!(addr);
                         emit(&cb, &ev);
                     }
@@ -1961,15 +1965,24 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                             state.moved.notify_waiters();
                         }
                     }
-                    ServerMsg::Fleet { computers, .. } => {
-                        emit(&cb, &json!({"event":"fleet","computers": computers.len()}));
+                    ServerMsg::Fleet { presence, computers, .. } => {
+                        *state.last_fleet.lock().unwrap() = presence.clone();
+                        emit(
+                            &cb,
+                            &json!({
+                                "event": "fleet",
+                                "computers": computers.len(),
+                                "presence": fleet_presence_json(&presence),
+                            }),
+                        );
                     }
                     ServerMsg::Release { version, client_url, .. } => {
                         emit(&cb, &json!({"event":"release","version": version, "url": client_url}));
                     }
                     reply @ ServerMsg::AccountResult { .. } => {
                         if !deliver_pending_account(&state, &reply) {
-                            emit(&cb, &account_event("", &reply));
+                            let presence = state.last_fleet.lock().unwrap().clone();
+                            emit(&cb, &account_event("", &reply, &presence));
                         }
                     }
                     ServerMsg::IncomingOnly { on } => {
@@ -2244,6 +2257,10 @@ async fn await_account(signal: &mut SignalClient, state: &State, cb: &Arc<dyn Ca
             Ok(Some(ServerMsg::ServerVersion { version })) => {
                 pjdesk_proto::routes::note_server_version(&mut state.routes.lock().unwrap(), &version);
                 sign_in_log(cb, address, step, &format!("reply=ServerVersion version={version}"));
+            }
+            Ok(Some(ServerMsg::Fleet { presence, .. })) => {
+                *state.last_fleet.lock().unwrap() = presence;
+                sign_in_log(cb, address, step, "reply=Fleet");
             }
             Ok(Some(ServerMsg::Routes(_))) => sign_in_log(cb, address, step, "reply=Routes"),
             Ok(Some(ServerMsg::Registered { .. })) => sign_in_log(cb, address, step, "reply=Registered"),
@@ -2573,7 +2590,26 @@ async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, m
     bail!("{}", sign_in_step_failure("register-then-account", "", "no answer"))
 }
 
-fn account_event(asked: &str, msg: &ServerMsg) -> Value {
+fn fleet_presence_json(presence: &[pjdesk_proto::signal::FleetPeer]) -> Vec<Value> {
+    presence
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "hostname": row.hostname,
+                "os_family": row.os_family,
+                "os_version": row.os_version,
+                "console_user": row.console_user,
+                "display_name": row.display_name,
+                "last_seen": row.last_seen,
+                "online": row.online,
+                "app_version": row.version,
+            })
+        })
+        .collect()
+}
+
+fn account_event(asked: &str, msg: &ServerMsg, presence: &[pjdesk_proto::signal::FleetPeer]) -> Value {
     let ServerMsg::AccountResult {
         op,
         ok,
@@ -2633,6 +2669,7 @@ fn account_event(asked: &str, msg: &ServerMsg) -> Value {
         "standbyLan": standby_lan,
         "publicIp": active_public_ip,
         "standbyPublicIp": standby_public_ip,
+        "presence": fleet_presence_json(presence),
     })
 }
 
@@ -4516,6 +4553,7 @@ mod tests {
             host_tx: Mutex::new(None),
             host_at: Mutex::new(String::new()),
             pending_account: Mutex::new(None),
+            last_fleet: Mutex::new(Vec::new()),
             sign_in_reregister: AtomicBool::new(false),
             host_gen: AtomicU64::new(0),
         })

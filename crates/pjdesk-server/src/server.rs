@@ -533,6 +533,7 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
                 // Before registration and before the Require gate. A 0.6.52 server
                 // already answers Account on a connection that has not registered.
                 let dir = state.lock().unwrap().data_dir.clone();
+                let fleet_dir = dir.clone();
                 let request = msg;
                 let reply = tokio::task::spawn_blocking(move || crate::account_mirror::answer(&dir, request))
                     .await
@@ -564,6 +565,11 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, addr: SocketAd
                             standby_public_ip: String::new(),
                         }
                     });
+                if matches!(reply, ServerMsg::AccountResult { ok: true, .. }) {
+                    if let Some(fleet) = crate::account_mirror::fleet_for(&fleet_dir, "") {
+                        conn.send(fleet);
+                    }
+                }
                 conn.send(reply);
                 continue;
             }
@@ -736,7 +742,8 @@ fn gate(st: &State, conn: &Conn) -> Result<Admitted, ()> {
         };
     }
     let policy = crate::access::Policy::load(&st.data_dir);
-    match crate::access::admit(&policy, token, crate::access::now_unix()) {
+    let mirror = crate::account_mirror::current_sign_public(&st.data_dir);
+    match crate::access::admit_keys(&policy, token, crate::access::now_unix(), &mirror) {
         Ok(crate::access::Decision::Open) => Ok(Admitted::Open),
         Ok(crate::access::Decision::Signed(claims)) => Ok(Admitted::Signed(claims)),
         Err(reason) => {
@@ -873,12 +880,14 @@ fn owner_email(st: &State, token: &str) -> Result<String, String> {
         return Err("Sign in on this computer as the owner of this server.".into());
     }
     let policy = crate::access::Policy::load(&st.data_dir);
-    let key = hex::decode(policy.public_key.trim()).unwrap_or_default();
-    if key.len() != 32 {
+    let mirror = crate::account_mirror::current_sign_public(&st.data_dir);
+    if policy.public_key.trim().len() != 64 && mirror.is_empty() && policy.trusted_keys.is_empty() {
         return Err("This server has not checked in with pjdesk.com yet, so it cannot confirm the owner.".into());
     }
-    let claims = pjdesk_proto::access::verify(&key, token, crate::access::now_unix(), &policy.fingerprint)
-        .map_err(|_| "Sign in again. This server could not confirm the account.".to_string())?;
+    let claims = match crate::access::admit_keys(&policy, token, crate::access::now_unix(), &mirror) {
+        Ok(crate::access::Decision::Signed(claims)) => claims,
+        _ => return Err("Sign in again. This server could not confirm the account.".into()),
+    };
     let Some(cfg) = crate::cloud::CloudConfig::load(&st.data_dir) else {
         return Err("This server is not signed in to a PJDesk account.".into());
     };
@@ -2335,6 +2344,114 @@ mod tests {
             },
         );
         assert!(rx.try_recv().is_err(), "sign-in is answered before the require gate, not refused here");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refreshed_mirror_session_can_connect() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-mirror-connect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp = "ab".repeat(32);
+        let mut copy = pjdesk_proto::account_mirror::AccountCopy::default();
+        copy.account_id = "acct".into();
+        copy.email = "ben@spader.us".into();
+        copy.auth_hash = "11".repeat(32);
+        copy.sign_pkcs8 = "not-a-key".into();
+        copy.network.id = "net".into();
+        copy.network.active_fingerprint = fp.clone();
+        copy.network.active_address = "192.168.0.193:21200".into();
+        let refresh = "cd".repeat(32);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        copy.devices.push(pjdesk_proto::account_mirror::DeviceRow {
+            device_id: "phone".into(),
+            account_id: "acct".into(),
+            email: "ben@spader.us".into(),
+            name: "Android".into(),
+            refresh_hash: pjdesk_proto::account_mirror::refresh_hash(&refresh),
+            enrolled_at: now.saturating_sub(10),
+            revoked_at: 0,
+        });
+        std::fs::write(dir.join("account-mirror.json"), serde_json::to_vec(&copy).unwrap()).unwrap();
+        crate::access::Policy {
+            require_accounts: true,
+            require_chosen: true,
+            public_key: "bb".repeat(32),
+            fingerprint: fp.clone(),
+            ..crate::access::Policy::default()
+        }
+        .save(&dir)
+        .unwrap();
+        let reply = crate::account_mirror::answer(
+            &dir,
+            ClientMsg::Account {
+                op: "refresh".into(),
+                email: String::new(),
+                auth_key: String::new(),
+                refresh,
+                device_id: "phone".into(),
+                device_name: String::new(),
+                vault: String::new(),
+                app_lock: String::new(),
+                computers: Vec::new(),
+                proof: String::new(),
+            },
+        );
+        let access = match reply {
+            ServerMsg::AccountResult { ok, access, message, .. } => {
+                assert!(ok, "{message}");
+                access
+            }
+            other => panic!("{other:?}"),
+        };
+        assert!(!access.is_empty());
+        let mirror = crate::account_mirror::current_sign_public(&dir);
+        assert_eq!(mirror.len(), 64, "the mirror must have a signing key");
+        let policy = crate::access::Policy::load(&dir);
+        assert!(
+            policy.trusted_keys.iter().any(|key| key.eq_ignore_ascii_case(&mirror)),
+            "the new public key is trusted as soon as it is created"
+        );
+        let cloud_key = hex::decode(policy.public_key.trim()).unwrap();
+        assert!(
+            pjdesk_proto::access::verify(&cloud_key, &access, now, &fp).is_err(),
+            "pjdesk.com's policy key does not sign this session"
+        );
+
+        let state = state_in(&dir);
+        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+        state.lock().unwrap().online.insert(
+            "123456789".into(),
+            OnlineHost {
+                conn_id: 9,
+                tx: host_tx,
+                hostname: "CHIP23".into(),
+                app_version: "0.6.64".into(),
+                addr: "192.168.0.193:21200".parse().unwrap(),
+                proto: 3,
+                since: Instant::now(),
+                close: Arc::new(Notify::new()),
+                access_key_id: String::new(),
+            },
+        );
+        let (mut conn, mut rx) = conn_pair();
+        conn.id = 2;
+        conn.access_token = access;
+        handle_message(
+            &state,
+            &mut conn,
+            ClientMsg::Connect { proto: 3, target_id: "123456789".into(), controller_name: "phone".into() },
+        );
+        match rx.try_recv() {
+            Ok(ServerMsg::Error { message, .. }) => panic!("connect refused: {message}"),
+            Ok(other) => panic!("{other:?}"),
+            Err(_) => {}
+        }
+        match host_rx.try_recv().unwrap() {
+            ServerMsg::IncomingSession { .. } => {}
+            other => panic!("connect did not reach the computer: {other:?}"),
+        }
+        assert_eq!(state.lock().unwrap().sessions.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

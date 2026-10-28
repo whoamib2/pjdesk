@@ -107,6 +107,16 @@ fun shouldRetryNotOnline(message: String, lastSeen: Long, nowMs: Long, attempt: 
 }
 
 /** Status line shown the moment Connect starts. */
+/** One line safe to keep after logcat rotates. Tokens and keys are removed. */
+fun redactConnectError(message: String): String {
+    var text = message.replace(
+        Regex("(?i)(password|token|auth_key|sign_pkcs8|refresh|secret|support_password)\\s*[:=]\\s*\\S+"),
+        "$1=(hidden)",
+    )
+    text = text.replace(Regex("\\b[0-9a-fA-F]{32,}\\b"), "(hidden)")
+    return text.replace('\n', ' ').replace('\r', ' ').take(400)
+}
+
 fun connectStatusLabel(name: String, id: String): String {
     val who = name.trim().ifBlank {
         id.filter { it.isDigit() }.chunked(3).joinToString(" ").ifBlank { "that computer" }

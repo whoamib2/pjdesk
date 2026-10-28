@@ -110,6 +110,35 @@ fun shownVersion(reported: String, mine: Boolean, selfVersion: String): String {
     return reported
 }
 
+/** Rows from an account or fleet `presence` array. A missing array is not fresh presence. */
+fun presenceReports(seen: org.json.JSONArray?): List<PresenceReport> {
+    if (seen == null) return emptyList()
+    val out = ArrayList<PresenceReport>(seen.length())
+    for (i in 0 until seen.length()) {
+        val o = seen.optJSONObject(i) ?: continue
+        val id = o.optString("id").filter { it.isDigit() }
+        if (id.length != 9) continue
+        val online = if (o.has("online") && !o.isNull("online")) o.get("online") else null
+        out.add(
+            PresenceReport(
+                id = id,
+                hostname = o.optString("hostname"),
+                osFamily = o.optString("os_family").ifBlank { o.optString("osFamily") },
+                osVersion = o.optString("os_version").ifBlank { o.optString("osVersion") },
+                consoleUser = o.optString("console_user").ifBlank { o.optString("consoleUser") },
+                displayName = o.optString("display_name").ifBlank { o.optString("displayName") },
+                lastSeen = when {
+                    o.has("last_seen") -> o.optLong("last_seen")
+                    else -> o.optLong("lastSeen")
+                },
+                online = presenceOnlineFlag(online),
+                appVersion = o.optString("app_version").ifBlank { o.optString("version") }.ifBlank { o.optString("appVersion") },
+            ),
+        )
+    }
+    return out
+}
+
 /** One row from the account presence list. `lastSeen` is unix seconds or milliseconds. */
 data class PresenceReport(
     val id: String,
@@ -147,6 +176,7 @@ fun applyPresence(computers: List<SavedComputer>, presence: List<PresenceReport>
                     lastSeen = seen,
                     online = row.online,
                     appVersion = row.appVersion,
+                    presenceFresh = true,
                 ),
             )
             continue
@@ -161,9 +191,20 @@ fun applyPresence(computers: List<SavedComputer>, presence: List<PresenceReport>
             lastSeen = maxOf(seenSeconds(cur.lastSeen), seen),
             online = row.online,
             appVersion = row.appVersion.ifBlank { cur.appVersion },
+            presenceFresh = true,
         )
     }
     return merged
+}
+
+/**
+ * Saved rows for the list on screen. Online and version come only from `presence`.
+ * An empty report clears both, including a flag that was stored earlier.
+ */
+fun shownSaved(stored: List<SavedComputer>, presence: List<PresenceReport>): List<SavedComputer> {
+    val base = stored.map { it.copy(online = false, appVersion = "", presenceFresh = false) }
+    if (presence.isEmpty()) return base
+    return applyPresence(base, presence)
 }
 
 /** Marks computers heard on the LAN online, without writing that into the saved file. */
@@ -171,7 +212,11 @@ fun applyLan(computers: List<SavedComputer>, lanIds: Set<String>): List<SavedCom
     if (lanIds.isEmpty()) return computers
     return computers.map { computer ->
         val id = computer.id.filter { it.isDigit() }
-        if (liveOnline(computer.online, id in lanIds) && !computer.online) computer.copy(online = true) else computer
+        if (liveOnline(computer.online, id in lanIds) && !computer.online) {
+            computer.copy(online = true, presenceFresh = true)
+        } else {
+            computer
+        }
     }
 }
 
@@ -216,8 +261,10 @@ fun versionBehind(installed: String, latest: String): Boolean {
 
 /** Second line of a compact Saved row: ID, short OS, when it was last seen, and its PJDesk version. */
 fun savedSubtitle(computer: SavedComputer, nowMs: Long = System.currentTimeMillis(), mine: Boolean = false): String {
-    val whenText = if (mine || computer.online) "now" else agoShort(computer.lastSeen, nowMs)
-    return listOf(formatSavedId(computer.id), osShort(computer), whenText, shownAppVersion(computer.appVersion))
+    val fresh = mine || computer.presenceFresh
+    val whenText = if (mine || (computer.presenceFresh && computer.online)) "now" else agoShort(computer.lastSeen, nowMs)
+    val version = if (fresh) shownAppVersion(computer.appVersion) else ""
+    return listOf(formatSavedId(computer.id), osShort(computer), whenText, version)
         .filter { it.isNotBlank() }
         .joinToString(" · ")
 }

@@ -259,6 +259,11 @@ class MainActivity : FragmentActivity() {
             var notOnlineTries by remember { mutableIntStateOf(0) }
             var query by remember { mutableStateOf("") }
             var saved by remember { mutableStateOf(app.store.saved()) }
+            var freshPresence by remember { mutableStateOf(emptyList<us.spader.pjdesk.core.PresenceReport>()) }
+            fun showSaved(presence: List<us.spader.pjdesk.core.PresenceReport> = freshPresence) {
+                freshPresence = presence
+                saved = us.spader.pjdesk.core.shownSaved(app.store.saved(), presence)
+            }
             var recentIds by remember { mutableStateOf(app.store.recentIds()) }
             var discovered by remember { mutableStateOf<List<SavedComputer>>(emptyList()) }
             val savedNow = rememberUpdatedState(saved)
@@ -356,7 +361,7 @@ class MainActivity : FragmentActivity() {
                 engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", "").toString())
                 engine.noteAccountSession("")
                 account = ""
-                saved = app.store.saved()
+                showSaved()
                 recentIds = app.store.recentIds()
                 tempWarn = false
                 enrolledFor = ""
@@ -385,7 +390,7 @@ class MainActivity : FragmentActivity() {
                 engine.command(org.json.JSONObject().put("cmd", "accessToken").put("token", "").toString())
                 engine.noteAccountSession("")
                 account = ""
-                saved = app.store.saved()
+                showSaved()
                 recentIds = app.store.recentIds()
                 tempWarn = false
                 enrolledFor = ""
@@ -422,7 +427,7 @@ class MainActivity : FragmentActivity() {
                         lockError = e.message ?: "Saved passwords need your account password again."
                         false
                     }
-                    if (changed) saved = app.store.saved()
+                    if (changed) showSaved()
                     adoptVaultPermanent(state.id)
                 }
             }
@@ -552,7 +557,7 @@ class MainActivity : FragmentActivity() {
                         runCatching { refreshAccount(refresh, device, null) }.getOrNull()
                     } ?: return@launch
                     app.store.mergeCloud(session.computers, preferAccount = true)
-                    saved = app.store.saved()
+                    showSaved(session.presence)
                     if (session.access.isNotBlank()) {
                         cloudAccess = session.access
                         engine.presentAccess(session.access, session.refresh, session.deviceId)
@@ -662,7 +667,7 @@ class MainActivity : FragmentActivity() {
                         engine.presentAccess(enrolled.access, enrolled.refresh, enrolled.deviceId)
                         account = who
                         signingIn = false
-                        saved = app.store.saved()
+                        showSaved(enrolled.presence)
                         if (!enrollOnlyNow) holdDerivedKey(who, accountPassword, upload = syncing && !temporaryNow)
                         val connected = enrolled.email.ifBlank { enrolled.address }.ifBlank { "this network" }
                         if (withoutPassword && !enrollOnlyNow) {
@@ -757,6 +762,7 @@ class MainActivity : FragmentActivity() {
                 if (state.incomingOnly) {
                     connecting = false
                     connectError = "Incoming only is on. This computer can't connect to others."
+                    AppLog.noteConnectError(connectError.orEmpty())
                     return
                 }
                 val now = android.os.SystemClock.elapsedRealtime()
@@ -820,12 +826,19 @@ class MainActivity : FragmentActivity() {
                         rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp, session.standbyFingerprint)
                         if (app.store.syncsSavedComputers() && !state.incomingOnly) {
                             app.store.mergeCloud(session.computers)
-                            saved = app.store.saved()
+                            showSaved(session.presence)
                         }
                     } finally {
                         presenceBusy = false
                     }
                 }
+            }
+            LaunchedEffect(state.fleetNote) {
+                if (state.fleetNote == 0) return@LaunchedEffect
+                val rows = runCatching {
+                    us.spader.pjdesk.core.presenceReports(org.json.JSONArray(CloudGate.fleetJson.ifBlank { "[]" }))
+                }.getOrDefault(emptyList())
+                showSaved(rows)
             }
             LaunchedEffect(tab, account, temporarySession) {
                 if (account.isBlank() || temporarySession) return@LaunchedEffect
@@ -839,6 +852,7 @@ class MainActivity : FragmentActivity() {
                 if (state.incomingOnly) {
                     connecting = false
                     connectError = "Incoming only is on. This computer can't connect to others."
+                    AppLog.noteConnectError(connectError.orEmpty())
                     return
                 }
                 val digits = rawId.filter { it.isDigit() }
@@ -860,6 +874,7 @@ class MainActivity : FragmentActivity() {
                 if (digits.length != 9) {
                     connecting = false
                     connectError = "That isn't a 9-digit PJDesk ID."
+                    AppLog.noteConnectError(connectError.orEmpty())
                     AppLog.e(connectError.orEmpty())
                     return
                 }
@@ -885,6 +900,7 @@ class MainActivity : FragmentActivity() {
                             if (fetched == null || fetched.address.isBlank()) {
                                 connecting = false
                                 connectError = "This phone has no server address yet. Sign in again, or set the server in Settings."
+                                AppLog.noteConnectError(connectError.orEmpty())
                                 AppLog.e(connectError.orEmpty())
                                 return@launch
                             }
@@ -897,6 +913,7 @@ class MainActivity : FragmentActivity() {
                     }
                     connecting = false
                     connectError = "This phone has no server address yet. Sign in again, or set the server in Settings."
+                    AppLog.noteConnectError(connectError.orEmpty())
                     AppLog.e(connectError.orEmpty())
                     return
                 }
@@ -910,6 +927,7 @@ class MainActivity : FragmentActivity() {
                     offlineRetry = computer
                     val who = name.ifBlank { computer.hostname.ifBlank { null } ?: "That computer" }
                     connectError = "$who is offline."
+                    AppLog.noteConnectError(connectError.orEmpty())
                     AppLog.i(connectError.orEmpty())
                     return
                 }
@@ -1052,7 +1070,7 @@ class MainActivity : FragmentActivity() {
                     val changed = withContext(Dispatchers.IO) {
                         runCatching { PasswordSync.pull(app.store, key, refresh, device, false) }.getOrDefault(false)
                     }
-                    if (changed) saved = app.store.saved()
+                    if (changed) showSaved()
                     adoptVaultPermanent(digits)
                     if (app.store.permanentPublished != 0L) return@LaunchedEffect
                 }
@@ -1100,7 +1118,7 @@ class MainActivity : FragmentActivity() {
                         rememberAccountServer(session.address, session.fingerprint, session.lan, session.publicIp, session.standbyAddress, session.routes, session.standbyLan, session.standbyPublicIp, session.standbyFingerprint)
                         if (app.store.syncsSavedComputers()) {
                             app.store.mergeCloud(session.computers)
-                            saved = app.store.saved()
+                            showSaved(session.presence)
                             if (app.vaultKey != null) syncPasswords(true)
                         }
                     }
@@ -1201,7 +1219,7 @@ class MainActivity : FragmentActivity() {
                 if (!state.askPassword) return@LaunchedEffect
                 connecting = false
                 promptBeforeConnect = false
-                saved = app.store.saved()
+                showSaved()
                 AppLog.i("password needed rejected=${state.askRejected}")
             }
             LaunchedEffect(state.session?.id) {
@@ -1311,6 +1329,7 @@ class MainActivity : FragmentActivity() {
                     connecting = false
                     engine.stopView("cancelled")
                     connectError = "No answer"
+                    AppLog.noteConnectError("No answer")
                 }
             }
             LaunchedEffect(state.notice) {
@@ -1329,7 +1348,7 @@ class MainActivity : FragmentActivity() {
                 if (session.id.isBlank()) return@LaunchedEffect
                 app.store.noteRemote(session.id, session.peer, session.platform, session.version)
                 app.store.touchRecent(session.id)
-                saved = app.store.saved()
+                showSaved()
                 recentIds = app.store.recentIds()
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                 val device = app.store.networkDeviceId
@@ -2333,19 +2352,19 @@ class MainActivity : FragmentActivity() {
                                     onConnect = { beginConnect(it.id) },
                                     onForget = {
                                         app.store.forget(it.id)
-                                        saved = app.store.saved()
+                                        showSaved()
                                         syncPasswords(true)
                                     },
                                     onRemovePassword = {
                                         app.store.stampPassword(it.id, "")
-                                        saved = app.store.saved()
+                                        showSaved()
                                         syncPasswords(true)
                                     },
                                     selfId = state.id,
                                     onRemoveAll = {
                                         app.store.clearLocalSaved()
                                         app.store.savedSyncChoice = "no"
-                                        saved = app.store.saved()
+                                        showSaved()
                                         recentIds = app.store.recentIds()
                                         scope.launch { snackbar.showSnackbar("Removed saved computers from this computer") }
                                     },
@@ -2358,7 +2377,7 @@ class MainActivity : FragmentActivity() {
                                     incomingOnly = state.incomingOnly,
                                     onRename = { computer, nickname ->
                                         app.store.rename(computer.id, nickname)
-                                        saved = app.store.saved()
+                                        showSaved()
                                         val refresh = app.store.networkRefresh()
                                         val device = app.store.networkDeviceId
                                         if (refresh.isNotBlank() && device.isNotBlank() && app.store.syncsSavedComputers()) {
@@ -2496,7 +2515,7 @@ class MainActivity : FragmentActivity() {
                                     onRemoveAllSaved = {
                                         app.store.clearLocalSaved()
                                         app.store.savedSyncChoice = "no"
-                                        saved = app.store.saved()
+                                        showSaved()
                                         recentIds = app.store.recentIds()
                                         scope.launch { snackbar.showSnackbar("Removed saved computers from this computer") }
                                     },
@@ -2741,7 +2760,7 @@ class MainActivity : FragmentActivity() {
                                 if (savePassword) {
                                     app.store.stampPassword(id, typed)
                                     if (temporarySession) app.store.noteTemporaryPassword(id)
-                                    saved = app.store.saved()
+                                    showSaved()
                                     syncPasswords(true)
                                 }
                                 askedPassword = ""
