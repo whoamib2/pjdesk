@@ -188,7 +188,7 @@ pub fn batch(dir: &Path, force: bool) -> bool {
             let _ = record_status(dir, 0, "HTTP 404: pjdesk.com has no account copy for this sign-in");
         }
         Err(Pull::Other(err)) => {
-            tracing::warn!("account mirror pull: {err}");
+            note_pull_failure(&err);
             let _ = record_status(dir, 0, &err);
         }
     }
@@ -228,10 +228,21 @@ pub fn pull_now(dir: &Path) -> String {
             record_status(dir, 0, "pjdesk.com is rate limited")
         }
         Err(Pull::Missing) => record_status(dir, 0, "HTTP 404: pjdesk.com has no account copy for this sign-in"),
-        Err(Pull::Other(err)) => record_status(dir, 0, &err),
+        Err(Pull::Other(err)) => {
+            note_pull_failure(&err);
+            record_status(dir, 0, &err)
+        }
     };
     tracing::info!("{line}");
     line
+}
+
+fn note_pull_failure(err: &str) {
+    if auth_rejected(err) {
+        tracing::info!("account mirror pull failed: {err}. Server sign-in needed");
+    } else {
+        tracing::info!("account mirror pull failed: {err}");
+    }
 }
 
 /// Shown when pjdesk.com rejected this server's token. A password sign-in replaces it.
@@ -241,7 +252,8 @@ pub const SERVER_SIGN_IN_NEEDED: &str = "Server sign-in needed";
 pub fn status_line(dir: &Path) -> String {
     let status = read_status(dir);
     if auth_rejected(&status.error) {
-        return SERVER_SIGN_IN_NEEDED.into();
+        let code = if status.error.to_ascii_lowercase().contains("http 403") { "403" } else { "401" };
+        return format!("{SERVER_SIGN_IN_NEEDED} (HTTP {code})");
     }
     if !status.error.is_empty() {
         format!("Account copy: error {}", one_line(&status.error))
@@ -1118,56 +1130,70 @@ fn fetch_peer_copy(dir: &Path, force: bool, budget: Duration) {
         app_lock: String::new(),
         computers: Vec::new(),
     };
+    tracing::info!("account copy seed targets={}", targets.len());
     for target in targets {
         let Some(addr) = crate::role_handoff::resolve_target(&target) else { continue };
         let private = pjdesk_proto::routes::endpoint_v4(&target).is_some_and(|ip| ip.is_private() || ip.is_loopback());
-        if pin.is_none() && !private {
+        // A saved fingerprint belongs to one server. A private peer on this LAN
+        // is dialed without that pin, or the Lenovo is rejected as the cabin.
+        let use_pin = if private { None } else { pin };
+        if use_pin.is_none() && !private {
+            tracing::info!("account copy seed skip {target}: public address without a fingerprint");
             continue;
         }
-        match crate::role_handoff::dial_observed(addr, pin, &msg, budget) {
+        tracing::info!("account copy seed dial {target}");
+        match crate::role_handoff::dial_observed(addr, use_pin, &msg, budget) {
             Ok((ServerMsg::Replica { body, .. }, observed)) => {
                 if let Some(fp) = observed {
                     let _ = std::fs::write(dir.join(PEER_FP_FILE), pjdesk_proto::tls::format_fingerprint(&fp));
                 }
                 if let Ok(fresh) = serde_json::from_slice::<AccountCopy>(&body) {
-                    store_peer_copy(dir, primary, &fresh);
+                    if store_peer_copy(dir, primary, &fresh) {
+                        return;
+                    }
+                    tracing::info!("account copy seed {target} had no password check");
                 }
-                return;
             }
-            Ok(_) => return,
-            Err(err) => tracing::debug!("account mirror from {target}: {err:#}"),
+            Ok(_) => tracing::info!("account copy seed {target} did not send a copy"),
+            Err(err) => tracing::info!("account copy seed {target} failed: {err:#}"),
         }
     }
 }
 
-fn store_peer_copy(dir: &Path, primary: bool, fresh: &AccountCopy) {
+fn store_peer_copy(dir: &Path, primary: bool, fresh: &AccountCopy) -> bool {
     let local = load(dir);
     if primary {
-        let Some(merged) = adopt_peer_copy(&local, fresh) else { return };
+        let Some(merged) = adopt_peer_copy(&local, fresh) else { return false };
         save(dir, &merged);
         let _ = record_status(dir, now(), "");
-        tracing::info!("account copy seeded from the standby");
-        return;
+        tracing::info!("account copy seeded from another server");
+        return true;
+    }
+    if !has_verifier(fresh) && !has_verifier(&local) {
+        return false;
     }
     save(dir, &merge(fresh, &local, &journal(dir)));
     tracing::info!("account copy mirrored from the primary");
+    true
 }
 
 fn standby_targets(dir: &Path) -> Vec<String> {
     let routes = cloud::advertised_routes(dir);
-    let mut out = Vec::new();
-    for raw in routes.standby_lan.iter().chain(routes.standby_public.iter()) {
-        let addr = raw.trim().to_string();
-        if addr.is_empty() || out.iter().any(|have: &String| have.eq_ignore_ascii_case(&addr)) {
-            continue;
+    let mut extras = crate::public_addr::lan_peer_addrs(dir);
+    let mine = crate::public_addr::discover_gateway_lans();
+    let have_local = extras.iter().any(|addr| pjdesk_proto::routes::on_subnet(addr, &mine));
+    if !have_local {
+        for (addr, beacon) in pjdesk_proto::discover::listen_servers(Duration::from_millis(1000)) {
+            extras.push(format!("{}:{}", addr.ip(), beacon.port));
         }
-        out.push(addr);
     }
-    let extra = cloud::cached_peer_address(dir);
-    if !extra.is_empty() && !out.iter().any(|have| pjdesk_proto::failover::same_server(have, &extra)) {
-        out.push(extra);
+    let cached = cloud::cached_peer_address(dir);
+    if !cached.is_empty() {
+        extras.push(cached);
     }
-    out
+    let own = crate::public_addr::lan_endpoints(crate::public_addr::remembered_port(dir));
+    let order = pjdesk_proto::routes::sign_in_peer_order(&routes, &mine, &extras, "");
+    order.into_iter().filter(|addr| !own.iter().any(|mine| pjdesk_proto::failover::same_server(mine, addr))).collect()
 }
 
 fn peer_pin(dir: &Path) -> Option<pjdesk_proto::tls::Fingerprint> {
@@ -1368,9 +1394,9 @@ mod tests {
         std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":1700000000,"error":""}"#).unwrap();
         assert_eq!(status_line(&dir), "Account copy: synced 2023-11-14 22:13:20 UTC");
         std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":1700000000,"error":"HTTP 401 auth: Please sign in."}"#).unwrap();
-        assert_eq!(status_line(&dir), "Server sign-in needed");
+        assert_eq!(status_line(&dir), "Server sign-in needed (HTTP 401)");
         std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":1700000000,"error":"HTTP 403 auth: Please sign in."}"#).unwrap();
-        assert_eq!(status_line(&dir), "Server sign-in needed");
+        assert_eq!(status_line(&dir), "Server sign-in needed (HTTP 403)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1484,7 +1510,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(STATUS_FILE), r#"{"synced_at":0,"error":"HTTP 401 auth: Please sign in."}"#).unwrap();
-        assert_eq!(status_line(&dir), SERVER_SIGN_IN_NEEDED);
+        assert_eq!(status_line(&dir), "Server sign-in needed (HTTP 401)");
         let msg = empty_copy_message(&dir);
         assert!(msg.contains("account copy is empty"), "{msg}");
         assert!(msg.contains("Server sign-in needed"), "{msg}");

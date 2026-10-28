@@ -1960,7 +1960,14 @@ fn assemble_routes(data_dir: &Path) -> pjdesk_proto::routes::ServerRoutes {
 
 fn assemble_routes_now(data_dir: &Path) -> pjdesk_proto::routes::ServerRoutes {
     let mine = local_advertised(data_dir);
-    let (peer_public, peer_lan, peer_names) = peer_endpoints(data_dir);
+    let (peer_public, mut peer_lan, peer_names) = peer_endpoints(data_dir);
+    for addr in crate::public_addr::lan_peer_addrs(data_dir) {
+        let ours = mine.lan.iter().any(|have| pjdesk_proto::failover::same_server(have, &addr));
+        let seen = peer_lan.iter().chain(peer_public.iter()).any(|have| pjdesk_proto::failover::same_server(have, &addr));
+        if !ours && !seen {
+            peer_lan.push(addr);
+        }
+    }
     let primary = accepts_host_registrations(data_dir);
     let mut names = mine.names.clone();
     for name in &peer_names {
@@ -2008,10 +2015,29 @@ fn peer_endpoints(data_dir: &Path) -> (Vec<String>, Vec<String>, Vec<String>) {
         pjdesk_proto::failover::counts_as_other_server(&peer.instance, &peer.name, &peer.version, &mine, &mine_name)
     });
     peers.sort_by_key(|peer| std::cmp::Reverse(peer.at));
-    match peers.into_iter().next() {
-        Some(peer) => (peer.public_addrs, peer.lan_addrs, peer.names),
-        None => (Vec::new(), Vec::new(), Vec::new()),
+    // Every server on the account. The newest health row is not the only peer:
+    // a cabin server must not hide the one on this LAN.
+    let mut public = Vec::new();
+    let mut lan = Vec::new();
+    let mut names = Vec::new();
+    for peer in peers {
+        for addr in peer.lan_addrs {
+            if !lan.iter().any(|have: &String| have.eq_ignore_ascii_case(&addr)) {
+                lan.push(addr);
+            }
+        }
+        for addr in peer.public_addrs {
+            if !public.iter().any(|have: &String| have.eq_ignore_ascii_case(&addr)) {
+                public.push(addr);
+            }
+        }
+        for name in peer.names {
+            if !names.iter().any(|have: &String| have.eq_ignore_ascii_case(&name)) {
+                names.push(name);
+            }
+        }
     }
+    (public, lan, names)
 }
 
 /// Asks the standby not to promote during a planned update or restart.

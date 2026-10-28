@@ -158,11 +158,22 @@ pub fn listen_servers(limit: std::time::Duration) -> Vec<(std::net::SocketAddr, 
     if !cached.is_empty() {
         return cached;
     }
-    let socket = match std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, crate::DISCOVERY_PORT)) {
-        Ok(socket) => socket,
-        Err(_) => return Vec::new(),
+    let Some(socket) = bind_discovery() else {
+        return Vec::new();
     };
     collect_beacons(socket, limit)
+}
+
+/// UDP 21202, shared. The phone and every server can listen at the same time.
+pub fn bind_discovery() -> Option<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)).ok()?;
+    let _ = socket.set_reuse_address(true);
+    #[cfg(unix)]
+    let _ = socket.set_reuse_port(true);
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, crate::DISCOVERY_PORT));
+    socket.bind(&addr.into()).ok()?;
+    let _ = socket.set_nonblocking(true);
+    Some(socket.into())
 }
 
 /// Reads beacons until `limit`. The socket is non-blocking, so a failed

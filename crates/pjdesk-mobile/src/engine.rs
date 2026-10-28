@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.62";
+pub const APP_VERSION: &str = "0.6.63";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -2298,22 +2298,36 @@ async fn account_on_address(
     }
 }
 
-/// The primary said its account copy is empty. Dial the standby, LAN on this /24 first.
-/// A public standby address is skipped unless its fingerprint is already saved.
+/// The primary said its account copy is empty. Try every known server.
+/// A LAN address on this phone's /24 is first. Discovery and the heartbeat
+/// are included, not only the one stored standby.
 async fn account_on_standby(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, msg: ClientMsg) -> Result<(ServerMsg, String)> {
     let routes = state.routes.lock().unwrap().clone();
     let saved = state.standby.lock().unwrap().clone();
+    let heartbeat = state.host_at.lock().unwrap().clone();
     let extra = state.phone_mine.lock().unwrap().clone();
-    let mine = tokio::task::spawn_blocking(move || merged_mine(&extra)).await.unwrap_or_default();
-    let targets = pjdesk_proto::routes::standby_account_order(&routes, &mine, &saved);
+    let (mine, heard) = tokio::task::spawn_blocking(move || {
+        let mine = merged_mine(&extra);
+        let heard = pjdesk_proto::discover::listen_servers(Duration::from_millis(1200));
+        (mine, heard)
+    })
+    .await
+    .unwrap_or_else(|_| (Vec::new(), Vec::new()));
+    let mut extras = vec![saved.clone(), heartbeat.clone()];
+    for (addr, beacon) in heard {
+        extras.push(format!("{}:{}", addr.ip(), beacon.port));
+        sign_in_log(cb, &format!("{}:{}", addr.ip(), beacon.port), "standby", "discovered");
+    }
+    let targets = pjdesk_proto::routes::sign_in_peer_order(&routes, &mine, &extras, &heartbeat);
     sign_in_log(cb, &saved, "standby", &format!("op={asked} targets={}", targets.len()));
     if targets.is_empty() {
-        bail!("{}", sign_in_step_failure("standby", "", "no standby address is saved"));
+        bail!("{}", sign_in_step_failure("standby", "", "no other server address is known"));
     }
     let mut last_addr = String::new();
     let mut last_why = String::new();
+    let mut empty: Option<(ServerMsg, String)> = None;
     for target in targets {
-        let Some(pin) = standby_pin(state, &target) else {
+        let Some(pin) = standby_pin(state, &target, &saved) else {
             sign_in_log(cb, &target, "standby", "reply=skipped public address without a fingerprint");
             continue;
         };
@@ -2321,8 +2335,12 @@ async fn account_on_standby(state: &State, cb: &Arc<dyn Callbacks>, asked: &str,
         match SignalClient::connect_endpoint(&target, pin, pjdesk_proto::routes::dial_budget(&target)).await {
             Ok(mut signal) => {
                 if let Some(fp) = signal.observed {
-                    *state.standby_fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&fp));
-                    persist(state);
+                    let mut slot = state.standby_fingerprint.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(pjdesk_proto::tls::format_fingerprint(&fp));
+                        drop(slot);
+                        persist(state);
+                    }
                 }
                 let addr = signal.server_addr.to_string();
                 sign_in_log(cb, &addr, "standby", "transport=tcp");
@@ -2332,6 +2350,10 @@ async fn account_on_standby(state: &State, cb: &Arc<dyn Callbacks>, asked: &str,
                     continue;
                 }
                 match await_account(&mut signal, state, cb, &addr, "standby", Duration::from_secs(12)).await {
+                    AccountRead::Reply(reply) if copy_is_empty(&reply) => {
+                        sign_in_log(cb, &addr, "standby", "reply=empty-copy");
+                        empty = Some((reply, addr));
+                    }
                     AccountRead::Reply(reply) => return Ok((reply, addr)),
                     AccountRead::Timeout | AccountRead::Closed => {
                         last_addr = addr;
@@ -2348,19 +2370,35 @@ async fn account_on_standby(state: &State, cb: &Arc<dyn Callbacks>, asked: &str,
             }
         }
     }
+    if let Some(found) = empty {
+        return Ok(found);
+    }
     bail!("{}", sign_in_step_failure("standby", &last_addr, &last_why));
 }
 
-/// `Some(None)` trusts a private LAN address once and remembers the certificate.
-/// A public address needs the saved standby fingerprint.
-fn standby_pin(state: &State, target: &str) -> Option<Option<pjdesk_proto::tls::Fingerprint>> {
-    if let Some(text) = state.standby_fingerprint.lock().unwrap().clone() {
-        if let Ok(fp) = pjdesk_proto::tls::parse_fingerprint(&text) {
-            return Some(Some(fp));
+/// `Some(None)` trusts a private address. The saved fingerprint is only for the
+/// stored standby, so it is not pinned onto a different server.
+fn standby_pin(state: &State, target: &str, saved_standby: &str) -> Option<Option<pjdesk_proto::tls::Fingerprint>> {
+    let on_saved = !saved_standby.trim().is_empty() && pjdesk_proto::routes::same_endpoint(target, saved_standby);
+    if on_saved {
+        if let Some(text) = state.standby_fingerprint.lock().unwrap().clone() {
+            if let Ok(fp) = pjdesk_proto::tls::parse_fingerprint(&text) {
+                return Some(Some(fp));
+            }
         }
     }
     let private = pjdesk_proto::routes::endpoint_v4(target).is_some_and(|ip| ip.is_private() || ip.is_loopback() || ip.is_link_local());
     if private { Some(None) } else { None }
+}
+
+fn copy_is_empty(msg: &ServerMsg) -> bool {
+    let ServerMsg::AccountResult { ok: false, message, .. } = msg else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    lower.contains("account copy is empty")
+        || lower.contains("does not have the account")
+        || lower.contains("server sign-in needed")
 }
 
 async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, msg: ClientMsg) -> Result<(ServerMsg, String)> {

@@ -351,7 +351,7 @@ fn sign_in(data_dir: &Path, req: &Request) -> Response {
     // Keep that session. A new login would replace the token and can fail.
     if let Some(saved) = same_saved_account(data_dir, &email) {
         let copy_line = crate::account_mirror::pull_now(data_dir);
-        let rejected = copy_line == crate::account_mirror::SERVER_SIGN_IN_NEEDED;
+        let rejected = copy_line.contains(crate::account_mirror::SERVER_SIGN_IN_NEEDED);
         if !rejected && crate::account_mirror::has_owner_copy(data_dir) {
             tracing::info!("sign-in: {email}: already signed in; the saved session stays");
             let mut response = ok(format!("Signed in as {saved}. Syncing as before."));
