@@ -3394,6 +3394,11 @@ impl App {
                     crate::client_update::start();
                 }
                 tray::Action::Revoke => self.revoke_support_access(),
+                tray::Action::Lock => {
+                    tracing::info!("Tray click: Lock now.");
+                    reveal_window(ctx, "Lock now");
+                    self.lock_now();
+                }
                 tray::Action::Quit => {
                     tracing::info!("The tray asked this window to exit.");
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -3496,6 +3501,12 @@ impl eframe::App for App {
             && !self.lock_ui
         {
             self.open_settings();
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::L)))
+            && !self.show_settings
+            && !self.lock_ui
+        {
+            self.lock_now();
         }
 
         let banner = self.cfg.support_banner();

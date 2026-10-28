@@ -124,6 +124,40 @@ impl App {
         }
     }
 
+    /// Lock now (header button or tray). With a PIN set, show the PIN screen at
+    /// once. Without one, open App lock so a PIN can be set.
+    pub(super) fn lock_now(&mut self) {
+        if self.pin_required() {
+            tracing::info!("Lock now: showing the PIN screen.");
+            self.engage_lock();
+            self.lock_armed = true;
+            return;
+        }
+        if !self.signed_in() && !self.cfg.joined_by_code_or_key() {
+            self.toast.show("Sign in to set a PIN, then Lock now shows the PIN screen.");
+            return;
+        }
+        tracing::info!("Lock now: no PIN is set; opening App lock to set one.");
+        self.open_settings();
+        self.settings.show_security();
+        self.pin_note = "No PIN is set yet. Set one here, then Lock now shows the PIN screen.".into();
+        self.toast.show("No PIN is set. Set one in App lock.");
+    }
+
+    fn can_lock_now(&self) -> bool {
+        self.signed_in() || self.cfg.joined_by_code_or_key()
+    }
+
+    pub(super) fn lock_now_button(&mut self, ui: &mut egui::Ui) {
+        if !self.can_lock_now() {
+            return;
+        }
+        let tip = if self.pin_required() { "Show the PIN screen now (Ctrl+L)" } else { "No PIN is set. Set one to lock this window." };
+        if ui.button("Lock now").on_hover_text(tip).clicked() {
+            self.lock_now();
+        }
+    }
+
     fn engage_lock(&mut self) {
         self.lock_ui = true;
         self.lock_pin.clear();
@@ -302,7 +336,8 @@ impl App {
                 self.save_cfg();
                 self.publish_shared();
                 let digits = self.saved_pin().map(|v| v.len).unwrap_or(0);
-                self.note_pin_outcome(&format!("rejected ({fails} misses, stored length {digits})"));
+                let changed = pjdesk_proto::applock::pin_changed_label(self.cfg.app_lock_updated, now);
+                self.note_pin_outcome(&format!("rejected ({fails} misses, stored length {digits}, saved at t={})", self.cfg.app_lock_updated));
                 self.lock_pin.clear();
                 self.lock_peeked.clear();
                 self.lock_shook = Some(Instant::now());
@@ -316,6 +351,9 @@ impl App {
                         format!("Wrong PIN. {left} left before a wait.")
                     }
                 };
+                if !changed.is_empty() {
+                    self.lock_error = format!("{}\n{changed}", self.lock_error);
+                }
             }
             LockMsg::Reauthed(key) => {
                 crate::vault::set_session_key(key);

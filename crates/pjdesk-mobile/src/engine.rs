@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.65";
+pub const APP_VERSION: &str = "0.6.66";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -3926,10 +3926,9 @@ async fn controller_session(
                 if established {
                     bail!("incorrect password");
                 }
-                let mut text = format!("Incorrect password for {}", format_id(target));
+                let text = incorrect_password_text(&format_id(target), from_store);
                 if from_store {
                     emit(&cb, &json!({"event":"clearSaved","id": target}));
-                    text.push_str(". The saved password on this computer was cleared.");
                 }
                 note = text;
                 password.clear();
@@ -4212,8 +4211,28 @@ async fn send_file_bytes(conn: quinn::Connection, id: u64, path: &Path, resume: 
 // quinn SendStream write_all is on AsyncWrite.
 use tokio::io::AsyncWriteExt;
 
+/// Which password the host refused: the one saved on this phone, or the one
+/// just typed. A saved one is cleared so the next try asks.
+fn incorrect_password_text(target: &str, from_store: bool) -> String {
+    if from_store {
+        format!(
+            "The saved password for {target} was refused. It was cleared from this phone. Type the password to try again; if it is right and still refused, the password on {target} was changed."
+        )
+    } else {
+        format!("Incorrect password for {target}. The password you typed was refused.")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refused_password_says_whether_it_was_saved_or_typed() {
+        let saved = super::incorrect_password_text("610 978 221", true);
+        assert!(saved.contains("saved password for 610 978 221 was refused") && saved.contains("cleared"));
+        let typed = super::incorrect_password_text("610 978 221", false);
+        assert!(typed.starts_with("Incorrect password for 610 978 221") && typed.contains("you typed"));
+    }
+
     use super::*;
 
     #[test]

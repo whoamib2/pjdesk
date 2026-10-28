@@ -10,6 +10,8 @@ pub enum Action {
     Show,
     Update,
     Revoke,
+    /// 0.6.66. Show the PIN screen now, or offer to set a PIN.
+    Lock,
     Quit,
 }
 
@@ -24,6 +26,7 @@ pub fn gui_actions() -> Vec<Action> {
         match token.as_str() {
             "update" => out.push(Action::Update),
             "revoke" => out.push(Action::Revoke),
+            "lock" => out.push(Action::Lock),
             _ => {}
         }
     }
@@ -331,14 +334,17 @@ mod imp {
         let icon = Icon::from_rgba(include_bytes!("../../assets/icon_32.rgba").to_vec(), 32, 32).ok()?;
         let menu = Menu::new();
         let show = MenuItem::new("Open PJDesk", true, None);
+        let lock = MenuItem::new("Lock now", true, None);
         let update = MenuItem::new("Check for updates now", true, None);
         let revoke = MenuItem::new("Revoke access", true, None);
         let quit = MenuItem::new("Quit PJDesk", true, None);
         menu.append(&show).ok()?;
+        menu.append(&lock).ok()?;
         menu.append(&update).ok()?;
         menu.append(&revoke).ok()?;
         menu.append(&quit).ok()?;
         let show_id = show.id().0.clone();
+        let lock_now = lock.id().0.clone();
         let update_id = update.id().0.clone();
         let revoke_id = revoke.id().0.clone();
         let quit_id = quit.id().0.clone();
@@ -350,6 +356,11 @@ mod imp {
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
             if e.id.0 == show_now {
                 ask_open("Open");
+                return;
+            }
+            if e.id.0 == lock_now {
+                super::remember_action("lock");
+                ask_open("Lock now");
                 return;
             }
             if e.id.0 == update_now {

@@ -322,6 +322,26 @@ pub fn lockout_for(file: &WindowLockFile, email: &str) -> (u32, u64) {
     }
 }
 
+/// "PIN last changed …" for the lock screen after a wrong PIN, so a PIN reset
+/// elsewhere (another window, another computer, the account) is visible.
+/// Empty when the time is unknown.
+pub fn pin_changed_label(updated: u64, now: u64) -> String {
+    if updated == 0 || updated > now.saturating_add(300) {
+        return String::new();
+    }
+    let secs = now.saturating_sub(updated);
+    let when = match secs {
+        0..=59 => "just now".to_string(),
+        60..=119 => "1 minute ago".to_string(),
+        120..=3599 => format!("{} minutes ago", secs / 60),
+        3600..=7199 => "1 hour ago".to_string(),
+        7200..=86_399 => format!("{} hours ago", secs / 3600),
+        86_400..=172_799 => "yesterday".to_string(),
+        _ => format!("{} days ago", secs / 86_400),
+    };
+    format!("PIN last changed {when}.")
+}
+
 pub fn hash_pin(pin: &str, salt: &[u8], iterations: u32) -> Result<[u8; 32], String> {
     let iterations =
         std::num::NonZeroU32::new(iterations).filter(|n| n.get() <= MAX_ITERATIONS).ok_or("bad pin hash")?;
@@ -413,6 +433,17 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lock_screen_says_when_the_pin_last_changed() {
+        assert_eq!(pin_changed_label(0, 1_000), "");
+        assert_eq!(pin_changed_label(1_000, 1_030), "PIN last changed just now.");
+        assert_eq!(pin_changed_label(1_000, 1_000 + 90), "PIN last changed 1 minute ago.");
+        assert_eq!(pin_changed_label(1_000, 1_000 + 47 * 60), "PIN last changed 47 minutes ago.");
+        assert_eq!(pin_changed_label(1_000, 1_000 + 2 * 3600 + 300), "PIN last changed 2 hours ago.");
+        assert_eq!(pin_changed_label(1_000, 1_000 + 3 * 86_400), "PIN last changed 3 days ago.");
+        assert_eq!(pin_changed_label(10_000, 1_000), "", "a time in the future is not shown");
+    }
 
     #[test]
     fn pin_rules_and_an_increasing_lockout() {

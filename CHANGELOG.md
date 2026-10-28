@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.66
+
+- Fixed: the PIN lock screen reversed the digits as they were typed, so the right PIN was always "Wrong PIN" (for example, 1234 was checked as 4321). This affected 0.6.50 to 0.6.65. The PIN saved on each computer is unchanged and now unlocks.
+- New: a Lock now button in the window header and the tray menu (also Ctrl+L). It shows the PIN screen at once. Without a PIN, it opens App lock so you can set one.
+- After a wrong PIN, the lock screen says when the PIN last changed.
+- Android: a refused password says whether it was the saved password (now cleared) or the one you typed.
+
 ## 0.6.65
 - Relay setup errors now say which side failed (this phone, or the host), with the relay address and UDP port. A host whose UDP bind fails tells the server, and the server tells the controller right away. The server logs what it is waiting for and drops the session after 17 s.
 - Android: the last connect error goes to logcat tag PJDeskConnect, and Settings has a "Share last error" button (secrets redacted).

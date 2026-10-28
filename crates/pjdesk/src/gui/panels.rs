@@ -49,6 +49,7 @@ impl App {
                 if widgets::icon_button(ui, Icon::Gear, "Settings (Ctrl+,)").clicked() {
                     self.open_settings();
                 }
+                self.lock_now_button(ui);
                 ui.separator();
                 let email = self.cfg.network_email.clone().unwrap_or_default();
                 let signed_in = self.temp.is_some() || !email.trim().is_empty();
