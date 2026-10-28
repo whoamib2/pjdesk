@@ -1455,7 +1455,15 @@ async fn session_inner(
     }
     let binding = match p2p::bind_udp(server_udp, session_id, token, Role::Host).await {
         Ok(binding) => binding,
-        Err(e) if !lan_direct.is_empty() => {
+        Err(e) => {
+            // Tell the server now, so the controller hears which side failed
+            // instead of waiting out its own relay timeout.
+            let reason = pjdesk_proto::signal::host_udp_failure(&server_udp.to_string(), &format!("{e:#}"));
+            tracing::warn!("Session {session_id:016x}: {reason}");
+            let _ = signal.send(ClientMsg::SessionResponse { session_id, accept: false, reason });
+            if lan_direct.is_empty() {
+                return Err(e);
+            }
             info!(
                 "UDP registration with the relay at {server_udp} failed: {e:#}. A computer on this network can still connect to UDP {}.",
                 pjdesk_proto::DIRECT_PORT
@@ -1463,7 +1471,6 @@ async fn session_inner(
             wait_until_direct(state, Duration::from_secs(20)).await?;
             return Ok(());
         }
-        Err(e) => return Err(e),
     };
     debug!("our public address for this session: {}", binding.observed);
     let endpoint = p2p::host_endpoint(binding.socket, &state.identity)?;

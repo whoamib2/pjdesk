@@ -121,6 +121,8 @@ pub struct Session {
     pub move_told: bool,
     /// The host reported [`ClientMsg::RelayMoved`].
     pub move_acked: bool,
+    /// The relay pieces last logged as missing, so each change is logged once.
+    pub wait_logged: String,
 }
 
 /// A role change that is waiting for relayed sessions to leave.
@@ -164,9 +166,30 @@ impl Session {
 
     /// Once both peers have bound their UDP socket and reported their LAN
     /// addresses, tell each side how to reach the other.
+    /// What the relay still needs before it can send PeerInfo. Empty when ready.
+    pub fn relay_missing(&self) -> Vec<&'static str> {
+        pjdesk_proto::signal::relay_missing(
+            self.host.public.is_some(),
+            self.host.local.is_some(),
+            self.controller.public.is_some(),
+            self.controller.local.is_some(),
+        )
+    }
+
     pub fn maybe_send_peer_info(&mut self, session_id: SessionId) {
         if self.info_sent {
             return;
+        }
+        let missing = self.relay_missing();
+        if !missing.is_empty() {
+            let text = missing.join(", ");
+            if self.accepted && text != self.wait_logged {
+                info!(
+                    "Session {session_id:016x}: host {} relay setup is waiting for {text}",
+                    format_id(&self.host_id)
+                );
+                self.wait_logged = text;
+            }
         }
         let (Some(host_pub), Some(host_lan), Some(ctrl_pub), Some(ctrl_lan)) =
             (self.host.public, self.host.local.as_ref(), self.controller.public, self.controller.local.as_ref())
@@ -959,6 +982,7 @@ fn start_session(st: &mut State, ctrl: &ControllerSide, target: &str, controller
         relayed: false,
         move_told: false,
         move_acked: false,
+        wait_logged: String::new(),
     };
     st.sessions.insert(session_id, session);
     crate::audit::AuditLog::open(&st.data_dir).record(
@@ -1285,6 +1309,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
         }
 
         ClientMsg::SessionResponse { session_id, accept, reason } => {
+            let relay_udp_port = st.udp_port;
             let Some(session) = st.sessions.get_mut(&session_id) else { return };
             if session.host_conn != conn.id {
                 return;
@@ -1295,8 +1320,23 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 format!("refused: {}", reason.chars().take(80).collect::<String>())
             };
             crate::audit::AuditLog::open(&st.data_dir).record("session", &session.host_id, &audit_detail);
+            if !accept && pjdesk_proto::signal::is_host_udp_failure(&reason) {
+                warn!(
+                    "Session {session_id:016x}: host {} could not bind UDP to the relay: {}",
+                    format_id(&session.host_id),
+                    reason.chars().take(200).collect::<String>()
+                );
+            }
             if accept {
                 session.accepted = true;
+                session.wait_logged = "host UDP bind, host UdpReady, controller UDP bind, controller UdpReady".into();
+                info!(
+                    "Session {session_id:016x}: host {} accepted; waiting for host UDP bind and controller UDP bind on UDP {} ({}s timeout)",
+                    format_id(&session.host_id),
+                    relay_udp_port,
+                    pjdesk_proto::signal::RELAY_SETUP_TIMEOUT_SECS
+                );
+                spawn_relay_setup_timeout(state, session_id);
                 let _ = session.controller_tx.send(ServerMsg::SessionReady {
                     session_id,
                     token: session.controller_token,
@@ -1565,6 +1605,26 @@ fn push_policy(st: &State) {
             let _ = host.tx.send(msg.clone());
         }
     }
+}
+
+/// Ends a session whose peers did not both bind UDP in time, and tells the
+/// controller which side was missing so it does not wait out its own timeout.
+fn spawn_relay_setup_timeout(state: &Shared, session_id: SessionId) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(pjdesk_proto::signal::RELAY_SETUP_TIMEOUT_SECS)).await;
+        let mut st = state.lock().unwrap();
+        let udp_port = st.udp_port;
+        let Some(session) = st.sessions.get(&session_id) else { return };
+        if session.info_sent {
+            return;
+        }
+        let missing = session.relay_missing();
+        let notice = pjdesk_proto::signal::relay_timeout_notice(&missing, udp_port);
+        warn!("Session {session_id:016x}: host {}: {notice}", format_id(&session.host_id));
+        let _ = session.controller_tx.send(ServerMsg::Error { code: ErrorCode::HostBusy, message: notice });
+        st.sessions.remove(&session_id);
+    });
 }
 
 /// Periodically forgets stale sessions and rate-limit counters.

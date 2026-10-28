@@ -2779,7 +2779,15 @@ async fn host_session(
     controller_ip: String,
 ) -> Result<()> {
     let gen = state.gen.load(Ordering::SeqCst);
-    let binding = p2p::bind_udp(server_udp, session_id, token, Role::Host).await?;
+    let binding = match p2p::bind_udp(server_udp, session_id, token, Role::Host).await {
+        Ok(binding) => binding,
+        Err(e) => {
+            let reason = pjdesk_proto::signal::host_udp_failure(&server_udp.to_string(), &format!("{e:#}"));
+            log_line(&cb, reason.clone());
+            let _ = signal.send(ClientMsg::SessionResponse { session_id, accept: false, reason });
+            return Err(e);
+        }
+    };
     let endpoint = p2p::host_endpoint(binding.socket, &state.identity)?;
     signal.send(ClientMsg::UdpReady {
         session_id,
@@ -3208,6 +3216,11 @@ fn surfaced_connect_error(raw: &str) -> Option<String> {
     }
 }
 
+/// The port of `host:port`, for the message. None when it does not parse.
+fn udp_port_of(addr: &str) -> Option<String> {
+    addr.parse::<SocketAddr>().ok().map(|a| a.port().to_string())
+}
+
 /// Turns a transport failure into a sentence the phone can show. The password is never included.
 fn explain_connect_error(target: &str, host_name: &str, err: &anyhow::Error) -> String {
     let raw = format!("{err:#}");
@@ -3223,11 +3236,44 @@ fn explain_connect_error(target: &str, host_name: &str, err: &anyhow::Error) -> 
     if lower.contains("even through the relay") {
         return format!("Could not reach {who}, even through the relay.");
     }
-    if lower.contains("no udp reply") {
+    if pjdesk_proto::signal::is_host_udp_failure(head) {
+        let detail = head.split_once(": ").map(|(_, d)| d).unwrap_or(head);
+        let server = head
+            .split_once("(server ")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(addr, _)| addr.to_string())
+            .unwrap_or_default();
+        let at = if server.is_empty() { String::new() } else { format!(" at {server}") };
+        return format!(
+            "{who} could not reach the PJDesk relay{at} over UDP. This phone's side is fine. Check that UDP {} is forwarded to the server and allowed by its firewall. ({detail})",
+            udp_port_of(&server).unwrap_or_else(|| "21200".into())
+        );
+    }
+    if pjdesk_proto::signal::is_relay_setup_timeout(head) {
+        let side = if head.contains("host UDP bind") {
+            format!("{who} did not register with the relay over UDP")
+        } else if head.contains("controller UDP bind") {
+            "This phone did not register with the relay over UDP".to_string()
+        } else {
+            format!("{who} did not finish the relay setup")
+        };
+        return format!("{side}. ({head})");
+    }
+    if lower.contains("this phone's udp setup failed") || lower.contains("no udp reply") {
         return head.to_string();
     }
     if lower.contains("did not finish the relay") || lower.contains("did not finish setting up") {
-        return format!("{who} is on the PJDesk server, but it did not finish the relay setup.");
+        let server = lower
+            .find("(server udp ")
+            .map(|at| &head[at + "(server udp ".len()..])
+            .and_then(|rest| rest.split_once(')'))
+            .map(|(addr, _)| addr.to_string());
+        return match server {
+            Some(addr) => format!(
+                "{who} is on the PJDesk server, but it did not finish the relay setup. This phone registered with the relay at {addr} over UDP; {who} did not."
+            ),
+            None => format!("{who} is on the PJDesk server, but it did not finish the relay setup."),
+        };
     }
     if lower.contains("did not start a session")
         || lower.contains("did not answer through the pjdesk server")
@@ -3771,7 +3817,9 @@ async fn controller_session(
         }
     };
     let server_udp = SocketAddr::new(signal.server_addr.ip(), udp_port);
-    let binding = p2p::bind_udp(server_udp, session_id, token, Role::Controller).await?;
+    let binding = p2p::bind_udp(server_udp, session_id, token, Role::Controller)
+        .await
+        .map_err(|e| anyhow::anyhow!("This phone's UDP setup failed (server {server_udp}): {e:#}"))?;
     signal.send(ClientMsg::UdpReady {
         session_id,
         local_addrs: binding.local_addrs.clone(),
@@ -3785,7 +3833,7 @@ async fn controller_session(
             Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
             Ok(Some(_)) => continue,
             Ok(None) => bail!("the server closed the connection"),
-            Err(_) => bail!("the computer did not finish the relay setup"),
+            Err(_) => bail!("the computer did not finish the relay setup (server UDP {server_udp})"),
         }
     };
     drop(signal);
@@ -4380,6 +4428,25 @@ mod tests {
             explain_connect_error("902488771", "BENLENOVODESK", &relay_setup),
             "BENLENOVODESK is on the PJDesk server, but it did not finish the relay setup."
         );
+        let named_setup = anyhow::anyhow!("the computer did not finish the relay setup (server UDP 192.168.0.193:21200)");
+        let text = explain_connect_error("902488771", "CABINDESK", &named_setup);
+        assert!(text.contains("192.168.0.193:21200"), "{text}");
+        assert!(text.contains("CABINDESK did not"), "{text}");
+        let host_failed = anyhow::anyhow!(
+            "{}",
+            pjdesk_proto::signal::host_udp_failure("204.248.122.44:21200", "no UDP reply from the server at 204.248.122.44:21200")
+        );
+        let text = explain_connect_error("902488771", "CABINDESK", &host_failed);
+        assert!(text.starts_with("CABINDESK could not reach the PJDesk relay at 204.248.122.44:21200"), "{text}");
+        assert!(text.contains("UDP 21200"), "{text}");
+        let timeout = anyhow::anyhow!(
+            "{}",
+            pjdesk_proto::signal::relay_timeout_notice(&pjdesk_proto::signal::relay_missing(false, false, true, true), 21200)
+        );
+        let text = explain_connect_error("610978221", "CHIP20", &timeout);
+        assert!(text.starts_with("CHIP20 did not register with the relay over UDP"), "{text}");
+        let mine = anyhow::anyhow!("This phone's UDP setup failed (server 192.168.0.193:21200): no UDP reply");
+        assert!(explain_connect_error("610978221", "CHIP20", &mine).starts_with("This phone's UDP setup failed"));
         let udp = anyhow::anyhow!(
             "no UDP reply from the server at 204.248.122.44:21201. Make sure UDP port 21201 is allowed in the server's firewall"
         );

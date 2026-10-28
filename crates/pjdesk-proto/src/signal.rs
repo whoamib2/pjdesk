@@ -666,6 +666,61 @@ pub fn is_sign_in_required(message: &str) -> bool {
     message.contains(crate::access::SIGN_IN_REQUIRED)
 }
 
+/// Start of a host's refusal sent after its UDP bind to the relay failed. The
+/// host sends it as a refused `SessionResponse`, so servers from before this
+/// text forward it to the controller and drop the session.
+pub const HOST_UDP_FAILED: &str = "Host UDP setup failed";
+/// Start of the server's notice when a session did not finish its relay setup in time.
+pub const RELAY_SETUP_TIMEOUT: &str = "Relay setup timed out";
+/// Seconds the server waits for both UDP binds after the host accepts. Under the
+/// controller's 20 second wait, so the controller hears which side was missing.
+pub const RELAY_SETUP_TIMEOUT_SECS: u64 = 17;
+
+/// The host's refusal text. `server_udp` is the address it tried. No secrets.
+pub fn host_udp_failure(server_udp: &str, detail: &str) -> String {
+    let detail = detail.lines().next().unwrap_or("").trim();
+    let detail: String = detail.chars().take(200).collect();
+    if detail.is_empty() {
+        format!("{HOST_UDP_FAILED}: no UDP reply from the server at {server_udp}")
+    } else {
+        format!("{HOST_UDP_FAILED} (server {server_udp}): {detail}")
+    }
+}
+
+pub fn is_host_udp_failure(message: &str) -> bool {
+    message.contains(HOST_UDP_FAILED)
+}
+
+pub fn is_relay_setup_timeout(message: &str) -> bool {
+    message.contains(RELAY_SETUP_TIMEOUT)
+}
+
+/// What the relay is still waiting for, in a fixed order. Empty when ready.
+pub fn relay_missing(host_bound: bool, host_ready: bool, ctrl_bound: bool, ctrl_ready: bool) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if !host_bound {
+        out.push("host UDP bind");
+    }
+    if !host_ready {
+        out.push("host UdpReady");
+    }
+    if !ctrl_bound {
+        out.push("controller UDP bind");
+    }
+    if !ctrl_ready {
+        out.push("controller UdpReady");
+    }
+    out
+}
+
+/// The server's timeout notice to the controller.
+pub fn relay_timeout_notice(missing: &[&str], udp_port: u16) -> String {
+    format!(
+        "{RELAY_SETUP_TIMEOUT} after {RELAY_SETUP_TIMEOUT_SECS}s: waiting for {} (server UDP port {udp_port})",
+        if missing.is_empty() { "nothing".to_string() } else { missing.join(", ") }
+    )
+}
+
 /// Shown on the controller when the account session cannot be refreshed.
 /// The registration notice stays the 0.6.52 sentence. This one is for the person connecting.
 pub const SIGN_IN_EXPIRED: &str = "Your sign-in expired";
@@ -959,6 +1014,16 @@ mod tests {
         assert!(!is_sign_in_required("the server closed the connection"));
         assert_eq!(SIGN_IN_EXPIRED, "Your sign-in expired");
         assert!(!is_sign_in_required(SIGN_IN_EXPIRED));
+        let host = host_udp_failure("204.248.122.44:21200", "no UDP reply from the server at 204.248.122.44:21200.\nmore");
+        assert!(is_host_udp_failure(&host));
+        assert!(host.contains("204.248.122.44:21200"));
+        assert!(!host.contains("more"));
+        assert_eq!(relay_missing(false, true, true, true), vec!["host UDP bind"]);
+        assert!(relay_missing(true, true, true, true).is_empty());
+        let notice = relay_timeout_notice(&relay_missing(false, false, true, true), 21200);
+        assert!(is_relay_setup_timeout(&notice));
+        assert!(notice.contains("host UDP bind, host UdpReady"));
+        assert!(notice.contains("21200"));
         assert_eq!(INCOMING_ONLY_REFUSAL, "Incoming only is on. This computer can't connect to others.");
         assert_eq!(reconcile_incoming_only(true, false, false), (true, true));
         assert_eq!(reconcile_incoming_only(true, false, true), (false, false));
