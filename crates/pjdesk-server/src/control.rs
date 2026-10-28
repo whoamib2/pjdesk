@@ -972,6 +972,10 @@ pub const ROLE_WAIT: Duration = Duration::from_secs(50);
 /// That is longer than a local file change, so it does not use [`CALL_TIMEOUT`].
 pub const SIGN_IN_WAIT: Duration = Duration::from_secs(45);
 
+/// A release check talks to pjdesk.com. Eight seconds is not enough, and a
+/// hung pipe must still finish with a timeout instead of spinning.
+pub const CHECK_WAIT: Duration = Duration::from_secs(45);
+
 /// Runs `job` and returns its response. If it is still going when `timeout` elapses,
 /// returns a failed response with `code` `timeout`. `None` from `job` is preserved
 /// (the service is not listening).

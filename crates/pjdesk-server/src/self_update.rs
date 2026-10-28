@@ -111,7 +111,7 @@ impl Settings {
 
     /// Seconds between automatic checks: 30 minutes plus up to 30 minutes.
     pub fn interval_secs(&self) -> u64 {
-        pjdesk_proto::failover::RELEASE_CHECK_SECS + (self.jitter_secs % (60 * 60))
+        30 * 60 + (self.jitter_secs % (30 * 60))
     }
 }
 
@@ -199,16 +199,17 @@ impl UpdateStatus {
         };
         let settled = raw.clone().settled(env!("CARGO_PKG_VERSION"));
         if settled != raw {
-            settled.save(data_dir);
+            let _ = settled.save(data_dir);
         }
     }
 
-    fn save(&self, data_dir: &Path) {
-        if let Ok(bytes) = serde_json::to_vec_pretty(self) {
-            let path = data_dir.join(STATUS_FILE);
-            let _ = std::fs::write(&path, bytes);
-            cloud::protect(&path);
-        }
+    fn save(&self, data_dir: &Path) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(self).context("encoding the update status")?;
+        let path = data_dir.join(STATUS_FILE);
+        std::fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
+        std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+        cloud::protect(&path);
+        Ok(())
     }
 }
 
@@ -266,10 +267,17 @@ pub fn decide(s: &Situation) -> Plan {
     if !s.role_active {
         return Plan::Install;
     }
+    // Only a healthy account standby holds the primary back. Another server
+    // that still publishes health, or one that is not healthy, is not that standby.
     let standbys: Vec<&PeerHealth> = s
         .peers
         .iter()
-        .filter(|p| p.instance != s.our_instance && s.now.saturating_sub(p.at) <= PEER_FRESH_SECS)
+        .filter(|p| {
+            p.instance != s.our_instance
+                && p.role.eq_ignore_ascii_case("standby")
+                && p.healthy
+                && s.now.saturating_sub(p.at) <= PEER_FRESH_SECS
+        })
         .collect();
     if standbys.is_empty() {
         return Plan::Install;
@@ -379,35 +387,52 @@ fn remember_offer(data_dir: &Path, settings: &mut Settings, version: &str) {
     }
 }
 
-fn record(data_dir: &Path, result: &str, available: &str, error: &str) {
-    UpdateStatus {
+fn record(data_dir: &Path, result: &str, available: &str, error: &str) -> Result<()> {
+    let status = UpdateStatus {
         last_check_at: now_secs(),
         last_result: result.into(),
         available: available.into(),
         error: error.into(),
+    };
+    status.save(data_dir)?;
+    tracing::info!(
+        "server update: checked at {} result={} available={} error={}",
+        status.last_check_at,
+        status.last_result,
+        if status.available.is_empty() { "none" } else { status.available.as_str() },
+        if status.error.is_empty() { "none" } else { status.error.as_str() }
+    );
+    Ok(())
+}
+
+/// The sentence the window shows after a check.
+pub fn check_sentence(current: &str, available: Option<&str>, error: Option<&str>) -> (String, String, String) {
+    if let Some(err) = error.map(str::trim).filter(|s| !s.is_empty()) {
+        let err = err.to_string();
+        return (err.clone(), String::new(), err);
     }
-    .save(data_dir);
+    if let Some(ver) = available.map(str::trim).filter(|s| !s.is_empty()) {
+        return (format!("Update {ver} available, Install"), ver.to_string(), String::new());
+    }
+    (format!("Up to date ({current})"), String::new(), String::new())
 }
 
 /// Checks the release feed and writes the status file. Does not install.
 pub fn check_now(data_dir: &Path) -> Result<String> {
     let current = env!("CARGO_PKG_VERSION");
-    match pjdesk_proto::update::check_server(current) {
-        Ok(None) => {
-            record(data_dir, "Up to date", "", "");
-            tracing::info!("server update: up to date ({current})");
-            Ok(format!("PJDesk Server {current} is up to date."))
-        }
-        Ok(Some(found)) => {
-            record(data_dir, &format!("Version {} is available", found.version), &found.version, "");
-            tracing::info!("server update: {} is available (this server is {current})", found.version);
-            Ok(format!("PJDesk Server {} is available.", found.version))
-        }
-        Err(e) => {
-            record(data_dir, "Check failed", "", &format!("{e:#}"));
-            tracing::warn!("server update: check failed: {e:#}");
-            Err(e)
-        }
+    let (sentence, available, error) = match pjdesk_proto::update::check_server(current) {
+        Ok(None) => check_sentence(current, None, None),
+        Ok(Some(found)) => check_sentence(current, Some(&found.version), None),
+        Err(e) => check_sentence(current, None, Some(&format!("{e:#}"))),
+    };
+    if let Err(err) = record(data_dir, &sentence, &available, &error) {
+        tracing::warn!("server update: could not save the check: {err:#}");
+        bail!("{sentence} The check time was not saved: {err:#}");
+    }
+    if error.is_empty() {
+        Ok(sentence)
+    } else {
+        bail!("{sentence}")
     }
 }
 
@@ -415,40 +440,49 @@ pub fn check_now(data_dir: &Path) -> Result<String> {
 /// `manual` skips the standby wait and the maintenance window.
 pub fn install_if_planned(data_dir: &Path, manual: bool) -> Result<String> {
     let current = env!("CARGO_PKG_VERSION");
-    let found = match pjdesk_proto::update::check_server(current) {
+        let found = match pjdesk_proto::update::check_server(current) {
         Ok(v) => v,
         Err(e) => {
-            record(data_dir, "Check failed", "", &format!("{e:#}"));
-            tracing::warn!("server update: check failed: {e:#}");
+            let reason = format!("{e:#}");
+            let _ = record(data_dir, &reason, "", &reason);
+            tracing::warn!("server update: check failed: {reason}");
             return Err(e);
         }
     };
     let Some(update) = found else {
-        record(data_dir, "Up to date", "", "");
-        tracing::info!("server update: up to date ({current})");
-        return Ok(format!("PJDesk Server {current} is up to date."));
+        let (sentence, available, error) = check_sentence(current, None, None);
+        record(data_dir, &sentence, &available, &error)?;
+        return Ok(sentence);
     };
     let mut settings = Settings::load(data_dir);
     remember_offer(data_dir, &mut settings, &update.version);
     let plan = plan_for(data_dir, &settings, Some(update.version.clone()), manual);
     match plan {
+        Plan::Skip { reason: "not newer" | "up to date" | "pre-release" } => {
+            let (sentence, available, error) = check_sentence(current, None, None);
+            record(data_dir, &sentence, &available, &error)?;
+            Ok(sentence)
+        }
         Plan::Skip { reason } | Plan::Defer { reason } => {
-            record(data_dir, reason, &update.version, "");
+            let (sentence, available, _) = check_sentence(current, Some(&update.version), None);
+            record(data_dir, &sentence, &available, reason)?;
             tracing::info!("server update: {reason} ({})", update.version);
-            Ok(format!("PJDesk Server {} is available ({reason}).", update.version))
+            Ok(format!("{sentence} {reason}."))
         }
         Plan::Install => {
             tracing::info!("server update: installing {}", update.version);
             crate::cloud::announce_maintenance(data_dir);
             match pjdesk_proto::update::install_available(&update) {
                 Ok(()) => {
-                    record(data_dir, &format!("Installing {}", update.version), &update.version, "");
+                    let sentence = format!("Installing {}", update.version);
+                    record(data_dir, &sentence, &update.version, "")?;
                     // The installer stops this process. If it fails to start,
                     // we are still running and the service was not stopped.
-                    Ok(format!("Installing PJDesk Server {}.", update.version))
+                    Ok(sentence)
                 }
                 Err(e) => {
-                    record(data_dir, "Install failed", &update.version, &format!("{e:#}"));
+                    let reason = format!("{e:#}");
+                    record(data_dir, &reason, &update.version, &reason)?;
                     tracing::warn!("server update: install failed, service left running: {e:#}");
                     Err(e)
                 }
@@ -564,7 +598,7 @@ mod tests {
         primary.role_active = true;
         primary.peers.push(peer("bbbb", "0.5.0", 3, primary.now - 60));
         primary.peers[0].healthy = false;
-        assert_eq!(decide(&primary), Plan::Defer { reason: "waiting for the standby to update" });
+        assert_eq!(decide(&primary), Plan::Install, "an unhealthy peer is not a standby to wait for");
         primary.peers[0].healthy = true;
         primary.peers[0].epoch = 2;
         assert_eq!(decide(&primary), Plan::Defer { reason: "waiting for the standby to update" });
@@ -695,6 +729,40 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("Up to date"), "{text}");
         assert!(!text.contains("Installing"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_check_records_the_time_and_names_the_result() {
+        let (up, available, error) = check_sentence("0.6.61", None, None);
+        assert_eq!(up, "Up to date (0.6.61)");
+        assert!(available.is_empty() && error.is_empty());
+        let (offer, available, error) = check_sentence("0.6.61", Some("9.9.9"), None);
+        assert_eq!(offer, "Update 9.9.9 available, Install");
+        assert_eq!(available, "9.9.9");
+        assert!(error.is_empty());
+        let (failed, _, error) = check_sentence("0.6.61", None, Some("fetching https://pjdesk.com/api/release: timed out"));
+        assert!(failed.contains("timed out"), "{failed}");
+        assert_eq!(failed, error);
+        let dir = std::env::temp_dir().join(format!("pjdesk-update-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        record(&dir, &offer, &available, "").unwrap();
+        let loaded = UpdateStatus::load(&dir);
+        assert!(loaded.last_check_at > 0);
+        assert_eq!(loaded.last_result, "Update 9.9.9 available, Install");
+        assert_eq!(loaded.available, "9.9.9");
+        let mut settings = Settings::default();
+        settings.jitter_secs = 1;
+        assert!(settings.interval_secs() >= 30 * 60);
+        assert!(settings.interval_secs() <= 60 * 60);
+        let mut primary = base();
+        primary.role_active = true;
+        let mut other = peer("cccc", "0.4.0", 3, primary.now - 30);
+        other.role = "active".into();
+        other.name = "old-server".into();
+        primary.peers.push(other);
+        assert_eq!(decide(&primary), Plan::Install, "a server that is not the standby does not hold the primary");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

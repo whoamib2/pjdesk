@@ -193,6 +193,8 @@ struct App {
     update_auto: bool,
     update_auto_dirty: bool,
     update_status: crate::self_update::UpdateStatus,
+    /// The sentence from the latest check, shown before the snapshot reloads.
+    update_feedback: String,
     cloud_email: String,
     cloud_token: String,
     cloud_api: String,
@@ -388,6 +390,7 @@ impl App {
             update_auto: false,
             update_auto_dirty: false,
             update_status: crate::self_update::UpdateStatus::default(),
+            update_feedback: String::new(),
             cloud_email: String::new(),
             cloud_token: String::new(),
             cloud_api: crate::cloud::default_api(),
@@ -676,18 +679,7 @@ impl App {
                     tracing::info!("Tray click: Check for updates. Showing the window.");
                     reveal_window(ctx, "Check for updates");
                     self.gate.engage();
-                    if self.via_service() {
-                        self.status = "Checking for updates…".into();
-                        self.spawn_cloud_job(|| {
-                            service_job(crate::control::Request { cmd: "check".into(), ..Default::default() })
-                        });
-                    } else {
-                        let dir = self.data_dir.clone();
-                        self.status = "Checking for updates…".into();
-                        std::thread::spawn(move || {
-                            let _ = crate::self_update::check_now(&dir);
-                        });
-                    }
+                    self.start_update_check();
                 }
                 crate::tray::Action::Promote => {
                     tracing::info!("Tray click: Make this the primary. Showing the window.");
@@ -953,6 +945,20 @@ enum SvcAction {
 }
 
 impl App {
+    fn start_update_check(&mut self) {
+        self.status = "Checking for updates…".into();
+        self.update_feedback = "Checking for updates…".into();
+        if self.control_ready || self.access != Access::Readable {
+            self.spawn_cloud_job(update_check_job);
+            return;
+        }
+        let dir = self.data_dir.clone();
+        self.spawn_cloud_job(move || match crate::self_update::check_now(&dir) {
+            Ok(msg) => Ok(JobDone::Message(msg)),
+            Err(err) => Err(err),
+        });
+    }
+
     fn updates_card(&mut self, ui: &mut egui::Ui) {
         if self.access != Access::Readable {
             self.updates_locked(ui);
@@ -1048,6 +1054,9 @@ impl App {
                 format!("Last check: {}", format_local(reported.last_check_at))
             };
             let result = if reported.last_result.is_empty() { "no result yet" } else { reported.last_result.as_str() };
+            if !self.update_feedback.is_empty() {
+                ui.label(RichText::new(&self.update_feedback).strong().size(14.0).color(p(ui).text));
+            }
             ui.label(RichText::new(format!("{checked} · {result}")).color(p(ui).muted).size(12.0));
             if !reported.available.is_empty() {
                 ui.label(format!("Available version: {}", reported.available));
@@ -1060,12 +1069,8 @@ impl App {
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Check for updates now").clicked() {
-                    let dir = self.data_dir.clone();
-                    self.status = "Checking for updates…".into();
-                    std::thread::spawn(move || {
-                        let _ = self_update::check_now(&dir);
-                    });
+                if ui.add_enabled(!self.cloud_job.is_some(), egui::Button::new("Check for updates now")).clicked() {
+                    self.start_update_check();
                 }
                 if !reported.available.is_empty()
                     && ui.add(egui::Button::new("Install this update").fill(p(ui).accent)).clicked()
@@ -1507,6 +1512,9 @@ impl App {
                 format!("Last check: {}", format_local(reported.last_check_at))
             };
             let result = if reported.last_result.is_empty() { "no result yet" } else { reported.last_result.as_str() };
+            if !self.update_feedback.is_empty() {
+                ui.label(RichText::new(&self.update_feedback).strong().size(14.0).color(p(ui).text));
+            }
             ui.label(RichText::new(format!("{checked} · {result}")).color(p(ui).muted).size(12.0));
             if !reported.available.is_empty() {
                 ui.label(format!("Available version: {}", reported.available));
@@ -1517,7 +1525,7 @@ impl App {
             if managed {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Check for updates now").clicked() {
+                    if ui.add_enabled(!self.cloud_job.is_some(), egui::Button::new("Check for updates now")).clicked() {
                         check_now = true;
                     }
                     if !reported.available.is_empty() && ui.button("Install this update").clicked() {
@@ -1549,8 +1557,7 @@ impl App {
             }
         });
         if check_now {
-            self.status = "Checking for updates…".into();
-            self.spawn_cloud_job(|| service_job(crate::control::Request { cmd: "check".into(), ..Default::default() }));
+            self.start_update_check();
         } else if install_now {
             self.status = "Installing the update…".into();
             self.spawn_cloud_job(|| {
@@ -2576,6 +2583,12 @@ impl App {
         self.cloud_job = None;
         match result {
             Ok(JobDone::Message(msg)) => {
+                if is_update_sentence(&msg) {
+                    self.update_feedback = msg.clone();
+                    if self.access == Access::Readable {
+                        self.update_status = crate::self_update::UpdateStatus::load(&self.data_dir);
+                    }
+                }
                 if let Some(email) = crate::control::email_from_sign_in_message(&msg) {
                     self.service_email = email;
                     self.service_session_known = true;
@@ -2606,6 +2619,12 @@ impl App {
                 self.status = "Choose which copy to keep.".into();
             }
             Err(e) => {
+                if self.status == "Checking for updates…" || self.status == "Installing the update…" || is_update_sentence(&e) {
+                    self.update_feedback = e.clone();
+                    if self.access == Access::Readable {
+                        self.update_status = crate::self_update::UpdateStatus::load(&self.data_dir);
+                    }
+                }
                 self.cloud_form.sign_error = e.clone();
                 self.status = e;
             }
@@ -4067,6 +4086,26 @@ fn sign_in_through_service(email: String, password: String) -> anyhow::Result<Jo
     };
     log_sign_in_outcome(&email, &outcome);
     outcome
+}
+
+fn is_update_sentence(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("Up to date (")
+        || text.starts_with("Update ")
+        || text.starts_with("Installing ")
+        || text.starts_with("The update check")
+}
+
+fn update_check_job() -> anyhow::Result<JobDone> {
+    match crate::control::call_for(
+        &crate::control::Request { cmd: "check".into(), ..Default::default() },
+        crate::control::CHECK_WAIT,
+    ) {
+        Some(response) if response.code == "timeout" => Err(anyhow::anyhow!("The update check timed out.")),
+        Some(response) if response.ok => Ok(JobDone::Message(response.message)),
+        Some(response) => Err(anyhow::anyhow!(response.message)),
+        None => Err(anyhow::anyhow!("The PJDesk service did not answer. The update check was not finished.")),
+    }
 }
 
 fn service_job(req: crate::control::Request) -> anyhow::Result<JobDone> {
