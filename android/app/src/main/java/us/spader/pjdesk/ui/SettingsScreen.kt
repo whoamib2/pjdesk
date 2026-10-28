@@ -61,6 +61,7 @@ fun SettingsScreen(
     onAllowComputer: (String) -> Unit = {},
     onForgetTrusted: (String, String) -> Unit = { _, _ -> },
     onShareLogs: () -> Unit = {},
+    onShareLastError: () -> Unit = {},
     onImportConfig: () -> Unit = {},
     onExportConfig: () -> Unit = {},
     importOffer: String? = null,
@@ -403,6 +404,7 @@ fun SettingsScreen(
                 color = pjMuted(),
             )
             TextButton(onClick = onShareLogs) { Text("Share logs") }
+            TextButton(onClick = onShareLastError) { Text("Share last error") }
         }
     }
 }

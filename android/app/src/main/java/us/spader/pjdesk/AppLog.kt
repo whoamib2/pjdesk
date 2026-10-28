@@ -13,6 +13,8 @@ import java.time.Instant
  */
 object AppLog {
     const val TAG = "PJDesk"
+    /** Stable logcat tag for the last Connect failure: `adb logcat -s PJDeskConnect`. */
+    const val CONNECT_TAG = "PJDeskConnect"
     private const val MAX_BYTES = 512 * 1024
     private lateinit var file: File
     private lateinit var signInFile: File
@@ -50,8 +52,34 @@ object AppLog {
         if (!::file.isInitialized) return
         val text = us.spader.pjdesk.core.redactConnectError(message).trim()
         if (text.isEmpty()) return
+        // ERROR priority, so a release build keeps it, under its own tag so it
+        // is easy to find among the main PJDesk lines.
+        Log.e(CONNECT_TAG, text)
         val dest = File(file.parentFile, "last-connect.txt")
         runCatching { dest.writeText("${Instant.now()} $text\n") }
+    }
+
+    /** The saved last Connect failure, already redacted, or empty. */
+    fun lastConnectError(): String {
+        if (!::file.isInitialized) return ""
+        val src = File(file.parentFile, "last-connect.txt")
+        if (!src.exists()) return ""
+        val text = runCatching { src.readText() }.getOrDefault("")
+        return us.spader.pjdesk.core.redactConnectError(text).trim()
+    }
+
+    /** Shares the last Connect failure as plain text. Nothing is sent without the person choosing an app. */
+    fun shareLastError(context: Context) {
+        val text = lastConnectError().ifEmpty { "No Connect error has been saved on this phone." }
+        val version = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }
+            .getOrNull()
+            .orEmpty()
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "PJDesk last connect error")
+            putExtra(Intent.EXTRA_TEXT, "PJDesk $version\n$text".trim())
+        }
+        context.startActivity(Intent.createChooser(send, "Share last error").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
     fun logFile(): File? = if (::file.isInitialized && file.exists()) file else null

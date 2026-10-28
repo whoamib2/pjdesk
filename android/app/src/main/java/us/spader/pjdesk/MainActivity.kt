@@ -2445,6 +2445,7 @@ class MainActivity : FragmentActivity() {
                                         trustedComputers = app.store.trustedComputers()
                                     },
                                     onShareLogs = { AppLog.share(this@MainActivity) },
+                                    onShareLastError = { AppLog.shareLastError(this@MainActivity) },
                                     onCheckUpdate = { engine.checkForUpdate() },
                                     signedIn = account.isNotEmpty() && !temporarySession,
                                     localPin = app.store.joinedWithoutPassword || visitWithoutPassword,
