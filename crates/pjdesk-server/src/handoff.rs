@@ -213,6 +213,9 @@ mod tests {
                 }
             }
         }
+        assert!(swap.contains("ping -n 61"), "a killed installer must still start the service");
+        assert!(swap.contains("PjEnsureRunning"), "a failed swap must retry starting the service");
+        assert!(swap.contains("failed:"), "a failed swap must record the error");
         assert!(swap.contains("taskkill"), "the swap never ends the running program");
         assert!(swap.contains("fc /b"), "the swap does not compare the installed file");
         assert!(swap.contains(">nul"), "fc output has to go to the NUL device");

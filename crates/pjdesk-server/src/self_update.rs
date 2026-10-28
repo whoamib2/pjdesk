@@ -562,22 +562,83 @@ pub fn install_if_planned(data_dir: &Path, manual: bool) -> Result<String> {
             tracing::info!("server update: installing {}", update.version);
             crate::cloud::announce_maintenance(data_dir);
             match pjdesk_proto::update::install_available(&update) {
-                Ok(()) => {
-                    let sentence = format!("Installing {}", update.version);
-                    record(data_dir, &sentence, &update.version, "")?;
-                    // The installer stops this process. If it fails to start,
-                    // we are still running and the service was not stopped.
-                    Ok(sentence)
-                }
+                Ok(code) => match recover_service_after_installer(code) {
+                    Ok(()) => {
+                        let sentence = format!("Installing {}", update.version);
+                        record(data_dir, &sentence, &update.version, "")?;
+                        Ok(sentence)
+                    }
+                    Err(reason) => {
+                        record(data_dir, &reason, &update.version, &reason)?;
+                        tracing::warn!("server update: {reason}");
+                        bail!("{reason}")
+                    }
+                },
                 Err(e) => {
+                    ensure_service_running();
                     let reason = format!("{e:#}");
                     record(data_dir, &reason, &update.version, &reason)?;
-                    tracing::warn!("server update: install failed, service left running: {e:#}");
+                    tracing::warn!("server update: install failed: {reason}");
                     Err(e)
                 }
             }
         }
     }
+}
+
+/// Starts PJDesk Server when an installer left it stopped.
+fn ensure_service_running() {
+    let (installed, running) = crate::service::status();
+    if installed && !running {
+        tracing::warn!("server update: the service is stopped after an update attempt; starting it");
+        if let Err(err) = crate::service::start() {
+            tracing::warn!("server update: could not start the service: {err:#}");
+        }
+    }
+}
+
+/// The installer has exited. A failure, a cancel, or an exit that did not
+/// replace the program starts the service again and returns that error.
+fn recover_service_after_installer(code: i32) -> Result<(), String> {
+    let text = std::fs::read_to_string(pjdesk_proto::update::last_result_path()).unwrap_or_default();
+    if let Some(err) = pjdesk_proto::update::install_result_error(&text) {
+        ensure_service_running();
+        return Err(err);
+    }
+    let replaced = pjdesk_proto::update::install_result_replaced(&text);
+    if let Err(message) = pjdesk_proto::update::installer_outcome(Some(code), replaced) {
+        ensure_service_running();
+        return Err(message);
+    }
+    ensure_service_running();
+    Ok(())
+}
+
+/// Reads the installer's result once, after a restart, and shows it in the window.
+pub fn note_installer_result(data_dir: &Path) {
+    let path = pjdesk_proto::update::last_result_path();
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let _ = std::fs::remove_file(&path);
+    let Some(err) = pjdesk_proto::update::install_result_error(&text) else { return };
+    tracing::warn!("server update: {err}");
+    if record(data_dir, &err, "", &err).is_err() {
+        tracing::warn!("server update: could not save the installer error");
+    }
+}
+
+/// The tray's backstop. An update attempt that left the service stopped is started again.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn restart_if_update_left_service_down() {
+    let Some(age) = pjdesk_proto::update::update_attempt_age() else { return };
+    let (installed, running) = crate::service::status();
+    if !pjdesk_proto::update::watchdog_should_start(age, running) {
+        return;
+    }
+    if !installed {
+        return;
+    }
+    tracing::warn!("server update: the service is still stopped {age}s after an update; starting it");
+    let _ = crate::service::start();
 }
 
 fn plan_for(data_dir: &Path, settings: &Settings, available: Option<String>, manual: bool) -> Plan {

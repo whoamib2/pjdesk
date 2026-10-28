@@ -96,6 +96,59 @@ FunctionEnd
 !insertmacro PjDeclare "" "inst_"
 !insertmacro PjDeclare "un." "uninst_"
 
+; If this installer is killed after the stop, start the service about 60 seconds later.
+Function PjArmWatchdog
+  Push "If this install stops after stopping $PjService, it will be started again in about 60 seconds."
+  Call PjInstallLog
+  nsExec::Exec 'cmd /d /c start "" /min cmd /d /c "ping -n 61 127.0.0.1 >nul & sc query $\"$PjService$\" | find /I RUNNING >nul || net start $\"$PjService$\""'
+FunctionEnd
+
+; net start, several times. A service that is still stopping fails the first try.
+Function PjEnsureRunning
+  Push $R0
+  Push $R1
+  StrCpy $R0 0
+pj_ensure_try:
+  nsExec::Exec 'cmd /d /c sc query "$PjService" | find /I "RUNNING" >nul'
+  Pop $R1
+  ${If} $R1 == 0
+    Goto pj_ensure_up
+  ${EndIf}
+  nsExec::Exec 'net start "$PjService"'
+  Sleep 1000
+  IntOp $R0 $R0 + 1
+  ${If} $R0 < 8
+    Goto pj_ensure_try
+  ${EndIf}
+  Push "$PjService did not start. See C:\ProgramData\PJDesk\updates\install.log"
+  Call PjInstallLog
+pj_ensure_up:
+  Pop $R1
+  Pop $R0
+FunctionEnd
+
+; One line, replaced each install. The service reads it after it starts.
+Function PjWriteResult
+  Exch $R9
+  Push $R8
+  Push $R7
+  ReadEnvStr $R8 ProgramData
+  ${If} $R8 == ""
+    StrCpy $R8 "C:\ProgramData"
+  ${EndIf}
+  CreateDirectory "$R8\PJDesk\updates"
+  ClearErrors
+  FileOpen $R7 "$R8\PJDesk\updates\last-result.txt" w
+  ${IfNot} ${Errors}
+    FileWrite $R7 "$R9$\r$\n"
+    FileClose $R7
+  ${EndIf}
+  ClearErrors
+  Pop $R7
+  Pop $R8
+  Pop $R9
+FunctionEnd
+
 ; The new ${IMAGE} is already at $PLUGINSDIR\${IMAGE}. SERVICE is the SCM name.
 !macro SwapLockedExe SERVICE IMAGE
   StrCpy $PjService "${SERVICE}"
@@ -116,6 +169,7 @@ FunctionEnd
     SetErrorLevel 1
     Abort "The installer is missing ${IMAGE}."
   ${EndIf}
+  Call PjArmWatchdog
   Call PjStopImage
   StrCpy $R0 0
   inst_pjswap_try:
@@ -161,6 +215,8 @@ FunctionEnd
     IfErrors 0 inst_pjswap_old_cleared
       System::Call 'kernel32::MoveFileEx(t "$INSTDIR\$PjImage.old", p 0, i 4)'
     inst_pjswap_old_cleared:
+    Push "ok ${VERSION}"
+    Call PjWriteResult
     Push "Replaced $PjImage. The installed file matches the installer. Starting $PjService."
     Call PjInstallLog
     ; End a process that still has the old file mapped, then start the new one.
@@ -171,6 +227,7 @@ FunctionEnd
       Call PjInstallLog
     ${EndIf}
     nsExec::Exec 'net start "$PjService"'
+    Call PjEnsureRunning
     ClearErrors
     Goto inst_pjswap_done
   inst_pjswap_fail:
@@ -179,13 +236,17 @@ FunctionEnd
         Rename "$INSTDIR\$PjImage.old" "$INSTDIR\$PjImage"
       ${EndIf}
     ${EndIf}
+    Push "failed: $PjService did not replace $PjImage. The previous program was started again."
+    Call PjWriteResult
     Push "$PjService did not replace $PjImage. Starting the previous program again."
     Call PjInstallLog
     nsExec::Exec 'net start "$PjService"'
+    Call PjEnsureRunning
     ${If} ${FileExists} "$INSTDIR\$PjImage"
       nsExec::ExecToLog '"$INSTDIR\$PjImage" update-handoff'
     ${EndIf}
     nsExec::Exec 'net start "$PjService"'
+    Call PjEnsureRunning
     SetErrorLevel 1
     Abort "$PjService did not replace $PjImage. The previous program was started again. See C:\ProgramData\PJDesk\updates\install.log"
   inst_pjswap_done:

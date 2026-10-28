@@ -79,8 +79,11 @@ Function .onInstFailed
     IfFileExists "$INSTDIR\${EXE}.old" 0 client_failed_start
       Rename "$INSTDIR\${EXE}.old" "$INSTDIR\${EXE}"
   client_failed_start:
+  StrCpy $PjService "${APPNAME}"
+  Call PjEnsureRunning
   nsExec::Exec '"$INSTDIR\${EXE}" update-handoff'
   nsExec::Exec 'net start ${APPNAME}'
+  Call PjEnsureRunning
 FunctionEnd
 
 !define ARP "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
