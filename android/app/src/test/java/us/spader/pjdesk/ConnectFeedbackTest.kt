@@ -14,6 +14,7 @@ import us.spader.pjdesk.core.shouldRetryNotOnline
 import us.spader.pjdesk.core.namedServerSignInFailure
 import us.spader.pjdesk.core.serverHasNoAccountCopy
 import us.spader.pjdesk.core.SignInTrace
+import us.spader.pjdesk.core.liveSignInServer
 import us.spader.pjdesk.core.signInLogLine
 import us.spader.pjdesk.core.signInPageError
 import us.spader.pjdesk.core.signInScreenPressed
@@ -150,6 +151,15 @@ class ConnectFeedbackTest {
             signInShownError("Could not reach the PJDesk server at 192.168.0.193:21200.", heartbeat = "192.168.0.193:21200"),
         )
         assertEquals("Could not reach the PJDesk server.", signInShownError("connection refused"))
+        assertEquals("192.168.0.193:21200", liveSignInServer("192.168.0.193:21200", true))
+        assertEquals("", liveSignInServer("204.248.122.44:21200", false))
+        assertEquals(
+            "The PJDesk server at 192.168.0.193:21200 is connected. The sign-in did not get an answer on that connection.",
+            signInShownError(
+                "Could not reach the PJDesk server.",
+                heartbeat = liveSignInServer("192.168.0.193:21200", true),
+            ),
+        )
         val trace = SignInTrace()
         val pressed = signInScreenPressed(trace, "192.168.0.193:21200", "sign-in")
         assertTrue(pressed.contains("step=screen"))

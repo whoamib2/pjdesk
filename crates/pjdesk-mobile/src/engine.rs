@@ -3,7 +3,7 @@
 //! Video bytes stay in Kotlin (MediaCodec). This task owns the sockets.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.58";
+pub const APP_VERSION: &str = "0.6.59";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -103,6 +103,10 @@ struct State {
     standby: Mutex<String>,
     /// This phone's public IP from pjdesk.com, used to decide the LAN path.
     my_public_ip: Mutex<String>,
+    /// IPv4 addresses the phone reported for the network it is on now.
+    phone_mine: Mutex<Vec<String>>,
+    /// Already left a public registration once to try the server's LAN address.
+    lan_shift: AtomicBool,
     /// Advertised addresses of both servers. Hostnames are dialed last.
     routes: Mutex<pjdesk_proto::routes::ServerRoutes>,
     fingerprint: Mutex<Option<String>>,
@@ -328,6 +332,8 @@ impl Engine {
             public_ip: Mutex::new(stored.public_ip),
             standby: Mutex::new(stored.standby),
             my_public_ip: Mutex::new(stored.my_public_ip),
+            phone_mine: Mutex::new(Vec::new()),
+            lan_shift: AtomicBool::new(false),
             routes: Mutex::new(routes),
             fingerprint: Mutex::new((!stored.fingerprint.is_empty()).then_some(stored.fingerprint)),
             otp: Mutex::new(generate_password()),
@@ -797,6 +803,17 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 }
             });
         }
+        "phoneMine" => {
+            if let Some(list) = cmd.get("mine").and_then(|v| v.as_array()) {
+                *state.phone_mine.lock().unwrap() = list
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+        }
         "setTrusted" => {
             *state.trusted_accounts.lock().unwrap() = trusted_list(cmd.get("accounts"));
             *state.trusted_computers.lock().unwrap() = trusted_list(cmd.get("computers"));
@@ -832,6 +849,15 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 }
                 if let Some(ip) = cmd.get("myPublicIp").and_then(|v| v.as_str()) {
                     *state.my_public_ip.lock().unwrap() = ip.trim().to_string();
+                }
+                if let Some(list) = cmd.get("mine").and_then(|v| v.as_array()) {
+                    *state.phone_mine.lock().unwrap() = list
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
                 }
                 let incoming = routes_from_command(&cmd);
                 let previous = state.routes.lock().unwrap().clone();
@@ -1303,6 +1329,18 @@ fn mouse_from(cmd: &Value) -> Option<InputEvent> {
     })
 }
 
+fn merged_mine(extra: &[String]) -> Vec<Ipv4Addr> {
+    let mut mine = pjdesk_proto::discover::private_ipv4s();
+    for raw in extra {
+        let Ok(ip) = raw.trim().parse::<Ipv4Addr>() else { continue };
+        if ip.is_loopback() || ip.is_unspecified() || mine.contains(&ip) {
+            continue;
+        }
+        mine.push(ip);
+    }
+    mine
+}
+
 fn split_lan(text: &str) -> Vec<String> {
     text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
 }
@@ -1347,7 +1385,8 @@ async fn open_ordered(state: &State, cb: &Arc<dyn Callbacks>, pinned: Option<pjd
     let routes = state.routes.lock().unwrap().clone();
     let saved = state.server.lock().unwrap().clone();
     let told = std::mem::take(&mut *state.move_primary.lock().unwrap());
-    let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
+    let extra = state.phone_mine.lock().unwrap().clone();
+    let mine = tokio::task::spawn_blocking(move || merged_mine(&extra)).await.unwrap_or_default();
     let targets = pjdesk_proto::routes::registration_targets(&told, &routes, &mine, &saved);
     if targets.is_empty() {
         bail!("This phone has no server address yet. Sign in again, or set the server in Settings.");
@@ -1554,6 +1593,35 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
     let mut signal = open_ordered(&state, &cb, pinned).await?;
     let server = signal.server_addr.to_string();
     log_line(&cb, format!("registration target (phone): {server}"));
+    let extra = state.phone_mine.lock().unwrap().clone();
+    let mine = tokio::task::spawn_blocking(move || merged_mine(&extra)).await.unwrap_or_default();
+    let routes = state.routes.lock().unwrap().clone();
+    if pjdesk_proto::routes::on_subnet(&server, &mine) {
+        state.lan_shift.store(false, Ordering::SeqCst);
+    } else if !state.lan_shift.load(Ordering::SeqCst) && pjdesk_proto::routes::lan_should_replace(&server, &routes, &mine) {
+        state.lan_shift.store(true, Ordering::SeqCst);
+        let next = routes.primary_lan.iter().chain(routes.standby_lan.iter()).find(|addr| pjdesk_proto::routes::on_subnet(addr, &mine));
+        log_line(
+            &cb,
+            format!(
+                "This phone is on the server's LAN. Reconnecting to {} instead of {server}.",
+                next.map(|addr| addr.as_str()).unwrap_or("the LAN address")
+            ),
+        );
+        return Ok(PhoneHost::Again);
+    }
+    let configured = state.server.lock().unwrap().clone();
+    emit(
+        &cb,
+        &json!({
+            "event": "signal",
+            "via": signal.via,
+            "reached": server,
+            "error": "",
+            "lan": state.lan.lock().unwrap().join(", "),
+            "public": configured,
+        }),
+    );
     let mut redirected = false;
     if let Some(fp) = signal.observed {
         let text = pjdesk_proto::tls::format_fingerprint(&fp);
@@ -3461,7 +3529,8 @@ async fn controller_session(
     };
     drop(signal);
     let endpoint = p2p::controller_endpoint(binding.socket, fingerprint)?;
-    let mine = tokio::task::spawn_blocking(pjdesk_proto::discover::private_ipv4s).await.unwrap_or_default();
+    let extra = state.phone_mine.lock().unwrap().clone();
+    let mine = tokio::task::spawn_blocking(move || merged_mine(&extra)).await.unwrap_or_default();
     let direct = p2p::candidates(peer_public, &peer_local);
     let candidates = p2p::candidates_from(peer_public, &peer_local, &mine);
     if candidates.len() != direct.len() {
@@ -4176,6 +4245,8 @@ mod tests {
             public_ip: Mutex::new(String::new()),
             standby: Mutex::new(String::new()),
             my_public_ip: Mutex::new(String::new()),
+            phone_mine: Mutex::new(Vec::new()),
+            lan_shift: AtomicBool::new(false),
             routes: Mutex::new(pjdesk_proto::routes::ServerRoutes::default()),
             fingerprint: Mutex::new(None),
             otp: Mutex::new(generate_password()),
