@@ -1451,8 +1451,13 @@ fn pin_marks(ui: &mut egui::Ui, count: usize, shake: f32) {
 /// Keyboard entry for the PIN. The field itself draws no bullets and no hint,
 /// so it does not show how long the PIN is.
 fn pin_key_field(ui: &mut egui::Ui, pin: &mut String) -> egui::Response {
-    let mut layouter = |ui: &egui::Ui, _: &dyn egui::TextBuffer, wrap: f32| {
-        ui.fonts_mut(|fonts| fonts.layout(String::new(), egui::FontId::proportional(14.0), egui::Color32::TRANSPARENT, wrap))
+    // Lay out the real (masked) text, only invisible. An empty layout pins the
+    // cursor at 0, so every digit went in front of the last one and "1234"
+    // was checked as "4321" (0.6.50 to 0.6.65).
+    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap: f32| {
+        ui.fonts_mut(|fonts| {
+            fonts.layout(text.as_str().to_owned(), egui::FontId::proportional(14.0), egui::Color32::TRANSPARENT, wrap)
+        })
     };
     ui.add(
         egui::TextEdit::singleline(pin)
@@ -1582,5 +1587,52 @@ mod tests {
         assert!((five[0] + five[4]).abs() < 0.01, "dots stay centered as they are added");
         assert_eq!(pin_shake_offset(None), 0.0);
         assert_eq!(pin_shake_offset(Some(Instant::now() - Duration::from_secs(2))), 0.0);
+    }
+
+    /// Type into a field the way egui delivers keys: one Text event a frame.
+    fn type_into(field: fn(&mut eframe::egui::Ui, &mut String) -> eframe::egui::Response, digits: &str) -> String {
+        use eframe::egui;
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        let mut step = |event: Option<egui::Event>, text: &mut String| {
+            let mut input = egui::RawInput::default();
+            input.events.extend(event);
+            let mut out = ctx.run_ui(input, |ui| field(ui, text).request_focus());
+            out.textures_delta.clear();
+        };
+        step(None, &mut text);
+        step(None, &mut text);
+        for c in digits.chars() {
+            step(Some(egui::Event::Text(c.to_string())), &mut text);
+        }
+        text
+    }
+
+    fn setup_field(ui: &mut eframe::egui::Ui, text: &mut String) -> eframe::egui::Response {
+        let mut shown = false;
+        crate::gui::widgets::password_field(ui, text, "4 to 8 digits", &mut shown)
+    }
+
+    #[test]
+    fn the_lock_field_keeps_digits_in_the_order_they_were_typed() {
+        assert_eq!(type_into(super::pin_key_field, "1234"), "1234");
+        assert_eq!(type_into(super::pin_key_field, "90817265"), "90817265");
+        assert_eq!(type_into(super::pin_key_field, "123456789"), "12345678", "eight digits at most");
+    }
+
+    #[test]
+    fn a_pin_set_on_the_setup_screen_unlocks_on_the_lock_screen() {
+        use pjdesk_proto::applock::{create, matches};
+        // Set, then verify.
+        let set = super::digits_only(&type_into(setup_field, "2580"));
+        let first = create(&set, 300, 1).unwrap();
+        let typed = super::digits_only(&type_into(super::pin_key_field, "2580"));
+        assert!(matches(&first, &typed), "the same PIN typed on the lock screen unlocks");
+        assert!(!matches(&first, "0852"));
+        // Reset (Forgot PIN, then a new PIN), then verify.
+        let reset = super::digits_only(&type_into(setup_field, "731946"));
+        let second = create(&reset, 300, 2).unwrap();
+        assert!(matches(&second, &super::digits_only(&type_into(super::pin_key_field, "731946"))));
+        assert!(!matches(&second, &typed), "the old PIN no longer unlocks after a reset");
     }
 }
