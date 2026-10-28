@@ -17,6 +17,7 @@ import us.spader.pjdesk.core.SignInTrace
 import us.spader.pjdesk.core.liveSignInServer
 import us.spader.pjdesk.core.redactDiagnostics
 import us.spader.pjdesk.core.signInLinesFromLog
+import us.spader.pjdesk.core.signInRequestAddresses
 import us.spader.pjdesk.core.signInLogLine
 import us.spader.pjdesk.core.signInPageError
 import us.spader.pjdesk.core.signInScreenPressed
@@ -167,6 +168,8 @@ class ConnectFeedbackTest {
         assertFalse(kept.contains("00112233445566778899"))
         assertFalse(kept.contains("temp-pass"))
         assertTrue(redactDiagnostics("Wrong email or password.").contains("password"))
+        val plan = signInRequestAddresses(listOf("204.248.122.44:21200", "192.168.0.169:21200"))
+        assertTrue(plan.isEmpty())
         assertEquals(
             "The PJDesk server at 192.168.0.193:21200 is connected. The sign-in did not get an answer on that connection.",
             signInShownError(

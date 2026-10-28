@@ -2881,49 +2881,45 @@ class MainActivity : FragmentActivity() {
         if (known.isNotBlank() && app.engine.state.value.server.isBlank()) {
             app.engine.applyAccountServer(known, app.store.accountFingerprint, quiet = true)
         }
-        val targets = LinkedHashSet<String>()
-        targets.add("")
-        listOf(app.engine.state.value.server, app.store.accountServer, app.store.accountStandby)
-            .filter { it.isNotBlank() }
-            .forEach { targets.add(it) }
+        // One engine attempt. Stored public and standby addresses are not dialed
+        // raw; the engine resolves LAN addresses on this phone's subnet first.
         val auth = CloudAuth.authKeyHex(email, password)
-        val tried = ArrayList<String>()
-        for (target in targets) {
-            if (target.isNotBlank() && tried.any { sameServer(it, target) }) continue
-            signInNote(target, "request", "op=sign-in")
-            val body = JSONObject()
-                .put("op", "sign-in")
-                .put("email", email.trim().lowercase())
-                .put("auth_key", auth)
-                .put("device_id", device)
-                .put("device_name", "Android")
-            if (target.isNotBlank()) body.put("address", target)
-            val reply = CloudGate.request(body)
-            val server = reply?.optString("server").orEmpty().ifBlank { target.ifBlank { known } }
-            val message = reply?.optString("message").orEmpty()
-            val ok = reply?.optBoolean("ok") == true
-            val replyDetail = if (reply == null) "ok=false message=timeout" else "ok=$ok message=$message"
-            signInNote(server, "reply", replyDetail)
-            if (reply == null) continue
-            if (ok) return CloudAuth.sessionFromServer(email, device, reply)
-            if (server.isNotBlank()) tried.add(server)
-            if (!us.spader.pjdesk.core.serverHasNoAccountCopy(message)) {
-                val pause = reply.optLong("pause")
-                val shown = showSignInError(message, pause)
-                val mapped = if (shown.contains("is connected") || shown.contains(" answered")) {
-                    shown
-                } else {
-                    us.spader.pjdesk.core.namedServerSignInFailure(server, shown)
-                }
-                val secs = us.spader.pjdesk.core.signInPauseSeconds(
-                    if (pause > 0L) 429 else 0,
-                    message.ifBlank { mapped },
-                    pause.takeIf { it > 0L },
-                )
-                throw CloudAuthException(mapped, status = if (secs != null) 429 else 401, retryAfter = secs)
+        signInNote("", "request", "op=sign-in")
+        val body = JSONObject()
+            .put("op", "sign-in")
+            .put("email", email.trim().lowercase())
+            .put("auth_key", auth)
+            .put("device_id", device)
+            .put("device_name", "Android")
+        val reply = CloudGate.request(body)
+        val server = reply?.optString("server").orEmpty().ifBlank { known }
+        val message = reply?.optString("message").orEmpty()
+        val ok = reply?.optBoolean("ok") == true
+        val replyDetail = if (reply == null) "ok=false message=timeout" else "ok=$ok message=$message"
+        signInNote(server, "reply", replyDetail)
+        val signed = reply?.takeIf { it.optBoolean("ok") }
+        if (signed != null) return CloudAuth.sessionFromServer(email, device, signed)
+        if (reply != null && !us.spader.pjdesk.core.serverHasNoAccountCopy(message)) {
+            val pause = reply.optLong("pause")
+            val shown = showSignInError(message, pause)
+            val mapped = if (
+                shown.contains("is connected") ||
+                shown.contains(" answered") ||
+                shown.contains("Could not connect") ||
+                shown.contains("step=")
+            ) {
+                shown
+            } else {
+                us.spader.pjdesk.core.namedServerSignInFailure(server, shown)
             }
+            val secs = us.spader.pjdesk.core.signInPauseSeconds(
+                if (pause > 0L) 429 else 0,
+                message.ifBlank { mapped },
+                pause.takeIf { it > 0L },
+            )
+            throw CloudAuthException(mapped, status = if (secs != null) 429 else 401, retryAfter = secs)
         }
-        val who = tried.joinToString(", ").ifBlank { known.ifBlank { "the PJDesk server" } }
+        val who = server.ifBlank { known.ifBlank { "the PJDesk server" } }
         signInNote("pjdesk.com", "cloud", "after=$who")
         return try {
             CloudAuth.signIn(email, password, device, "Android", forceCloud = true)
@@ -2932,13 +2928,6 @@ class MainActivity : FragmentActivity() {
                 "The server at $who answered and does not have the account yet. ${err.message ?: "pjdesk.com did not answer."}",
             )
         }
-    }
-
-    private fun sameServer(left: String, right: String): Boolean {
-        fun host(text: String) = text.trim().substringBefore(':').lowercase()
-        val a = host(left)
-        val b = host(right)
-        return a.isNotEmpty() && a == b
     }
 
     private fun refreshAccount(
