@@ -108,10 +108,10 @@ Section "PJDesk Server (required)" SecCore
   ; every newer release on its own. The data folder under ProgramData is not
   ; touched: the key, accounts, cloud settings and the update preference stay.
   nsExec::Exec 'schtasks /Delete /TN "PJDesk Server Update" /F'
-  nsExec::Exec 'netsh advfirewall firewall delete rule name="PJDesk Server TCP"'
-  nsExec::Exec 'netsh advfirewall firewall add rule name="PJDesk Server TCP" dir=in action=allow protocol=TCP localport=21200 profile=any'
-  nsExec::Exec 'netsh advfirewall firewall delete rule name="PJDesk Server UDP"'
-  nsExec::Exec 'netsh advfirewall firewall add rule name="PJDesk Server UDP" dir=in action=allow protocol=UDP localport=21200 profile=any'
+  ; Inbound TCP and UDP 21200 (all profiles): program rules plus port rules.
+  ; Checked on every install and upgrade; the service checks again at start.
+  DetailPrint "Checking Windows Firewall rules for TCP and UDP 21200..."
+  nsExec::ExecToLog '"$INSTDIR\${EXE}" firewall'
   ; Tray icon for the user who installed, started at every sign-in.
   ; The service itself cannot show a tray (it runs in session 0).
   WriteRegDWORD HKCU "Software\PJDeskServer" "TrayAtLogin" 1
@@ -154,6 +154,7 @@ Section "Uninstall"
   Call un.PjStopImage
   nsExec::Exec 'schtasks /Delete /TN "PJDesk Server Update" /F'
   ExecWait '"$INSTDIR\${EXE}" service uninstall'
+  nsExec::Exec '"$INSTDIR\${EXE}" firewall --remove'
 
   Delete "$INSTDIR\${EXE}"
   Delete "$INSTDIR\${EXE}.old"

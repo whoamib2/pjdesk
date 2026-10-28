@@ -3056,6 +3056,11 @@ impl App {
                             .size(13.0),
                     );
                 }
+                if !live.firewall_line.is_empty() {
+                    let warn = live.firewall_line.contains("could not");
+                    let color = if warn { egui::Color32::from_rgb(0xd9, 0x8a, 0x2b) } else { p(ui).muted };
+                    ui.label(RichText::new(&live.firewall_line).color(color).size(12.0));
+                }
                 if !live.routes_line.is_empty() {
                     ui.label(RichText::new(&live.routes_line).color(p(ui).muted).size(12.0));
                 }

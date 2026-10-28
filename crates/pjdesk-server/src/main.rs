@@ -25,6 +25,7 @@ mod handoff;
 mod password_policy;
 mod public_addr;
 mod registry;
+mod firewall;
 mod relay;
 mod requests;
 mod role_handoff;
@@ -138,6 +139,13 @@ enum Command {
     /// Install, remove, start or stop the Windows service.
     #[command(subcommand)]
     Service(ServiceCommand),
+    /// Check the inbound TCP and UDP rules and fix any that is missing or
+    /// disabled (run elevated; the installer does this). `--remove` deletes them.
+    #[command(hide = true)]
+    Firewall {
+        #[arg(long)]
+        remove: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -383,6 +391,7 @@ fn main() -> Result<()> {
         Some(Command::Account(cmd)) => account_command(cmd, &data_dir),
         Some(Command::Cloud(cmd)) => cloud_command(cmd, &data_dir),
         Some(Command::Service(cmd)) => service_command(cmd, cli.opts, data_dir),
+        Some(Command::Firewall { remove }) => firewall_command(remove, cli.opts.port, &data_dir),
     }
 }
 
@@ -635,6 +644,29 @@ fn service_command(cmd: ServiceCommand, opts: ServerOpts, data_dir: PathBuf) -> 
         ServiceCommand::Restart => service::restart(),
         ServiceCommand::Run => service::run_dispatcher(opts, data_dir),
     }
+}
+
+#[cfg(windows)]
+fn firewall_command(remove: bool, port: u16, data_dir: &std::path::Path) -> Result<()> {
+    if remove {
+        firewall::remove();
+        println!("Removed the PJDesk Server firewall rules.");
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    let _ = std::fs::create_dir_all(data_dir);
+    let report = firewall::ensure(&exe, port, Some(data_dir));
+    println!("{}", report.summary(port));
+    if report.failed.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", report.summary(port))
+    }
+}
+
+#[cfg(not(windows))]
+fn firewall_command(_remove: bool, _port: u16, _data_dir: &std::path::Path) -> Result<()> {
+    anyhow::bail!("firewall rules are only managed on Windows")
 }
 
 #[cfg(not(windows))]

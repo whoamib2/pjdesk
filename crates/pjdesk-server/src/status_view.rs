@@ -114,6 +114,9 @@ pub struct Snapshot {
     /// Public and LAN addresses of both servers.
     #[serde(default)]
     pub routes_line: String,
+    /// The last firewall check by the service or installer.
+    #[serde(default)]
+    pub firewall_line: String,
     /// Server access keys, without the secret or its hash.
     #[serde(default)]
     pub access_keys: Vec<pjdesk_proto::signal::AccessKeyBrief>,
@@ -249,6 +252,7 @@ impl Snapshot {
         snap.public_ip_line = watch.line();
         snap.address_warn = crate::public_addr::stored_address_warning(dir);
         snap.routes_line = crate::cloud::routes_line(dir);
+        snap.firewall_line = crate::firewall::last_status(dir).unwrap_or_default();
         snap.log_tail = redacted_log_tail(&dir.join("server.log"));
         snap.access_keys = crate::access_keys::Store::public_list(dir);
         snap

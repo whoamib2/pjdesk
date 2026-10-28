@@ -19,7 +19,6 @@ use crate::ServerOpts;
 pub const SERVICE_NAME: &str = "PJDeskServer";
 const DISPLAY_NAME: &str = "PJDesk Server";
 const DESCRIPTION: &str = "PJDesk remote desktop signaling, rendezvous and relay server.";
-const FIREWALL_RULE: &str = "PJDesk Server";
 
 /// The SCM calls `service_main` on its own thread; options are passed here.
 static SERVICE_ARGS: OnceLock<(ServerOpts, PathBuf)> = OnceLock::new();
@@ -74,6 +73,11 @@ fn run_service(opts: ServerOpts, data_dir: PathBuf) -> Result<()> {
     )?;
     // server::run protects the data folder itself, just before it reads the
     // identity (see crate::server::run).
+    // Every start, including the restart after an auto-update, checks the rules.
+    if let Ok(exe) = std::env::current_exe() {
+        let (port, dir) = (opts.port, data_dir.clone());
+        std::thread::spawn(move || crate::firewall::ensure(&exe, port, Some(&dir)));
+    }
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(crate::server::run(opts, data_dir, async move {
         let _ = stop_rx.wait_for(|stopped| *stopped).await;
@@ -198,9 +202,10 @@ pub fn install(opts: &ServerOpts, data_dir: &Path, firewall: bool) -> Result<()>
     let (service, created) = open_or_create(&manager, &info)?;
     let _ = service.set_description(DESCRIPTION);
 
-    if firewall {
-        add_firewall_rule(&exe)?;
-    }
+    // Always: every install and upgrade checks the TCP and UDP rules.
+    let _ = firewall;
+    let report = crate::firewall::ensure(&exe, opts.port, Some(data_dir));
+    println!("{}", report.summary(opts.port));
     repair_data_dir(data_dir);
 
     start_if_needed(&service)?;
@@ -210,9 +215,6 @@ pub fn install(opts: &ServerOpts, data_dir: &Path, firewall: bool) -> Result<()>
         println!("The \"{DISPLAY_NAME}\" service is already installed. It is updated and running.");
     }
     println!("It starts automatically with Windows and logs to server.log in its data folder.");
-    if !firewall {
-        println!("Tip: re-install with --firewall, or allow TCP+UDP port {} in Windows Firewall.", opts.port);
-    }
     Ok(())
 }
 
@@ -232,7 +234,7 @@ pub fn uninstall() -> Result<()> {
         }
     }
     service.delete()?;
-    remove_firewall_rule();
+    crate::firewall::remove();
     println!("Removed the \"{DISPLAY_NAME}\" service.");
     Ok(())
 }
@@ -279,43 +281,6 @@ pub fn restart() -> Result<()> {
     crate::cloud::announce_maintenance(&dir);
     let _ = stop();
     start()
-}
-
-/// One program-based inbound rule, plus explicit TCP and UDP 21200 rules.
-/// The program path is quoted the way netsh parses it, so a path with spaces applies.
-fn add_firewall_rule(exe: &Path) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-    remove_firewall_rule();
-    let program = format!("program=\"{}\"", exe.display());
-    let status = std::process::Command::new("netsh")
-        .raw_arg(format!(
-            "advfirewall firewall add rule name=\"{FIREWALL_RULE}\" dir=in action=allow {program} enable=yes profile=any"
-        ))
-        .status()
-        .context("running netsh")?;
-    if !status.success() {
-        anyhow::bail!("netsh could not add the firewall rule");
-    }
-    for (name, proto) in [("PJDesk Server TCP", "TCP"), ("PJDesk Server UDP", "UDP")] {
-        let _ = std::process::Command::new("netsh")
-            .raw_arg(format!(
-                "advfirewall firewall add rule name=\"{name}\" dir=in action=allow protocol={proto} localport=21200 profile=any"
-            ))
-            .status();
-    }
-    println!("Added Windows Firewall rule \"{FIREWALL_RULE}\".");
-    Ok(())
-}
-
-fn remove_firewall_rule() {
-    use std::os::windows::process::CommandExt;
-    for name in [FIREWALL_RULE, "PJDesk Server TCP", "PJDesk Server UDP"] {
-        let _ = std::process::Command::new("netsh")
-            .raw_arg(format!("advfirewall firewall delete rule name=\"{name}\""))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
 }
 
 fn open_or_create(
