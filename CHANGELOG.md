@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.56
+
+Windows is 0.6.56. Android is 0.6.56 (versionCode 63125). The installer reads that version from Cargo.toml, so the files are PJDesk-Client-Setup-0.6.56.exe and PJDesk-Server-Setup-0.6.56.exe. This build does not redeploy the worker and does not run `cloud\deploy.cmd`. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off until the computers you want to keep have signed in. Do not delete cloud-sync.json, cloud-state.json, or account-mirror.json. The phone needs 63125. The PJDesk client and PJDesk Server both need this build. A computer already on 0.6.55 will take this build from auto-update once v0.6.56 is the latest release. This machine has no Windows PC and no wine, so the windows were not clicked through here. The phone was not clicked through here.
+
+* Sign-in uses the connection that is already heartbeating. A 0.6.52 server can leave an account message sent before Register unanswered. When that happens the phone registers, then sends the account message. Could not reach the PJDesk server is only for a dial that no address accepted. Each sign-in step is written to the PJDesk log: the address, the step, and the reply or the timeout. The password, the refresh token, and the access token are not written.
+
 ## 0.6.55
 
 Windows is 0.6.55. Android is 0.6.55 (versionCode 63124). The installer reads that version from Cargo.toml, so the files are PJDesk-Client-Setup-0.6.55.exe and PJDesk-Server-Setup-0.6.55.exe. This build does not redeploy the worker and does not run `cloud\deploy.cmd`. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off until the computers you want to keep have signed in. Do not delete cloud-sync.json, cloud-state.json, or account-mirror.json. The phone needs 63124. The PJDesk client and PJDesk Server both need this build. A computer already on 0.6.54 will take this build from auto-update once v0.6.55 is the latest release. This machine has no Windows PC and no wine, so the windows were not clicked through here. The phone was not clicked through here.

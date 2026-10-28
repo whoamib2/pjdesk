@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.55";
+pub const APP_VERSION: &str = "0.6.56";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -195,6 +195,14 @@ struct State {
     incoming_told: AtomicBool,
     /// `(on, password)` waiting for the server. The password is not logged.
     incoming_ask: Mutex<Option<(bool, String)>>,
+    /// The heartbeating registration connection, once the server has registered this phone.
+    host_tx: Mutex<Option<mpsc::UnboundedSender<ClientMsg>>>,
+    /// `address:port` of [`State::host_tx`]. Empty when that connection is down.
+    host_at: Mutex<String>,
+    /// Sign-in waiting for an AccountResult on [`State::host_tx`].
+    pending_account: Mutex<Option<(String, oneshot::Sender<ServerMsg>)>>,
+    /// A sign-in connection registered this phone. The heartbeat connection should dial again.
+    sign_in_reregister: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -375,6 +383,10 @@ impl Engine {
             incoming_ready: AtomicBool::new(false),
             incoming_told: AtomicBool::new(false),
             incoming_ask: Mutex::new(None),
+            host_tx: Mutex::new(None),
+            host_at: Mutex::new(String::new()),
+            pending_account: Mutex::new(None),
+            sign_in_reregister: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let engine = Self { state: state.clone(), cmds: tx };
@@ -752,9 +764,6 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             let cb = cb.clone();
             tokio::spawn(async move {
                 let asked = op.clone();
-                if account_op_first(&asked) {
-                    log_line(&cb, format!("account {asked} on this connection before registration"));
-                }
                 let msg = ClientMsg::Account {
                     op,
                     email,
@@ -767,35 +776,15 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                     computers,
                     proof: String::new(),
                 };
-                let outcome = async {
-                    // Account is the first message. A 0.6.52 server answers it
-                    // before Register, and does not require a token to do so.
-                    let mut signal = open_ordered(&state, &cb, None).await?;
-                    signal.send(msg)?;
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-                    loop {
-                        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if left.is_zero() {
-                            bail!("the server did not answer");
-                        }
-                        match tokio::time::timeout(left, signal.recv()).await {
-                            Ok(Some(ServerMsg::ServerVersion { version })) => {
-                                pjdesk_proto::routes::note_server_version(&mut state.routes.lock().unwrap(), &version);
-                            }
-                            Ok(Some(ServerMsg::Routes(_))) => {}
-                            Ok(Some(reply)) => return Ok(reply),
-                            Ok(None) => bail!("the server closed the connection"),
-                            Err(_) => bail!("the server did not answer"),
-                        }
-                    }
-                }
-                .await;
+                let outcome = exchange_account(&state, &cb, &asked, msg).await;
                 match outcome {
                     Ok(reply) => emit(&cb, &account_event(&asked, &reply)),
-                    Err(err) => emit(
-                        &cb,
-                        &json!({"event":"account","ok": false, "op": asked, "message": err.to_string()}),
-                    ),
+                    Err(err) => {
+                        let message = err.to_string();
+                        let message = message.lines().next().unwrap_or(&message).trim();
+                        sign_in_log(&cb, "", "failed", message);
+                        emit(&cb, &json!({"event":"account","ok": false, "op": asked, "message": message}));
+                    }
                 }
             });
         }
@@ -1566,22 +1555,10 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
     let epoch = state.access_epoch.load(Ordering::SeqCst);
     let key = state.access_key.lock().unwrap().trim().to_string();
     let keyed = !key.is_empty();
-    if !keyed {
-        // Same connection, account message first, then registration. A 0.6.52
-        // server accepts the refresh before it will Register.
-        match refresh_phone_access(&mut signal, &state).await {
-            PhoneRefresh::Token(access) => {
-                *state.access_token.lock().unwrap() = access;
-                persist(&state);
-                emit(&cb, &json!({"event":"accountSession","state":"valid"}));
-            }
-            PhoneRefresh::Refused => {}
-            PhoneRefresh::Closed => {
-                log_line(&cb, "account refresh closed the connection; opening it again to register");
-                signal = open_ordered(&state, &cb, pinned).await?;
-            }
-        }
-    }
+    // Register first. A 0.6.52 server heartbeats on that connection and does not
+    // answer an account message sent before Register. Sign-in uses this connection
+    // after the server has registered the phone.
+    let _host_publish = HostPublish { state: state.clone() };
     let token = if keyed {
         key
     } else if state.suppress_token.swap(false, Ordering::SeqCst) {
@@ -1616,10 +1593,19 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
             emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
             return Ok(PhoneHost::Lost);
         }
+        if state.sign_in_reregister.swap(false, Ordering::SeqCst) {
+            log_line(&cb, "sign-in address={server} step=reregister reply=the sign-in connection registered this phone");
+            emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
+            return Ok(PhoneHost::Lost);
+        }
         tokio::select! {
             _ = state.moved.notified() => {
                 state.leave_primary.store(false, Ordering::SeqCst);
-                log_line(&cb, "failover: registering with the new primary");
+                if state.sign_in_reregister.swap(false, Ordering::SeqCst) {
+                    log_line(&cb, "sign-in address={server} step=reregister reply=the sign-in connection registered this phone");
+                } else {
+                    log_line(&cb, "failover: registering with the new primary");
+                }
                 emit(&cb, &json!({"event":"status","text":"Reconnecting"}));
                 return Ok(PhoneHost::Lost);
             }
@@ -1702,6 +1688,8 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                     ServerMsg::Registered { device_id } => {
                         emit(&cb, &json!({"event":"serverLink","up": true}));
                         saw_registered = true;
+                        *state.host_tx.lock().unwrap() = Some(signal.sender());
+                        *state.host_at.lock().unwrap() = signal.server_addr.to_string();
                         *state.device_id.lock().unwrap() = Some(device_id.clone());
                         persist(&state);
                         publish(&state, &cb);
@@ -1874,7 +1862,11 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                     ServerMsg::Release { version, client_url, .. } => {
                         emit(&cb, &json!({"event":"release","version": version, "url": client_url}));
                     }
-                    reply @ ServerMsg::AccountResult { .. } => emit(&cb, &account_event("", &reply)),
+                    reply @ ServerMsg::AccountResult { .. } => {
+                        if !deliver_pending_account(&state, &reply) {
+                            emit(&cb, &account_event("", &reply));
+                        }
+                    }
                     ServerMsg::IncomingOnly { on } => {
                         incoming_ready = true;
                         state.incoming_ready.store(true, Ordering::SeqCst);
@@ -2008,8 +2000,254 @@ fn fleet_from_command(value: Option<&Value>) -> Vec<pjdesk_proto::signal::FleetC
         .collect()
 }
 
-fn account_op_first(op: &str) -> bool {
-    matches!(op, "sign-in" | "verify" | "refresh" | "join" | "enroll")
+/// Drops the heartbeating connection's sender when registration ends.
+struct HostPublish {
+    state: Arc<State>,
+}
+
+impl Drop for HostPublish {
+    fn drop(&mut self) {
+        *self.state.host_tx.lock().unwrap() = None;
+        *self.state.host_at.lock().unwrap() = String::new();
+        self.state.pending_account.lock().unwrap().take();
+    }
+}
+
+/// Where a sign-in is tried. A 0.6.52 server answers on the connection that
+/// already registered (the heartbeat). An account message before Register
+/// on a new connection can sit unanswered. Register, then the account message,
+/// is the fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignInAttempt {
+    Heartbeat,
+    AccountFirst,
+    RegisterThenAccount,
+}
+
+fn sign_in_attempts(heartbeat_up: bool) -> &'static [SignInAttempt] {
+    if heartbeat_up {
+        &[SignInAttempt::Heartbeat, SignInAttempt::AccountFirst, SignInAttempt::RegisterThenAccount]
+    } else {
+        &[SignInAttempt::AccountFirst, SignInAttempt::RegisterThenAccount]
+    }
+}
+
+fn sign_in_log(cb: &Arc<dyn Callbacks>, address: &str, step: &str, detail: &str) {
+    let address = if address.trim().is_empty() { "none" } else { address.trim() };
+    let detail = detail.replace(['\n', '\r'], " ");
+    log_line(cb, format!("sign-in address={address} step={step} {detail}"));
+}
+
+fn reply_note(msg: &ServerMsg) -> String {
+    match msg {
+        ServerMsg::AccountResult { ok, op, message, .. } => {
+            let message: String = message.chars().take(160).collect();
+            format!("reply=AccountResult op={op} ok={ok} message={message}")
+        }
+        ServerMsg::Error { message, .. } => {
+            let message: String = message.chars().take(160).collect();
+            format!("reply=Error message={message}")
+        }
+        ServerMsg::Registered { .. } => "reply=Registered".into(),
+        ServerMsg::ServerVersion { version } => format!("reply=ServerVersion version={version}"),
+        ServerMsg::Routes(_) => "reply=Routes".into(),
+        _ => "reply=other".into(),
+    }
+}
+
+fn deliver_pending_account(state: &State, msg: &ServerMsg) -> bool {
+    let op = match msg {
+        ServerMsg::AccountResult { op, .. } => op.as_str(),
+        _ => return false,
+    };
+    let mut slot = state.pending_account.lock().unwrap();
+    let matches = slot.as_ref().is_some_and(|(want, _)| want == op || op.is_empty() || want.is_empty());
+    if !matches {
+        return false;
+    }
+    if let Some((_, tx)) = slot.take() {
+        let _ = tx.send(msg.clone());
+        true
+    } else {
+        false
+    }
+}
+
+enum AccountRead {
+    Reply(ServerMsg),
+    Timeout,
+    Closed,
+}
+
+async fn await_account(signal: &mut SignalClient, state: &State, cb: &Arc<dyn Callbacks>, address: &str, step: &str, wait: Duration) -> AccountRead {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            sign_in_log(cb, address, step, "reply=timeout");
+            return AccountRead::Timeout;
+        }
+        match tokio::time::timeout(left, signal.recv()).await {
+            Ok(Some(ServerMsg::ServerVersion { version })) => {
+                pjdesk_proto::routes::note_server_version(&mut state.routes.lock().unwrap(), &version);
+                sign_in_log(cb, address, step, &format!("reply=ServerVersion version={version}"));
+            }
+            Ok(Some(ServerMsg::Routes(_))) => sign_in_log(cb, address, step, "reply=Routes"),
+            Ok(Some(ServerMsg::Registered { .. })) => sign_in_log(cb, address, step, "reply=Registered"),
+            Ok(Some(reply @ ServerMsg::AccountResult { .. })) | Ok(Some(reply @ ServerMsg::Error { .. })) => {
+                sign_in_log(cb, address, step, &reply_note(&reply));
+                return AccountRead::Reply(reply);
+            }
+            Ok(Some(_)) => sign_in_log(cb, address, step, "reply=other"),
+            Ok(None) => {
+                sign_in_log(cb, address, step, "reply=closed");
+                return AccountRead::Closed;
+            }
+            Err(_) => {
+                sign_in_log(cb, address, step, "reply=timeout");
+                return AccountRead::Timeout;
+            }
+        }
+    }
+}
+
+async fn exchange_account(state: &State, cb: &Arc<dyn Callbacks>, asked: &str, msg: ClientMsg) -> Result<ServerMsg> {
+    sign_in_log(cb, &state.host_at.lock().unwrap().clone(), "start", &format!("op={asked}"));
+    let heartbeat_up = state.host_tx.lock().unwrap().is_some();
+    let mut signal: Option<SignalClient> = None;
+    for attempt in sign_in_attempts(heartbeat_up) {
+        match attempt {
+            SignInAttempt::Heartbeat => {
+                let tx = state.host_tx.lock().unwrap().clone();
+                let addr = state.host_at.lock().unwrap().clone();
+                let Some(tx) = tx else {
+                    sign_in_log(cb, &addr, "heartbeat", "reply=no-connection");
+                    continue;
+                };
+                sign_in_log(cb, &addr, "heartbeat", &format!("op={asked}"));
+                let (rtx, rrx) = oneshot::channel();
+                *state.pending_account.lock().unwrap() = Some((asked.to_string(), rtx));
+                if tx.send(msg.clone()).is_err() {
+                    state.pending_account.lock().unwrap().take();
+                    sign_in_log(cb, &addr, "heartbeat", "reply=send-failed");
+                    continue;
+                }
+                match tokio::time::timeout(Duration::from_secs(8), rrx).await {
+                    Ok(Ok(reply)) => {
+                        sign_in_log(cb, &addr, "heartbeat", &reply_note(&reply));
+                        return Ok(reply);
+                    }
+                    Ok(Err(_)) => sign_in_log(cb, &addr, "heartbeat", "reply=closed"),
+                    Err(_) => {
+                        state.pending_account.lock().unwrap().take();
+                        sign_in_log(cb, &addr, "heartbeat", "reply=timeout");
+                    }
+                }
+            }
+            SignInAttempt::AccountFirst => {
+                if signal.is_none() {
+                    sign_in_log(cb, "", "dial", "op=account-before-register");
+                    match open_ordered(state, cb, None).await {
+                        Ok(opened) => {
+                            let addr = opened.server_addr.to_string();
+                            sign_in_log(cb, &addr, "connected", "transport=tcp");
+                            signal = Some(opened);
+                        }
+                        Err(err) => {
+                            let why = err.to_string();
+                            let why = why.lines().next().unwrap_or("failed").trim();
+                            sign_in_log(cb, "", "dial", &format!("reply=no-transport {why}"));
+                            bail!("Could not reach the PJDesk server.");
+                        }
+                    }
+                }
+                let Some(opened) = signal.as_mut() else { continue };
+                let addr = opened.server_addr.to_string();
+                sign_in_log(cb, &addr, "account-before-register", &format!("op={asked}"));
+                if opened.send(msg.clone()).is_err() {
+                    sign_in_log(cb, &addr, "account-before-register", "reply=send-failed");
+                    signal = None;
+                    continue;
+                }
+                match await_account(opened, state, cb, &addr, "account-before-register", Duration::from_secs(4)).await {
+                    AccountRead::Reply(reply) => return Ok(reply),
+                    AccountRead::Timeout => {}
+                    AccountRead::Closed => signal = None,
+                }
+            }
+            SignInAttempt::RegisterThenAccount => {
+                if signal.is_none() {
+                    sign_in_log(cb, "", "dial", "op=register-then-account");
+                    match open_ordered(state, cb, None).await {
+                        Ok(opened) => {
+                            let addr = opened.server_addr.to_string();
+                            sign_in_log(cb, &addr, "connected", "transport=tcp");
+                            signal = Some(opened);
+                        }
+                        Err(err) => {
+                            let why = err.to_string();
+                            let why = why.lines().next().unwrap_or("failed").trim();
+                            sign_in_log(cb, "", "dial", &format!("reply=no-transport {why}"));
+                            bail!("Could not reach the PJDesk server.");
+                        }
+                    }
+                }
+                let Some(opened) = signal.as_mut() else { continue };
+                let addr = opened.server_addr.to_string();
+                sign_in_log(cb, &addr, "register-then-account", &format!("op={asked}"));
+                if send_host_register(opened, state).is_err() {
+                    sign_in_log(cb, &addr, "register-then-account", "reply=send-failed");
+                    bail!("The PJDesk server did not answer the sign-in.");
+                }
+                state.sign_in_reregister.store(true, Ordering::SeqCst);
+                state.moved.notify_waiters();
+                let mut registered = false;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+                while tokio::time::Instant::now() < deadline {
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    match tokio::time::timeout(left, opened.recv()).await {
+                        Ok(Some(ServerMsg::Registered { .. })) => {
+                            sign_in_log(cb, &addr, "register-then-account", "reply=Registered");
+                            registered = true;
+                            break;
+                        }
+                        Ok(Some(reply @ ServerMsg::AccountResult { .. })) | Ok(Some(reply @ ServerMsg::Error { .. })) => {
+                            sign_in_log(cb, &addr, "register-then-account", &reply_note(&reply));
+                            return Ok(reply);
+                        }
+                        Ok(Some(ServerMsg::ServerVersion { version })) => {
+                            pjdesk_proto::routes::note_server_version(&mut state.routes.lock().unwrap(), &version);
+                            sign_in_log(cb, &addr, "register-then-account", &format!("reply=ServerVersion version={version}"));
+                        }
+                        Ok(Some(ServerMsg::Routes(_))) => sign_in_log(cb, &addr, "register-then-account", "reply=Routes"),
+                        Ok(Some(_)) => sign_in_log(cb, &addr, "register-then-account", "reply=other"),
+                        Ok(None) => {
+                            sign_in_log(cb, &addr, "register-then-account", "reply=closed");
+                            bail!("The PJDesk server did not answer the sign-in.");
+                        }
+                        Err(_) => {
+                            sign_in_log(cb, &addr, "register-then-account", "reply=timeout");
+                            break;
+                        }
+                    }
+                }
+                if !registered {
+                    sign_in_log(cb, &addr, "register-then-account", "reply=not-registered");
+                }
+                if opened.send(msg.clone()).is_err() {
+                    sign_in_log(cb, &addr, "register-then-account", "reply=send-failed");
+                    bail!("The PJDesk server did not answer the sign-in.");
+                }
+                match await_account(opened, state, cb, &addr, "register-then-account", Duration::from_secs(12)).await {
+                    AccountRead::Reply(reply) => return Ok(reply),
+                    AccountRead::Timeout | AccountRead::Closed => {
+                        bail!("The PJDesk server did not answer the sign-in.");
+                    }
+                }
+            }
+        }
+    }
+    bail!("The PJDesk server did not answer the sign-in.")
 }
 
 fn account_event(asked: &str, msg: &ServerMsg) -> Value {
@@ -3931,7 +4169,97 @@ mod tests {
             incoming_ready: AtomicBool::new(false),
             incoming_told: AtomicBool::new(false),
             incoming_ask: Mutex::new(None),
+            host_tx: Mutex::new(None),
+            host_at: Mutex::new(String::new()),
+            pending_account: Mutex::new(None),
+            sign_in_reregister: AtomicBool::new(false),
         })
+    }
+
+    /// A 0.6.52 server that does not answer an account message until the
+    /// connection has registered. The heartbeat connection is already registered.
+    struct Server0652 {
+        registered: bool,
+        transport: bool,
+        heartbeat: bool,
+        steps: Vec<&'static str>,
+    }
+
+    impl Server0652 {
+        fn answer(&mut self, attempt: SignInAttempt) -> Result<&'static str, &'static str> {
+            self.steps.push(match attempt {
+                SignInAttempt::Heartbeat => "heartbeat",
+                SignInAttempt::AccountFirst => "account-before-register",
+                SignInAttempt::RegisterThenAccount => "register-then-account",
+            });
+            match attempt {
+                SignInAttempt::Heartbeat => {
+                    if self.heartbeat && self.registered {
+                        Ok("signed-in")
+                    } else {
+                        Err("timeout")
+                    }
+                }
+                SignInAttempt::AccountFirst => {
+                    if !self.transport {
+                        return Err("no-transport");
+                    }
+                    if self.registered {
+                        Ok("signed-in")
+                    } else {
+                        Err("timeout")
+                    }
+                }
+                SignInAttempt::RegisterThenAccount => {
+                    if !self.transport {
+                        return Err("no-transport");
+                    }
+                    self.registered = true;
+                    Ok("signed-in")
+                }
+            }
+        }
+    }
+
+    fn run_sign_in(server: &mut Server0652) -> Result<&'static str, &'static str> {
+        let mut saw_transport = server.heartbeat;
+        for attempt in sign_in_attempts(server.heartbeat) {
+            if matches!(attempt, SignInAttempt::AccountFirst | SignInAttempt::RegisterThenAccount) && !server.transport {
+                return Err("unreachable");
+            }
+            if matches!(attempt, SignInAttempt::AccountFirst | SignInAttempt::RegisterThenAccount) {
+                saw_transport = true;
+            }
+            match server.answer(*attempt) {
+                Ok(done) => return Ok(done),
+                Err("no-transport") => return Err("unreachable"),
+                Err(_) => continue,
+            }
+        }
+        if saw_transport {
+            Err("no-sign-in-reply")
+        } else {
+            Err("unreachable")
+        }
+    }
+
+    #[test]
+    fn a_0_6_52_server_signs_in_on_the_heartbeat_connection() {
+        let mut live = Server0652 { registered: true, transport: true, heartbeat: true, steps: Vec::new() };
+        assert_eq!(run_sign_in(&mut live), Ok("signed-in"));
+        assert_eq!(live.steps, vec!["heartbeat"]);
+        let mut quiet = Server0652 { registered: false, transport: true, heartbeat: false, steps: Vec::new() };
+        assert_eq!(run_sign_in(&mut quiet), Ok("signed-in"));
+        assert_eq!(quiet.steps, vec!["account-before-register", "register-then-account"]);
+        let mut down = Server0652 { registered: false, transport: false, heartbeat: false, steps: Vec::new() };
+        assert_eq!(run_sign_in(&mut down), Err("unreachable"));
+        let mut ignored = Server0652 { registered: true, transport: true, heartbeat: true, steps: Vec::new() };
+        ignored.registered = false;
+        ignored.heartbeat = true;
+        // The open connection has not finished registering, so the account message
+        // before Register is silence and the next step registers, then signs in.
+        assert_eq!(run_sign_in(&mut ignored), Ok("signed-in"));
+        assert_eq!(ignored.steps, vec!["heartbeat", "account-before-register", "register-then-account"]);
     }
 
     #[test]

@@ -37,12 +37,15 @@ fun signInPageError(message: String, pauseSecs: Long = 0): String {
     if (lower.contains("sign in required") || lower.contains("requires sign-in")) {
         return "This server is too old to accept a sign-in while Require signed-in accounts is on. Update the server."
     }
+    if (lower.contains("did not answer the sign-in")) {
+        return "The PJDesk server did not answer the sign-in."
+    }
+    if (text.isEmpty()) return "The sign-in did not finish."
     if (
-        text.isEmpty() ||
-        lower.contains("did not answer") ||
         lower.contains("could not reach") ||
-        lower.contains("timed out") ||
-        lower.contains("closed the connection")
+        lower.contains("timed out connecting") ||
+        lower.contains("connection refused") ||
+        lower.contains("network is unreachable")
     ) {
         return "Could not reach the PJDesk server."
     }
