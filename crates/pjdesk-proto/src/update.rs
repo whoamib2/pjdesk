@@ -419,17 +419,118 @@ fn download_verified_progress(update: &Available, progress: &dyn Fn(&str), lock_
     Ok(path)
 }
 
-/// Runs the installer silently. The caller is expected to be elevated already
-/// (the scheduled task runs as SYSTEM); the installer stops the service/app,
-/// replaces the files and restarts.
+/// How long a failed update may leave the service stopped before something starts it.
+pub const UPDATE_WATCHDOG_SECS: u64 = 60;
+
+/// True when an update attempt is old enough and the service is still stopped.
+pub fn watchdog_should_start(age_secs: u64, service_running: bool) -> bool {
+    !service_running && age_secs >= UPDATE_WATCHDOG_SECS
+}
+
+/// `replaced` is true only when the installer wrote that the program file was swapped.
+/// A cancel, a denied elevation, or an exit that did not swap must start the service.
+pub fn installer_outcome(exit_code: Option<i32>, replaced: bool) -> Result<(), String> {
+    match exit_code {
+        Some(0) if replaced => Ok(()),
+        Some(0) => Err(
+            "The installer finished without replacing PJDesk Server. The service is being started again.".into(),
+        ),
+        Some(1223) | Some(2) => Err(
+            "The update was cancelled before it replaced PJDesk Server. The service is being started again.".into(),
+        ),
+        Some(5) => Err(
+            "The update was not allowed to run. The service is being started again.".into(),
+        ),
+        Some(code) => Err(format!(
+            "The installer exited with code {code} without replacing PJDesk Server. The service is being started again."
+        )),
+        None => Err("The installer did not start. The service is being started again.".into()),
+    }
+}
+
+/// The failure line from `last-result.txt`, when the installer recorded one.
+pub fn install_result_error(text: &str) -> Option<String> {
+    let line = text.lines().next().unwrap_or("").trim();
+    let rest = line.strip_prefix("failed:")?.trim();
+    if rest.is_empty() { None } else { Some(rest.to_string()) }
+}
+
+/// True when `last-result.txt` says the program file was replaced.
+pub fn install_result_replaced(text: &str) -> bool {
+    text.lines().next().unwrap_or("").trim().starts_with("ok")
+}
+
+/// Command the detached watchdog runs about 60 seconds after an update attempt.
+/// It starts the service only when that service is not already running.
+pub fn service_watchdog_script(service: &str) -> String {
+    let mut service: String = service.chars().filter(|c| c.is_ascii_alphanumeric() || *c == ' ').collect();
+    if service.trim().is_empty() {
+        service = "PJDeskServer".into();
+    }
+    format!(
+        "ping -n 61 127.0.0.1 >nul & sc query \"{service}\" | find /I \"RUNNING\" >nul || (net start \"{service}\" & echo failed: The update stopped the {service} service and did not replace it. The service was started again.> \"%ProgramData%\\PJDesk\\updates\\last-result.txt\")"
+    )
+}
+
+pub fn last_result_path() -> std::path::PathBuf {
+    update_dir().join("last-result.txt")
+}
+
+pub fn update_attempt_path() -> std::path::PathBuf {
+    update_dir().join("update-attempt.txt")
+}
+
+/// Marks that an update is about to stop the service. The tray uses the age.
+pub fn note_update_attempt() {
+    let path = update_attempt_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let _ = std::fs::write(path, secs.to_string());
+}
+
+pub fn update_attempt_age() -> Option<u64> {
+    let text = std::fs::read_to_string(update_attempt_path()).ok()?;
+    let at = text.trim().parse::<u64>().ok()?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    Some(now.saturating_sub(at))
+}
+
+/// Starts a detached command that brings the service back if it is still
+/// stopped about 60 seconds later. The installer may kill this process.
 #[cfg(windows)]
-pub fn run_installer(path: &std::path::Path) -> Result<()> {
-    std::process::Command::new(path).arg("/S").spawn().with_context(|| format!("launching {}", path.display()))?;
-    Ok(())
+pub fn arm_service_watchdog(service: &str) {
+    use std::os::windows::process::CommandExt;
+    let script = service_watchdog_script(service);
+    // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW.
+    // `start` returns at once; the inner command survives this process exiting.
+    const DETACHED: u32 = 0x0000_0008 | 0x0000_0200 | 0x0800_0000;
+    let _ = std::process::Command::new("cmd")
+        .args(["/d", "/c", "start", "", "/min", "cmd", "/d", "/c", &script])
+        .creation_flags(DETACHED)
+        .spawn();
 }
 
 #[cfg(not(windows))]
-pub fn run_installer(_path: &std::path::Path) -> Result<()> {
+pub fn arm_service_watchdog(_service: &str) {}
+
+/// Runs the installer silently and waits for it. The caller is expected to be
+/// elevated already. The installer stops the service, replaces the files, and
+/// starts the service again. A non-zero exit is returned as that code so the
+/// caller can start the service if the installer did not.
+#[cfg(windows)]
+pub fn run_installer(path: &std::path::Path) -> Result<i32> {
+    let mut child = std::process::Command::new(path)
+        .arg("/S")
+        .spawn()
+        .with_context(|| format!("launching {}", path.display()))?;
+    let status = child.wait().with_context(|| format!("waiting for {}", path.display()))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(not(windows))]
+pub fn run_installer(_path: &std::path::Path) -> Result<i32> {
     bail!("installing updates is only supported on Windows")
 }
 
@@ -489,7 +590,9 @@ fn check_site(current: &str) -> Result<Option<Available>> {
 }
 
 /// Downloads, verifies, re-hashes the file on disk, and launches the installer.
-pub fn install_available(update: &Available) -> Result<()> {
+/// The returned code is the installer's exit code. `0` does not by itself mean
+/// the service is running or that the program file changed.
+pub fn install_available(update: &Available) -> Result<i32> {
     let path = download_verified(update)?;
     // Read the bytes we are about to execute one more time. `download_verified`
     // already did this; repeating it here is the last step before the process
@@ -508,8 +611,14 @@ pub fn install_available(update: &Available) -> Result<()> {
         let _ = std::fs::remove_file(&path);
         bail!("the installer changed on disk after its checksum was verified");
     }
-    run_installer(&path)?;
-    Ok(())
+    // The clock starts as the installer is launched, not during the download.
+    // The installer is about to stop the service. If it dies after that, this
+    // command starts PJDesk Server again.
+    let _ = std::fs::remove_file(last_result_path());
+    note_update_attempt();
+    arm_service_watchdog("PJDeskServer");
+    let code = run_installer(&path)?;
+    Ok(code)
 }
 
 /// Checks, downloads, verifies, and launches the latest client installer.
@@ -544,7 +653,12 @@ fn install_client_reporting_lock(current: &str, progress: &dyn Fn(&str), lock_ac
     // One beat so the window can paint that line before the installer
     // closes this process.
     std::thread::sleep(Duration::from_millis(600));
-    run_installer(&path)?;
+    let code = run_installer(&path)?;
+    if let Err(message) = installer_outcome(Some(code), true) {
+        // A fast failure (cancelled, not elevated) returns here. A real install
+        // stops this process before wait returns.
+        bail!("{message}");
+    }
     Ok(Outcome::Installing(update.version))
 }
 
@@ -720,5 +834,38 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa *PJDesk-Server-
         assert_eq!(pick_client_asset(&assets).map(|a| a.name.as_str()), Some("PJDesk-Client-Setup-0.6.2.exe"));
         let legacy = vec![Asset { name: "PJDesk-Setup-0.6.2.exe".into(), browser_download_url: "old".into() }];
         assert_eq!(pick_client_asset(&legacy).map(|a| a.name.as_str()), Some("PJDesk-Setup-0.6.2.exe"));
+    }
+
+    #[test]
+    fn a_failed_or_cancelled_installer_must_start_the_service() {
+        assert!(installer_outcome(Some(0), true).is_ok());
+        let cancelled = installer_outcome(Some(1223), false).unwrap_err();
+        assert!(cancelled.contains("cancelled"), "{cancelled}");
+        assert!(cancelled.contains("started again"), "{cancelled}");
+        let denied = installer_outcome(Some(5), false).unwrap_err();
+        assert!(denied.contains("not allowed"), "{denied}");
+        let untouched = installer_outcome(Some(0), false).unwrap_err();
+        assert!(untouched.contains("without replacing"), "{untouched}");
+        let crashed = installer_outcome(Some(1), false).unwrap_err();
+        assert!(crashed.contains("code 1"), "{crashed}");
+        assert_eq!(
+            install_result_error("failed: PJDeskServer did not replace pjdesk-server.exe. The previous program was started again.\r\n"),
+            Some("PJDeskServer did not replace pjdesk-server.exe. The previous program was started again.".into())
+        );
+        assert!(install_result_error("ok 0.6.65").is_none());
+        assert!(install_result_replaced("ok 0.6.65"));
+        assert!(!install_result_replaced("failed: still 0.6.63"));
+        assert!(!watchdog_should_start(10, false));
+        assert!(watchdog_should_start(60, false));
+        assert!(!watchdog_should_start(120, true));
+        let script = service_watchdog_script("PJDeskServer");
+        assert!(script.contains("ping -n 61"), "{script}");
+        assert!(script.contains("net start \"PJDeskServer\""), "{script}");
+        assert!(script.contains("RUNNING"), "{script}");
+        let clean = service_watchdog_script("PJDeskServer");
+        let hostile = service_watchdog_script("PJDesk\" & calc");
+        assert_eq!(clean.matches('&').count(), hostile.matches('&').count());
+        assert!(!hostile.contains(" & calc"), "{hostile}");
+        assert!(hostile.contains("PJDesk  calc"), "{hostile}");
     }
 }

@@ -397,6 +397,58 @@ pub enum HostMsg {
         name: String,
         unix: u64,
     },
+    /// 0.6.65. This computer's PJDesk version. Sent only when Hello carried
+    /// [`crate::perms::PEER_VERSION`]. An older controller never sets that bit,
+    /// so it never receives this variant.
+    PeerVersion {
+        version: String,
+    },
+}
+
+/// Whether the session toolbar may offer chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatGate {
+    /// The peer's PJDesk version is known and new enough.
+    Ready,
+    /// The peer's PJDesk version is known and older than 0.6.50.
+    TooOld,
+    /// The handshake did not report a version and there is no fresh presence.
+    /// That is not the same as an old peer.
+    Unknown,
+}
+
+/// Handshake version wins. A fresh presence version is used only when the
+/// handshake did not report a PJDesk version. A saved-list version that is not
+/// fresh is ignored. `10` and `11` are operating-system versions, not PJDesk.
+pub fn chat_gate(handshake_version: &str, presence_version: &str, presence_fresh: bool) -> ChatGate {
+    match live_peer_version(handshake_version, presence_version, presence_fresh) {
+        Some(version) if chat_supported(&version) => ChatGate::Ready,
+        Some(_) => ChatGate::TooOld,
+        None => ChatGate::Unknown,
+    }
+}
+
+/// The PJDesk version to trust for a feature check.
+pub fn live_peer_version(handshake_version: &str, presence_version: &str, presence_fresh: bool) -> Option<String> {
+    if let Some(version) = pjdesk_app_version(handshake_version) {
+        return Some(version);
+    }
+    if presence_fresh {
+        if let Some(version) = pjdesk_app_version(presence_version) {
+            return Some(version);
+        }
+    }
+    None
+}
+
+/// A PJDesk release is `0.x`. Windows 10 and 11 are not.
+fn pjdesk_app_version(raw: &str) -> Option<String> {
+    let raw = raw.trim().trim_start_matches('v');
+    let (major, _, _) = crate::update::parse_version(raw)?;
+    if major != 0 {
+        return None;
+    }
+    Some(raw.to_string())
 }
 
 /// First PJDesk release that speaks named in-session chat.
@@ -785,6 +837,15 @@ mod tests {
         assert!(chat_supported("0.6.50"));
         assert!(chat_supported("0.6.51"));
         assert!(!chat_supported("0.6.50-rc1"));
+        assert_eq!(chat_gate("0.6.64", "0.6.43", true), ChatGate::Ready, "the handshake wins over presence");
+        assert_eq!(chat_gate("0.6.49", "0.6.64", true), ChatGate::TooOld, "an old handshake is not replaced by presence");
+        assert_eq!(chat_gate("", "0.6.64", true), ChatGate::Ready);
+        assert_eq!(chat_gate("", "0.6.43", true), ChatGate::TooOld);
+        assert_eq!(chat_gate("", "0.6.64", false), ChatGate::Unknown, "a saved-list version is not fresh presence");
+        assert_eq!(chat_gate("", "", false), ChatGate::Unknown);
+        assert_eq!(chat_gate("11", "0.6.64", true), ChatGate::Ready, "an operating-system version is not PJDesk");
+        assert_eq!(chat_gate("10.0.22631", "", false), ChatGate::Unknown);
+        assert_eq!(postcard::to_stdvec(&HostMsg::PeerVersion { version: "0.6.65".into() }).unwrap()[0], 17);
         assert!(chat_line("   ").is_none());
         assert!(chat_line("").is_none());
         assert_eq!(chat_line("  hello\u{0001} there  ").as_deref(), Some("hello there"));

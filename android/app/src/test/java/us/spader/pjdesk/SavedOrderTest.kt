@@ -24,6 +24,10 @@ import us.spader.pjdesk.core.savedSyncChoiceOnUpdate
 import us.spader.pjdesk.core.signInPauseSeconds
 import us.spader.pjdesk.core.signInPauseText
 import us.spader.pjdesk.core.redactConnectError
+import us.spader.pjdesk.ui.ChatGate
+import us.spader.pjdesk.ui.chatButtonOn
+import us.spader.pjdesk.ui.chatGate
+import us.spader.pjdesk.ui.showChatNeedsTip
 import us.spader.pjdesk.core.savedSubtitle
 import us.spader.pjdesk.core.shownSaved
 import us.spader.pjdesk.core.shownVersion
@@ -197,6 +201,22 @@ class SavedOrderTest {
         assertEquals("0.6.43", shownVersion("0.6.43", mine = true, selfVersion = ""))
         assertTrue(versionBehind("0.6.43", "0.6.44"))
         assertFalse(versionBehind("0.6.44", ""))
+    }
+
+    @Test
+    fun chatUsesTheHandshakeVersionThenFreshPresence() {
+        assertEquals(ChatGate.Ready, chatGate("0.6.64", "0.6.43", true))
+        assertEquals(ChatGate.TooOld, chatGate("0.6.49", "0.6.64", true))
+        assertEquals(ChatGate.Ready, chatGate("", "0.6.64", true))
+        assertEquals(ChatGate.TooOld, chatGate("", "0.6.43", true))
+        assertEquals(ChatGate.Unknown, chatGate("", "0.6.64", false))
+        assertEquals(ChatGate.Unknown, chatGate("", "", false))
+        assertEquals(ChatGate.Ready, chatGate("11", "0.6.64", true))
+        assertEquals(ChatGate.Unknown, chatGate("10.0.22631", "", false))
+        assertTrue(chatButtonOn(chatReady = false, chatGate("0.6.64", "", false)))
+        assertFalse(showChatNeedsTip(chatReady = false, chatGate("", "", false)))
+        assertTrue(showChatNeedsTip(chatReady = false, chatGate("0.6.49", "", false)))
+        assertFalse(showChatNeedsTip(chatReady = true, chatGate("0.6.49", "", false)))
     }
 
     @Test

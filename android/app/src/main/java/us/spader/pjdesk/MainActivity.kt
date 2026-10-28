@@ -1980,7 +1980,22 @@ class MainActivity : FragmentActivity() {
                         idleWarn = sessionIdleWarn,
                         onStay = { sessionIdleWarn = false },
                         onActivity = {},
-                        chatReady = state.chatReady,
+                        chatReady = us.spader.pjdesk.ui.chatButtonOn(
+                            state.chatReady,
+                            us.spader.pjdesk.ui.chatGate(
+                                state.peerHandshakeVersion,
+                                state.peerPresenceVersion,
+                                state.peerPresenceVersion.isNotBlank(),
+                            ),
+                        ),
+                        chatTooOld = us.spader.pjdesk.ui.showChatNeedsTip(
+                            state.chatReady,
+                            us.spader.pjdesk.ui.chatGate(
+                                state.peerHandshakeVersion,
+                                state.peerPresenceVersion,
+                                state.peerPresenceVersion.isNotBlank(),
+                            ),
+                        ),
                         chatLines = state.chatLines,
                         chatUnread = state.chatUnread,
                         onChat = engine::chat,

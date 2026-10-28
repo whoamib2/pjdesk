@@ -404,6 +404,9 @@ impl Session {
         if requested & pjdesk_proto::perms::VISITOR != 0 {
             write_msg(send, &HostMsg::AskVisitor).await?;
         }
+        if requested & pjdesk_proto::perms::PEER_VERSION != 0 {
+            write_msg(send, &HostMsg::PeerVersion { version: env!("CARGO_PKG_VERSION").into() }).await?;
+        }
         if requested & pjdesk_proto::perms::CHAT_PEER != 0 && has(granted, perms::CHAT) {
             self.chat_peer.store(true, Ordering::SeqCst);
             write_msg(send, &HostMsg::ChatReady).await?;

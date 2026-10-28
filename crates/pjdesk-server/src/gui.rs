@@ -105,6 +105,14 @@ pub fn run(data_dir: PathBuf, port: u16) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
+struct InstallWatch {
+    target: String,
+    started: Instant,
+    /// The installer was started, or the service stopped while starting it.
+    launched: bool,
+}
+
 struct App {
     data_dir: PathBuf,
     port: u16,
@@ -195,6 +203,10 @@ struct App {
     update_status: crate::self_update::UpdateStatus,
     /// The sentence from the latest check, shown before the snapshot reloads.
     update_feedback: String,
+    /// Set while an installer is starting or the service is restarting.
+    install_watch: Option<InstallWatch>,
+    /// Set when the new service is up and this window could not reopen itself.
+    reopen_version: String,
     cloud_email: String,
     cloud_token: String,
     cloud_api: String,
@@ -391,6 +403,8 @@ impl App {
             update_auto_dirty: false,
             update_status: crate::self_update::UpdateStatus::default(),
             update_feedback: String::new(),
+            install_watch: None,
+            reopen_version: String::new(),
             cloud_email: String::new(),
             cloud_token: String::new(),
             cloud_api: crate::cloud::default_api(),
@@ -639,6 +653,9 @@ impl App {
     fn poll_notes(&mut self) {
         let mut refresh = false;
         while let Ok(msg) = self.bg_rx.try_recv() {
+            if self.keep_update_status(&msg) {
+                continue;
+            }
             if msg.contains("Signed out") {
                 self.service_email.clear();
                 self.service_session_known = true;
@@ -763,6 +780,7 @@ impl eframe::App for App {
         self.poll_notes();
         self.poll_access_keys();
         self.poll_require();
+        self.poll_install();
         let snaps: Vec<Snapshot> = self
             .probe
             .as_ref()
@@ -776,7 +794,7 @@ impl eframe::App for App {
         // A minimized window is not asked to present again. That present is
         // what stopped the message loop. A restore from the taskbar wakes it.
         if !hidden {
-            ctx.request_repaint_after(if self.waiting_for_service() || self.disk_rx.is_some() || self.svc_rx.is_some() || self.ak_rx.is_some() || self.require_rx.is_some() {
+            ctx.request_repaint_after(if self.waiting_for_service() || self.install_watch.is_some() || self.disk_rx.is_some() || self.svc_rx.is_some() || self.ak_rx.is_some() || self.require_rx.is_some() {
                 Duration::from_millis(50)
             } else {
                 Duration::from_secs(1)
@@ -855,7 +873,7 @@ impl eframe::App for App {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("PJDesk Server").size(22.0).strong().color(p(ui).text));
-                    ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(p(ui).muted));
+                    ui.label(RichText::new(self.server_version_label()).color(p(ui).muted));
                 });
                 ui.add_space(8.0);
 
@@ -887,13 +905,13 @@ impl eframe::App for App {
                 }
 
                 if self.preview_devices {
-                    ui.label(RichText::new(format!("This server  v{}", env!("CARGO_PKG_VERSION"))).strong().size(18.0));
+                    ui.label(RichText::new(self.server_title()).strong().size(18.0));
                     ui.add_space(8.0);
                     self.devices_card(ui);
                     return;
                 }
                 if self.preview_network || self.preview_netkey {
-                    ui.label(RichText::new(format!("This server  v{}", env!("CARGO_PKG_VERSION"))).strong().size(18.0));
+                    ui.label(RichText::new(self.server_title()).strong().size(18.0));
                     ui.add_space(8.0);
                     self.network_card(ui);
                     return;
@@ -957,6 +975,146 @@ impl App {
             Ok(msg) => Ok(JobDone::Message(msg)),
             Err(err) => Err(err),
         });
+    }
+
+    fn reported_service_version(&self) -> String {
+        self.live.as_ref().map(|snap| snap.version.trim().to_string()).unwrap_or_default()
+    }
+
+    fn server_version_label(&self) -> String {
+        let version = crate::self_update::service_version_text(&self.reported_service_version());
+        if version == "unknown" { "version unknown".into() } else { format!("v{version}") }
+    }
+
+    fn server_title(&self) -> String {
+        format!("This server  {}", self.server_version_label())
+    }
+
+    fn updating_line(&self) -> String {
+        let version = self.install_watch.as_ref().map(|watch| watch.target.as_str()).unwrap_or("");
+        crate::self_update::updating_line(version)
+    }
+
+    fn start_install(&mut self, version: &str) {
+        let version = version.trim().to_string();
+        if version.is_empty() {
+            self.update_feedback = "No update is available.".into();
+            self.status = self.update_feedback.clone();
+            return;
+        }
+        let line = crate::self_update::updating_line(&version);
+        tracing::info!("server update: {line}");
+        self.update_feedback = line.clone();
+        self.status = line;
+        self.reopen_version.clear();
+        self.install_watch = Some(InstallWatch { target: version, started: Instant::now(), launched: false });
+        if self.access == Access::Readable {
+            let dir = self.data_dir.clone();
+            self.spawn_cloud_job(move || match crate::self_update::install_if_planned(&dir, true) {
+                Ok(msg) => Ok(JobDone::Message(msg)),
+                Err(err) => Err(err),
+            });
+            return;
+        }
+        self.spawn_cloud_job(|| {
+            let req = crate::control::Request { cmd: "update_now".into(), ..Default::default() };
+            match crate::control::call_for(&req, Duration::from_secs(crate::self_update::INSTALL_WAIT_SECS)) {
+                Some(response) if response.ok => Ok(JobDone::Message(response.message)),
+                Some(response) => Err(anyhow::anyhow!(response.message)),
+                None => Err(anyhow::anyhow!("The PJDesk service did not answer.")),
+            }
+        });
+    }
+
+    fn note_install_job(&mut self, result: Result<String, String>) {
+        let Some(target) = self.install_watch.as_ref().map(|watch| watch.target.clone()) else { return };
+        match result {
+            Ok(msg) if msg.starts_with("Installing ") => {
+                if let Some(watch) = &mut self.install_watch {
+                    watch.launched = true;
+                }
+                let line = crate::self_update::updating_line(&target);
+                self.update_feedback = line.clone();
+                self.status = line;
+            }
+            Ok(msg) => {
+                self.install_watch = None;
+                self.update_feedback = msg.clone();
+                self.status = msg;
+            }
+            Err(err) if crate::self_update::service_down_notice(&err) => {
+                if let Some(watch) = &mut self.install_watch {
+                    watch.launched = true;
+                }
+            }
+            Err(err) => {
+                tracing::info!("server update: {err}");
+                self.install_watch = None;
+                self.update_feedback = err.clone();
+                self.status = err;
+            }
+        }
+    }
+
+    fn poll_install(&mut self) {
+        let Some(watch) = self.install_watch.clone() else { return };
+        let (_installed, running) = self.service_state();
+        let status = if self.access == Access::Readable {
+            crate::self_update::UpdateStatus::load(&self.data_dir)
+        } else if let Some(live) = &self.live {
+            crate::self_update::UpdateStatus {
+                last_check_at: live.last_check_at,
+                last_result: live.last_result.clone(),
+                available: live.update_available.clone(),
+                error: live.update_error.clone(),
+            }
+        } else {
+            self.update_status.clone()
+        };
+        if status.last_result.starts_with("Installing ") {
+            if let Some(watch) = &mut self.install_watch {
+                watch.launched = true;
+            }
+        }
+        let launched = self.install_watch.as_ref().is_some_and(|watch| watch.launched);
+        match crate::self_update::watch_install(
+            &watch.target,
+            launched,
+            running,
+            &self.reported_service_version(),
+            &status,
+            watch.started.elapsed().as_secs(),
+        ) {
+            crate::self_update::InstallWatchResult::Keep => {}
+            crate::self_update::InstallWatchResult::Updated(version) => {
+                tracing::info!("server update: updated to {version}");
+                self.install_watch = None;
+                let line = format!("Updated to {version}");
+                self.update_feedback = line.clone();
+                self.status = line;
+                self.reopen_version = version;
+                self.reopen_after_update();
+            }
+            crate::self_update::InstallWatchResult::Failed(err) => {
+                tracing::info!("server update: {err}");
+                self.install_watch = None;
+                self.update_feedback = err.clone();
+                self.status = err;
+            }
+        }
+    }
+
+    fn reopen_after_update(&mut self) {
+        if reopen_server_window() {
+            tracing::info!("server update: reopening the window on the new program");
+            std::process::exit(0);
+        }
+        self.status = format!("Updated to {}. Reopen to use the new version.", self.reopen_version);
+        self.update_feedback = self.status.clone();
+    }
+
+    fn keep_update_status(&self, message: &str) -> bool {
+        self.install_watch.is_some() && crate::self_update::service_down_notice(message)
     }
 
     fn updates_card(&mut self, ui: &mut egui::Ui) {
@@ -1068,18 +1226,22 @@ impl App {
                 });
             }
             ui.add_space(4.0);
+            if !self.reopen_version.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("Updated to {}", self.reopen_version)).strong().size(14.0));
+                if ui.button("Reopen").clicked() {
+                    self.reopen_after_update();
+                }
+            }
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.cloud_job.is_some(), egui::Button::new("Check for updates now")).clicked() {
+                let busy = self.cloud_job.is_some() || self.install_watch.is_some();
+                if ui.add_enabled(!busy, egui::Button::new("Check for updates now")).clicked() {
                     self.start_update_check();
                 }
-                if !reported.available.is_empty()
-                    && ui.add(egui::Button::new("Install this update").fill(p(ui).accent)).clicked()
+                if !reported.available.is_empty() && ui.add_enabled(!busy, egui::Button::new("Install this update").fill(p(ui).accent)).clicked()
                 {
-                    let dir = self.data_dir.clone();
-                    self.status = "Installing the update…".into();
-                    std::thread::spawn(move || {
-                        let _ = self_update::install_if_planned(&dir, true);
-                    });
+                    self.start_install(&reported.available);
                 }
             });
         });
@@ -1091,19 +1253,19 @@ impl App {
             heading(ui, "SERVICE");
             let (installed, running) = self.service_state();
             ui.horizontal(|ui| {
-                let (c, t) = if !installed {
-                    (p(ui).muted, "Not installed")
+                let (c, t) = if self.install_watch.is_some() && !running {
+                    (p(ui).text, self.updating_line())
+                } else if !installed {
+                    (p(ui).muted, "Not installed".to_string())
                 } else if running {
-                    (p(ui).ok, "Installed and running")
+                    (p(ui).ok, "Installed and running".to_string())
                 } else {
-                    (p(ui).warn, "Installed, not running")
+                    (p(ui).warn, "Installed, not running".to_string())
                 };
                 ui_widgets::dot(ui, c);
                 ui.label(t);
             });
-            let version =
-                self.live.as_ref().map(|s| s.version.clone()).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-            ui.label(RichText::new(format!("This server  v{version}")).strong().size(18.0).color(p(ui).text));
+            ui.label(RichText::new(self.server_title()).strong().size(18.0).color(p(ui).text));
             if let Some(peer) = self.peer_version_line() {
                 ui.label(RichText::new(peer).color(p(ui).muted));
             }
@@ -1303,7 +1465,9 @@ impl App {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.require_rx = None;
                 self.require_busy = false;
-                self.status = "The PJDesk service did not answer. Require signed-in accounts was not changed.".into();
+                if self.install_watch.is_none() {
+                    self.status = "The PJDesk service did not answer. Require signed-in accounts was not changed.".into();
+                }
             }
         }
     }
@@ -1471,6 +1635,7 @@ impl App {
     fn updates_locked(&mut self, ui: &mut egui::Ui) {
         let mut check_now = false;
         let mut install_now = false;
+        let mut install_version = String::new();
         card(ui, |ui| {
             heading(ui, "UPDATES");
             let Some(snap) = self.live.clone() else {
@@ -1522,14 +1687,23 @@ impl App {
             if !reported.error.is_empty() {
                 ui.colored_label(p(ui).warn, &reported.error);
             }
+            if !self.reopen_version.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("Updated to {}", self.reopen_version)).strong());
+                if ui.button("Reopen").clicked() {
+                    self.reopen_after_update();
+                }
+            }
             if managed {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!self.cloud_job.is_some(), egui::Button::new("Check for updates now")).clicked() {
+                    let busy = self.cloud_job.is_some() || self.install_watch.is_some();
+                    if ui.add_enabled(!busy, egui::Button::new("Check for updates now")).clicked() {
                         check_now = true;
                     }
-                    if !reported.available.is_empty() && ui.button("Install this update").clicked() {
+                    if !reported.available.is_empty() && ui.add_enabled(!busy, egui::Button::new("Install this update")).clicked() {
                         install_now = true;
+                        install_version = reported.available.clone();
                     }
                 });
                 if self.update_start.is_empty() && !snap.window_start.is_empty() {
@@ -1559,10 +1733,7 @@ impl App {
         if check_now {
             self.start_update_check();
         } else if install_now {
-            self.status = "Installing the update…".into();
-            self.spawn_cloud_job(|| {
-                service_job(crate::control::Request { cmd: "update_now".into(), ..Default::default() })
-            });
+            self.start_install(&install_version);
         }
     }
 
@@ -1767,6 +1938,9 @@ impl App {
                 tracing::info!("session: {}", self.service_session_fault);
             }
             _ => {
+                if self.install_watch.is_some() {
+                    return;
+                }
                 self.service_session_failed = true;
                 self.service_session_fault =
                     "The PJDesk service did not answer. The saved sign-in was left on the service. Trying again.".into();
@@ -2581,6 +2755,14 @@ impl App {
         let Some(rx) = &self.cloud_job else { return };
         let Ok(result) = rx.try_recv() else { return };
         self.cloud_job = None;
+        if self.install_watch.is_some() {
+            match result {
+                Ok(JobDone::Message(msg)) => self.note_install_job(Ok(msg)),
+                Err(err) => self.note_install_job(Err(err)),
+                Ok(_) => {}
+            }
+            return;
+        }
         match result {
             Ok(JobDone::Message(msg)) => {
                 if is_update_sentence(&msg) {
@@ -4093,7 +4275,14 @@ fn is_update_sentence(text: &str) -> bool {
     text.starts_with("Up to date (")
         || text.starts_with("Update ")
         || text.starts_with("Installing ")
+        || text.starts_with("Updating to ")
+        || text.starts_with("Updated to ")
         || text.starts_with("The update check")
+}
+
+fn reopen_server_window() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    std::process::Command::new(exe).arg("--window").spawn().is_ok()
 }
 
 fn update_check_job() -> anyhow::Result<JobDone> {

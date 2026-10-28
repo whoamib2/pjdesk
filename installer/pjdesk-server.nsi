@@ -77,8 +77,11 @@ Function .onInstFailed
     IfFileExists "$INSTDIR\${EXE}.old" 0 server_failed_start
       Rename "$INSTDIR\${EXE}.old" "$INSTDIR\${EXE}"
   server_failed_start:
+  StrCpy $PjService "PJDeskServer"
+  Call PjEnsureRunning
   nsExec::Exec '"$INSTDIR\${EXE}" update-handoff'
   nsExec::Exec 'net start PJDeskServer'
+  Call PjEnsureRunning
 FunctionEnd
 
 !define ARP "Software\Microsoft\Windows\CurrentVersion\Uninstall\PJDeskServer"

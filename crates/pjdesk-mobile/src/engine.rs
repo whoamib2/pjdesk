@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.64";
+pub const APP_VERSION: &str = "0.6.65";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -3319,6 +3319,23 @@ fn auth_passwords(state: &State) -> Vec<String> {
     pws
 }
 
+/// PJDesk version from the latest fleet for this computer. Empty when that list has none.
+fn fresh_presence_version(state: &State, id: &str) -> String {
+    let want: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+    if want.len() != 9 {
+        return String::new();
+    }
+    state
+        .last_fleet
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|row| row.id.chars().filter(|c| c.is_ascii_digit()).collect::<String>() == want)
+        .map(|row| row.version.trim().to_string())
+        .filter(|version| !version.is_empty())
+        .unwrap_or_default()
+}
+
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -3349,6 +3366,9 @@ async fn send_welcome(
     write_msg(send, &HostMsg::Welcome { permissions: granted, monitors, proto: PROTOCOL_VERSION }).await?;
     if requested & perms::VISITOR != 0 {
         write_msg(send, &HostMsg::AskVisitor).await?;
+    }
+    if requested & perms::PEER_VERSION != 0 {
+        write_msg(send, &HostMsg::PeerVersion { version: APP_VERSION.into() }).await?;
     }
     if requested & perms::CHAT_PEER != 0 && pjdesk_proto::perms::has(granted, perms::CHAT) {
         state.host_chat_peer.store(true, Ordering::SeqCst);
@@ -3883,6 +3903,7 @@ async fn controller_session(
         LinkPath::Relay(_) => "Internet, relayed",
     };
     log_line(&cb, format!("controlling {peer} via {path}"));
+    let presence_version = fresh_presence_version(&state, target);
     emit(
         &cb,
         &json!({
@@ -3894,8 +3915,13 @@ async fn controller_session(
             "version": "",
             "layout": false,
             "displays": [],
+            "presenceVersion": presence_version,
         }),
     );
+    if pjdesk_proto::peer::chat_gate("", &presence_version, !presence_version.is_empty()) == pjdesk_proto::peer::ChatGate::Ready {
+        state.view_chat_peer.store(true, Ordering::SeqCst);
+        emit(&cb, &json!({"event":"chatReady"}));
+    }
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlMsg>();
     *state.control.lock().unwrap() = Some(control_tx.clone());
     *state.viewer.lock().unwrap() = Some(connection.clone());
@@ -3916,7 +3942,7 @@ async fn controller_session(
     state.view_chat_peer.store(false, Ordering::SeqCst);
     if auth.peer_proto >= 3 {
         let _ = control_tx.send(ControlMsg::Hello {
-            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR | perms::CHAT_PEER,
+            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR | perms::CHAT_PEER | perms::PEER_VERSION,
             monitor: 0,
             quality: quality::preset("balanced").unwrap_or(StreamQuality::default()),
         });
@@ -4018,6 +4044,13 @@ async fn controller_session(
             }
             Ok(HostMsg::AskVisitor) => {
                 let _ = control_tx.send(android_visitor(&state));
+            }
+            Ok(HostMsg::PeerVersion { version }) => {
+                emit(&cb, &json!({"event":"peerVersion","version": version}));
+                if pjdesk_proto::peer::chat_gate(&version, "", false) == pjdesk_proto::peer::ChatGate::Ready {
+                    state.view_chat_peer.store(true, Ordering::SeqCst);
+                    emit(&cb, &json!({"event":"chatReady"}));
+                }
             }
             Ok(HostMsg::ChatReady) => {
                 state.view_chat_peer.store(true, Ordering::SeqCst);

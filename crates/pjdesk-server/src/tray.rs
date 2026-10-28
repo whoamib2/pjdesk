@@ -580,6 +580,7 @@ fn pump(icon: TrayIcon) {
         }
         if sign_in_at.elapsed() >= std::time::Duration::from_secs(15) {
             sign_in_at = std::time::Instant::now();
+            crate::self_update::restart_if_update_left_service_down();
             if let Some(notice) = tray_sign_in_notice() {
                 let _ = icon.set_tooltip(Some(notice));
             }

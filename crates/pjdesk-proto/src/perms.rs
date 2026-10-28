@@ -44,6 +44,11 @@ pub const VISITOR: u32 = 1 << 12;
 /// it as something the person allowed.
 pub const CHAT_PEER: u32 = 1 << 13;
 
+/// Not a permission. A 0.6.65 controller sets this on Hello so the host sends
+/// its PJDesk version. Absent from [`ALL`], so [`grant`] clears it. An older
+/// host ignores the bit and does not send a message that host cannot decode.
+pub const PEER_VERSION: u32 = 1 << 14;
+
 /// Every permission bit this version defines. Unknown high bits are ignored.
 pub const ALL: u32 =
     KEYBOARD | MOUSE | CLIPBOARD | FILE | AUDIO | RESTART | PRIVACY | BLOCK_INPUT | CHAT | RECORD | TUNNEL;

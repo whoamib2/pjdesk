@@ -253,6 +253,7 @@ pub async fn run(opts: ServerOpts, data_dir: PathBuf, shutdown: impl Future<Outp
         .await
         .with_context(|| format!("cannot listen on UDP {}:{}", opts.bind, opts.port))?;
 
+    crate::self_update::note_installer_result(&data_dir);
     info!("PJDesk server {} started", env!("CARGO_PKG_VERSION"));
     info!("  Signaling (TCP, TLS 1.3) : {}:{}", opts.bind, opts.port);
     info!("  Rendezvous/relay (UDP)   : {}:{}", opts.bind, opts.port);
