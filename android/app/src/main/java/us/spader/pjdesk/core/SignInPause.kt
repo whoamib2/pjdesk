@@ -59,6 +59,15 @@ open class SignInTrace(private val limit: Int = 50) {
 /** The trace the sign-in screen and the account request share. */
 object SignInSteps : SignInTrace()
 
+/**
+ * The address of the connection that is heartbeating, not the saved public route.
+ * Empty when this phone is not on a server connection.
+ */
+fun liveSignInServer(signalReached: String, serverUp: Boolean): String {
+    if (!serverUp) return ""
+    return signalReached.trim()
+}
+
 /** The Sign in button's first action. Returns the line it recorded. */
 fun signInScreenPressed(trace: SignInTrace, heartbeat: String, op: String): String {
     val line = signInLogLine(heartbeat, "screen", "op=$op")

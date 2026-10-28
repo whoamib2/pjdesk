@@ -285,6 +285,7 @@ class Engine(context: Context) : EngineListener {
             body.put("lan", lanForEngine())
             body.put("publicIp", store.accountPublicIp)
             body.put("myPublicIp", store.myPublicIp)
+            body.put("mine", phoneMine())
         } else {
             body.put("lan", JSONArray())
             body.put("publicIp", "")
@@ -440,6 +441,16 @@ class Engine(context: Context) : EngineListener {
     fun paste(text: String) {
         if (text.isBlank()) return
         command(JSONObject().put("cmd", "paste").put("text", text.take(48_000)).toString())
+    }
+
+    fun noteLocalAddresses() {
+        command(JSONObject().put("cmd", "phoneMine").put("mine", phoneMine()).toString())
+    }
+
+    private fun phoneMine(): JSONArray {
+        val mine = JSONArray()
+        NetworkPath.ipv4s(app).forEach { mine.put(it) }
+        return mine
     }
 
     private fun lanForEngine(): JSONArray {

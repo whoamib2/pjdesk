@@ -171,18 +171,19 @@ pub fn dial_order(routes: &ServerRoutes, mine: &[Ipv4Addr]) -> Vec<String> {
 pub fn dial_targets(routes: &ServerRoutes, mine: &[Ipv4Addr], saved: &str) -> Vec<String> {
     let mut order = dial_order(routes, mine);
     let saved = saved.trim();
-    if saved.is_empty() {
-        return order;
+    if !saved.is_empty() {
+        if order.is_empty() {
+            push_unique(&mut order, canonical(saved));
+        } else if !is_ip_endpoint(saved) && !order.iter().any(|have| same_endpoint(have, saved)) {
+            push_unique(&mut order, canonical(saved));
+        }
     }
     if order.is_empty() {
-        push_unique(&mut order, canonical(saved));
         return order;
     }
-    if !is_ip_endpoint(saved) && !order.iter().any(|have| same_endpoint(have, saved)) {
-        push_unique(&mut order, canonical(saved));
-    }
     let order = apply_route_health(order, routes);
-    prefer_public_off_lan(order, routes, mine)
+    let order = prefer_public_off_lan(order, routes, mine);
+    promote_same_lan(order, routes, mine)
 }
 
 /// The banner, then one `address: error` line for every dial that failed.
@@ -243,7 +244,7 @@ pub fn registration_targets(follow: &str, routes: &ServerRoutes, mine: &[Ipv4Add
     }
     order.retain(|addr| !same_endpoint(addr, &follow));
     order.insert(0, follow);
-    order
+    promote_same_lan(order, routes, mine)
 }
 
 /// Uses the older LAN and public fields when `routes` has no advertised IP.
@@ -377,8 +378,8 @@ pub fn apply_route_health(order: Vec<String>, routes: &ServerRoutes) -> Vec<Stri
 /// Off the server's LAN, a public address is the path that can work.
 ///
 /// A LAN address that answered at home is not put back in front. A public
-/// address that timed out on that LAN (often a hairpin that does not answer)
-/// is still tried before DNS.
+/// address that has timed out four times is not put back either: that count
+/// is the route-health drop, and a hairpin failure must not keep winning.
 fn prefer_public_off_lan(order: Vec<String>, routes: &ServerRoutes, mine: &[Ipv4Addr]) -> Vec<String> {
     let on_lan = routes.primary_lan.iter().chain(routes.standby_lan.iter()).any(|addr| on_subnet(addr, mine));
     if on_lan {
@@ -393,6 +394,9 @@ fn prefer_public_off_lan(order: Vec<String>, routes: &ServerRoutes, mine: &[Ipv4
         if endpoint_v4(&addr).is_some_and(|ip| ip.is_private()) {
             continue;
         }
+        if miss_count(routes, &addr) >= 4 {
+            continue;
+        }
         push_unique(&mut public, addr);
     }
     if public.is_empty() {
@@ -405,6 +409,53 @@ fn prefer_public_off_lan(order: Vec<String>, routes: &ServerRoutes, mine: &[Ipv4
         push_unique(&mut public, addr);
     }
     public
+}
+
+/// On the server's LAN, that LAN address stays ahead of a public address.
+///
+/// A saved public route, including one that answered on cellular, does not
+/// jump the queue while this computer shares the server's /24. A LAN address
+/// that answered recently is included when this computer's own address is
+/// unknown, so a missed interface list does not hide the path that just worked.
+fn promote_same_lan(order: Vec<String>, routes: &ServerRoutes, mine: &[Ipv4Addr]) -> Vec<String> {
+    let mut lan = Vec::new();
+    for raw in routes.primary_lan.iter().chain(routes.standby_lan.iter()) {
+        let addr = canonical(raw);
+        if on_subnet(&addr, mine) {
+            push_unique(&mut lan, addr);
+        }
+    }
+    let preferred = canonical(&routes.preferred);
+    let listed = routes
+        .primary_lan
+        .iter()
+        .chain(routes.standby_lan.iter())
+        .any(|addr| same_endpoint(addr, &preferred));
+    if listed && miss_count(routes, &preferred) < 4 && (mine.is_empty() || on_subnet(&preferred, mine)) {
+        if let Some(pos) = lan.iter().position(|addr| same_endpoint(addr, &preferred)) {
+            let item = lan.remove(pos);
+            lan.insert(0, item);
+        } else {
+            lan.insert(0, preferred);
+        }
+    }
+    if lan.is_empty() {
+        return order;
+    }
+    let mut out = lan;
+    for addr in order {
+        push_unique(&mut out, addr);
+    }
+    out
+}
+
+/// True when the next dial should leave `current` for a same-subnet LAN address.
+pub fn lan_should_replace(current: &str, routes: &ServerRoutes, mine: &[Ipv4Addr]) -> bool {
+    let targets = dial_targets(routes, mine, "");
+    match targets.first() {
+        Some(first) if on_subnet(first, mine) && !same_endpoint(first, current) => true,
+        _ => false,
+    }
 }
 
 pub fn miss_count(routes: &ServerRoutes, addr: &str) -> u32 {
@@ -921,13 +972,12 @@ mod tests {
         assert_eq!(order[0], "192.168.0.20:21200");
         assert!(order.iter().any(|addr| addr == "198.51.100.8:21200"));
         assert_eq!(order.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
-        // 10.1.1.8 is the standby LAN. The primary LAN is a different /24, so
-        // this computer dials the primary's public address first, then the
-        // standby it shares a subnet with.
+        // 10.1.1.8 is the standby LAN on this computer's /24, so it is first.
+        // The primary's public address follows.
         let cabin = [v4(10, 1, 1, 50)];
         let from_cabin = registration_targets("", &sample(), &cabin, "");
-        assert_eq!(from_cabin[0], "204.248.122.44:21200");
-        assert_eq!(from_cabin[1], "10.1.1.8:21200");
+        assert_eq!(from_cabin[0], "10.1.1.8:21200");
+        assert_eq!(from_cabin[1], "204.248.122.44:21200");
         assert!(from_cabin.iter().any(|addr| addr == "198.51.100.8:21200"));
         assert_eq!(from_cabin.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
     }
@@ -1000,10 +1050,12 @@ mod tests {
         routes.primary_public.push("68.234.75.68:21200".into());
         let house = [v4(192, 168, 0, 10)];
         let order = dial_targets(&routes, &house, "pjdesk.spader.us:21200");
-        assert_eq!(order[0], "pjdesk.spader.us:21200");
-        assert!(!order.iter().any(|addr| addr.starts_with("68.234.75.68")), "{order:?}");
+        assert!(order[0].starts_with("192.168.0."), "{order:?}");
+        let lan = order.iter().position(|addr| addr.starts_with("192.168.0.20")).unwrap();
         let stale = order.iter().position(|addr| addr.starts_with("204.248.122.44")).unwrap();
-        assert!(stale > 1, "{order:?}");
+        assert!(lan < stale, "{order:?}");
+        assert!(order.iter().any(|addr| addr == "pjdesk.spader.us:21200"), "{order:?}");
+        assert!(!order.iter().any(|addr| addr.starts_with("68.234.75.68")), "{order:?}");
         assert_eq!(miss_count(&routes, "pjdesk.spader.us:21200"), 0);
     }
 
@@ -1017,12 +1069,44 @@ mod tests {
         note_timeout(&mut routes, "204.248.122.44:21200");
         let cellular = [v4(10, 9, 9, 9)];
         let order = dial_targets(&routes, &cellular, "pjdesk.spader.us:21200");
-        assert_eq!(order[0], "204.248.122.44:21200", "{order:?}");
-        assert!(order.iter().any(|addr| addr == "198.51.100.8:21200"), "{order:?}");
+        assert_eq!(order[0], "198.51.100.8:21200", "{order:?}");
+        assert!(!order.iter().any(|addr| addr.starts_with("204.248.122.44")), "{order:?}");
         assert!(!order.iter().any(|addr| addr.starts_with("192.168.0.")), "{order:?}");
-        let public = order.iter().position(|addr| addr.starts_with("204.248.122.44")).unwrap();
         let name = order.iter().position(|addr| addr.contains("pjdesk.spader.us")).unwrap();
-        assert!(public < name, "{order:?}");
+        assert!(name > 0, "{order:?}");
+    }
+
+    #[test]
+    fn the_home_wifi_dials_the_server_lan_before_a_stale_public_route() {
+        let mut routes = ServerRoutes {
+            primary_lan: vec!["192.168.0.193:21200".into()],
+            primary_public: vec!["204.248.122.44:21200".into()],
+            names: vec!["pjdesk.spader.us:21200".into()],
+            preferred: "204.248.122.44:21200".into(),
+            ..ServerRoutes::default()
+        };
+        let phone = [v4(192, 168, 0, 245)];
+        let order = dial_targets(&routes, &phone, "204.248.122.44:21200");
+        assert_eq!(order[0], "192.168.0.193:21200", "{order:?}");
+        assert!(lan_should_replace("204.248.122.44:21200", &routes, &phone));
+        assert!(!lan_should_replace("192.168.0.193:21200", &routes, &phone));
+        for _ in 0..4 {
+            note_timeout(&mut routes, "204.248.122.44:21200");
+        }
+        let pruned = dial_targets(&routes, &phone, "");
+        assert_eq!(pruned[0], "192.168.0.193:21200", "{pruned:?}");
+        assert!(!pruned.iter().any(|addr| addr.starts_with("204.248.122.44")), "{pruned:?}");
+        let away = dial_targets(&routes, &[v4(10, 9, 9, 9)], "pjdesk.spader.us:21200");
+        assert!(!away.iter().any(|addr| addr.starts_with("204.248.122.44")), "{away:?}");
+        assert!(!away.iter().any(|addr| addr.starts_with("192.168.0.193")), "{away:?}");
+        let remembered = ServerRoutes {
+            primary_lan: vec!["192.168.0.193:21200".into()],
+            primary_public: vec!["204.248.122.44:21200".into()],
+            preferred: "192.168.0.193:21200".into(),
+            ..ServerRoutes::default()
+        };
+        let without_phone_ip = dial_targets(&remembered, &[], "");
+        assert_eq!(without_phone_ip[0], "192.168.0.193:21200", "{without_phone_ip:?}");
     }
 
     #[test]

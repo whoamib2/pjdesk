@@ -436,4 +436,17 @@ mod tests {
         assert!(is_lan_ip(on_lan[0].ip()));
         assert_eq!(*on_lan.last().unwrap(), public);
     }
+
+    #[test]
+    fn home_wifi_reaches_the_host_on_its_lan_before_a_stale_public_address() {
+        let public = "204.248.122.44:21201".parse().unwrap();
+        let local = vec!["192.168.0.193:40000".parse().unwrap(), public];
+        let phone = [Ipv4Addr::new(192, 168, 0, 245)];
+        let got = candidates_from(public, &local, &phone);
+        assert_eq!(got[0].ip().to_string(), "192.168.0.193");
+        assert_eq!(*got.last().unwrap(), public);
+        let order = dial_order(&got);
+        assert_eq!(order[0].0, "192.168.0.193:21201".parse().unwrap());
+        assert!(order[0].1.is_zero());
+    }
 }

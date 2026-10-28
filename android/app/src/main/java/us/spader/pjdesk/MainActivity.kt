@@ -192,6 +192,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onStart() {
         super.onStart()
+        app.engine.noteLocalAddresses()
         val away = app.backgroundAt
         app.backgroundAt = 0L
         if (away > 0L && !app.bioPrompt && app.uiUnlocked.value) {
@@ -2860,7 +2861,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun signInHeartbeat(): String =
-        app.engine.state.value.server.ifBlank { app.store.accountServer }
+        us.spader.pjdesk.core.liveSignInServer(app.engine.state.value.signalReached, CloudGate.serverUp)
 
     private fun signInNote(address: String, step: String, detail: String) {
         val line = us.spader.pjdesk.core.signInLogLine(address, step, detail)

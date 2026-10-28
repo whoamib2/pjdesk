@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.59
+
+Windows is 0.6.59. Android is 0.6.59 (versionCode 63128). The installer reads that version from Cargo.toml, so the files are PJDesk-Client-Setup-0.6.59.exe and PJDesk-Server-Setup-0.6.59.exe. This build does not redeploy the worker and does not run `cloud\deploy.cmd`. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off until the computers you want to keep have signed in. Do not delete cloud-sync.json, cloud-state.json, or account-mirror.json. The phone needs 63128. The PJDesk client and PJDesk Server both need this build. A computer already on 0.6.58 will take this build from auto-update once v0.6.59 is the latest release. This machine has no Windows PC and no wine, so the windows were not clicked through here. The phone was not clicked through here.
+
+* On the same network as the server, the LAN address is dialed first for the heartbeat, for sign-in, and for a session. A saved public address, including 204.248.122.44, does not go ahead of 192.168.0.193 when the phone is 192.168.0.245. A public address that has timed out four times is left out. If the phone is already registered through the public address and it is on that LAN, it reconnects to the LAN address. Sign-in uses that heartbeating connection and names its real address, not the saved public route.
+
 ## 0.6.58
 
 Windows is 0.6.58. Android is 0.6.58 (versionCode 63127). The installer reads that version from Cargo.toml, so the files are PJDesk-Client-Setup-0.6.58.exe and PJDesk-Server-Setup-0.6.58.exe. This build does not redeploy the worker and does not run `cloud\deploy.cmd`. Protocol stays 3. No tag, no release, and no GitHub Actions. If pjdesk.spader.us:21200 is already the active address, do not run the 0.6.1 slot-clearing SQL. Leave Require signed-in accounts off until the computers you want to keep have signed in. Do not delete cloud-sync.json, cloud-state.json, or account-mirror.json. The phone needs 63127. The PJDesk client and PJDesk Server both need this build. A computer already on 0.6.57 will take this build from auto-update once v0.6.58 is the latest release. This machine has no Windows PC and no wine, so the windows were not clicked through here. The phone was not clicked through here.

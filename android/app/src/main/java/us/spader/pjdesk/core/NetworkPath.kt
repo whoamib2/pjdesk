@@ -6,6 +6,7 @@ import android.net.NetworkCapabilities
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import java.net.Inet4Address
 
 /**
  * Names the network this phone is on, so a LAN address that worked here can be
@@ -13,6 +14,20 @@ import android.os.Build
  * address. The Wi-Fi name is used when the system will share it.
  */
 object NetworkPath {
+    /** IPv4 addresses on the network this phone is using. Loopback is left out. */
+    fun ipv4s(context: Context): List<String> {
+        val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java) ?: return emptyList()
+        val props = cm.getLinkProperties(cm.activeNetwork ?: return emptyList()) ?: return emptyList()
+        val out = ArrayList<String>()
+        for (link in props.linkAddresses) {
+            val addr = link.address
+            if (addr !is Inet4Address || addr.isLoopbackAddress || addr.isAnyLocalAddress) continue
+            val text = addr.hostAddress ?: continue
+            if (text.isNotBlank() && !out.contains(text)) out.add(text)
+        }
+        return out
+    }
+
     fun key(context: Context): String {
         val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java) ?: return ""
         val network = cm.activeNetwork ?: return ""
