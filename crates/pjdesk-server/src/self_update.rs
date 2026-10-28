@@ -631,6 +631,10 @@ pub fn note_installer_result(data_dir: &Path) {
 pub fn restart_if_update_left_service_down() {
     let Some(age) = pjdesk_proto::update::update_attempt_age() else { return };
     let (installed, running) = crate::service::status();
+    if pjdesk_proto::update::watchdog_done(age, running) {
+        pjdesk_proto::update::clear_update_attempt();
+        return;
+    }
     if !pjdesk_proto::update::watchdog_should_start(age, running) {
         return;
     }

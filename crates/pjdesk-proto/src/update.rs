@@ -422,9 +422,22 @@ fn download_verified_progress(update: &Available, progress: &dyn Fn(&str), lock_
 /// How long a failed update may leave the service stopped before something starts it.
 pub const UPDATE_WATCHDOG_SECS: u64 = 60;
 
-/// True when an update attempt is old enough and the service is still stopped.
+/// After this long an update attempt no longer explains a stopped service.
+/// A person who stops the service later must not have it started again.
+pub const UPDATE_WATCHDOG_WINDOW_SECS: u64 = 15 * 60;
+
+/// True when an update attempt is old enough, still recent, and the service is stopped.
 pub fn watchdog_should_start(age_secs: u64, service_running: bool) -> bool {
-    !service_running && age_secs >= UPDATE_WATCHDOG_SECS
+    !service_running && (UPDATE_WATCHDOG_SECS..UPDATE_WATCHDOG_WINDOW_SECS).contains(&age_secs)
+}
+
+/// The marker has done its job: the service is back, or the attempt is too old.
+pub fn watchdog_done(age_secs: u64, service_running: bool) -> bool {
+    age_secs >= UPDATE_WATCHDOG_WINDOW_SECS || (service_running && age_secs >= UPDATE_WATCHDOG_SECS)
+}
+
+pub fn clear_update_attempt() {
+    let _ = std::fs::remove_file(update_attempt_path());
 }
 
 /// `replaced` is true only when the installer wrote that the program file was swapped.
@@ -858,6 +871,11 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa *PJDesk-Server-
         assert!(!watchdog_should_start(10, false));
         assert!(watchdog_should_start(60, false));
         assert!(!watchdog_should_start(120, true));
+        assert!(!watchdog_should_start(UPDATE_WATCHDOG_WINDOW_SECS, false), "a later manual stop is left alone");
+        assert!(!watchdog_should_start(3 * 24 * 3600, false));
+        assert!(watchdog_done(UPDATE_WATCHDOG_WINDOW_SECS, false));
+        assert!(watchdog_done(61, true));
+        assert!(!watchdog_done(30, true), "the installer may still be running");
         let script = service_watchdog_script("PJDeskServer");
         assert!(script.contains("ping -n 61"), "{script}");
         assert!(script.contains("net start \"PJDeskServer\""), "{script}");
