@@ -41,6 +41,7 @@ VIAddVersionKey "OriginalFilename" "PJDesk-Client-Setup-${VERSION}.exe"
 !include "MUI2.nsh"
 !include "StrFunc.nsh"
 ${Using:StrFunc} StrStr
+!include "replace.nsh"
 
 !define MUI_ICON "pjdesk.ico"
 !define MUI_UNICON "pjdesk.ico"
@@ -63,14 +64,21 @@ ${Using:StrFunc} StrStr
 ; Don't load DLLs from the folder the installer was launched from.
 Function .onInit
   System::Call 'kernel32::SetDllDirectoryA(t "")'
+  ; A locked file must fail the install. The default lets a silent install skip it.
+  AllowSkipFiles off
 FunctionEnd
 
 Function un.onInit
   System::Call 'kernel32::SetDllDirectoryA(t "")'
 FunctionEnd
 
-; If the install stops after the service was stopped, bring the computer back.
+; If the install stops after the service was stopped, put the previous
+; program back when the new file is not there, then bring the service back.
 Function .onInstFailed
+  IfFileExists "$INSTDIR\${EXE}" client_failed_start 0
+    IfFileExists "$INSTDIR\${EXE}.old" 0 client_failed_start
+      Rename "$INSTDIR\${EXE}.old" "$INSTDIR\${EXE}"
+  client_failed_start:
   nsExec::Exec '"$INSTDIR\${EXE}" update-handoff'
   nsExec::Exec 'net start ${APPNAME}'
 FunctionEnd
@@ -80,13 +88,14 @@ FunctionEnd
 Section "PJDesk (required)" SecCore
   SectionIn RO
 
-  ; Upgrade in place: stop the service and close the app so the files unlock.
-  nsExec::Exec 'net stop ${APPNAME}'
-  nsExec::Exec 'taskkill /F /IM ${EXE}'
-  Sleep 800
-
-  SetOutPath "$INSTDIR"
+  ; Extract beside the running program, then stop, wait, and swap.
+  ; The service is started again inside the swap, before the registry is written.
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  SetOverwrite on
   File "${EXE}"
+  SetOutPath "$INSTDIR"
+  !insertmacro SwapLockedExe "${APPNAME}" "${EXE}"
   File "README.md"
   File "LICENSE"
   File "QUICKSTART.txt"
@@ -155,11 +164,20 @@ Function RememberNetworkKey
 FunctionEnd
 
 Section "Uninstall"
+  StrCpy $PjService "${APPNAME}"
+  StrCpy $PjImage "${EXE}"
+  Call un.PjStopImage
   nsExec::Exec 'schtasks /Delete /TN "PJDesk Update" /F'
   ; Remove the service if it was installed (ignored if it wasn't).
   ExecWait '"$INSTDIR\${EXE}" service uninstall'
 
   Delete "$INSTDIR\${EXE}"
+  Delete "$INSTDIR\${EXE}.old"
+  Delete "$INSTDIR\install.log"
+  Delete "$INSTDIR\$$null"
+  IfFileExists "$INSTDIR\${EXE}" 0 client_exe_gone
+    SetErrorLevel 1
+  client_exe_gone:
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\QUICKSTART.txt"

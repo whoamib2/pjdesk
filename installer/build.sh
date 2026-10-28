@@ -54,7 +54,7 @@ cp "$TARGET/pjdesk.exe" "$TARGET/pjdesk-server.exe" "$WORK/"
 cp "$ROOT/README.md" "$ROOT/LICENSE" "$WORK/"
 cp "$ROOT/crates/pjdesk/assets/pjdesk.ico" "$WORK/"
 cp "$ROOT/crates/pjdesk-server/assets/pjdesk-server.ico" "$WORK/"
-cp "$HERE/pjdesk-client.nsi" "$HERE/pjdesk-server.nsi" "$WORK/"
+cp "$HERE/pjdesk-client.nsi" "$HERE/pjdesk-server.nsi" "$HERE/replace.nsh" "$WORK/"
 
 # QUICKSTART packaged with the client.
 cat > "$WORK/QUICKSTART.txt" <<'EOF'
