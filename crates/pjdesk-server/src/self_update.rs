@@ -181,7 +181,10 @@ impl UpdateStatus {
         if pjdesk_proto::update::parse_version(available).is_some() {
             return Some(available.to_string());
         }
-        if !(self.last_result.starts_with("Installing ") || self.last_result.contains(" is available")) {
+        if !(self.last_result.starts_with("Installing ")
+            || self.last_result.contains(" is available")
+            || (self.last_result.starts_with("Update ") && self.last_result.contains(" available")))
+        {
             return None;
         }
         self.last_result.split_whitespace().find_map(|token| {
@@ -348,7 +351,7 @@ pub fn set_window(data_dir: &Path, start: &str, end: &str) -> Result<()> {
     Ok(())
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
@@ -501,7 +504,7 @@ pub fn check_sentence(current: &str, available: Option<&str>, error: Option<&str
         return (err.clone(), String::new(), err);
     }
     if let Some(ver) = available.map(str::trim).filter(|s| !s.is_empty()) {
-        return (format!("Update {ver} available, Install"), ver.to_string(), String::new());
+        return (format!("Update {ver} available"), ver.to_string(), String::new());
     }
     (format!("Up to date ({current})"), String::new(), String::new())
 }
@@ -658,13 +661,66 @@ pub fn service_tick(data_dir: &Path) {
         return;
     }
     let status = UpdateStatus::load(data_dir);
-    let now = now_secs();
-    if status.last_check_at > 0 && now.saturating_sub(status.last_check_at) < settings.interval_secs() {
+    if !auto_due(&settings, &status, env!("CARGO_PKG_VERSION"), now_secs()) {
         return;
     }
     match install_if_planned(data_dir, false) {
         Ok(msg) => tracing::info!("server update: {msg}"),
         Err(e) => tracing::warn!("server update: {e:#}"),
+    }
+}
+
+/// Whether the automatic check should run now. A check the window started
+/// (or a deferred plan) that recorded a newer version does not restart the
+/// 30–60 minute timer: the next tick tries the install. A recorded error still
+/// waits the interval so a failing install is not retried every minute.
+pub fn auto_due(settings: &Settings, status: &UpdateStatus, current: &str, now: u64) -> bool {
+    if !settings.auto {
+        return false;
+    }
+    if status.last_check_at == 0 || now.saturating_sub(status.last_check_at) >= settings.interval_secs() {
+        return true;
+    }
+    let offered = status.available.trim().trim_start_matches('v');
+    status.error.trim().is_empty()
+        && !offered.is_empty()
+        && !pjdesk_proto::update::is_prerelease(offered)
+        && pjdesk_proto::update::is_newer(current, offered)
+}
+
+/// The version an update sentence offers: `Update 0.6.68 available` (or the
+/// older `Update 0.6.68 available, Install`).
+pub fn offer_in(sentence: &str) -> Option<String> {
+    let rest = sentence.trim().strip_prefix("Update ")?;
+    let (ver, tail) = rest.split_once(' ')?;
+    if !tail.starts_with("available") {
+        return None;
+    }
+    let ver = ver.trim_start_matches('v');
+    pjdesk_proto::update::parse_version(ver).map(|_| ver.to_string())
+}
+
+/// The status a finished check in the window stands for, stamped now. Used
+/// until the service's own status file catches up.
+pub fn status_from_check(current: &str, message: &str, failed: bool, now: u64) -> UpdateStatus {
+    let message = message.trim();
+    if failed {
+        return UpdateStatus { last_check_at: now, last_result: message.into(), available: String::new(), error: message.into() };
+    }
+    if let Some(ver) = offer_in(message) {
+        let (sentence, available, _) = check_sentence(current, Some(&ver), None);
+        let error = message.strip_prefix(sentence.as_str()).unwrap_or("").trim().trim_end_matches('.').trim().to_string();
+        let error = if error.is_empty() || error == ", Install" { String::new() } else { error };
+        return UpdateStatus { last_check_at: now, last_result: sentence, available, error };
+    }
+    UpdateStatus { last_check_at: now, last_result: message.into(), available: String::new(), error: String::new() }
+}
+
+/// The newer of the service's status and the window's own last check.
+pub fn latest_status(service: UpdateStatus, window: Option<&UpdateStatus>) -> UpdateStatus {
+    match window {
+        Some(w) if w.last_check_at > service.last_check_at => w.clone(),
+        _ => service,
     }
 }
 
@@ -925,12 +981,53 @@ mod tests {
     }
 
     #[test]
+    fn a_found_update_is_installed_on_the_next_tick_not_after_the_timer() {
+        let mut settings = Settings::default();
+        settings.auto = true;
+        settings.jitter_secs = 600;
+        let now = 1_000_000;
+        let offered = UpdateStatus { last_check_at: now - 60, last_result: "Update 0.6.68 available".into(), available: "0.6.68".into(), error: String::new() };
+        assert!(auto_due(&settings, &offered, "0.6.67", now), "a manual check must not push the install back an hour");
+        let up = UpdateStatus { last_check_at: now - 60, last_result: "Up to date (0.6.67)".into(), ..Default::default() };
+        assert!(!auto_due(&settings, &up, "0.6.67", now));
+        let failed = UpdateStatus { error: "download failed".into(), ..offered.clone() };
+        assert!(!auto_due(&settings, &failed, "0.6.67", now), "a failing install waits the interval");
+        assert!(auto_due(&settings, &failed, "0.6.67", now + 3600));
+        settings.auto = false;
+        assert!(!auto_due(&settings, &offered, "0.6.67", now));
+    }
+
+    #[test]
+    fn the_window_shows_its_own_newer_check_with_the_offer() {
+        assert_eq!(offer_in("Update 0.6.68 available").as_deref(), Some("0.6.68"));
+        assert_eq!(offer_in("Update 0.6.68 available, Install").as_deref(), Some("0.6.68"));
+        assert_eq!(offer_in("Up to date (0.6.67)"), None);
+        let stale = UpdateStatus { last_check_at: 100, last_result: "Up to date (0.6.67)".into(), ..Default::default() };
+        let fresh = status_from_check("0.6.67", "Update 0.6.68 available, Install", false, 200);
+        assert_eq!(fresh.available, "0.6.68");
+        assert_eq!(fresh.last_result, "Update 0.6.68 available");
+        assert!(fresh.error.is_empty());
+        let shown = latest_status(stale.clone(), Some(&fresh));
+        assert_eq!(shown.last_check_at, 200);
+        assert_eq!(shown.available, "0.6.68");
+        let deferred = status_from_check("0.6.67", "Update 0.6.68 available outside the maintenance window.", false, 200);
+        assert_eq!(deferred.available, "0.6.68");
+        assert_eq!(deferred.error, "outside the maintenance window");
+        let err = status_from_check("0.6.67", "fetching release: timed out", true, 300);
+        assert_eq!(err.error, "fetching release: timed out");
+        assert_eq!(latest_status(fresh.clone(), Some(&err)).last_check_at, 300);
+        assert_eq!(latest_status(fresh.clone(), Some(&stale)).last_check_at, 200);
+        let st = UpdateStatus { last_check_at: 1, last_result: "Update 0.6.68 available".into(), ..Default::default() };
+        assert_eq!(st.offered_version().as_deref(), Some("0.6.68"));
+    }
+
+    #[test]
     fn a_check_records_the_time_and_names_the_result() {
         let (up, available, error) = check_sentence("0.6.61", None, None);
         assert_eq!(up, "Up to date (0.6.61)");
         assert!(available.is_empty() && error.is_empty());
         let (offer, available, error) = check_sentence("0.6.61", Some("9.9.9"), None);
-        assert_eq!(offer, "Update 9.9.9 available, Install");
+        assert_eq!(offer, "Update 9.9.9 available");
         assert_eq!(available, "9.9.9");
         assert!(error.is_empty());
         let (failed, _, error) = check_sentence("0.6.61", None, Some("fetching https://pjdesk.com/api/release: timed out"));
@@ -942,7 +1039,7 @@ mod tests {
         record(&dir, &offer, &available, "").unwrap();
         let loaded = UpdateStatus::load(&dir);
         assert!(loaded.last_check_at > 0);
-        assert_eq!(loaded.last_result, "Update 9.9.9 available, Install");
+        assert_eq!(loaded.last_result, "Update 9.9.9 available");
         assert_eq!(loaded.available, "9.9.9");
         let mut settings = Settings::default();
         settings.jitter_secs = 1;

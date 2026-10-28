@@ -203,6 +203,10 @@ struct App {
     update_status: crate::self_update::UpdateStatus,
     /// The sentence from the latest check, shown before the snapshot reloads.
     update_feedback: String,
+    /// The window's own last check, shown until the service's status catches up.
+    window_check: Option<crate::self_update::UpdateStatus>,
+    /// Set while a "Check for updates now" job is running.
+    checking_updates: bool,
     /// Set while an installer is starting or the service is restarting.
     install_watch: Option<InstallWatch>,
     /// Set when the new service is up and this window could not reopen itself.
@@ -403,6 +407,8 @@ impl App {
             update_auto_dirty: false,
             update_status: crate::self_update::UpdateStatus::default(),
             update_feedback: String::new(),
+            window_check: None,
+            checking_updates: false,
             install_watch: None,
             reopen_version: String::new(),
             cloud_email: String::new(),
@@ -966,6 +972,7 @@ impl App {
     fn start_update_check(&mut self) {
         self.status = "Checking for updates…".into();
         self.update_feedback = "Checking for updates…".into();
+        self.checking_updates = true;
         if self.control_ready || self.access != Access::Readable {
             self.spawn_cloud_job(update_check_job);
             return;
@@ -1089,6 +1096,7 @@ impl App {
             crate::self_update::InstallWatchResult::Updated(version) => {
                 tracing::info!("server update: updated to {version}");
                 self.install_watch = None;
+                self.window_check = None;
                 let line = format!("Updated to {version}");
                 self.update_feedback = line.clone();
                 self.status = line;
@@ -1113,6 +1121,40 @@ impl App {
         self.update_feedback = self.status.clone();
     }
 
+    /// Check is always shown. A known newer version adds a primary
+    /// "Install X" button; while an install runs it shows the progress line.
+    fn update_buttons(&self, ui: &mut egui::Ui, available: &str, can_install: bool) -> (bool, Option<String>) {
+        let busy = self.cloud_job.is_some() || self.install_watch.is_some();
+        let mut check = false;
+        let mut install = None;
+        let offered = install_offer(available, env!("CARGO_PKG_VERSION"));
+        ui.horizontal(|ui| {
+            if let Some(version) = offered.as_deref() {
+                let label = RichText::new(format!("Install {version}")).strong().color(egui::Color32::WHITE);
+                if ui.add_enabled(!busy && can_install, egui::Button::new(label).fill(p(ui).accent)).clicked() {
+                    install = Some(version.to_string());
+                }
+            }
+            if ui.add_enabled(!busy, egui::Button::new("Check for updates now")).clicked() {
+                check = true;
+            }
+            if busy {
+                ui.add(egui::Spinner::new());
+                let line = if self.install_watch.is_some() {
+                    self.updating_line()
+                } else if self.checking_updates {
+                    "Checking for updates…".to_string()
+                } else {
+                    String::new()
+                };
+                if !line.is_empty() {
+                    ui.label(RichText::new(line).color(p(ui).muted).size(12.0));
+                }
+            }
+        });
+        (check, install)
+    }
+
     fn keep_update_status(&self, message: &str) -> bool {
         self.install_watch.is_some() && crate::self_update::service_down_notice(message)
     }
@@ -1123,11 +1165,14 @@ impl App {
             return;
         }
         use crate::self_update::{self};
-        let reported = shown_update(
-            self.update_status.last_check_at,
-            &self.update_status.last_result,
-            &self.update_status.available,
-            &self.update_status.error,
+        let reported = self_update::latest_status(
+            shown_update(
+                self.update_status.last_check_at,
+                &self.update_status.last_result,
+                &self.update_status.available,
+                &self.update_status.error,
+            ),
+            self.window_check.as_ref(),
         );
         let may_edit = self.may_edit_settings();
         card(ui, |ui| {
@@ -1234,16 +1279,12 @@ impl App {
                 }
             }
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let busy = self.cloud_job.is_some() || self.install_watch.is_some();
-                if ui.add_enabled(!busy, egui::Button::new("Check for updates now")).clicked() {
-                    self.start_update_check();
-                }
-                if !reported.available.is_empty() && ui.add_enabled(!busy, egui::Button::new("Install this update").fill(p(ui).accent)).clicked()
-                {
-                    self.start_install(&reported.available);
-                }
-            });
+            let (check, install) = self.update_buttons(ui, &reported.available, true);
+            if check {
+                self.start_update_check();
+            } else if let Some(version) = install {
+                self.start_install(&version);
+            }
         });
     }
 
@@ -1670,7 +1711,10 @@ impl App {
             if !snap.window_start.is_empty() || !snap.window_end.is_empty() {
                 ui.label(format!("Maintenance window {} to {}", snap.window_start, snap.window_end));
             }
-            let reported = shown_update(snap.last_check_at, &snap.last_result, &snap.update_available, &snap.update_error);
+            let reported = crate::self_update::latest_status(
+                shown_update(snap.last_check_at, &snap.last_result, &snap.update_available, &snap.update_error),
+                self.window_check.as_ref(),
+            );
             let checked = if reported.last_check_at == 0 {
                 "Last check: never".to_string()
             } else {
@@ -1694,18 +1738,14 @@ impl App {
                     self.reopen_after_update();
                 }
             }
+            ui.add_space(6.0);
+            let (check, install) = self.update_buttons(ui, &reported.available, true);
+            check_now = check;
+            if let Some(version) = install {
+                install_now = true;
+                install_version = version;
+            }
             if managed {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let busy = self.cloud_job.is_some() || self.install_watch.is_some();
-                    if ui.add_enabled(!busy, egui::Button::new("Check for updates now")).clicked() {
-                        check_now = true;
-                    }
-                    if !reported.available.is_empty() && ui.add_enabled(!busy, egui::Button::new("Install this update")).clicked() {
-                        install_now = true;
-                        install_version = reported.available.clone();
-                    }
-                });
                 if self.update_start.is_empty() && !snap.window_start.is_empty() {
                     self.update_start = snap.window_start.clone();
                 }
@@ -2759,6 +2799,22 @@ impl App {
         let Some(rx) = &self.cloud_job else { return };
         let Ok(result) = rx.try_recv() else { return };
         self.cloud_job = None;
+        if std::mem::take(&mut self.checking_updates) {
+            let (msg, failed) = match &result {
+                Ok(JobDone::Message(msg)) => (msg.clone(), false),
+                Err(err) => (err.clone(), true),
+                Ok(_) => (String::new(), true),
+            };
+            if !msg.trim().is_empty() {
+                self.window_check = Some(crate::self_update::status_from_check(
+                    env!("CARGO_PKG_VERSION"),
+                    &msg,
+                    failed,
+                    crate::self_update::now_secs(),
+                ));
+                self.update_feedback = msg;
+            }
+        }
         if self.install_watch.is_some() {
             match result {
                 Ok(JobDone::Message(msg)) => self.note_install_job(Ok(msg)),
@@ -4285,6 +4341,15 @@ fn sign_in_through_service(email: String, password: String) -> anyhow::Result<Jo
     outcome
 }
 
+/// The version an Install button should offer, if it is newer than this program.
+fn install_offer(available: &str, current: &str) -> Option<String> {
+    let version = available.trim().trim_start_matches('v');
+    if version.is_empty() || !pjdesk_proto::update::is_newer(current, version) {
+        return None;
+    }
+    Some(version.to_string())
+}
+
 fn is_update_sentence(text: &str) -> bool {
     let text = text.trim();
     text.starts_with("Up to date (")
@@ -4988,6 +5053,14 @@ fn standby_role_text(active_name: &str, epoch: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_offered_newer_version_gets_a_real_install_button() {
+        assert_eq!(super::install_offer("0.6.68", "0.6.67").as_deref(), Some("0.6.68"));
+        assert_eq!(super::install_offer("v0.6.68", "0.6.67").as_deref(), Some("0.6.68"));
+        assert_eq!(super::install_offer("", "0.6.67"), None);
+        assert_eq!(super::install_offer("0.6.67", "0.6.67"), None);
+    }
+
     use super::*;
 
     #[test]
