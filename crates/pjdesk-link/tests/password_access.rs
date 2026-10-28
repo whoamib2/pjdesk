@@ -199,3 +199,60 @@ async fn five_failures_lock_the_source_and_a_later_try_is_told_to_wait() {
     assert_eq!(still.to_string(), text);
     assert_eq!(checks.load(Ordering::SeqCst), 5, "a locked attempt does not check the password");
 }
+
+/// A host with no permanent password says so before any password is tried,
+/// and the controller asks the person on the same connection. No attempt is
+/// counted as a wrong password.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_without_a_permanent_password_skips_the_prompt() {
+    let pair = pair();
+    let host = pair.host;
+    let serve = tokio::spawn(async move {
+        let incoming = host.accept().await.expect("the controller connects");
+        let connection = incoming.await.unwrap();
+        let passwords = vec!["one-time-pass".to_string()];
+        let attempt = AtomicBool::new(false);
+        let fail = || "wrong password".to_string();
+        let result = session::host_auth_facts(&connection, &passwords, Some(false), "CABINDESK", &attempt, &fail).await;
+        let asked = match result {
+            Err(e) => e.is::<session::NeedsApproval>(),
+            Ok(_) => false,
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        asked
+    });
+    let connection = dial(&pair.controller, pair.addr).await;
+    let permanent = session::controller_probe(&connection).await;
+    assert_eq!(permanent, Some(false));
+    assert_eq!(session::after_probe(permanent), session::NoPassword::AskPerson);
+    let _ = tokio::time::timeout(
+        Duration::from_millis(500),
+        session::controller_ask_person_for(&connection, "Pixel", Duration::from_millis(400)),
+    )
+    .await;
+    assert!(serve.await.unwrap(), "the host received the ask on the same connection");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_with_a_permanent_password_or_an_older_one_gets_the_prompt() {
+    let pair = pair();
+    let host = pair.host;
+    let serve = tokio::spawn(async move {
+        let incoming = host.accept().await.expect("the controller connects");
+        let connection = incoming.await.unwrap();
+        let passwords = vec!["one-time-pass".to_string(), "permanent-secret".to_string()];
+        let attempt = AtomicBool::new(false);
+        let fail = || "wrong password".to_string();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            session::host_auth_facts(&connection, &passwords, Some(true), "CABINDESK", &attempt, &fail),
+        )
+        .await;
+    });
+    let connection = dial(&pair.controller, pair.addr).await;
+    assert_eq!(session::controller_probe(&connection).await, Some(true));
+    assert_eq!(session::after_probe(Some(true)), session::NoPassword::Prompt);
+    assert_eq!(session::after_probe(None), session::NoPassword::Prompt, "an older host cannot say");
+    connection.close(0u32.into(), b"done");
+    let _ = serve.await;
+}

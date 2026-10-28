@@ -440,6 +440,12 @@ impl HostState {
         }
     }
 
+    /// Whether a permanent password is set, read fresh from the config.
+    pub(crate) fn has_permanent(&self) -> bool {
+        self.reload_permanent();
+        self.permanent.lock().unwrap().as_deref().is_some_and(|p| !p.trim().is_empty())
+    }
+
     /// The passwords a controller may authenticate with: the one-time password,
     /// the permanent one when set, and the temporary support password.
     fn auth_passwords(&self) -> Vec<String> {
@@ -1715,7 +1721,8 @@ async fn accept_authenticated(
                     let fail_state = state.clone();
                     let fail_source = source.clone();
                     let fail = move || fail_state.note_wrong_password(&fail_source);
-                    match session::host_auth(&connection, &passwords, &my_name, &attempt_used, &fail).await {
+                    let permanent_set = state.has_permanent();
+                    match session::host_auth_facts(&connection, &passwords, Some(permanent_set), &my_name, &attempt_used, &fail).await {
                         Ok(auth) => Ok((connection, auth)),
                         Err(e) if e.is::<NeedsApproval>() => {
                             let wait = e.downcast::<NeedsApproval>().unwrap();

@@ -48,6 +48,13 @@ pub enum AuthMsg {
     /// Otherwise it is empty and the host uses `computer`, then `id`.
     /// Appended after [`AuthMsg::AskPerson`]. An older host cannot decode it.
     AskView { proto: u16, account: String, computer: String, id: String },
+    /// 0.6.69+. Controller → host, on its own stream before any password:
+    /// does this computer have a permanent password? An older host cannot
+    /// decode it; the controller then treats the answer as unknown.
+    Probe { proto: u16 },
+    /// 0.6.69+. Host → controller answer to [`AuthMsg::Probe`]. No secret:
+    /// only whether a permanent password is set.
+    Facts { permanent: bool },
 }
 
 /// Controller → host messages after authentication.

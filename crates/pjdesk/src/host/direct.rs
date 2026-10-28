@@ -66,7 +66,7 @@ async fn one(state: Arc<HostState>, incoming: quinn::Incoming) -> Result<()> {
     let fail_state = state.clone();
     let fail_source = source.clone();
     let fail = move || fail_state.note_wrong_password(&fail_source);
-    let mut auth = match session::host_auth(&connection, &passwords, &state.name, &attempt, &fail).await {
+    let mut auth = match session::host_auth_facts(&connection, &passwords, Some(state.has_permanent()), &state.name, &attempt, &fail).await {
         Ok(auth) => auth,
         Err(e) if e.is::<NeedsApproval>() => {
             let wait = e.downcast::<NeedsApproval>().unwrap();

@@ -220,6 +220,34 @@ pub async fn controller_auth_version(
     }
 }
 
+/// Asks the host whether it has a permanent password, before any password is
+/// tried. `None` when the host is older than 0.6.69 or did not answer: the
+/// controller then prompts as before, on a new connection.
+pub async fn controller_probe(connection: &Connection) -> Option<bool> {
+    let ask = async {
+        let (mut send, mut recv) = connection.open_bi().await.ok()?;
+        write_msg(&mut send, &AuthMsg::Probe { proto: PROTOCOL_VERSION }).await.ok()?;
+        match read_msg::<_, AuthMsg>(&mut recv, MAX_CONTROL_FRAME).await.ok()? {
+            AuthMsg::Facts { permanent } => Some(permanent),
+            _ => None,
+        }
+    };
+    timeout(Duration::from_secs(4), ask).await.ok().flatten()
+}
+
+/// What a controller with no saved password does after [`controller_probe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoPassword {
+    /// No permanent password on the host: ask the person, no prompt.
+    AskPerson,
+    /// The host has one, or is too old to say: show the password prompt.
+    Prompt,
+}
+
+pub fn after_probe(permanent: Option<bool>) -> NoPassword {
+    if permanent == Some(false) { NoPassword::AskPerson } else { NoPassword::Prompt }
+}
+
 /// Ask the host to show "wants to view your screen" instead of checking a password.
 ///
 /// `account` is empty when this computer is not signed in to pjdesk.com.
@@ -286,16 +314,44 @@ pub async fn controller_ask_person_for(
 pub async fn host_auth(
     connection: &Connection,
     passwords: &[String],
+    my_name: &str,
+    attempt_used: &AtomicBool,
+    failure_message: &(dyn Fn() -> String + Sync),
+) -> Result<Authenticated> {
+    host_auth_facts(connection, passwords, None, my_name, attempt_used, failure_message).await
+}
+
+/// [`host_auth`], and answers a controller's [`AuthMsg::Probe`] with whether
+/// a permanent password is set (`None` answers "set").
+pub async fn host_auth_facts(
+    connection: &Connection,
+    passwords: &[String],
+    permanent: Option<bool>,
     _my_name: &str,
     attempt_used: &AtomicBool,
     failure_message: &(dyn Fn() -> String + Sync),
 ) -> Result<Authenticated> {
-    let (mut send, mut recv) = timeout(Duration::from_secs(10), connection.accept_bi())
-        .await
-        .context("the controller did not start authentication")??;
-    let start: AuthMsg = timeout(Duration::from_secs(10), read_msg(&mut recv, MAX_CONTROL_FRAME))
-        .await
-        .context("the controller did not start authentication")??;
+    let mut probes = 0;
+    let (mut send, mut recv, start) = loop {
+        let (mut send, recv_stream) = timeout(Duration::from_secs(10), connection.accept_bi())
+            .await
+            .context("the controller did not start authentication")??;
+        let mut recv = recv_stream;
+        let start: AuthMsg = timeout(Duration::from_secs(10), read_msg(&mut recv, MAX_CONTROL_FRAME))
+            .await
+            .context("the controller did not start authentication")??;
+        if let AuthMsg::Probe { .. } = start {
+            probes += 1;
+            if probes > 2 {
+                bail!("the controller asked too many times");
+            }
+            // Unknown (an embedder that did not say) answers "set", so the controller prompts as before.
+            write_msg(&mut send, &AuthMsg::Facts { permanent: permanent.unwrap_or(true) }).await?;
+            let _ = send.finish();
+            continue;
+        }
+        break (send, recv, start);
+    };
     let (proto, controller_spakes, controller_name) = match start {
         AuthMsg::AskPerson { proto, controller_name } => {
             if !protocol_ok(proto) {

@@ -3700,7 +3700,8 @@ async fn accept_authenticated(
                         }
                         if status.locked { lockout::message(status.minutes) } else { "wrong password".into() }
                     };
-                    match session::host_auth(&connection, &passwords, &my_name, &attempt_used, &fail).await {
+                    let permanent_set = state.permanent.lock().unwrap().as_deref().is_some_and(|p| !p.trim().is_empty());
+                    match session::host_auth_facts(&connection, &passwords, Some(permanent_set), &my_name, &attempt_used, &fail).await {
                         Ok(auth) => Ok((connection, auth, ViewAsk::default())),
                         Err(e) if e.is::<NeedsApproval>() => {
                             let wait = e.downcast::<NeedsApproval>().unwrap();
@@ -3956,8 +3957,11 @@ async fn controller_session(
     let mut rejected = false;
     let mut note = String::new();
     let mut ask_person = ask_now;
+    // With no password in hand, ask the computer first whether it has a
+    // permanent password. Without one there is nothing to type: ask the person.
+    let mut probed = !password.is_empty() || ask_person;
     let (connection, path, auth) = loop {
-        if password.is_empty() && !ask_person {
+        if password.is_empty() && !ask_person && probed {
             emit(
                 &cb,
                 &json!({"event":"needPassword","id": target, "name": host_name, "rejected": rejected, "message": note}),
@@ -3994,6 +3998,19 @@ async fn controller_session(
                 return Err(anyhow::Error::msg(text));
             }
         };
+        if !probed {
+            probed = true;
+            match session::after_probe(session::controller_probe(&connection).await) {
+                session::NoPassword::AskPerson => {
+                    log_line(&cb, "That computer has no permanent password. Asking the person there instead.");
+                    ask_person = true;
+                }
+                session::NoPassword::Prompt => {
+                    connection.close(0u32.into(), b"password needed");
+                    continue;
+                }
+            }
+        }
         let authed = if ask_person {
             let who = if host_name.trim().is_empty() { format_id(target) } else { host_name.clone() };
             emit(&cb, &json!({"event":"status","text": format!("Waiting for {who} to accept…")}));

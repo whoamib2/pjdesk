@@ -690,11 +690,15 @@ async fn connect(
         Asked::View
     } else if ask_person {
         Asked::Person
-    } else if let Some(path) = ask {
-        wait_asked_password(path, &host_name).await?
+    } else if ask.is_some() {
+        // Placeholder until the computer says whether it has a permanent password.
+        Asked::Person
     } else {
         Asked::Password(password.to_string())
     };
+    // No password yet: ask the computer first. Without a permanent password
+    // there is nothing to type, so the window never shows the prompt.
+    let mut probe_first = ask.is_some() && !ask_view && !ask_person;
     let mut from_store = std::env::var("PJDESK_SAVED").ok().as_deref() == Some("1");
     let mut tries = 0u32;
     let (connection, path, auth) = loop {
@@ -706,6 +710,20 @@ async fn connect(
             punching.abort();
         }
         let (connection, path) = connected?;
+        if probe_first {
+            probe_first = false;
+            match session::after_probe(session::controller_probe(&connection).await) {
+                session::NoPassword::AskPerson => {
+                    tracing::info!("{} has no permanent password; asking the person there", format_id(target));
+                    attempt = Asked::Person;
+                }
+                session::NoPassword::Prompt => {
+                    connection.close(0u32.into(), b"password needed");
+                    attempt = wait_asked_password(ask.unwrap(), &host_name).await?;
+                    continue;
+                }
+            }
+        }
         let authed = match &attempt {
             Asked::View => {
                 tracing::info!("Requesting view access to {}", format_id(target));

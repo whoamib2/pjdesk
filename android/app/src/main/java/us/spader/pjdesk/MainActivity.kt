@@ -935,11 +935,14 @@ class MainActivity : FragmentActivity() {
                     return
                 }
                 if (savedPassword.isEmpty()) {
-                    askChoice = true
+                    // No prompt yet: the engine asks the computer whether it has a
+                    // permanent password. Without one it asks the person there;
+                    // with one (or an older computer) it shows the password prompt.
                     promptBeforeConnect = false
                     askedPassword = ""
                     savePassword = true
-                    AppLog.i("Connect offering a password or an ask for ${name.ifBlank { digits }}")
+                    AppLog.i("Connect without a saved password for ${name.ifBlank { digits }}; checking for a permanent password")
+                    launchConnect(digits, name, "")
                     return
                 }
                 launchConnect(digits, name, savedPassword)
