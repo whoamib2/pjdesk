@@ -470,6 +470,14 @@ pub fn confirm_owner(dir: &Path, email: &str, password: &str) -> Result<[u8; 32]
     }
 }
 
+/// Sign-in, a token refresh, a password check, and a code join are answered
+/// before this computer is registered. Require signed-in accounts does not
+/// apply to them. The password, the refresh token, or the code is checked
+/// inside the handler.
+pub fn open_before_registration(op: &str) -> bool {
+    matches!(op.trim(), "sign-in" | "verify" | "refresh" | "join" | "enroll")
+}
+
 /// Answers one client account request from the local copy.
 pub fn answer(dir: &Path, msg: ClientMsg) -> ServerMsg {
     let ClientMsg::Account {
@@ -1098,5 +1106,65 @@ mod tests {
         assert_eq!(proof, replica_proof(&key, 1_700_000_030));
         assert_ne!(proof, replica_proof(&key, 1_700_000_060));
         assert_ne!(proof, replica_proof(&[8u8; 32], 1_700_000_000));
+    }
+
+    #[test]
+    fn sign_in_refresh_and_join_are_answered_while_require_is_on() {
+        assert!(open_before_registration("sign-in"));
+        assert!(open_before_registration("verify"));
+        assert!(open_before_registration("refresh"));
+        assert!(open_before_registration("join"));
+        assert!(open_before_registration("enroll"));
+        assert!(!open_before_registration("vault-read"));
+        let dir = std::env::temp_dir().join(format!("pjdesk-open-account-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::access::Policy { require_accounts: true, require_chosen: true, ..crate::access::Policy::default() }
+            .save(&dir)
+            .unwrap();
+        let sign_in = answer(
+            &dir,
+            ClientMsg::Account {
+                op: "sign-in".into(),
+                email: "ben@spader.us".into(),
+                auth_key: "zz".into(),
+                refresh: String::new(),
+                device_id: "phone".into(),
+                device_name: "Android".into(),
+                vault: String::new(),
+                app_lock: String::new(),
+                computers: Vec::new(),
+                proof: String::new(),
+            },
+        );
+        match sign_in {
+            ServerMsg::AccountResult { ok, op, message, .. } => {
+                assert!(!ok);
+                assert_eq!(op, "sign-in");
+                assert_eq!(message, "Enter your email and password.");
+                assert!(!crate::access::peer_message().eq_ignore_ascii_case(message.trim_end_matches('.')));
+            }
+            other => panic!("{other:?}"),
+        }
+        let join = answer(
+            &dir,
+            ClientMsg::Account {
+                op: "join".into(),
+                email: String::new(),
+                auth_key: String::new(),
+                refresh: String::new(),
+                device_id: "phone".into(),
+                device_name: "Android".into(),
+                vault: String::new(),
+                app_lock: String::new(),
+                computers: Vec::new(),
+                proof: String::new(),
+            },
+        );
+        match join {
+            ServerMsg::AccountResult { message, .. } => assert_ne!(message, crate::access::peer_message()),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

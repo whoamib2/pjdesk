@@ -11,6 +11,7 @@ import us.spader.pjdesk.core.connectFailureText
 import us.spader.pjdesk.core.connectStatusLabel
 import us.spader.pjdesk.core.sessionAfterRefreshFailure
 import us.spader.pjdesk.core.shouldRetryNotOnline
+import us.spader.pjdesk.core.signInPageError
 
 class ConnectFeedbackTest {
     @Test
@@ -108,6 +109,25 @@ class ConnectFeedbackTest {
         assertFalse(blockOfflineConnect(online = false, lastSeen = now / 1000 - 30, nowMs = now))
         assertTrue(blockOfflineConnect(online = false, lastSeen = now / 1000 - 120, nowMs = now))
         assertTrue(blockOfflineConnect(online = false, lastSeen = 0, nowMs = now))
+    }
+
+    @Test
+    fun theSignInPageDoesNotShowTheRawRefusal() {
+        assertEquals("Wrong email or password.", signInPageError("Wrong email or password."))
+        assertEquals(
+            "Too many sign-in attempts. Try again in 3 minutes.",
+            signInPageError("Too many sign-in attempts. Try again in 3 minutes.", 150),
+        )
+        assertEquals("Could not reach the PJDesk server.", signInPageError("the server did not answer"))
+        assertEquals("Could not reach the PJDesk server.", signInPageError(""))
+        assertEquals(
+            "This server is too old to accept a sign-in while Require signed-in accounts is on. Update the server.",
+            signInPageError("Sign in required."),
+        )
+        assertEquals(
+            "This server is too old to accept a sign-in while Require signed-in accounts is on. Update the server.",
+            signInPageError("The server at 192.168.0.193 requires sign-in. Update it to 0.6.52 or turn off Require signed-in accounts."),
+        )
     }
 
     @Test

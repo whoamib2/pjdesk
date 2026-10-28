@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 /// Shown in Register and on the About screen. Independent of the Windows crate version.
-pub const APP_VERSION: &str = "0.6.54";
+pub const APP_VERSION: &str = "0.6.55";
 
 const MAX_IN_FLIGHT: u32 = 3;
 
@@ -450,12 +450,20 @@ fn send_host_register(signal: &mut SignalClient, state: &State) -> Result<()> {
     }
 }
 
-/// One Account refresh on the connection that refused Register. The token is not logged.
-async fn refresh_phone_access(signal: &mut SignalClient, state: &State) -> Option<String> {
+enum PhoneRefresh {
+    Token(String),
+    /// The server answered, and did not issue a token. The connection is still open.
+    Refused,
+    /// The connection closed. Register has to dial again.
+    Closed,
+}
+
+/// One Account refresh on this connection, before Register. The token is not logged.
+async fn refresh_phone_access(signal: &mut SignalClient, state: &State) -> PhoneRefresh {
     let refresh = state.account_refresh.lock().unwrap().clone();
     let device = state.account_device.lock().unwrap().clone();
     if refresh.is_empty() || device.trim().is_empty() {
-        return None;
+        return PhoneRefresh::Refused;
     }
     if signal
         .send(ClientMsg::Account {
@@ -472,20 +480,25 @@ async fn refresh_phone_access(signal: &mut SignalClient, state: &State) -> Optio
         })
         .is_err()
     {
-        return None;
+        return PhoneRefresh::Closed;
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
-            return None;
+            return PhoneRefresh::Refused;
         }
         match tokio::time::timeout(left, signal.recv()).await {
-            Ok(Some(ServerMsg::AccountResult { ok: true, access, .. })) if !access.is_empty() => return Some(access),
+            Ok(Some(ServerMsg::AccountResult { ok: true, access, .. })) if !access.is_empty() => {
+                return PhoneRefresh::Token(access);
+            }
             Ok(Some(ServerMsg::ServerVersion { version })) => {
                 pjdesk_proto::routes::note_server_version(&mut state.routes.lock().unwrap(), &version);
             }
-            Ok(Some(ServerMsg::AccountResult { .. })) | Ok(Some(ServerMsg::Error { .. })) | Ok(None) | Err(_) => return None,
+            Ok(Some(ServerMsg::Routes(_))) => {}
+            Ok(Some(ServerMsg::AccountResult { .. })) | Ok(Some(ServerMsg::Error { .. })) => return PhoneRefresh::Refused,
+            Ok(None) => return PhoneRefresh::Closed,
+            Err(_) => return PhoneRefresh::Refused,
             Ok(Some(_)) => {}
         }
     }
@@ -738,6 +751,10 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             let state = state.clone();
             let cb = cb.clone();
             tokio::spawn(async move {
+                let asked = op.clone();
+                if account_op_first(&asked) {
+                    log_line(&cb, format!("account {asked} on this connection before registration"));
+                }
                 let msg = ClientMsg::Account {
                     op,
                     email,
@@ -751,18 +768,34 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                     proof: String::new(),
                 };
                 let outcome = async {
+                    // Account is the first message. A 0.6.52 server answers it
+                    // before Register, and does not require a token to do so.
                     let mut signal = open_ordered(&state, &cb, None).await?;
                     signal.send(msg)?;
-                    match tokio::time::timeout(Duration::from_secs(20), signal.recv()).await {
-                        Ok(Some(reply)) => Ok(reply),
-                        Ok(None) => bail!("the server closed the connection"),
-                        Err(_) => bail!("the server did not answer"),
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                    loop {
+                        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if left.is_zero() {
+                            bail!("the server did not answer");
+                        }
+                        match tokio::time::timeout(left, signal.recv()).await {
+                            Ok(Some(ServerMsg::ServerVersion { version })) => {
+                                pjdesk_proto::routes::note_server_version(&mut state.routes.lock().unwrap(), &version);
+                            }
+                            Ok(Some(ServerMsg::Routes(_))) => {}
+                            Ok(Some(reply)) => return Ok(reply),
+                            Ok(None) => bail!("the server closed the connection"),
+                            Err(_) => bail!("the server did not answer"),
+                        }
                     }
                 }
                 .await;
                 match outcome {
-                    Ok(reply) => emit(&cb, &account_event(&reply)),
-                    Err(err) => emit(&cb, &json!({"event":"account","ok": false, "message": err.to_string()})),
+                    Ok(reply) => emit(&cb, &account_event(&asked, &reply)),
+                    Err(err) => emit(
+                        &cb,
+                        &json!({"event":"account","ok": false, "op": asked, "message": err.to_string()}),
+                    ),
                 }
             });
         }
@@ -1533,6 +1566,22 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
     let epoch = state.access_epoch.load(Ordering::SeqCst);
     let key = state.access_key.lock().unwrap().trim().to_string();
     let keyed = !key.is_empty();
+    if !keyed {
+        // Same connection, account message first, then registration. A 0.6.52
+        // server accepts the refresh before it will Register.
+        match refresh_phone_access(&mut signal, &state).await {
+            PhoneRefresh::Token(access) => {
+                *state.access_token.lock().unwrap() = access;
+                persist(&state);
+                emit(&cb, &json!({"event":"accountSession","state":"valid"}));
+            }
+            PhoneRefresh::Refused => {}
+            PhoneRefresh::Closed => {
+                log_line(&cb, "account refresh closed the connection; opening it again to register");
+                signal = open_ordered(&state, &cb, pinned).await?;
+            }
+        }
+    }
     let token = if keyed {
         key
     } else if state.suppress_token.swap(false, Ordering::SeqCst) {
@@ -1735,7 +1784,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                         if !tried_proxy && pjdesk_proto::signal::is_sign_in_required(&message) {
                             tried_proxy = true;
                             log_line(&cb, "registration was refused until this phone is signed in; refreshing the account on this server");
-                            if let Some(access) = refresh_phone_access(&mut signal, &state).await {
+                            if let PhoneRefresh::Token(access) = refresh_phone_access(&mut signal, &state).await {
                                 *state.access_token.lock().unwrap() = access.clone();
                                 let _ = signal.send(ClientMsg::PresentAccess { token: access });
                                 send_host_register(&mut signal, &state)?;
@@ -1825,7 +1874,7 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                     ServerMsg::Release { version, client_url, .. } => {
                         emit(&cb, &json!({"event":"release","version": version, "url": client_url}));
                     }
-                    reply @ ServerMsg::AccountResult { .. } => emit(&cb, &account_event(&reply)),
+                    reply @ ServerMsg::AccountResult { .. } => emit(&cb, &account_event("", &reply)),
                     ServerMsg::IncomingOnly { on } => {
                         incoming_ready = true;
                         state.incoming_ready.store(true, Ordering::SeqCst);
@@ -1959,8 +2008,13 @@ fn fleet_from_command(value: Option<&Value>) -> Vec<pjdesk_proto::signal::FleetC
         .collect()
 }
 
-fn account_event(msg: &ServerMsg) -> Value {
+fn account_op_first(op: &str) -> bool {
+    matches!(op, "sign-in" | "verify" | "refresh" | "join" | "enroll")
+}
+
+fn account_event(asked: &str, msg: &ServerMsg) -> Value {
     let ServerMsg::AccountResult {
+        op,
         ok,
         message,
         access,
@@ -1986,11 +2040,17 @@ fn account_event(msg: &ServerMsg) -> Value {
         ..
     } = msg
     else {
-        return json!({"event":"account","ok": false, "message": "the server did not answer the sign-in"});
+        let message = match msg {
+            ServerMsg::Error { message, .. } => message.clone(),
+            _ => "the server did not answer the sign-in".to_string(),
+        };
+        return json!({"event":"account","ok": false, "op": asked, "message": message});
     };
+    let op = if op.is_empty() { asked.to_string() } else { op.clone() };
     json!({
         "event": "account",
         "ok": ok,
+        "op": op,
         "message": message,
         "access": access,
         "exp": exp,
@@ -3066,7 +3126,7 @@ async fn controller_session(
                     &cb,
                     "the server requires a signed-in account; refreshing this phone's session on this connection",
                 );
-                if let Some(fresh) = refresh_phone_access(&mut signal, &state).await {
+                if let PhoneRefresh::Token(fresh) = refresh_phone_access(&mut signal, &state).await {
                     *state.access_token.lock().unwrap() = fresh.clone();
                     persist(&state);
                     access = fresh;

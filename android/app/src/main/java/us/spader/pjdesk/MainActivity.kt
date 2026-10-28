@@ -24,7 +24,11 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.layout.Row
@@ -214,11 +218,14 @@ class MainActivity : FragmentActivity() {
         CloudGate.exchange = exchange@{ body ->
             if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) return@exchange null
             val gen = CloudGate.accountGen.get()
+            val want = body.optString("op")
             app.engine.command(JSONObject(body.toString()).put("cmd", "accountOp").toString())
             val deadline = System.currentTimeMillis() + 20_000
             while (System.currentTimeMillis() < deadline) {
                 if (CloudGate.accountGen.get() != gen) {
-                    return@exchange runCatching { JSONObject(CloudGate.accountJson) }.getOrNull()
+                    val parsed = runCatching { JSONObject(CloudGate.accountJson) }.getOrNull()
+                    val got = parsed?.optString("op").orEmpty()
+                    if (want.isEmpty() || got.isEmpty() || got == want) return@exchange parsed
                 }
                 Thread.sleep(50)
             }
@@ -663,7 +670,7 @@ class MainActivity : FragmentActivity() {
                             state.fingerprint,
                         )
                         netLogin = if (netOffer) cloud?.loginToken.orEmpty() else ""
-                        if (!noteSignInPause(err)) netError = err.message ?: "Could not sign in."
+                        if (!noteSignInPause(err)) netError = us.spader.pjdesk.core.signInPageError(err.message ?: "Could not sign in.")
                     }
                 }
             }
@@ -2028,7 +2035,7 @@ class MainActivity : FragmentActivity() {
                                     applySignedIn(session, email, null, false, true)
                                 }.onFailure { err ->
                                     netBusy = false
-                                    if (!noteSignInPause(err)) netError = err.message ?: "Could not sign in."
+                                    if (!noteSignInPause(err)) netError = us.spader.pjdesk.core.signInPageError(err.message ?: "Could not sign in.")
                                 }
                             }
                         },
@@ -2051,7 +2058,7 @@ class MainActivity : FragmentActivity() {
                                     applySignedIn(session, netEmail, null, signOutWhenDone, false, accountPassword = netPass)
                                 }.onFailure {
                                     netBusy = false
-                                    netError = it.message ?: "Could not sign in."
+                                    netError = us.spader.pjdesk.core.signInPageError(it.message ?: "Could not sign in.")
                                 }
                             }
                         },
@@ -2110,7 +2117,7 @@ class MainActivity : FragmentActivity() {
                                         state.fingerprint,
                                     )
                                     netLogin = if (netOffer) cloud?.loginToken.orEmpty() else ""
-                                    if (!noteSignInPause(err)) netError = err.message ?: "Could not sign in."
+                                    if (!noteSignInPause(err)) netError = us.spader.pjdesk.core.signInPageError(err.message ?: "Could not sign in.")
                                 }
                             }
                         },
@@ -2135,8 +2142,10 @@ class MainActivity : FragmentActivity() {
                     Scaffold(
                         snackbarHost = { SnackbarHost(snackbar) },
                         containerColor = androidx.compose.material3.MaterialTheme.colorScheme.background,
+                        contentWindowInsets = WindowInsets.safeDrawing,
                         topBar = {
                             TopAppBar(
+                                windowInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Top),
                                 title = {
                                     Text(
                                         when (tab) {
@@ -2857,21 +2866,17 @@ class MainActivity : FragmentActivity() {
                     .put("device_id", device)
                     .put("device_name", "Android"),
             )
-            if (reply?.optBoolean("ok") == true) return CloudAuth.sessionFromServer(email, device, reply)
-            val message = reply?.optString("message").orEmpty()
-            val pause = reply?.optLong("pause") ?: 0L
-            val finalAnswer = message.contains("Wrong email or password")
-                || message.contains("Too many sign-in attempts")
-                || message.contains("Enter your email")
-                || pause > 0L
-            if (finalAnswer) {
-                throw CloudAuthException(
-                    message.ifBlank { "Could not sign in." },
-                    status = if (pause > 0L) 429 else 401,
-                    retryAfter = pause.takeIf { it > 0L },
-                )
-            }
-            CloudGate.noteServer(false)
+            if (reply == null) throw CloudAuthException("Could not reach the PJDesk server.")
+            if (reply.optBoolean("ok")) return CloudAuth.sessionFromServer(email, device, reply)
+            val message = reply.optString("message")
+            val pause = reply.optLong("pause")
+            val mapped = us.spader.pjdesk.core.signInPageError(message, pause)
+            val secs = us.spader.pjdesk.core.signInPauseSeconds(
+                if (pause > 0L) 429 else 0,
+                message.ifBlank { mapped },
+                pause.takeIf { it > 0L },
+            )
+            throw CloudAuthException(mapped, status = if (secs != null) 429 else 401, retryAfter = secs)
         }
         return CloudAuth.signIn(email, password, device, "Android")
     }
