@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.73
+
+- Fixed: connecting from Windows could fail with "Could not start the session: Sign in required" when the window's account session had expired (for example right after the window opened, before its first renewal). The viewer now renews an expiring account session before it asks the server, and if the server still asks for a sign-in it renews once more and retries the same connection.
+
 ## 0.6.72
 
 - Changed: End on the Windows session toolbar and the Android End button shows a clean X instead of the power icon (same line style; End stays a red pill).

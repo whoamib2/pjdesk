@@ -478,6 +478,27 @@ async fn lan_after_relay_setup(
     }
 }
 
+/// Renews the account access token off the async runtime and keeps the result.
+async fn refresh_account_token(config: &mut Config, force: bool) {
+    let mut copy = config.clone();
+    let Ok(copy) = tokio::task::spawn_blocking(move || {
+        if force {
+            crate::network::refresh_config_now(&mut copy);
+        } else {
+            crate::network::refresh_config(&mut copy);
+        }
+        copy
+    })
+    .await
+    else {
+        return;
+    };
+    config.network_access = copy.network_access;
+    config.network_access_exp = copy.network_access_exp;
+    config.network_refresh = copy.network_refresh;
+    config.network_email = copy.network_email;
+}
+
 /// Signaling → UDP binding → hole punching / relay → QUIC → password check.
 async fn connect(
     server: &ServerAddr,
@@ -494,6 +515,11 @@ async fn connect(
     tracing::info!("Connecting to {} through the advertised servers", format_id(target));
     let _ = (server, prefer_standby);
     let _ = waiting_retry;
+    if !pjdesk_proto::access::is_access_key(&config.presented_access()) {
+        // An expired account token is refused with "Sign in required" before
+        // the host is even asked, so renew it first when it is near expiry.
+        refresh_account_token(config, false).await;
+    }
     let mut access = config.presented_access();
     if access.is_empty() {
         // A temporary sign-in keeps the access token in this process only.
@@ -533,8 +559,25 @@ async fn connect(
 
     tracing::info!("Waiting for {} to answer", format_id(target));
     let mut retried_without_token = false;
+    let mut retried_sign_in = false;
     let (session_id, token, udp_port, host_name) = loop {
         match timeout(host_wait, signal.recv()).await {
+            Ok(Some(ServerMsg::Error { message, .. }))
+                if !retried_sign_in && !access_key && pjdesk_proto::signal::is_sign_in_required(&message) =>
+            {
+                retried_sign_in = true;
+                tracing::info!("The server asked for a sign-in; renewing this computer's account session and trying once more");
+                refresh_account_token(config, true).await;
+                let fresh = config.presented_access();
+                if fresh.is_empty() || fresh == access {
+                    bail!("{message}");
+                }
+                access = fresh;
+                signal = SignalClient::connect_catalog(config, &mine).await?;
+                let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
+                signal.send(connect.clone())?;
+                continue;
+            }
             Ok(None) if !access.is_empty() && !access_key && !retried_without_token => {
                 retried_without_token = true;
                 signal = SignalClient::connect_catalog(config, &mine).await?;
