@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.70
+
+- New: the Windows session window has its own compact title bar. The computer tabs (OMAS-DESKTOP, CABINDESK, …) and the screen picker (Screen 1, Screen 2, All screens, separate windows) now sit in one 38 px strip at the very top, next to minimize, maximize/restore and close, instead of two rows under the system title bar. Drag the empty part of the strip to move the window, double-click it to maximize or restore, and resize from any edge or corner. Full screen hides the strip.
+- Improved: following the pointer when zoomed in. The picture now pans in proportion to where the pointer is in the window (like RustDesk), so the window edge always reaches the picture edge, including the far side of the second screen in All screens, and it glides there with a short easing instead of jumping in steps or stalling at the edge. The remote pointer is mapped through the final position, so it does not jitter while the picture moves.
+- Fixed: in separate-windows mode the pointer in an extra screen window was offset by the height of the tab strip.
+
 ## 0.6.69
 
 - Connecting to a computer with no permanent password no longer shows a password prompt: the computer now says whether it has one (older computers still get the prompt), and the phone and Windows go straight to asking the person there.

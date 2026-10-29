@@ -353,6 +353,11 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
         toolbar,
         zoom: Zoom::Fit,
         pan: (0, 0),
+        pan_shown: (0.0, 0.0),
+        pan_at: Instant::now(),
+        dot_cursor: None,
+        edge_cursor: false,
+        last_title_click: None,
         live: armed.live,
         cmds: armed.cmds,
         panel: super::panel::Panel::default(),
@@ -648,6 +653,13 @@ struct App {
     zoom: Zoom,
     /// Pan offset in window pixels when the picture is zoomed past the window.
     pan: (i32, i32),
+    /// Pan drawn right now; eases toward `pan` so following the pointer is smooth.
+    pan_shown: (f32, f32),
+    pan_at: Instant,
+    dot_cursor: Option<winit::window::CustomCursor>,
+    /// The pointer shows a resize arrow over the window's edge.
+    edge_cursor: bool,
+    last_title_click: Option<Instant>,
     live: Arc<Mutex<super::controls::Live>>,
     cmds: mpsc::UnboundedSender<super::controls::Cmd>,
     panel: super::panel::Panel,
@@ -805,6 +817,7 @@ impl App {
         });
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else { return };
         let snap = self.live.lock().unwrap().snapshot();
+        self.toolbar.set_titlebar(window.fullscreen().is_none(), window.is_maximized(), &self.title);
         self.toolbar.sync(screens_of(&snap.displays), snap.current_display, snap.view_mode);
         self.toolbar.set_android(snap.platform_family == "android");
         if !snap.platform_family.is_empty() && snap.platform_family != self.noted_platform {
@@ -840,13 +853,19 @@ impl App {
         let Ok(mut buffer) = surface.buffer_mut() else { return };
         let shown = if separate { cropped.as_ref() } else { self.current.as_ref() };
         let origin = self.toolbar.tab_height() as usize;
+        let now = Instant::now();
+        let dt = now.duration_since(self.pan_at).as_secs_f32().min(0.1);
+        self.pan_at = now;
+        self.pan_shown = render::ease_pan(self.pan_shown, self.pan, dt);
+        let easing = self.pan_shown != (self.pan.0 as f32, self.pan.1 as f32);
+        let drawn_pan = (self.pan_shown.0.round() as i32, self.pan_shown.1.round() as i32);
         let layout = Self::paint_picture(
             &mut buffer,
             win_w,
             paint_h,
             shown,
             self.zoom,
-            self.pan,
+            drawn_pan,
             origin,
             self.toolbar.letterbox(),
             nav,
@@ -915,6 +934,9 @@ impl App {
             self.restarting = true;
         }
         let _ = buffer.present();
+        if easing {
+            window.request_redraw();
+        }
     }
 
     /// Carries out a toolbar action. Returns true if the window should close.
@@ -928,6 +950,7 @@ impl App {
             Action::ZoomFit => {
                 self.zoom = Zoom::Fit;
                 self.pan = (0, 0);
+                self.pan_shown = (0.0, 0.0);
             }
             Action::ZoomTo(percent) => self.set_scale(percent as f32 / 100.0),
             Action::ZoomIn => self.set_scale(self.current_scale() * 1.25),
@@ -1058,6 +1081,7 @@ impl App {
             self.pan = (ww / 2 - (cx * niw as f32) as i32, wh / 2 - (cy * nih as f32) as i32);
         }
         self.zoom = Zoom::Scale(new);
+        self.pan_shown = (self.pan.0 as f32, self.pan.1 as f32);
     }
 
     /// Sends a key combination to the host: presses the keys in order, then
@@ -1302,6 +1326,25 @@ impl App {
 
     fn on_cursor(&mut self, position: PhysicalPosition<f64>) {
         self.cursor_px = (position.x, position.y);
+        if let Some(window) = self.window.clone() {
+            let size = window.inner_size();
+            let edge = if self.toolbar.has_titlebar() && !window.is_maximized() {
+                resize_edge(position.x, position.y, size.width as f64, size.height as f64, window.scale_factor())
+            } else {
+                None
+            };
+            if let Some(dir) = edge {
+                window.set_cursor(winit::window::CursorIcon::from(dir));
+                self.edge_cursor = true;
+                return;
+            }
+            if self.edge_cursor {
+                self.edge_cursor = false;
+                if let Some(dot) = &self.dot_cursor {
+                    window.set_cursor(dot.clone());
+                }
+            }
+        }
         if self.confirm_close {
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -1339,51 +1382,39 @@ impl App {
             let Some(window) = self.window.clone() else { return };
             let size = window.inner_size();
             if let Some((x, y)) =
-                self.pointer_for(self.primary_display, position, size.width as f64, size.height as f64)
+                self.pointer_for(self.primary_display, position, size.width as f64, size.height as f64, self.toolbar.tab_height())
             {
                 self.send_pointer(self.primary_display, x, y);
             }
             return;
         }
-        // When zoomed in past the window, pan to keep the pointer in sight: a
-        // dead-zone near each edge nudges the picture along.
-        if let (Zoom::Scale(_), Some(window)) = (self.zoom, self.window.clone()) {
-            let _ = window;
+        // When zoomed in past the window, the picture follows the pointer
+        // proportionally (see `render::follow_pan`) and eases there on redraw.
+        let mut target_layout = None;
+        if let (Zoom::Scale(scale), Some(window), Some((fw, fh))) =
+            (self.zoom, self.window.clone(), self.current.as_ref().map(|f| (f.width, f.height)))
+        {
             let (ww, wh, origin) = self.content_extent();
-            let (iw, ih) = (self.layout.width as i32, self.layout.height as i32);
-            let mut moved = false;
-            if iw > ww {
-                let margin = ww / 6;
-                let cx = position.x as i32;
-                if cx < margin {
-                    self.pan.0 += margin - cx;
-                    moved = true;
-                } else if cx > ww - margin {
-                    self.pan.0 -= cx - (ww - margin);
-                    moved = true;
-                }
-                self.pan.0 = self.pan.0.clamp(ww - iw, 0);
-            }
-            if ih > wh {
-                let margin = wh / 6;
-                let cy = position.y as i32 - origin;
-                if cy < margin {
-                    self.pan.1 += margin - cy;
-                    moved = true;
-                } else if cy > wh - margin {
-                    self.pan.1 -= cy - (wh - margin);
-                    moved = true;
-                }
-                self.pan.1 = self.pan.1.clamp(wh - ih, 0);
-            }
-            if moved {
+            let iw = ((fw as f32 * scale).round() as i32).max(1);
+            let ih = ((fh as f32 * scale).round() as i32).max(1);
+            let next = (
+                render::follow_pan(position.x, ww, iw),
+                render::follow_pan(position.y - origin as f64, wh, ih),
+            );
+            if next != self.pan {
+                self.pan = next;
                 window.request_redraw();
             }
+            let mut lay = render::placement(fw, fh, ww as usize, wh as usize, scale, self.pan);
+            lay.y += origin;
+            target_layout = Some(lay);
         }
         if self.toolbar.block_input {
             return;
         }
-        let layout = self.layout;
+        // Map through where the picture is heading, not where the easing has
+        // drawn it, so the remote pointer lands under the local one.
+        let layout = target_layout.unwrap_or(self.layout);
         if layout.width == 0 || layout.height == 0 {
             return;
         }
@@ -1687,12 +1718,11 @@ impl App {
         }
     }
 
-    fn pointer_for(&self, display: u8, position: PhysicalPosition<f64>, win_w: f64, win_h: f64) -> Option<(u16, u16)> {
+    fn pointer_for(&self, display: u8, position: PhysicalPosition<f64>, win_w: f64, win_h: f64, origin: f32) -> Option<(u16, u16)> {
         let screen = {
             let g = self.live.lock().unwrap();
             screens_of(&g.displays).into_iter().find(|s| s.index == display)?
         };
-        let origin = self.toolbar.tab_height() as f32;
         let content_h = (win_h as f32 - origin).max(1.0);
         pjdesk_proto::layout::window_to_pointer(
             screen,
@@ -1706,6 +1736,60 @@ impl App {
 
     fn send_pointer(&self, display: u8, x: u16, y: u16) {
         let _ = self.control.send(ControlMsg::Pointer { display, x, y });
+    }
+
+    /// The window's close button (system or PJDesk's own title bar).
+    fn request_close(&mut self, event_loop: &ActiveEventLoop) {
+        self.remember_places(true);
+        if crate::session_window::window_close_needs_confirm(self.open_count()) {
+            self.confirm_close = true;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        } else if self.is_separate() {
+            if self.close_primary_screen() {
+                event_loop.exit();
+            }
+        } else {
+            event_loop.exit();
+        }
+    }
+
+    /// Presses on the window edge and on the title strip: resize, caption
+    /// buttons, drag and double-click to maximize. True when handled.
+    fn title_press(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let Some(window) = self.window.clone() else { return false };
+        if !self.toolbar.has_titlebar() {
+            return false;
+        }
+        let size = window.inner_size();
+        let (px, py) = self.cursor_px;
+        if !window.is_maximized() {
+            if let Some(dir) = resize_edge(px, py, size.width as f64, size.height as f64, window.scale_factor()) {
+                let _ = window.drag_resize_window(dir);
+                return true;
+            }
+        }
+        match self.toolbar.title_hit(px, py, size.width as usize) {
+            Some(toolbar::TitleHit::Caption(toolbar::Caption::Minimize)) => window.set_minimized(true),
+            Some(toolbar::TitleHit::Caption(toolbar::Caption::Maximize)) => {
+                window.set_maximized(!window.is_maximized());
+            }
+            Some(toolbar::TitleHit::Caption(toolbar::Caption::Close)) => self.request_close(event_loop),
+            Some(toolbar::TitleHit::Drag) => {
+                let double = self.last_title_click.is_some_and(|at| at.elapsed() < Duration::from_millis(450));
+                if double {
+                    self.last_title_click = None;
+                    window.set_maximized(!window.is_maximized());
+                } else {
+                    self.last_title_click = Some(Instant::now());
+                    let _ = window.drag_window();
+                }
+            }
+            Some(toolbar::TitleHit::Tab) | None => return false,
+        }
+        window.request_redraw();
+        true
     }
 
     fn toggle_fullscreen(window: &Window) {
@@ -1816,7 +1900,9 @@ impl App {
         let window = Rc::new(window);
         let sized = self.apply_place(event_loop, &window, display);
         if let Ok(source) = CustomCursor::from_rgba(dot_cursor(), 5, 5, 2, 2) {
-            window.set_cursor(event_loop.create_custom_cursor(source));
+            let dot = event_loop.create_custom_cursor(source);
+            window.set_cursor(dot.clone());
+            self.dot_cursor = Some(dot);
         }
         let Ok(context) = softbuffer::Context::new(window.clone()) else { return };
         let Ok(surface) = softbuffer::Surface::new(&context, window.clone()) else { return };
@@ -2012,7 +2098,7 @@ impl App {
                 if self.toolbar.block_input {
                     return;
                 }
-                if let Some((x, y)) = self.pointer_for(display, position, size.width as f64, size.height as f64) {
+                if let Some((x, y)) = self.pointer_for(display, position, size.width as f64, size.height as f64, 0.0) {
                     self.send_pointer(display, x, y);
                 }
             }
@@ -2163,6 +2249,12 @@ impl App {
     }
 
     fn take_active(&mut self, next: Held) -> Held {
+        let held = self.take_active_inner(next);
+        self.pan_shown = (self.pan.0 as f32, self.pan.1 as f32);
+        held
+    }
+
+    fn take_active_inner(&mut self, next: Held) -> Held {
         Held {
             sid: std::mem::replace(&mut self.sid, next.sid),
             seed: std::mem::replace(&mut self.seed, next.seed),
@@ -2829,11 +2921,19 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
+        // No system title bar: the computer and screen tabs sit in PJDesk's
+        // own strip with minimize, maximize and close (see toolbar::TITLE_H).
         let attributes = Window::default_attributes()
             .with_title(self.title.clone())
             .with_inner_size(PhysicalSize::new(1280u32, 720u32))
+            .with_decorations(false)
             .with_visible(true)
             .with_active(true);
+        #[cfg(windows)]
+        let attributes = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes.with_undecorated_shadow(true)
+        };
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Rc::new(window),
             Err(e) => {
@@ -3001,21 +3101,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.remember_places(false);
         }
         match event {
-            WindowEvent::CloseRequested => {
-                self.remember_places(true);
-                if crate::session_window::window_close_needs_confirm(self.open_count()) {
-                    self.confirm_close = true;
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                } else if self.is_separate() {
-                    if self.close_primary_screen() {
-                        event_loop.exit();
-                    }
-                } else {
-                    event_loop.exit();
-                }
-            }
+            WindowEvent::CloseRequested => self.request_close(event_loop),
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(_) => {
                 if let Some(window) = &self.window {
@@ -3039,6 +3125,12 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => self.on_cursor(position),
             WindowEvent::MouseInput { state, button, .. } => {
+                if state == ElementState::Pressed
+                    && button == winit::event::MouseButton::Left
+                    && self.title_press(event_loop)
+                {
+                    return;
+                }
                 let win_w = self.window.as_ref().map(|w| w.inner_size().width as usize).unwrap_or(0);
                 let win_h = self.window.as_ref().map(|w| w.inner_size().height as usize).unwrap_or(0);
                 if self.confirm_close {
@@ -3202,6 +3294,30 @@ impl ApplicationHandler<UserEvent> for App {
             _ => {}
         }
     }
+}
+
+/// The resize border of a window without a system frame: about 6 px, a
+/// little more at the corners.
+fn resize_edge(px: f64, py: f64, w: f64, h: f64, scale: f64) -> Option<winit::window::ResizeDirection> {
+    use winit::window::ResizeDirection as D;
+    let band = 6.0 * scale.max(1.0);
+    let corner = band * 2.0;
+    if px < 0.0 || py < 0.0 || px > w || py > h {
+        return None;
+    }
+    let (l, r, t, b) = (px < band, px > w - band, py < band, py > h - band);
+    let (lc, rc, tc, bc) = (px < corner, px > w - corner, py < corner, py > h - corner);
+    Some(match () {
+        _ if (t && lc) || (l && tc) => D::NorthWest,
+        _ if (t && rc) || (r && tc) => D::NorthEast,
+        _ if (b && lc) || (l && bc) => D::SouthWest,
+        _ if (b && rc) || (r && bc) => D::SouthEast,
+        _ if t => D::North,
+        _ if b => D::South,
+        _ if l => D::West,
+        _ if r => D::East,
+        _ => return None,
+    })
 }
 
 fn screens_of(displays: &[pjdesk_proto::peer::DisplayLayout]) -> Vec<pjdesk_proto::layout::Screen> {

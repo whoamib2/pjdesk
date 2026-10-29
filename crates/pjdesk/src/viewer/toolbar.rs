@@ -70,6 +70,29 @@ const BAR_H: f32 = 40.0;
 pub const TAB_H: f32 = 40.0;
 /// Computer tabs. Hidden until the window is given a session list.
 pub const SESSION_H: f32 = 36.0;
+/// One compact strip that replaces the system title bar: computer tabs, screen
+/// tabs, then minimize, maximize and close.
+pub const TITLE_H: f32 = 38.0;
+const CAPTION_BTN_W: f32 = 46.0;
+pub const CAPTION_W: f32 = CAPTION_BTN_W * 3.0;
+
+/// Minimize, maximize/restore and close in the custom title bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caption {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+/// What a press in the title strip means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleHit {
+    Caption(Caption),
+    /// A tab or the separate-windows button; the toolbar click handles it.
+    Tab,
+    /// Empty strip: move the window (double-click maximizes).
+    Drag,
+}
 const ITEM_H: f32 = 30.0;
 const PAD: f32 = 12.0;
 const MAP_W: f32 = 280.0;
@@ -434,6 +457,11 @@ pub struct Toolbar {
     android: bool,
     /// The navigation bar under an Android picture. On until the Phone menu hides it.
     android_nav: bool,
+    /// The window has no system title bar; tabs and caption buttons share one strip.
+    titlebar: bool,
+    maximized: bool,
+    title: String,
+    hovered_caption: Option<Caption>,
 }
 
 impl Default for Toolbar {
@@ -478,6 +506,10 @@ impl Default for Toolbar {
             unread: Vec::new(),
             active_session: 0,
             hovered_session: None,
+            titlebar: false,
+            maximized: false,
+            title: String::new(),
+            hovered_caption: None,
             chat_ready: false,
             android: false,
             android_nav: true,
@@ -646,9 +678,75 @@ impl Toolbar {
         }
     }
 
+    /// Draws the window's own title bar (off in full screen).
+    pub fn set_titlebar(&mut self, on: bool, maximized: bool, title: &str) {
+        self.titlebar = on;
+        self.maximized = maximized;
+        if self.title != title {
+            self.title = title.to_string();
+        }
+        if !on {
+            self.hovered_caption = None;
+        }
+    }
+
+    pub fn has_titlebar(&self) -> bool {
+        self.titlebar
+    }
+
     /// Height reserved at the top for computer tabs and, under them, screen tabs.
+    /// With the custom title bar both share one strip.
     pub fn tab_height(&self) -> f32 {
+        if self.titlebar {
+            return TITLE_H;
+        }
         self.session_height() + if self.shows_tabs() { TAB_H } else { 0.0 }
+    }
+
+    fn caption_rect(&self, which: Caption, win_w: usize) -> (f32, f32, f32, f32) {
+        let i = match which {
+            Caption::Minimize => 3.0,
+            Caption::Maximize => 2.0,
+            Caption::Close => 1.0,
+        };
+        (win_w as f32 - CAPTION_BTN_W * i, 0.0, CAPTION_BTN_W, TITLE_H)
+    }
+
+    fn caption_at(&self, px: f64, py: f64, win_w: usize) -> Option<Caption> {
+        if !self.titlebar {
+            return None;
+        }
+        [Caption::Minimize, Caption::Maximize, Caption::Close].into_iter().find(|&c| {
+            let (x, y, w, h) = self.caption_rect(c, win_w);
+            Self::hit(px, py, x, y, w, h)
+        })
+    }
+
+    /// What a press at this point of the title strip does. `None` below it.
+    pub fn title_hit(&self, px: f64, py: f64, win_w: usize) -> Option<TitleHit> {
+        if !self.titlebar || py < 0.0 || py > TITLE_H as f64 || px < 0.0 || px > win_w as f64 {
+            return None;
+        }
+        if let Some(c) = self.caption_at(px, py, win_w) {
+            return Some(TitleHit::Caption(c));
+        }
+        if self.session_at(px, py, win_w).is_some() || self.tab_action(px, py, win_w).is_some() {
+            return Some(TitleHit::Tab);
+        }
+        Some(TitleHit::Drag)
+    }
+
+    /// Left edge of the screen tabs in the title strip: after the computer
+    /// tabs, or after the window title when no computer tabs are showing.
+    fn screens_left(&self, win_w: usize) -> f32 {
+        if let Some(last) = self.session_slots(win_w).last() {
+            return last.x + last.w + 14.0;
+        }
+        if self.title.is_empty() {
+            12.0
+        } else {
+            12.0 + text_width(&fit_label(&self.title, 220.0)) + 18.0
+        }
     }
 
     fn session_height(&self) -> f32 {
@@ -665,6 +763,9 @@ impl Toolbar {
 
     /// Screen tabs start under the computer tabs when those are showing.
     fn monitor_top(&self) -> f32 {
+        if self.titlebar {
+            return 0.0;
+        }
         self.session_height()
     }
 
@@ -749,7 +850,9 @@ impl Toolbar {
         let w = if self.collapsed { self.collapsed_w } else { self.width };
         let x = ((win_w as f32 - w) / 2.0).max(8.0);
         // Leave room under the tabs for a resolution tooltip.
-        let y = if self.shows_tabs() {
+        let y = if self.titlebar {
+            TITLE_H + 8.0
+        } else if self.shows_tabs() {
             self.tab_height() + 36.0
         } else if self.shows_sessions() {
             self.tab_height() + 8.0
@@ -764,14 +867,15 @@ impl Toolbar {
         if !self.shows_tabs() || win_w < 120 {
             return Vec::new();
         }
-        let y = self.monitor_top() + 6.0;
+        let y = if self.titlebar { 5.0 } else { self.monitor_top() + 6.0 };
         let h = 28.0;
         let right = 28.0;
-        let limit = win_w as f32 - right - 16.0;
+        let captions = if self.titlebar { CAPTION_W } else { 0.0 };
+        let limit = win_w as f32 - captions - right - 16.0;
         let mut order: Vec<usize> = (0..self.displays.len()).collect();
         order.sort_by_key(|&i| self.displays[i].index);
         let mut slots = Vec::new();
-        let mut x = 8.0;
+        let mut x = if self.titlebar { self.screens_left(win_w) } else { 8.0 };
         for i in order {
             let screen = &self.displays[i];
             let label = format!("Screen {}", screen.index + 1);
@@ -811,7 +915,7 @@ impl Toolbar {
             });
         }
         slots.push(Slot {
-            x: win_w as f32 - right - 8.0,
+            x: win_w as f32 - captions - right - 8.0,
             y,
             w: right,
             h,
@@ -834,7 +938,7 @@ impl Toolbar {
     fn slot_at(&self, px: f64, py: f64, win_w: usize) -> Option<usize> {
         let slots = self.tab_slots(win_w);
         if let Some(i) = self.hovered_slot {
-            if let Some(tip) = tooltip_rect_of(slots.get(i)?, self.monitor_top() + TAB_H) {
+            if let Some(tip) = tooltip_rect_of(slots.get(i)?, self.tab_bottom()) {
                 if px >= tip.0 as f64
                     && py >= tip.1 as f64
                     && px <= (tip.0 + tip.2) as f64
@@ -864,10 +968,18 @@ impl Toolbar {
         let n = self.sessions.len();
         let gap = 4.0;
         let pad = 8.0;
-        let avail = (win_w as f32 - pad * 2.0 - gap * (n.saturating_sub(1) as f32)).max(72.0);
-        let w = (avail / n as f32).clamp(72.0, 220.0);
+        // In the title strip the computer tabs share the row with the screen
+        // tabs and the caption buttons, so they take at most about half of it.
+        let row = if self.titlebar {
+            let screens = if self.shows_tabs() { 110.0 * (self.displays.len() as f32 + 1.0) + 40.0 } else { 40.0 };
+            (win_w as f32 - CAPTION_W - screens).max(win_w as f32 * 0.3)
+        } else {
+            win_w as f32
+        };
+        let avail = (row - pad * 2.0 - gap * (n.saturating_sub(1) as f32)).max(72.0);
+        let w = (avail / n as f32).clamp(72.0, if self.titlebar { 200.0 } else { 220.0 });
         let h = 28.0;
-        let y = 4.0;
+        let y = if self.titlebar { 5.0 } else { 4.0 };
         let mut x = pad;
         let mut slots = Vec::with_capacity(n);
         for (index, label) in self.sessions.iter().enumerate() {
@@ -909,8 +1021,10 @@ impl Toolbar {
             return;
         }
         let c = chrome(self.light);
-        fill_rect(buf, win_w, win_h, 0.0, 0.0, win_w as f32, SESSION_H, c.panel);
-        fill_rect(buf, win_w, win_h, 0.0, SESSION_H - 1.0, win_w as f32, 1.0, c.line);
+        if !self.titlebar {
+            fill_rect(buf, win_w, win_h, 0.0, 0.0, win_w as f32, SESSION_H, c.panel);
+            fill_rect(buf, win_w, win_h, 0.0, SESSION_H - 1.0, win_w as f32, 1.0, c.line);
+        }
         for slot in &slots {
             let hover = self.hovered_session == Some(slot.index);
             let fill = if slot.active {
@@ -946,6 +1060,9 @@ impl Toolbar {
     }
 
     pub fn draw_tabs(&self, buf: &mut [u32], win_w: usize, win_h: usize) {
+        if self.titlebar {
+            self.draw_titlebar(buf, win_w, win_h);
+        }
         self.draw_sessions(buf, win_w, win_h);
         let slots = self.tab_slots(win_w);
         let top = self.monitor_top();
@@ -953,8 +1070,15 @@ impl Toolbar {
             return;
         }
         let c = chrome(self.light);
-        fill_rect(buf, win_w, win_h, 0.0, top, win_w as f32, TAB_H, c.panel);
-        fill_rect(buf, win_w, win_h, 0.0, top + TAB_H - 1.0, win_w as f32, 1.0, c.line);
+        if self.titlebar {
+            if self.shows_sessions() || !self.title.is_empty() {
+                let sx = slots[0].x - 7.0;
+                fill_rect(buf, win_w, win_h, sx, 10.0, 1.0, TITLE_H - 20.0, c.line);
+            }
+        } else {
+            fill_rect(buf, win_w, win_h, 0.0, top, win_w as f32, TAB_H, c.panel);
+            fill_rect(buf, win_w, win_h, 0.0, top + TAB_H - 1.0, win_w as f32, 1.0, c.line);
+        }
         for (i, slot) in slots.iter().enumerate() {
             let hover = self.hovered_slot == Some(i);
             let fill = if slot.active {
@@ -987,11 +1111,64 @@ impl Toolbar {
         }
         if let Some(i) = self.hovered_slot {
             if let Some(slot) = slots.get(i) {
-                if let Some((x, y, tw, th)) = tooltip_rect_of(slot, self.monitor_top() + TAB_H) {
+                if let Some((x, y, tw, th)) = tooltip_rect_of(slot, self.tab_bottom()) {
                     let x = x.min((win_w as f32 - tw - 8.0).max(8.0));
                     fill_round(buf, win_w, win_h, x, y, tw, th, 6.0, c.card);
                     fill_rect(buf, win_w, win_h, x, y, tw, 1.0, c.line);
                     draw_text(buf, win_w, win_h, x + 8.0, y + 15.0, &slot.tip, c.text);
+                }
+            }
+        }
+    }
+
+    fn tab_bottom(&self) -> f32 {
+        if self.titlebar { TITLE_H } else { self.monitor_top() + TAB_H }
+    }
+
+    /// Strip background, the window title when no computer tabs show, and
+    /// the caption buttons drawn like Windows 11's.
+    fn draw_titlebar(&self, buf: &mut [u32], win_w: usize, win_h: usize) {
+        if win_h < TITLE_H as usize {
+            return;
+        }
+        let c = chrome(self.light);
+        fill_rect(buf, win_w, win_h, 0.0, 0.0, win_w as f32, TITLE_H, c.panel);
+        fill_rect(buf, win_w, win_h, 0.0, TITLE_H - 1.0, win_w as f32, 1.0, c.line);
+        if !self.shows_sessions() && !self.title.is_empty() {
+            draw_text(buf, win_w, win_h, 12.0, 24.0, &fit_label(&self.title, 220.0), c.text);
+        }
+        for which in [Caption::Minimize, Caption::Maximize, Caption::Close] {
+            let (x, y, w, h) = self.caption_rect(which, win_w);
+            let hover = self.hovered_caption == Some(which);
+            let mut ink = c.text;
+            if hover {
+                let fill = if which == Caption::Close { 0xFF_c4_2b_1c } else { c.elev };
+                fill_rect(buf, win_w, win_h, x, y, w, h - 1.0, fill);
+                if which == Caption::Close {
+                    ink = 0xFF_ff_ff_ff;
+                }
+            }
+            let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+            match which {
+                Caption::Minimize => fill_rect(buf, win_w, win_h, cx - 5.0, cy, 10.0, 1.0, ink),
+                Caption::Maximize => {
+                    let hole = if hover { c.elev } else { c.panel };
+                    if self.maximized {
+                        fill_rect(buf, win_w, win_h, cx - 3.0, cy - 6.0, 9.0, 9.0, ink);
+                        fill_rect(buf, win_w, win_h, cx - 2.0, cy - 5.0, 7.0, 7.0, hole);
+                        fill_rect(buf, win_w, win_h, cx - 6.0, cy - 3.0, 9.0, 9.0, ink);
+                        fill_rect(buf, win_w, win_h, cx - 5.0, cy - 2.0, 7.0, 7.0, hole);
+                    } else {
+                        fill_rect(buf, win_w, win_h, cx - 5.0, cy - 5.0, 10.0, 10.0, ink);
+                        fill_rect(buf, win_w, win_h, cx - 4.0, cy - 4.0, 8.0, 8.0, hole);
+                    }
+                }
+                Caption::Close => {
+                    for i in 0..11 {
+                        let d = i as f32 - 5.0;
+                        fill_rect(buf, win_w, win_h, cx + d, cy + d, 1.0, 1.0, ink);
+                        fill_rect(buf, win_w, win_h, cx + d, cy - d, 1.0, 1.0, ink);
+                    }
                 }
             }
         }
@@ -1119,6 +1296,7 @@ impl Toolbar {
     }
 
     pub fn on_pointer(&mut self, px: f64, py: f64, win_w: usize) -> bool {
+        self.hovered_caption = self.caption_at(px, py, win_w);
         if let Some(i) = self.session_at(px, py, win_w) {
             self.hovered_session = Some(i);
             self.hovered_slot = None;
@@ -2251,5 +2429,55 @@ mod tests {
 
     fn overlaps(a: &AndroidButton, b: &AndroidButton) -> bool {
         a.x < b.x + b.w - 0.5 && b.x < a.x + a.w - 0.5 && a.y < b.y + b.h - 0.5 && b.y < a.y + a.h - 0.5
+    }
+}
+
+#[cfg(test)]
+mod titlebar_tests {
+    use super::*;
+
+    fn screens(n: u8) -> Vec<pjdesk_proto::layout::Screen> {
+        (0..n)
+            .map(|i| pjdesk_proto::layout::Screen { index: i, x: i as i32 * 1920, y: 0, width: 1920, height: 1080, dpi: 0 })
+            .collect()
+    }
+
+    #[test]
+    fn tabs_and_screens_share_the_title_strip() {
+        let mut bar = Toolbar::default();
+        bar.sync(screens(2), 0, pjdesk_proto::peer::VIEW_SINGLE);
+        bar.set_sessions(&["OMAS-DESKTOP".into(), "CABINDESK".into()], 0);
+        let classic = bar.tab_height();
+        bar.set_titlebar(true, false, "PJDesk");
+        assert_eq!(bar.tab_height(), TITLE_H);
+        assert!(classic > TITLE_H, "the old rows were taller: {classic}");
+        let w = 1400;
+        let sessions = bar.session_slots(w);
+        let tabs = bar.tab_slots(w);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(tabs.len(), 4, "Screen 1, Screen 2, All screens, separate windows");
+        let last = sessions.last().unwrap();
+        for t in &tabs {
+            assert!(t.y < TITLE_H && t.y + t.h <= TITLE_H);
+            assert!(t.x >= last.x + last.w, "screen tabs come after the computer tabs");
+            assert!(t.x + t.w <= w as f32 - CAPTION_W, "nothing under the caption buttons");
+        }
+    }
+
+    #[test]
+    fn caption_buttons_and_the_empty_strip_are_hit_tested() {
+        let mut bar = Toolbar::default();
+        bar.sync(screens(2), 0, pjdesk_proto::peer::VIEW_SINGLE);
+        bar.set_sessions(&["CABINDESK".into()], 0);
+        bar.set_titlebar(true, false, "PJDesk");
+        let w = 1200usize;
+        assert_eq!(bar.title_hit(w as f64 - 10.0, 10.0, w), Some(TitleHit::Caption(Caption::Close)));
+        assert_eq!(bar.title_hit(w as f64 - 60.0, 10.0, w), Some(TitleHit::Caption(Caption::Maximize)));
+        assert_eq!(bar.title_hit(w as f64 - 110.0, 10.0, w), Some(TitleHit::Caption(Caption::Minimize)));
+        assert_eq!(bar.title_hit(20.0, 15.0, w), Some(TitleHit::Tab));
+        assert_eq!(bar.title_hit(800.0, 15.0, w), Some(TitleHit::Drag));
+        assert_eq!(bar.title_hit(800.0, 60.0, w), None);
+        bar.set_titlebar(false, false, "PJDesk");
+        assert_eq!(bar.title_hit(w as f64 - 10.0, 10.0, w), None, "full screen has no caption buttons");
     }
 }

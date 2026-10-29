@@ -218,3 +218,73 @@ mod tests {
         assert_eq!(lerp(0x000000, 0xFF00FF, 128), 0x7F007F);
     }
 }
+
+/// Where a zoomed picture should sit so the spot under the pointer is in view.
+///
+/// Proportional, like RustDesk's follow mode: the pointer's place across the
+/// window (inside a small edge band) picks the same place across the picture,
+/// so moving the mouse to the window edge always reaches the picture edge,
+/// even on a wide "All screens" picture. It depends only on the pointer, so
+/// it never jitters or drifts while the mouse rests.
+pub fn follow_pan(cursor: f64, view: i32, image: i32) -> i32 {
+    if image <= view || view <= 0 {
+        return 0;
+    }
+    let band = (view as f64 / 10.0).clamp(0.0, 80.0);
+    let span = (view as f64 - band * 2.0).max(1.0);
+    let f = ((cursor - band) / span).clamp(0.0, 1.0);
+    -((f * (image - view) as f64).round() as i32)
+}
+
+/// Moves the drawn pan toward the target. `dt` in seconds; about 60 ms to
+/// settle most of the way, and it lands exactly once within half a pixel.
+pub fn ease_pan(shown: (f32, f32), target: (i32, i32), dt: f32) -> (f32, f32) {
+    let k = 1.0 - (-dt.max(0.0) / 0.06).exp();
+    let step = |s: f32, t: i32| {
+        let t = t as f32;
+        let n = s + (t - s) * k;
+        if (t - n).abs() < 0.5 { t } else { n }
+    };
+    (step(shown.0, target.0), step(shown.1, target.1))
+}
+
+#[cfg(test)]
+mod follow_tests {
+    use super::*;
+
+    #[test]
+    fn the_window_edges_reach_both_ends_of_a_wide_all_screens_picture() {
+        // Two 1920 screens side by side at 150 % in a 1280 window.
+        let (view, image) = (1280, 5760);
+        assert_eq!(follow_pan(0.0, view, image), 0);
+        assert_eq!(follow_pan(1279.0, view, image), view - image);
+        let mid = follow_pan(640.0, view, image);
+        assert!((mid - (view - image) / 2).abs() <= 1);
+    }
+
+    #[test]
+    fn panning_is_monotonic_and_has_no_jumps() {
+        let (view, image) = (1280, 5760);
+        let mut last = follow_pan(0.0, view, image);
+        for x in 1..1280 {
+            let p = follow_pan(x as f64, view, image);
+            assert!(p <= last);
+            assert!(last - p <= 6, "a one-pixel move shifts the picture smoothly");
+            last = p;
+        }
+        assert_eq!(follow_pan(500.0, 1280, 1000), 0, "a picture that fits never pans");
+    }
+
+    #[test]
+    fn easing_settles_on_the_target_without_overshoot() {
+        let mut shown = (0.0f32, 0.0f32);
+        let mut steps = 0;
+        while shown != (-900.0, -300.0) {
+            let next = ease_pan(shown, (-900, -300), 1.0 / 60.0);
+            assert!(next.0 <= shown.0 && next.0 >= -900.0);
+            shown = next;
+            steps += 1;
+            assert!(steps < 120);
+        }
+    }
+}
