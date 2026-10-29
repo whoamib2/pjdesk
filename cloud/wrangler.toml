@@ -3,16 +3,17 @@
 name = "pjdesk-cloud"
 main = "src/index.js"
 compatibility_date = "2025-09-01"
-# The pjdesk@spader.us Cloudflare account.
-account_id = "5d6fd11395ef0b3901ae32e08c3edb70"
+# The expensecub@spader.us Cloudflare account (moved from pjdesk@spader.us on 2026-10-29).
+account_id = "499fcfb10813bb5555fa4547e726b466"
 workers_dev = true
 
 # pjdesk.com and www.pjdesk.com are served by this Worker (Cloudflare adds the
 # DNS records and certificates for them on deploy).
-routes = [
-  { pattern = "pjdesk.com", custom_domain = true },
-  { pattern = "www.pjdesk.com", custom_domain = true },
-]
+# Removed during the account move until pjdesk.com is active in this account:
+# routes = [
+#   { pattern = "pjdesk.com", custom_domain = true },
+#   { pattern = "www.pjdesk.com", custom_domain = true },
+# ]
 
 # The website (and account pages). The Worker handles /api/* and /download/*.
 [assets]
@@ -24,7 +25,7 @@ run_worker_first = ["/api/*", "/download/*"]
 [[d1_databases]]
 binding = "DB"
 database_name = "pjdesk-cloud"
-database_id = "1f7d21b1-0851-49f5-b5c8-d6c4150f7f62"
+database_id = "d521694f-0273-42c2-83f0-0f56418ed80a"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
