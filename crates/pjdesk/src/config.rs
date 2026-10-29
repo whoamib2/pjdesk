@@ -225,6 +225,9 @@ pub struct Settings {
     /// Local notes for computers (favorites, last connection). Not synced.
     #[serde(default)]
     pub peers: BTreeMap<String, PeerNote>,
+    /// The session toolbar was folded to its handle tab. Remembered between sessions.
+    #[serde(default)]
+    pub toolbar_collapsed: bool,
     /// Pinned QUIC fingerprints for direct IP connections, keyed by `host:port`.
     #[serde(default)]
     pub direct_pins: BTreeMap<String, String>,
@@ -338,10 +341,10 @@ fn default_fps() -> u32 {
     30
 }
 fn default_bitrate() -> u32 {
-    6000
+    12_000
 }
 fn default_max_width() -> u32 {
-    2560
+    3840
 }
 fn default_temp_idle() -> u32 {
     30
@@ -367,6 +370,7 @@ impl Default for Settings {
             saved_view: default_saved_view(),
             tunnel_ports: Vec::new(),
             peers: BTreeMap::new(),
+            toolbar_collapsed: false,
             direct_pins: BTreeMap::new(),
         }
     }

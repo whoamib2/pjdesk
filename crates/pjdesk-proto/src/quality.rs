@@ -24,7 +24,9 @@ impl StreamQuality {
 
 impl Default for StreamQuality {
     fn default() -> Self {
-        Self { fps: 30, bitrate_kbps: 6_000, max_width: 1920 }
+        // Native resolution: the host only scales down past OpenH264's
+        // 3840×2160 limit. Slow links are handled by `BitrateControl`.
+        Self { fps: 30, bitrate_kbps: 12_000, max_width: 3840 }
     }
 }
 
@@ -32,9 +34,12 @@ impl Default for StreamQuality {
 pub fn preset(name: &str) -> Option<StreamQuality> {
     Some(match name {
         "smooth" => StreamQuality { fps: 24, bitrate_kbps: 2_000, max_width: 1280 },
-        "balanced" => StreamQuality { fps: 30, bitrate_kbps: 6_000, max_width: 1920 },
-        "sharp" => StreamQuality { fps: 30, bitrate_kbps: 12_000, max_width: 2560 },
-        "high" => StreamQuality { fps: 60, bitrate_kbps: 20_000, max_width: 2560 },
+        // Until 0.6.71 balanced capped the width at 1920. The host scales by a
+        // whole factor, so a 2560 screen or a two-screen "All screens" picture
+        // was sent at half size and looked soft once stretched back up.
+        "balanced" => StreamQuality { fps: 30, bitrate_kbps: 12_000, max_width: 3840 },
+        "sharp" => StreamQuality { fps: 30, bitrate_kbps: 20_000, max_width: 3840 },
+        "high" => StreamQuality { fps: 60, bitrate_kbps: 30_000, max_width: 3840 },
         _ => return None,
     })
 }
@@ -125,6 +130,15 @@ pub const AUDIO_FRAME_SAMPLES: usize = 960 * 2;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balanced_sends_native_resolution() {
+        let q = preset("balanced").unwrap();
+        assert_eq!(q, StreamQuality::default());
+        assert!(q.max_width >= 3840, "a 2560 screen or two 1920 screens are not halved");
+        assert!(q.bitrate_kbps >= 12_000);
+        assert!(preset("smooth").unwrap().bitrate_kbps <= 2_000, "the slow-link preset stays light");
+    }
 
     #[test]
     fn presets_are_within_bounds() {

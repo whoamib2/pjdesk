@@ -238,6 +238,19 @@ struct PendingTunnel {
     waiters: HashMap<u64, oneshot::Sender<Result<(), String>>>,
 }
 
+/// Through the TCP relay every byte crosses the relay server twice, so the
+/// opening bitrate stays at 8 Mbit/s there. Native resolution either way; the
+/// host's adaptive control still steps down on a slow link.
+pub(crate) const RELAY_BITRATE_KBPS: u32 = 8_000;
+
+pub(crate) fn opening_quality(relayed: bool) -> quality::StreamQuality {
+    let mut q = quality::preset("balanced").unwrap_or_default();
+    if relayed {
+        q.bitrate_kbps = q.bitrate_kbps.min(RELAY_BITRATE_KBPS);
+    }
+    q
+}
+
 /// Starts the host-message loop and the side-stream reader.
 pub fn start(
     rt: Handle,
@@ -280,7 +293,7 @@ pub fn start(
         let _ = control.send(ControlMsg::Hello {
             permissions: perms::ALL | perms::LAYOUT | perms::VISITOR | perms::CHAT_PEER,
             monitor: saved_display,
-            quality: quality::preset("balanced").unwrap_or_default(),
+            quality: opening_quality(relayed),
         });
     }
 
@@ -1194,6 +1207,16 @@ mod tests {
     use super::*;
     use std::net::UdpSocket;
     use std::time::Duration;
+
+    #[test]
+    fn a_relayed_session_opens_at_native_resolution_with_a_capped_bitrate() {
+        let direct = super::opening_quality(false);
+        let relayed = super::opening_quality(true);
+        assert_eq!(direct.max_width, 3840);
+        assert_eq!(relayed.max_width, 3840);
+        assert!(relayed.bitrate_kbps <= super::RELAY_BITRATE_KBPS);
+        assert!(direct.bitrate_kbps > relayed.bitrate_kbps);
+    }
 
     #[test]
     fn a_phone_that_is_asking_for_the_screen_waits_a_minute_and_names_the_reason() {

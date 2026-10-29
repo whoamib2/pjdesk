@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.71
+
+- Sharper picture. The Windows viewer always asked for the "balanced" quality: at most 1920 pixels wide at 6 Mbit/s. The host only shrinks by whole steps, so any wider picture was halved (a 2560 screen arrived 1280 wide, two screens in All screens arrived 1920 wide) and then stretched back up, and that is what looked soft. Balanced now streams at the screen's native resolution (up to 3840 wide) at 12 Mbit/s, Sharp at 20 Mbit/s and High at 60 fps / 30 Mbit/s; the encoder uses its medium quality setting instead of the fastest one. Smooth stays light (1280 wide, 2 Mbit/s) for slow links, the host still steps the bitrate down when frames arrive late, and a session through the TCP relay opens at 8 Mbit/s.
+- Sharper scaling in the viewer: a picture within 4% of the window size is drawn pixel for pixel, and shrinking a big picture averages the pixels instead of skipping them.
+- New toolbar: docked at the top center of the session, under the title strip, as a dark rounded pill with a soft shadow. Crisp, anti-aliased line icons (zoom, screens, keys, session, phone, files, chat) with hover and pressed states and a tooltip under each, and End as a red pill. The chevron folds it to a small handle tab at the top edge; click the handle to bring it back. The folded state is remembered. It no longer hides itself when the pointer moves away.
+- New: the screen picker has "Open Screen N in new window" for each screen. That screen opens in a window of its own while this window keeps showing another; closing it brings this window back to one screen.
+- Fixed: switching Screen 1, Screen 2 or All screens no longer shrinks a maximized or full-screen session window. The window only resizes to the picture in its normal state.
+- Android: the session's Chat button is a chat-bubble icon and End shows a power icon.
+
 ## 0.6.70
 
 - New: the Windows session window has its own compact title bar. The computer tabs (OMAS-DESKTOP, CABINDESK, …) and the screen picker (Screen 1, Screen 2, All screens, separate windows) now sit in one 38 px strip at the very top, next to minimize, maximize/restore and close, instead of two rows under the system title bar. Drag the empty part of the strip to move the window, double-click it to maximize or restore, and resize from any edge or corner. Full screen hides the strip.

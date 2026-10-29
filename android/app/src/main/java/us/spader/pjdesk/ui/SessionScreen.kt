@@ -585,7 +585,7 @@ fun SessionScreen(
                             pressedColor = MaterialTheme.colorScheme.primary,
                             enabled = chatReady,
                             onClick = { chatSheet = true },
-                        ) { Text("Chat", style = MaterialTheme.typography.labelLarge) }
+                        ) { ChatMark(dim = !chatReady) }
                         if (chatUnread > 0) {
                             Surface(
                                 modifier = Modifier.align(Alignment.TopEnd),
@@ -817,11 +817,49 @@ private fun Modifier.reportPad(space: OverlaySpace, id: String): Modifier {
 private fun Modifier.onSizeChangedSafe(block: (androidx.compose.ui.unit.IntSize) -> Unit): Modifier =
     onGloballyPositioned { block(it.size) }
 
+/** Power mark for End: an open ring with a bar, the same stroke icon as the Windows toolbar. */
 @Composable
 private fun EndMark() {
     Canvas(Modifier.size(22.dp)) {
-        drawLine(Color.White, Offset(5f, 5f), Offset(size.width - 5f, size.height - 5f), strokeWidth = 2.4.dp.toPx())
-        drawLine(Color.White, Offset(size.width - 5f, 5f), Offset(5f, size.height - 5f), strokeWidth = 2.4.dp.toPx())
+        val w = 2.2.dp.toPx()
+        val r = size.minDimension * 0.36f
+        val c = Offset(center.x, center.y + size.minDimension * 0.04f)
+        drawArc(
+            Color.White,
+            startAngle = -60f,
+            sweepAngle = 300f,
+            useCenter = false,
+            topLeft = Offset(c.x - r, c.y - r),
+            size = androidx.compose.ui.geometry.Size(r * 2, r * 2),
+            style = Stroke(width = w, cap = androidx.compose.ui.graphics.StrokeCap.Round),
+        )
+        drawLine(
+            Color.White,
+            Offset(center.x, size.height * 0.08f),
+            Offset(center.x, size.height * 0.48f),
+            strokeWidth = w,
+            cap = androidx.compose.ui.graphics.StrokeCap.Round,
+        )
+    }
+}
+
+/** Chat bubble stroke icon. */
+@Composable
+private fun ChatMark(dim: Boolean) {
+    val color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (dim) 0.45f else 1f)
+    Canvas(Modifier.size(22.dp)) {
+        val w = 1.8.dp.toPx()
+        val u = size.minDimension / 18f
+        drawRoundRect(
+            color,
+            topLeft = Offset(1.5f * u, 2.5f * u),
+            size = androidx.compose.ui.geometry.Size(15f * u, 10.5f * u),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(3f * u, 3f * u),
+            style = Stroke(width = w),
+        )
+        val cap = androidx.compose.ui.graphics.StrokeCap.Round
+        drawLine(color, Offset(5f * u, 13f * u), Offset(4.6f * u, 16.4f * u), strokeWidth = w, cap = cap)
+        drawLine(color, Offset(4.6f * u, 16.4f * u), Offset(9f * u, 13f * u), strokeWidth = w, cap = cap)
     }
 }
 

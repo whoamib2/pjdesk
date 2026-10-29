@@ -319,6 +319,7 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
     let loaded = crate::config::Config::load().ok();
     let theme_name = loaded.as_ref().map(|c| c.settings.theme.clone()).unwrap_or_default();
     let mut toolbar = toolbar::Toolbar::default();
+    toolbar.set_collapsed(loaded.as_ref().is_some_and(|c| c.settings.toolbar_collapsed));
     let follow_system_theme = theme_name != "light" && theme_name != "dark";
     let light = theme_name == "light";
     if light {
@@ -356,6 +357,7 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
         pan_shown: (0.0, 0.0),
         pan_at: Instant::now(),
         dot_cursor: None,
+        separate_pick: None,
         edge_cursor: false,
         last_title_click: None,
         live: armed.live,
@@ -657,6 +659,9 @@ struct App {
     pan_shown: (f32, f32),
     pan_at: Instant,
     dot_cursor: Option<winit::window::CustomCursor>,
+    /// "Open in new window" from the screen picker: only these screens get a
+    /// window. `None` is the full separate-windows view (one per screen).
+    separate_pick: Option<Vec<u8>>,
     /// The pointer shows a resize arrow over the window's edge.
     edge_cursor: bool,
     last_title_click: Option<Instant>,
@@ -1019,7 +1024,23 @@ impl App {
                 self.choose_view(pjdesk_proto::peer::VIEW_SINGLE, display);
             }
             Action::ViewAll => self.choose_view(pjdesk_proto::peer::VIEW_ALL, 0),
+            Action::OpenScreenWindow(display) => {
+                // This window keeps a screen; the chosen one opens on its own.
+                let indexes = self.display_indexes();
+                let current = self.live.lock().unwrap().current_display;
+                let primary = if current != display {
+                    current
+                } else {
+                    indexes.iter().copied().find(|i| *i != display).unwrap_or(display)
+                };
+                self.separate_pick = Some(vec![primary, display]);
+                self.primary_display = primary;
+                self.sent_watch.clear();
+                self.placed_primary = false;
+                self.choose_view(pjdesk_proto::peer::VIEW_SEPARATE, primary);
+            }
             Action::ViewSeparate => {
+                self.separate_pick = None;
                 let display = self.live.lock().unwrap().current_display;
                 self.primary_display = display;
                 self.sent_watch.clear();
@@ -1802,6 +1823,10 @@ impl App {
     /// Returns true when a saved size was applied, so the first picture does
     /// not overwrite it.
     fn apply_place(&self, event_loop: &ActiveEventLoop, window: &Window, display: u8) -> bool {
+        if !auto_resize(window.is_maximized(), window.fullscreen().is_some()) {
+            // A maximized or full-screen window keeps its state when the view changes.
+            return true;
+        }
         let Some(place) = self.places.iter().find(|p| p.display == display && !p.monitor.is_empty()) else {
             return false;
         };
@@ -1818,7 +1843,7 @@ impl App {
     }
 
     fn fit_remote(window: &Window, frame_w: usize, frame_h: usize, extra_h: u32) {
-        if frame_w == 0 || frame_h == 0 {
+        if frame_w == 0 || frame_h == 0 || !auto_resize(window.is_maximized(), window.fullscreen().is_some()) {
             return;
         }
         let monitor = window.current_monitor().map(|m| m.size()).unwrap_or(PhysicalSize::new(1920, 1080));
@@ -1892,6 +1917,20 @@ impl App {
         let _ = self.control.send(ControlMsg::Watch { displays });
     }
 
+    /// After "Open in new window", closing that window returns this one to
+    /// the normal single-screen view.
+    fn end_pick_if_done(&mut self) {
+        if self.separate_pick.is_some() && self.extra.is_empty() && self.window.is_some() {
+            self.separate_pick = None;
+            self.sent_watch.clear();
+            self.placed_primary = false;
+            if let Some(window) = &self.window {
+                window.set_title(&self.title);
+            }
+            self.choose_view(pjdesk_proto::peer::VIEW_SINGLE, self.primary_display);
+        }
+    }
+
     fn open_extra(&mut self, event_loop: &ActiveEventLoop, display: u8) {
         let attributes = Window::default_attributes()
             .with_title(self.screen_named(display))
@@ -1940,6 +1979,7 @@ impl App {
             (g.view_mode, g.displays.clone())
         };
         if mode != pjdesk_proto::peer::VIEW_SEPARATE {
+            self.separate_pick = None;
             if !self.extra.is_empty() || self.placed_primary {
                 self.extra.clear();
                 self.sent_watch.clear();
@@ -1987,6 +2027,9 @@ impl App {
         }
         for &index in &indexes {
             if index == self.primary_display || self.extra.iter().any(|p| p.display == index) {
+                continue;
+            }
+            if self.separate_pick.as_ref().is_some_and(|pick| !pick.contains(&index)) {
                 continue;
             }
             self.open_extra(event_loop, index);
@@ -2065,6 +2108,7 @@ impl App {
                 self.extra.retain(|p| p.window.id() != id);
                 self.push_watch();
                 self.show_toast(format!("Screen {} closed", display + 1));
+                self.end_pick_if_done();
                 if self.window.is_none() && self.extra.is_empty() {
                     event_loop.exit();
                 }
@@ -2142,6 +2186,7 @@ impl App {
                                 self.extra.retain(|p| p.window.id() != id);
                                 self.push_watch();
                                 self.show_toast(format!("Screen {} closed", display + 1));
+                                self.end_pick_if_done();
                             } else if action == Action::Fullscreen {
                                 if let Some(pane) = self.extra.iter().find(|p| p.window.id() == id) {
                                     Self::toggle_fullscreen(&pane.window);
@@ -2742,6 +2787,7 @@ impl App {
             .unwrap_or_default();
         let mut toolbar = super::toolbar::Toolbar::default();
         toolbar.set_light(self.light);
+        toolbar.set_collapsed(self.toolbar.is_collapsed());
         let mut panel = super::panel::Panel::default();
         if seed.files {
             panel.open = true;
@@ -3238,9 +3284,19 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         return;
                     }
+                    if state == ElementState::Released && self.toolbar.release() {
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
                     if self.toolbar.covers(self.cursor_px.0, self.cursor_px.1, win_w) {
                         if state == ElementState::Pressed {
-                            if let Some(action) = self.toolbar.click(self.cursor_px.0, self.cursor_px.1, win_w) {
+                            let folded = self.toolbar.is_collapsed();
+                            let clicked = self.toolbar.click(self.cursor_px.0, self.cursor_px.1, win_w);
+                            if folded != self.toolbar.is_collapsed() {
+                                remember_toolbar(self.toolbar.is_collapsed());
+                            }
+                            if let Some(action) = clicked {
                                 if self.perform(action) {
                                     event_loop.exit();
                                 } else {
@@ -3294,6 +3350,24 @@ impl ApplicationHandler<UserEvent> for App {
             _ => {}
         }
     }
+}
+
+/// Saves the toolbar's folded state off the UI thread.
+fn remember_toolbar(collapsed: bool) {
+    std::thread::spawn(move || {
+        if let Ok(mut cfg) = crate::config::Config::load() {
+            if cfg.settings.toolbar_collapsed != collapsed {
+                cfg.settings.toolbar_collapsed = collapsed;
+                let _ = cfg.save();
+            }
+        }
+    });
+}
+
+/// Fit the window to the picture only in the normal window state: a
+/// maximized or full-screen window stays that way when the view changes.
+pub(crate) fn auto_resize(maximized: bool, fullscreen: bool) -> bool {
+    !maximized && !fullscreen
 }
 
 /// The resize border of a window without a system frame: about 6 px, a
@@ -3403,6 +3477,15 @@ fn walk_drop(path: &std::path::Path, depth: u32, out: &mut Vec<std::path::PathBu
 mod tests {
     use super::{android_nav_key, android_nav_named};
     use winit::keyboard::{Key, KeyCode, NamedKey};
+
+    #[test]
+    fn a_maximized_or_full_screen_window_is_never_resized_for_a_new_view() {
+        use super::auto_resize;
+        assert!(auto_resize(false, false));
+        assert!(!auto_resize(true, false));
+        assert!(!auto_resize(false, true));
+        assert!(!auto_resize(true, true));
+    }
 
     #[test]
     fn android_keyboard_shortcuts_match_the_nav_bar() {

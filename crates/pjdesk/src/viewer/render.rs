@@ -29,6 +29,12 @@ pub fn fit(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Layout {
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return Layout::default();
     }
+    // Within a few percent of 1:1, draw pixel for pixel: a tiny stretch
+    // blurs every line of text for no visible gain in size.
+    let near = |s: usize, d: usize| s <= d && (d - s) * 100 <= s * 4;
+    if (near(src_w, dst_w) && src_h <= dst_h) || (near(src_h, dst_h) && src_w <= dst_w) {
+        return Layout { x: ((dst_w - src_w) / 2) as i32, y: ((dst_h - src_h) / 2) as i32, width: src_w, height: src_h };
+    }
     let (width, height) = if src_w * dst_h <= dst_w * src_h {
         ((src_w * dst_h / src_h).clamp(1, dst_w), dst_h)
     } else {
@@ -124,6 +130,41 @@ pub fn draw_on(frame: &RgbFrame, dst: &mut [u32], dst_w: usize, dst_h: usize, la
     };
     let rows_per_chunk = visible_h.div_ceil(threads);
     let band = &mut dst[vy0 * dst_w..vy1 * dst_w];
+    // Shrinking a lot (a native-resolution "All screens" picture in a normal
+    // window): bilinear skips source pixels and text turns ragged, so each
+    // window pixel averages the source pixels it covers instead.
+    if layout.width * 4 < sw * 3 || layout.height * 4 < sh * 3 {
+        let span = |i: i32, dst_len: usize, src_len: usize| {
+            let a = (i.max(0) as usize * src_len / dst_len).min(src_len - 1);
+            let b = ((i.max(0) as usize + 1) * src_len).div_ceil(dst_len).clamp(a + 1, src_len);
+            (a, b)
+        };
+        let cols: Vec<(usize, usize)> = (vx0..vx1).map(|dx| span(dx as i32 - layout.x, layout.width, sw)).collect();
+        let cols = &cols;
+        std::thread::scope(|scope| {
+            for (chunk_index, chunk) in band.chunks_mut(rows_per_chunk * dst_w).enumerate() {
+                scope.spawn(move || {
+                    for (r, line) in chunk.chunks_exact_mut(dst_w).enumerate() {
+                        let dy = vy0 + chunk_index * rows_per_chunk + r;
+                        let (y0, y1) = span(dy as i32 - layout.y, layout.height, sh);
+                        for (dx, &(x0, x1)) in (vx0..vx1).zip(cols) {
+                            let (mut rr, mut gg, mut bb) = (0u32, 0u32, 0u32);
+                            for y in y0..y1 {
+                                for &p in &frame.pixels[y * sw + x0..y * sw + x1] {
+                                    rr += (p >> 16) & 0xFF;
+                                    gg += (p >> 8) & 0xFF;
+                                    bb += p & 0xFF;
+                                }
+                            }
+                            let n = ((y1 - y0) * (x1 - x0)) as u32;
+                            line[dx] = ((rr / n) << 16) | ((gg / n) << 8) | (bb / n);
+                        }
+                    }
+                });
+            }
+        });
+        return;
+    }
     let columns = &columns;
     std::thread::scope(|scope| {
         for (chunk_index, chunk) in band.chunks_mut(rows_per_chunk * dst_w).enumerate() {
@@ -251,6 +292,28 @@ pub fn ease_pan(shown: (f32, f32), target: (i32, i32), dt: f32) -> (f32, f32) {
 #[cfg(test)]
 mod follow_tests {
     use super::*;
+
+    #[test]
+    fn a_big_shrink_averages_instead_of_skipping_pixels() {
+        // Thin one-pixel black lines on white, shrunk 4×: every output pixel
+        // gets a quarter of the line, never all white or all black.
+        let (w, h) = (16usize, 16usize);
+        let pixels = (0..w * h).map(|i| if i % w % 4 == 0 { 0 } else { 0xFF_FF_FF }).collect();
+        let frame = RgbFrame { width: w, height: h, pixels };
+        let mut dst = vec![0u32; 4 * 4];
+        draw_on(&frame, &mut dst, 4, 4, Layout { x: 0, y: 0, width: 4, height: 4 }, 0);
+        for p in dst {
+            assert_eq!(p & 0xFF, 0xBF, "three white and one black pixel averaged");
+        }
+    }
+
+    #[test]
+    fn a_picture_that_nearly_fills_the_window_is_drawn_one_to_one() {
+        let l = fit(1920, 1080, 1940, 1100);
+        assert_eq!((l.width, l.height), (1920, 1080));
+        let big = fit(1920, 1080, 2560, 1440);
+        assert_eq!((big.width, big.height), (2560, 1440), "a clearly larger window still fills");
+    }
 
     #[test]
     fn the_window_edges_reach_both_ends_of_a_wide_all_screens_picture() {

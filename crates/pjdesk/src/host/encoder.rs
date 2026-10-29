@@ -27,7 +27,8 @@ impl VideoEncoder {
             // OpenH264 can only hold the bitrate if it may drop frames; the
             // capture loop re-sends the latest image after a dropped frame.
             .skip_frames(true)
-            .complexity(Complexity::Low)
+            // Medium spends a little more CPU for visibly sharper text and edges.
+            .complexity(Complexity::Medium)
             // Not supported for screen content (OpenH264 would warn and disable them).
             .adaptive_quantization(false)
             .background_detection(false)
