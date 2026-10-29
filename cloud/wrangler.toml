@@ -9,11 +9,10 @@ workers_dev = true
 
 # pjdesk.com and www.pjdesk.com are served by this Worker (Cloudflare adds the
 # DNS records and certificates for them on deploy).
-# Removed during the account move until pjdesk.com is active in this account:
-# routes = [
-#   { pattern = "pjdesk.com", custom_domain = true },
-#   { pattern = "www.pjdesk.com", custom_domain = true },
-# ]
+routes = [
+  { pattern = "pjdesk.com", custom_domain = true },
+  { pattern = "www.pjdesk.com", custom_domain = true },
+]
 
 # The website (and account pages). The Worker handles /api/* and /download/*.
 [assets]
