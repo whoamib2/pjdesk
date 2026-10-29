@@ -817,29 +817,15 @@ private fun Modifier.reportPad(space: OverlaySpace, id: String): Modifier {
 private fun Modifier.onSizeChangedSafe(block: (androidx.compose.ui.unit.IntSize) -> Unit): Modifier =
     onGloballyPositioned { block(it.size) }
 
-/** Power mark for End: an open ring with a bar, the same stroke icon as the Windows toolbar. */
+/** X mark for End, the same stroke icon as the Windows toolbar. */
 @Composable
 private fun EndMark() {
     Canvas(Modifier.size(22.dp)) {
         val w = 2.2.dp.toPx()
-        val r = size.minDimension * 0.36f
-        val c = Offset(center.x, center.y + size.minDimension * 0.04f)
-        drawArc(
-            Color.White,
-            startAngle = -60f,
-            sweepAngle = 300f,
-            useCenter = false,
-            topLeft = Offset(c.x - r, c.y - r),
-            size = androidx.compose.ui.geometry.Size(r * 2, r * 2),
-            style = Stroke(width = w, cap = androidx.compose.ui.graphics.StrokeCap.Round),
-        )
-        drawLine(
-            Color.White,
-            Offset(center.x, size.height * 0.08f),
-            Offset(center.x, size.height * 0.48f),
-            strokeWidth = w,
-            cap = androidx.compose.ui.graphics.StrokeCap.Round,
-        )
+        val u = size.minDimension / 18f
+        val cap = androidx.compose.ui.graphics.StrokeCap.Round
+        drawLine(Color.White, Offset(4.5f * u, 4.5f * u), Offset(13.5f * u, 13.5f * u), strokeWidth = w, cap = cap)
+        drawLine(Color.White, Offset(13.5f * u, 4.5f * u), Offset(4.5f * u, 13.5f * u), strokeWidth = w, cap = cap)
     }
 }
 

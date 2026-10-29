@@ -1934,9 +1934,8 @@ fn draw_icon(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, size: f32, mar
             line(buf, (4.6, 16.4), (9.0, 13.0));
         }
         Mark::End => {
-            let (cx, cy) = p(9.0, 9.8);
-            stroke_ring(buf, w, h, cx, cy, 6.2 * k, sw * 1.1, argb, true);
-            line(buf, (9.0, 1.8), (9.0, 8.4));
+            line(buf, (4.5, 4.5), (13.5, 13.5));
+            line(buf, (13.5, 4.5), (4.5, 13.5));
         }
         Mark::Collapse => {
             line(buf, (4.0, 11.5), (9.0, 6.5));

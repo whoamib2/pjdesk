@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.72
+
+- Changed: End on the Windows session toolbar and the Android End button shows a clean X instead of the power icon (same line style; End stays a red pill).
+
 ## 0.6.71
 
 - Sharper picture. The Windows viewer always asked for the "balanced" quality: at most 1920 pixels wide at 6 Mbit/s. The host only shrinks by whole steps, so any wider picture was halved (a 2560 screen arrived 1280 wide, two screens in All screens arrived 1920 wide) and then stretched back up, and that is what looked soft. Balanced now streams at the screen's native resolution (up to 3840 wide) at 12 Mbit/s, Sharp at 20 Mbit/s and High at 60 fps / 30 Mbit/s; the encoder uses its medium quality setting instead of the fastest one. Smooth stays light (1280 wide, 2 Mbit/s) for slow links, the host still steps the bitrate down when frames arrive late, and a session through the TCP relay opens at 8 Mbit/s.
