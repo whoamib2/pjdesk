@@ -652,10 +652,11 @@ impl Session {
                 .await;
         }
         let have = filesafe::partial_len(&root, name).unwrap_or(0);
-        let offset = if resume_from == have { have } else { 0 };
+        let offset = filesafe::resume_offset(resume_from, have, size);
         self.expected.lock().unwrap().insert(id, ExpectedFile { name: name.to_string(), size, offset });
         info!("Accepting file \"{name}\" ({size} bytes) from {}, resume {offset}", self.peer_name);
         self.note(&format!("Receiving {name}"));
+        super::filewin::incoming(id, name, size, offset);
         write_msg(send, &HostMsg::File(FileMsg::Accept { id, resume_from: offset })).await
     }
 
@@ -671,10 +672,12 @@ impl Session {
         if resume_from == 0 || resume_from > len {
             job.resume = 0;
         }
+        super::filewin::outgoing_state(job.id, job.resume, "sending");
         let conn = self.conn.clone();
         let tx = self.host_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = send_file_bytes(conn, job.id, &job.path, job.resume, tx.clone()).await {
+                super::filewin::outgoing_state(job.id, 0, &format!("{e:#}"));
                 let _ = tx.send(HostMsg::File(FileMsg::Error { id: job.id, reason: format!("{e:#}") }));
             }
         });
@@ -700,12 +703,19 @@ impl Session {
                 }
             }
         }
-        if self.allow(perms::FILE) && self.v3() {
+        let files_ok = self.allow(perms::FILE) && self.v3();
+        super::filewin::set_allowed(files_ok, self.receive_dir.lock().unwrap().trim());
+        if files_ok {
             if let Some(shared) = &self.shared {
                 for path in shared.take_send_files() {
                     self.queue_send(send, path).await?;
                 }
             }
+            for path in super::filewin::take_sends() {
+                self.queue_send(send, path).await?;
+            }
+        } else {
+            let _ = super::filewin::take_sends();
         }
         self.watch_clipboard(send).await?;
         if self.layout_aware.load(Ordering::SeqCst) {
@@ -764,6 +774,7 @@ impl Session {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         self.outgoing.lock().unwrap().insert(id, OutFile { id, path, resume: 0 });
         self.note(&format!("Offering {name}"));
+        super::filewin::outgoing(id, &name, size);
         write_msg(send, &HostMsg::File(FileMsg::Offer { id, name, size, resume_from: 0 })).await
     }
 
@@ -844,7 +855,22 @@ impl Session {
         let root = PathBuf::from(self.receive_dir.lock().unwrap().trim());
         let (mut file, offset) = filesafe::open_for_receive(&root, &job.name, header.offset)?;
         let mut got = offset;
-        while let Some(chunk) = read_side_chunk(stream).await? {
+        loop {
+            let chunk = match read_side_chunk(stream).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => {
+                    super::filewin::incoming_done(header.id, Some("interrupted; resumes on reconnect".into()));
+                    return Err(e);
+                }
+            };
+            if super::filewin::cancelled(header.id) {
+                let _ = self.host_tx.send(HostMsg::File(FileMsg::Error {
+                    id: header.id,
+                    reason: "cancelled on the other computer".into(),
+                }));
+                return Ok(());
+            }
             if got.saturating_add(chunk.len() as u64) > job.size.max(MAX_TRANSFER_BYTES) {
                 let _ = self.host_tx.send(HostMsg::File(FileMsg::Error {
                     id: header.id,
@@ -856,6 +882,7 @@ impl Session {
             got += chunk.len() as u64;
             if got % (256 * 1024) < chunk.len() as u64 {
                 let _ = self.host_tx.send(HostMsg::File(FileMsg::Progress { id: header.id, bytes: got }));
+                super::filewin::incoming_progress(header.id, got);
             }
         }
         file.flush()?;
@@ -868,6 +895,7 @@ impl Session {
             return Ok(());
         }
         let saved = filesafe::finish_receive(&root, &job.name)?;
+        super::filewin::incoming_done(header.id, None);
         self.expected.lock().unwrap().remove(&header.id);
         info!("Saved {}", saved.display());
         self.note(&format!("Saved {}", job.name));
@@ -1007,6 +1035,8 @@ async fn send_file_bytes(
     use std::io::{Read, Seek, SeekFrom};
     file.seek(SeekFrom::Start(resume))?;
     let mut uni = conn.open_uni().await?;
+    // Below control and video, so pings keep flowing during a big transfer.
+    let _ = uni.set_priority(-1);
     write_side_header(&mut uni, FILE_MAGIC, &SideHeader { id, offset: resume, a: 0, b: 0 }).await?;
     let mut buf = vec![0u8; SIDE_CHUNK];
     let mut sent = resume;
@@ -1015,12 +1045,20 @@ async fn send_file_bytes(
         if n == 0 {
             break;
         }
+        if super::filewin::cancelled(id) {
+            let _ = uni.reset(0u32.into());
+            super::filewin::outgoing_state(id, sent, "cancelled");
+            let _ = tx.send(HostMsg::File(FileMsg::Error { id, reason: "cancelled on the other computer".into() }));
+            return Ok(());
+        }
         write_side_chunk(&mut uni, &buf[..n]).await?;
         sent += n as u64;
         let _ = tx.send(HostMsg::File(FileMsg::Progress { id, bytes: sent }));
+        super::filewin::outgoing_bytes(id, sent);
     }
     write_side_chunk(&mut uni, &[]).await?;
     let _ = uni.finish();
     let _ = tx.send(HostMsg::File(FileMsg::Done { id }));
+    super::filewin::outgoing_state(id, sent, "done");
     Ok(())
 }

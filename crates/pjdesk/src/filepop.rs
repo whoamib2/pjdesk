@@ -55,6 +55,9 @@ pub struct State {
     pub beat: u64,
     #[serde(default)]
     pub close: bool,
+    /// The other side cannot list its folder (the controlled computer's window).
+    #[serde(default)]
+    pub no_pull: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -66,11 +69,11 @@ pub enum Request {
     ClearFinished,
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-fn write_atomic(path: &Path, body: &[u8]) {
+pub(crate) fn write_atomic(path: &Path, body: &[u8]) {
     let tmp = path.with_extension("tmp");
     if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::write(path, body);
@@ -468,6 +471,7 @@ pub mod window {
                     }
                 });
                 ui.add_space(4.0);
+                if !self.state.no_pull {
                 egui::CollapsingHeader::new(RichText::new("Get files from the other computer").strong())
                     .default_open(false)
                     .show(ui, |ui| {
@@ -491,6 +495,7 @@ pub mod window {
                             }
                         });
                     });
+                }
             });
         }
 

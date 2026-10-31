@@ -248,6 +248,8 @@ impl Live {
 
 pub enum Cmd {
     SendFile(PathBuf),
+    /// Offer again after a reconnect; the receiver keeps what it already has.
+    ResumeFile(PathBuf),
     Cancel(u64),
     Accept(u64),
     Pull(String),
@@ -674,6 +676,15 @@ fn apply_clip(g: &mut Live, clip: Clipboard) {
     }
 }
 
+/// Uploads that had not finished when the connection dropped.
+pub(crate) fn unfinished_sends(g: &Live) -> Vec<PathBuf> {
+    g.transfers
+        .iter()
+        .filter(|t| !t.incoming && (t.state == "offering" || t.state == "sending"))
+        .filter_map(|t| g.paths.get(&t.id).cloned())
+        .collect()
+}
+
 /// When the host accepts an upload, returns the local file to send.
 fn take_send(g: &mut Live, msg: &FileMsg) -> Option<(u64, PathBuf, u64)> {
     match msg {
@@ -740,6 +751,10 @@ async fn on_cmd(
     recorder: &Arc<Mutex<RecorderSlot>>,
     wake: &Arc<dyn Fn() + Send + Sync>,
 ) {
+    let (cmd, again) = match cmd {
+        Cmd::ResumeFile(path) => (Cmd::SendFile(path), true),
+        other => (other, false),
+    };
     match cmd {
         Cmd::SendFile(path) => {
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
@@ -769,8 +784,10 @@ async fn on_cmd(
                 state: "offering".into(),
             });
             drop(g);
-            let _ = control.send(ControlMsg::File(FileMsg::Offer { id, name, size, resume_from: 0 }));
+            let resume_from = if again { filesafe::RESUME_PARTIAL } else { 0 };
+            let _ = control.send(ControlMsg::File(FileMsg::Offer { id, name, size, resume_from }));
         }
+        Cmd::ResumeFile(_) => {}
         Cmd::Cancel(id) => {
             let mut g = live.lock().unwrap();
             if let Some(t) = g.live_transfer(id) {
@@ -928,6 +945,9 @@ async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(resume))?;
     let mut uni = conn.open_uni().await?;
+    // Below the control and picture streams, so pings and frames keep flowing
+    // while a big file fills the link.
+    let _ = uni.set_priority(-1);
     write_side_header(&mut uni, FILE_MAGIC, &SideHeader { id, offset: resume, a: 0, b: 0 }).await?;
     let mut buf = vec![0u8; pjdesk_proto::peer::SIDE_CHUNK];
     let mut sent = resume;
@@ -1315,6 +1335,95 @@ mod tests {
         );
         connection.close(0u32.into(), b"test");
         rt.shutdown_timeout(Duration::from_secs(3));
+    }
+
+    /// More than 4 GiB in one transfer, then a resume from past 4 GiB, while a
+    /// small stream keeps flowing. Run with:
+    /// cargo test --release -p pjdesk --bin pjdesk huge_file -- --ignored
+    #[test]
+    #[ignore]
+    fn huge_file_streams_past_4_gib_and_resumes_while_pings_flow() {
+        const SIZE: u64 = 4 * 1024 * 1024 * 1024 + 300 * 1024 * 1024;
+        let dir = std::env::temp_dir().join(format!("pjdesk-huge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.bin");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(SIZE).unwrap();
+        drop(f);
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let ok = rt.block_on(async {
+            let (client, host) = conn_pair().await;
+            let live = Arc::new(Mutex::new(Live::new(true)));
+            // Pings at normal priority, read on the host while the file streams.
+            let mut ping = client.open_uni().await.unwrap();
+            ping.write_all(&[1]).await.unwrap();
+            let pinger = tokio::spawn(async move {
+                loop {
+                    if ping.write_all(&[7u8; 16]).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            });
+            let mut ping_rx = host.accept_uni().await.unwrap();
+            let mut first = [0u8; 1];
+            ping_rx.read_exact(&mut first).await.unwrap();
+            let gap = Arc::new(AtomicU64::new(0));
+            let gap_w = gap.clone();
+            let watcher = tokio::spawn(async move {
+                let mut last = Instant::now();
+                let mut buf = [0u8; 16];
+                while ping_rx.read_exact(&mut buf).await.is_ok() {
+                    let g = last.elapsed().as_millis() as u64;
+                    gap_w.fetch_max(g, Ordering::Relaxed);
+                    last = Instant::now();
+                }
+            });
+            let mut results = Vec::new();
+            for resume in [0u64, SIZE - 200 * 1024 * 1024] {
+                let host2 = host.clone();
+                let reader = tokio::spawn(async move {
+                    let mut uni = host2.accept_uni().await.unwrap();
+                    let (magic, header): ([u8; 8], SideHeader) =
+                        pjdesk_proto::peer::read_side_header(&mut uni).await.unwrap();
+                    assert_eq!(&magic, pjdesk_proto::peer::FILE_MAGIC);
+                    let mut got = header.offset;
+                    while let Some(chunk) = read_side_chunk(&mut uni).await.unwrap() {
+                        got += chunk.len() as u64;
+                    }
+                    (header.offset, got)
+                });
+                let sent = send_bytes(client.clone(), 1, &path, resume, &live).await.unwrap();
+                assert!(sent);
+                results.push(reader.await.unwrap());
+            }
+            pinger.abort();
+            watcher.abort();
+            (results, gap.load(Ordering::Relaxed))
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let (results, worst_gap_ms) = ok;
+        assert_eq!(results[0], (0, SIZE));
+        assert_eq!(results[1], (SIZE - 200 * 1024 * 1024, SIZE));
+        assert!(worst_gap_ms < 1_000, "pings stalled for {worst_gap_ms} ms during the transfer");
+        eprintln!("huge transfer ok; worst ping gap {worst_gap_ms} ms");
+    }
+
+    async fn conn_pair() -> (Connection, Connection) {
+        let identity = pjdesk_proto::tls::TlsIdentity::generate("pjdesk-host").unwrap();
+        let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        host_sock.set_nonblocking(true).unwrap();
+        let addr = host_sock.local_addr().unwrap();
+        let host = crate::p2p::host_endpoint(host_sock, &identity).unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_sock.set_nonblocking(true).unwrap();
+        let client = crate::p2p::controller_endpoint(client_sock, identity.fingerprint()).unwrap();
+        let connecting = client.connect(addr, pjdesk_proto::PEER_SERVER_NAME).unwrap();
+        let incoming = host.accept().await.expect("host accept").await.expect("host handshake");
+        let connection = connecting.await.expect("client handshake");
+        std::mem::forget(host);
+        std::mem::forget(client);
+        (connection, incoming)
     }
 
     async fn session_pair() -> (Connection, quinn::RecvStream) {

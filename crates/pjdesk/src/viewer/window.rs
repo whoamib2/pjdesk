@@ -394,6 +394,7 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
         chat_pops: HashMap::new(),
         file_pops: HashMap::new(),
         file_batches: HashMap::new(),
+        files_popped: HashSet::new(),
         chat_heard: HashMap::new(),
         tab_order: vec![1],
         connecting: Vec::new(),
@@ -644,6 +645,8 @@ struct App {
     file_pops: HashMap<u64, crate::filepop::FilePop>,
     /// Files received per session, shown in Explorer when a batch is over.
     file_batches: HashMap<u64, crate::reveal::Batch>,
+    /// Incoming transfers that already opened the Files window (sid, id).
+    files_popped: HashSet<(u64, u64)>,
     /// Incoming chat lines already seen per session (auto-open on new ones).
     chat_heard: HashMap<u64, usize>,
     window: Option<Rc<Window>>,
@@ -2313,12 +2316,31 @@ impl App {
         for sid in self.live_ids() {
             let Some((live, cmds)) = self.files_target(sid) else { continue };
             // Received files, whether or not the window is open.
-            let (saved, arriving) = {
+            let (saved, arriving, fresh) = {
                 let mut g = live.lock().unwrap();
                 let saved = std::mem::take(&mut g.saved);
                 let arriving = g.transfers.iter().any(|t| t.incoming && matches!(t.state.as_str(), "offered" | "downloading"));
-                (saved, arriving)
+                let fresh: Vec<u64> = g
+                    .transfers
+                    .iter()
+                    .filter(|t| t.incoming && matches!(t.state.as_str(), "offered" | "downloading"))
+                    .map(|t| t.id)
+                    .filter(|id| !self.files_popped.contains(&(sid, *id)))
+                    .collect();
+                (saved, arriving, fresh)
             };
+            let _ = &cmds;
+            // A file starting to arrive opens the Files window so it can be watched live.
+            if !fresh.is_empty() {
+                for id in &fresh {
+                    self.files_popped.insert((sid, *id));
+                }
+                let shut = self.file_pops.get_mut(&sid).map_or(true, |p| !p.is_open());
+                if shut {
+                    self.open_files(sid);
+                }
+            }
+            let Some((live, cmds)) = self.files_target(sid) else { continue };
             let batch = self.file_batches.entry(sid).or_default();
             for path in saved {
                 batch.saved(path);
@@ -2365,6 +2387,7 @@ impl App {
                 pop.close();
             }
             self.file_batches.remove(&sid);
+            self.files_popped.retain(|(s, _)| *s != sid);
         }
     }
 
@@ -3046,6 +3069,16 @@ impl App {
     }
 
     fn graft(&mut self, sid: u64, armed: Armed) {
+        // Uploads that were still going continue on the new connection from
+        // where the other computer's partial file ends.
+        let unfinished = {
+            let old = if sid == self.sid { Some(&self.live) } else { self.others.iter().find(|h| h.sid == sid).map(|h| &h.live) };
+            old.map(|live| super::controls::unfinished_sends(&live.lock().unwrap())).unwrap_or_default()
+        };
+        for path in unfinished {
+            info!("Resuming the upload of {} after the reconnect", path.display());
+            let _ = armed.cmds.send(super::controls::Cmd::ResumeFile(path));
+        }
         if sid == self.sid {
             self.connection.close(0u32.into(), b"reconnecting");
             self.connection = armed.connection;

@@ -21,6 +21,7 @@ mod client_update;
 mod chatpop;
 mod consentpop;
 mod filepop;
+mod companion;
 mod reveal;
 #[path = "../../shared/localtime.rs"]
 mod localtime;
@@ -137,6 +138,12 @@ enum Cmd {
     /// Internal: the file-transfer window for a session.
     #[command(name = "__files-window", hide = true)]
     FilesWindow {
+        #[arg(long)]
+        dir: String,
+    },
+    /// Internal: the minimized session companion on the controlled computer.
+    #[command(name = "__session-companion", hide = true)]
+    SessionCompanion {
         #[arg(long)]
         dir: String,
     },
@@ -400,7 +407,7 @@ fn main() {
         // with no log line and no window after the password was accepted.
         init_viewer_com();
     }
-    let is_background = raw.iter().any(|a| a == "__session-host" || a == "__chat-window" || a == "update-handoff" || a == "--tray" || a == "--minimized" || a == "--background" || a == "--window")
+    let is_background = raw.iter().any(|a| a == "__session-host" || a == "__chat-window" || a == "__session-companion" || a == "__files-window" || a == "__consent-window" || a == "update-handoff" || a == "--tray" || a == "--minimized" || a == "--background" || a == "--window")
         || (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"));
 
     // With any other argument, attach a console so output and clap errors show.
@@ -438,6 +445,11 @@ fn main() {
         }
         Some(Cmd::FilesWindow { dir }) => {
             if let Err(e) = filepop::run_window(std::path::PathBuf::from(dir)) {
+                tracing::warn!("{e:#}");
+            }
+        }
+        Some(Cmd::SessionCompanion { dir }) => {
+            if let Err(e) = companion::run_window(std::path::PathBuf::from(dir)) {
                 tracing::warn!("{e:#}");
             }
         }
@@ -492,7 +504,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::UpdateTask { disable }) => service::set_update_task(!disable),
         Some(Cmd::Console) => interactive(config, cli.server),
         Some(Cmd::Service(cmd)) => service_command(cmd),
-        Some(Cmd::SessionHost { .. }) | Some(Cmd::ChatWindow { .. }) | Some(Cmd::ConsentWindow { .. }) | Some(Cmd::FilesWindow { .. }) | None => {
+        Some(Cmd::SessionHost { .. }) | Some(Cmd::ChatWindow { .. }) | Some(Cmd::ConsentWindow { .. }) | Some(Cmd::FilesWindow { .. }) | Some(Cmd::SessionCompanion { .. }) | None => {
             unreachable!("handled in main")
         }
     }

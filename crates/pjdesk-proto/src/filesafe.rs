@@ -14,6 +14,19 @@ use anyhow::{bail, Context, Result};
 
 /// Largest single transfer accepted (8 GiB).
 pub const MAX_TRANSFER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// `resume_from` in an offer that means "keep whatever part you already have".
+/// Sent when a transfer is offered again after the connection came back.
+/// An older receiver sees a mismatch and simply starts from 0.
+pub const RESUME_PARTIAL: u64 = u64::MAX;
+
+/// Where the receiver continues an offered file, given what it already holds.
+pub fn resume_offset(resume_from: u64, have: u64, size: u64) -> u64 {
+    if resume_from == have || (resume_from == RESUME_PARTIAL && have <= size) {
+        have
+    } else {
+        0
+    }
+}
 /// Suffix for a transfer that has not finished. Removed on success.
 pub const PARTIAL_SUFFIX: &str = ".pjpart";
 
@@ -164,6 +177,16 @@ pub fn partial_len(root: &Path, name: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reoffer_after_reconnect_keeps_the_partial_file() {
+        assert_eq!(super::resume_offset(super::RESUME_PARTIAL, 1_000_000_000, 1_100_000_000), 1_000_000_000);
+        assert_eq!(super::resume_offset(super::RESUME_PARTIAL, 0, 5), 0);
+        assert_eq!(super::resume_offset(0, 1_000, 5_000), 0);
+        assert_eq!(super::resume_offset(1_000, 1_000, 5_000), 1_000);
+        assert_eq!(super::resume_offset(super::RESUME_PARTIAL, 9_000, 5_000), 0);
+        assert_eq!(super::resume_offset(5_000_000_000, 5_000_000_000, 6_000_000_000), 5_000_000_000);
+    }
+
     use super::*;
 
     fn scratch(label: &str) -> PathBuf {

@@ -132,6 +132,8 @@ pub async fn run(
     };
     let handed = args.service_host && super::notice::client_alive();
     let _chat = super::chatwin::Guard::begin(handed);
+    // Small minimized taskbar window with Chat and Send files; closes with the session.
+    let _files = super::filewin::Guard::begin(&peer_name);
     if let Some(shared) = &ui {
         shared.clear_chat();
     }

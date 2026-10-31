@@ -1,6 +1,10 @@
 # Changelog
 
 ## 0.6.78
+- Fixed: large file transfers through the PJDesk server failed at about 1 GB ("connection lost: closed"). The server's relay cut each route after 1 GiB; the cap is now 256 GiB (update PJDesk Server too).
+- Interrupted uploads now resume from where they stopped after a reconnect, and keepalives take priority over file data. Tested with a 4.3 GiB file.
+- The Files window opens on its own as soon as a file starts arriving, so it can be watched live.
+- On the controlled computer, a small minimized "PJDesk session" window sits on the taskbar during a session with Chat and Send files (to the person connected). It closes when the session ends. Files sent this way land in the viewer's Downloads\PJDesk and open in Explorer.
 
 - Android: the app now opens to Saved computers. Settings → Display → Open to lets you choose Saved computers or Home (connect and share this phone), and the choice is remembered.
 - Windows: after an update (automatic or a silent installer run, /S), PJDesk comes back in the tray only, with no main window, PIN screen or notice. The background service keeps the computer reachable. The window opens when you open it. A manual first-time install can still open PJDesk from the last page.

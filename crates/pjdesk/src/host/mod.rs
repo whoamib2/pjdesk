@@ -2,6 +2,7 @@
 
 pub mod capture;
 pub(crate) mod chatwin;
+pub(crate) mod filewin;
 mod ctrl;
 pub(crate) mod direct;
 mod encoder;

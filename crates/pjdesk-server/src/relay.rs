@@ -26,8 +26,11 @@ use crate::server::Shared;
 const ROUTE_IDLE: Duration = Duration::from_secs(120);
 /// One session may relay at most this much. The route exists before the
 /// password check (QUIC has to come up first), so an open-ended forward would
-/// let anyone who can open a session burn bandwidth.
-const ROUTE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// let anyone who can open a session burn bandwidth. Binding a route already
+/// needs the session's token from this server, so the cap is only a backstop.
+/// It was 1 GiB, which cut every relayed transfer off at about 1 GB
+/// ("connection lost: closed"); it must stay well above the 8 GiB file limit.
+const ROUTE_MAX_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 /// Cap on simultaneous relay routes, so a flood of binds cannot grow forever.
 const MAX_ROUTES: usize = 4096;
 /// Bind datagrams one address may send in a second. Past this they are dropped
@@ -274,4 +277,12 @@ pub fn from_tcp(state: &Shared, conn_id: u64, session_id: SessionId, data: Vec<u
 /// Compares tokens without revealing (through timing) how many bytes matched.
 fn constant_time_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod cap_tests {
+    #[test]
+    fn a_relayed_session_can_carry_more_than_the_largest_file() {
+        assert!(super::ROUTE_MAX_BYTES > 2 * pjdesk_proto::filesafe::MAX_TRANSFER_BYTES);
+    }
 }
