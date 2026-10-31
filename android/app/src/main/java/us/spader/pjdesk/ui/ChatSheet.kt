@@ -28,6 +28,15 @@ import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.ChatLine
 
 const val CHAT_NEEDS_TIP = "The other computer needs PJDesk 0.6.50 or newer"
+const val CHAT_OFF_TIP = "Chat is not allowed in this session by the other computer"
+const val CHAT_WAIT_TIP = "Chat is not available in this session yet"
+
+/** Why chat is off, matching Windows: the version message only for a known old version. */
+fun chatOffTip(gate: ChatGate): String = when (gate) {
+    ChatGate.TooOld -> CHAT_NEEDS_TIP
+    ChatGate.Ready -> CHAT_OFF_TIP
+    ChatGate.Unknown -> CHAT_WAIT_TIP
+}
 
 enum class ChatGate { Ready, TooOld, Unknown }
 

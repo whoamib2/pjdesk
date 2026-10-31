@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.75
+
+- Chat is always allowed in every session: Allow prompt (window- or service-hosted), saved/permanent and temporary passwords, support keys and codes, server access keys, view requests, view-only sessions, and Android hosts. No permission ceiling, policy, access key, or approval choice removes it. Both computers need 0.6.75 for this.
+- Android: the chat button explains why chat is off the same way Windows does. The "needs PJDesk 0.6.50 or newer" message appears only when the other computer is known to run an older version.
+
 ## 0.6.74
 
 - Chat: unattended and support-key sessions now grant chat, so the Chat button works with PJDesk 0.6.50 and newer. The viewer asks the other computer for its version and shows the real reason when chat is off (not allowed, older version, or not ready yet) instead of always saying "needs 0.6.50 or newer". The computer being controlled must run 0.6.74 for chat in unattended sessions.

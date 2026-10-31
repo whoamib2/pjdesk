@@ -574,7 +574,7 @@ fun SessionScreen(
                 Column(horizontalAlignment = Alignment.End) {
                     Box {
                         HitButton(
-                            description = if (chatTooOld) CHAT_NEEDS_TIP else "Chat",
+                            description = if (chatReady) "Chat" else if (chatTooOld) CHAT_NEEDS_TIP else CHAT_WAIT_TIP,
                             space = space,
                             padId = "chat",
                             color = if (chatReady) {

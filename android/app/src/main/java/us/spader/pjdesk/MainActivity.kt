@@ -2609,7 +2609,7 @@ class MainActivity : FragmentActivity() {
                                     ) {
                                         if (!state.chatReady) {
                                             Text(
-                                                us.spader.pjdesk.ui.CHAT_NEEDS_TIP,
+                                                us.spader.pjdesk.ui.CHAT_WAIT_TIP,
                                                 color = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant,
                                                 style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
                                                 textAlign = TextAlign.End,
