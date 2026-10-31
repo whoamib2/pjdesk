@@ -2,15 +2,25 @@
 
 package us.spader.pjdesk.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -85,6 +95,48 @@ fun formatChatLine(line: ChatLine): String {
     return "%02d:%02d:%02d UTC  %s  %s".format(h, m, s, line.name, line.text)
 }
 
+/** "3:07 PM" in the phone's time zone. */
+fun chatClock(unix: Long): String =
+    java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(unix * 1000))
+
+private val MineBubble = Color(0xFF0A84FF)
+private val TheirBubble = Color(0xFF3A3A3C)
+private val Header = Color(0xFF5E5CE6)
+private val PeerName = Color(0xFFFF9F0A)
+private val MeName = Color(0xFF64D2FF)
+
+@Composable
+private fun Bubble(line: ChatLine, showHeader: Boolean) {
+    Column(
+        Modifier.fillMaxWidth(),
+        horizontalAlignment = if (line.mine) Alignment.End else Alignment.Start,
+    ) {
+        if (showHeader) {
+            Row(Modifier.padding(top = 6.dp, bottom = 2.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    if (line.mine) "You" else line.name,
+                    color = if (line.mine) MeName else PeerName,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp,
+                )
+                Text(chatClock(line.unix), color = Color(0xFF8E8E93), fontSize = 12.sp)
+            }
+        }
+        Surface(
+            color = if (line.mine) MineBubble else TheirBubble,
+            shape = if (line.mine) RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp) else RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp),
+            modifier = Modifier.widthIn(max = 280.dp),
+        ) {
+            Text(
+                line.text,
+                color = Color.White,
+                fontSize = 15.sp,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+            )
+        }
+    }
+}
+
 @Composable
 fun ChatSheet(
     lines: List<ChatLine>,
@@ -94,41 +146,66 @@ fun ChatSheet(
     onClose: () -> Unit,
 ) {
     var draft by remember { mutableStateOf("") }
+    val list = rememberLazyListState()
+    val shown = lines.takeLast(200)
+    LaunchedEffect(shown.size) {
+        if (shown.isNotEmpty()) list.animateScrollToItem(shown.size - 1)
+    }
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
-        color = MaterialTheme.colorScheme.surface,
+        color = Color(0xFF1C1C1E),
         tonalElevation = 8.dp,
     ) {
-        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Chat", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                TextButton(onClick = onClose) { Text("Close") }
+        Column(Modifier.fillMaxWidth()) {
+            Row(
+                Modifier.fillMaxWidth().background(Header).padding(horizontal = 16.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(Modifier.size(10.dp).background(if (ready) Color(0xFF30D158) else Color(0xFF8E8E93), CircleShape))
+                Text(
+                    "Chat",
+                    color = Color.White,
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.padding(start = 10.dp).weight(1f),
+                )
+                TextButton(onClick = onClose) { Text("Close", color = Color.White) }
             }
             if (tooOld) {
-                Text(CHAT_NEEDS_TIP, color = MaterialTheme.colorScheme.tertiary)
+                Text(CHAT_NEEDS_TIP, color = Color(0xFFF2B03A), modifier = Modifier.padding(16.dp))
             } else {
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 120.dp, max = 280.dp)
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                LazyColumn(
+                    state = list,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 140.dp, max = 320.dp).padding(horizontal = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(3.dp),
                 ) {
-                    if (lines.isEmpty()) {
-                        Text("No messages yet. This chat lasts for the session only.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (shown.isEmpty()) {
+                        item {
+                            Text(
+                                "No messages yet. Say hello! This chat lasts for the session only.",
+                                color = Color(0xFF8E8E93),
+                                modifier = Modifier.padding(vertical = 16.dp),
+                            )
+                        }
                     }
-                    lines.takeLast(40).forEach { line ->
-                        Text(formatChatLine(line), style = MaterialTheme.typography.bodyMedium)
+                    itemsIndexed(shown) { i, line ->
+                        val prev = shown.getOrNull(i - 1)
+                        Bubble(line, prev == null || prev.mine != line.mine || prev.name != line.name)
                     }
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    Modifier.fillMaxWidth().background(Color(0xFF2C2C2E)).padding(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     OutlinedTextField(
                         value = draft,
                         onValueChange = { draft = it.take(2000) },
                         modifier = Modifier.weight(1f),
-                        singleLine = true,
-                        label = { Text("Message") },
+                        maxLines = 4,
+                        enabled = ready,
+                        placeholder = { Text("Message") },
+                        shape = RoundedCornerShape(18.dp),
                     )
                     Button(
                         onClick = {
@@ -138,8 +215,10 @@ fun ChatSheet(
                                 draft = ""
                             }
                         },
-                        enabled = draft.isNotBlank(),
-                    ) { Text("Send") }
+                        enabled = ready && draft.isNotBlank(),
+                        shape = RoundedCornerShape(18.dp),
+                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = MineBubble),
+                    ) { Text("Send", color = Color.White) }
                 }
             }
         }

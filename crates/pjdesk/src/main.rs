@@ -18,6 +18,7 @@ mod account;
 mod access_keys;
 mod audio;
 mod client_update;
+mod chatpop;
 mod clip;
 mod color;
 mod config;
@@ -120,6 +121,12 @@ enum Cmd {
         /// Path to the service config to host from.
         #[arg(long)]
         config: Option<String>,
+    },
+    /// Internal: the compact chat window for a session.
+    #[command(name = "__chat-window", hide = true)]
+    ChatWindow {
+        #[arg(long)]
+        dir: String,
     },
 }
 
@@ -365,7 +372,7 @@ fn main() {
         // with no log line and no window after the password was accepted.
         init_viewer_com();
     }
-    let is_background = raw.iter().any(|a| a == "__session-host" || a == "update-handoff" || a == "--tray" || a == "--window")
+    let is_background = raw.iter().any(|a| a == "__session-host" || a == "__chat-window" || a == "update-handoff" || a == "--tray" || a == "--window")
         || (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"));
 
     // With any other argument, attach a console so output and clap errors show.
@@ -394,6 +401,11 @@ fn main() {
         Some(Cmd::SessionHost { config }) => {
             if let Err(e) = service::session_host(config.clone()) {
                 tracing::error!("session host: {e:#}");
+            }
+        }
+        Some(Cmd::ChatWindow { dir }) => {
+            if let Err(e) = chatpop::run_window(std::path::PathBuf::from(dir)) {
+                tracing::warn!("{e:#}");
             }
         }
         Some(Cmd::UpdateHandoff) => {
@@ -442,7 +454,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::UpdateTask { disable }) => service::set_update_task(!disable),
         Some(Cmd::Console) => interactive(config, cli.server),
         Some(Cmd::Service(cmd)) => service_command(cmd),
-        Some(Cmd::SessionHost { .. }) | None => {
+        Some(Cmd::SessionHost { .. }) | Some(Cmd::ChatWindow { .. }) | None => {
             unreachable!("handled in main")
         }
     }

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use pjdesk_proto::peer::{chat_line, chat_name, chat_now, format_chat_line, ChatEntry};
+use pjdesk_proto::peer::{chat_line, chat_name, chat_now, ChatEntry};
 
 struct Log {
     lines: Vec<ChatEntry>,
@@ -185,6 +185,9 @@ pub fn adopt() {
     if SEEN.swap(seq, Ordering::SeqCst) == seq {
         return;
     }
+    if let Some(peer) = parsed.iter().rev().find(|l| !l.mine) {
+        set_peer(&peer.name);
+    }
     LOG.lock().unwrap().lines = parsed;
     LOG.lock().unwrap().seq = seq;
     if alert {
@@ -196,6 +199,9 @@ pub fn adopt() {
 }
 
 fn push(entry: ChatEntry, incoming: bool) {
+    if !entry.mine {
+        set_peer(&entry.name);
+    }
     {
         let mut log = LOG.lock().unwrap();
         log.lines.push(entry);
@@ -295,253 +301,66 @@ fn ensure_thread() {
     }
 }
 
-#[cfg(not(windows))]
+/// Keeps the compact chat window (its own small process) in step with the
+/// transcript. Wakes on every change and at least every 250 ms.
 #[cfg_attr(test, allow(dead_code))]
 fn ui_thread() {
+    #[cfg(windows)]
+    THREAD.store(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }, Ordering::SeqCst);
+    let mut pop = crate::chatpop::ChatPop::new("host");
+    let mut shown = false;
     loop {
-        let _ = lines();
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        if OPEN.load(Ordering::SeqCst) {
+            let peer = PEER.lock().unwrap().clone();
+            let ready = ARMED.load(Ordering::SeqCst);
+            let note = if ready { "" } else { "The session has ended." };
+            pop.update(&peer, ready, note, &lines());
+            let alert = take_alert();
+            if !shown || alert || !pop.is_open() {
+                if shown && !alert && pop.take_closed() {
+                    user_closed();
+                    continue;
+                }
+                pop.show(alert);
+                shown = true;
+            }
+            for text in pop.take_replies() {
+                let _ = queue_reply(&text);
+            }
+        } else if shown {
+            pop.close();
+            shown = false;
+        }
+        wait_for_wake(std::time::Duration::from_millis(250));
     }
 }
 
 #[cfg(windows)]
-fn ui_thread() {
-    use windows::core::w;
-    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
-    use windows::Win32::Graphics::Gdi::{
-        BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
-        InvalidateRect, MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-        DEFAULT_QUALITY, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
-        OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
-    };
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::HiDpi::GetDpiForWindow;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_BACK, VK_RETURN};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FlashWindow, GetClientRect, GetMessageW,
-        PostQuitMessage, RegisterClassW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, HWND_TOPMOST, MSG,
-        SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE,
-        WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_PAINT, WNDCLASSW,
-    };
-
-    const WS_CAPTION: u32 = 0x00C0_0000;
-    const WS_SYSMENU: u32 = 0x0008_0000;
-    const WS_MINIMIZEBOX: u32 = 0x0002_0000;
-    const WS_EX_TOPMOST: u32 = 0x0000_0008;
-    const WS_EX_APPWINDOW: u32 = 0x0004_0000;
-
-    static DRAFT: Mutex<String> = Mutex::new(String::new());
-
-    unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        match msg {
-            WM_ERASEBKGND => LRESULT(1),
-            WM_CLOSE => {
-                user_closed();
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                LRESULT(0)
-            }
-            WM_KEYDOWN => {
-                if wparam.0 as u16 == VK_BACK.0 {
-                    DRAFT.lock().unwrap().pop();
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                } else if wparam.0 as u16 == VK_RETURN.0 {
-                    send_draft();
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-                LRESULT(0)
-            }
-            WM_CHAR => {
-                let unit = wparam.0 as u32;
-                if unit >= 32 && unit != 127 {
-                    if let Some(ch) = char::from_u32(unit) {
-                        let mut draft = DRAFT.lock().unwrap();
-                        if draft.chars().count() < pjdesk_proto::peer::MAX_CHAT_TEXT {
-                            draft.push(ch);
-                        }
-                    }
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-                LRESULT(0)
-            }
-            WM_LBUTTONUP => {
-                let (x, y) = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32);
-                if hit_send(hwnd, x, y) {
-                    send_draft();
-                }
-                let _ = InvalidateRect(Some(hwnd), None, false);
-                LRESULT(0)
-            }
-            WM_PAINT => {
-                paint(hwnd);
-                LRESULT(0)
-            }
-            WM_DESTROY => {
-                PostQuitMessage(0);
-                LRESULT(0)
-            }
-            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-        }
-    }
-
-    fn send_draft() {
-        let text = std::mem::take(&mut *DRAFT.lock().unwrap());
-        let _ = queue_reply(&text);
-    }
-
-    unsafe fn dpi(hwnd: HWND) -> i32 {
-        let value = GetDpiForWindow(hwnd) as i32;
-        if value > 0 { value } else { 96 }
-    }
-
-    unsafe fn scale(hwnd: HWND, px: i32) -> i32 {
-        px * dpi(hwnd) / 96
-    }
-
-    unsafe fn hit_send(hwnd: HWND, x: i32, y: i32) -> bool {
-        let mut rect = RECT::default();
-        let _ = GetClientRect(hwnd, &mut rect);
-        let r = send_rect(&rect, dpi(hwnd));
-        x >= r.left && x < r.right && y >= r.top && y < r.bottom
-    }
-
-    fn send_rect(client: &RECT, dpi: i32) -> RECT {
-        let s = |px: i32| px * dpi / 96;
-        RECT { left: client.right - s(88), top: client.bottom - s(40), right: client.right - s(12), bottom: client.bottom - s(10) }
-    }
-
-    unsafe fn place(hwnd: HWND) {
-        let w = scale(hwnd, 420);
-        let h = scale(hwnd, 320);
-        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..MONITORINFO::default() };
-        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
-        let (right, top) = if GetMonitorInfoW(mon, &mut info).as_bool() {
-            (info.rcWork.right, info.rcWork.top)
-        } else {
-            (scale(hwnd, 1920), 0)
-        };
-        let margin = scale(hwnd, 12);
-        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), right - w - margin, top + scale(hwnd, 150), w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    }
-
-    unsafe fn paint(hwnd: HWND) {
-        let mut ps = PAINTSTRUCT::default();
-        let dc = BeginPaint(hwnd, &mut ps);
-        if dc.is_invalid() {
-            return;
-        }
-        let mut rect = RECT::default();
-        let _ = GetClientRect(hwnd, &mut rect);
-        let bg = CreateSolidBrush(COLORREF(0x00_22_1b_16));
-        let _ = FillRect(dc, &rect, bg);
-        let _ = DeleteObject(HGDIOBJ(bg.0));
-        let _ = SetBkMode(dc, TRANSPARENT);
-        let d = dpi(hwnd);
-        let lines = lines();
-        let start = lines.len().saturating_sub(8);
-        let mut y = rect.top + scale(hwnd, 8);
-        for line in lines.iter().skip(start) {
-            let shown = format_chat_line(line.unix, &line.name, &line.text);
-            let shown: String = shown.chars().take(72).collect();
-            let _ = SetTextColor(dc, COLORREF(if line.mine { 0x00_ff_e3_cf } else { 0x00_f2_ec_e8 }));
-            text(
-                dc,
-                &shown,
-                RECT { left: scale(hwnd, 12), top: y, right: rect.right - scale(hwnd, 12), bottom: y + scale(hwnd, 22) },
-                -(13 * d / 96),
-            );
-            y += scale(hwnd, 22);
-        }
-        let draft_rect = RECT { left: scale(hwnd, 12), top: rect.bottom - scale(hwnd, 40), right: rect.right - scale(hwnd, 96), bottom: rect.bottom - scale(hwnd, 10) };
-        let draft_bg = CreateSolidBrush(COLORREF(0x00_37_2c_26));
-        let _ = FillRect(dc, &draft_rect, draft_bg);
-        let _ = DeleteObject(HGDIOBJ(draft_bg.0));
-        let draft = DRAFT.lock().unwrap().clone();
-        let shown = if draft.is_empty() { "Message".to_string() } else { draft.chars().rev().take(48).collect::<String>().chars().rev().collect() };
-        let _ = SetTextColor(dc, COLORREF(0x00_f2_ec_e8));
-        text(dc, &shown, draft_rect, -(13 * d / 96));
-        let btn = send_rect(&rect, d);
-        let blue = CreateSolidBrush(COLORREF(0x00_ff_9b_4d));
-        let _ = FillRect(dc, &btn, blue);
-        let _ = DeleteObject(HGDIOBJ(blue.0));
-        let _ = SetTextColor(dc, COLORREF(0x00_ff_ff_ff));
-        text(dc, "Send", btn, -(13 * d / 96));
-        let _ = EndPaint(hwnd, &ps);
-    }
-
-    unsafe fn text(dc: windows::Win32::Graphics::Gdi::HDC, value: &str, mut rect: RECT, height: i32) {
-        let font = CreateFontW(height, 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, 0, w!("Segoe UI"));
-        let old = SelectObject(dc, HGDIOBJ(font.0));
-        let mut wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
-        let _ = DrawTextW(dc, &mut wide, &mut rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        let _ = SelectObject(dc, old);
-        let _ = DeleteObject(HGDIOBJ(font.0));
-    }
-
-    unsafe fn refresh(hwnd: HWND) {
-        let title: Vec<u16> = "Chat".encode_utf16().chain(std::iter::once(0)).collect();
-        let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(title.as_ptr()));
-        if OPEN.load(Ordering::SeqCst) {
-            place(hwnd);
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOACTIVATE | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE);
-            if take_alert() {
-                let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(
-                    windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK,
-                );
-                let _ = FlashWindow(hwnd, true);
-            }
-            let _ = InvalidateRect(Some(hwnd), None, false);
-        } else {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
-    }
-
+fn wait_for_wake(timeout: std::time::Duration) {
+    use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjects, PeekMessageW, MSG, PM_REMOVE, QS_ALLINPUT};
     unsafe {
-        let class = WNDCLASSW {
-            lpfnWndProc: Some(proc),
-            hInstance: GetModuleHandleW(None).unwrap_or_default().into(),
-            lpszClassName: w!("PJDeskChat"),
-            ..WNDCLASSW::default()
-        };
-        if RegisterClassW(&class) == 0 && windows::Win32::Foundation::GetLastError().0 != 1410 {
-            tracing::warn!("Could not register the chat window");
-            return;
-        }
-        let Ok(hwnd) = CreateWindowExW(
-            WINDOW_EX_STYLE(WS_EX_TOPMOST | WS_EX_APPWINDOW),
-            w!("PJDeskChat"),
-            w!("Chat"),
-            WINDOW_STYLE(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX),
-            0,
-            0,
-            10,
-            10,
-            None,
-            None,
-            None,
-            None,
-        ) else {
-            tracing::warn!("Could not create the chat window");
-            return;
-        };
-        THREAD.store(windows::Win32::System::Threading::GetCurrentThreadId(), Ordering::SeqCst);
-        refresh(hwnd);
+        let _ = MsgWaitForMultipleObjects(None, false, timeout.as_millis() as u32, QS_ALLINPUT);
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.message == WM_APP_REFRESH {
-                refresh(hwnd);
-                continue;
-            }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        let _ = DestroyWindow(hwnd);
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {}
     }
+}
+
+#[cfg(not(windows))]
+fn wait_for_wake(timeout: std::time::Duration) {
+    std::thread::sleep(timeout);
+}
+
+/// Who the person at this computer is chatting with, for the window header.
+static PEER: Mutex<String> = Mutex::new(String::new());
+
+pub fn set_peer(name: &str) {
+    *PEER.lock().unwrap() = name.to_string();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pjdesk_proto::peer::format_chat_line;
 
     static TEST: Mutex<()> = Mutex::new(());
 

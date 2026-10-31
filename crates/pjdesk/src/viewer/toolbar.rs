@@ -464,6 +464,8 @@ pub struct Toolbar {
     /// Computer names in this window. Empty keeps the older single-session strip.
     sessions: Vec<String>,
     unread: Vec<u32>,
+    /// Chat lines this session has not seen; drawn on the Chat icon.
+    chat_badge: u32,
     active_session: usize,
     hovered_session: Option<usize>,
     /// The other computer sent ChatReady. Until then Chat stays visible and does nothing.
@@ -513,6 +515,7 @@ impl Default for Toolbar {
             hovered_slot: None,
             sessions: Vec::new(),
             unread: Vec::new(),
+            chat_badge: 0,
             active_session: 0,
             hovered_session: None,
             titlebar: false,
@@ -675,6 +678,14 @@ impl Toolbar {
     pub fn set_unread(&mut self, counts: &[u32]) {
         self.unread = counts.to_vec();
         self.unread.resize(self.sessions.len(), 0);
+    }
+
+    pub fn set_chat_badge(&mut self, count: u32) {
+        self.chat_badge = count;
+    }
+
+    pub fn chat_badge(&self) -> u32 {
+        self.chat_badge
     }
 
     pub fn set_chat_ready(&mut self, ready: bool) {
@@ -1549,6 +1560,13 @@ impl Toolbar {
             let size = if collapse { ICON - 4.0 } else { ICON };
             let off = if pressed { 1.0 } else { 0.0 };
             draw_icon(buf, win_w, win_h, bx + b.x + (b.w - size) / 2.0, by + (bh - size) / 2.0 + off, size, b.mark, color);
+            if b.label == "Chat" && self.chat_badge > 0 {
+                let label = badge_text(self.chat_badge);
+                let bw = (text_width(&label) + 10.0).max(17.0);
+                let (cx, cy) = (bx + b.x + b.w / 2.0 + size / 2.0 - 4.0, by + (bh - size) / 2.0 - 5.0);
+                aa_round(buf, win_w, win_h, cx, cy, bw, 17.0, 8.5, 0xFF_ff_3b_30, 0.0);
+                draw_text(buf, win_w, win_h, cx + (bw - text_width(&label)) / 2.0, cy + 13.0, &label, 0xFF_ff_ff_ff);
+            }
         }
 
         if let Some((tx, ty, tw, th)) = self.tooltip_rect(win_w) {

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.76
+
+- Chat now opens in its own compact window on both computers (the viewer and the computer being controlled) and pops up automatically when a message arrives.
+- New chat look: colored bubbles for you and the other person, sender names and local times, auto-scroll, a multi-line box (Enter sends, Shift+Enter adds a line) and a Send button.
+- Unread count badge on the session toolbar's Chat icon; a sound and a flash when a new message arrives.
+- "On top" pin keeps the chat window above other windows; the window remembers its position, size and pin setting.
+- Android: the chat sheet uses the same bubbles, names and times, scrolls to the newest message and opens when a message arrives.
+
 ## 0.6.75
 
 - Chat is always allowed in every session: Allow prompt (window- or service-hosted), saved/permanent and temporary passwords, support keys and codes, server access keys, view requests, view-only sessions, and Android hosts. No permission ceiling, policy, access key, or approval choice removes it. Both computers need 0.6.75 for this.

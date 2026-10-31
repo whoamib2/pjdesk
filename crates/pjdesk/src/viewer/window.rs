@@ -391,6 +391,8 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
         endpoint: armed.endpoint,
         retire: armed.retire,
         others: Vec::new(),
+        chat_pops: HashMap::new(),
+        chat_heard: HashMap::new(),
         tab_order: vec![1],
         connecting: Vec::new(),
         cancelled: HashSet::new(),
@@ -634,6 +636,10 @@ fn retire_held(held: &Held) {
 
 struct App {
     title: String,
+    /// One compact chat window per session, opened on demand or when a line arrives.
+    chat_pops: HashMap<u64, crate::chatpop::ChatPop>,
+    /// Incoming chat lines already seen per session (auto-open on new ones).
+    chat_heard: HashMap<u64, usize>,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     slot: Arc<FrameSlot>,
@@ -1003,6 +1009,11 @@ impl App {
                         let _ = self.control.send(ControlMsg::SetQuality(q));
                     }
                 }
+            }
+            Action::OpenPanel(1) => {
+                // Chat lives in its own compact window. Clicking again brings it forward.
+                let sid = self.sid;
+                self.open_chat(sid, false);
             }
             Action::OpenPanel(tab) => {
                 if tab == 1 && !self.live.lock().unwrap().chat_ready {
@@ -2243,11 +2254,90 @@ impl App {
         ids
     }
 
+    fn chat_target(&self, sid: u64) -> Option<(Arc<Mutex<super::controls::Live>>, mpsc::UnboundedSender<ControlMsg>)> {
+        if sid == self.sid {
+            return Some((self.live.clone(), self.control.clone()));
+        }
+        self.others.iter().find(|held| held.sid == sid).map(|held| (held.live.clone(), held.control.clone()))
+    }
+
+    fn open_chat(&mut self, sid: u64, alert: bool) {
+        let Some((live, _)) = self.chat_target(sid) else { return };
+        let g = live.lock().unwrap();
+        let tip = pjdesk_proto::peer::chat_off_tip(&g.peer_version);
+        let note = if g.chat_ready { "" } else { tip };
+        let (peer, ready, lines) = (g.peer_label.clone(), g.chat_ready, g.chat.clone());
+        drop(g);
+        let pop = self.chat_pops.entry(sid).or_insert_with(|| crate::chatpop::ChatPop::new(&format!("v{sid}")));
+        pop.update(&peer, ready, note, &lines);
+        pop.show(alert);
+    }
+
+    /// Keeps every session's chat window in step: opens it when a line
+    /// arrives, sends what was typed there, and counts what is unread.
+    /// Returns true when something on screen changed.
+    fn pump_chats(&mut self) -> bool {
+        let mut changed = false;
+        for sid in self.live_ids() {
+            let Some((live, control)) = self.chat_target(sid) else { continue };
+            let incoming = live.lock().unwrap().chat.iter().filter(|l| !l.mine).count();
+            let heard = self.chat_heard.entry(sid).or_insert(incoming);
+            let fresh = incoming > *heard;
+            *heard = incoming;
+            if fresh {
+                self.open_chat(sid, true);
+            }
+            let Some(pop) = self.chat_pops.get_mut(&sid) else { continue };
+            for text in pop.take_replies() {
+                let mut g = live.lock().unwrap();
+                if !g.chat_ready {
+                    continue;
+                }
+                if let Some(text) = pjdesk_proto::peer::chat_line(&text) {
+                    let name = super::controls::controller_chat_name();
+                    let unix = pjdesk_proto::peer::chat_now();
+                    g.chat.push(pjdesk_proto::peer::ChatEntry { mine: true, name: name.clone(), text: text.clone(), unix });
+                    if g.chat.len() > 200 {
+                        let drop_n = g.chat.len() - 200;
+                        g.chat.drain(0..drop_n);
+                    }
+                    drop(g);
+                    let _ = control.send(ControlMsg::ChatLine { text, name, unix });
+                }
+            }
+            let mut g = live.lock().unwrap();
+            let tip = pjdesk_proto::peer::chat_off_tip(&g.peer_version);
+            let note = if g.chat_ready { "" } else { tip };
+            pop.update(&g.peer_label.clone(), g.chat_ready, note, &g.chat.clone());
+            let seen = pop.seen();
+            let unread = pop.unread(&g.chat);
+            g.chat_open = pop.is_open() && seen.focused;
+            if g.chat_unread != unread {
+                g.chat_unread = unread;
+                changed = true;
+            }
+        }
+        let gone: Vec<u64> = self.chat_pops.keys().copied().filter(|sid| !self.live_ids().contains(sid)).collect();
+        for sid in gone {
+            if let Some(mut pop) = self.chat_pops.remove(&sid) {
+                pop.close();
+            }
+            self.chat_heard.remove(&sid);
+        }
+        let badge = self.live.lock().unwrap().chat_unread;
+        if self.toolbar.chat_badge() != badge {
+            self.toolbar.set_chat_badge(badge);
+            changed = true;
+        }
+        changed
+    }
+
     fn sync_chat_panel(&mut self) {
+        let _ = self.pump_chats();
         let open = self.panel.open && self.panel.tab == 1;
         let mut g = self.live.lock().unwrap();
-        g.chat_open = open;
         if open {
+            g.chat_open = true;
             g.chat_unread = 0;
         }
         let ready = g.chat_ready;
@@ -3107,9 +3197,16 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Chat windows and incoming lines are checked a few times a second.
+        if self.pump_chats() {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+        let chat_tick = Instant::now() + Duration::from_millis(300);
         if self.retries.is_empty() {
             self.retry_drawn = None;
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(chat_tick));
             return;
         }
         let now = Instant::now();
@@ -3144,7 +3241,7 @@ impl ApplicationHandler<UserEvent> for App {
         let soon = self.retries.values().map(|wait| wait.next_at).min();
         if let Some(at) = soon {
             let tick = Instant::now() + Duration::from_secs(1);
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at.min(tick)));
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at.min(tick).min(chat_tick)));
         }
     }
 

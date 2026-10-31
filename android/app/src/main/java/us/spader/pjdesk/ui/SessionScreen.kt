@@ -150,6 +150,13 @@ fun SessionScreen(
             else -> confirmEnd = true
         }
     }
+    // A new line from the other computer opens the chat sheet, like the desktop window.
+    val incoming = chatLines.count { !it.mine }
+    var heard by remember { mutableStateOf(incoming) }
+    LaunchedEffect(incoming) {
+        if (incoming > heard) chatSheet = true
+        heard = incoming
+    }
     LaunchedEffect(chatSheet, chatLines.size) {
         if (chatSheet) onChatOpen()
     }
