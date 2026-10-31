@@ -2938,29 +2938,23 @@ impl App {
         } else if let Some(ask) = file {
             (ask.from, ask.ip, ask.id, true)
         } else {
+            CONSENT_POP.with(|pop| {
+                if pop.borrow().id() != 0 {
+                    pop.borrow_mut().close();
+                }
+            });
             ctx.request_repaint_after(Duration::from_millis(400));
             return;
         };
-        raise_consent(ctx, id);
-        let mut allow = false;
-        let mut decline = false;
-        egui::Window::new("Allow this connection?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label(format!("{from} ({ip}) wants to control this computer."));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Decline").clicked() {
-                        decline = true;
-                    }
-                    if widgets::accent_button(ui, "Allow", egui::Vec2::new(120.0, 36.0)) {
-                        allow = true;
-                    }
-                });
-            });
-        if allow || decline {
+        // The main window stays where it is (hidden, minimized or locked).
+        // Only the small popup in the corner asks.
+        raise_consent(id);
+        let answered = CONSENT_POP.with(|pop| {
+            let mut pop = pop.borrow_mut();
+            pop.show(&crate::consentpop::Ask { id, from: from.clone(), ip: ip.clone() });
+            pop.take_answer()
+        });
+        if let Some(allow) = answered {
             if from_file {
                 write_service_consent(allow);
             } else {
@@ -2981,13 +2975,18 @@ struct ServiceConsent {
     ip: String,
 }
 
-fn raise_consent(ctx: &egui::Context, id: u64) {
+thread_local! {
+    static CONSENT_POP: std::cell::RefCell<crate::consentpop::ConsentPop> =
+        std::cell::RefCell::new(crate::consentpop::ConsentPop::new());
+}
+
+/// Beeps once per request. It does not show the main window: an incoming
+/// connection must never bring PJDesk (or its PIN lock) over the desktop.
+fn raise_consent(id: u64) {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if LAST.swap(id, std::sync::atomic::Ordering::SeqCst) == id {
         return;
     }
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     #[cfg(windows)]
     unsafe {
         let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(

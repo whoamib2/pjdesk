@@ -220,7 +220,7 @@ fn ui_thread() {
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
         KillTimer, PostQuitMessage, RegisterClassW, SetTimer, SetWindowDisplayAffinity, SetWindowPos, SetWindowTextW,
         ShowWindow, TranslateMessage, HWND_NOTOPMOST, HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_SHOWWINDOW, SW_HIDE, SW_MINIMIZE, SW_SHOWNOACTIVATE,
+        SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
         WINDOW_DISPLAY_AFFINITY, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP,
         WM_MOUSEACTIVATE, WM_PAINT, WM_TIMER, WNDCLASSW,
     };
@@ -254,7 +254,9 @@ fn ui_thread() {
                     0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                 );
-                let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                // A toast: about two seconds, then gone. It never restores
+                // the PJDesk main window.
+                let _ = ShowWindow(hwnd, SW_HIDE);
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
@@ -302,20 +304,20 @@ fn ui_thread() {
 
     unsafe fn place(hwnd: HWND) {
         let collapsed = UI.lock().unwrap().as_ref().map(|u| u.collapsed).unwrap_or(false);
-        let (w, h) = if collapsed { (scale(hwnd, 168), scale(hwnd, 32)) } else { (scale(hwnd, 400), scale(hwnd, 128)) };
+        let (w, h) = if collapsed { (scale(hwnd, 168), scale(hwnd, 32)) } else { (scale(hwnd, 340), scale(hwnd, 104)) };
         let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..MONITORINFO::default() };
         let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
-        let (right, top) = if GetMonitorInfoW(mon, &mut info).as_bool() {
-            (info.rcWork.right, info.rcWork.top)
+        let (right, bottom) = if GetMonitorInfoW(mon, &mut info).as_bool() {
+            (info.rcWork.right, info.rcWork.bottom)
         } else {
-            (scale(hwnd, 1920), 0)
+            (scale(hwnd, 1920), scale(hwnd, 1040))
         };
         let margin = scale(hwnd, 12);
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
             right - w - margin,
-            top + margin,
+            bottom - h - margin,
             w,
             h,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,

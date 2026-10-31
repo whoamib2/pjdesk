@@ -19,6 +19,7 @@ mod access_keys;
 mod audio;
 mod client_update;
 mod chatpop;
+mod consentpop;
 #[path = "../../shared/localtime.rs"]
 mod localtime;
 mod clip;
@@ -127,6 +128,12 @@ enum Cmd {
     /// Internal: the compact chat window for a session.
     #[command(name = "__chat-window", hide = true)]
     ChatWindow {
+        #[arg(long)]
+        dir: String,
+    },
+    /// Internal: the small Allow / Decline popup for an incoming connection.
+    #[command(name = "__consent-window", hide = true)]
+    ConsentWindow {
         #[arg(long)]
         dir: String,
     },
@@ -410,6 +417,11 @@ fn main() {
                 tracing::warn!("{e:#}");
             }
         }
+        Some(Cmd::ConsentWindow { dir }) => {
+            if let Err(e) = consentpop::run_window(std::path::PathBuf::from(dir)) {
+                tracing::warn!("{e:#}");
+            }
+        }
         Some(Cmd::UpdateHandoff) => {
             // A missing client.json must not keep the computer offline.
             if let Err(e) = handoff::run() {
@@ -456,7 +468,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::UpdateTask { disable }) => service::set_update_task(!disable),
         Some(Cmd::Console) => interactive(config, cli.server),
         Some(Cmd::Service(cmd)) => service_command(cmd),
-        Some(Cmd::SessionHost { .. }) | Some(Cmd::ChatWindow { .. }) | None => {
+        Some(Cmd::SessionHost { .. }) | Some(Cmd::ChatWindow { .. }) | Some(Cmd::ConsentWindow { .. }) | None => {
             unreachable!("handled in main")
         }
     }

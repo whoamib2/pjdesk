@@ -6,6 +6,9 @@
   - Windows client, saved computers (list, small and big tiles, Recent and LAN): hover the status for a tooltip, click it for a notice, and the computer's Menu shows it at the top.
   - Android: tap the status dot or the line under the name, and the computer's ⋮ menu shows it.
   - PJDesk Server, Registered computers: hover the online / last-seen status, click it to show the exact time under it, and the details line now has seconds and the zone.
+- Someone connecting to this computer no longer brings up the PJDesk main window (or its PIN lock screen) over the desktop. The main window stays hidden, minimized or locked and opens only when you open it.
+  - Root cause: the Allow / Decline prompt for an incoming connection was drawn inside the main window, so each request made the main window visible and focused it. With App lock on, that showed the PIN screen on top of the remote desktop.
+  - Now a small Allow / Decline popup appears in the bottom-right corner instead, and the "who connected" notice is a compact bottom-right toast that hides itself after about 2 seconds. The chat window works as before.
 - Release SHA256SUMS now lists the cloud zip and the Android APK as well as the installers.
 
 ## 0.6.76
