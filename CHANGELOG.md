@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.77
+
+- See exactly when each computer last reported in, as a local date and time with the time zone (for example "Last seen Oct 31, 2026 9:58:12 AM CDT"). Online computers show their latest report.
+  - Windows client, saved computers (list, small and big tiles, Recent and LAN): hover the status for a tooltip, click it for a notice, and the computer's Menu shows it at the top.
+  - Android: tap the status dot or the line under the name, and the computer's ⋮ menu shows it.
+  - PJDesk Server, Registered computers: hover the online / last-seen status, click it to show the exact time under it, and the details line now has seconds and the zone.
+- Release SHA256SUMS now lists the cloud zip and the Android APK as well as the installers.
+
 ## 0.6.76
 
 - Chat now opens in its own compact window on both computers (the viewer and the computer being controlled) and pops up automatically when a message arrives.

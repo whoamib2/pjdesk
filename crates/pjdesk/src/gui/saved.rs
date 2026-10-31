@@ -632,6 +632,8 @@ impl App {
         let slots = column_slots(rect, layout);
         in_rect(ui, slots.icon, (&id, "icon"), |ui| {
             paint_list_avatar(ui, ui.max_rect(), row);
+            let hit = ui.interact(ui.max_rect(), ui.id().with((&id, "icon-status")), Sense::hover());
+            seen_hover(hit, row);
         });
         let renaming = self.renaming.as_deref() == Some(id.as_str());
         if renaming {
@@ -698,8 +700,11 @@ impl App {
             in_rect(ui, r, (&id, "status"), |ui| {
                 let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
                 ui.painter().circle_filled(dot.center(), 4.0, color);
-                ui.add(egui::Label::new(RichText::new(text).color(p.text).size(12.5)).truncate());
+                let resp = ui.add(egui::Label::new(RichText::new(text).color(p.text).size(12.5)).truncate().sense(Sense::click()));
+                seen_hover(resp, row);
             });
+            let whole = ui.interact(r, ui.id().with((&id, "status-hit")), Sense::click());
+            seen_hover(whole, row);
         }
         self.row_actions(ui, row, &id, slots.connect, slots.menu, layout.compact_connect, action);
     }
@@ -756,6 +761,8 @@ impl App {
     }
 
     fn menu_items(&mut self, ui: &mut egui::Ui, row: &SavedRow, id: &str, action: &mut Option<RowCmd>) {
+        ui.label(RichText::new(seen_text(row)).size(12.0).color(theme::paint(ui).muted));
+        ui.separator();
                     let can_keys = self.cfg.can_manage_support_keys();
                     if can_keys && ui.button("Support keys").clicked() {
                         self.show_support_keys = true;
@@ -879,7 +886,10 @@ impl App {
         });
 
         let dot = status_color(ui, row);
-        ui.painter().circle_filled(Pos2::new(footer.left() + 16.0, footer.center().y), 4.5, dot);
+        let dot_at = Pos2::new(footer.left() + 16.0, footer.center().y);
+        ui.painter().circle_filled(dot_at, 4.5, dot);
+        let hit = ui.interact(Rect::from_center_size(dot_at, Vec2::splat(18.0)), ui.id().with((&id, "tile-status")), Sense::click());
+        seen_hover(hit, row);
         let menu_w = 32.0;
         let connect_w = if big { 96.0 } else { 36.0 };
         let right = footer.right() - 4.0;
@@ -1716,6 +1726,30 @@ fn paint_icon(ui: &egui::Ui, rect: Rect, icon: Icon, color: egui::Color32) {
     super::icons::paint(ui.painter(), icon_rect, icon, color);
 }
 
+/// The exact local time this computer last reported in, with a zone label.
+pub(crate) fn seen_text(row: &SavedRow) -> String {
+    if row.this_computer && row.online {
+        return "This computer · online now".into();
+    }
+    crate::localtime::seen_line(row.online, row.last_seen)
+}
+
+static SEEN_CLICKED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Hover on a status shows the exact last-report time; a click shows it as a notice.
+fn seen_hover(resp: egui::Response, row: &SavedRow) {
+    let tip = format!("{}\n{}", status_text(row), seen_text(row));
+    if resp.clicked() {
+        *SEEN_CLICKED.lock().unwrap() = Some(format!("{}: {}", row_primary_name(row), seen_text(row)));
+    }
+    resp.on_hover_text(tip);
+}
+
+/// A status click from this frame, to show as a notice.
+pub(crate) fn take_seen_click() -> Option<String> {
+    SEEN_CLICKED.lock().unwrap().take()
+}
+
 fn status_text(row: &SavedRow) -> String {
     if row.online {
         "Online".into()
@@ -1799,8 +1833,8 @@ fn name_block(ui: &mut egui::Ui, mut rect: Rect, row: &SavedRow, layout: &SavedL
         let center = Pos2::new(rect.left() + 8.0, rect.center().y);
         let dot = Rect::from_center_size(center, Vec2::splat(12.0));
         ui.painter().circle_filled(center, 4.0, color);
-        let hover = ui.interact(dot, ui.id().with((&row.id, "status-dot")), Sense::hover());
-        hover.on_hover_text(status_text(row));
+        let hover = ui.interact(dot, ui.id().with((&row.id, "status-dot")), Sense::click());
+        seen_hover(hover, row);
         rect = rect.with_min_x(rect.left() + 18.0);
     }
     let show_copy = !layout.show_id && rect.width() >= 150.0;

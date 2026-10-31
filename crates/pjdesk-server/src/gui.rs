@@ -3992,13 +3992,13 @@ impl App {
                                     .background_color(p(ui).elev),
                             );
                         }
-                        let mut seen = if d.last_seen == 0 {
-                            String::new()
-                        } else if d.first_seen > 0 {
-                            format!("Last seen {} ({})\nFirst registered {}", format_local(d.last_seen), ago(d.last_seen), format_local(d.first_seen))
-                        } else {
-                            format!("Last seen {}", format_local(d.last_seen))
-                        };
+                        let mut seen = crate::localtime::seen_line(d.online, d.last_seen);
+                        if d.last_seen > 0 {
+                            seen.push_str(&format!(" ({})", ago(d.last_seen)));
+                        }
+                        if d.first_seen > 0 {
+                            seen.push_str(&format!("\nFirst registered {}", crate::localtime::exact_local(d.first_seen)));
+                        }
                         if !d.last_ip.trim().is_empty() {
                             if !seen.is_empty() {
                                 seen.push('\n');
@@ -4010,16 +4010,29 @@ impl App {
                         } else if !d.signed_in {
                             ui.label(RichText::new("not signed in").color(p(ui).warn).size(11.0));
                         }
-                        if d.online {
-                            ui.horizontal(|ui| {
+                        let seen_id = egui::Id::new(("seen-open", d.id.clone()));
+                        let status = if d.online {
+                            let inner = ui.horizontal(|ui| {
                                 ui_widgets::dot(ui, p(ui).ok);
-                                ui.label(RichText::new("online").color(p(ui).ok).size(11.0));
-                            })
-                            .response
-                            .on_hover_text(seen);
-                        } else if d.last_seen > 0 {
-                            ui.label(RichText::new(format!("last seen {}", format_local(d.last_seen))).color(p(ui).muted).size(11.0))
-                                .on_hover_text(seen);
+                                ui.add(egui::Label::new(RichText::new("online").color(p(ui).ok).size(11.0)).sense(egui::Sense::click()))
+                            });
+                            Some(inner.inner.union(inner.response.interact(egui::Sense::click())))
+                        } else {
+                            let text = if d.last_seen > 0 { format!("last seen {}", format_local(d.last_seen)) } else { "never seen".into() };
+                            Some(ui.add(egui::Label::new(RichText::new(text).color(p(ui).muted).size(11.0)).sense(egui::Sense::click())))
+                        };
+                        if let Some(resp) = status {
+                            if resp.clicked() {
+                                ui.ctx().data_mut(|m| {
+                                    let open = m.get_temp::<bool>(seen_id).unwrap_or(false);
+                                    m.insert_temp(seen_id, !open);
+                                });
+                            }
+                            resp.on_hover_text(seen.clone());
+                        }
+                        if ui.ctx().data(|m| m.get_temp::<bool>(seen_id).unwrap_or(false)) {
+                            let exact = crate::localtime::seen_line(d.online, d.last_seen);
+                            ui.label(RichText::new(exact).color(p(ui).text).size(11.0));
                         }
                         if !locked {
                             if d.online && ui.small_button("Update").on_hover_text("Update this computer now").clicked() {
@@ -4721,7 +4734,7 @@ fn save_require_local(dir: &std::path::Path, require: bool) -> RequireResult {
 fn computer_facts(ip: &str, first_seen: u64, last_seen: u64, blocked_at: u64) -> String {
     let ip = if ip.trim().is_empty() { "unknown" } else { ip.trim() };
     let first = if first_seen == 0 { "unknown".into() } else { format_local(first_seen) };
-    let last = if last_seen == 0 { "unknown".into() } else { format!("{} ({})", format_local(last_seen), ago(last_seen)) };
+    let last = if last_seen == 0 { "unknown".into() } else { format!("{} ({})", crate::localtime::exact_local(last_seen), ago(last_seen)) };
     let mut line = format!("Last IP {ip}   ·   First seen {first}   ·   Last seen {last}");
     if blocked_at > 0 {
         line.push_str(&format!("   ·   Blocked {}", format_local(blocked_at)));

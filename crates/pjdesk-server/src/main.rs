@@ -12,6 +12,8 @@
 //! Runs in a console (`pjdesk-server`) or as a Windows service
 //! (`pjdesk-server service install`).
 
+#[path = "../../shared/localtime.rs"]
+mod localtime;
 mod access;
 mod account_mirror;
 mod access_keys;

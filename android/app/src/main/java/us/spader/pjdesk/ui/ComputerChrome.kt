@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import us.spader.pjdesk.core.SavedComputer
 import us.spader.pjdesk.core.computerTitle
 import us.spader.pjdesk.core.savedSubtitle
+import us.spader.pjdesk.core.seenLine
 import us.spader.pjdesk.core.shownAppVersion
 import us.spader.pjdesk.core.shownVersion
 import us.spader.pjdesk.core.versionBehind
@@ -92,6 +93,7 @@ fun ComputerAvatar(
     online: Boolean,
     modifier: Modifier = Modifier,
     size: Dp = 40.dp,
+    seen: String? = null,
 ) {
     val color = computerTileColor(computer)
     Box(modifier.size(size)) {
@@ -109,12 +111,22 @@ fun ComputerAvatar(
                 cutout = color,
             )
         }
-        StatusBadge(
-            online = online,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .offset(2.dp, 2.dp),
-        )
+        val badgeMod = Modifier
+            .align(Alignment.BottomEnd)
+            .offset(2.dp, 2.dp)
+        if (seen != null) SeenBadge(online, seen, badgeMod) else StatusBadge(online = online, modifier = badgeMod)
+    }
+}
+
+/** A status dot that shows the exact last-report time when tapped. */
+@Composable
+fun SeenBadge(online: Boolean, seen: String, modifier: Modifier = Modifier) {
+    var open by remember { mutableStateOf(false) }
+    Box(modifier) {
+        StatusBadge(online, Modifier.clickable { open = true })
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(text = { Text(seen) }, onClick = { open = false })
+        }
     }
 }
 
@@ -207,7 +219,8 @@ fun ComputerRow(
             .padding(horizontal = inset, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        ComputerAvatar(computer, online = mine || computer.online, size = 40.dp)
+        val seen = seenLine(computer.online, computer.lastSeen, mine)
+        ComputerAvatar(computer, online = mine || computer.online, size = 40.dp, seen = seen)
         Column(
             Modifier
                 .weight(1f)
@@ -224,7 +237,13 @@ fun ComputerRow(
                 )
                 if (mine) ThisPhoneChip()
             }
-            VersionSubtitle(shown, mine, latestRelease)
+            var showSeen by remember { mutableStateOf(false) }
+            Box(Modifier.clickable { showSeen = !showSeen }) {
+                VersionSubtitle(shown, mine, latestRelease)
+            }
+            if (showSeen) {
+                Text(seen, color = pjMuted(), style = MaterialTheme.typography.bodySmall)
+            }
         }
         if (!mine) ConnectButton(onConnect)
         if (showMenu) {
@@ -289,8 +308,9 @@ fun ComputerCard(
                         )
                     }
                 }
-                StatusBadge(
+                SeenBadge(
                     online = mine || computer.online,
+                    seen = seenLine(computer.online, computer.lastSeen, mine),
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
                         .padding(8.dp),
@@ -350,6 +370,7 @@ private fun ComputerMenu(
             Icon(PjIcons.More, contentDescription = "More actions", tint = pjMuted())
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            DropdownMenuItem(text = { Text(seenLine(computer.online, computer.lastSeen)) }, onClick = { menu = false }, enabled = false)
             if (user.isNotBlank()) {
                 DropdownMenuItem(text = { Text("User: $user") }, onClick = { menu = false }, enabled = false)
             }

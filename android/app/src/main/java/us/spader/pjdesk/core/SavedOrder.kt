@@ -388,3 +388,21 @@ fun discoveredComputers(
     }
     return out.values.toList()
 }
+
+/** "Oct 31, 2026 9:58:12 AM CDT" in [zone]. [unix] is seconds or milliseconds. */
+fun exactSeen(unix: Long, zone: java.util.TimeZone = java.util.TimeZone.getDefault()): String {
+    val secs = seenSeconds(unix)
+    if (secs <= 0L) return "never"
+    val f = java.text.SimpleDateFormat("MMM d, yyyy h:mm:ss a z", java.util.Locale.US)
+    f.timeZone = zone
+    return f.format(java.util.Date(secs * 1000))
+}
+
+/** What tapping a computer's status shows: its exact last report in local time. */
+fun seenLine(online: Boolean, lastSeen: Long, mine: Boolean = false, zone: java.util.TimeZone = java.util.TimeZone.getDefault()): String = when {
+    mine -> "This phone · online now"
+    online && seenSeconds(lastSeen) > 0 -> "Online · last report ${exactSeen(lastSeen, zone)}"
+    online -> "Online · last report time not known yet"
+    seenSeconds(lastSeen) > 0 -> "Last seen ${exactSeen(lastSeen, zone)}"
+    else -> "Last seen: never reported"
+}

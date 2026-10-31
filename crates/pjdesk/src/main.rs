@@ -19,6 +19,8 @@ mod access_keys;
 mod audio;
 mod client_update;
 mod chatpop;
+#[path = "../../shared/localtime.rs"]
+mod localtime;
 mod clip;
 mod color;
 mod config;

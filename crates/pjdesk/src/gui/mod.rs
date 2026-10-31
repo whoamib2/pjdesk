@@ -3570,6 +3570,9 @@ impl eframe::App for App {
             self.lock_after_remote_session();
             adopt_service_chat();
             self.poll_lan();
+            if let Some(text) = saved::take_seen_click() {
+                self.toast.show(text);
+            }
             self.toast.render(&ctx);
             return;
         }
@@ -3605,6 +3608,9 @@ impl eframe::App for App {
         self.change_password_window(&ctx);
         self.poll_lan();
         self.add_book_window(&ctx);
+        if let Some(text) = saved::take_seen_click() {
+            self.toast.show(text);
+        }
         self.toast.render(&ctx);
 
         if !self.status.is_empty() {
