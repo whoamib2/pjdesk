@@ -3,6 +3,7 @@
 ## 0.6.78
 
 - Android: the app now opens to Saved computers. Settings → Display → Open to lets you choose Saved computers or Home (connect and share this phone), and the choice is remembered.
+- Windows: after an update (automatic or a silent installer run, /S), PJDesk comes back in the tray only, with no main window, PIN screen or notice. The background service keeps the computer reachable. The window opens when you open it. A manual first-time install can still open PJDesk from the last page.
 
 ## 0.6.77
 

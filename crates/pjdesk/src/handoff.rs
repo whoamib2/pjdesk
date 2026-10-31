@@ -11,9 +11,11 @@ use anyhow::Result;
 
 use pjdesk_proto::handoff::{self, ServiceOutcome};
 
-/// No extra arguments: the normal window hosts when the service is not running.
+/// After an install or update PJDesk comes back silently: the tray icon only,
+/// with no main window, PIN screen or notice. The service hosts; the window
+/// (and any "Updated to X" note) appears only when the user opens it.
 pub fn relaunch_args() -> &'static [&'static str] {
-    &[]
+    &["--minimized"]
 }
 
 pub fn run() -> Result<()> {
@@ -195,8 +197,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_user_process_is_the_normal_window() {
-        assert!(relaunch_args().is_empty());
+    fn the_user_process_comes_back_minimized_to_the_tray() {
+        assert_eq!(relaunch_args(), &["--minimized"]);
     }
 
     #[test]

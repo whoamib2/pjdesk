@@ -78,7 +78,8 @@ struct Cli {
     #[arg(long = "config", global = true, value_name = "BLOB")]
     import_config: Option<String>,
     /// Tray icon only. This process never opens a window.
-    #[arg(long, hide = true)]
+    /// `--minimized` and `--background` mean the same (used after an update).
+    #[arg(long, hide = true, alias = "minimized", alias = "background")]
     tray: bool,
     /// Window only. This process never owns the tray icon. The tray starts it.
     #[arg(long, hide = true)]
@@ -399,7 +400,7 @@ fn main() {
         // with no log line and no window after the password was accepted.
         init_viewer_com();
     }
-    let is_background = raw.iter().any(|a| a == "__session-host" || a == "__chat-window" || a == "update-handoff" || a == "--tray" || a == "--window")
+    let is_background = raw.iter().any(|a| a == "__session-host" || a == "__chat-window" || a == "update-handoff" || a == "--tray" || a == "--minimized" || a == "--background" || a == "--window")
         || (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"));
 
     // With any other argument, attach a console so output and clap errors show.
