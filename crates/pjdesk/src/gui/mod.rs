@@ -3060,7 +3060,7 @@ fn write_service_consent(accept: bool) {
     let body = serde_json::json!({
         "id": 1,
         "accept": accept,
-        "permissions": if accept { pjdesk_proto::perms::KEYBOARD | pjdesk_proto::perms::MOUSE } else { 0 },
+        "permissions": if accept { pjdesk_proto::perms::KEYBOARD | pjdesk_proto::perms::MOUSE | pjdesk_proto::perms::CHAT } else { 0 },
         "receive_dir": "",
     });
     let _ = std::fs::write(path, body.to_string());

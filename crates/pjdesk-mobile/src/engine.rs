@@ -3444,10 +3444,8 @@ async fn send_welcome(
     if !v3 {
         return Ok(());
     }
-    let mut cap = ceiling & (perms::KEYBOARD | perms::MOUSE);
-    if requested & perms::CHAT_PEER != 0 {
-        cap |= perms::CHAT;
-    }
+    // Chat is always allowed; grant() adds it whenever the controller asks.
+    let cap = ceiling & (perms::KEYBOARD | perms::MOUSE) | perms::CHAT;
     let granted = grant(requested, cap, false);
     let (w, h) = *state.capture.lock().unwrap();
     let monitors = vec![MonitorInfo { index: 0, width: w, height: h, primary: true, name: "Screen".into() }];

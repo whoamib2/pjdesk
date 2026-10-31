@@ -63,13 +63,32 @@ pub const UNATTENDED_DEFAULT: u32 = KEYBOARD | MOUSE;
 /// on purpose: a view-only session must not read or write it.
 pub const VIEW_ONLY_DENIED: u32 = KEYBOARD | MOUSE | CLIPBOARD | FILE | RESTART | PRIVACY | BLOCK_INPUT | TUNNEL;
 
-/// `requested` ∩ `ceiling`, then view-only stripping.
+/// Always granted when the controller asks, in every session: no ceiling,
+/// policy, access key, approval choice, or view-only mode removes it.
+pub const ALWAYS: u32 = CHAT;
+
+/// `requested` ∩ `ceiling`, then view-only stripping, then [`ALWAYS`].
 pub fn grant(requested: u32, ceiling: u32, view_only: bool) -> u32 {
     let mut g = requested & ceiling & ALL;
     if view_only {
         g &= !VIEW_ONLY_DENIED;
     }
-    g
+    g | (requested & ALWAYS)
+}
+
+#[cfg(test)]
+mod always_tests {
+    use super::*;
+
+    #[test]
+    fn chat_is_granted_whatever_the_ceiling() {
+        for ceiling in [0, KEYBOARD | MOUSE, UNATTENDED_DEFAULT, ALL & !CHAT, ALL] {
+            for view_only in [false, true] {
+                assert!(has(grant(ALL, ceiling, view_only), CHAT), "ceiling {ceiling:#x} view_only {view_only}");
+            }
+        }
+        assert!(!has(grant(KEYBOARD, ALL, false), CHAT), "only when asked");
+    }
 }
 
 pub fn has(perms: u32, bit: u32) -> bool {
