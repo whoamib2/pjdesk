@@ -3641,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "pjdesk"
-version = "0.6.78"
+version = "0.6.79"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -3678,7 +3678,7 @@ dependencies = [
 
 [[package]]
 name = "pjdesk-link"
-version = "0.6.78"
+version = "0.6.79"
 dependencies = [
  "anyhow",
  "pjdesk-proto",
@@ -3692,7 +3692,7 @@ dependencies = [
 
 [[package]]
 name = "pjdesk-mobile"
-version = "0.6.78"
+version = "0.6.79"
 dependencies = [
  "anyhow",
  "hex",
@@ -3710,7 +3710,7 @@ dependencies = [
 
 [[package]]
 name = "pjdesk-proto"
-version = "0.6.78"
+version = "0.6.79"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3733,7 +3733,7 @@ dependencies = [
 
 [[package]]
 name = "pjdesk-server"
-version = "0.6.78"
+version = "0.6.79"
 dependencies = [
  "anyhow",
  "arboard",

@@ -341,6 +341,13 @@ fn read_status(dir: &Path) -> CopyStatus {
     std::fs::read(dir.join(STATUS_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
+/// Whether the last pull could not reach or was refused by pjdesk.com, so the
+/// next batch should back off. "Not signed in" and "no copy yet" are answers.
+pub fn cloud_failed(dir: &Path) -> bool {
+    let error = read_status(dir).error;
+    !error.is_empty() && error != "not signed in" && !error.starts_with("HTTP 404")
+}
+
 fn record_status(dir: &Path, synced_at: u64, error: &str) -> String {
     let row = if error.is_empty() {
         CopyStatus { synced_at, error: String::new() }

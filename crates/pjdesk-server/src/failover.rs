@@ -92,7 +92,9 @@ pub fn watch_once(data_dir: &Path, misses: u32) -> Step {
         }
         return Step::Stay { misses: 0, log: String::new() };
     }
-    let Some(address) = cloud::peer_target(data_dir) else {
+    // Saved address; pjdesk.com is re-read every 5 minutes, or within a
+    // minute once the probe starts missing. The probe cadence is unchanged.
+    let Some(address) = cloud::peer_target_paced(data_dir, misses > 0) else {
         return Step::Stay {
             misses,
             log: "failover: no primary address yet; staying standby".into(),

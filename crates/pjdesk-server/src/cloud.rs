@@ -1276,6 +1276,7 @@ pub fn sync_once(data_dir: &Path, role: Role, force_push: bool) -> bool {
         Ok(())
     })();
     publish_health(data_dir, effective);
+    batch_done(result.is_ok());
     let st = SyncState::load(data_dir);
     let mut status = CloudStatus::load(data_dir).unwrap_or_default();
     status.enabled = true;
@@ -1538,7 +1539,7 @@ pub fn peer_dial_targets(data_dir: &Path) -> Vec<String> {
         }
         out.push(addr);
     }
-    if let Some(extra) = peer_target(data_dir) {
+    if let Some(extra) = peer_target_paced(data_dir, false) {
         if !out.iter().any(|have| pjdesk_proto::failover::same_server(have, &extra)) {
             out.push(extra);
         }
@@ -1981,7 +1982,7 @@ fn assemble_routes_now(data_dir: &Path) -> pjdesk_proto::routes::ServerRoutes {
     let mut primary_public = peer_public;
     let primary_lan = peer_lan;
     if primary_public.is_empty() && primary_lan.is_empty() {
-        if let Some(addr) = peer_target(data_dir) {
+        if let Some(addr) = peer_target_paced(data_dir, false) {
             let legacy = pjdesk_proto::routes::ServerRoutes::from_legacy(&addr, &[], "", "", &[], "");
             primary_public = legacy.primary_public;
             names.extend(legacy.names);
@@ -2173,29 +2174,97 @@ pub fn cached_peer_address(data_dir: &Path) -> String {
 /// Address of the account's active server, when it is not this server.
 /// A failed lookup keeps the last address this server learned.
 pub fn peer_target(data_dir: &Path) -> Option<String> {
+    peer_lookup(data_dir).0
+}
+
+/// `(address, whether pjdesk.com was read)`. No sign-in counts as read: there
+/// is nothing to back off from.
+fn peer_lookup(data_dir: &Path) -> (Option<String>, bool) {
     let cached = std::fs::read_to_string(data_dir.join(PEER_FILE))
         .ok()
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
     let Some(cfg) = CloudConfig::load(data_dir) else {
-        return cached;
+        return (cached, true);
     };
     if !cfg.is_account() || cfg.token.is_empty() {
-        return cached;
+        return (cached, true);
     }
     let mine = crate::public_addr::load(data_dir).map(|record| record.address).unwrap_or_default();
     match network_addresses(&cfg) {
         Ok((active, standby)) => match pjdesk_proto::failover::choose_peer(&mine, &active, &standby) {
             Some(addr) => {
                 let _ = std::fs::write(data_dir.join(PEER_FILE), &addr);
-                Some(addr)
+                (Some(addr), true)
             }
-            None => cached,
+            None => (cached, true),
         },
         Err(e) => {
             tracing::debug!("failover: could not read the account server list: {e:#}");
-            cached
+            (cached, false)
         }
+    }
+}
+
+static PEER_PACE: std::sync::Mutex<pjdesk_proto::failover::CloudPace> =
+    std::sync::Mutex::new(pjdesk_proto::failover::CloudPace { next_at: 0, backoff: 0, last_try: 0 });
+
+/// [`peer_target`] for the 3-second failover beat and other frequent callers.
+/// Uses the saved address and re-reads pjdesk.com every 5 minutes (±20%), or
+/// at most once a minute while `missing` (the primary stopped answering). A
+/// failed read backs off from 1 to 30 minutes and keeps the saved address.
+pub fn peer_target_paced(data_dir: &Path, missing: bool) -> Option<String> {
+    use pjdesk_proto::failover::{jitter_seed, PEER_LOOKUP_SECS, PEER_MISS_LOOKUP_SECS};
+    let now = now();
+    let cached = Some(cached_peer_address(data_dir)).filter(|a| !a.is_empty());
+    let due = {
+        let pace = PEER_PACE.lock().unwrap();
+        if missing { pace.due_urgent(now, PEER_MISS_LOOKUP_SECS) } else { pace.due(now) }
+    };
+    if !due {
+        return cached;
+    }
+    let (addr, ok) = peer_lookup(data_dir);
+    let mut pace = PEER_PACE.lock().unwrap();
+    if ok {
+        pace.ok(now, PEER_LOOKUP_SECS, jitter_seed());
+    } else {
+        pace.fail(now, jitter_seed());
+    }
+    addr
+}
+
+const REGISTER_REFRESH_SECS: u64 = 6 * 60 * 60;
+
+fn register_unchanged(stamp: &Path, publication: &serde_json::Value) -> bool {
+    let Ok(prev) = std::fs::read(stamp) else { return false };
+    let mut prev: serde_json::Value = match serde_json::from_slice(&prev) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if let Some(obj) = prev.as_object_mut() {
+        obj.remove("checked_at");
+    }
+    let age = stamp.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok());
+    &prev == publication && age.is_some_and(|a| a.as_secs() < REGISTER_REFRESH_SECS)
+}
+
+static BATCH_PACE: std::sync::Mutex<pjdesk_proto::failover::CloudPace> =
+    std::sync::Mutex::new(pjdesk_proto::failover::CloudPace { next_at: 0, backoff: 0, last_try: 0 });
+
+/// Whether the 5-minute cloud batch is due (jittered, with backoff after failures).
+pub fn batch_due() -> bool {
+    BATCH_PACE.lock().unwrap().due(now())
+}
+
+/// Records how the cloud batch went and schedules the next one.
+pub fn batch_done(ok: bool) {
+    use pjdesk_proto::failover::{jitter_seed, CLOUD_BATCH_SECS};
+    let mut pace = BATCH_PACE.lock().unwrap();
+    if ok {
+        pace.ok(now(), CLOUD_BATCH_SECS, jitter_seed());
+    } else {
+        pace.fail(now(), jitter_seed());
     }
 }
 
@@ -2683,7 +2752,6 @@ fn register_network(data_dir: &Path, role: Role, replace: bool) {
         "instance": instance_id(data_dir),
         "lan": lan,
         "public_ip": watch.observed,
-        "checked_at": watch.checked_at,
         "replace": replace,
         "endpoints": {
             "public": endpoints.public,
@@ -2691,13 +2759,11 @@ fn register_network(data_dir: &Path, role: Role, replace: bool) {
             "names": endpoints.names,
         },
     });
+    // Only what changed: a routine public-IP re-check that found the same
+    // address is not a new registration. It is refreshed every 6 hours anyway.
     let stamp = data_dir.join("network-publish.json");
-    if !replace {
-        if let Ok(prev) = std::fs::read(&stamp) {
-            if serde_json::from_slice::<serde_json::Value>(&prev).ok().as_ref() == Some(&publication) {
-                return;
-            }
-        }
+    if !replace && register_unchanged(&stamp, &publication) {
+        return;
     }
     let body = serde_json::json!({
         "role": role_name(role),
@@ -3059,6 +3125,37 @@ fn read_health_doc(cfg: &CloudConfig) -> Result<(HealthDoc, Option<String>)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_same_address_recheck_is_not_a_new_registration() {
+        let dir = std::env::temp_dir().join(format!("pjd-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stamp = dir.join("network-publish.json");
+        let now_pub = serde_json::json!({"role":"active","address":"a.example:21200","public_ip":"1.2.3.4"});
+        assert!(!super::register_unchanged(&stamp, &now_pub), "nothing posted yet");
+        let mut posted = now_pub.clone();
+        posted["checked_at"] = serde_json::json!(1234);
+        std::fs::write(&stamp, posted.to_string()).unwrap();
+        assert!(super::register_unchanged(&stamp, &now_pub), "only the check time moved");
+        let moved = serde_json::json!({"role":"active","address":"a.example:21200","public_ip":"5.6.7.8"});
+        assert!(!super::register_unchanged(&stamp, &moved), "a new public IP is published");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_standby_beat_uses_the_saved_address_between_lookups() {
+        let dir = std::env::temp_dir().join(format!("pjd-peer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(super::PEER_FILE), "primary.example:21200").unwrap();
+        // No sign-in: the first call "reads" (nothing to back off from) and schedules 5 minutes out.
+        assert_eq!(super::peer_target_paced(&dir, false).as_deref(), Some("primary.example:21200"));
+        let pace = *super::PEER_PACE.lock().unwrap();
+        assert!(pace.next_at >= super::now() + 230, "next read is ~5 minutes away");
+        // Every 3-second beat in between is answered from the saved file.
+        std::fs::write(dir.join(super::PEER_FILE), "moved.example:21200").unwrap();
+        assert_eq!(super::peer_target_paced(&dir, false).as_deref(), Some("moved.example:21200"));
+        assert_eq!(*super::PEER_PACE.lock().unwrap(), pace, "no lookup happened");
+        let _ = std::fs::remove_dir_all(dir);
+    }
     use super::*;
 
     #[test]

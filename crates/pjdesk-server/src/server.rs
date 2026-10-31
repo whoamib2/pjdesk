@@ -2203,7 +2203,6 @@ fn push_routes(state: &Shared, routes: &pjdesk_proto::routes::ServerRoutes) {
 async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
     use crate::cloud::{promote, sync_once, Role};
     use crate::requests::{take, DEMOTE_FILE, PROMOTE_FILE, RELOAD_FILE, SYNC_FILE};
-    const PASS_EVERY: u32 = 150; // ticks of 2 s: one cloud batch every 5 minutes
     let data_dir = state.lock().unwrap().data_dir.clone();
     let startup = data_dir.clone();
     match tokio::task::spawn_blocking(move || crate::account_mirror::recover_if_empty(&startup)).await {
@@ -2271,7 +2270,8 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
             }
         }
         let forced = !take(&data_dir, SYNC_FILE).is_empty();
-        if !promote_now && !forced && ticks % PASS_EVERY != 1 {
+        // Every 5 minutes ±20%, backing off up to 30 minutes while pjdesk.com fails.
+        if !promote_now && !forced && !crate::cloud::batch_due() {
             continue;
         }
         // The standby does not upload. It still downloads the account copy so a
@@ -2279,8 +2279,14 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
         if !crate::cloud::accepts_host_registrations(&data_dir) && !forced {
             let dir = data_dir.clone();
             match tokio::task::spawn_blocking(move || crate::account_mirror::pull_now(&dir)).await {
-                Ok(line) => info!("standby account copy: {line}"),
-                Err(err) => warn!("standby account copy: {err}"),
+                Ok(line) => {
+                    info!("standby account copy: {line}");
+                    crate::cloud::batch_done(!crate::account_mirror::cloud_failed(&data_dir));
+                }
+                Err(err) => {
+                    warn!("standby account copy: {err}");
+                    crate::cloud::batch_done(false);
+                }
             }
             continue;
         }

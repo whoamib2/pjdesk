@@ -4,7 +4,7 @@ name = "pjdesk-cloud"
 main = "src/index.js"
 compatibility_date = "2025-09-01"
 # The pjdesk@spader.us Cloudflare account.
-account_id = "5d6fd11395ef0b3901ae32e08c3edb70"
+account_id = "499fcfb10813bb5555fa4547e726b466"
 workers_dev = true
 
 # pjdesk.com and www.pjdesk.com are served by this Worker (Cloudflare adds the

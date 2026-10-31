@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.79
+
+- Far fewer requests to pjdesk.com (about 33,000 a day down to about 3,000 for a typical network):
+  - The standby PJDesk Server no longer asks pjdesk.com for the primary's address every 3 seconds. It uses the saved address and re-reads it every 5 minutes, or within a minute once the primary stops answering. The 3-second direct check and failover are unchanged.
+  - A routine public-IP re-check that finds the same address no longer re-registers the server (still refreshed every 6 hours).
+  - The 5-minute cloud batch is spread by ±20% and backs off from 1 to 30 minutes (±20%) while pjdesk.com is failing; so does the standby's address lookup.
+
 ## 0.6.78
 - Fixed: large file transfers through the PJDesk server failed at about 1 GB ("connection lost: closed"). The server's relay cut each route after 1 GiB; the cap is now 256 GiB (update PJDesk Server too).
 - Interrupted uploads now resume from where they stopped after a reconnect, and keepalives take priority over file data. Tested with a 4.3 GiB file.

@@ -39,6 +39,68 @@ pub fn next_cloud_wait(previous: u64) -> u64 {
     }
 }
 
+/// How often a standby re-reads the primary's address from pjdesk.com while
+/// the direct probe answers. The probe itself stays on the LAN every beat.
+pub const PEER_LOOKUP_SECS: u64 = 5 * 60;
+/// While the probe misses, the address is re-read at most this often, so a
+/// moved primary is found before the standby would promote.
+pub const PEER_MISS_LOOKUP_SECS: u64 = 60;
+
+/// `secs` spread by up to ±20%, so servers do not call pjdesk.com in step.
+/// `seed` is any changing number (clock nanos); the same seed gives the same wait.
+pub fn jittered(secs: u64, seed: u64) -> u64 {
+    let swing = secs / 5;
+    if swing == 0 {
+        return secs;
+    }
+    let mixed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17);
+    secs - swing + mixed % (swing * 2 + 1)
+}
+
+/// A seed for [`jittered`] from the clock.
+pub fn jitter_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Schedule for one periodic pjdesk.com call: its normal cadence with jitter,
+/// and exponential backoff (1 minute doubling to 30, ±20%) after failures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CloudPace {
+    /// Unix seconds when the call is next due. 0 means now.
+    pub next_at: u64,
+    /// Current backoff in seconds; 0 while calls succeed.
+    pub backoff: u64,
+    /// Unix seconds of the last attempt.
+    pub last_try: u64,
+}
+
+impl CloudPace {
+    pub fn due(&self, now: u64) -> bool {
+        now >= self.next_at
+    }
+
+    /// Due early because something local looks wrong (e.g. the primary stopped
+    /// answering). Never faster than `min_gap`, and never while backing off.
+    pub fn due_urgent(&self, now: u64, min_gap: u64) -> bool {
+        self.due(now) || (self.backoff == 0 && now >= self.last_try.saturating_add(min_gap))
+    }
+
+    pub fn ok(&mut self, now: u64, every: u64, seed: u64) {
+        self.backoff = 0;
+        self.last_try = now;
+        self.next_at = now + jittered(every, seed);
+    }
+
+    pub fn fail(&mut self, now: u64, seed: u64) {
+        self.backoff = next_cloud_wait(self.backoff);
+        self.last_try = now;
+        self.next_at = now + jittered(self.backoff, seed);
+    }
+}
+
 /// Cloudflare's HTML 429 (error 1027, "temporarily rate limited").
 /// A JSON 429 from `/api/login` is not this.
 pub fn cloud_edge_limited(status: u16, content_type: &str, body: &str) -> bool {
@@ -663,6 +725,40 @@ fn host_is_name(address: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn jitter_stays_within_twenty_percent() {
+        for seed in 0..5_000u64 {
+            let w = jittered(300, seed);
+            assert!((240..=360).contains(&w), "{w}");
+        }
+        let spread: std::collections::HashSet<u64> = (0..200u64).map(|s| jittered(300, s)).collect();
+        assert!(spread.len() > 20, "the wait actually varies");
+        assert_eq!(jittered(3, 9), 3);
+    }
+
+    #[test]
+    fn cloud_pace_backs_off_to_thirty_minutes_and_recovers() {
+        let mut pace = CloudPace::default();
+        assert!(pace.due(0));
+        let mut now = 1_000;
+        let mut waits = Vec::new();
+        for i in 0..8 {
+            pace.fail(now, i);
+            waits.push(pace.backoff);
+            assert!(!pace.due(now + pace.backoff * 4 / 5 - 1));
+            assert!(pace.due(now + pace.backoff * 6 / 5));
+            assert!(!pace.due_urgent(now + 30, 1), "no early calls while backing off");
+            now = pace.next_at;
+        }
+        assert_eq!(waits, vec![60, 120, 240, 480, 960, 1800, 1800, 1800]);
+        pace.ok(now, PEER_LOOKUP_SECS, 3);
+        assert_eq!(pace.backoff, 0);
+        assert!(!pace.due(now + 239));
+        assert!(pace.due(now + 361));
+        assert!(!pace.due_urgent(now + 59, PEER_MISS_LOOKUP_SECS));
+        assert!(pace.due_urgent(now + 60, PEER_MISS_LOOKUP_SECS));
+    }
     use super::*;
 
     fn watch(misses: u32, probe: Probe, second: SecondPath) -> Watch {
