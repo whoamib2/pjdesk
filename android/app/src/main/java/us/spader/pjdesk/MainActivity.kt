@@ -255,7 +255,8 @@ class MainActivity : FragmentActivity() {
             val savedFilter by listPrefs.filter.collectAsStateWithLifecycle(SavedFilter.All)
             val savedView by listPrefs.view.collectAsStateWithLifecycle(SavedView.List)
             val snackbar = remember { SnackbarHostState() }
-            var tab by remember { mutableIntStateOf(0) }
+            var tab by remember { mutableIntStateOf(us.spader.pjdesk.core.StartScreen.tab(app.store.startScreen)) }
+            val startScreen = remember { mutableStateOf(app.store.startScreen) }
             var connectId by remember { mutableStateOf("") }
             var connectPassword by remember { mutableStateOf("") }
             var connectAsk by remember { mutableStateOf(false) }
@@ -2433,6 +2434,11 @@ class MainActivity : FragmentActivity() {
                                     onTheme = {
                                         theme.value = it
                                         app.store.theme = it
+                                    },
+                                    startScreen = startScreen.value,
+                                    onStartScreen = {
+                                        app.store.startScreen = it
+                                        startScreen.value = app.store.startScreen
                                     },
                                     onServer = engine::setServer,
                                     savedAccessKey = app.store.accessKey,

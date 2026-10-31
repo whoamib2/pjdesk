@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.78
+
+- Android: the app now opens to Saved computers. Settings → Display → Open to lets you choose Saved computers or Home (connect and share this phone), and the choice is remembered.
+
 ## 0.6.77
 
 - See exactly when each computer last reported in, as a local date and time with the time zone (for example "Last seen Oct 31, 2026 9:58:12 AM CDT"). Online computers show their latest report.

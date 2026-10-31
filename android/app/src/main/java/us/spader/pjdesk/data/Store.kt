@@ -64,6 +64,11 @@ class Store(context: Context) {
         get() = prefs.getBoolean("captureTried", false)
         set(value) { prefs.edit().putBoolean("captureTried", value).apply() }
 
+    /** Which main screen the app opens to: "saved" (default) or "home". */
+    var startScreen: String
+        get() = us.spader.pjdesk.core.StartScreen.normalize(prefs.getString("startScreen", null))
+        set(value) { prefs.edit().putString("startScreen", us.spader.pjdesk.core.StartScreen.normalize(value)).apply() }
+
     var theme: String
         get() = prefs.getString("theme", "system") ?: "system"
         set(value) { prefs.edit().putString("theme", value).apply() }

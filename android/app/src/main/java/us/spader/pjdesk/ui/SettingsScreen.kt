@@ -50,6 +50,8 @@ fun SettingsScreen(
     state: DeskState,
     theme: String,
     onTheme: (String) -> Unit,
+    startScreen: String = us.spader.pjdesk.core.StartScreen.SAVED,
+    onStartScreen: (String) -> Unit = {},
     onServer: (String) -> Unit,
     onResetFingerprint: () -> Unit,
     onSavePermanent: (String, String) -> Boolean = { _, _ -> false },
@@ -262,6 +264,12 @@ fun SettingsScreen(
                     FilterChip(selected = theme == id, onClick = { onTheme(id) }, label = { Text(label) })
                 }
             }
+            Text("Open to", color = pjMuted())
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                us.spader.pjdesk.core.StartScreen.choices.forEach { (id, label) ->
+                    FilterChip(selected = startScreen == id, onClick = { onStartScreen(id) }, label = { Text(label) })
+                }
+            }
         }
         if (signedIn || localPin) {
             Section("App lock") {
@@ -404,7 +412,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.77", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.78", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }
