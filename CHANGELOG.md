@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.74
+
+- Chat: unattended and support-key sessions now grant chat, so the Chat button works with PJDesk 0.6.50 and newer. The viewer asks the other computer for its version and shows the real reason when chat is off (not allowed, older version, or not ready yet) instead of always saying "needs 0.6.50 or newer". The computer being controlled must run 0.6.74 for chat in unattended sessions.
+- App lock: PJDesk locks to the PIN screen as soon as a remote session controlling this computer ends (Windows and Android), when a PIN is set.
+- App lock: "Lock PJDesk after inactivity" now offers 1, 5, 15, 30 minutes, 1 hour, or Never (default 5 minutes). The choice is saved on this device.
+- Windows: connecting a second computer while a session is open no longer stalls the window. Saving a remembered password runs off the window thread, and the window's per-frame service file checks are throttled.
+- PJDesk Server window: status from the service is read at once on open and retried every 200 ms until it answers. Sections show "Loading…" until then, and "Locked" only if the service really does not answer. The service now keeps several status pipe instances listening.
+
 ## 0.6.73
 
 - Fixed: connecting from Windows could fail with "Could not start the session: Sign in required" when the window's account session had expired (for example right after the window opened, before its first renewal). The viewer now renews an expiring account session before it asks the server, and if the server still asks for a sign-in it renews once more and retries the same connection.

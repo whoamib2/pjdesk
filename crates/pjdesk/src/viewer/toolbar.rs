@@ -687,6 +687,18 @@ impl Toolbar {
         }
     }
 
+    /// The tooltip the Chat button shows while chat is off.
+    pub fn set_chat_off_tip(&mut self, tip: &'static str) {
+        if self.chat_ready {
+            return;
+        }
+        for button in &mut self.buttons {
+            if button.label == "Chat" {
+                button.tip = tip;
+            }
+        }
+    }
+
     /// Draws the window's own title bar (off in full screen).
     pub fn set_titlebar(&mut self, on: bool, maximized: bool, title: &str) {
         self.titlebar = on;

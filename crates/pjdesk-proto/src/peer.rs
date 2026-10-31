@@ -464,6 +464,24 @@ pub const CHAT_MIN_VERSION: &str = "0.6.50";
 /// Shown on a Chat button when the other computer is older than 0.6.50.
 pub const CHAT_NEEDS_TIP: &str = "The other computer needs PJDesk 0.6.50 or newer";
 
+/// Shown on a Chat button when the other computer is new enough but did not
+/// allow chat in this session (for example an older host that left chat out of
+/// unattended sessions).
+pub const CHAT_OFF_TIP: &str = "Chat is not allowed in this session by the other computer";
+
+/// Shown while the other computer's version is not known yet.
+pub const CHAT_WAIT_TIP: &str = "Chat is not available in this session yet";
+
+/// The Chat button's tooltip while chat is off. Only a version that is known
+/// and older than 0.6.50 is blamed on the version.
+pub fn chat_off_tip(peer_version: &str) -> &'static str {
+    match pjdesk_app_version(peer_version) {
+        Some(v) if chat_supported(&v) => CHAT_OFF_TIP,
+        Some(_) => CHAT_NEEDS_TIP,
+        None => CHAT_WAIT_TIP,
+    }
+}
+
 /// Largest chat message accepted, in characters.
 pub const MAX_CHAT_TEXT: usize = 2000;
 /// Largest sender name stored on a chat line, in characters.
@@ -840,6 +858,11 @@ mod tests {
         let back: HostMsg = postcard::from_bytes(&postcard::to_stdvec(&host).unwrap()).unwrap();
         assert!(matches!(back, HostMsg::ChatLine { .. }));
         assert_eq!(CHAT_NEEDS_TIP, "The other computer needs PJDesk 0.6.50 or newer");
+        assert_eq!(chat_off_tip("0.6.73"), CHAT_OFF_TIP);
+        assert_eq!(chat_off_tip("0.6.100"), CHAT_OFF_TIP);
+        assert_eq!(chat_off_tip("0.6.49"), CHAT_NEEDS_TIP);
+        assert_eq!(chat_off_tip(""), CHAT_WAIT_TIP);
+        assert!(chat_supported("0.6.73") && chat_supported("0.7.0") && !chat_supported("0.6.9"));
         assert!(!chat_supported("0.6.49"));
         assert!(chat_supported("0.6.50"));
         assert!(chat_supported("0.6.51"));

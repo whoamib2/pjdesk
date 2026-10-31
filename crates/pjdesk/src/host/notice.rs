@@ -32,6 +32,13 @@ static THREAD: AtomicU32 = AtomicU32::new(0);
 #[cfg_attr(not(windows), allow(dead_code))]
 static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
 static HANDED: AtomicBool = AtomicBool::new(false);
+/// Counts remote sessions that ended in this process. The window locks when it moves.
+static ENDED: AtomicU64 = AtomicU64::new(0);
+
+/// How many remote sessions controlling this computer have ended in this process.
+pub fn ended_count() -> u64 {
+    ENDED.load(Ordering::SeqCst)
+}
 
 const WM_APP_REFRESH: u32 = 0x8000;
 
@@ -92,6 +99,9 @@ pub fn update(account: &str, computer: &str, user: &str, id: &str) {
 /// Hides the notice. The session is over.
 pub fn end() {
     let mut slot = SLOT.lock().unwrap();
+    if slot.who.is_some() {
+        ENDED.fetch_add(1, Ordering::SeqCst);
+    }
     slot.who = None;
     slot.seq = slot.seq.wrapping_add(1);
     drop(slot);

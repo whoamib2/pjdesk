@@ -238,7 +238,7 @@ impl Panel {
     fn draw_chat(&self, buf: &mut [u32], win_w: usize, win_h: usize, x: f32, y: f32, w: f32, h: f32, live: &Live) {
         let mut row = y + ROW + 8.0;
         if !live.chat_ready {
-            draw_text(buf, win_w, win_h, x + 12.0, row + 16.0, pjdesk_proto::peer::CHAT_NEEDS_TIP, 0xFF_f2_b0_3a);
+            draw_text(buf, win_w, win_h, x + 12.0, row + 16.0, pjdesk_proto::peer::chat_off_tip(&live.peer_version), 0xFF_f2_b0_3a);
             return;
         }
         let start = live.chat.len().saturating_sub(12);

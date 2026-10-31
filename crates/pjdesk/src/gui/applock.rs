@@ -55,6 +55,10 @@ impl App {
     }
 
     fn lock_idle(&self) -> Duration {
+        if let Some(minutes) = self.cfg.settings.auto_lock_minutes {
+            // 0 is Never: relock() treats a zero delay as off.
+            return Duration::from_secs(u64::from(minutes.min(24 * 60)) * 60);
+        }
         let secs = self.saved_pin().map(|v| v.idle_sec).unwrap_or(pjdesk_proto::applock::IDLE_DEFAULT);
         Duration::from_secs(pjdesk_proto::applock::clamp_idle(secs))
     }
@@ -114,6 +118,20 @@ impl App {
             self.last_input = now;
         } else if pjdesk_proto::applock::relock(self.last_input.elapsed().as_secs(), self.lock_idle().as_secs()) {
             self.engage_lock();
+        }
+    }
+
+    /// A remote session that controlled this computer ended. Lock at once, like Lock now.
+    pub(super) fn lock_after_remote_session(&mut self) {
+        let ended = crate::host::notice::ended_count();
+        if ended == self.remote_ended_seen {
+            return;
+        }
+        self.remote_ended_seen = ended;
+        if self.pin_required() {
+            tracing::info!("A remote session on this computer ended. Showing the PIN screen.");
+            self.engage_lock();
+            self.lock_armed = true;
         }
     }
 
@@ -1065,15 +1083,22 @@ impl App {
             self.start_save(false);
         }
         ui.add_space(4.0);
-        ui.label("Ask again after");
+        ui.label("Lock PJDesk after inactivity");
         ui.horizontal(|ui| {
-            for (minutes, label) in [(1, "1 min"), (5, "5 min"), (15, "15 min"), (30, "30 min")] {
-                let selected = self.pin_idle_minutes == minutes;
+            let current = self.cfg.settings.auto_lock_minutes.unwrap_or(self.pin_idle_minutes);
+            for (minutes, label) in pjdesk_proto::applock::AUTO_LOCK_CHOICES {
+                let selected = current == minutes;
                 if ui.selectable_label(selected, label).clicked() {
-                    self.pin_idle_minutes = minutes;
-                    if have && !self.lock_busy {
-                        self.start_idle();
+                    self.cfg.settings.auto_lock_minutes = Some(minutes);
+                    let _ = self.cfg.save();
+                    tracing::info!("Auto-lock set to {label}.");
+                    if minutes > 0 {
+                        self.pin_idle_minutes = minutes;
+                        if have && !self.lock_busy {
+                            self.start_idle();
+                        }
                     }
+                    self.last_input = Instant::now();
                 }
             }
         });

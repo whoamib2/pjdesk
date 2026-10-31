@@ -1006,7 +1006,9 @@ impl App {
             }
             Action::OpenPanel(tab) => {
                 if tab == 1 && !self.live.lock().unwrap().chat_ready {
-                    self.live.lock().unwrap().notices.push(pjdesk_proto::peer::CHAT_NEEDS_TIP.into());
+                    let mut g = self.live.lock().unwrap();
+                    let tip = pjdesk_proto::peer::chat_off_tip(&g.peer_version);
+                    g.notices.push(tip.into());
                 } else if self.panel.open && self.panel.tab == tab {
                     self.panel.open = false;
                 } else {
@@ -1179,7 +1181,8 @@ impl App {
             PanelCmd::Chat(text) => {
                 let mut g = self.live.lock().unwrap();
                 if !g.chat_ready {
-                    g.notices.push(pjdesk_proto::peer::CHAT_NEEDS_TIP.into());
+                    let tip = pjdesk_proto::peer::chat_off_tip(&g.peer_version);
+                    g.notices.push(tip.into());
                 } else if let Some(text) = pjdesk_proto::peer::chat_line(&text) {
                     let name = super::controls::controller_chat_name();
                     let unix = pjdesk_proto::peer::chat_now();
@@ -2248,8 +2251,10 @@ impl App {
             g.chat_unread = 0;
         }
         let ready = g.chat_ready;
+        let tip = pjdesk_proto::peer::chat_off_tip(&g.peer_version);
         drop(g);
         self.toolbar.set_chat_ready(ready);
+        self.toolbar.set_chat_off_tip(tip);
     }
 
     fn unread_of(&self, sid: u64) -> u32 {
@@ -2628,10 +2633,15 @@ impl App {
             return;
         }
         if seed.remember && !seed.password.is_empty() && pjdesk_proto::is_valid_id(&seed.target) {
-            if let Ok(mut cfg) = crate::config::Config::load() {
-                cfg.remember_password(&seed.target, Some(&seed.password));
-                let _ = cfg.save();
-            }
+            // Saving the config can be slow; keep it off the window thread.
+            let target = seed.target.clone();
+            let password = seed.password.clone();
+            let _ = std::thread::Builder::new().name("remember-password".into()).spawn(move || {
+                if let Ok(mut cfg) = crate::config::Config::load() {
+                    cfg.remember_password(&target, Some(&password));
+                    let _ = cfg.save();
+                }
+            });
         }
         match self.hold(link, seed, sid) {
             Ok(held) => self.install(held),
@@ -3259,7 +3269,9 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             if self.panel.tab == 1 && !self.live.lock().unwrap().chat_ready {
                                 self.panel.tab = 0;
-                                self.live.lock().unwrap().notices.push(pjdesk_proto::peer::CHAT_NEEDS_TIP.into());
+                                let mut g = self.live.lock().unwrap();
+                                let tip = pjdesk_proto::peer::chat_off_tip(&g.peer_version);
+                                g.notices.push(tip.into());
                             }
                             if let Some(window) = &self.window {
                                 window.request_redraw();

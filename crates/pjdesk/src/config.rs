@@ -199,6 +199,10 @@ pub struct Settings {
     /// Minutes with no PJDesk activity before a temporary sign-in ends.
     #[serde(default = "default_temp_idle")]
     pub temp_idle_minutes: u32,
+    /// Minutes of inactivity before the window shows the PIN screen. 0 is Never.
+    /// None follows the PIN's own delay (5 minutes by default).
+    #[serde(default)]
+    pub auto_lock_minutes: Option<u32>,
     /// "system" follows Windows, or "dark" / "light".
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -362,6 +366,7 @@ impl Default for Settings {
             start_with_windows: false,
             remember_passwords: false,
             temp_idle_minutes: default_temp_idle(),
+            auto_lock_minutes: None,
             theme: default_theme(),
             approval: default_approval(),
             receive_dir: String::new(),

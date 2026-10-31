@@ -25,7 +25,7 @@ pub fn after_password(
 ) -> Admit {
     // File transfer stays inside the host's receive folder (the Desktop when
     // that folder was left blank). View-only still loses it via `grant`.
-    let restricted = grant(perms::UNATTENDED_DEFAULT | perms::FILE, policy.max_permissions, view_only);
+    let restricted = grant(perms::UNATTENDED_DEFAULT | perms::FILE | perms::CHAT, policy.max_permissions, view_only);
     let password_access = policy.unattended_allowed && !policy.force_prompt;
     if matched_permanent && password_access {
         return Admit::Open(restricted);
@@ -54,7 +54,7 @@ pub fn matched_support(passwords: &[String], slot: u8, support: Option<&str>) ->
 
 /// Permission bits for a support-code session. The person is not asked.
 pub fn support_open(policy: &Policy, view_only: bool) -> u32 {
-    grant(perms::UNATTENDED_DEFAULT | perms::FILE, policy.max_permissions, view_only)
+    grant(perms::UNATTENDED_DEFAULT | perms::FILE | perms::CHAT, policy.max_permissions, view_only)
 }
 
 /// An unattended support key opens a session that arrived through Ben's server.
@@ -104,6 +104,12 @@ mod tests {
         let policy = Policy::default();
         assert!(perms::has(support_open(&policy, false), perms::FILE));
         assert!(!perms::has(support_open(&policy, true), perms::FILE));
+        assert!(perms::has(support_open(&policy, false), perms::CHAT));
+        assert!(perms::has(support_open(&policy, true), perms::CHAT));
+        match after_password("unattended", true, true, &policy, false) {
+            Admit::Open(bits) => assert!(perms::has(bits, perms::CHAT)),
+            Admit::Ask => panic!("should open"),
+        }
         assert!(matches!(after_password("prompt", false, true, &policy, false), Admit::Ask));
     }
 

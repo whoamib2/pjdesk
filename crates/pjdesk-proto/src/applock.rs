@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 pub const MAGIC: &[u8] = b"PJLOCK01";
 pub const ITERATIONS: u32 = 200_000;
 pub const IDLE_DEFAULT: u64 = 300;
+/// Auto-lock delays offered in Settings, in minutes. 0 is Never.
+pub const AUTO_LOCK_CHOICES: [(u32, &str); 6] =
+    [(1, "1 min"), (5, "5 min"), (15, "15 min"), (30, "30 min"), (60, "1 hour"), (0, "Never")];
 const MAX_ITERATIONS: u32 = 600_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -466,6 +466,7 @@ pub struct App {
     lock_pull_rx: Option<Receiver<Result<applock::LockRemote, String>>>,
     next_lock_pull: Instant,
     last_input: Instant,
+    remote_ended_seen: u64,
     minimized_at: Option<Instant>,
     reauth_until: Instant,
     pin_current: String,
@@ -677,6 +678,7 @@ impl App {
             lock_pull_rx: None,
             next_lock_pull: Instant::now(),
             last_input: Instant::now(),
+            remote_ended_seen: 0,
             minimized_at: None,
             reauth_until: Instant::now(),
             pin_current: String::new(),
@@ -2994,7 +2996,21 @@ fn raise_consent(ctx: &egui::Context, id: u64) {
     }
 }
 
+/// True at most once per `every`, per caller slot. Keeps file work off most frames.
+fn due(slot: &std::sync::Mutex<Option<Instant>>, every: Duration) -> bool {
+    let mut last = slot.lock().unwrap();
+    if last.is_some_and(|at| at.elapsed() < every) {
+        return false;
+    }
+    *last = Some(Instant::now());
+    true
+}
+
 fn poll_client_heartbeat() {
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    if !due(&LAST, Duration::from_secs(2)) {
+        return;
+    }
     let dir = crate::syspaths::service_dir();
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join("client-alive"), b"1");
@@ -3002,6 +3018,10 @@ fn poll_client_heartbeat() {
 
 fn adopt_service_notice() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static READ: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    if !due(&READ, Duration::from_millis(250)) {
+        return;
+    }
     let path = crate::syspaths::service_dir().join("connect-notice.json");
     let Ok(bytes) = std::fs::read(&path) else {
         if LAST.swap(0, std::sync::atomic::Ordering::SeqCst) != 0 {
@@ -3493,6 +3513,7 @@ impl eframe::App for App {
         self.poll_support_leave();
         self.poll_app_lock();
         self.note_lock_visibility(&ctx);
+        self.lock_after_remote_session();
         self.notice_sign_in_paste(&ctx);
 
         if ctx
@@ -3546,6 +3567,7 @@ impl eframe::App for App {
             self.consent_prompt(&ctx);
             poll_client_heartbeat();
             adopt_service_notice();
+            self.lock_after_remote_session();
             adopt_service_chat();
             self.poll_lan();
             self.toast.render(&ctx);
@@ -3577,6 +3599,7 @@ impl eframe::App for App {
         self.consent_prompt(&ctx);
         poll_client_heartbeat();
         adopt_service_notice();
+        self.lock_after_remote_session();
         adopt_service_chat();
         self.login_window(&ctx);
         self.change_password_window(&ctx);

@@ -77,6 +77,8 @@ pub struct Live {
     pub chat: Vec<pjdesk_proto::peer::ChatEntry>,
     /// The host sent ChatReady. The Chat button stays off until then.
     pub chat_ready: bool,
+    /// The host's PJDesk version from PeerVersion, empty until it arrives.
+    pub peer_version: String,
     /// Messages that arrived while the chat panel was closed.
     pub chat_unread: u32,
     /// The session window is showing the chat panel.
@@ -126,6 +128,7 @@ impl Live {
             transfers: Vec::new(),
             chat: Vec::new(),
             chat_ready: false,
+            peer_version: String::new(),
             chat_unread: 0,
             chat_open: false,
             peer_label: String::new(),
@@ -177,6 +180,7 @@ impl Live {
             transfers: self.transfers.clone(),
             chat: self.chat.clone(),
             chat_ready: self.chat_ready,
+            peer_version: self.peer_version.clone(),
             chat_unread: self.chat_unread,
             chat_open: self.chat_open,
             peer_label: self.peer_label.clone(),
@@ -291,7 +295,7 @@ pub fn start(
 
     if peer_proto >= 3 {
         let _ = control.send(ControlMsg::Hello {
-            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR | perms::CHAT_PEER,
+            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR | perms::CHAT_PEER | perms::PEER_VERSION,
             monitor: saved_display,
             quality: opening_quality(relayed),
         });
@@ -573,6 +577,8 @@ fn on_host(
             let _ = control.send(this_visitor());
         }
         HostMsg::PeerVersion { version } => {
+            tracing::info!("The other computer runs PJDesk {version}");
+            g.peer_version = version.clone();
             if pjdesk_proto::peer::chat_gate(&version, "", false) == pjdesk_proto::peer::ChatGate::Ready {
                 g.chat_ready = true;
             }

@@ -147,6 +147,8 @@ struct App {
     /// Latest snapshot from the service pipe. Used when the folder is locked.
     live: Option<Snapshot>,
     probe: Option<std::sync::mpsc::Receiver<Option<Snapshot>>>,
+    /// The status pipe did not answer within PIPE_GIVE_UP.
+    pipe_failed: bool,
     opened_at: Instant,
     /// Screenshots inject the service state. The real window asks Windows.
     svc_override: Option<(bool, bool)>,
@@ -361,6 +363,7 @@ impl App {
             access: Access::Missing,
             live: None,
             probe: None,
+            pipe_failed: false,
             opened_at: Instant::now(),
             svc_override: None,
             preview_locked: false,
@@ -496,7 +499,11 @@ impl App {
     }
 
     fn waiting_for_service(&self) -> bool {
-        self.access != Access::Readable && self.live.is_none() && self.opened_at.elapsed() < Duration::from_secs(2)
+        if self.access == Access::Readable || self.live.is_some() || self.pipe_failed {
+            return false;
+        }
+        // With a probe running, wait for its first answer or its give-up.
+        self.probe.is_some() || self.opened_at.elapsed() < Duration::from_secs(2)
     }
 
     fn via_service(&self) -> bool {
@@ -787,13 +794,15 @@ impl eframe::App for App {
         self.poll_access_keys();
         self.poll_require();
         self.poll_install();
-        let snaps: Vec<Snapshot> = self
-            .probe
-            .as_ref()
-            .map(|rx| rx.try_iter().filter_map(|snap| snap).collect())
-            .unwrap_or_default();
+        let snaps: Vec<Option<Snapshot>> = self.probe.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
         for snap in snaps {
-            self.accept_snapshot(snap);
+            match snap {
+                Some(snap) => {
+                    self.pipe_failed = false;
+                    self.accept_snapshot(snap);
+                }
+                None => self.pipe_failed = true,
+            }
         }
         let ctx = ui.ctx().clone();
         let hidden = ctx.input(|i| i.viewport().minimized == Some(true) || i.viewport().visible() == Some(false));
@@ -1356,7 +1365,7 @@ impl App {
                 let (text, can_copy) = self.fingerprint_line();
                 if text.is_empty() {
                     ui_widgets::spinner(ui, p(ui).accent);
-                    ui.label("Reading status from the service…");
+                    ui.label("Loading…");
                 } else {
                     ui.label(RichText::new(&text).monospace().size(13.0));
                     if can_copy && ui_widgets::icon_button(ui, Icon::Copy, "Copy fingerprint") {
@@ -1668,7 +1677,7 @@ impl App {
             }
         }
         if self.waiting_for_service() {
-            return (String::new(), false);
+            return ("Loading…".into(), false);
         }
         ("Locked — open as administrator to view".into(), false)
     }
@@ -4826,20 +4835,37 @@ fn glyph(ui: &mut egui::Ui, icon: Icon, color: Color32) {
     crate::ui_icons::paint(ui.painter(), rect, icon, color);
 }
 
+/// How long the window shows Loading… before saying the service did not answer.
+const PIPE_GIVE_UP: Duration = Duration::from_secs(10);
+
 fn spawn_status_probe(ctx: &egui::Context) -> Option<std::sync::mpsc::Receiver<Option<Snapshot>>> {
     let (tx, rx) = std::sync::mpsc::channel();
     let ctx = ctx.clone();
     std::thread::Builder::new()
         .name("pjdesk-server-status".into())
-        .spawn(move || loop {
-            let snap = crate::status_pipe::read_snapshot();
-            if snap.is_some() {
-                if tx.send(snap).is_err() {
-                    break;
+        .spawn(move || {
+            // Ask at once, retry quickly until the first answer, then once a second.
+            let started = Instant::now();
+            let mut answered = false;
+            let mut gave_up = false;
+            loop {
+                let snap = crate::status_pipe::read_snapshot();
+                if snap.is_some() {
+                    answered = true;
+                    if tx.send(snap).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                } else if !answered && !gave_up && started.elapsed() >= PIPE_GIVE_UP {
+                    // None tells the window the service really did not answer.
+                    gave_up = true;
+                    if tx.send(None).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
+                std::thread::sleep(if answered { Duration::from_secs(1) } else { Duration::from_millis(200) });
             }
-            std::thread::sleep(Duration::from_secs(1));
         })
         .ok()?;
     Some(rx)

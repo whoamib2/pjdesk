@@ -12,12 +12,26 @@ use crate::status_view::Snapshot;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const PIPE_NAME: &str = r"\\.\pipe\PJDeskServerStatus";
 
+/// Pipe instances the service keeps listening.
+#[cfg(windows)]
+const PIPE_WORKERS: usize = 4;
+
 #[cfg(windows)]
 pub fn serve(data_dir: PathBuf, port: u16) {
     let _pipe = PIPE_NAME;
+    // Several listening instances, so a window opening while another reader
+    // holds the pipe is answered at once instead of seeing "busy".
+    for n in 1..PIPE_WORKERS {
+        let dir = data_dir.clone();
+        let _ = std::thread::Builder::new().name(format!("status-pipe-{n}")).spawn(move || loop {
+            if !serve_once(&dir, port) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
     loop {
         if !serve_once(&data_dir, port) {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 }
@@ -53,7 +67,7 @@ fn serve_once(data_dir: &std::path::Path, port: u16) -> bool {
             w!(r"\\.\pipe\PJDeskServerStatus"),
             PIPE_ACCESS_OUTBOUND,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-            1,
+            PIPE_WORKERS as u32,
             256 * 1024,
             0,
             0,
@@ -101,7 +115,7 @@ pub fn read_snapshot() -> Option<Snapshot> {
     use windows::Win32::System::Pipes::WaitNamedPipeW;
 
     unsafe {
-        if !WaitNamedPipeW(w!(r"\\.\pipe\PJDeskServerStatus"), 250).as_bool() {
+        if !WaitNamedPipeW(w!(r"\\.\pipe\PJDeskServerStatus"), 1000).as_bool() {
             return None;
         }
         let handle = CreateFileW(

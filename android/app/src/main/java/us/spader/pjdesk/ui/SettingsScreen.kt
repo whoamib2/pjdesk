@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -287,9 +288,9 @@ fun SettingsScreen(
                         Switch(checked = biometricsOn, onCheckedChange = onToggleBiometrics)
                     }
                 }
-                Text("Ask again after", color = pjMuted())
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(60 to "1 min", 300 to "5 min", 900 to "15 min", 1800 to "30 min").forEach { (seconds, label) ->
+                Text("Lock PJDesk after inactivity", color = pjMuted())
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(60 to "1 min", 300 to "5 min", 900 to "15 min", 1800 to "30 min", 3600 to "1 hour", 0 to "Never").forEach { (seconds, label) ->
                         FilterChip(
                             selected = autoLockSeconds == seconds,
                             onClick = { onAutoLock(seconds) },
@@ -403,7 +404,7 @@ fun SettingsScreen(
             )
         }
         Section("About") {
-            Text("PJDesk 0.6.73", style = MaterialTheme.typography.titleMedium)
+            Text("PJDesk 0.6.74", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) {
                 Text("Check for updates")
             }

@@ -1343,8 +1343,16 @@ class MainActivity : FragmentActivity() {
                 snackbar.showSnackbar(text)
                 engine.dismissNotice()
             }
+            var wasHosting by remember { mutableStateOf(false) }
             LaunchedEffect(state.hosting, state.hostWho, state.acceptedAutomatically) {
                 HostService.controlled(this@MainActivity, state.hosting, state.hostWho, state.acceptedAutomatically)
+                if (wasHosting && !state.hosting && app.uiUnlocked.value &&
+                    (app.store.hasAccountPin() || app.store.hasPin())
+                ) {
+                    app.lockUi()
+                    AppLog.i("app locked because a remote session on this phone ended")
+                }
+                wasHosting = state.hosting
             }
             LaunchedEffect(account) {
                 engine.command(org.json.JSONObject().put("cmd", "account").put("email", account).toString())
@@ -1707,7 +1715,9 @@ class MainActivity : FragmentActivity() {
             LaunchedEffect(bumps, uiUnlocked, account) {
                 if (!uiUnlocked || account.isBlank() || temporarySession) return@LaunchedEffect
                 if (!app.store.hasAccountPin() && !app.store.hasPin()) return@LaunchedEffect
-                delay(app.store.autoLockSeconds * 1000L)
+                val autoLock = app.store.autoLockSeconds
+                if (autoLock <= 0) return@LaunchedEffect
+                delay(autoLock * 1000L)
                 if (app.uiUnlocked.value && !app.bioPrompt) app.lockUi()
             }
             fun saveAccountPin(current: String, password: String, newPin: String, idleSec: Int, enableBio: Boolean) {

@@ -429,11 +429,11 @@ class Store(context: Context) {
     var autoLockSeconds: Int
         get() {
             val value = prefs.getInt("autoLockSeconds", 300)
-            return if (value == 60 || value == 120 || value == 300 || value == 900 || value == 1800) value else 300
+            return if (value in AUTO_LOCK_ALLOWED) value else 300
         }
         set(value) {
-            val kept = if (value == 60 || value == 120 || value == 300 || value == 900 || value == 1800) value else 300
-            prefs.edit().putInt("autoLockSeconds", kept).apply()
+            val kept = if (value in AUTO_LOCK_ALLOWED) value else 300
+            prefs.edit().putInt("autoLockSeconds", kept).putBoolean("autoLockChosen", true).apply()
         }
 
     var accountPinSalt: String
@@ -521,7 +521,7 @@ class Store(context: Context) {
             .putBoolean("appLockPending", pending)
             .putInt("pinFails", 0)
             .putLong("pinLockedUntil", 0L)
-            .putInt("autoLockSeconds", idle)
+            .apply { if (!prefs.getBoolean("autoLockChosen", false)) putInt("autoLockSeconds", idle) }
             .commit()
     }
 
@@ -757,3 +757,6 @@ class Store(context: Context) {
         const val PLAIN_PERMANENT = "permanent"
     }
 }
+
+/** Auto-lock delays in seconds. 0 is Never. */
+val AUTO_LOCK_ALLOWED = setOf(0, 60, 120, 300, 900, 1800, 3600)
