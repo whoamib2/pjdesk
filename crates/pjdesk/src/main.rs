@@ -20,6 +20,8 @@ mod audio;
 mod client_update;
 mod chatpop;
 mod consentpop;
+mod filepop;
+mod reveal;
 #[path = "../../shared/localtime.rs"]
 mod localtime;
 mod clip;
@@ -128,6 +130,12 @@ enum Cmd {
     /// Internal: the compact chat window for a session.
     #[command(name = "__chat-window", hide = true)]
     ChatWindow {
+        #[arg(long)]
+        dir: String,
+    },
+    /// Internal: the file-transfer window for a session.
+    #[command(name = "__files-window", hide = true)]
+    FilesWindow {
         #[arg(long)]
         dir: String,
     },
@@ -279,10 +287,20 @@ pub fn resolve_receive_dir(configured: &str) -> String {
     if text.eq_ignore_ascii_case("downloads") {
         return home_folder("Downloads");
     }
-    if !text.is_empty() && !text.eq_ignore_ascii_case("desktop") {
+    if text.eq_ignore_ascii_case("desktop") {
+        return home_folder("Desktop");
+    }
+    if !text.is_empty() {
         return text.to_string();
     }
-    home_folder("Desktop")
+    // Default: Downloads\PJDesk in the signed-in user's profile.
+    let base = home_folder("Downloads");
+    if base.is_empty() {
+        return base;
+    }
+    let dir = std::path::PathBuf::from(base).join("PJDesk");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.to_string_lossy().into_owned()
 }
 
 fn home_folder(name: &str) -> String {
@@ -417,6 +435,11 @@ fn main() {
                 tracing::warn!("{e:#}");
             }
         }
+        Some(Cmd::FilesWindow { dir }) => {
+            if let Err(e) = filepop::run_window(std::path::PathBuf::from(dir)) {
+                tracing::warn!("{e:#}");
+            }
+        }
         Some(Cmd::ConsentWindow { dir }) => {
             if let Err(e) = consentpop::run_window(std::path::PathBuf::from(dir)) {
                 tracing::warn!("{e:#}");
@@ -468,7 +491,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::UpdateTask { disable }) => service::set_update_task(!disable),
         Some(Cmd::Console) => interactive(config, cli.server),
         Some(Cmd::Service(cmd)) => service_command(cmd),
-        Some(Cmd::SessionHost { .. }) | Some(Cmd::ChatWindow { .. }) | Some(Cmd::ConsentWindow { .. }) | None => {
+        Some(Cmd::SessionHost { .. }) | Some(Cmd::ChatWindow { .. }) | Some(Cmd::ConsentWindow { .. }) | Some(Cmd::FilesWindow { .. }) | None => {
             unreachable!("handled in main")
         }
     }

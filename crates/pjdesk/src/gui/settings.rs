@@ -660,10 +660,10 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
     ui.add_space(12.0);
     widgets::heading(ui, "INCOMING FILES");
     widgets::field_label(ui, "Folder for files people send you");
-    widgets::text_field(ui, &mut d.receive_dir, "Empty uses this computer's Desktop", false);
+    widgets::text_field(ui, &mut d.receive_dir, "Empty uses Downloads\\PJDesk on this computer", false);
     ui.label(widgets::muted(
         ui,
-        "Files dropped on a remote session are saved here. Leave this empty to use the Desktop. Type Downloads to use that folder. Files are never executed.",
+        "Files dropped on a remote session are saved here. Leave this empty to use Downloads\\PJDesk. Type Desktop or Downloads to use those folders. Files are never executed.",
     ));
 
     ui.add_space(12.0);

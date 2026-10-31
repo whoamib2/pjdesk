@@ -76,6 +76,7 @@ pub struct Session {
     service_host: bool,
     keyboard: Mutex<KeyboardMode>,
     expected: Mutex<HashMap<u64, ExpectedFile>>,
+    received: Mutex<crate::reveal::Batch>,
     outgoing: Mutex<HashMap<u64, OutFile>>,
     next_id: AtomicU64,
     host_tx: mpsc::UnboundedSender<HostMsg>,
@@ -135,6 +136,7 @@ impl Session {
             service_host,
             keyboard: Mutex::new(KeyboardMode::Map),
             expected: Mutex::new(HashMap::new()),
+            received: Mutex::new(crate::reveal::Batch::default()),
             outgoing: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             host_tx,
@@ -870,6 +872,17 @@ impl Session {
         info!("Saved {}", saved.display());
         self.note(&format!("Saved {}", job.name));
         let _ = self.host_tx.send(HostMsg::File(FileMsg::Done { id: header.id }));
+        self.received.lock().unwrap().saved(saved);
+        // When the batch is over, show the files in Explorer. The host runs in
+        // the signed-in user's session (the service starts it with their token),
+        // so the window opens on their desktop.
+        if self.expected.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            let idle = self.expected.lock().unwrap().is_empty();
+            if let Some(paths) = self.received.lock().unwrap().take_if_settled(!idle) {
+                crate::reveal::select_in_explorer(paths);
+            }
+        }
         Ok(())
     }
 

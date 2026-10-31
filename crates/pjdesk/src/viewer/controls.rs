@@ -102,6 +102,8 @@ pub struct Live {
     pub closed: Option<String>,
     /// The phone's accessibility service is off, so clicks do not land.
     pub control_off: bool,
+    /// Files saved here since the owner last took them (to show in Explorer).
+    pub saved: Vec<PathBuf>,
     paths: HashMap<u64, PathBuf>,
     wanted: HashSet<String>,
     next_id: u64,
@@ -144,6 +146,7 @@ impl Live {
             host_ended: false,
             closed: None,
             control_off: false,
+            saved: Vec::new(),
             paths: HashMap::new(),
             wanted: HashSet::new(),
             next_id: 1,
@@ -196,6 +199,7 @@ impl Live {
             host_ended: self.host_ended,
             closed: self.closed.clone(),
             control_off: self.control_off,
+            saved: Vec::new(),
             paths: HashMap::new(),
             wanted: HashSet::new(),
             next_id: 0,
@@ -226,10 +230,25 @@ impl Live {
     fn transfer_mut(&mut self, id: u64) -> Option<&mut Transfer> {
         self.transfers.iter_mut().find(|t| t.id == id)
     }
+
+    /// A transfer that is still moving (not done, cancelled or failed).
+    fn live_transfer(&mut self, id: u64) -> Option<&mut Transfer> {
+        self.transfer_mut(id).filter(|t| matches!(t.state.as_str(), "offering" | "offered" | "sending" | "downloading"))
+    }
+
+    fn is_cancelled(&self, id: u64) -> bool {
+        self.transfers.iter().any(|t| t.id == id && t.state == "cancelled")
+    }
+
+    /// Forgets finished, cancelled and failed rows.
+    pub fn clear_finished(&mut self) {
+        self.transfers.retain(|t| matches!(t.state.as_str(), "offering" | "offered" | "sending" | "downloading"));
+    }
 }
 
 pub enum Cmd {
     SendFile(PathBuf),
+    Cancel(u64),
     Accept(u64),
     Pull(String),
     ListRemote,
@@ -546,16 +565,19 @@ fn on_host(
                 let wake = std::sync::Arc::clone(wake);
                 let control = control.clone();
                 spawn_viewer(async move {
-                    if let Err(e) = send_bytes(conn, id, &path, resume, &live).await {
-                        if let Some(t) = live.lock().unwrap().transfer_mut(id) {
-                            t.state = format!("{e:#}");
+                    match send_bytes(conn, id, &path, resume, &live).await {
+                        Err(e) => {
+                            if let Some(t) = live.lock().unwrap().live_transfer(id) {
+                                t.state = format!("{e:#}");
+                            }
+                            warn!("send file: {e:#}");
                         }
-                        warn!("send file: {e:#}");
-                    } else if let Some(t) = live.lock().unwrap().transfer_mut(id) {
-                        t.bytes = t.size;
-                        t.state = "done".into();
+                        Ok(false) => {}
+                        Ok(true) => {
+                            // The host confirms with Done once the file is saved there.
+                            let _ = control.send(ControlMsg::File(FileMsg::Done { id }));
+                        }
                     }
-                    let _ = control.send(ControlMsg::File(FileMsg::Done { id }));
                     wake();
                 });
             }
@@ -680,24 +702,27 @@ fn take_send(g: &mut Live, msg: &FileMsg) -> Option<(u64, PathBuf, u64)> {
             }
         }
         FileMsg::Progress { id, bytes } => {
-            if let Some(t) = g.transfer_mut(*id) {
-                t.bytes = *bytes;
+            if let Some(t) = g.live_transfer(*id) {
+                t.bytes = (*bytes).max(t.bytes);
             }
         }
         FileMsg::Done { id } => {
-            if let Some(t) = g.transfer_mut(*id) {
+            if let Some(t) = g.live_transfer(*id) {
                 t.bytes = t.size;
                 t.state = "done".into();
             }
         }
         FileMsg::Reject { id, reason } | FileMsg::Error { id, reason } => {
+            if g.is_cancelled(*id) {
+                return None;
+            }
             if let Some(t) = g.transfer_mut(*id) {
                 t.state = reason.clone();
             }
             g.note(reason.clone());
         }
         FileMsg::Cancel { id } => {
-            if let Some(t) = g.transfer_mut(*id) {
+            if let Some(t) = g.live_transfer(*id) {
                 t.state = "cancelled".into();
             }
         }
@@ -745,6 +770,15 @@ async fn on_cmd(
             });
             drop(g);
             let _ = control.send(ControlMsg::File(FileMsg::Offer { id, name, size, resume_from: 0 }));
+        }
+        Cmd::Cancel(id) => {
+            let mut g = live.lock().unwrap();
+            if let Some(t) = g.live_transfer(id) {
+                t.state = "cancelled".into();
+                drop(g);
+                let _ = control.send(ControlMsg::File(FileMsg::Cancel { id }));
+            }
+            wake();
         }
         Cmd::Accept(id) => {
             let resume = resume_download(&live.lock().unwrap(), id);
@@ -888,7 +922,8 @@ pub fn downloads_dir() -> PathBuf {
     dir
 }
 
-async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &Arc<Mutex<Live>>) -> anyhow::Result<()> {
+/// Ok(true) when every byte went out, Ok(false) when the person cancelled.
+async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &Arc<Mutex<Live>>) -> anyhow::Result<bool> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(resume))?;
@@ -901,15 +936,19 @@ async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &
         if n == 0 {
             break;
         }
+        if live.lock().unwrap().is_cancelled(id) {
+            let _ = uni.reset(0u32.into());
+            return Ok(false);
+        }
         write_side_chunk(&mut uni, &buf[..n]).await?;
         sent += n as u64;
-        if let Some(t) = live.lock().unwrap().transfer_mut(id) {
+        if let Some(t) = live.lock().unwrap().live_transfer(id) {
             t.bytes = sent;
         }
     }
     write_side_chunk(&mut uni, &[]).await?;
     let _ = uni.finish();
-    Ok(())
+    Ok(true)
 }
 
 /// The phone's accessibility service is not connected.
@@ -1086,18 +1125,26 @@ async fn receive_file(stream: &mut quinn::RecvStream, header: SideHeader, live: 
     let (mut file, offset) = filesafe::open_for_receive(&root, &name, header.offset)?;
     let mut got = offset;
     while let Some(chunk) = read_side_chunk(stream).await? {
+        if live.lock().unwrap().is_cancelled(header.id) {
+            let _ = stream.stop(0u32.into());
+            return Ok(());
+        }
         std::io::Write::write_all(&mut file, &chunk)?;
         got += chunk.len() as u64;
-        if let Some(t) = live.lock().unwrap().transfer_mut(header.id) {
+        if let Some(t) = live.lock().unwrap().live_transfer(header.id) {
             t.bytes = got;
         }
     }
     std::io::Write::flush(&mut file)?;
     drop(file);
-    let _ = filesafe::finish_receive(&root, &name);
-    if let Some(t) = live.lock().unwrap().transfer_mut(header.id) {
+    let saved = filesafe::finish_receive(&root, &name);
+    let mut g = live.lock().unwrap();
+    if let Some(t) = g.live_transfer(header.id) {
         t.bytes = got;
         t.state = "done".into();
+    }
+    if let Ok(path) = saved {
+        g.saved.push(path);
     }
     Ok(())
 }

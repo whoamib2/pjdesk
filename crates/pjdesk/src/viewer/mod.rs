@@ -5,6 +5,11 @@ pub(crate) fn render_monitor_shots(dir: &std::path::Path) {
     toolbar::render_monitor_shots(dir);
 }
 
+#[cfg(windows)]
+pub(crate) fn attach_drop_hwnd(hwnd: isize, on_drop: impl Fn(Vec<std::path::PathBuf>) + Send + Sync + 'static) {
+    filedrop::attach_hwnd(hwnd, on_drop);
+}
+
 mod controls;
 pub mod decoder;
 mod filedrop;

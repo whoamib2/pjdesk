@@ -30,6 +30,15 @@ pub fn attach(window: &winit::window::Window, on_drop: impl Fn(Vec<PathBuf>) + S
     unsafe { install(hwnd) };
 }
 
+/// Same drop target for a window this process made some other way (the files window).
+#[cfg(windows)]
+pub fn attach_hwnd(hwnd: isize, on_drop: impl Fn(Vec<PathBuf>) + Send + Sync + 'static) {
+    let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut _);
+    let callback: Arc<dyn Fn(Vec<PathBuf>) + Send + Sync> = Arc::new(on_drop);
+    *ON_DROP.lock().unwrap() = Some(callback);
+    unsafe { install(hwnd) };
+}
+
 #[cfg(not(windows))]
 pub fn attach(_window: &winit::window::Window, _on_drop: impl Fn(Vec<PathBuf>) + Send + Sync + 'static) {}
 

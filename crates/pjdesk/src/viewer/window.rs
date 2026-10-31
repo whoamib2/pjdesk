@@ -392,6 +392,8 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
         retire: armed.retire,
         others: Vec::new(),
         chat_pops: HashMap::new(),
+        file_pops: HashMap::new(),
+        file_batches: HashMap::new(),
         chat_heard: HashMap::new(),
         tab_order: vec![1],
         connecting: Vec::new(),
@@ -638,6 +640,10 @@ struct App {
     title: String,
     /// One compact chat window per session, opened on demand or when a line arrives.
     chat_pops: HashMap<u64, crate::chatpop::ChatPop>,
+    /// One file-transfer window per session.
+    file_pops: HashMap<u64, crate::filepop::FilePop>,
+    /// Files received per session, shown in Explorer when a batch is over.
+    file_batches: HashMap<u64, crate::reveal::Batch>,
     /// Incoming chat lines already seen per session (auto-open on new ones).
     chat_heard: HashMap<u64, usize>,
     window: Option<Rc<Window>>,
@@ -1014,6 +1020,11 @@ impl App {
                 // Chat lives in its own compact window. Clicking again brings it forward.
                 let sid = self.sid;
                 self.open_chat(sid, false);
+            }
+            Action::OpenPanel(0) => {
+                // Files live in their own compact window, one per session.
+                let sid = self.sid;
+                self.open_files(sid);
             }
             Action::OpenPanel(tab) => {
                 if tab == 1 && !self.live.lock().unwrap().chat_ready {
@@ -1670,8 +1681,8 @@ impl App {
                 n += 1;
             }
         }
-        self.panel.open = true;
-        self.panel.tab = 0;
+        let sid = self.sid;
+        self.open_files(sid);
         if n == 0 {
             self.show_toast("That drop had no files to send");
         } else if n == 1 {
@@ -2259,6 +2270,102 @@ impl App {
             return Some((self.live.clone(), self.control.clone()));
         }
         self.others.iter().find(|held| held.sid == sid).map(|held| (held.live.clone(), held.control.clone()))
+    }
+
+    fn files_target(&self, sid: u64) -> Option<(Arc<Mutex<super::controls::Live>>, mpsc::UnboundedSender<super::controls::Cmd>)> {
+        if sid == self.sid {
+            return Some((self.live.clone(), self.cmds.clone()));
+        }
+        self.others.iter().find(|held| held.sid == sid).map(|held| (held.live.clone(), held.cmds.clone()))
+    }
+
+    fn files_state(live: &super::controls::Live) -> crate::filepop::State {
+        let items = live
+            .transfers
+            .iter()
+            .map(|t| crate::filepop::Item { id: t.id, name: t.name.clone(), size: t.size, bytes: t.bytes, incoming: t.incoming, state: t.state.clone() })
+            .collect();
+        let allowed = live.allowed(pjdesk_proto::perms::FILE);
+        let note = if live.v3 && live.perms != 0 && !allowed { "The other computer did not allow file transfer.".to_string() } else { String::new() };
+        crate::filepop::State {
+            peer: live.peer_label.clone(),
+            allowed: allowed || live.perms == 0,
+            note,
+            items,
+            remote: live.remote_files.clone(),
+            save_dir: super::controls::downloads_dir().to_string_lossy().into_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn open_files(&mut self, sid: u64) {
+        let Some((live, _)) = self.files_target(sid) else { return };
+        let state = Self::files_state(&live.lock().unwrap());
+        let pop = self.file_pops.entry(sid).or_insert_with(|| crate::filepop::FilePop::new(&format!("v{sid}")));
+        pop.update(state);
+        pop.show();
+    }
+
+    /// Keeps every session's files window in step and shows received files
+    /// in Explorer once a batch is over.
+    fn pump_files(&mut self) {
+        use super::controls::Cmd;
+        for sid in self.live_ids() {
+            let Some((live, cmds)) = self.files_target(sid) else { continue };
+            // Received files, whether or not the window is open.
+            let (saved, arriving) = {
+                let mut g = live.lock().unwrap();
+                let saved = std::mem::take(&mut g.saved);
+                let arriving = g.transfers.iter().any(|t| t.incoming && matches!(t.state.as_str(), "offered" | "downloading"));
+                (saved, arriving)
+            };
+            let batch = self.file_batches.entry(sid).or_default();
+            for path in saved {
+                batch.saved(path);
+            }
+            if let Some(paths) = batch.take_if_settled(arriving) {
+                crate::reveal::select_in_explorer(paths);
+            }
+            let Some(pop) = self.file_pops.get_mut(&sid) else { continue };
+            let open = pop.is_open();
+            for req in pop.take_requests() {
+                match req {
+                    crate::filepop::Request::Send(paths) => {
+                        for path in &paths {
+                            for file in expand_drop(path) {
+                                let _ = cmds.send(Cmd::SendFile(file));
+                            }
+                        }
+                    }
+                    crate::filepop::Request::Cancel(id) => {
+                        let _ = cmds.send(Cmd::Cancel(id));
+                    }
+                    crate::filepop::Request::List => {
+                        let _ = cmds.send(Cmd::ListRemote);
+                    }
+                    crate::filepop::Request::Pull(name) => {
+                        let _ = cmds.send(Cmd::Pull(name));
+                    }
+                    crate::filepop::Request::ClearFinished => live.lock().unwrap().clear_finished(),
+                }
+            }
+            if open {
+                // Files the other side offers are taken while the window is open.
+                let offered: Vec<u64> = live.lock().unwrap().transfers.iter().filter(|t| t.incoming && t.state == "offered").map(|t| t.id).collect();
+                for id in offered {
+                    let _ = cmds.send(Cmd::Accept(id));
+                }
+            }
+            let state = Self::files_state(&live.lock().unwrap());
+            pop.update(state);
+        }
+        let gone: Vec<u64> = self.file_pops.keys().copied().filter(|sid| !self.live_ids().contains(sid)).collect();
+        for sid in gone {
+            if let Some(mut pop) = self.file_pops.remove(&sid) {
+                pop.close();
+            }
+            self.file_batches.remove(&sid);
+        }
     }
 
     fn open_chat(&mut self, sid: u64, alert: bool) {
@@ -3197,7 +3304,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Chat windows and incoming lines are checked a few times a second.
+        // Chat and files windows and incoming lines are checked a few times a second.
+        self.pump_files();
         if self.pump_chats() {
             if let Some(window) = &self.window {
                 window.request_redraw();
