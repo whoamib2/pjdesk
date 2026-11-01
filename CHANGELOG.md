@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.81
 
 - Settings: "Sync PIN across my computers" (Windows and Android, on by default). Off keeps this install's PIN to itself; turning it back on takes the account's PIN.
 - Windows never writes a secret in the clear: a DPAPI failure keeps nothing, and `plain:` values from older builds are sealed on load.
