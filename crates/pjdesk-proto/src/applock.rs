@@ -307,6 +307,29 @@ pub fn adopt_lock(local: &LockSide, remote: &LockSide) -> LockAdopt {
     LockAdopt::Keep
 }
 
+/// "Sync PIN across my computers" was just turned back on. The account's PIN
+/// wins over whatever this install kept while syncing was off, whatever the
+/// timestamps say. An account with no PIN ever saved keeps the local one, which
+/// then uploads. A copy this install cannot open is left alone.
+pub fn adopt_on_resync(local: &LockSide, remote: &LockSide) -> LockAdopt {
+    let remote_sealed = remote.sealed.trim();
+    let remote_hash = remote.hash.trim();
+    if remote_sealed.is_empty() && remote_hash.is_empty() {
+        return if remote.updated > 0 && (!local.sealed.trim().is_empty() || !local.hash.trim().is_empty()) {
+            LockAdopt::Clear
+        } else {
+            LockAdopt::Keep
+        };
+    }
+    if remote_hash.is_empty() {
+        return LockAdopt::Keep;
+    }
+    if !local.sealed.trim().is_empty() && local.sealed.trim() == remote_sealed {
+        return LockAdopt::Stored;
+    }
+    LockAdopt::Take
+}
+
 /// The shared window file. The later PIN save wins. A pending upload does not
 /// hide a newer save already written into that file, and an older save in the
 /// file does not replace a newer one.
@@ -435,6 +458,25 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn turning_sync_back_on_takes_the_account_pin_even_when_older() {
+        let side = |sealed: &str, updated, generation, hash: &str, pending| LockSide {
+            sealed: sealed.into(),
+            updated,
+            generation,
+            hash: hash.into(),
+            pending,
+        };
+        let local = side("local", 900, 900, "aa", true);
+        let older = side("acct", 100, 100, "bb", false);
+        assert_eq!(adopt_lock(&local, &older), LockAdopt::Keep);
+        assert_eq!(adopt_on_resync(&local, &older), LockAdopt::Take);
+        assert_eq!(adopt_on_resync(&local, &side("local", 100, 900, "aa", false)), LockAdopt::Stored);
+        assert_eq!(adopt_on_resync(&local, &side("", 0, 0, "", false)), LockAdopt::Keep);
+        assert_eq!(adopt_on_resync(&local, &side("", 50, 0, "", false)), LockAdopt::Clear);
+        assert_eq!(adopt_on_resync(&local, &side("sealed-other-key", 950, 0, "", false)), LockAdopt::Keep);
+    }
+
     use super::*;
 
     #[test]

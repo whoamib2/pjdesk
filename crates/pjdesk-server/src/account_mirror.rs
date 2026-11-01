@@ -45,15 +45,21 @@ struct Pause {
     wait: u64,
 }
 
+/// The network signing key is sealed on disk (see `sealed`). A copy from an
+/// older build is plain text; the next save seals it.
 pub fn load(dir: &Path) -> AccountCopy {
-    std::fs::read(dir.join(MIRROR_FILE))
+    let mut copy: AccountCopy = std::fs::read(dir.join(MIRROR_FILE))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    copy.sign_pkcs8 = crate::sealed::open(&copy.sign_pkcs8);
+    copy
 }
 
 fn save(dir: &Path, copy: &AccountCopy) {
-    let Ok(bytes) = serde_json::to_vec_pretty(copy) else { return };
+    let mut disk = copy.clone();
+    disk.sign_pkcs8 = crate::sealed::seal(&copy.sign_pkcs8);
+    let Ok(bytes) = serde_json::to_vec_pretty(&disk) else { return };
     let path = dir.join(MIRROR_FILE);
     if std::fs::write(&path, bytes).is_ok() {
         cloud::protect(&path);

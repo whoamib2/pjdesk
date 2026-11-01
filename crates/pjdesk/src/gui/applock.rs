@@ -229,6 +229,9 @@ impl App {
                 }
             }
         }
+        if !self.cfg.settings.pin_sync {
+            return;
+        }
         if self.lock_pull_rx.is_some() || !self.signed_in() || self.cfg.joined_by_code_or_key() || Instant::now() < self.next_lock_pull
         {
             return;
@@ -269,7 +272,28 @@ impl App {
         );
         let opened = crate::vault::key_from(&self.cfg).and_then(|key| pjdesk_proto::applock::open(&key, remote.sealed.trim()).ok());
         let incoming = pjdesk_proto::applock::LockSide::from_verifier(remote.sealed.trim(), remote.updated, opened.as_ref(), false);
-        match pjdesk_proto::applock::adopt_lock(&local, &incoming) {
+        if !self.cfg.settings.pin_sync {
+            return;
+        }
+        let resync = std::mem::take(&mut self.cfg.settings.pin_sync_adopt);
+        let decision = if resync {
+            pjdesk_proto::applock::adopt_on_resync(&local, &incoming)
+        } else {
+            pjdesk_proto::applock::adopt_lock(&local, &incoming)
+        };
+        if resync {
+            // The account never had a PIN: this install's PIN becomes the account's.
+            if decision == pjdesk_proto::applock::LockAdopt::Keep
+                && remote.sealed.trim().is_empty()
+                && !self.cfg.app_lock_sealed.trim().is_empty()
+            {
+                self.cfg.app_lock_pending = true;
+                self.next_lock_pull = Instant::now();
+            }
+            self.save_cfg();
+            self.note_pin_outcome("PIN sync turned back on; using the account's PIN");
+        }
+        match decision {
             pjdesk_proto::applock::LockAdopt::Keep => {
                 if local.generation == 0
                     && local.hash.is_empty()
@@ -1102,6 +1126,22 @@ impl App {
                 }
             }
         });
+        ui.add_space(4.0);
+        let mut sync = self.cfg.settings.pin_sync;
+        if ui
+            .checkbox(&mut sync, "Sync PIN across my computers")
+            .on_hover_text("Off keeps this computer's PIN to itself. Turning it back on uses your account's PIN.")
+            .changed()
+        {
+            self.cfg.settings.pin_sync = sync;
+            self.cfg.settings.pin_sync_adopt = sync;
+            if sync {
+                self.cfg.app_lock_pending = false;
+                self.next_lock_pull = Instant::now();
+            }
+            let _ = self.cfg.save();
+            tracing::info!("PIN sync turned {}.", if sync { "on" } else { "off" });
+        }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let label = if have { "Change PIN" } else { "Set PIN" };
@@ -1267,6 +1307,7 @@ impl App {
             have,
             recent,
             existing_key,
+            local_only: !self.cfg.settings.pin_sync,
         });
     }
 
@@ -1305,6 +1346,7 @@ impl App {
             have: Some(have),
             recent: false,
             existing_key,
+            local_only: !self.cfg.settings.pin_sync,
         });
     }
 
@@ -1402,6 +1444,8 @@ struct SaveJob {
     have: Option<pjdesk_proto::applock::Verifier>,
     recent: bool,
     existing_key: Option<[u8; 32]>,
+    /// PIN sync is off here. Nothing is sent to the account.
+    local_only: bool,
 }
 
 fn save_lock(job: SaveJob) -> LockMsg {
@@ -1445,6 +1489,9 @@ fn save_lock(job: SaveJob) -> LockMsg {
         };
         return finish_lock_upload(&job, sealed, verifier, key);
     }
+    if job.remove && job.local_only {
+        return LockMsg::Cleared { updated: super::unix_now().max(1) };
+    }
     if job.remove {
         return match crate::network::put_app_lock(&job.refresh, &job.device, "") {
             Ok(updated) => LockMsg::Cleared { updated },
@@ -1463,6 +1510,9 @@ fn save_lock(job: SaveJob) -> LockMsg {
 }
 
 fn finish_lock_upload(job: &SaveJob, sealed: String, verifier: pjdesk_proto::applock::Verifier, key: [u8; 32]) -> LockMsg {
+    if job.local_only {
+        return LockMsg::StoredLocal { sealed, verifier, key, note: "PIN saved on this computer only.".into() };
+    }
     if job.refresh.is_empty() || job.device.is_empty() {
         return LockMsg::StoredLocal { sealed, verifier, key, note: local_pin_note("") };
     }

@@ -1638,7 +1638,9 @@ class MainActivity : FragmentActivity() {
                 if (app.store.pinLockedUntil > System.currentTimeMillis()) return@LaunchedEffect
                 tryBio()
             }
+            var pinSyncUi by remember { mutableStateOf(app.store.pinSync) }
             fun pullAppLock() {
+                if (!app.store.pinSync) return
                 if (!CloudGate.serverUp) return
                 if (app.store.joinedWithoutPassword || visitWithoutPassword) return
                 val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
@@ -1652,11 +1654,20 @@ class MainActivity : FragmentActivity() {
                         runCatching { CloudAuth.fetchAppLock(refresh, device) }
                     }.getOrNull() ?: return@launch
                     val (lock, updated) = remote
-                    val pending = app.store.appLockPending
+                    if (!app.store.pinSync) return@launch
+                    // Sync was just turned back on: the account's PIN wins whatever the times say.
+                    val resync = app.store.pinSyncAdopt
+                    if (resync) app.store.pinSyncAdopt = false
+                    val pending = if (resync) false else app.store.appLockPending
                     val localSealed = app.store.appLockSealed
-                    val localGen = app.store.accountPinUpdated
+                    val localGen = if (resync) 0L else app.store.accountPinUpdated
                     val localHash = app.store.accountPinHash
-                    val localUpdated = app.store.appLockUpdated
+                    val localUpdated = if (resync) 0L else app.store.appLockUpdated
+                    if (resync && lock.isBlank() && updated == 0L && app.store.hasAccountPin()) {
+                        // The account never had a PIN. This phone's PIN uploads on the next pull.
+                        app.store.appLockPending = true
+                        return@launch
+                    }
                     val key = app.vaultKey
                     val opened = if (lock.isNotBlank() && key != null) {
                         runCatching { AccountPin.open(key, lock) }.getOrNull()
@@ -1770,7 +1781,9 @@ class MainActivity : FragmentActivity() {
                             val sealed = AccountPin.seal(key, verifier)
                             val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                             val device = app.store.networkDeviceId
-                            val stored = if (refresh.isBlank() || device.isBlank()) {
+                            val stored = if (!app.store.pinSync) {
+                                null to "PIN saved on this phone only. PIN sync is off."
+                            } else if (refresh.isBlank() || device.isBlank()) {
                                 null to "PIN saved on this phone. It will sync to the account when the server answers."
                             } else {
                                 runCatching { CloudAuth.putAppLock(refresh, device, sealed) }.fold(
@@ -1850,8 +1863,10 @@ class MainActivity : FragmentActivity() {
                             }
                             val refresh = if (temporarySession) memoryRefresh else app.store.networkRefresh()
                             val device = app.store.networkDeviceId
-                            if (refresh.isBlank() || device.isBlank()) error("Sign in again, then remove the PIN.")
-                            CloudAuth.putAppLock(refresh, device, "")
+                            if (app.store.pinSync) {
+                                if (refresh.isBlank() || device.isBlank()) error("Sign in again, then remove the PIN.")
+                                CloudAuth.putAppLock(refresh, device, "")
+                            }
                         }
                     }
                     lockBusy = false
@@ -2510,6 +2525,16 @@ class MainActivity : FragmentActivity() {
                                             }
                                         }
                                     },
+                                    pinSync = pinSyncUi,
+                                    onPinSync = { on ->
+                                        pinSyncUi = on
+                                        app.store.pinSync = on
+                                        app.store.pinSyncAdopt = on
+                                        // A PIN kept here while sync was off must not overwrite the account's.
+                                        if (on) app.store.appLockPending = false
+                                        AppLog.i("PIN sync turned ${if (on) "on" else "off"}")
+                                        if (on) pullAppLock()
+                                    },
                                     onAutoLock = { seconds ->
                                         app.store.autoLockSeconds = seconds
                                         val key = app.vaultKey
@@ -2528,7 +2553,7 @@ class MainActivity : FragmentActivity() {
                                                         app.store.accountPinLen,
                                                     )
                                                     val sealed = AccountPin.seal(key, verifier)
-                                                    val updated = runCatching { CloudAuth.putAppLock(refresh, device, sealed) }.getOrNull()
+                                                    val updated = if (app.store.pinSync) runCatching { CloudAuth.putAppLock(refresh, device, sealed) }.getOrNull() else null
                                                     val whenSaved = updated ?: (System.currentTimeMillis() / 1000)
                                                     app.store.saveAccountPin(email, verifier, sealed, whenSaved, updated == null)
                                                 }

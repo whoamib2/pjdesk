@@ -88,7 +88,7 @@ fn b64() -> base64::engine::GeneralPurpose {
 // ---------------------------------------------------------------------------
 // Configuration and join codes
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CloudConfig {
     /// `"account"` (PJDesk Cloud) or `"r2"` (your own bucket).
     #[serde(default = "mode_r2")]
@@ -201,6 +201,25 @@ pub fn sign_out(data_dir: &Path) {
     turn_off(data_dir);
 }
 
+/// Debug output never shows the token, the R2 secret or the backup key.
+impl std::fmt::Debug for CloudConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hidden = |v: &str| if v.is_empty() { "" } else { "<redacted>" };
+        f.debug_struct("CloudConfig")
+            .field("mode", &self.mode)
+            .field("api", &self.api)
+            .field("email", &self.email)
+            .field("token", &hidden(&self.token))
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &hidden(&self.secret_access_key))
+            .field("key", &hidden(&self.key))
+            .field("region", &self.region)
+            .finish()
+    }
+}
+
 impl CloudConfig {
     /// New settings for a first-time setup, with a fresh encryption key.
     /// `endpoint` may be the S3 URL Cloudflare shows (with or without the
@@ -264,15 +283,30 @@ impl CloudConfig {
         }
     }
 
+    /// Reads `cloud-sync.json`. The token, R2 secret and backup key are sealed
+    /// on disk (see `sealed`); a file from an older build is plain text and is
+    /// rewritten sealed in place.
     pub fn load(data_dir: &Path) -> Option<Self> {
         let bytes = std::fs::read(data_dir.join(CONFIG_FILE)).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        let mut cfg: Self = serde_json::from_slice(&bytes).ok()?;
+        let plain = [&cfg.token, &cfg.secret_access_key, &cfg.key].iter().any(|v| crate::sealed::needs_seal(v));
+        cfg.token = crate::sealed::open(&cfg.token);
+        cfg.secret_access_key = crate::sealed::open(&cfg.secret_access_key);
+        cfg.key = crate::sealed::open(&cfg.key);
+        if plain {
+            let _ = cfg.save(data_dir);
+        }
+        Some(cfg)
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join(CONFIG_FILE);
-        write_atomic(&path, &serde_json::to_vec_pretty(self)?)?;
+        let mut disk = self.clone();
+        disk.token = crate::sealed::seal(&self.token);
+        disk.secret_access_key = crate::sealed::seal(&self.secret_access_key);
+        disk.key = crate::sealed::seal(&self.key);
+        write_atomic(&path, &serde_json::to_vec_pretty(&disk)?)?;
         protect(&path);
         Ok(())
     }

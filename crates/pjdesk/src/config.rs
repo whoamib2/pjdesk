@@ -171,6 +171,14 @@ pub struct Config {
 /// Quality, behaviour and startup preferences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
+    /// "Sync PIN across my computers". Off keeps this install's PIN to itself:
+    /// no upload and no account copy taken.
+    #[serde(default = "yes")]
+    pub pin_sync: bool,
+    /// Set when syncing was just turned back on. The next account read takes
+    /// the account's PIN over the local one.
+    #[serde(default)]
+    pub pin_sync_adopt: bool,
     /// Maximum frames per second when sharing this screen.
     #[serde(default = "default_fps")]
     pub fps: u32,
@@ -357,6 +365,8 @@ fn default_temp_idle() -> u32 {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            pin_sync: true,
+            pin_sync_adopt: false,
             fps: default_fps(),
             bitrate_kbps: default_bitrate(),
             max_width: default_max_width(),
@@ -446,9 +456,42 @@ impl Config {
     /// Loads a config from a specific file (missing file → defaults).
     pub fn load_from(path: &std::path::Path) -> Result<Self> {
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display())),
+            Ok(bytes) => serde_json::from_slice::<Self>(&bytes)
+                .map(|mut cfg| {
+                    cfg.reseal_plain();
+                    cfg
+                })
+                .with_context(|| format!("parsing {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// Seals any secret an older build left as `plain:` (Windows only). The
+    /// sealed form is written on the next save.
+    fn reseal_plain(&mut self) {
+        fn fix(slot: &mut String, machine: bool) {
+            if let Some(sealed) = secure::reseal(slot, machine) {
+                *slot = sealed;
+            }
+        }
+        fn fix_opt(slot: &mut Option<String>, machine: bool) {
+            if let Some(v) = slot.as_mut() {
+                fix(v, machine);
+            }
+        }
+        // The service opens these at the sign-in screen, so they stay machine scope.
+        fix_opt(&mut self.settings.permanent_password, true);
+        fix_opt(&mut self.server_access_key, true);
+        fix_opt(&mut self.network_refresh, true);
+        fix_opt(&mut self.network_access, false);
+        fix_opt(&mut self.password_vault_key, false);
+        fix_opt(&mut self.app_lock_verifier, false);
+        if let Some(account) = self.account.as_mut() {
+            fix(&mut account.token, false);
+        }
+        for v in self.saved_passwords.values_mut() {
+            fix(v, false);
         }
     }
 

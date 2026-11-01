@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Settings: "Sync PIN across my computers" (Windows and Android, on by default). Off keeps this install's PIN to itself; turning it back on takes the account's PIN.
+- Windows never writes a secret in the clear: a DPAPI failure keeps nothing, and `plain:` values from older builds are sealed on load.
+- PJDesk Server seals the cloud sign-in token, R2 secret, backup key and network signing key with machine DPAPI in cloud-sync.json and account-mirror.json. Older plain files still open and are sealed on the next save.
+
 ## 0.6.80
 
 - Fixed: signing in with email and password on a computer with no saved PJDesk server failed with "no PJDesk server is saved on this computer". The sign-in now reaches the account's server that pjdesk.com returned and saves it; if that server cannot be reached yet, the sign-in is kept and this computer is published on the next sync.

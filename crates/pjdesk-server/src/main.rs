@@ -16,6 +16,7 @@
 mod localtime;
 mod access;
 mod account_mirror;
+mod sealed;
 mod access_keys;
 mod accounts;
 mod audit;

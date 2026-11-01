@@ -480,6 +480,16 @@ class Store(context: Context) {
         set(value) { prefs.edit().putLong("appLockUpdated", value).commit() }
 
     /** The PIN is on this phone and has not reached the account yet. */
+    /** "Sync PIN across my computers". Off keeps this phone's PIN to itself. */
+    var pinSync: Boolean
+        get() = prefs.getBoolean("pinSync", true)
+        set(value) { prefs.edit().putBoolean("pinSync", value).commit() }
+
+    /** Set when PIN sync was turned back on. The next account read takes the account's PIN. */
+    var pinSyncAdopt: Boolean
+        get() = prefs.getBoolean("pinSyncAdopt", false)
+        set(value) { prefs.edit().putBoolean("pinSyncAdopt", value).commit() }
+
     var appLockPending: Boolean
         get() = prefs.getBoolean("appLockPending", false)
         set(value) { prefs.edit().putBoolean("appLockPending", value).commit() }

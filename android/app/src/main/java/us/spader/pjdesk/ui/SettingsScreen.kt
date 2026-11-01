@@ -90,6 +90,8 @@ fun SettingsScreen(
     onChangePin: () -> Unit = {},
     onToggleBiometrics: (Boolean) -> Unit = {},
     onAutoLock: (Int) -> Unit = {},
+    pinSync: Boolean = true,
+    onPinSync: (Boolean) -> Unit = {},
     onSaveAccountPin: (current: String, password: String, newPin: String, idleSec: Int, enableBio: Boolean) -> Unit = { _, _, _, _, _ -> },
     onRemoveAccountPin: (current: String, password: String) -> Unit = { _, _ -> },
     pinBusy: Boolean = false,
@@ -295,6 +297,10 @@ fun SettingsScreen(
                         Text("Unlock with fingerprint or face", modifier = Modifier.weight(1f))
                         Switch(checked = biometricsOn, onCheckedChange = onToggleBiometrics)
                     }
+                }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    Text("Sync PIN across my computers", modifier = Modifier.weight(1f))
+                    Switch(checked = pinSync, onCheckedChange = onPinSync)
                 }
                 Text("Lock PJDesk after inactivity", color = pjMuted())
                 Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {

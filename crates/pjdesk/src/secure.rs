@@ -35,8 +35,33 @@ fn protect_inner(secret: &str, machine: bool) -> String {
         }
     }
     let _ = machine;
-    // Fallback: clearly not encrypted.
-    format!("plain:{}", hex::encode(secret.as_bytes()))
+    #[cfg(windows)]
+    {
+        // Never write a secret in the clear on Windows. Try the other DPAPI
+        // scope, and failing that keep nothing: the person types it again.
+        if let Some(bytes) = dpapi::protect(secret.as_bytes(), !machine) {
+            let tag = if machine { "dpapi" } else { "dpapi-machine" };
+            return format!("{tag}:{}", hex::encode(bytes));
+        }
+        tracing::warn!("Windows could not encrypt a secret; it was not saved.");
+        String::new()
+    }
+    // Development builds off Windows: clearly not encrypted.
+    #[cfg(not(windows))]
+    {
+        format!("plain:{}", hex::encode(secret.as_bytes()))
+    }
+}
+
+/// A value an older build or a DPAPI failure left as `plain:`, sealed now.
+/// `None` when it is already sealed, empty, or this platform has no DPAPI.
+pub fn reseal(stored: &str, machine: bool) -> Option<String> {
+    if !cfg!(windows) || !stored.starts_with("plain:") {
+        return None;
+    }
+    let text = reveal(stored)?;
+    let sealed = protect_inner(&text, machine);
+    (!sealed.is_empty() && !sealed.starts_with("plain:")).then_some(sealed)
 }
 
 /// Reverses [`protect`] or [`protect_machine`]. Returns `None` if the value
