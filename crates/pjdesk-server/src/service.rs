@@ -151,8 +151,21 @@ pub(crate) fn repair_data_dir(dir: &Path) {
     }
 }
 
+/// server.log larger than this moves to server.log.1 when the service starts.
+const LOG_ROTATE_BYTES: u64 = 20 * 1024 * 1024;
+
+pub(crate) fn rotate_log(path: &Path, limit: u64) -> bool {
+    if std::fs::metadata(path).map(|m| m.len() > limit).unwrap_or(false) {
+        let old = path.with_extension("log.1");
+        let _ = std::fs::remove_file(&old);
+        return std::fs::rename(path, &old).is_ok();
+    }
+    false
+}
+
 fn init_file_logging(data_dir: &Path) {
     let _ = std::fs::create_dir_all(data_dir);
+    let rotated = rotate_log(&data_dir.join("server.log"), LOG_ROTATE_BYTES);
     if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(data_dir.join("server.log")) {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
@@ -160,6 +173,9 @@ fn init_file_logging(data_dir: &Path) {
             .with_target(false)
             .with_writer(std::sync::Mutex::new(file))
             .try_init();
+        if rotated {
+            tracing::info!("server.log was over {} MB; the old log is server.log.1", LOG_ROTATE_BYTES / 1024 / 1024);
+        }
     }
 }
 
@@ -327,5 +343,20 @@ fn win_code(err: &windows_service::Error) -> Option<i32> {
     match err {
         windows_service::Error::Winapi(io) => io.raw_os_error(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod log_rotate_tests {
+    #[test]
+    fn a_large_server_log_moves_to_log_1() {
+        let dir = std::env::temp_dir().join(format!("pjd-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("server.log");
+        std::fs::write(&log, vec![b'x'; 2048]).unwrap();
+        assert!(!super::rotate_log(&log, 4096), "a small log stays");
+        assert!(super::rotate_log(&log, 1024));
+        assert!(!log.exists() && dir.join("server.log.1").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -2278,7 +2278,16 @@ async fn cloud_sync(state: Shared, acceptor: Arc<RwLock<TlsAcceptor>>) {
         // phone can sign in against either server.
         if !crate::cloud::accepts_host_registrations(&data_dir) && !forced {
             let dir = data_dir.clone();
-            match tokio::task::spawn_blocking(move || crate::account_mirror::pull_now(&dir)).await {
+            // It still reports its own version and role, and re-reads the
+            // primary's, so each window shows the other server's real version.
+            // Without this a standby's health stayed at whatever it last wrote
+            // as primary (CHIP20 showed v0.6.62 for days after upgrading).
+            match tokio::task::spawn_blocking(move || {
+                crate::cloud::publish_heartbeat(&dir);
+                crate::account_mirror::pull_now(&dir)
+            })
+            .await
+            {
                 Ok(line) => {
                     info!("standby account copy: {line}");
                     crate::cloud::batch_done(!crate::account_mirror::cloud_failed(&data_dir));

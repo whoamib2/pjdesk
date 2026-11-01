@@ -16,9 +16,44 @@ pub const PIPE_NAME: &str = r"\\.\pipe\PJDeskServerStatus";
 #[cfg(windows)]
 const PIPE_WORKERS: usize = 4;
 
+/// The latest snapshot as JSON, rebuilt every second on its own thread. A pipe
+/// answer writes these bytes and never waits on the data folder or the log.
+#[cfg(windows)]
+static CACHED: std::sync::Mutex<Option<std::sync::Arc<Vec<u8>>>> = std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn build_bytes(data_dir: &std::path::Path, port: u16) -> Option<Vec<u8>> {
+    let started = std::time::Instant::now();
+    let bytes = serde_json::to_vec(&Snapshot::from_disk(data_dir, port, true)).ok();
+    let took = started.elapsed();
+    if took > std::time::Duration::from_millis(250) {
+        tracing::info!("status pipe: snapshot took {} ms", took.as_millis());
+    }
+    bytes
+}
+
+#[cfg(windows)]
+fn cached_bytes(data_dir: &std::path::Path, port: u16) -> Option<std::sync::Arc<Vec<u8>>> {
+    if let Some(bytes) = CACHED.lock().unwrap().clone() {
+        return Some(bytes);
+    }
+    let bytes = std::sync::Arc::new(build_bytes(data_dir, port)?);
+    *CACHED.lock().unwrap() = Some(bytes.clone());
+    Some(bytes)
+}
+
 #[cfg(windows)]
 pub fn serve(data_dir: PathBuf, port: u16) {
     let _pipe = PIPE_NAME;
+    {
+        let dir = data_dir.clone();
+        let _ = std::thread::Builder::new().name("status-snapshot".into()).spawn(move || loop {
+            if let Some(bytes) = build_bytes(&dir, port) {
+                *CACHED.lock().unwrap() = Some(std::sync::Arc::new(bytes));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+    }
     // Several listening instances, so a window opening while another reader
     // holds the pipe is answered at once instead of seeing "busy".
     for n in 1..PIPE_WORKERS {
@@ -86,8 +121,7 @@ fn serve_once(data_dir: &std::path::Path, port: u16) -> bool {
             let _ = windows::Win32::Foundation::CloseHandle(pipe);
             return false;
         }
-        let snap = Snapshot::from_disk(data_dir, port, true);
-        if let Ok(bytes) = serde_json::to_vec(&snap) {
+        if let Some(bytes) = cached_bytes(data_dir, port) {
             let mut sent = 0usize;
             while sent < bytes.len() {
                 let mut wrote = 0u32;

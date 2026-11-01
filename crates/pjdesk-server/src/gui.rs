@@ -499,8 +499,13 @@ impl App {
     }
 
     fn waiting_for_service(&self) -> bool {
-        if self.access == Access::Readable || self.live.is_some() || self.pipe_failed {
+        if self.access == Access::Readable || self.live.is_some() {
             return false;
+        }
+        // A running service is still answering. Keep "Loading…" for up to a
+        // minute rather than calling the section locked after the 10 s give-up.
+        if self.pipe_failed {
+            return self.service_state().1 && self.opened_at.elapsed() < SERVICE_WAIT_MAX;
         }
         // With a probe running, wait for its first answer or its give-up.
         self.probe.is_some() || self.opened_at.elapsed() < Duration::from_secs(2)
@@ -1884,7 +1889,7 @@ impl App {
         if self.waiting_for_service() {
             ui.horizontal(|ui| {
                 ui_widgets::spinner(ui, p(ui).accent);
-                ui.label("Reading status from the service…");
+                ui.label("Loading…");
             });
         } else {
             ui.label("Locked — open as administrator to view.");
@@ -4850,6 +4855,8 @@ fn glyph(ui: &mut egui::Ui, icon: Icon, color: Color32) {
 
 /// How long the window shows Loading… before saying the service did not answer.
 const PIPE_GIVE_UP: Duration = Duration::from_secs(10);
+/// How long sections say "Loading…" while the service runs but has not answered.
+const SERVICE_WAIT_MAX: Duration = Duration::from_secs(60);
 
 fn spawn_status_probe(ctx: &egui::Context) -> Option<std::sync::mpsc::Receiver<Option<Snapshot>>> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -4864,6 +4871,9 @@ fn spawn_status_probe(ctx: &egui::Context) -> Option<std::sync::mpsc::Receiver<O
             loop {
                 let snap = crate::status_pipe::read_snapshot();
                 if snap.is_some() {
+                    if !answered {
+                        tracing::info!("status pipe: first answer after {} ms", started.elapsed().as_millis());
+                    }
                     answered = true;
                     if tx.send(snap).is_err() {
                         break;

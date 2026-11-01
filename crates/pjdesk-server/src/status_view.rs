@@ -261,7 +261,7 @@ impl Snapshot {
 
 /// Last lines of a log, safe to put on the clipboard or the status pipe.
 pub(crate) fn redacted_log_tail(path: &Path) -> String {
-    let Ok(bytes) = std::fs::read(path) else {
+    let Some(bytes) = read_file_end(path, LOG_TAIL_BYTES) else {
         return String::new();
     };
     let text = String::from_utf8_lossy(&bytes);
@@ -276,6 +276,28 @@ pub(crate) fn redacted_log_tail(path: &Path) -> String {
         let skip = redacted.chars().count() - max;
         redacted.chars().skip(skip).collect()
     }
+}
+
+/// Bytes read from the end of a log for its tail. server.log was read whole on
+/// every status-pipe answer; at hundreds of MB that kept the pipe busy for
+/// seconds per answer, and the window showed "Locked" for about a minute.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
+
+/// The last `max` bytes of a file, starting at a line break when one is in range.
+pub(crate) fn read_file_end(path: &Path, max: u64) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    file.take(max).read_to_end(&mut buf).ok()?;
+    if start > 0 {
+        if let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+            buf.drain(..=nl);
+        }
+    }
+    Some(buf)
 }
 
 /// Drops passwords, tokens, and key material. Host names, IDs, and addresses stay.
@@ -489,6 +511,28 @@ fn listed_blocked(dir: &Path) -> Vec<ListedBlock> {
         .collect();
     rows.sort_by(|a, b| b.blocked_at.cmp(&a.blocked_at).then(a.id.cmp(&b.id)));
     rows
+}
+
+#[cfg(test)]
+mod tail_tests {
+    #[test]
+    fn a_large_log_tail_reads_only_the_end() {
+        let dir = std::env::temp_dir().join(format!("pjd-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.log");
+        let mut text = String::new();
+        for i in 0..200_000 {
+            text.push_str(&format!("line {i} some log text here\n"));
+        }
+        std::fs::write(&path, &text).unwrap();
+        let started = std::time::Instant::now();
+        let tail = super::redacted_log_tail(&path);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(tail.ends_with("line 199999 some log text here"));
+        assert_eq!(tail.lines().count(), 80);
+        assert!(tail.lines().next().unwrap().starts_with("line 199920 "));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]
