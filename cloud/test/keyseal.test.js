@@ -54,3 +54,11 @@ test("the sweep seals every plain row once and they still open", async () => {
   assert.equal(await sealPlainRows(e), 0);
   assert.equal(await sealPlainRows({ DB: fakeDb({ private_pkcs8: "aa" }, []) }), 0);
 });
+
+test("a base64 or BOM-prefixed secret works; a short one seals nothing", async () => {
+  const b64env = { SIGNING_KEY_SECRET: "\uFEFFq83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80=\r\n" };
+  const sealed = await sealKey(b64env, "ab".repeat(48), serviceAad());
+  assert.ok(isSealed(sealed));
+  assert.equal(await openKey({ SIGNING_KEY_SECRET: "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80=" }, sealed, serviceAad()), "ab".repeat(48));
+  assert.equal(await sealKey({ SIGNING_KEY_SECRET: "short" }, "ab".repeat(48), serviceAad()), "ab".repeat(48));
+});

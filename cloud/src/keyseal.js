@@ -2,7 +2,7 @@
 //
 // Rows in network_keys (the service-wide Ed25519 key) and network_sign_keys
 // (one key per network) hold `private_pkcs8`. With the SIGNING_KEY_SECRET
-// Worker secret set (64 hex characters, 32 bytes), the column holds
+// Worker secret set (64 hex characters, or any 32+ character value, hashed), the column holds
 // "enc1:" + base64(iv || AES-256-GCM ciphertext). The row's table and id are
 // bound in as additional data, so a sealed value cannot be moved to another row.
 //
@@ -20,18 +20,28 @@ export function isSealed(stored) {
   return typeof stored === "string" && stored.startsWith(PREFIX);
 }
 
+// The secret as set. Strips whitespace and a byte-order mark (PowerShell pipes
+// can add one) so a pasted value works.
+function secretText(env) {
+  return String(env?.SIGNING_KEY_SECRET || "").replace(/^\uFEFF/, "").trim();
+}
+
+/** 64 hex characters are used as the raw key; any other value of at least 32
+ * characters is hashed (SHA-256) into one, so base64 or other strong secrets work. */
 export function hasSealKey(env) {
-  return /^[0-9a-fA-F]{64}$/.test(String(env?.SIGNING_KEY_SECRET || "").trim());
+  return secretText(env).length >= 32;
 }
 
 async function aesKey(env) {
-  const hex = String(env.SIGNING_KEY_SECRET).trim().toLowerCase();
-  let key = keyCache.get(hex);
+  const text = secretText(env);
+  let key = keyCache.get(text);
   if (!key) {
-    const raw = new Uint8Array(hex.match(/../g).map((b) => parseInt(b, 16)));
+    const raw = /^[0-9a-fA-F]{64}$/.test(text)
+      ? new Uint8Array(text.toLowerCase().match(/../g).map((b) => parseInt(b, 16)))
+      : new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(text)));
     key = await crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
     keyCache.clear();
-    keyCache.set(hex, key);
+    keyCache.set(text, key);
   }
   return key;
 }
@@ -107,11 +117,18 @@ let swept = false;
 
 /** Runs sealPlainRows once per isolate, in the background. Never logs key material. */
 export function sealPlainRowsOnce(env, ctx) {
-  if (swept || !hasSealKey(env) || !env.DB) return;
+  if (swept || !env.DB) return;
+  if (!hasSealKey(env)) {
+    if (env.SIGNING_KEY_SECRET) {
+      swept = true; // warn once per isolate
+      console.warn(`SIGNING_KEY_SECRET is set but too short (${secretText(env).length} chars, need 32+); signing keys stay plain`);
+    }
+    return;
+  }
   swept = true;
   const job = sealPlainRows(env)
     .then((n) => {
-      if (n > 0) console.log(`sealed ${n} signing key row(s)`);
+      console.log(`signing key seal sweep: sealed ${n} row(s)`);
     })
     .catch((err) => {
       swept = false;
