@@ -113,26 +113,33 @@ export async function sealPlainRows(env) {
   return changed;
 }
 
-let swept = false;
+let swept = false; // true once a sweep finished with the secret set
+let lastTry = 0;
+const RETRY_MS = 60_000;
 
-/** Runs sealPlainRows once per isolate, in the background. Never logs key material. */
+/** Runs sealPlainRows in the background until one sweep succeeds in this
+ * isolate, retrying at most once a minute. Logs the outcome (counts, lengths,
+ * error text) but never key material. */
 export function sealPlainRowsOnce(env, ctx) {
-  if (swept || !env.DB) return;
+  if (swept || !env?.DB) return;
+  const now = Date.now();
+  if (now - lastTry < RETRY_MS) return;
+  lastTry = now;
   if (!hasSealKey(env)) {
-    if (env.SIGNING_KEY_SECRET) {
-      swept = true; // warn once per isolate
-      console.warn(`SIGNING_KEY_SECRET is set but too short (${secretText(env).length} chars, need 32+); signing keys stay plain`);
-    }
+    console.warn(
+      env?.SIGNING_KEY_SECRET
+        ? `seal sweep skipped: SIGNING_KEY_SECRET is ${secretText(env).length} chars, need 32+`
+        : "seal sweep skipped: SIGNING_KEY_SECRET is not set",
+    );
     return;
   }
-  swept = true;
   const job = sealPlainRows(env)
     .then((n) => {
+      swept = true;
       console.log(`signing key seal sweep: sealed ${n} row(s)`);
     })
     .catch((err) => {
-      swept = false;
-      console.error(`signing key seal sweep failed: ${err?.name || "error"}`);
+      console.error(`signing key seal sweep failed: ${err?.name || "Error"}: ${String(err?.message || err).slice(0, 300)}`);
     });
   if (ctx?.waitUntil) ctx.waitUntil(job);
 }
