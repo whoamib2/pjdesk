@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fixed: signing in with email and password on a computer with no saved PJDesk server failed with "no PJDesk server is saved on this computer". The sign-in now reaches the account's server that pjdesk.com returned and saves it; if that server cannot be reached yet, the sign-in is kept and this computer is published on the next sync.
+
 ## 0.6.79
 
 - Far fewer requests to pjdesk.com (about 33,000 a day down to about 3,000 for a typical network):

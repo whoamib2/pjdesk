@@ -869,6 +869,9 @@ fn server_refresh(refresh: &str, device_id: &str, computers: Option<&serde_json:
     session_from_account(&reply, device_id, &rpc.presence)
 }
 
+/// No server on disk and none from a pending pjdesk.com sign-in.
+pub(crate) const NO_SAVED_SERVER: &str = "no PJDesk server is saved on this computer";
+
 struct AccountRpc {
     msg: pjdesk_proto::signal::ServerMsg,
     host: String,
@@ -880,10 +883,35 @@ fn account_rpc(msg: pjdesk_proto::signal::ClientMsg) -> Result<pjdesk_proto::sig
     Ok(account_rpc_meta(msg)?.msg)
 }
 
+thread_local! {
+    /// Servers pjdesk.com just gave a sign-in that is not saved yet. A fresh
+    /// computer has none on disk, and its first account call must still reach one.
+    static PENDING_ROUTE: std::cell::RefCell<Option<Session>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Fills an unsaved config with the servers from `session` (address,
+/// fingerprint, routes). Tokens are not copied. Returns false when the
+/// session has no server either.
+fn borrow_session_route(config: &mut crate::config::Config, session: &Session) -> bool {
+    if !session.address.trim().is_empty() {
+        config.server = Some(session.address.trim().to_string());
+    }
+    if let Ok(fp) = pjdesk_proto::tls::parse_fingerprint(&session.fingerprint) {
+        config.server_fingerprint = Some(pjdesk_proto::tls::format_fingerprint(&fp));
+    }
+    if !session.routes.is_empty() {
+        config.network_routes = session.routes.clone();
+    }
+    !(config.effective_server().trim().is_empty() && config.network_routes.is_empty())
+}
+
 fn account_rpc_meta(msg: pjdesk_proto::signal::ClientMsg) -> Result<AccountRpc> {
     let mut config = crate::config::Config::load().unwrap_or_default();
     if config.effective_server().trim().is_empty() && config.network_routes.is_empty() {
-        bail!("no PJDesk server is saved on this computer");
+        let borrowed = PENDING_ROUTE.with(|p| p.borrow().as_ref().map(|s| borrow_session_route(&mut config, s)));
+        if borrowed != Some(true) {
+            bail!("{NO_SAVED_SERVER}");
+        }
     }
     let cached_version = config.network_routes.server_version.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1453,7 +1481,28 @@ pub fn publish_this_computer(session: &Session, this: &ThisComputer, local: &[Sa
         ensure_support_computer(&mut list, &this.id, &info.label);
     }
     let body = saved_value(&list);
-    let mut next = refresh_account(&session.refresh, &session.device_id, Some(&body), &this.id, true)?;
+    // A fresh computer signed in through pjdesk.com has no server saved yet.
+    // Reach the account's server from this session instead of failing.
+    let saved = crate::config::Config::load().unwrap_or_default();
+    let fresh = saved.effective_server().trim().is_empty() && saved.network_routes.is_empty();
+    if fresh {
+        PENDING_ROUTE.with(|p| *p.borrow_mut() = Some(session.clone()));
+    }
+    let published = refresh_account(&session.refresh, &session.device_id, Some(&body), &this.id, true);
+    if fresh {
+        PENDING_ROUTE.with(|p| *p.borrow_mut() = None);
+    }
+    let mut next = match published {
+        Ok(next) => next,
+        // The account's server did not answer from here yet. The sign-in from
+        // pjdesk.com is still good: keep it, save its servers, and let the next
+        // sync publish this computer.
+        Err(err) if fresh && session_has_route(session) => {
+            tracing::warn!("signed in through pjdesk.com; publishing this computer later: {err:#}");
+            session.clone()
+        }
+        Err(err) => return Err(err),
+    };
     if next.email.is_empty() {
         next.email = session.email.clone();
     }
@@ -1464,6 +1513,10 @@ pub fn publish_this_computer(session: &Session, this: &ThisComputer, local: &[Sa
     next.vault_key = session.vault_key;
     next.support = session.support.clone();
     Ok(next)
+}
+
+fn session_has_route(session: &Session) -> bool {
+    !session.address.trim().is_empty() || !session.routes.is_empty()
 }
 
 /// Puts this computer on the account under the support key's label, in Clients.
@@ -2002,6 +2055,49 @@ pub fn clear_installer_network_key() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cloud_session(address: &str) -> Session {
+        Session {
+            email: "ben@example.com".into(),
+            access: "access-token".into(),
+            exp: 0,
+            refresh: "refresh-token".into(),
+            device_id: "dev".into(),
+            address: address.into(),
+            fingerprint: String::new(),
+            standby_address: String::new(),
+            standby_fingerprint: String::new(),
+            lan: Vec::new(),
+            public_ip: String::new(),
+            standby_lan: Vec::new(),
+            standby_public_ip: String::new(),
+            routes: pjdesk_proto::routes::ServerRoutes::default(),
+            computers: Vec::new(),
+            presence: Vec::new(),
+            removed: Vec::new(),
+            vault_key: None,
+            role: "owner".into(),
+            support: None,
+        }
+    }
+
+    #[test]
+    fn a_fresh_computer_reaches_the_server_pjdesk_com_returned() {
+        let mut config = crate::config::Config::default();
+        assert!(config.effective_server().is_empty(), "nothing saved");
+        assert!(borrow_session_route(&mut config, &cloud_session("server.example:21200")));
+        assert_eq!(config.effective_server(), "server.example:21200");
+        assert!(config.network_refresh.is_none() && config.network_access.is_none(), "no tokens copied");
+        let mut empty = crate::config::Config::default();
+        assert!(!borrow_session_route(&mut empty, &cloud_session("")), "an account with no server still says so");
+    }
+
+    #[test]
+    fn no_saved_server_falls_back_to_pjdesk_com() {
+        assert!(!account_answer_is_final(NO_SAVED_SERVER));
+        assert!(session_has_route(&cloud_session("server.example:21200")));
+        assert!(!session_has_route(&cloud_session(" ")));
+    }
 
     #[test]
     fn a_missing_account_copy_is_not_a_final_sign_in_answer() {
