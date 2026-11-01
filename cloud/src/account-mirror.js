@@ -6,6 +6,8 @@
 // matches. A mismatch is 412 with the current copy. The service-wide
 // Ed25519 private key is not included. sign_pkcs8 is a per-network key.
 
+import { networkAad, openKey, sealKey } from "./keyseal.js";
+
 const encoder = new TextEncoder();
 
 function json(body, status = 200, extra = {}) {
@@ -287,9 +289,10 @@ async function ensureSignKey(env, networkId, mirror) {
   )
     .bind(networkId)
     .first();
-  if (existing && (await signingKeyUsable(existing.private_pkcs8))) {
+  const existingPkcs8 = existing ? await openKey(env, existing.private_pkcs8, networkAad(networkId)) : "";
+  if (existing && (await signingKeyUsable(existingPkcs8))) {
     mirror.sign_public = existing.public_key;
-    mirror.sign_pkcs8 = existing.private_pkcs8;
+    mirror.sign_pkcs8 = existingPkcs8;
     return mirror;
   }
   const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
@@ -303,7 +306,7 @@ async function ensureSignKey(env, networkId, mirror) {
        private_pkcs8 = excluded.private_pkcs8,
        created_at = excluded.created_at`,
   )
-    .bind(networkId, pub, pkcs8, now)
+    .bind(networkId, pub, await sealKey(env, pkcs8, networkAad(networkId)), now)
     .run();
   mirror.sign_public = pub;
   mirror.sign_pkcs8 = pkcs8;
@@ -357,6 +360,7 @@ async function loadParts(env, session) {
   const sign = await env.DB.prepare("SELECT public_key, private_pkcs8 FROM network_sign_keys WHERE network_id = ?")
     .bind(id)
     .first();
+  if (sign) sign.private_pkcs8 = await openKey(env, sign.private_pkcs8, networkAad(id));
   return { owner, network, members, memberAccounts, devices, computers, removed, vaults, locks, invites, cloudKey, sign };
 }
 
@@ -491,7 +495,7 @@ async function persist(env, networkId, change) {
          private_pkcs8 = excluded.private_pkcs8,
          created_at = excluded.created_at`,
     )
-      .bind(networkId, pub, pkcs8, now)
+      .bind(networkId, pub, await sealKey(env, pkcs8, networkAad(networkId)), now)
       .run();
   }
 }

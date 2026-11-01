@@ -39,6 +39,7 @@
 //   GET  /download/{client,server,sums}  → the latest release's files
 // Everything else is the static website in ./public.
 
+import { sealPlainRowsOnce } from "./keyseal.js";
 import { effectivePlan, isPlan } from "./plans.js";
 import { route as networkRoute } from "./network.js";
 import { probeQuery, shapeHealth } from "./health.js";
@@ -56,7 +57,10 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     try {
-      if (url.pathname.startsWith("/api/")) return await api(request, env, url, ctx);
+      if (url.pathname.startsWith("/api/")) {
+        sealPlainRowsOnce(env, ctx);
+        return await api(request, env, url, ctx);
+      }
       if (url.pathname.startsWith("/download/")) return await download(env, url);
       return env.ASSETS.fetch(request);
     } catch (e) {

@@ -9,6 +9,7 @@
 // Android client:
 //   PJN1\n{email}\n{network id}\n{sorted fingerprints}\n{device id}\n{exp}\n
 
+import { openKey, sealKey, serviceAad } from "./keyseal.js";
 import {
   JOIN_TTL_SEC,
   SUPPORT_TTL_SEC,
@@ -353,13 +354,16 @@ async function session(request, env) {
 async function signingKey(env) {
   const row = await env.DB.prepare("SELECT public_key, private_pkcs8 FROM network_keys WHERE id = 1").first();
   if (row) {
-    const privateKey = await crypto.subtle.importKey("pkcs8", fromHex(row.private_pkcs8), { name: "Ed25519" }, false, ["sign"]);
+    const pkcs8Hex = await openKey(env, row.private_pkcs8, serviceAad());
+    const privateKey = await crypto.subtle.importKey("pkcs8", fromHex(pkcs8Hex), { name: "Ed25519" }, false, ["sign"]);
     return { publicKey: row.public_key, privateKey };
   }
   const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
   const pub = toHex(await crypto.subtle.exportKey("raw", pair.publicKey));
   const pkcs8 = toHex(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
-  await env.DB.prepare("INSERT INTO network_keys (id, public_key, private_pkcs8) VALUES (1, ?, ?)").bind(pub, pkcs8).run();
+  await env.DB.prepare("INSERT INTO network_keys (id, public_key, private_pkcs8) VALUES (1, ?, ?)")
+    .bind(pub, await sealKey(env, pkcs8, serviceAad()))
+    .run();
   return { publicKey: pub, privateKey: pair.privateKey };
 }
 
