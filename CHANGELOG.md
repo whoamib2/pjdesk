@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.82
+
+- PJDesk Server: a standby reports its own version and re-reads the primary's on every cloud pass (and right after it starts), so each window shows the other server's real version. Since 0.6.57 a standby's report stopped updating.
+- PJDesk Server window: sections no longer say "Locked" for about a minute when opened without administrator rights. The service answers the status pipe from a snapshot it refreshes every second, reads only the end of server.log, and rotates server.log above 20 MB at start; sections say "Loading…" while the service is starting to answer.
+- pjdesk.com: network signing keys in D1 are encrypted with the SIGNING_KEY_SECRET Worker secret (AES-256-GCM, bound to each row). Older plain rows are sealed in the background.
+
 ## 0.6.81
 
 - Settings: "Sync PIN across my computers" (Windows and Android, on by default). Off keeps this install's PIN to itself; turning it back on takes the account's PIN.
