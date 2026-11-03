@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.85
+
+- Fixed: mouse and keyboard stopped responding on the remote computer during a file transfer. Input and control messages no longer wait behind file data (file data is sent in small pieces, paced by the receiver, below video priority).
+- Fixed: "Set a PIN" after signing in on a new computer, the "Update it to 0.6.52" error, and email and password being asked again when already signed in. The account PIN is read (through pjdesk.com when the server has not learned this sign-in yet) and asked for only if the account really has none.
+- Fixed: the app used about 60% CPU while idle with a spinner showing, and "Checking the password…" could spin forever. It now stops after 10 s with "That computer is offline" or "Couldn't reach it, try again". The Saved list toolbar no longer overlaps the list in narrow windows.
+- Black remote screen: the viewer now says why (for example, no monitor or a disconnected Remote Desktop session; an HDMI dummy plug helps) and keeps asking for a fresh picture. An updated host reports a black capture and retries screen capture.
+- Signed-in controllers are no longer limited by "Too many connection attempts" or the per-address session cap, for any computer; the error offers "Clear lockout and try again" for your own computers. Needs an updated server.
+- Received files now go to your Downloads folder (not Downloads\PJDesk). Settings > "Save received files to" picks another folder or resets to Downloads; unfinished transfers stay hidden until they complete.
+
 ## 0.6.84
 
 - Fixed: large uploads (1 GB and up) dropped mid-transfer. The controller judged the connection only by control messages, which queue behind file data, and closed a healthy connection after 4 s. It now counts any arriving packet, and gives up only after 30 s with no control traffic either.
