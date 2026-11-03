@@ -291,6 +291,8 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
     let mut args = args.clone();
     let mut plan_watch: Vec<u8> = Vec::new();
     let mut plan_layout = String::new();
+    let mut black_since: Option<Instant> = None;
+    let mut black_told = false;
 
     while !shared.flow.stopped() {
         let (want_display, want_watch, want_layout) = session.capture_plan();
@@ -466,6 +468,23 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
         }
         if have_picture {
             errors = 0;
+            if luma_is_black(&picture.y) {
+                let since = *black_since.get_or_insert_with(Instant::now);
+                if !black_told && since.elapsed() >= Duration::from_secs(3) {
+                    black_told = true;
+                    let reason = black_capture_reason(capturer.name(), crate::platform::session_id());
+                    warn!("Captured picture is black with {} ({reason})", capturer.name());
+                    session.notify(&format!("The remote screen can't be captured: {reason}"));
+                    // Try Desktop Duplication again soon instead of in 10 s.
+                    next_dxgi_retry = Instant::now();
+                }
+            } else {
+                if black_told {
+                    info!("Captured picture has content again");
+                }
+                black_since = None;
+                black_told = false;
+            }
         }
         // The display can move or change size (resolution change, monitor layout).
         {
@@ -511,6 +530,33 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
         }
     }
     Ok(())
+}
+
+/// True when the luma plane is (almost) all black.
+fn luma_is_black(y: &[u8]) -> bool {
+    if y.is_empty() {
+        return false;
+    }
+    let step = (y.len() / 4096).max(1);
+    let (mut seen, mut bright) = (0usize, 0usize);
+    for v in y.iter().step_by(step) {
+        seen += 1;
+        if *v > 40 {
+            bright += 1;
+        }
+    }
+    bright * 1000 < seen
+}
+
+/// Why a captured picture is black, as far as this process can tell.
+fn black_capture_reason(backend: &str, session: Option<u32>) -> String {
+    if session == Some(0) {
+        return "the capture runs in Windows session 0, which has no desktop.".into();
+    }
+    if backend.contains("GDI") {
+        return "Windows gives only a black picture. No monitor may be connected or turned on, or this computer's Remote Desktop session was disconnected. Connect a monitor or a display emulator (HDMI dummy plug), or sign in at the console.".into();
+    }
+    "the screen is black. The display may be off or asleep, or a full-screen program is drawing black.".into()
 }
 
 fn describe(rect: Rect) -> String {
@@ -571,5 +617,22 @@ mod tests {
         assert!(!flow.wait_for_credit(Duration::from_millis(10)));
         flow.stop();
         assert!(!flow.wait_for_credit(Duration::from_millis(10)));
+    }
+}
+
+#[cfg(test)]
+mod black_capture_tests {
+    use super::*;
+
+    #[test]
+    fn a_black_capture_is_explained() {
+        assert!(luma_is_black(&vec![16u8; 1920 * 1080]));
+        let mut y = vec![16u8; 1920 * 1080];
+        for v in y.iter_mut().step_by(5) {
+            *v = 200;
+        }
+        assert!(!luma_is_black(&y));
+        assert!(black_capture_reason("GDI BitBlt", Some(1)).contains("monitor"));
+        assert!(black_capture_reason("DXGI", Some(0)).contains("session 0"));
     }
 }

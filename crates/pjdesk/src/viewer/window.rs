@@ -57,6 +57,45 @@ struct FrameSlot {
     latest: Mutex<Option<RgbFrame>>,
     /// Pixel buffers the window is done with, reused by the decoder.
     spare: Mutex<Vec<Vec<u32>>>,
+    /// When every picture decoded so far has been black, the time the first
+    /// one arrived. None once a picture with content arrives.
+    black_since: Mutex<Option<Instant>>,
+    /// A picture with content has arrived in this session.
+    saw_content: AtomicBool,
+}
+
+/// True when a decoded picture is (almost) all black. Samples a grid so a
+/// 4K frame costs a few thousand reads.
+pub(crate) fn picture_is_black(pixels: &[u32]) -> bool {
+    if pixels.is_empty() {
+        return false;
+    }
+    let step = (pixels.len() / 4096).max(1);
+    let mut bright = 0usize;
+    let mut seen = 0usize;
+    for px in pixels.iter().step_by(step) {
+        seen += 1;
+        let (r, g, b) = ((px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF);
+        if r.max(g).max(b) > 24 {
+            bright += 1;
+        }
+    }
+    bright * 1000 < seen
+}
+
+/// Seconds a black picture shows before the viewer says so.
+pub(crate) const BLACK_NOTICE_SECS: u64 = 4;
+
+/// The line drawn over a picture that has stayed black.
+pub(crate) fn black_picture_text(host: &str) -> String {
+    format!(
+        "The picture from {host} is black. That computer may have no monitor on, the screen may be off, or its Remote Desktop session was disconnected. Asking for a new picture..."
+    )
+}
+
+/// Keyframe requests while the picture is black: 1 s, 2 s, 4 s ... up to 15 s.
+pub(crate) fn black_retry_delay(tries: u32) -> Duration {
+    Duration::from_secs((1u64 << tries.min(4)).min(15))
 }
 
 #[derive(Default)]
@@ -533,6 +572,8 @@ fn decode_loop(
         }
     };
     let mut waiting_for_keyframe = false;
+    let mut black_tries = 0u32;
+    let mut black_next: Option<Instant> = None;
     let mut last_request = Instant::now() - Duration::from_secs(10);
 
     while let Ok((header, data)) = frames.recv() {
@@ -560,6 +601,21 @@ fn decode_loop(
         match decoder.decode(&data, &mut pixels) {
             Ok(Some((width, height))) => {
                 waiting_for_keyframe = false;
+                if picture_is_black(&pixels) {
+                    let mut since = slot.black_since.lock().unwrap();
+                    let started = *since.get_or_insert_with(Instant::now);
+                    // Keep asking for a fresh picture, backing off, until one has content.
+                    if started.elapsed() >= Duration::from_secs(1) && black_next.is_none_or(|at| Instant::now() >= at) {
+                        let _ = control.send(ControlMsg::RequestKeyframe);
+                        black_next = Some(Instant::now() + black_retry_delay(black_tries));
+                        black_tries = black_tries.saturating_add(1);
+                    }
+                } else {
+                    *slot.black_since.lock().unwrap() = None;
+                    slot.saw_content.store(true, Ordering::Relaxed);
+                    black_tries = 0;
+                    black_next = None;
+                }
                 *slot.latest.lock().unwrap() = Some(RgbFrame { width, height, pixels });
                 stats.frames.fetch_add(1, Ordering::Relaxed);
                 let _ = proxy.send_event(UserEvent::Frame(session));
@@ -910,6 +966,14 @@ impl App {
                 format!("Waiting for the picture from {}", self.host_name)
             };
             toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, origin as f32 + 48.0, &waiting, 0xFF_e7_ec_f5);
+        } else if let Some(since) = *self.slot.black_since.lock().unwrap() {
+            if since.elapsed() >= Duration::from_secs(BLACK_NOTICE_SECS) {
+                let text = match snap.notices.iter().rev().find(|n| n.starts_with("The remote screen can't be captured")) {
+                    Some(reason) => reason.clone(),
+                    None => black_picture_text(&self.host_name),
+                };
+                toolbar::draw_text(&mut buffer, win_w, win_h, 24.0, origin as f32 + 48.0, &text, 0xFF_e7_ec_f5);
+            }
         }
         Self::paint_overlay(&self.toolbar, &self.toast, &mut buffer, win_w, win_h, display, separate, true);
         if nav {
@@ -3766,5 +3830,29 @@ mod tests {
         assert_eq!(android_nav_named(&Key::Named(NamedKey::GoBack)), Some(0));
         assert_eq!(android_nav_named(&Key::Named(NamedKey::GoHome)), Some(1));
         assert_eq!(android_nav_named(&Key::Named(NamedKey::Home)), None);
+    }
+}
+
+#[cfg(test)]
+mod black_tests {
+    use super::*;
+
+    #[test]
+    fn a_black_picture_is_noticed() {
+        assert!(picture_is_black(&vec![0xFF00_0000u32; 1920 * 1080]));
+        assert!(picture_is_black(&vec![0xFF05_0505u32; 640 * 480]));
+        let mut desktop = vec![0xFF00_0000u32; 1920 * 1080];
+        for px in desktop.iter_mut().skip(1000).step_by(7) {
+            *px = 0xFF20_60C0;
+        }
+        assert!(!picture_is_black(&desktop));
+        assert!(!picture_is_black(&[]));
+    }
+
+    #[test]
+    fn black_retries_back_off() {
+        assert_eq!(black_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(black_retry_delay(3), Duration::from_secs(8));
+        assert_eq!(black_retry_delay(30), Duration::from_secs(15));
     }
 }
