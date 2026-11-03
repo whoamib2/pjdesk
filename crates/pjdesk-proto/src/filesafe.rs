@@ -123,6 +123,8 @@ pub fn open_for_receive(root: &Path, name: &str, resume_from: u64) -> Result<(Fi
         .with_context(|| format!("creating {}", partial.display()))?;
     // Refuse if the path changed identity under us (a link swapped in).
     refuse_reparse(&partial)?;
+    // Received files may land straight in Downloads: keep the partial out of sight.
+    set_hidden(&partial, true);
 
     let len = file.metadata()?.len();
     let offset = if resume_from > 0 && resume_from == len && len > 0 {
@@ -161,6 +163,8 @@ pub fn finish_receive(root: &Path, name: &str) -> Result<PathBuf> {
     }
     fs::rename(&partial, &final_path).with_context(|| format!("saving {}", final_path.display()))?;
     refuse_reparse(&final_path)?;
+    // The rename keeps the partial's hidden attribute. The finished file shows.
+    set_hidden(&final_path, false);
     let _ = fs::remove_file(meta_path(&final_path));
     Ok(final_path)
 }
@@ -211,7 +215,10 @@ pub fn note_partial(root: &Path, name: &str, size: u64) -> Result<()> {
     refuse_reparse(&meta)?;
     let started_unix =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    // CREATE_ALWAYS fails on a hidden file, so show it before rewriting.
+    set_hidden(&meta, false);
     fs::write(&meta, serde_json::to_vec(&PartialMeta { size, started_unix })?)?;
+    set_hidden(&meta, true);
     Ok(())
 }
 
@@ -447,5 +454,40 @@ mod tests {
         assert!(open_for_receive(&root, "notes.txt", 0).is_err());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
+    }
+}
+
+/// Sets or clears the Windows hidden attribute. No-op elsewhere (the partial
+/// name already ends in a suffix file managers sort apart).
+pub fn set_hidden(path: &Path, hidden: bool) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetFileAttributesW(name: *const u16) -> u32;
+            fn SetFileAttributesW(name: *const u16, attrs: u32) -> i32;
+        }
+        const HIDDEN: u32 = 0x2;
+        const NORMAL: u32 = 0x80;
+        const INVALID: u32 = u32::MAX;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        unsafe {
+            let attrs = GetFileAttributesW(wide.as_ptr());
+            if attrs == INVALID {
+                return;
+            }
+            let mut next = if hidden { attrs | HIDDEN } else { attrs & !HIDDEN };
+            if next == 0 {
+                next = NORMAL;
+            }
+            if next != attrs {
+                SetFileAttributesW(wide.as_ptr(), next);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, hidden);
     }
 }

@@ -1004,11 +1004,11 @@ pub fn recordings_dir() -> PathBuf {
     base.join("Videos").join("PJDesk")
 }
 
+/// Where files received from the other computer are saved: Settings > Save
+/// received files to, or this user's Downloads folder.
 pub fn downloads_dir() -> PathBuf {
-    let base = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("Downloads").join("PJDesk");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    let configured = crate::config::Config::load().map(|c| c.settings.receive_dir).unwrap_or_default();
+    PathBuf::from(crate::resolve_receive_dir(&configured))
 }
 
 /// File streams go below control (0) and the picture (-1).

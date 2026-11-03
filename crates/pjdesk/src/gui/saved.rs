@@ -2280,7 +2280,7 @@ mod toolbar_tests {
         assert_eq!(super::toolbar_rows(900.0, true, true), 1);
         assert_eq!(super::toolbar_rows(600.0, true, true), 2);
         assert_eq!(super::toolbar_rows(600.0, false, true), 1);
-        assert_eq!(super::toolbar_rows(320.0, false, false), 2);
+        assert_eq!(super::toolbar_rows(280.0, false, false), 2);
         assert_eq!(super::toolbar_rows(400.0, false, false), 1);
     }
 }

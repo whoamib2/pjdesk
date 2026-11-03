@@ -289,26 +289,54 @@ impl Default for HostArgs {
     }
 }
 
-/// Empty, or the word Desktop, is this user's Desktop. The word Downloads is that folder.
+/// Where received files go. Empty, or the word Downloads, is this user's real
+/// Downloads folder (the Known Folder, which may have been moved off the
+/// profile). The word Desktop is the Desktop. Anything else is that folder.
 pub fn resolve_receive_dir(configured: &str) -> String {
     let text = configured.trim();
-    if text.eq_ignore_ascii_case("downloads") {
-        return home_folder("Downloads");
-    }
     if text.eq_ignore_ascii_case("desktop") {
         return home_folder("Desktop");
     }
-    if !text.is_empty() {
+    if !text.is_empty() && !text.eq_ignore_ascii_case("downloads") {
+        let _ = std::fs::create_dir_all(text);
         return text.to_string();
     }
-    // Default: Downloads\PJDesk in the signed-in user's profile.
-    let base = home_folder("Downloads");
-    if base.is_empty() {
-        return base;
-    }
-    let dir = std::path::PathBuf::from(base).join("PJDesk");
+    let dir = downloads_folder();
     let _ = std::fs::create_dir_all(&dir);
     dir.to_string_lossy().into_owned()
+}
+
+/// This user's Downloads folder: FOLDERID_Downloads on Windows, ~/Downloads elsewhere.
+pub fn downloads_folder() -> std::path::PathBuf {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{FOLDERID_Downloads, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+        if let Ok(p) = SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, None) {
+            let text = p.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(p.0 as *const _));
+            if !text.trim().is_empty() {
+                return std::path::PathBuf::from(text);
+            }
+        }
+    }
+    let home = home_folder("Downloads");
+    if home.is_empty() { std::env::temp_dir() } else { std::path::PathBuf::from(home) }
+}
+
+/// The folder for the Files window footer and drop text: "Downloads" for the
+/// default, else the last two parts of the path.
+pub fn receive_dir_label(configured: &str) -> String {
+    let text = configured.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("downloads") {
+        return "Downloads".into();
+    }
+    if text.eq_ignore_ascii_case("desktop") {
+        return "Desktop".into();
+    }
+    let p = std::path::Path::new(text);
+    let parts: Vec<_> = p.components().rev().take(2).collect();
+    parts.iter().rev().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("\\")
 }
 
 fn home_folder(name: &str) -> String {

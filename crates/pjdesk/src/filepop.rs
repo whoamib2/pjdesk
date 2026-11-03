@@ -283,6 +283,38 @@ fn pick(folders: bool) -> Vec<PathBuf> {
     out
 }
 
+/// One folder, for Settings > Save received files to. None when cancelled.
+#[cfg(windows)]
+pub fn pick_save_folder(start: &str) -> Option<PathBuf> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dialog = CoCreateInstance::<_, IFileOpenDialog>(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let opts = dialog.GetOptions().unwrap_or_default();
+        let _ = dialog.SetOptions(opts | FOS_PICKFOLDERS);
+        let title: Vec<u16> = "Save received files to".encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = dialog.SetTitle(windows::core::PCWSTR(title.as_ptr()));
+        if !start.trim().is_empty() {
+            let wide: Vec<u16> = start.encode_utf16().chain(std::iter::once(0)).collect();
+            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(windows::core::PCWSTR(wide.as_ptr()), None) {
+                let _ = dialog.SetFolder(&item);
+            }
+        }
+        dialog.Show(None).ok()?;
+        let item = dialog.GetResult().ok()?;
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let text = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        text.map(PathBuf::from)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn pick_save_folder(_start: &str) -> Option<PathBuf> {
+    None
+}
+
 #[cfg(not(windows))]
 fn pick(_folders: bool) -> Vec<PathBuf> {
     Vec::new()
@@ -430,7 +462,7 @@ pub mod window {
                     ui.set_width(ui.available_width());
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new(if hovering { "Drop to send" } else { "Drag files or folders here" }).size(15.0).strong());
-                        ui.label(RichText::new("They go to the other computer's Downloads\\PJDesk folder").size(11.0).color(MUTED));
+                        ui.label(RichText::new("They go to the other computer's Downloads folder, or the folder chosen in its Settings").size(11.0).color(MUTED));
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             let w = (ui.available_width() - 8.0) / 2.0;
@@ -566,8 +598,8 @@ pub mod window {
     }
 
     fn short_dir(dir: &str) -> String {
-        if dir.is_empty() {
-            return "Downloads\\PJDesk".into();
+        if dir.is_empty() || std::path::Path::new(dir) == crate::downloads_folder() {
+            return "Downloads".into();
         }
         let p = std::path::Path::new(dir);
         let parts: Vec<_> = p.components().rev().take(2).collect();
@@ -659,7 +691,7 @@ mod shots {
         app.state = State {
             peer: "Ben (OMAS-DESKTOP)".into(),
             allowed: true,
-            save_dir: "C:\\Users\\Ben\\Downloads\\PJDesk".into(),
+            save_dir: "C:\\Users\\Ben\\Downloads".into(),
             items: vec![
                 it(1, "Quarterly report.xlsx", 2_400_000, 2_400_000, false, "done"),
                 it(2, "Photos\\IMG_2041.jpg", 5_200_000, 5_200_000, false, "done"),

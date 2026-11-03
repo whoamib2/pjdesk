@@ -659,11 +659,22 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
 
     ui.add_space(12.0);
     widgets::heading(ui, "INCOMING FILES");
-    widgets::field_label(ui, "Folder for files people send you");
-    widgets::text_field(ui, &mut d.receive_dir, "Empty uses Downloads\\PJDesk on this computer", false);
+    widgets::field_label(ui, "Save received files to");
+    let shown = crate::resolve_receive_dir(&d.receive_dir);
+    ui.label(egui::RichText::new(&shown).monospace().size(12.0));
+    ui.horizontal(|ui| {
+        if ui.button("Choose folder…").clicked() {
+            if let Some(dir) = crate::filepop::pick_save_folder(&shown) {
+                d.receive_dir = dir.to_string_lossy().into_owned();
+            }
+        }
+        if !d.receive_dir.trim().is_empty() && ui.button("Reset to Downloads").clicked() {
+            d.receive_dir.clear();
+        }
+    });
     ui.label(widgets::muted(
         ui,
-        "Files dropped on a remote session are saved here. Leave this empty to use Downloads\\PJDesk. Type Desktop or Downloads to use those folders. Files are never executed.",
+        "Files from a remote session, the Files window and file drops, in both directions, are saved here. Unfinished transfers stay hidden in this folder until they finish or are cleaned up. Files are never executed.",
     ));
 
     ui.add_space(12.0);
