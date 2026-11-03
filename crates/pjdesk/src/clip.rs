@@ -1,5 +1,5 @@
 //! Clipboard text and PNG images. View-only sessions never call this.
-//! File lists (CF_HDROP) are not synced.
+//! File lists (CF_HDROP) are not synced; files go through file transfer.
 
 use std::io::Cursor;
 
@@ -63,4 +63,100 @@ pub fn decode_png(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
         _ => return None,
     };
     Some((info.width as usize, info.height as usize, rgba))
+}
+
+/// Windows' clipboard change counter; `None` where there is none.
+pub fn sequence() -> Option<u32> {
+    #[cfg(windows)]
+    {
+        let n = unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+        (n != 0).then_some(n)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// A short fingerprint of image pixels, used to avoid sending an image back.
+pub fn image_hash(width: usize, height: usize, rgba: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (width, height).hash(&mut h);
+    rgba.hash(&mut h);
+    h.finish()
+}
+
+/// Decides when clipboard text on one side should go to the other side.
+///
+/// The first read sets a baseline, so text that was already on the clipboard
+/// when the session opened is not sent. Before this type, a failed or empty
+/// first read left no baseline, and the next real copy became the baseline
+/// and was silently dropped.
+#[derive(Debug, Default, Clone)]
+pub struct TextWatch {
+    primed: bool,
+    last: Option<String>,
+}
+
+impl TextWatch {
+    /// Feeds one clipboard read (`None` when there was no text or it could
+    /// not be read). Returns the text to send, if any.
+    pub fn observe(&mut self, read: Option<String>) -> Option<String> {
+        if !self.primed {
+            self.primed = true;
+            self.last = read;
+            return None;
+        }
+        let text = read?;
+        if text.is_empty() || self.last.as_deref() == Some(text.as_str()) {
+            return None;
+        }
+        self.last = Some(text.clone());
+        Some(text)
+    }
+
+    /// Records text that the other side put here, so it is not sent back.
+    pub fn remember(&mut self, text: &str) {
+        self.primed = true;
+        self.last = Some(text.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TextWatch;
+
+    #[test]
+    fn a_copy_after_an_unreadable_first_read_is_sent() {
+        let mut w = TextWatch::default();
+        assert_eq!(w.observe(None), None);
+        assert_eq!(w.observe(Some("copied on the host".into())).as_deref(), Some("copied on the host"));
+    }
+
+    #[test]
+    fn text_present_at_the_start_is_not_sent_but_the_next_copy_is() {
+        let mut w = TextWatch::default();
+        assert_eq!(w.observe(Some("old".into())), None);
+        assert_eq!(w.observe(Some("old".into())), None);
+        assert_eq!(w.observe(Some("new".into())).as_deref(), Some("new"));
+        assert_eq!(w.observe(Some("new".into())), None);
+    }
+
+    #[test]
+    fn text_from_the_other_side_is_not_echoed() {
+        let mut w = TextWatch::default();
+        w.observe(Some("a".into()));
+        w.remember("from the controller");
+        assert_eq!(w.observe(Some("from the controller".into())), None);
+        assert_eq!(w.observe(None), None);
+        assert_eq!(w.observe(Some("b".into())).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn remembering_before_the_first_read_primes_the_watch() {
+        let mut w = TextWatch::default();
+        w.remember("x");
+        assert_eq!(w.observe(Some("y".into())).as_deref(), Some("y"));
+    }
 }

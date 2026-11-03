@@ -85,8 +85,11 @@ pub struct Session {
     privacy: AtomicBool,
     blocked: AtomicBool,
     audio_stop: Arc<AtomicBool>,
-    clip_text: Mutex<Option<String>>,
+    clip_text: Mutex<crate::clip::TextWatch>,
     clip_tick: AtomicU32,
+    /// Clipboard sequence number and image fingerprint last seen or sent.
+    clip_seq: Mutex<Option<u32>>,
+    clip_image: Mutex<Option<u64>>,
     /// Hello asked for display layout. Older controllers leave this false, so
     /// they never receive the new host messages.
     layout_aware: AtomicBool,
@@ -145,8 +148,10 @@ impl Session {
             privacy: AtomicBool::new(false),
             blocked: AtomicBool::new(false),
             audio_stop: Arc::new(AtomicBool::new(true)),
-            clip_text: Mutex::new(None),
+            clip_text: Mutex::new(crate::clip::TextWatch::default()),
             clip_tick: AtomicU32::new(0),
+            clip_seq: Mutex::new(None),
+            clip_image: Mutex::new(None),
             layout_aware: AtomicBool::new(false),
             layout_key: Mutex::new(String::new()),
             platform_sent: AtomicBool::new(false),
@@ -507,7 +512,8 @@ impl Session {
                 let Ok(text) = String::from_utf8(clip.bytes) else {
                     return self.deny(send, "clipboard", "clipboard text was not UTF-8").await;
                 };
-                *self.clip_text.lock().unwrap() = Some(text.clone());
+                info!("clipboard: received {} bytes of text from the controller", text.len());
+                self.clip_text.lock().unwrap().remember(&text);
                 crate::clip::set_text(&text);
             }
             ClipKind::ImagePng => {
@@ -518,6 +524,7 @@ impl Session {
                     return self.deny(send, "clipboard", "clipboard image is too large").await;
                 }
                 if let Some((w, h, rgba)) = crate::clip::decode_png(&clip.bytes) {
+                    *self.clip_image.lock().unwrap() = Some(crate::clip::image_hash(w, h, &rgba));
                     crate::clip::set_image(w, h, &rgba);
                 }
             }
@@ -735,27 +742,73 @@ impl Session {
         if n % 5 != 0 {
             return Ok(());
         }
-        let Some(text) = crate::clip::get_text() else { return Ok(()) };
-        if text.len() > MAX_CLIP_TEXT {
-            return Ok(());
-        }
-        // The guard must not live across the await below: the session task is spawned.
-        let send_it = {
-            let mut seen = self.clip_text.lock().unwrap();
-            let first = seen.is_none();
-            if seen.as_ref() == Some(&text) {
-                false
-            } else {
-                *seen = Some(text.clone());
-                !first && !text.is_empty()
-            }
+        // Windows bumps this on every copy; where it is known and unchanged,
+        // skip opening the clipboard at all.
+        let seq = crate::clip::sequence();
+        let changed = {
+            let mut last = self.clip_seq.lock().unwrap();
+            let changed = seq.is_none() || *last != seq;
+            *last = seq;
+            changed
         };
-        if !send_it {
+        let first = n == 0;
+        if !changed && !first {
             return Ok(());
         }
-        let byte_len = text.len() as u32;
-        write_msg(send, &HostMsg::Clipboard(Clipboard { kind: ClipKind::Text, bytes: text.into_bytes(), byte_len }))
-            .await
+        let read = crate::clip::get_text().filter(|t| t.len() <= MAX_CLIP_TEXT);
+        let has_text = read.as_deref().is_some_and(|t| !t.is_empty());
+        // The guard must not live across the await below: the session task is spawned.
+        let text = self.clip_text.lock().unwrap().observe(read);
+        if let Some(text) = text {
+            info!("clipboard: sending {} bytes of text to the controller", text.len());
+            let byte_len = text.len() as u32;
+            return write_msg(send, &HostMsg::Clipboard(Clipboard { kind: ClipKind::Text, bytes: text.into_bytes(), byte_len }))
+                .await;
+        }
+        if first || has_text || seq.is_none() {
+            // Images only follow a real copy, which needs the sequence number.
+            if first {
+                if let Some((w, h, rgba)) = crate::clip::get_image() {
+                    *self.clip_image.lock().unwrap() = Some(crate::clip::image_hash(w, h, &rgba));
+                }
+            }
+            return Ok(());
+        }
+        self.send_clip_image(send).await
+    }
+
+    /// Sends a newly copied host image to the controller (inline when small,
+    /// otherwise on a side stream the controller already reads).
+    async fn send_clip_image(&self, send: &mut SendStream) -> Result<()> {
+        let Some((w, h, rgba)) = crate::clip::get_image() else { return Ok(()) };
+        let hash = crate::clip::image_hash(w, h, &rgba);
+        {
+            let mut last = self.clip_image.lock().unwrap();
+            if *last == Some(hash) {
+                return Ok(());
+            }
+            *last = Some(hash);
+        }
+        let Some(png) = crate::clip::encode_png(w as u32, h as u32, &rgba) else { return Ok(()) };
+        if png.len() > MAX_CLIP_IMAGE as usize {
+            info!("clipboard: host image is {} bytes, over the limit; not sent", png.len());
+            return Ok(());
+        }
+        info!("clipboard: sending a {w}x{h} image ({} bytes) to the controller", png.len());
+        if png.len() <= 256 * 1024 {
+            let byte_len = png.len() as u32;
+            return write_msg(send, &HostMsg::Clipboard(Clipboard { kind: ClipKind::ImagePng, bytes: png, byte_len })).await;
+        }
+        let conn = self.conn.clone();
+        tokio::spawn(async move {
+            if let Ok(mut uni) = conn.open_uni().await {
+                let _ = write_side_header(&mut uni, CLIP_MAGIC, &SideHeader { id: 0, offset: 0, a: w as u32, b: h as u32 }).await;
+                let _ = write_side_chunk(&mut uni, &png).await;
+                let _ = write_side_chunk(&mut uni, &[]).await;
+                let _ = uni.finish();
+            }
+        });
+        Ok(())
     }
 
     async fn queue_send(&self, send: &mut SendStream, path: PathBuf) -> Result<()> {
@@ -927,6 +980,7 @@ impl Session {
         }
         let _ = header;
         if let Some((w, h, rgba)) = crate::clip::decode_png(&bytes) {
+            *self.clip_image.lock().unwrap() = Some(crate::clip::image_hash(w, h, &rgba));
             crate::clip::set_image(w, h, &rgba);
         }
         Ok(())

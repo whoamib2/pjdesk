@@ -22,7 +22,7 @@ use pjdesk_proto::quality;
 use quinn::Connection;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// The viewer window runs on the winit thread, which is not inside the Tokio
 /// runtime. `tokio::spawn` from that thread panics ("there is no reactor
@@ -107,7 +107,7 @@ pub struct Live {
     paths: HashMap<u64, PathBuf>,
     wanted: HashSet<String>,
     next_id: u64,
-    clip_text: Option<String>,
+    clip_text: clip::TextWatch,
 }
 
 impl Live {
@@ -150,7 +150,7 @@ impl Live {
             paths: HashMap::new(),
             wanted: HashSet::new(),
             next_id: 1,
-            clip_text: None,
+            clip_text: clip::TextWatch::default(),
         }
     }
 
@@ -160,7 +160,7 @@ impl Live {
 
     /// Stores text we just placed on the clipboard so the watcher does not send it back.
     pub fn remember_clip(&mut self, text: &str) {
-        self.clip_text = Some(text.to_string());
+        self.clip_text.remember(text);
     }
 
     /// A copy of the fields the panel draws. Taken so the window can drop the lock.
@@ -203,7 +203,7 @@ impl Live {
             paths: HashMap::new(),
             wanted: HashSet::new(),
             next_id: 0,
-            clip_text: None,
+            clip_text: clip::TextWatch::default(),
         }
     }
 
@@ -664,7 +664,8 @@ fn apply_clip(g: &mut Live, clip: Clipboard) {
     match clip.kind {
         ClipKind::Text => {
             if let Ok(text) = String::from_utf8(clip.bytes) {
-                g.clip_text = Some(text.clone());
+                info!("clipboard: received {} bytes of text from the host", text.len());
+                g.clip_text.remember(&text);
                 clip::set_text(&text);
             }
         }
@@ -1219,25 +1220,19 @@ async fn clip_watch(live: Arc<Mutex<Live>>, control: mpsc::UnboundedSender<Contr
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick.tick().await;
-        let (allowed, seen) = {
+        let allowed = {
             let g = live.lock().unwrap();
             if g.closed.is_some() || g.restart {
                 return;
             }
-            (g.allowed(perms::CLIPBOARD), g.clip_text.clone())
+            g.allowed(perms::CLIPBOARD)
         };
         if !allowed {
             continue;
         }
-        let Some(text) = clip::get_text() else { continue };
-        if text.len() > MAX_CLIP_TEXT || seen.as_ref() == Some(&text) {
-            continue;
-        }
-        let first = seen.is_none();
-        live.lock().unwrap().clip_text = Some(text.clone());
-        if first || text.is_empty() {
-            continue;
-        }
+        let read = clip::get_text().filter(|t| t.len() <= MAX_CLIP_TEXT);
+        let Some(text) = live.lock().unwrap().clip_text.observe(read) else { continue };
+        info!("clipboard: sending {} bytes of text to the host", text.len());
         let _ = control.send(ControlMsg::Clipboard(Clipboard {
             kind: ClipKind::Text,
             byte_len: text.len() as u32,
