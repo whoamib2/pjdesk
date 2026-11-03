@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.84
+
+- Fixed: large uploads (1 GB and up) dropped mid-transfer. The controller judged the connection only by control messages, which queue behind file data, and closed a healthy connection after 4 s. It now counts any arriving packet, and gives up only after 30 s with no control traffic either.
+- Fixed: the automatic reconnect after a drop failed with "Incorrect password" and then "too many connection attempts". The host now keeps the support password for 2 minutes after a session ends, a reconnect from an open window no longer quits or forgets the saved password, and the server counts only open sessions toward its per-IP limit.
+- Transfers resume in both directions (Send and Get files). The receiver keeps the partial file and continues from where it stopped after the reconnect, and the whole file is checked with SHA-256 (older versions still work, without the check). Failed rows show Resume or Retry; week-old partial files are removed.
+- New "Clear lockout" on the host (window, tray, and Android) resets the wrong-password lockout and, with a 0.6.84 server, the connection-attempt limit for that host. Computers signed in to the server owner's account are exempt from the connection-attempt limits.
+
 ## 0.6.83
 
 - Fixed: arrow keys typed numbers on the remote computer (Left as 4, Right as 6). Home, End, Page Up/Down, Insert and Delete typed numpad digits too, and right Ctrl, right Alt (AltGr), numpad Enter and numpad / did nothing. The host mistook every extended key for a numpad digit. Applies to the Windows and Android controllers; update the computer being controlled.
