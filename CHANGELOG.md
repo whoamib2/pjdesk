@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.83
+
+- Fixed: arrow keys typed numbers on the remote computer (Left as 4, Right as 6). Home, End, Page Up/Down, Insert and Delete typed numpad digits too, and right Ctrl, right Alt (AltGr), numpad Enter and numpad / did nothing. The host mistook every extended key for a numpad digit. Applies to the Windows and Android controllers; update the computer being controlled.
+- Fixed: clipboard text copied on the remote computer did not reach this one. When the remote clipboard was empty or held an image at the start of a session, the next copy was dropped. Both directions now sync from the first copy.
+- Images copied on the remote computer now come back to the controller's clipboard too (up to 4 MB). Clipboard transfers are logged by size only, never their content.
+
 ## 0.6.82
 
 - PJDesk Server: a standby reports its own version and re-reads the primary's on every cloud pass (and right after it starts), so each window shows the other server's real version. Since 0.6.57 a standby's report stopped updating.
