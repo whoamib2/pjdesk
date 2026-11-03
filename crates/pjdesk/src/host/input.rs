@@ -112,7 +112,7 @@ impl InputInjector {
 mod platform {
     use std::sync::OnceLock;
 
-    use pjdesk_proto::peer::{MouseButton, KEY_NUMPAD_DIGIT};
+    use pjdesk_proto::peer::MouseButton;
     use windows::core::{s, w};
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -238,7 +238,9 @@ mod platform {
     /// Injects one key event; true if Windows accepted it.
     pub fn key(code: u16, down: bool) -> bool {
         let up = if down { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP };
-        let input = if code & KEY_NUMPAD_DIGIT != 0 {
+        // Not `code & KEY_NUMPAD_DIGIT`: every extended key (0xE0__) has bit 15
+        // set too, which turned Left/Right into numpad 4/6 on the host.
+        let input = if pjdesk_proto::peer::is_numpad_digit(code) {
             // The controller typed a digit on its numpad (NumLock on there).
             // Send the digit itself so it doesn't depend on the host's NumLock.
             let scan = (code & 0xFF) as u8;

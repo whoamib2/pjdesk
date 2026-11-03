@@ -606,7 +606,32 @@ pub enum InputEvent {
 }
 
 /// Flag on [`InputEvent::Key`] scan codes: a numpad key meant as a digit.
+/// It sits in the high byte, where extended keys carry 0xE0, so test it with
+/// [`is_numpad_digit`]; `scan & KEY_NUMPAD_DIGIT` is also true for 0xE0__.
 pub const KEY_NUMPAD_DIGIT: u16 = 0x8000;
+
+/// True only for a numpad digit (high byte exactly 0x80). Extended keys such
+/// as Left (0xE04B) and Pause (0xE11D) are not, although bit 15 is set in them.
+pub fn is_numpad_digit(scan: u16) -> bool {
+    scan & 0xFF00 == KEY_NUMPAD_DIGIT
+}
+
+#[cfg(test)]
+mod numpad_flag_tests {
+    use super::*;
+
+    #[test]
+    fn extended_keys_are_not_numpad_digits() {
+        for scan in [0xE048u16, 0xE04B, 0xE04D, 0xE050, 0xE047, 0xE04F, 0xE049, 0xE051, 0xE052, 0xE053, 0xE01D, 0xE038, 0xE01C, 0xE035, 0xE05B, 0xE037, 0xE11D] {
+            assert!(!is_numpad_digit(scan), "{scan:#06x}");
+        }
+        for scan in [0x4Bu16, 0x4D, 0x1C, 0x1D, 0x38] {
+            assert!(!is_numpad_digit(scan), "{scan:#06x}");
+        }
+        assert!(is_numpad_digit(KEY_NUMPAD_DIGIT | 0x4B));
+        assert!(is_numpad_digit(KEY_NUMPAD_DIGIT | 0x52));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {
