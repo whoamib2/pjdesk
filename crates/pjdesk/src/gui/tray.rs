@@ -10,6 +10,8 @@ pub enum Action {
     Show,
     Update,
     Revoke,
+    /// 0.6.84. Forget wrong-password locks and connect throttles for this computer.
+    ClearLockout,
     /// 0.6.66. Show the PIN screen now, or offer to set a PIN.
     Lock,
     Quit,
@@ -26,6 +28,7 @@ pub fn gui_actions() -> Vec<Action> {
         match token.as_str() {
             "update" => out.push(Action::Update),
             "revoke" => out.push(Action::Revoke),
+            "clear_lockout" => out.push(Action::ClearLockout),
             "lock" => out.push(Action::Lock),
             _ => {}
         }
@@ -337,11 +340,13 @@ mod imp {
         let lock = MenuItem::new("Lock now", true, None);
         let update = MenuItem::new("Check for updates now", true, None);
         let revoke = MenuItem::new("Revoke access", true, None);
+        let unlock = MenuItem::new("Clear lockout", true, None);
         let quit = MenuItem::new("Quit PJDesk", true, None);
         menu.append(&show).ok()?;
         menu.append(&lock).ok()?;
         menu.append(&update).ok()?;
         menu.append(&revoke).ok()?;
+        menu.append(&unlock).ok()?;
         menu.append(&quit).ok()?;
         let show_id = show.id().0.clone();
         let lock_now = lock.id().0.clone();
@@ -352,6 +357,7 @@ mod imp {
         let show_now = show_id.clone();
         let update_now = update_id.clone();
         let revoke_now = revoke_id.clone();
+        let unlock_now = unlock.id().0.clone();
         let quit_now = quit_id.clone();
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
             if e.id.0 == show_now {
@@ -371,6 +377,18 @@ mod imp {
             if e.id.0 == revoke_now {
                 super::remember_action("revoke");
                 ask_open("Revoke access");
+                return;
+            }
+            if e.id.0 == unlock_now {
+                // The service host picks this file up even with no window open;
+                // a window hosting in-process takes the action below.
+                let path = crate::syspaths::service_dir().join("lockout.clear");
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(path, b"1\n");
+                tracing::info!("Tray click: Clear lockout.");
+                super::remember_action("clear_lockout");
                 return;
             }
             if e.id.0 == quit_now {

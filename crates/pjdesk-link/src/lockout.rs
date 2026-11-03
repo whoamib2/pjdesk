@@ -71,6 +71,11 @@ impl Lockout {
         }
     }
 
+    /// The person at this computer cleared every lock and count ("Clear lockout").
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
     /// A correct password clears this source. Other sources, and a global lock, stay.
     pub fn succeed(&mut self, source: &str) {
         self.hits.retain(|(s, _)| s != source);
@@ -155,6 +160,19 @@ pub fn source_key(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clear_lifts_a_source_lock_and_a_global_lock() {
+        let mut l = super::Lockout::default();
+        let now = std::time::Instant::now();
+        for i in 0..(super::GLOBAL + super::PER_SOURCE) {
+            l.fail(if i % 2 == 0 { "a" } else { &"b" }, now);
+        }
+        assert!(l.check("a", now).locked);
+        l.clear();
+        assert!(!l.check("a", now).locked);
+        assert!(!l.check("c", now).locked);
+    }
+
     use super::*;
     use std::net::Ipv4Addr;
 

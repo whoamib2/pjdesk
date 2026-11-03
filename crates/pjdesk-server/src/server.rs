@@ -997,13 +997,40 @@ fn offline_message(target: &str) -> String {
     format!("device {} is not online", format_id(target))
 }
 
+/// Sessions from `ip` whose controller is still connected. A controller that
+/// gave up (a wrong password, a closed window) no longer holds a place, even
+/// though its entry lingers until [`SESSION_TTL`] for the relay's sake.
+fn open_sessions_from(st: &State, ip: IpAddr) -> usize {
+    st.sessions.values().filter(|s| s.controller_ip == ip && !s.controller_tx.is_closed()).count()
+}
+
+/// The host `host_id` asked to clear connection throttles aimed at it.
+/// Returns (addresses cleared, sessions dropped).
+fn clear_connect_limits(st: &mut State, host_id: &str) -> (usize, usize) {
+    let ips: HashSet<IpAddr> = st.sessions.values().filter(|s| s.host_id == host_id).map(|s| s.controller_ip).collect();
+    for ip in &ips {
+        st.limiter.forget(*ip, "connect");
+    }
+    let stale: Vec<SessionId> = st
+        .sessions
+        .iter()
+        .filter(|(_, s)| s.host_id == host_id && (!s.accepted || s.controller_tx.is_closed()) && !s.relayed)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in &stale {
+        st.sessions.remove(id);
+    }
+    (ips.len(), stale.len())
+}
+
 fn send_error(tx: &mpsc::UnboundedSender<ServerMsg>, code: ErrorCode, message: impl Into<String>) {
     let _ = tx.send(ServerMsg::Error { code, message: message.into() });
 }
 
 /// Opens a session when `target` is in the live table. The caller has already
 /// checked the network-access gate and the connect rate limit.
-fn start_session(st: &mut State, ctrl: &ControllerSide, target: &str, controller_name: &str) {
+/// `exempt` skips the per-address cap (the server owner's own signed-in computers).
+fn start_session(st: &mut State, ctrl: &ControllerSide, target: &str, controller_name: &str, exempt: bool) {
     let Some(host) = st.online.get(target) else {
         send_error(&ctrl.tx, ErrorCode::HostOffline, offline_message(target));
         return;
@@ -1012,8 +1039,8 @@ fn start_session(st: &mut State, ctrl: &ControllerSide, target: &str, controller
         send_error(&ctrl.tx, ErrorCode::BadRequest, "a device cannot connect to itself on the same connection");
         return;
     }
-    let from_here = st.sessions.values().filter(|s| s.controller_ip == ctrl.addr.ip()).count();
-    if from_here >= MAX_SESSIONS_PER_IP || st.sessions.len() >= MAX_SESSIONS {
+    let from_here = open_sessions_from(st, ctrl.addr.ip());
+    if (!exempt && from_here >= MAX_SESSIONS_PER_IP) || st.sessions.len() >= MAX_SESSIONS {
         send_error(&ctrl.tx, ErrorCode::RateLimited, "too many connection attempts, wait a minute");
         return;
     }
@@ -1312,7 +1339,10 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                 return;
             }
             // Throttles ID scanning and password guessing from one address.
-            if !st.limiter.allow(conn.addr.ip(), "connect", 30) {
+            // The server owner's own signed-in computers are not throttled: the
+            // token is verified, and the host's wrong-password lockout still applies.
+            let exempt = owner_token(st, conn);
+            if !exempt && !st.limiter.allow(conn.addr.ip(), "connect", 30) {
                 conn.error(ErrorCode::RateLimited, "too many connection attempts, wait a minute");
                 return;
             }
@@ -1320,7 +1350,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             let controller_name: String = controller_name.chars().take(64).collect();
             let side = ControllerSide { conn_id: conn.id, addr: conn.addr, tx: conn.tx.clone() };
             if st.online.contains_key(&target) {
-                start_session(st, &side, &target, &controller_name);
+                start_session(st, &side, &target, &controller_name, exempt);
                 return;
             }
             let seen = st.registry.last_seen_of(&target);
@@ -1350,7 +1380,7 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
                                 "Connect to {} is going ahead; it registered during the wait",
                                 format_id(&target_for_wait)
                             );
-                            start_session(&mut guard, &side, &target_for_wait, &name_for_wait);
+                            start_session(&mut guard, &side, &target_for_wait, &name_for_wait, exempt);
                             return;
                         }
                     }
@@ -1458,6 +1488,17 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
 
         // Handled before the burst limit in the connection loop.
         ClientMsg::RelayData { .. } => {}
+
+        ClientMsg::ClearConnectLimits => {
+            // Only a registered host (it proved its ID with its secret), and
+            // only for attempts aimed at that host.
+            let Some(id) = conn.host_id.clone() else {
+                conn.error(ErrorCode::Unauthorized, "only a registered computer can clear its lockout");
+                return;
+            };
+            let (ips, dropped) = clear_connect_limits(st, &id);
+            info!("{} cleared its connection lockout ({ips} addresses, {dropped} unopened sessions)", format_id(&id));
+        }
 
         ClientMsg::Logout { token } => st.accounts.logout(&token),
 
@@ -2381,6 +2422,11 @@ impl RateLimiter {
         entry.1 <= per_minute
     }
 
+    /// Forgets the count of `kind` events from `ip`.
+    pub fn forget(&mut self, ip: IpAddr, kind: &'static str) {
+        self.windows.remove(&(ip, kind));
+    }
+
     pub fn sweep(&mut self) {
         self.windows.retain(|_, (start, _)| start.elapsed() < Duration::from_secs(60));
     }
@@ -2439,6 +2485,59 @@ mod tests {
             close: Arc::new(Notify::new()),
         };
         (conn, rx)
+    }
+
+    #[test]
+    fn given_up_attempts_do_not_hold_places_and_the_host_can_clear_the_throttle() {
+        let dir = std::env::temp_dir().join(format!("pjdesk-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = state_in(&dir);
+        let (mut host, mut host_rx) = conn_pair();
+        host.id = 100;
+        host.addr = "198.51.100.7:50000".parse().unwrap();
+        handle_message(
+            &state,
+            &mut host,
+            ClientMsg::Register {
+                proto: 3,
+                device_id: Some("222333444".into()),
+                device_secret: [3u8; 32],
+                hostname: "CHIP20".into(),
+                app_version: "0.6.84".into(),
+            },
+        );
+        assert!(std::iter::from_fn(|| host_rx.try_recv().ok()).any(|m| matches!(m, ServerMsg::Registered { .. })));
+        let connect = |n: u64| {
+            let (mut c, rx) = conn_pair();
+            c.id = 1000 + n;
+            handle_message(&state, &mut c, ClientMsg::Connect { proto: 3, target_id: "222333444".into(), controller_name: "Lenovo".into() });
+            rx
+        };
+        let refused = |rx: &mut mpsc::UnboundedReceiver<ServerMsg>| {
+            std::iter::from_fn(|| rx.try_recv().ok()).any(|m| matches!(m, ServerMsg::Error { code: ErrorCode::RateLimited, .. }))
+        };
+        // Eight attempts that are still waiting hold all the places.
+        let mut held: Vec<_> = (0..MAX_SESSIONS_PER_IP as u64).map(connect).collect();
+        assert!(held.iter_mut().all(|rx| !refused(rx)));
+        assert!(refused(&mut connect(50)));
+        // Those viewers gave up (wrong password, window closed): the places free up.
+        held.clear();
+        assert!(!refused(&mut connect(51)));
+        // Past the per-minute throttle, then the host clears it.
+        let mut n = 60;
+        while !refused(&mut connect(n)) {
+            n += 1;
+            assert!(n < 200);
+        }
+        handle_message(&state, &mut host, ClientMsg::ClearConnectLimits);
+        assert!(!refused(&mut connect(300)));
+        // A controller (no registered ID) cannot clear anything.
+        let (mut stranger, mut srx) = conn_pair();
+        stranger.id = 400;
+        handle_message(&state, &mut stranger, ClientMsg::ClearConnectLimits);
+        assert!(std::iter::from_fn(|| srx.try_recv().ok()).any(|m| matches!(m, ServerMsg::Error { code: ErrorCode::Unauthorized, .. })));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

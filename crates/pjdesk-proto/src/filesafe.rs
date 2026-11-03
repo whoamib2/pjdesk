@@ -11,6 +11,8 @@ use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+/// The end-of-transfer check uses SHA-256; callers stream bytes through this.
+pub use sha2::{Digest, Sha256};
 
 /// Largest single transfer accepted (8 GiB).
 pub const MAX_TRANSFER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -70,7 +72,7 @@ fn is_reserved(stem: &str) -> bool {
 /// `root/name` after checking the name. Does not touch the filesystem.
 pub fn join_under(root: &Path, name: &str) -> Result<PathBuf> {
     let name = sanitize_name(name)?;
-    if name.ends_with(PARTIAL_SUFFIX) {
+    if name.ends_with(PARTIAL_SUFFIX) || name.ends_with(META_SUFFIX) {
         bail!("that name is reserved for an unfinished transfer");
     }
     Ok(root.join(name))
@@ -159,7 +161,137 @@ pub fn finish_receive(root: &Path, name: &str) -> Result<PathBuf> {
     }
     fs::rename(&partial, &final_path).with_context(|| format!("saving {}", final_path.display()))?;
     refuse_reparse(&final_path)?;
+    let _ = fs::remove_file(meta_path(&final_path));
     Ok(final_path)
+}
+
+/// `SideHeader.a` bit on a file stream: a SHA-256 of the whole file (32 bytes)
+/// follows the end chunk. Older receivers stop reading at the end chunk and
+/// never see it; older senders leave the bit clear and nothing is checked.
+pub const HASH_TRAILER: u32 = 1;
+/// Sidecar next to a partial file, recording what it is a part of.
+pub const META_SUFFIX: &str = ".pjpart.meta";
+/// Partial files untouched for this long are removed.
+pub const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+struct PartialMeta {
+    size: u64,
+    #[serde(default)]
+    started_unix: u64,
+}
+
+pub fn meta_path(final_path: &Path) -> PathBuf {
+    let mut name = final_path.file_name().map(|s| s.to_os_string()).unwrap_or_default();
+    name.push(META_SUFFIX);
+    final_path.with_file_name(name)
+}
+
+/// Bytes of `name` this side can continue from, for a file of `size` bytes.
+/// 0 when there is no partial, it is longer than the file, or its sidecar
+/// says it belongs to a file of a different size. A partial without a sidecar
+/// (left by an older version) is trusted on length alone; the end-of-transfer
+/// hash still catches a mismatch when both sides support it.
+pub fn resumable_len(root: &Path, name: &str, size: u64) -> u64 {
+    let have = partial_len(root, name).unwrap_or(0);
+    if have == 0 || have > size {
+        return 0;
+    }
+    let Ok(final_path) = join_under(root, name) else { return 0 };
+    match fs::read(meta_path(&final_path)).ok().and_then(|b| serde_json::from_slice::<PartialMeta>(&b).ok()) {
+        Some(meta) if meta.size != size => 0,
+        _ => have,
+    }
+}
+
+/// Records that the partial of `name` is part of a `size`-byte file.
+pub fn note_partial(root: &Path, name: &str, size: u64) -> Result<()> {
+    let final_path = join_under(root, name)?;
+    let meta = meta_path(&final_path);
+    refuse_reparse(&meta)?;
+    let started_unix =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    fs::write(&meta, serde_json::to_vec(&PartialMeta { size, started_unix })?)?;
+    Ok(())
+}
+
+/// SHA-256 state over the first `len` bytes of `path`.
+pub fn hash_prefix(path: &Path, len: u64) -> Result<sha2::Sha256> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut hasher = sha2::Sha256::new();
+    let mut file = File::open(path)?.take(len);
+    let mut buf = vec![0u8; 1 << 20];
+    let mut done = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        done += n as u64;
+    }
+    if done != len {
+        bail!("{} is shorter than expected", path.display());
+    }
+    Ok(hasher)
+}
+
+/// Like [`finish_receive`], first checking the whole partial file against the
+/// sender's SHA-256 when it sent one. A mismatch removes the partial file so a
+/// retry starts clean.
+pub fn finish_receive_checked(root: &Path, name: &str, expected: Option<[u8; 32]>) -> Result<PathBuf> {
+    if let Some(want) = expected {
+        use sha2::Digest;
+        let final_path = join_under(root, name)?;
+        let partial = partial_path(&final_path);
+        refuse_reparse(&partial)?;
+        let len = fs::metadata(&partial)?.len();
+        let got: [u8; 32] = hash_prefix(&partial, len)?.finalize().into();
+        if got != want {
+            let _ = fs::remove_file(&partial);
+            let _ = fs::remove_file(meta_path(&final_path));
+            bail!("the file arrived damaged (checksum mismatch); Retry sends it again");
+        }
+    }
+    finish_receive(root, name)
+}
+
+/// Removes partial files (and their sidecars) in `root` not written for
+/// `max_age`. Returns how many partial files went.
+pub fn sweep_stale(root: &Path, max_age: std::time::Duration) -> usize {
+    let Ok(dir) = fs::read_dir(root) else { return 0 };
+    let mut gone = 0;
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_part = name.ends_with(PARTIAL_SUFFIX);
+        if !is_part && !name.ends_with(META_SUFFIX) {
+            continue;
+        }
+        let Ok(meta) = entry.path().symlink_metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let old = meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age >= max_age);
+        if !old {
+            continue;
+        }
+        if is_part {
+            // Keep a sidecar only as long as its partial.
+            if fs::remove_file(entry.path()).is_ok() {
+                gone += 1;
+                let mut side = entry.path().into_os_string();
+                side.push(".meta");
+                let _ = fs::remove_file(PathBuf::from(side));
+            }
+        } else {
+            let base = name.trim_end_matches(".meta");
+            if !root.join(base).exists() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    gone
 }
 
 /// How many bytes of `path` are already received, if a partial file exists
@@ -242,6 +374,67 @@ mod tests {
         assert_eq!(off, 0);
         assert_eq!(file.metadata().unwrap().len(), 0);
         drop(file);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_partial_for_a_different_file_size_is_not_resumed() {
+        let root = scratch("meta");
+        let (mut file, _) = open_for_receive(&root, "big.bin", 0).unwrap();
+        use std::io::Write;
+        file.write_all(&[7u8; 1000]).unwrap();
+        drop(file);
+        // No sidecar (older version): trusted on length.
+        assert_eq!(resumable_len(&root, "big.bin", 5000), 1000);
+        note_partial(&root, "big.bin", 5000).unwrap();
+        assert_eq!(resumable_len(&root, "big.bin", 5000), 1000);
+        assert_eq!(resumable_len(&root, "big.bin", 6000), 0);
+        assert_eq!(resumable_len(&root, "big.bin", 500), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_damaged_file_is_refused_and_a_good_one_saved() {
+        use sha2::Digest;
+        let root = scratch("hash");
+        let body = b"0123456789abcdef".repeat(1000);
+        let want: [u8; 32] = sha2::Sha256::digest(&body).into();
+        for (damaged, name) in [(true, "x.bin"), (false, "y.bin")] {
+            let (mut file, _) = open_for_receive(&root, name, 0).unwrap();
+            use std::io::Write;
+            let mut data = body.clone();
+            if damaged {
+                data[5000] ^= 1;
+            }
+            file.write_all(&data).unwrap();
+            drop(file);
+            note_partial(&root, name, data.len() as u64).unwrap();
+            let r = finish_receive_checked(&root, name, Some(want));
+            assert_eq!(r.is_err(), damaged);
+            assert_eq!(partial_len(&root, name).unwrap(), 0);
+            assert!(!meta_path(&root.join(name)).exists());
+        }
+        assert_eq!(fs::read(root.join("y.bin")).unwrap(), body);
+        assert!(!root.join("x.bin").exists());
+        // The prefix hash continues to the same digest.
+        let mut h = hash_prefix(&root.join("y.bin"), 4000).unwrap();
+        h.update(&body[4000..]);
+        assert_eq!(<[u8; 32]>::from(h.finalize()), want);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_partials_are_swept_and_fresh_ones_kept() {
+        let root = scratch("sweep");
+        fs::write(root.join("a.bin.pjpart"), b"x").unwrap();
+        fs::write(root.join("a.bin.pjpart.meta"), b"{}").unwrap();
+        fs::write(root.join("keep.txt"), b"x").unwrap();
+        assert_eq!(sweep_stale(&root, std::time::Duration::from_secs(3600)), 0);
+        assert!(root.join("a.bin.pjpart").exists());
+        assert_eq!(sweep_stale(&root, std::time::Duration::ZERO), 1);
+        assert!(!root.join("a.bin.pjpart").exists());
+        assert!(!root.join("a.bin.pjpart.meta").exists());
+        assert!(root.join("keep.txt").exists());
         let _ = fs::remove_dir_all(&root);
     }
 

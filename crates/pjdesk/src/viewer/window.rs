@@ -2369,6 +2369,9 @@ impl App {
                         let _ = cmds.send(Cmd::Pull(name));
                     }
                     crate::filepop::Request::ClearFinished => live.lock().unwrap().clear_finished(),
+                    crate::filepop::Request::Resume(id) => {
+                        let _ = cmds.send(Cmd::Retry(id));
+                    }
                 }
             }
             if open {
@@ -3073,11 +3076,21 @@ impl App {
         // where the other computer's partial file ends.
         let unfinished = {
             let old = if sid == self.sid { Some(&self.live) } else { self.others.iter().find(|h| h.sid == sid).map(|h| &h.live) };
-            old.map(|live| super::controls::unfinished_sends(&live.lock().unwrap())).unwrap_or_default()
+            old.map(|live| {
+                let g = live.lock().unwrap();
+                (super::controls::unfinished_sends(&g), super::controls::unfinished_pulls(&g))
+            })
+            .unwrap_or_default()
         };
-        for path in unfinished {
+        let (sends, pulls) = unfinished;
+        for path in sends {
             info!("Resuming the upload of {} after the reconnect", path.display());
             let _ = armed.cmds.send(super::controls::Cmd::ResumeFile(path));
+        }
+        // Downloads continue from the partial file in Downloads.
+        for name in pulls {
+            info!("Resuming the download of {name} after the reconnect");
+            let _ = armed.cmds.send(super::controls::Cmd::Pull(name));
         }
         if sid == self.sid {
             self.connection.close(0u32.into(), b"reconnecting");

@@ -54,7 +54,13 @@ pub struct Transfer {
     pub bytes: u64,
     pub incoming: bool,
     pub state: String,
+    /// Asked for with "Get files", so it can be asked for again to resume.
+    pub pulled: bool,
 }
+
+/// Row state for a transfer cut off by a dropped connection. It continues
+/// from the partial file after the reconnect, or with Resume.
+pub const INTERRUPTED: &str = "interrupted";
 
 pub struct Live {
     pub v3: bool,
@@ -248,6 +254,8 @@ impl Live {
 
 pub enum Cmd {
     SendFile(PathBuf),
+    /// Resume (or start again) a failed or interrupted row.
+    Retry(u64),
     /// Offer again after a reconnect; the receiver keeps what it already has.
     ResumeFile(PathBuf),
     Cancel(u64),
@@ -384,6 +392,8 @@ async fn run_loop(
     host_id: String,
 ) {
     let mut last_heard = Instant::now();
+    let mut last_packet = Instant::now();
+    let mut rx_datagrams = connection.stats().udp_rx.datagrams;
     let mut ping = tokio::time::interval(Duration::from_secs(1));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -414,10 +424,20 @@ async fn run_loop(
                 on_cmd(cmd, &connection, &control, &live, &tunnels, &recorder, &wake).await;
             }
             _ = ping.tick() => {
-                let silent = last_heard.elapsed();
+                let rx = connection.stats().udp_rx.datagrams;
+                if rx != rx_datagrams {
+                    rx_datagrams = rx;
+                    last_packet = Instant::now();
+                }
+                let silent = last_packet.elapsed();
+                let quiet = last_heard.elapsed();
                 let mut g = live.lock().unwrap();
-                if pjdesk_proto::failover::path_is_dead(silent) && g.closed.is_none() && resume_after_drop_live(&g) {
-                    tracing::info!("failover: no packet from the host for {} ms", silent.as_millis());
+                if pjdesk_proto::failover::session_is_dead(silent, quiet) && g.closed.is_none() && resume_after_drop_live(&g) {
+                    tracing::info!(
+                        "failover: no packet from the host for {} ms (last control message {} ms ago)",
+                        silent.as_millis(),
+                        quiet.as_millis()
+                    );
                     note_relay_resume(&mut g);
                     drop(g);
                     wake();
@@ -567,12 +587,16 @@ fn on_host(
                 let wake = std::sync::Arc::clone(wake);
                 let control = control.clone();
                 spawn_viewer(async move {
+                    let closed = conn.clone();
                     match send_bytes(conn, id, &path, resume, &live).await {
                         Err(e) => {
+                            // A dropped connection resumes after the reconnect;
+                            // anything else shows as a failure with Retry.
+                            let dropped = closed.close_reason().is_some();
                             if let Some(t) = live.lock().unwrap().live_transfer(id) {
-                                t.state = format!("{e:#}");
+                                t.state = if dropped { INTERRUPTED.into() } else { format!("{e:#}") };
                             }
-                            warn!("send file: {e:#}");
+                            warn!("send file: {e:#}{}", if dropped { " (resumes after the reconnect)" } else { "" });
                         }
                         Ok(false) => {}
                         Ok(true) => {
@@ -681,8 +705,18 @@ fn apply_clip(g: &mut Live, clip: Clipboard) {
 pub(crate) fn unfinished_sends(g: &Live) -> Vec<PathBuf> {
     g.transfers
         .iter()
-        .filter(|t| !t.incoming && (t.state == "offering" || t.state == "sending"))
+        .filter(|t| !t.incoming && matches!(t.state.as_str(), "offering" | "sending" | INTERRUPTED))
         .filter_map(|t| g.paths.get(&t.id).cloned())
+        .collect()
+}
+
+/// Files asked for with "Get files" that had not arrived when the connection
+/// dropped. Asked for again after the reconnect; they continue from the partial file.
+pub(crate) fn unfinished_pulls(g: &Live) -> Vec<String> {
+    g.transfers
+        .iter()
+        .filter(|t| t.incoming && t.pulled && matches!(t.state.as_str(), "offered" | "downloading" | INTERRUPTED))
+        .map(|t| t.name.clone())
         .collect()
 }
 
@@ -699,6 +733,7 @@ fn take_send(g: &mut Live, msg: &FileMsg) -> Option<(u64, PathBuf, u64)> {
                 bytes: *resume_from,
                 incoming: true,
                 state: if auto { "downloading".into() } else { "offered".into() },
+                pulled: auto,
             });
             if auto {
                 // Accepted below by the caller via a follow-up; stored as downloading.
@@ -783,12 +818,36 @@ async fn on_cmd(
                 bytes: 0,
                 incoming: false,
                 state: "offering".into(),
+                pulled: false,
             });
             drop(g);
             let resume_from = if again { filesafe::RESUME_PARTIAL } else { 0 };
             let _ = control.send(ControlMsg::File(FileMsg::Offer { id, name, size, resume_from }));
         }
         Cmd::ResumeFile(_) => {}
+        Cmd::Retry(id) => {
+            let next = {
+                let mut g = live.lock().unwrap();
+                let Some(pos) = g.transfers.iter().position(|t| t.id == id) else { return };
+                let row = g.transfers[pos].clone();
+                let path = g.paths.get(&id).cloned();
+                if !row.incoming && path.is_some() {
+                    g.transfers.remove(pos);
+                    // Offered with "keep what you have": the receiver continues
+                    // from its partial file, or starts over if it has none.
+                    path.map(Cmd::ResumeFile)
+                } else if row.incoming && row.pulled {
+                    g.transfers.remove(pos);
+                    Some(Cmd::Pull(row.name))
+                } else {
+                    g.note(format!("Ask the other computer to send {} again; it continues where it stopped", row.name));
+                    None
+                }
+            };
+            if let Some(cmd) = next {
+                Box::pin(on_cmd(cmd, connection, control, live, tunnels, recorder, wake)).await;
+            }
+        }
         Cmd::Cancel(id) => {
             let mut g = live.lock().unwrap();
             if let Some(t) = g.live_transfer(id) {
@@ -924,8 +983,16 @@ fn open_recording(width: u16, height: u16) -> anyhow::Result<pjdesk_proto::recor
     pjdesk_proto::record::Recorder::start(file, width, height, 30)
 }
 
+/// Where an accepted download continues: the partial file's length when it
+/// belongs to a file of this size. Also records the size next to the partial
+/// and sweeps week-old partials.
 fn resume_download(g: &Live, id: u64) -> u64 {
-    g.transfers.iter().find(|t| t.id == id).and_then(|t| filesafe::partial_len(&downloads_dir(), &t.name).ok()).unwrap_or(0)
+    let Some(t) = g.transfers.iter().find(|t| t.id == id) else { return 0 };
+    let root = downloads_dir();
+    filesafe::sweep_stale(&root, filesafe::STALE_PARTIAL);
+    let have = filesafe::resumable_len(&root, &t.name, t.size);
+    let _ = filesafe::note_partial(&root, &t.name, t.size);
+    have
 }
 
 pub fn recordings_dir() -> PathBuf {
@@ -945,11 +1012,17 @@ async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(resume))?;
+    // The receiver checks the whole file against this, including the part it
+    // had before a resume.
+    let mut hasher = {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || filesafe::hash_prefix(&path, resume)).await??
+    };
     let mut uni = conn.open_uni().await?;
     // Below the control and picture streams, so pings and frames keep flowing
     // while a big file fills the link.
     let _ = uni.set_priority(-1);
-    write_side_header(&mut uni, FILE_MAGIC, &SideHeader { id, offset: resume, a: 0, b: 0 }).await?;
+    write_side_header(&mut uni, FILE_MAGIC, &SideHeader { id, offset: resume, a: filesafe::HASH_TRAILER, b: 0 }).await?;
     let mut buf = vec![0u8; pjdesk_proto::peer::SIDE_CHUNK];
     let mut sent = resume;
     loop {
@@ -962,12 +1035,16 @@ async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &
             return Ok(false);
         }
         write_side_chunk(&mut uni, &buf[..n]).await?;
+        filesafe::Digest::update(&mut hasher, &buf[..n]);
         sent += n as u64;
         if let Some(t) = live.lock().unwrap().live_transfer(id) {
             t.bytes = sent;
         }
     }
     write_side_chunk(&mut uni, &[]).await?;
+    let digest: [u8; 32] = filesafe::Digest::finalize(hasher).into();
+    // An older receiver stopped reading at the end chunk and never sees this.
+    let _ = uni.write_all(&digest).await;
     let _ = uni.finish();
     Ok(true)
 }
@@ -1145,7 +1222,22 @@ async fn receive_file(stream: &mut quinn::RecvStream, header: SideHeader, live: 
     let root = downloads_dir();
     let (mut file, offset) = filesafe::open_for_receive(&root, &name, header.offset)?;
     let mut got = offset;
-    while let Some(chunk) = read_side_chunk(stream).await? {
+    let interrupted = |live: &Arc<Mutex<Live>>, got: u64| {
+        if let Some(t) = live.lock().unwrap().live_transfer(header.id) {
+            t.bytes = got;
+            t.state = INTERRUPTED.into();
+        }
+    };
+    loop {
+        let chunk = match read_side_chunk(stream).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(e) => {
+                let _ = std::io::Write::flush(&mut file);
+                interrupted(live, got);
+                return Err(e);
+            }
+        };
         if live.lock().unwrap().is_cancelled(header.id) {
             let _ = stream.stop(0u32.into());
             return Ok(());
@@ -1158,14 +1250,35 @@ async fn receive_file(stream: &mut quinn::RecvStream, header: SideHeader, live: 
     }
     std::io::Write::flush(&mut file)?;
     drop(file);
-    let saved = filesafe::finish_receive(&root, &name);
-    let mut g = live.lock().unwrap();
-    if let Some(t) = g.live_transfer(header.id) {
-        t.bytes = got;
-        t.state = "done".into();
+    let mut expected = None;
+    if header.a & filesafe::HASH_TRAILER != 0 {
+        let mut trailer = [0u8; 32];
+        if let Err(e) = stream.read_exact(&mut trailer).await {
+            interrupted(live, got);
+            return Err(e.into());
+        }
+        expected = Some(trailer);
     }
-    if let Ok(path) = saved {
-        g.saved.push(path);
+    let saved = {
+        let (root, name) = (root.clone(), name.clone());
+        tokio::task::spawn_blocking(move || filesafe::finish_receive_checked(&root, &name, expected)).await?
+    };
+    let mut g = live.lock().unwrap();
+    match saved {
+        Ok(path) => {
+            if let Some(t) = g.live_transfer(header.id) {
+                t.bytes = got;
+                t.state = "done".into();
+            }
+            g.saved.push(path);
+        }
+        Err(e) => {
+            warn!("receive {name}: {e:#}");
+            if let Some(t) = g.live_transfer(header.id) {
+                t.bytes = 0;
+                t.state = format!("{e:#}");
+            }
+        }
     }
     Ok(())
 }

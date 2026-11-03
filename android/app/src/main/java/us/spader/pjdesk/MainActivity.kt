@@ -2262,6 +2262,7 @@ class MainActivity : FragmentActivity() {
                                     onCopyId = { copy(state.idFormatted) },
                                     onCopyPassword = { copy(state.password) },
                                     onRegenerate = engine::regenerate,
+                                    onClearLockout = engine::clearLockout,
                                     onStop = { HostService.stop(this@MainActivity) },
                                     showPermanent = showPermanent,
                                     onShowPermanent = { showPermanent = it },

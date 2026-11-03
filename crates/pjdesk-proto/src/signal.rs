@@ -244,7 +244,15 @@ pub enum ClientMsg {
         session_id: SessionId,
         data: Vec<u8>,
     },
+    /// 0.6.84+. Host only: the person at this computer pressed "Clear lockout".
+    /// The server forgets the connect throttle for addresses that tried this
+    /// host and drops its sessions that never opened. Sent only to a server
+    /// whose [`ServerMsg::ServerVersion`] is [`CLEAR_LIMITS_MIN_VERSION`] or newer.
+    ClearConnectLimits,
 }
+
+/// The first server version that understands [`ClientMsg::ClearConnectLimits`].
+pub const CLEAR_LIMITS_MIN_VERSION: &str = "0.6.84";
 
 /// The first server version that relays a session over the TLS connection.
 pub const TCP_RELAY_MIN_VERSION: &str = "0.6.67";

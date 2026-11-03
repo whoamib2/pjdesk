@@ -617,6 +617,11 @@ pub fn session_host(config_path: Option<String>) -> Result<()> {
             let _ = std::fs::remove_file(&refresh);
             shared.request_support_refresh();
         }
+        let clear = crate::syspaths::service_dir().join("lockout.clear");
+        if clear.is_file() {
+            let _ = std::fs::remove_file(&clear);
+            shared.request_clear_lockout();
+        }
         // The lock screen can ask for a new one-time password without the
         // password itself being written into this file.
         let rotate = crate::syspaths::service_dir().join("password.refresh");

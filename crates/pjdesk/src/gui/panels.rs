@@ -273,6 +273,13 @@ impl App {
                             self.engine.shared.request_regenerate();
                             self.toast.show("New one-time password");
                         }
+                        if ui
+                            .small_button("Clear lockout")
+                            .on_hover_text("Let connection attempts to this computer work again right away")
+                            .clicked()
+                        {
+                            self.clear_lockout();
+                        }
                     }
                     None => {
                         widgets::spinner(ui, p.muted);

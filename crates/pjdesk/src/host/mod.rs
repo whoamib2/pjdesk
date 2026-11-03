@@ -76,6 +76,8 @@ pub struct HostShared {
     set_password: Mutex<Option<String>>,
     /// UI → host: pick a fresh random password.
     regenerate: AtomicBool,
+    /// UI → host: forget wrong-password locks here and connect throttles on the server.
+    clear_lockout: AtomicBool,
     /// UI → host: replace the support code and its temporary password.
     refresh_support: AtomicBool,
     /// UI → host: stop hosting and return (e.g. the server changed).
@@ -192,6 +194,10 @@ impl HostShared {
     }
     pub fn permanent_set(&self) -> bool {
         self.permanent_set.load(Ordering::SeqCst)
+    }
+    /// "Clear lockout": the person here wants connection attempts to work again now.
+    pub fn request_clear_lockout(&self) {
+        self.clear_lockout.store(true, Ordering::SeqCst);
     }
     /// Request a fresh random password.
     pub fn request_regenerate(&self) {
@@ -332,6 +338,10 @@ pub(crate) struct HostState {
     support_password: Mutex<String>,
     /// When the current support pair was created.
     support_born: Mutex<Instant>,
+    /// A session that used the support pair ended; the pair is replaced at this
+    /// time unless a session is open then. Lets the viewer's automatic
+    /// reconnect sign in again with the same password.
+    support_retire_at: Mutex<Option<Instant>>,
     /// An authenticated controller is connected.
     streaming: AtomicBool,
     /// Sessions being set up (not yet authenticated).
@@ -470,7 +480,17 @@ impl HostState {
         *self.support_code.lock().unwrap() = pjdesk_proto::random_digits(8);
         *self.support_password.lock().unwrap() = generate_password();
         *self.support_born.lock().unwrap() = Instant::now();
+        *self.support_retire_at.lock().unwrap() = None;
         self.publish_support();
+    }
+
+    /// A session ended. The support pair stays valid for
+    /// [`pjdesk_proto::failover::SUPPORT_RESUME_GRACE`] so a dropped session can
+    /// reconnect (replacing it at once made every reconnect after a drop fail
+    /// with "Incorrect password", clear the saved password and lock the viewer
+    /// out), then it is replaced.
+    pub(crate) fn session_over_support(&self) {
+        *self.support_retire_at.lock().unwrap() = Some(Instant::now() + pjdesk_proto::failover::SUPPORT_RESUME_GRACE);
     }
 
     fn publish_support(&self) {
@@ -486,6 +506,16 @@ impl HostState {
     fn maybe_expire_support(&self) {
         if self.streaming.load(Ordering::SeqCst) {
             return;
+        }
+        let retire = *self.support_retire_at.lock().unwrap();
+        match retire {
+            Some(at) if Instant::now() >= at => {
+                self.fresh_support();
+                return;
+            }
+            // Inside the reconnect grace: not replaced for its age either.
+            Some(_) => return,
+            None => {}
         }
         let born = *self.support_born.lock().unwrap();
         if born.elapsed() >= Duration::from_secs(10 * 60) {
@@ -554,6 +584,18 @@ impl HostState {
         }
     }
 
+    /// Applies "Clear lockout" from the UI. True when the server should be told too.
+    fn take_clear_lockout(&self) -> bool {
+        let Some(shared) = &self.shared else { return false };
+        if !shared.clear_lockout.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+        self.lockout.lock().unwrap().clear();
+        self.otp_misses.store(0, Ordering::SeqCst);
+        info!("Lockout cleared by the person at this computer");
+        true
+    }
+
     fn note_success(&self, source: &str) {
         self.lockout.lock().unwrap().succeed(source);
         self.otp_misses.store(0, Ordering::SeqCst);
@@ -596,6 +638,7 @@ async fn host_main(
         support_code: Mutex::new(String::new()),
         support_password: Mutex::new(String::new()),
         support_born: Mutex::new(Instant::now()),
+        support_retire_at: Mutex::new(None),
         streaming: AtomicBool::new(false),
         pending: AtomicUsize::new(0),
         peer_info_routes: Mutex::new(HashMap::new()),
@@ -1205,6 +1248,14 @@ async fn signaling_loop(
                     return Ok(SignalEnd::Stop);
                 }
                 state.apply_ui_requests();
+                if state.take_clear_lockout() {
+                    let version = state.server_version.lock().unwrap().clone();
+                    if pjdesk_proto::update::version_at_least(&version, pjdesk_proto::signal::CLEAR_LIMITS_MIN_VERSION) {
+                        let _ = signal.send(ClientMsg::ClearConnectLimits);
+                    } else {
+                        info!("The server ({}) predates clearing its connect limit; it clears itself within a minute", if version.is_empty() { "unknown version" } else { version.as_str() });
+                    }
+                }
                 let sent = state.shared.as_ref().is_some_and(|s| s.relay_sent.load(Ordering::SeqCst));
                 if sent && !state.streaming.load(Ordering::SeqCst) {
                     if let Some(id) = state.moving.lock().unwrap().take() {
@@ -1651,7 +1702,7 @@ async fn session_inner(
     let result =
         stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
     state.streaming.store(false, Ordering::SeqCst);
-    state.fresh_support();
+    state.session_over_support();
     if let Some(shared) = &state.shared {
         *shared.connected.lock().unwrap() = None;
     }

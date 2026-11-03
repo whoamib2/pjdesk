@@ -703,6 +703,17 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             *state.otp.lock().unwrap() = generate_password();
             publish(state, cb);
         }
+        "clearLockout" => {
+            state.lockout.lock().unwrap().clear();
+            let version = state.routes.lock().unwrap().server_version.clone();
+            if pjdesk_proto::update::version_at_least(&version, pjdesk_proto::signal::CLEAR_LIMITS_MIN_VERSION) {
+                if let Some(tx) = state.host_tx.lock().unwrap().as_ref() {
+                    let _ = tx.send(ClientMsg::ClearConnectLimits);
+                }
+            }
+            log_line(cb, "Lockout cleared by the person at this phone");
+            emit(cb, &json!({"event":"status","text":"Lockout cleared. Connection attempts work again."}));
+        }
         "refreshSupport" => {
             refresh_support(state);
             publish(state, cb);

@@ -21,6 +21,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -54,6 +55,7 @@ fun HomeScreen(
     onCopyId: () -> Unit,
     onCopyPassword: () -> Unit,
     onRegenerate: () -> Unit,
+    onClearLockout: () -> Unit = {},
     onStop: () -> Unit,
     showPermanent: Boolean = false,
     onShowPermanent: (Boolean) -> Unit = {},
@@ -249,7 +251,10 @@ fun HomeScreen(
                     IconButton(onClick = onCopyPassword, enabled = state.password.isNotEmpty()) { Glyph("copy") }
                     RefreshPasswordButton(onClick = onRegenerate)
                 }
-                Text("One-time password", color = pjMuted(), style = MaterialTheme.typography.labelMedium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("One-time password", color = pjMuted(), style = MaterialTheme.typography.labelMedium, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onClearLockout) { Text("Clear lockout") }
+                }
             }
         }
         Row(verticalAlignment = Alignment.CenterVertically) {

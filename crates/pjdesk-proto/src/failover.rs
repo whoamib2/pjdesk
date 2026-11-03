@@ -318,6 +318,25 @@ pub fn path_is_dead(silent_for: Duration) -> bool {
     silent_for >= TRANSPORT_DEAD
 }
 
+/// How long a host keeps its support password after a session ends, so the
+/// viewer's automatic reconnect can sign in again.
+pub const SUPPORT_RESUME_GRACE: Duration = Duration::from_secs(120);
+
+/// Packets (ACKs, keep-alives) still arriving but no control message for this
+/// long means the host is stuck, not the path.
+pub const CONTROL_DEAD: Duration = Duration::from_secs(30);
+
+/// The session watchdog. `packet_silence` is time since any datagram arrived
+/// from the host; `control_silence` since the last control message (Pong etc.).
+///
+/// During a big upload over a slow uplink, a Pong can sit behind seconds of
+/// file data in the router's queue while the host's ACKs keep arriving. Judging
+/// by control messages alone closed healthy sessions mid-transfer
+/// ("connection lost: closed"), so any packet counts as proof of life.
+pub fn session_is_dead(packet_silence: Duration, control_silence: Duration) -> bool {
+    path_is_dead(packet_silence) || control_silence >= CONTROL_DEAD
+}
+
 /// A dead path reconnects. A host restart and a person ending the session do not.
 pub fn resume_after_drop(restarting: bool, host_ended: bool) -> bool {
     !restarting && !host_ended
@@ -329,6 +348,8 @@ pub fn session_refusal(reason: &str) -> Option<&'static str> {
     let lower = reason.to_ascii_lowercase();
     if lower.contains("wrong password") || lower.contains("incorrect password") {
         Some("Wrong password.")
+    } else if lower.contains("locked out") {
+        Some("The other computer is locked after wrong passwords. Clear lockout there, or wait.")
     } else if lower.contains("revoked") {
         Some("Access was revoked.")
     } else if lower.contains("blocked") {
@@ -725,6 +746,17 @@ fn host_is_name(address: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_late_pong_during_an_upload_is_not_a_dead_path() {
+        use std::time::Duration as D;
+        // ACKs arriving, Pong 6 s late behind file data: alive.
+        assert!(!super::session_is_dead(D::from_millis(200), D::from_secs(6)));
+        // Nothing at all for 4 s: dead.
+        assert!(super::session_is_dead(D::from_secs(4), D::from_secs(4)));
+        // Packets but no control message for 30 s: the host is stuck.
+        assert!(super::session_is_dead(D::from_millis(100), D::from_secs(30)));
+    }
+
 
     #[test]
     fn jitter_stays_within_twenty_percent() {

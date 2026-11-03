@@ -630,7 +630,7 @@ impl Session {
             if let Ok(rd) = std::fs::read_dir(&root) {
                 for ent in rd.flatten() {
                     let Ok(name) = ent.file_name().into_string() else { continue };
-                    if name.ends_with(".pjpart") || filesafe::sanitize_name(&name).is_err() {
+                    if name.ends_with(".pjpart") || name.ends_with(filesafe::META_SUFFIX) || filesafe::sanitize_name(&name).is_err() {
                         continue;
                     }
                     if ent.path().is_file() {
@@ -658,8 +658,10 @@ impl Session {
             return write_msg(send, &HostMsg::File(FileMsg::Reject { id, reason: "that file is not accepted".into() }))
                 .await;
         }
-        let have = filesafe::partial_len(&root, name).unwrap_or(0);
+        filesafe::sweep_stale(&root, filesafe::STALE_PARTIAL);
+        let have = filesafe::resumable_len(&root, name, size);
         let offset = filesafe::resume_offset(resume_from, have, size);
+        let _ = filesafe::note_partial(&root, name, size);
         self.expected.lock().unwrap().insert(id, ExpectedFile { name: name.to_string(), size, offset });
         info!("Accepting file \"{name}\" ({size} bytes) from {}, resume {offset}", self.peer_name);
         self.note(&format!("Receiving {name}"));
@@ -940,6 +942,15 @@ impl Session {
         }
         file.flush()?;
         drop(file);
+        let mut expected_hash = None;
+        if header.a & filesafe::HASH_TRAILER != 0 {
+            let mut trailer = [0u8; 32];
+            if let Err(e) = stream.read_exact(&mut trailer).await {
+                super::filewin::incoming_done(header.id, Some("interrupted; resumes on reconnect".into()));
+                return Err(e.into());
+            }
+            expected_hash = Some(trailer);
+        }
         if got != job.size && job.size != 0 {
             let _ = self.host_tx.send(HostMsg::File(FileMsg::Error {
                 id: header.id,
@@ -947,7 +958,21 @@ impl Session {
             }));
             return Ok(());
         }
-        let saved = filesafe::finish_receive(&root, &job.name)?;
+        let check = {
+            let (root, name) = (root.clone(), job.name.clone());
+            tokio::task::spawn_blocking(move || filesafe::finish_receive_checked(&root, &name, expected_hash)).await?
+        };
+        let saved = match check {
+            Ok(saved) => saved,
+            Err(e) => {
+                let reason = format!("{e:#}");
+                warn!("receive {}: {reason}", job.name);
+                super::filewin::incoming_done(header.id, Some(reason.clone()));
+                self.expected.lock().unwrap().remove(&header.id);
+                let _ = self.host_tx.send(HostMsg::File(FileMsg::Error { id: header.id, reason }));
+                return Ok(());
+            }
+        };
         super::filewin::incoming_done(header.id, None);
         self.expected.lock().unwrap().remove(&header.id);
         info!("Saved {}", saved.display());
@@ -1088,10 +1113,16 @@ async fn send_file_bytes(
     let mut file = std::fs::File::open(path)?;
     use std::io::{Read, Seek, SeekFrom};
     file.seek(SeekFrom::Start(resume))?;
+    // The receiver checks the whole file against this at the end, including
+    // the part it already had before a resume.
+    let mut hasher = {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || filesafe::hash_prefix(&path, resume)).await??
+    };
     let mut uni = conn.open_uni().await?;
     // Below control and video, so pings keep flowing during a big transfer.
     let _ = uni.set_priority(-1);
-    write_side_header(&mut uni, FILE_MAGIC, &SideHeader { id, offset: resume, a: 0, b: 0 }).await?;
+    write_side_header(&mut uni, FILE_MAGIC, &SideHeader { id, offset: resume, a: filesafe::HASH_TRAILER, b: 0 }).await?;
     let mut buf = vec![0u8; SIDE_CHUNK];
     let mut sent = resume;
     loop {
@@ -1106,11 +1137,15 @@ async fn send_file_bytes(
             return Ok(());
         }
         write_side_chunk(&mut uni, &buf[..n]).await?;
+        filesafe::Digest::update(&mut hasher, &buf[..n]);
         sent += n as u64;
         let _ = tx.send(HostMsg::File(FileMsg::Progress { id, bytes: sent }));
         super::filewin::outgoing_bytes(id, sent);
     }
     write_side_chunk(&mut uni, &[]).await?;
+    let digest: [u8; 32] = filesafe::Digest::finalize(hasher).into();
+    // An older receiver has stopped reading by now; it never sees this.
+    let _ = uni.write_all(&digest).await;
     let _ = uni.finish();
     let _ = tx.send(HostMsg::File(FileMsg::Done { id }));
     super::filewin::outgoing_state(id, sent, "done");

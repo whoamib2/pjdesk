@@ -605,6 +605,8 @@ class Engine(context: Context) : EngineListener {
     fun regenerate() = command("""{"cmd":"regenerate"}""")
 
     fun refreshSupport() = command("""{"cmd":"refreshSupport"}""")
+    /** Forget wrong-password locks here and the server's connect throttle for this phone. */
+    fun clearLockout() = command("""{"cmd":"clearLockout"}""")
     fun setServer(address: String) = applyAccountServer(address, "", quiet = false)
     fun resetFingerprint() = command("""{"cmd":"resetFingerprint"}""")
     fun captureSize(width: Int, height: Int) =

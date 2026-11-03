@@ -88,7 +88,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
     let mut tries = 0u32;
     loop {
         let link = if let Some(addr) = direct.clone() {
-            runtime.block_on(connect_direct(&mut config, &addr, &password, ask.as_deref(), args.trust && !waiting))
+            runtime.block_on(connect_direct(&mut config, &addr, &password, ask.as_deref(), args.trust && !waiting, false))
         } else {
             runtime.block_on(connect(
                 &server,
@@ -101,6 +101,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
                 prefer_standby,
                 move_to.as_deref(),
                 Duration::from_secs(90),
+                false,
             ))
         };
         let link = match link {
@@ -250,7 +251,7 @@ async fn open_for(
 ) -> Result<Link> {
     let mut config = Config::load().context("reading settings")?;
     if !admit.direct.trim().is_empty() {
-        return connect_direct(&mut config, admit.direct.trim(), &admit.password, None, false).await;
+        return connect_direct(&mut config, admit.direct.trim(), &admit.password, None, false, true).await;
     }
     let server = ServerAddr::parse(&admit.server).unwrap_or(ServerAddr {
         host: admit.server.clone(),
@@ -267,6 +268,7 @@ async fn open_for(
         false,
         move_to,
         host_wait,
+        true,
     )
     .await
 }
@@ -516,6 +518,7 @@ async fn connect(
     prefer_standby: bool,
     move_to: Option<&str>,
     host_wait: Duration,
+    in_window: bool,
 ) -> Result<Link> {
     tracing::info!("Connecting to {} through the advertised servers", format_id(target));
     let _ = (server, prefer_standby);
@@ -800,6 +803,10 @@ async fn connect(
             Err(e) if e.is::<session::LockedOut>() => {
                 connection.close(1u32.into(), b"locked out");
                 let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+                if in_window {
+                    // A reconnect or another tab: the window and its other sessions stay.
+                    return Err(e);
+                }
                 crate::note_failure(&e.to_string());
                 std::process::exit(4);
             }
@@ -811,6 +818,13 @@ async fn connect(
                 let _ = std::fs::remove_file(ask_reply_path(path));
                 from_store = false;
                 attempt = wait_asked_password(path, &host_name).await?;
+            }
+            Err(e) if e.is::<session::WrongPassword>() && in_window => {
+                // A reconnect: the password worked minutes ago, so the saved one is
+                // not cleared and the window is not closed; the caller stops retrying.
+                connection.close(1u32.into(), b"authentication failed");
+                let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+                return Err(anyhow!("wrong password: the other computer no longer accepts the password this session used"));
             }
             Err(e) if e.is::<session::WrongPassword>() => {
                 connection.close(1u32.into(), b"authentication failed");
@@ -950,6 +964,7 @@ async fn connect_direct(
     password: &str,
     ask: Option<&std::path::Path>,
     trust: bool,
+    in_window: bool,
 ) -> Result<Link> {
     let socket_addr: SocketAddr = addr
         .parse()
@@ -1003,6 +1018,9 @@ async fn connect_direct(
         }
         Err(e) if e.is::<session::LockedOut>() => {
             connection.close(1u32.into(), b"locked out");
+            if in_window {
+                return Err(e);
+            }
             crate::note_failure(&e.to_string());
             std::process::exit(4);
         }

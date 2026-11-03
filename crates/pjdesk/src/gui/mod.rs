@@ -3171,6 +3171,22 @@ impl App {
         }
     }
 
+    /// "Clear lockout": wrong-password locks on this computer and the server's
+    /// connect throttle for attempts aimed at it.
+    pub(crate) fn clear_lockout(&mut self) {
+        if self.engine.service_running {
+            let path = crate::syspaths::service_dir().join("lockout.clear");
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, b"1\n");
+        } else {
+            self.engine.shared.request_clear_lockout();
+        }
+        tracing::info!("Clear lockout requested");
+        self.toast.show("Lockout cleared. Connection attempts work again.");
+    }
+
     fn refresh_support_pair(&mut self) {
         if self.engine.service_running {
             let path = crate::syspaths::service_dir().join("support.refresh");
@@ -3413,6 +3429,7 @@ impl App {
                     crate::client_update::start();
                 }
                 tray::Action::Revoke => self.revoke_support_access(),
+                tray::Action::ClearLockout => self.clear_lockout(),
                 tray::Action::Lock => {
                     tracing::info!("Tray click: Lock now.");
                     reveal_window(ctx, "Lock now");

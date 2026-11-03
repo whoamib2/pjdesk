@@ -36,6 +36,10 @@ impl Item {
     pub fn failed(&self) -> bool {
         !self.active() && !self.finished() && !self.cancelled()
     }
+    /// Cut off by a dropped connection; continues after the reconnect.
+    pub fn interrupted(&self) -> bool {
+        self.state == "interrupted"
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -67,6 +71,8 @@ pub enum Request {
     List,
     Pull(String),
     ClearFinished,
+    /// Resume (or start again) a failed or interrupted transfer.
+    Resume(u64),
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -513,6 +519,15 @@ pub mod window {
                                     if ui.small_button("✕").on_hover_text("Cancel").clicked() {
                                         self.request(vec![Request::Cancel(item.id)]);
                                     }
+                                } else if item.failed() || item.cancelled() {
+                                    let (label, tip) = if item.bytes > 0 {
+                                        ("Resume", "Continue from where it stopped")
+                                    } else {
+                                        ("Retry", "Start this file again")
+                                    };
+                                    if ui.small_button(label).on_hover_text(tip).clicked() {
+                                        self.request(vec![Request::Resume(item.id)]);
+                                    }
                                 }
                             });
                         });
@@ -520,7 +535,7 @@ pub mod window {
                         let bar_color = if item.finished() { OK } else if item.failed() || item.cancelled() { BAD } else { ACCENT };
                         ui.add(egui::ProgressBar::new(if item.finished() { 1.0 } else { frac }).desired_height(6.0).fill(bar_color).corner_radius(CornerRadius::same(3)));
                         let status = status_line(item, speed);
-                        let tint = if item.finished() { OK } else if item.failed() { BAD } else { MUTED };
+                        let tint = if item.finished() { OK } else if item.failed() && !item.interrupted() { BAD } else { MUTED };
                         ui.label(RichText::new(status).size(11.0).color(tint));
                     });
                 });
@@ -533,6 +548,7 @@ pub mod window {
         match item.state.as_str() {
             "done" => format!("{} · {size}", if item.incoming { "Received" } else { "Sent" }),
             "cancelled" => "Cancelled".into(),
+            "interrupted" => format!("Interrupted at {} of {size} · resumes when the connection is back", human_bytes(item.bytes)),
             "offering" | "offered" => format!("Waiting · {size}"),
             "sending" | "downloading" => {
                 let mut s = format!("{} of {size}", human_bytes(item.bytes));
