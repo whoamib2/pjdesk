@@ -324,8 +324,13 @@ pub fn spinner(ui: &mut egui::Ui, color: Color32) {
         ui.painter().line_segment([prev, next], stroke);
         prev = next;
     }
-    ui.ctx().request_repaint();
+    // About 30 frames a second. A bare request_repaint() redraws as fast as
+    // the machine allows for as long as the spinner shows.
+    ui.ctx().request_repaint_after(SPINNER_FRAME);
 }
+
+/// Frame interval while a spinner shows.
+pub const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(33);
 
 pub fn muted(ui: &egui::Ui, text: &str) -> RichText {
     RichText::new(text).color(theme::paint(ui).muted).size(12.5)

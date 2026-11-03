@@ -128,8 +128,14 @@ fn saved_list_widths() {
         assert!(!menus.is_empty(), "{name}: no Menu buttons");
         let mut saw_connect = false;
         let mut saw_phone = false;
+        // The toolbar's Menu sits beside Remove all, not beside a row action.
+        let toolbar_y: Vec<f32> =
+            harness.query_all_by_label("Remove all saved computers").into_iter().map(|n| n.rect().center().y).collect();
         for menu in &menus {
             let rect = menu.rect();
+            if toolbar_y.iter().any(|y| (rect.center().y - y).abs() < 10.0) {
+                continue;
+            }
             assert!(
                 rect.right() <= points_w - 12.0 && rect.right() >= points_w - 80.0,
                 "{name}: Menu is not pinned inside the window. rect {rect:?} width {points_w}"
@@ -177,4 +183,44 @@ enum Prep {
     ServerConfig,
     ImportOffer,
     EmptyNetwork,
+}
+
+/// The column headers and the first row never draw over the list's toolbar.
+#[test]
+fn saved_header_clears_the_toolbar() {
+    let dir = std::path::PathBuf::from(
+        std::env::var("PJDESK_SHOT_DIR").unwrap_or_else(|_| "/opt/cursor/artifacts/pjdesk-saved".into()),
+    );
+    std::fs::create_dir_all(&dir).expect("create shot dir");
+    for w in [1180.0_f32, 1100.0, 1040.0, 1000.0, 996.0, 900.0, 700.0, 480.0] {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(w, 760.0))
+            .with_pixels_per_point(1.0)
+            .with_theme(egui::Theme::Light)
+            .wgpu()
+            .build_eframe(|cc| {
+                let mut cfg = crate::config::Config::default();
+                cfg.settings.theme = "light".into();
+                cfg.settings.saved_view = "list".into();
+                let mut app = App::create(cc, cfg, true);
+                app.load_saved_preview();
+                // Support keys shows, so the toolbar has to fit one more button.
+                app.cfg.network_refresh = Some(crate::secure::protect_machine("preview-refresh"));
+                app
+            });
+        harness.step();
+        harness.step();
+        let image = harness.render().unwrap_or_else(|e| panic!("render {w}: {e}"));
+        let _ = image.save(dir.join(format!("header-{w}.png")));
+        let toolbar_bottom = ["Remove all saved computers", "Favorites", "Sort"]
+            .iter()
+            .flat_map(|l| harness.query_all_by_label(l).into_iter().map(|n| n.rect().bottom()).collect::<Vec<_>>())
+            .fold(f32::MIN, f32::max);
+        for head in ["Name", "Status", "Version"] {
+            for node in harness.query_all_by_label(head) {
+                let r = node.rect();
+                assert!(r.top() >= toolbar_bottom, "width {w}: header {head} at {r:?} overlaps the toolbar ending at {toolbar_bottom}");
+            }
+        }
+    }
 }

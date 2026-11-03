@@ -256,6 +256,21 @@ pub fn client_sections(rows: Vec<SavedRow>) -> (Vec<(String, Vec<SavedRow>)>, Ve
 }
 
 impl App {
+    /// Remove all and Menu, pinned to the right edge like each row's Menu.
+    fn saved_toolbar_actions(&mut self, ui: &mut egui::Ui) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.menu_button("Menu", |ui| {
+                if ui.button("Sign out and remove everything from this computer").clicked() {
+                    self.confirm_sign_out_clear = true;
+                    ui.close();
+                }
+            });
+            if ui.button("Remove all saved computers").clicked() {
+                self.confirm_clear_saved = true;
+            }
+        });
+    }
+
     pub(super) fn computer_list(&mut self, ui: &mut egui::Ui) {
         if crate::incoming::enabled() {
             theme::card(ui, |ui| {
@@ -347,8 +362,12 @@ impl App {
             let search = widgets::text_field(ui, &mut self.saved_query, "Search nickname, name, ID, or OS", false);
             submitted = search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                let can_keys = self.cfg.can_manage_support_keys();
+            // Explicit rows, not horizontal_wrapped: a wrapped row can report the
+            // height of the previous frame, and the list below then drew over it.
+            let can_keys = self.cfg.can_manage_support_keys();
+            let saved_tab = self.desk_tab == super::DeskTab::Saved;
+            let rows_needed = toolbar_rows(ui.available_width(), can_keys, saved_tab);
+            ui.horizontal(|ui| {
                 if can_keys && ui.button("Support keys").clicked() {
                     self.show_support_keys = true;
                 }
@@ -367,18 +386,14 @@ impl App {
                         ui.selectable_value(&mut self.saved_sort, SavedSort::Order, "Saved order");
                     });
                 widgets::checkbox(ui, &mut self.saved_favorites, "Favorites");
-                if self.desk_tab == super::DeskTab::Saved {
-                    if ui.button("Remove all saved computers").clicked() {
-                        self.confirm_clear_saved = true;
-                    }
-                    ui.menu_button("Menu", |ui| {
-                        if ui.button("Sign out and remove everything from this computer").clicked() {
-                            self.confirm_sign_out_clear = true;
-                            ui.close();
-                        }
-                    });
+                if saved_tab && rows_needed == 1 {
+                    self.saved_toolbar_actions(ui);
                 }
             });
+            if saved_tab && rows_needed == 2 {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| self.saved_toolbar_actions(ui));
+            }
         });
         ui.add_space(8.0);
 
@@ -479,7 +494,7 @@ impl App {
         }
     }
 
-    fn saved_rows(&self) -> Vec<SavedRow> {
+    pub(super) fn saved_rows(&self) -> Vec<SavedRow> {
         use std::collections::BTreeSet;
         let mut ids = BTreeSet::new();
         for entry in &self.cfg.address_book {
@@ -2200,11 +2215,23 @@ mod tests {
     }
 }
 
+pub(super) const PASSWORD_CHECK_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const CHECK_OFFLINE: &str = "That computer is offline. Try again when it is online.";
+pub(super) const CHECK_UNREACHABLE: &str = "Couldn't reach that computer. Try again.";
+
+/// The answer once a password check has run too long. None while it may still answer.
+pub(super) fn password_check_timeout(elapsed: std::time::Duration, online: Option<bool>) -> Option<&'static str> {
+    if elapsed < PASSWORD_CHECK_LIMIT {
+        return None;
+    }
+    Some(if online == Some(false) { CHECK_OFFLINE } else { CHECK_UNREACHABLE })
+}
+
 /// The one line under the computer's ID in the password prompt.
 fn connect_prompt_message(rejected: bool, checking: bool, status: &str) -> String {
     if checking {
         "Checking the password…".into()
-    } else if rejected && status.starts_with("Saved password") {
+    } else if rejected && (status.starts_with("Saved password") || status.starts_with(CHECK_OFFLINE) || status.starts_with(CHECK_UNREACHABLE)) {
         status.lines().next().unwrap_or_default().to_string()
     } else if rejected {
         "That password didn't work. Enter it again.".into()
@@ -2220,5 +2247,40 @@ mod prompt_tests {
         assert_eq!(super::connect_prompt_message(false, true, ""), "Checking the password…");
         assert_eq!(super::connect_prompt_message(true, false, "Incorrect password"), "That password didn't work. Enter it again.");
         assert_eq!(super::connect_prompt_message(false, false, ""), "Enter the password set on that computer.");
+    }
+
+    #[test]
+    fn a_password_check_ends_after_ten_seconds() {
+        use std::time::Duration;
+        assert_eq!(super::password_check_timeout(Duration::from_secs(9), Some(false)), None);
+        assert_eq!(super::password_check_timeout(Duration::from_secs(10), Some(false)), Some(super::CHECK_OFFLINE));
+        assert_eq!(super::password_check_timeout(Duration::from_secs(12), Some(true)), Some(super::CHECK_UNREACHABLE));
+        assert_eq!(super::password_check_timeout(Duration::from_secs(12), None), Some(super::CHECK_UNREACHABLE));
+        assert_eq!(super::connect_prompt_message(true, false, super::CHECK_OFFLINE), super::CHECK_OFFLINE);
+    }
+}
+
+/// Rows the Saved toolbar needs at this width. Widths are the controls'
+/// sizes at the default font plus spacing.
+fn toolbar_rows(width: f32, support_keys: bool, saved_tab: bool) -> usize {
+    let mut one_row = 40.0 + 150.0 + 100.0; // Sort, the sort box, Favorites
+    if support_keys {
+        one_row += 110.0;
+    }
+    if saved_tab {
+        one_row += 220.0 + 70.0; // Remove all saved computers, Menu
+    }
+    if width >= one_row { 1 } else { 2 }
+}
+
+#[cfg(test)]
+mod toolbar_tests {
+    #[test]
+    fn a_narrow_toolbar_takes_two_rows() {
+        assert_eq!(super::toolbar_rows(900.0, true, true), 1);
+        assert_eq!(super::toolbar_rows(600.0, true, true), 2);
+        assert_eq!(super::toolbar_rows(600.0, false, true), 1);
+        assert_eq!(super::toolbar_rows(320.0, false, false), 2);
+        assert_eq!(super::toolbar_rows(400.0, false, false), 1);
     }
 }

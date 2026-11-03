@@ -69,7 +69,7 @@ impl App {
             self.saved_pin().is_some(),
             self.cfg.joined_by_code_or_key(),
             self.cfg.pin_declined,
-        )
+        ) && account_pin_settled(self.cfg.settings.pin_sync, self.account_pin_known)
     }
 
     pub(super) fn note_lock_visibility(&mut self, ctx: &egui::Context) {
@@ -219,10 +219,21 @@ impl App {
             if let Some(msg) = msg {
                 self.lock_pull_rx = None;
                 match msg {
-                    Ok(remote) => self.apply_remote_lock(remote),
+                    Ok(remote) => {
+                        self.lock_pull_fails = 0;
+                        let had_answer = self.account_pin_known.is_some();
+                        self.account_pin_known = Some(!remote.sealed.trim().is_empty());
+                        self.apply_remote_lock(remote);
+                        // The account answered that it has no PIN: now Set a PIN may show.
+                        if !had_answer && self.saved_pin().is_none() && self.pin_screen_wanted() {
+                            self.lock_armed = false;
+                        }
+                    }
                     Err(err) => {
-                        self.next_lock_pull = Instant::now() + Duration::from_secs(60);
-                        if self.lock_ui {
+                        // Nothing answered: skip the PIN screen quietly and try again later.
+                        self.lock_pull_fails = self.lock_pull_fails.saturating_add(1);
+                        self.next_lock_pull = Instant::now() + lock_pull_backoff(self.lock_pull_fails);
+                        if self.lock_ui && self.saved_pin().is_some() {
                             self.lock_error = err;
                         }
                     }
@@ -577,7 +588,16 @@ impl App {
         if email.is_empty() {
             return;
         }
-        let file = pjdesk_proto::applock::read_window_lock(&pjdesk_proto::applock::window_lock_path());
+        // This runs every frame. Read and decrypt the file only when it changed.
+        let path = pjdesk_proto::applock::window_lock_path();
+        let stamp = file_stamp(&path);
+        if let Some((seen_email, seen)) = &self.shared_lock_seen {
+            if *seen_email == email && !stamp_changed(seen.as_ref(), stamp.as_ref()) {
+                return;
+            }
+        }
+        self.shared_lock_seen = Some((email.clone(), stamp));
+        let file = pjdesk_proto::applock::read_window_lock(&path);
         if !file.email.eq_ignore_ascii_case(&email) {
             return;
         }
@@ -818,9 +838,29 @@ impl App {
             });
     }
 
+    /// Another PJDesk window or the sign-in thread may have saved the account
+    /// after this window loaded its settings. Read it back before asking for an
+    /// email or password that this computer already has. At most every 2 s.
+    fn adopt_saved_sign_in(&mut self) {
+        let missing = self.account_email().is_empty() || crate::vault::key_from(&self.cfg).is_none();
+        if !missing || self.setup_disk_check.is_some_and(|at| at.elapsed() < Duration::from_secs(2)) {
+            return;
+        }
+        self.setup_disk_check = Some(Instant::now());
+        self.cfg.reload_identity_from_disk();
+        if self.cfg.password_vault_key.is_none() {
+            if let Ok(disk) = crate::config::Config::load() {
+                if disk.network_email == self.cfg.network_email {
+                    self.cfg.password_vault_key = disk.password_vault_key;
+                }
+            }
+        }
+    }
+
     pub(super) fn setup_screen(&mut self, ui: &mut egui::Ui) {
         let p = theme::paint(ui);
         let title = if self.lock_resetting { "Choose a new PIN" } else { "Set a PIN" };
+        self.adopt_saved_sign_in();
         let need_password = crate::vault::key_from(&self.cfg).is_none() && !self.password_recently_ok();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::same(24)))
@@ -1519,6 +1559,83 @@ fn finish_lock_upload(job: &SaveJob, sealed: String, verifier: pjdesk_proto::app
     match crate::network::put_app_lock(&job.refresh, &job.device, &sealed) {
         Ok(updated) => LockMsg::Stored { sealed, updated, verifier, key },
         Err(err) => LockMsg::StoredLocal { sealed, verifier, key, note: local_pin_note(&err.to_string()) },
+    }
+}
+
+/// With PIN sync on, Set a PIN shows only after the account answered that it
+/// has no PIN. Unknown (offline, not answered yet) skips the screen quietly.
+fn account_pin_settled(pin_sync: bool, known: Option<bool>) -> bool {
+    !pin_sync || known == Some(false)
+}
+
+/// 15 s, 30 s, 60 s ... up to 5 min between failed account PIN reads.
+fn lock_pull_backoff(fails: u32) -> Duration {
+    let secs = 15u64.saturating_mul(1u64 << fails.saturating_sub(1).min(5));
+    Duration::from_secs(secs.min(300))
+}
+
+#[cfg(test)]
+mod pin_ask_tests {
+    use super::*;
+
+    #[test]
+    fn set_a_pin_waits_for_the_account() {
+        assert!(!account_pin_settled(true, None));
+        assert!(!account_pin_settled(true, Some(true)));
+        assert!(account_pin_settled(true, Some(false)));
+        assert!(account_pin_settled(false, None));
+    }
+
+    #[test]
+    fn failed_pin_reads_back_off() {
+        assert_eq!(lock_pull_backoff(1), Duration::from_secs(15));
+        assert_eq!(lock_pull_backoff(2), Duration::from_secs(30));
+        assert_eq!(lock_pull_backoff(4), Duration::from_secs(120));
+        assert_eq!(lock_pull_backoff(40), Duration::from_secs(300));
+        for n in 1..50 {
+            assert!(lock_pull_backoff(n) >= Duration::from_secs(15));
+        }
+    }
+}
+
+/// Size and modified time of a file, to tell whether it changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp { len: meta.len(), modified: meta.modified().ok() })
+}
+
+/// A missing file that was missing before is unchanged too.
+fn stamp_changed(seen: Option<&FileStamp>, now: Option<&FileStamp>) -> bool {
+    match (seen, now) {
+        (Some(a), Some(b)) => a != b,
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+
+    #[test]
+    fn the_shared_lock_is_read_only_when_it_changes() {
+        let dir = std::env::temp_dir().join(format!("pjd-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lock.json");
+        assert!(!stamp_changed(None, file_stamp(&path).as_ref()));
+        std::fs::write(&path, "{}").unwrap();
+        let first = file_stamp(&path);
+        assert!(stamp_changed(None, first.as_ref()));
+        assert!(!stamp_changed(first.as_ref(), file_stamp(&path).as_ref()));
+        std::fs::write(&path, "{\"a\":1}").unwrap();
+        assert!(stamp_changed(first.as_ref(), file_stamp(&path).as_ref()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

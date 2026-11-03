@@ -339,6 +339,17 @@ pub struct App {
     prompt_files: bool,
     prompt_rejected: bool,
     prompt_checking: bool,
+    /// When the current password check started, for the 10 s limit.
+    prompt_checking_since: Option<std::time::Instant>,
+    /// Size and time of the shared window lock when it was last read.
+    /// What the last account PIN read said: Some(true) the account has one,
+    /// Some(false) it has none, None not known yet.
+    account_pin_known: Option<bool>,
+    /// Failed account PIN reads in a row, for the backoff.
+    lock_pull_fails: u32,
+    /// Last time Set a PIN re-read the saved sign-in from disk.
+    setup_disk_check: Option<Instant>,
+    shared_lock_seen: Option<(String, Option<applock::FileStamp>)>,
     prompt_direct: Option<String>,
     /// Viewer is waiting for a password after the other computer answered.
     ask_path: Option<std::path::PathBuf>,
@@ -578,6 +589,11 @@ impl App {
             prompt_files: false,
             prompt_rejected: false,
             prompt_checking: false,
+            prompt_checking_since: None,
+            shared_lock_seen: None,
+            account_pin_known: None,
+            lock_pull_fails: 0,
+            setup_disk_check: None,
             prompt_direct: None,
             ask_path: None,
             ask_alive: false,
@@ -1530,6 +1546,10 @@ impl App {
                 self.net_error.clear();
                 self.net_pause_until = None;
                 self.show_net_sign_in = false;
+                // Ask the account for its PIN right away. Set a PIN waits for that answer.
+                self.account_pin_known = None;
+                self.lock_pull_fails = 0;
+                self.next_lock_pull = Instant::now();
                 let mut session = session;
                 if !without_password {
                     if session.email.is_empty() && self.cfg.network_email.is_none() {
@@ -2674,7 +2694,29 @@ impl App {
         }
     }
 
+    /// A password check never spins forever. After PASSWORD_CHECK_LIMIT the
+    /// dialog says the computer is offline or could not be reached.
+    fn limit_password_check(&mut self) {
+        if !self.prompt_checking || !self.prompt_open {
+            self.prompt_checking_since = None;
+            return;
+        }
+        let started = *self.prompt_checking_since.get_or_insert_with(std::time::Instant::now);
+        let id = normalize_id(&self.prompt_id);
+        let online = self.saved_rows().iter().find(|r| r.id == id).map(|r| r.online);
+        let Some(text) = saved::password_check_timeout(started.elapsed(), online) else { return };
+        // Stop the stuck viewer. Connect starts a fresh one with the password.
+        self.write_ask_reply("cancel\n");
+        self.ask_alive = false;
+        self.ask_path = None;
+        self.prompt_checking = false;
+        self.prompt_checking_since = None;
+        self.prompt_rejected = true;
+        self.status = text.to_string();
+    }
+
     fn poll_ask(&mut self) {
+        self.limit_password_check();
         let Some(path) = self.ask_path.clone() else { return };
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         if text.starts_with("accepted") {
