@@ -349,6 +349,8 @@ pub struct App {
     lock_pull_fails: u32,
     /// Last time Set a PIN re-read the saved sign-in from disk.
     setup_disk_check: Option<Instant>,
+    /// The computer and files flag of the last viewer started, for Try again.
+    last_connect: Option<(String, bool)>,
     shared_lock_seen: Option<(String, Option<applock::FileStamp>)>,
     prompt_direct: Option<String>,
     /// Viewer is waiting for a password after the other computer answered.
@@ -594,6 +596,7 @@ impl App {
             account_pin_known: None,
             lock_pull_fails: 0,
             setup_disk_check: None,
+            last_connect: None,
             prompt_direct: None,
             ask_path: None,
             ask_alive: false,
@@ -2420,6 +2423,7 @@ impl App {
     /// came from storage is marked `PJDESK_SAVED`; if it is rejected the viewer
     /// exits 3 and this window asks again.
     fn spawn_viewer(&mut self, id: &str, password: &str, files: bool, remember: bool, from_store: bool) {
+        self.last_connect = Some((id.to_string(), files));
         if self.outgoing_blocked() {
             return;
         }
@@ -3133,6 +3137,12 @@ impl App {
     fn session_error_dialog(&mut self, ctx: &egui::Context) {
         let Some(text) = self.session_error.clone() else { return };
         let mut close = false;
+        let mut retry = false;
+        let owned = self.last_connect.as_ref().is_some_and(|(id, _)| {
+            let id = normalize_id(id);
+            self.signed_in() && self.saved_rows().iter().any(|r| r.id == id && r.in_book)
+        });
+        let offer_retry = owned && is_rate_limit_text(&text);
         egui::Window::new("Could not start the session")
             .collapsible(false)
             .resizable(false)
@@ -3140,12 +3150,26 @@ impl App {
             .show(ctx, |ui| {
                 ui.label(&text);
                 ui.add_space(12.0);
-                if widgets::accent_button(ui, "OK", egui::Vec2::new(120.0, 36.0)) {
-                    close = true;
-                }
+                ui.horizontal(|ui| {
+                    if widgets::accent_button(ui, "OK", egui::Vec2::new(120.0, 36.0)) {
+                        close = true;
+                    }
+                    if offer_retry && ui.button("Clear lockout and try again").clicked() {
+                        retry = true;
+                    }
+                });
             });
         if close {
             self.session_error = None;
+        }
+        if retry {
+            self.session_error = None;
+            // Clears this computer's own throttles (when it hosts too). A signed-in
+            // controller is no longer throttled by the server, so the retry goes through.
+            self.clear_lockout();
+            if let Some((id, files)) = self.last_connect.clone() {
+                self.spawn_ask(&id, files, None);
+            }
         }
     }
 }
@@ -3689,4 +3713,20 @@ impl eframe::App for App {
 
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// The server's or host's "too many attempts" answers.
+fn is_rate_limit_text(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("too many connection attempts") || t.contains("wait a minute") || t.contains("locked out")
+}
+
+#[cfg(test)]
+mod rate_limit_text_tests {
+    #[test]
+    fn the_lockout_answer_offers_try_again() {
+        assert!(super::is_rate_limit_text("too many connection attempts, wait a minute"));
+        assert!(super::is_rate_limit_text("Too many connection attempts in progress; try again shortly"));
+        assert!(!super::is_rate_limit_text("Wrong password"));
+    }
 }

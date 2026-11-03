@@ -818,6 +818,12 @@ fn gate(st: &State, conn: &Conn) -> Result<Admitted, ()> {
 }
 
 /// True when this connection's token belongs to the account the server is signed in as.
+/// A verified signed-in account token skips the per-address connect throttle
+/// and session cap. The host's wrong-password lockout still applies.
+fn connect_exempt(st: &State, conn: &Conn) -> bool {
+    matches!(gate(st, conn), Ok(Admitted::Signed(_))) || owner_token(st, conn)
+}
+
 fn owner_token(st: &State, conn: &Conn) -> bool {
     let owner = crate::cloud::saved_account_email(&st.data_dir);
     if owner.is_empty() {
@@ -1341,7 +1347,10 @@ fn handle_message(state: &Shared, conn: &mut Conn, msg: ClientMsg) {
             // Throttles ID scanning and password guessing from one address.
             // The server owner's own signed-in computers are not throttled: the
             // token is verified, and the host's wrong-password lockout still applies.
-            let exempt = owner_token(st, conn);
+            // Any signed-in account on this network is exempt too: its token is
+            // verified, so it is not scanning IDs, and a second window, a
+            // reconnect or a transfer must not lock it out of its own computers.
+            let exempt = connect_exempt(st, conn);
             if !exempt && !st.limiter.allow(conn.addr.ip(), "connect", 30) {
                 conn.error(ErrorCode::RateLimited, "too many connection attempts, wait a minute");
                 return;
