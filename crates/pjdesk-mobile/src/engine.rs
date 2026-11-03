@@ -4261,6 +4261,7 @@ async fn controller_session(
             }
             Ok(HostMsg::File(msg)) => match msg {
                 FileMsg::Entries { names, .. } => emit(&cb, &json!({"event":"files","names": names})),
+                FileMsg::Progress { id, bytes } => pjdesk_link::fileflow::ack(&connection, id, bytes),
                 FileMsg::Accept { id, resume_from } => {
                     let job = state.files.lock().unwrap().get(&id).cloned();
                     let conn = state.viewer.lock().unwrap().clone();
@@ -4325,14 +4326,21 @@ async fn send_file_bytes(conn: quinn::Connection, id: u64, path: &Path, resume: 
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(resume))?;
     let mut uni = conn.open_uni().await?;
+    // Below control (0) and the picture (-1), and only a confirmed window in
+    // flight, so taps and keys never wait behind the file.
+    let _ = uni.set_priority(-2);
     write_side_header(&mut uni, FILE_MAGIC, &SideHeader { id, offset: resume, a: 0, b: 0 }).await?;
-    let mut buf = vec![0u8; pjdesk_proto::peer::SIDE_CHUNK];
+    let mut pacer = pjdesk_link::fileflow::Pacer::new(&conn, id, resume);
+    let mut buf = vec![0u8; pjdesk_link::fileflow::CHUNK];
+    let mut sent = resume;
     loop {
+        pacer.wait(sent).await;
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
         write_side_chunk(&mut uni, &buf[..n]).await?;
+        sent += n as u64;
     }
     write_side_chunk(&mut uni, &[]).await?;
     let _ = uni.finish();

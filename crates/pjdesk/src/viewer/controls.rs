@@ -333,8 +333,9 @@ pub fn start(
     let conn = connection.clone();
     let live_uni = live.clone();
     let player_uni = player.clone();
+    let control_uni = control.clone();
     spawn_viewer(async move {
-        dispatch_uni(conn, frames, live_uni, player_uni).await;
+        dispatch_uni(conn, frames, live_uni, player_uni, control_uni).await;
     });
 
     let live_loop = live.clone();
@@ -577,6 +578,9 @@ fn on_host(
             g.note(format!("Port forward closed: {reason}"));
         }
         HostMsg::File(msg) => {
+            if let FileMsg::Progress { id, bytes } = &msg {
+                pjdesk_link::fileflow::ack(connection, *id, *bytes);
+            }
             let accept_id = match &msg {
                 FileMsg::Offer { id, name, .. } if g.wanted.contains(name) => Some(*id),
                 _ => None,
@@ -1007,6 +1011,9 @@ pub fn downloads_dir() -> PathBuf {
     dir
 }
 
+/// File streams go below control (0) and the picture (-1).
+pub(crate) const FILE_PRIORITY: i32 = -2;
+
 /// Ok(true) when every byte went out, Ok(false) when the person cancelled.
 async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &Arc<Mutex<Live>>) -> anyhow::Result<bool> {
     use std::io::{Read, Seek, SeekFrom};
@@ -1019,13 +1026,15 @@ async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &
         tokio::task::spawn_blocking(move || filesafe::hash_prefix(&path, resume)).await??
     };
     let mut uni = conn.open_uni().await?;
-    // Below the control and picture streams, so pings and frames keep flowing
-    // while a big file fills the link.
-    let _ = uni.set_priority(-1);
+    // Below the control stream (0) and the picture (-1).
+    let _ = uni.set_priority(FILE_PRIORITY);
     write_side_header(&mut uni, FILE_MAGIC, &SideHeader { id, offset: resume, a: filesafe::HASH_TRAILER, b: 0 }).await?;
-    let mut buf = vec![0u8; pjdesk_proto::peer::SIDE_CHUNK];
+    // Small chunks, and only a window the host has confirmed in flight.
+    let mut pacer = pjdesk_link::fileflow::Pacer::new(&conn, id, resume);
+    let mut buf = vec![0u8; pjdesk_link::fileflow::CHUNK];
     let mut sent = resume;
     loop {
+        pacer.wait(sent).await;
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
@@ -1156,6 +1165,7 @@ async fn dispatch_uni(
     frames: std::sync::mpsc::Sender<(VideoHeader, Vec<u8>)>,
     live: Arc<Mutex<Live>>,
     player: Arc<Mutex<Option<Player>>>,
+    control: mpsc::UnboundedSender<ControlMsg>,
 ) {
     let video = match await_video_stream(&connection, &live).await {
         Ok(stream) => stream,
@@ -1184,16 +1194,22 @@ async fn dispatch_uni(
     while let Ok(mut stream) = connection.accept_uni().await {
         let live = live.clone();
         let player = player.clone();
+        let control = control.clone();
         spawn_viewer(async move {
-            let _ = read_side(&mut stream, &live, &player).await;
+            let _ = read_side(&mut stream, &live, &player, &control).await;
         });
     }
 }
 
-async fn read_side(stream: &mut quinn::RecvStream, live: &Arc<Mutex<Live>>, player: &Arc<Mutex<Option<Player>>>) -> anyhow::Result<()> {
+async fn read_side(
+    stream: &mut quinn::RecvStream,
+    live: &Arc<Mutex<Live>>,
+    player: &Arc<Mutex<Option<Player>>>,
+    control: &mpsc::UnboundedSender<ControlMsg>,
+) -> anyhow::Result<()> {
     let (magic, header) = read_side_header::<_, SideHeader>(stream).await?;
     if &magic == FILE_MAGIC {
-        receive_file(stream, header, live).await?;
+        receive_file(stream, header, live, control).await?;
     } else if &magic == AUDIO_MAGIC {
         play_audio(stream, player).await?;
     } else if &magic == CLIP_MAGIC {
@@ -1213,7 +1229,12 @@ async fn read_side(stream: &mut quinn::RecvStream, live: &Arc<Mutex<Live>>, play
     Ok(())
 }
 
-async fn receive_file(stream: &mut quinn::RecvStream, header: SideHeader, live: &Arc<Mutex<Live>>) -> anyhow::Result<()> {
+async fn receive_file(
+    stream: &mut quinn::RecvStream,
+    header: SideHeader,
+    live: &Arc<Mutex<Live>>,
+    control: &mpsc::UnboundedSender<ControlMsg>,
+) -> anyhow::Result<()> {
     let name = {
         let g = live.lock().unwrap();
         g.transfers.iter().find(|t| t.id == header.id).map(|t| t.name.clone())
@@ -1243,9 +1264,16 @@ async fn receive_file(stream: &mut quinn::RecvStream, header: SideHeader, live: 
             return Ok(());
         }
         std::io::Write::write_all(&mut file, &chunk)?;
+        let before = got;
         got += chunk.len() as u64;
         if let Some(t) = live.lock().unwrap().live_transfer(header.id) {
             t.bytes = got;
+        }
+        // Confirms what arrived so the sender keeps only a small window of
+        // file data in flight (input and the picture never wait behind it).
+        // Older hosts ignore this message.
+        if got / pjdesk_link::fileflow::ACK_EVERY != before / pjdesk_link::fileflow::ACK_EVERY {
+            let _ = control.send(ControlMsg::File(FileMsg::Progress { id: header.id, bytes: got }));
         }
     }
     std::io::Write::flush(&mut file)?;

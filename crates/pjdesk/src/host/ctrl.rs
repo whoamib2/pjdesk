@@ -14,7 +14,7 @@ use pjdesk_proto::framing::write_msg;
 use pjdesk_proto::peer::{
     read_side_chunk, read_side_header, write_side_chunk, write_side_header, AtlasTile, ClipKind, Clipboard, ControlMsg,
     DisplayLayout, FileMsg, HostMsg, KeyboardMode, SideHeader, SpecialCommand, TunnelMsg, CLIP_MAGIC, FILE_MAGIC,
-    MAX_CLIP_IMAGE, MAX_CLIP_TEXT, SIDE_CHUNK, VIEW_ALL, VIEW_SEPARATE,
+    MAX_CLIP_IMAGE, MAX_CLIP_TEXT, VIEW_ALL, VIEW_SEPARATE,
 };
 use pjdesk_proto::perms::{self, grant, has};
 use pjdesk_proto::quality::{BitrateControl, StreamQuality};
@@ -611,7 +611,9 @@ impl Session {
                     self.queue_send(send, root.join(safe)).await?;
                 }
             }
-            FileMsg::Progress { .. } | FileMsg::Done { .. } | FileMsg::Error { .. } | FileMsg::Entries { .. } => {}
+            // The controller confirms what it wrote; the sender's window moves on.
+            FileMsg::Progress { id, bytes } => pjdesk_link::fileflow::ack(&self.conn, id, bytes),
+            FileMsg::Done { .. } | FileMsg::Error { .. } | FileMsg::Entries { .. } => {}
         }
         Ok(())
     }
@@ -1120,12 +1122,17 @@ async fn send_file_bytes(
         tokio::task::spawn_blocking(move || filesafe::hash_prefix(&path, resume)).await??
     };
     let mut uni = conn.open_uni().await?;
-    // Below control and video, so pings keep flowing during a big transfer.
-    let _ = uni.set_priority(-1);
+    // Below control (0) and the picture (-1).
+    let _ = uni.set_priority(-2);
     write_side_header(&mut uni, FILE_MAGIC, &SideHeader { id, offset: resume, a: filesafe::HASH_TRAILER, b: 0 }).await?;
-    let mut buf = vec![0u8; SIDE_CHUNK];
+    // Small chunks, and only a window the controller has confirmed in flight
+    // (delay-based pacing for controllers that do not confirm).
+    let mut pacer = pjdesk_link::fileflow::Pacer::new(&conn, id, resume);
+    let mut buf = vec![0u8; pjdesk_link::fileflow::CHUNK];
     let mut sent = resume;
+    let mut reported = resume;
     loop {
+        pacer.wait(sent).await;
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
@@ -1139,7 +1146,12 @@ async fn send_file_bytes(
         write_side_chunk(&mut uni, &buf[..n]).await?;
         filesafe::Digest::update(&mut hasher, &buf[..n]);
         sent += n as u64;
-        let _ = tx.send(HostMsg::File(FileMsg::Progress { id, bytes: sent }));
+        // A progress line every 256 KB, not every chunk: they share the
+        // control stream with everything else.
+        if sent - reported >= 256 * 1024 {
+            reported = sent;
+            let _ = tx.send(HostMsg::File(FileMsg::Progress { id, bytes: sent }));
+        }
         super::filewin::outgoing_bytes(id, sent);
     }
     write_side_chunk(&mut uni, &[]).await?;

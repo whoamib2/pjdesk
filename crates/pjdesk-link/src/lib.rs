@@ -5,6 +5,7 @@
 //! that has to stay identical, including on Android.
 
 pub mod admit;
+pub mod fileflow;
 pub mod lockout;
 pub mod p2p;
 pub mod session;
