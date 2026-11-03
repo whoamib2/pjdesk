@@ -764,6 +764,19 @@ pub const SIGN_IN_EXPIRED: &str = "Your sign-in expired";
 
 /// The sentence shown when that server refused registration or an account write.
 /// `version` is empty when the server did not say which build it is running.
+/// "Sign in required" from an account request. A 0.6.52 or newer server
+/// already handles signed-in accounts, so there it means that server's copy
+/// of the account does not know this computer's sign-in (new or not yet
+/// mirrored). Only an older or unknown server is told to update.
+pub fn account_sign_in_refusal(addr: &str, version: &str) -> String {
+    if crate::update::version_at_least(version.trim(), "0.6.52") {
+        let host = crate::routes::display_host(addr);
+        let host = if host.is_empty() { "the server".to_string() } else { format!("the server at {host}") };
+        return format!("Waiting for {host} to learn this computer's sign-in.");
+    }
+    sign_in_required_notice(addr, version)
+}
+
 pub fn sign_in_required_notice(addr: &str, version: &str) -> String {
     let host = crate::routes::display_host(addr);
     let host = if host.is_empty() { "this address" } else { host.as_str() };
@@ -1156,5 +1169,17 @@ mod tests {
         assert_eq!(next_reconnect_delay(RECONNECT_CAP), RECONNECT_CAP);
         let paused = jitter_reconnect(Duration::from_secs(4));
         assert!(paused >= Duration::from_millis(3200) && paused <= Duration::from_millis(4800), "{paused:?}");
+    }
+}
+
+#[cfg(test)]
+mod account_refusal_tests {
+    #[test]
+    fn a_current_server_is_not_told_to_update() {
+        let text = super::account_sign_in_refusal("10.0.0.20:21118", "0.6.83");
+        assert!(!text.contains("Update it"), "{text}");
+        assert!(text.contains("10.0.0.20"), "{text}");
+        assert!(super::account_sign_in_refusal("10.0.0.20:21118", "0.6.40").contains("Update it to 0.6.52"));
+        assert!(super::account_sign_in_refusal("10.0.0.20:21118", "").contains("Update it to 0.6.52"));
     }
 }

@@ -431,7 +431,7 @@ fn fetch_password_vault_cloud(refresh: &str, device_id: &str) -> Result<String> 
     Ok(parsed.vault)
 }
 
-pub fn fetch_app_lock(refresh: &str, device_id: &str) -> Result<(String, u64)> {
+fn fetch_app_lock_server(refresh: &str, device_id: &str) -> Result<(String, u64)> {
     if let Ok(pjdesk_proto::signal::ServerMsg::AccountResult { ok: true, app_lock, app_lock_updated, .. }) =
         account_rpc(pjdesk_proto::signal::ClientMsg::Account {
             op: "lock-read".into(),
@@ -452,7 +452,6 @@ pub fn fetch_app_lock(refresh: &str, device_id: &str) -> Result<(String, u64)> {
     bail!("No PJDesk server answered.");
 }
 
-#[allow(dead_code)]
 fn fetch_app_lock_cloud(refresh: &str, device_id: &str) -> Result<(String, u64)> {
     let text = post_json(
         &format!("{}/api/network/app-lock", api_base()),
@@ -463,7 +462,55 @@ fn fetch_app_lock_cloud(refresh: &str, device_id: &str) -> Result<(String, u64)>
     Ok((parsed.lock, parsed.updated_at))
 }
 
+/// Reads the account PIN. The server's account copy answers first. A computer
+/// signed in through pjdesk.com may not be in that copy yet, so pjdesk.com is
+/// asked when the server cannot answer for this sign-in.
+pub fn fetch_app_lock(refresh: &str, device_id: &str) -> Result<(String, u64)> {
+    let server = match fetch_app_lock_server(refresh, device_id) {
+        Ok(found) => return Ok(found),
+        Err(err) => err,
+    };
+    if !cloud_fallback_allowed() {
+        return Err(server);
+    }
+    match fetch_app_lock_cloud(refresh, device_id) {
+        Ok(found) => {
+            note_cloud_ok();
+            Ok(found)
+        }
+        Err(_) => Err(server),
+    }
+}
+
+/// Saves the account PIN, on the server's account copy or else pjdesk.com.
 pub fn put_app_lock(refresh: &str, device_id: &str, lock: &str) -> Result<u64> {
+    let server = match put_app_lock_server(refresh, device_id, lock) {
+        Ok(updated) => return Ok(updated),
+        Err(err) => err,
+    };
+    if !cloud_fallback_allowed() {
+        return Err(server);
+    }
+    match put_app_lock_cloud(refresh, device_id, lock) {
+        Ok(updated) => {
+            note_cloud_ok();
+            Ok(updated)
+        }
+        Err(_) => Err(server),
+    }
+}
+
+fn put_app_lock_cloud(refresh: &str, device_id: &str, lock: &str) -> Result<u64> {
+    let text = post_json(
+        &format!("{}/api/network/app-lock", api_base()),
+        None,
+        &serde_json::json!({ "refresh": refresh, "device_id": device_id, "lock": lock }),
+    )?;
+    let parsed: LockReply = serde_json::from_str(&text).context("the account sent an unexpected app lock reply")?;
+    Ok(parsed.updated_at.max(1))
+}
+
+fn put_app_lock_server(refresh: &str, device_id: &str, lock: &str) -> Result<u64> {
     match account_rpc_meta(pjdesk_proto::signal::ClientMsg::Account {
         op: "lock-write".into(),
         email: String::new(),
@@ -509,7 +556,7 @@ pub fn put_app_lock(refresh: &str, device_id: &str, lock: &str) -> Result<u64> {
 
 fn account_refusal(host: &str, version: &str, message: &str) -> String {
     if pjdesk_proto::signal::is_sign_in_required(message) {
-        return pjdesk_proto::signal::sign_in_required_notice(host, version);
+        return pjdesk_proto::signal::account_sign_in_refusal(host, version);
     }
     let message = message.trim();
     if message.is_empty() {
