@@ -394,9 +394,23 @@ fun UnlockScreen(
             onCopyPassword = onCopyPassword,
             onRefreshPassword = onRefreshPassword,
         )
+        Spacer(Modifier.size(16.dp))
+        LockVersion()
         Spacer(Modifier.size(12.dp))
     }
     }
+}
+
+internal fun lockVersionLabel(versionName: String?): String =
+    if (versionName.isNullOrBlank()) "PJDesk" else "PJDesk $versionName"
+
+@Composable
+private fun LockVersion() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val label = androidx.compose.runtime.remember {
+        lockVersionLabel(runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull())
+    }
+    Text(label, color = pjMuted(), style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
 }
 
 /** ID and one-time password the PIN screen may show. Same rule as the Windows lock screen. */

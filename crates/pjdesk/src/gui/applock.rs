@@ -833,6 +833,8 @@ impl App {
                             self.start_reauth();
                         }
                     }
+                    ui.add_space(16.0);
+                    ui.label(RichText::new(lock_version_label()).size(11.5).color(p.muted));
                 });
                 });
             });
@@ -2016,5 +2018,19 @@ mod tests {
         let second = create(&reset, 300, 2).unwrap();
         assert!(matches(&second, &super::digits_only(&type_into(super::pin_key_field, "731946"))));
         assert!(!matches(&second, &typed), "the old PIN no longer unlocks after a reset");
+    }
+}
+
+/// Subtle version line shown at the bottom of the PIN screen.
+pub(super) fn lock_version_label() -> String {
+    format!("PJDesk {}", env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(test)]
+mod version_label_tests {
+    #[test]
+    fn lock_screen_shows_package_version() {
+        assert_eq!(super::lock_version_label(), format!("PJDesk {}", env!("CARGO_PKG_VERSION")));
+        assert!(super::lock_version_label().starts_with("PJDesk 0."));
     }
 }

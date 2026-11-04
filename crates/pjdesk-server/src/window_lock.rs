@@ -327,6 +327,9 @@ impl Gate {
                         self.start_reauth();
                     }
                 }
+
+                ui.add_space(16.0);
+                ui.label(RichText::new(version_label()).size(11.5).color(p.muted));
             });
         });
     }
@@ -905,5 +908,18 @@ mod dpapi {
             CryptUnprotectData(&input, None, None, None, None, 0x1, &mut output).ok()?;
             Some(take(output))
         }
+    }
+}
+
+/// Subtle version line shown on the window lock screen.
+fn version_label() -> String {
+    format!("PJDesk Server {}", env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(test)]
+mod version_label_tests {
+    #[test]
+    fn unlock_screen_shows_package_version() {
+        assert_eq!(super::version_label(), format!("PJDesk Server {}", env!("CARGO_PKG_VERSION")));
     }
 }
