@@ -33,6 +33,7 @@ pub mod peer;
 pub mod perms;
 pub mod quality;
 pub mod record;
+pub mod sessionnote;
 pub mod signal;
 pub mod tls;
 pub mod trayshow;

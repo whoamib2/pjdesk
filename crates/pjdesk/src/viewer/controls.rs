@@ -109,6 +109,8 @@ pub struct Live {
     pub move_primary: String,
     /// The person at the computer ended the session. Do not open it again.
     pub host_ended: bool,
+    /// Session-state banner (lock screen, Remote Desktop…) and when it fades.
+    pub session_banner: Option<(String, std::time::Instant)>,
     pub closed: Option<String>,
     /// The phone's accessibility service is off, so clicks do not land.
     pub control_off: bool,
@@ -156,6 +158,7 @@ impl Live {
             resume_relay: false,
             move_primary: String::new(),
             host_ended: false,
+            session_banner: None,
             closed: None,
             control_off: false,
             saved: Vec::new(),
@@ -211,6 +214,7 @@ impl Live {
             resume_relay: self.resume_relay,
             move_primary: self.move_primary.clone(),
             host_ended: self.host_ended,
+            session_banner: self.session_banner.clone(),
             closed: self.closed.clone(),
             control_off: self.control_off,
             saved: Vec::new(),
@@ -541,6 +545,18 @@ fn on_host(
                 g.control_off = false;
                 crate::note_status(&text);
                 g.note(text);
+            } else if pjdesk_proto::sessionnote::is_session_state(&text) {
+                // Information only: a fading banner, never a dialog, and the
+                // session stays open. The same notice twice in a row is shown once.
+                let repeat = g.notices.last().is_some_and(|last| *last == text);
+                if !repeat {
+                    crate::note_status(&format!("Host: {text}"));
+                    g.session_banner = Some((
+                        text.clone(),
+                        std::time::Instant::now() + std::time::Duration::from_secs(pjdesk_proto::sessionnote::BANNER_SECS),
+                    ));
+                    g.note(text);
+                }
             } else if pjdesk_proto::failover::host_ended_the_session(&text) {
                 g.host_ended = true;
                 crate::note_status(&text);

@@ -282,7 +282,10 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
     let mut facts_checked = Instant::now();
     let mut facts_problem: Option<String> = SessionFacts::now().problem();
     if let Some(p) = &facts_problem {
-        session.notify(&format!("Remote session: {p}"));
+        warn!("Session state: {p}");
+        if let Some(state) = SessionFacts::now().state() {
+            session.notify(&pjdesk_proto::sessionnote::text(&crate::hostname(), state));
+        }
     }
     let mut live_fps = session.fps.load(Ordering::SeqCst);
     let mut live_bitrate = session.bitrate.load(Ordering::SeqCst);
@@ -490,11 +493,16 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
                 match &problem {
                     Some(p) => {
                         warn!("Session state: {p}");
-                        session.notify(&format!("Remote session: {p}"));
+                        if let Some(state) = SessionFacts::now().state() {
+                            session.notify(&pjdesk_proto::sessionnote::text(&crate::hostname(), state));
+                        }
                     }
                     None => {
                         info!("Session state is normal again");
-                        session.notify("The remote session is back on the screen.");
+                        session.notify(&pjdesk_proto::sessionnote::text(
+                            &crate::hostname(),
+                            pjdesk_proto::sessionnote::SessionState::Back,
+                        ));
                         shared.keyframe_requested.store(true, Ordering::SeqCst);
                     }
                 }
@@ -641,6 +649,24 @@ impl SessionFacts {
     #[cfg(not(windows))]
     pub fn now() -> SessionFacts {
         SessionFacts { monitors: 1, ..Default::default() }
+    }
+
+    /// The short state the controller is told about, matching [`Self::problem`].
+    pub fn state(&self) -> Option<pjdesk_proto::sessionnote::SessionState> {
+        use pjdesk_proto::sessionnote::SessionState as S;
+        if self.session == Some(0) {
+            Some(S::NoDesktop)
+        } else if self.remote {
+            Some(S::RemoteDesktop)
+        } else if self.disconnected {
+            Some(S::NotOnScreen)
+        } else if self.console.is_some_and(|c| Some(c) != self.session) {
+            Some(S::OtherSession)
+        } else if self.monitors <= 0 {
+            Some(S::NoMonitor)
+        } else {
+            None
+        }
     }
 
     /// A plain reason when this session can't show a normal desktop, else None.

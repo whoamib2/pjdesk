@@ -1001,6 +1001,11 @@ impl App {
                 super::controls::CONTROL_OFF,
             );
         }
+        if let Some((text, until)) = &snap.session_banner {
+            if std::time::Instant::now() < *until && !snap.control_off {
+                toolbar::draw_info_banner(&mut buffer, win_w, win_h, origin as f32, text);
+            }
+        }
         self.panel.draw(&mut buffer, win_w, win_h, &snap);
         if confirm {
             toolbar::draw_confirm_close(&mut buffer, win_w, win_h, open.max(2), light);
@@ -3454,6 +3459,20 @@ impl ApplicationHandler<UserEvent> for App {
         // Chat and files windows and incoming lines are checked a few times a second.
         self.pump_files();
         if self.pump_chats() {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+        // Fade the session-state banner once its time is up (one redraw).
+        let faded = {
+            let mut live = self.live.lock().unwrap();
+            let done = live.session_banner.as_ref().is_some_and(|(_, until)| Instant::now() >= *until);
+            if done {
+                live.session_banner = None;
+            }
+            done
+        };
+        if faded {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }

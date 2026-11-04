@@ -429,6 +429,7 @@ impl HostState {
 
     /// Publishes the current password to the UI handle, if any.
     fn publish_password(&self) {
+        otp_carry::save(&self.password.lock().unwrap());
         if let Some(shared) = &self.shared {
             *shared.password.lock().unwrap() = self.password.lock().unwrap().clone();
             shared.permanent_set.store(self.permanent.lock().unwrap().is_some(), Ordering::SeqCst);
@@ -637,7 +638,7 @@ async fn host_main(
 ) -> Result<()> {
     let state = Arc::new(HostState {
         identity: TlsIdentity::generate(PEER_SERVER_NAME)?,
-        password: Mutex::new(generate_password()),
+        password: Mutex::new(otp_carry::load().unwrap_or_else(generate_password)),
         permanent: Mutex::new(args.permanent_password.clone().filter(|p| !p.trim().is_empty())),
         support_code: Mutex::new(String::new()),
         support_password: Mutex::new(String::new()),
@@ -2042,5 +2043,62 @@ mod permanent_tests {
         assert_eq!(super::fresh_permanent(old.clone(), false, None), None, "removed in settings");
         assert_eq!(super::fresh_permanent(old.clone(), true, None), old, "unreadable blob keeps the current one");
         assert_eq!(super::fresh_permanent(None, true, Some("  ".into())), None);
+    }
+}
+
+/// The service restarts the session-host helper whenever Windows moves the
+/// console to another session (lock screen, tscon, user switch). A helper that
+/// made a new one-time password then refused the controller's automatic
+/// reconnect with "wrong password", and three misses rotated it again and
+/// started a lockout. The helper now carries the password over, sealed with
+/// machine DPAPI, in the locked service folder, for a short while.
+mod otp_carry {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const MAX_AGE: Duration = Duration::from_secs(30 * 60);
+
+    fn path() -> Option<std::path::PathBuf> {
+        // Only the service-run helper; a user-run host keeps its own password.
+        std::env::var_os("PJDESK_CONFIG")?;
+        Some(crate::config::Config::path().parent()?.join("otp-carry"))
+    }
+
+    fn now() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    }
+
+    pub(super) fn save(password: &str) {
+        let Some(path) = path() else { return };
+        if password.trim().is_empty() {
+            return;
+        }
+        let sealed = crate::secure::protect_machine(password);
+        if sealed.is_empty() {
+            return;
+        }
+        let _ = std::fs::write(path, format!("{}\n{sealed}", now()));
+    }
+
+    pub(super) fn load() -> Option<String> {
+        let text = std::fs::read_to_string(path()?).ok()?;
+        parse(&text, now()).and_then(|sealed| crate::secure::reveal(sealed)).filter(|p| !p.trim().is_empty())
+    }
+
+    /// The sealed value when the carry file is recent enough.
+    pub(super) fn parse(text: &str, now: u64) -> Option<&str> {
+        let (stamp, sealed) = text.split_once('\n')?;
+        let stamp: u64 = stamp.trim().parse().ok()?;
+        (now >= stamp && now - stamp <= MAX_AGE.as_secs() && !sealed.trim().is_empty()).then_some(sealed.trim())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn carry_expires() {
+            assert_eq!(super::parse("100\ndpapi:ab", 200), Some("dpapi:ab"));
+            assert_eq!(super::parse("100\ndpapi:ab", 100 + 31 * 60), None);
+            assert_eq!(super::parse("300\ndpapi:ab", 200), None);
+            assert_eq!(super::parse("junk", 200), None);
+        }
     }
 }

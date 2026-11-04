@@ -374,8 +374,15 @@ pub fn retry_countdown(wait_secs: u64, trying: bool) -> String {
 
 /// The person at the computer, or the phone, ended the session on purpose.
 pub fn host_ended_the_session(notice: &str) -> bool {
+    // Session-state notices (lock screen, Remote Desktop, tscon) never end the
+    // session. 0.6.86 hosts sent "Remote session: the Windows session (session
+    // 3) is disconnected…", which used to match "disconnected" here, closed
+    // the viewer and turned off automatic reconnect.
+    if crate::sessionnote::is_session_state(notice) {
+        return false;
+    }
     let lower = notice.to_ascii_lowercase();
-    lower.contains("disconnected") || lower.contains("stopped sharing")
+    lower.contains("person at this computer disconnected") || lower.contains("stopped sharing")
 }
 
 /// A relayed session moves to the primary. Every other path stays up.
@@ -1015,6 +1022,10 @@ mod tests {
         assert!(host_ended_the_session("The person at this computer disconnected"));
         assert!(host_ended_the_session("The phone stopped sharing"));
         assert!(!host_ended_the_session("Reconnecting…"));
+        assert!(!host_ended_the_session(
+            "Remote session: the Windows session (session 3) is disconnected, usually after Remote Desktop was closed"
+        ));
+        assert!(!host_ended_the_session("CABINSIGHTHOUND is at the Windows sign-in screen."));
         assert_eq!(standby_result("CHIP20", 7), "Now standby; CHIP20 is primary, gen 7");
         assert_eq!(standby_result("  ", 7), "Now standby; the other server is primary, gen 7");
         assert_eq!(primary_result(7, "BENLENOVODESK"), "Now primary, gen 7. BENLENOVODESK is standby.");

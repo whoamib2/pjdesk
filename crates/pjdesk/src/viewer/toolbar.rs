@@ -439,6 +439,13 @@ pub(crate) fn draw_banner(buf: &mut [u32], win_w: usize, win_h: usize, y: f32, t
     draw_text(buf, win_w, win_h, 16.0, y + 10.0, text, 0xFF_ff_d0_c8);
 }
 
+/// A quiet, non-blocking information strip (session state). Fades on its own.
+pub(crate) fn draw_info_banner(buf: &mut [u32], win_w: usize, win_h: usize, y: f32, text: &str) {
+    fill_rect(buf, win_w, win_h, 0.0, y, win_w as f32, 30.0, 0xD8_1b_22_2e);
+    let shown: String = text.chars().take(140).collect();
+    draw_text(buf, win_w, win_h, 16.0, y + 8.0, &shown, 0xFF_e6_ec_f5);
+}
+
 pub struct Toolbar {
     buttons: Vec<Button>,
     menus: Vec<Menu>,
