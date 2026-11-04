@@ -123,8 +123,10 @@ mod platform {
     use super::Rect;
 
     /// Sends the inputs; true if Windows accepted all of them.
+    /// Goes through the dedicated input thread, which follows the input
+    /// desktop and the SYSTEM input agent (see `host::inputroute`).
     fn send(inputs: &[INPUT]) -> bool {
-        unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) as usize == inputs.len() }
+        crate::host::inputwin::submit(inputs, None)
     }
 
     fn mouse(dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
@@ -159,12 +161,15 @@ mod platform {
         if vw <= 0 || vh <= 0 {
             return false;
         }
-        send(&[mouse(
-            normalize(px - vx, vw),
-            normalize(py - vy, vh),
-            0,
-            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-        )])
+        crate::host::inputwin::submit(
+            &[mouse(
+                normalize(px - vx, vw),
+                normalize(py - vy, vh),
+                0,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            )],
+            Some((px as i32, py as i32)),
+        )
     }
 
     /// Returns the button's resulting state as Windows saw it (`down` if

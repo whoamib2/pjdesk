@@ -208,6 +208,10 @@ pub async fn run(
                     let _ = write_msg(&mut control_send, &HostMsg::Notice("The person at this computer disconnected".into())).await;
                     break Ok(());
                 }
+                // Input self-check: tell the viewer once when moves stop landing.
+                if let Some(problem) = super::inputroute::take_problem() {
+                    let _ = write_msg(&mut control_send, &HostMsg::Notice(problem)).await;
+                }
                 if let Err(e) = session.poll_local(&mut control_send).await {
                     break Err(e);
                 }

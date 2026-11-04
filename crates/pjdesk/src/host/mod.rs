@@ -7,6 +7,9 @@ mod ctrl;
 pub(crate) mod direct;
 mod encoder;
 mod input;
+pub mod inputroute;
+#[cfg(windows)]
+pub mod inputwin;
 pub(crate) mod notice;
 mod stream;
 

@@ -307,6 +307,7 @@ mod imp {
         let mut child: Option<Child> = None;
         let mut spawned_at = Instant::now();
         let mut quick_failures: u32 = 0;
+        let mut agent: Option<(u32, Child, Instant)> = None;
 
         loop {
             if stop_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
@@ -316,6 +317,22 @@ mod imp {
             let active = unsafe { WTSGetActiveConsoleSessionId() };
             if active == u32::MAX {
                 continue; // No console session right now (fast user switching, etc.).
+            }
+            // The SYSTEM input agent follows the console session on its own
+            // schedule, so a helper restart never leaves input without it.
+            let agent_ok = matches!(&agent, Some((s, c, _)) if *s == active && c.is_alive());
+            let agent_due = agent.as_ref().is_none_or(|(s, _, at)| *s != active || at.elapsed() >= Duration::from_secs(3));
+            if !agent_ok && agent_due {
+                if let Some((_, mut c, _)) = agent.take() {
+                    c.kill();
+                }
+                match spawn_input_agent(active) {
+                    Ok(c) => {
+                        tracing::info!("Launched input agent in session {active}");
+                        agent = Some((active, c, Instant::now()));
+                    }
+                    Err(e) => tracing::warn!("could not launch input agent in session {active}: {e:#}"),
+                }
             }
             let session_changed = active != current_session;
             let child_dead = child.as_ref().map(|c| !c.is_alive()).unwrap_or(true);
@@ -362,6 +379,9 @@ mod imp {
         if let Some(mut c) = child.take() {
             c.kill();
         }
+        if let Some((_, mut c, _)) = agent.take() {
+            c.kill();
+        }
         // Mark offline for the GUI.
         crate::syspaths::ServiceStatus::now(None, false, None, None, false).write();
     }
@@ -402,6 +422,17 @@ mod imp {
     /// session, and start the helper on that session's default desktop. Running
     /// as SYSTEM is what lets the helper reach the secure desktop.
     fn spawn_session_host(session_id: u32) -> Result<Child> {
+        spawn_in_session(session_id, false)
+    }
+
+    /// Launches `pjdesk __input-agent` as LocalSystem in `session_id`. The
+    /// helper (usually running as the user) hands its input to it, so input
+    /// reaches elevated windows (UIPI) and the secure desktop.
+    fn spawn_input_agent(session_id: u32) -> Result<Child> {
+        spawn_in_session(session_id, true)
+    }
+
+    fn spawn_in_session(session_id: u32, input_agent: bool) -> Result<Child> {
         unsafe {
             // Prefer the interactive user's own token for this session: the
             // helper then runs exactly like the user's own app — stable, and
@@ -409,7 +440,7 @@ mod imp {
             // as LocalSystem. Only when nobody is signed in (the lock / sign-in
             // screen) do we fall back to a SYSTEM token so we stay reachable.
             let mut token = HANDLE::default();
-            let as_user = WTSQueryUserToken(session_id, &mut token).is_ok();
+            let as_user = !input_agent && WTSQueryUserToken(session_id, &mut token).is_ok();
             if !as_user {
                 let mut proc_token = HANDLE::default();
                 OpenProcessToken(GetCurrentProcess(), TOKEN_ACCESS_MASK(TOKEN_ALL_ACCESS.0), &mut proc_token)
@@ -445,8 +476,12 @@ mod imp {
                 }
             };
             let cfg_path = crate::syspaths::service_config_path();
-            let mut cmdline: Vec<u16> =
+            let line = if input_agent {
+                format!("\"{}\" __input-agent", exe.display())
+            } else {
                 format!("\"{}\" __session-host --config \"{}\"", exe.display(), cfg_path.display())
+            };
+            let mut cmdline: Vec<u16> = line
                     .encode_utf16()
                     .chain(std::iter::once(0))
                     .collect();
