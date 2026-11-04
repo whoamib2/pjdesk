@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.88
+
+- Fixed: the keyboard-shortcut menu. Ctrl+Alt+Del is now sent by the PJDesk service (only Windows' SYSTEM account may send it; the service also allows this in Windows policy when no policy is set), and you get a message if it cannot be sent. Win+L locks the remote computer, the Windows key and Win+D/Win+E work, and Task Manager opens for administrators. Clicking a menu item no longer sends a stray mouse click to the remote computer.
+- Ctrl+Alt+End on your keyboard sends Ctrl+Alt+Del to the remote computer, as in Remote Desktop.
+- Clipboard images: images copied on your computer now go to the remote computer automatically, like text, and images over 256 KB (up to 4 MB) now arrive in both directions. Large images travel beside the session so typing never waits.
+- Faster end of file transfers: the file is checked while it arrives instead of being read again at the end, the last part is no longer held back, and the row shows "Finishing…" instead of a falling speed and growing time left.
+
 ## 0.6.87
 
 - Fixed: when the remote computer went to the lock screen or switched Windows sessions (for example after Remote Desktop or tscon), a "Remote session" notice appeared as a dialog, and its Close button ended the session, and reconnecting then failed with a wrong password. Session notices are now a short banner that fades on its own, and the session stays open and reconnects by itself. The host keeps its one-time password when it moves to the new session.
