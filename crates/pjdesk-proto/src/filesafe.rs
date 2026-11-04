@@ -264,6 +264,21 @@ pub fn finish_receive_checked(root: &Path, name: &str, expected: Option<[u8; 32]
     finish_receive(root, name)
 }
 
+/// Like [`finish_receive_checked`], with the SHA-256 the receiver computed
+/// while the bytes arrived, so the finish does not read the whole file again
+/// (a 310 MB file took many seconds at "310 MB of 310 MB").
+pub fn finish_receive_hashed(root: &Path, name: &str, expected: Option<[u8; 32]>, got: [u8; 32]) -> Result<PathBuf> {
+    if let Some(want) = expected {
+        if got != want {
+            let final_path = join_under(root, name)?;
+            let _ = fs::remove_file(partial_path(&final_path));
+            let _ = fs::remove_file(meta_path(&final_path));
+            bail!("the file arrived damaged (checksum mismatch); Retry sends it again");
+        }
+    }
+    finish_receive(root, name)
+}
+
 /// Removes partial files (and their sidecars) in `root` not written for
 /// `max_age`. Returns how many partial files went.
 pub fn sweep_stale(root: &Path, max_age: std::time::Duration) -> usize {
@@ -489,5 +504,31 @@ pub fn set_hidden(path: &Path, hidden: bool) {
     #[cfg(not(windows))]
     {
         let _ = (path, hidden);
+    }
+}
+
+#[cfg(test)]
+mod hashed_finish_tests {
+    use super::*;
+    use sha2::Digest;
+
+    #[test]
+    fn the_running_hash_saves_without_rereading_and_catches_damage() {
+        let root = std::env::temp_dir().join(format!("pjd-hashed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let (mut f, _) = open_for_receive(&root, "a.bin", 0).unwrap();
+        std::io::Write::write_all(&mut f, b"hello").unwrap();
+        drop(f);
+        let good: [u8; 32] = Sha256::digest(b"hello").into();
+        let saved = finish_receive_hashed(&root, "a.bin", Some(good), good).unwrap();
+        assert_eq!(fs::read(&saved).unwrap(), b"hello");
+        let (mut f, _) = open_for_receive(&root, "b.bin", 0).unwrap();
+        std::io::Write::write_all(&mut f, b"hellO").unwrap();
+        drop(f);
+        let bad: [u8; 32] = Sha256::digest(b"hellO").into();
+        assert!(finish_receive_hashed(&root, "b.bin", Some(good), bad).is_err());
+        assert!(!root.join("b.bin").exists());
+        let _ = fs::remove_dir_all(&root);
     }
 }

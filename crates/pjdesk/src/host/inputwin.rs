@@ -66,6 +66,22 @@ fn from_rec(r: &Rec) -> INPUT {
 
 /// Sends `inputs` on the input thread; true if Windows accepted all of them.
 /// `want` is the pixel an absolute move should land on (for the self-check).
+/// Ctrl+Alt+Del: through the SYSTEM input agent when it is running, else
+/// directly (only works when this process is SYSTEM). True when sent.
+pub fn send_sas() -> bool {
+    if let Some(session) = crate::platform::session_id() {
+        let name = inputroute::agent_pipe_name(session);
+        if let Ok(mut pipe) = std::fs::OpenOptions::new().read(true).write(true).open(&name) {
+            let mut reply = [0u8; 5];
+            if pipe.write_all(&inputroute::encode(&inputroute::sas_request())).is_ok() && pipe.read_exact(&mut reply).is_ok() {
+                return reply[0] == 1;
+            }
+            tracing::warn!("Ctrl+Alt+Del: the input agent did not answer (older agent?)");
+        }
+    }
+    crate::platform::send_ctrl_alt_del()
+}
+
 pub fn submit(inputs: &[INPUT], want: Option<(i32, i32)>) -> bool {
     let queue = QUEUE.get_or_init(|| {
         let (tx, rx) = sync_channel::<Req>(256);
@@ -373,6 +389,13 @@ fn serve_client(pipe: windows::Win32::Foundation::HANDLE) {
             return;
         }
         let Some(recs) = inputroute::decode(&body) else { return };
+        if inputroute::is_sas(&recs) {
+            let ok = crate::platform::send_ctrl_alt_del();
+            if unsafe { WriteFile(pipe, Some(&inputroute::encode_reply(ok, 0)), None, None) }.is_err() {
+                return;
+            }
+            continue;
+        }
         let inputs: Vec<INPUT> = recs.iter().map(from_rec).collect();
         let (ok, err) = send_following(&mut desk, &inputs);
         let reply = inputroute::encode_reply(ok, err);

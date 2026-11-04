@@ -458,6 +458,9 @@ pub struct Toolbar {
     hovered_button: Option<usize>,
     /// The button under a held mouse press, drawn pushed in.
     pressed: Option<usize>,
+    /// The last left press landed on the toolbar or its menu, so its release
+    /// belongs to the toolbar too and must not reach the remote computer.
+    pub ate_press: bool,
     open: Option<usize>,
     hovered_item: Option<usize>,
     /// True while input forwarding is suppressed ("view only" from this side).
@@ -509,6 +512,7 @@ impl Default for Toolbar {
             width,
             collapsed_w,
             pressed: None,
+            ate_press: false,
             visible: true,
             collapsed: false,
             hovered_button: None,

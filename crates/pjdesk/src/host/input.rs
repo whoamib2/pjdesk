@@ -259,6 +259,12 @@ mod platform {
                 0xE11D => keyboard(VK_PAUSE, 0x45, up),
                 0x0045 => keyboard(VK_NUMLOCK, 0x45, up | KEYEVENTF_EXTENDEDKEY),
                 0xE037 => keyboard(VK_SNAPSHOT, 0x37, up | KEYEVENTF_EXTENDEDKEY),
+                // Win and Menu keys: the shell matches its hotkeys (Start,
+                // Win+D, Win+E) by virtual key, so send it with the scan code.
+                0xE05B | 0xE05C | 0xE05D => {
+                    let vk = crate::host::inputroute::vk_for_scan(code).unwrap_or(0);
+                    keyboard(VIRTUAL_KEY(vk), code & 0xFF, up | KEYEVENTF_EXTENDEDKEY)
+                }
                 _ => {
                     let mut flags = up;
                     if code & 0xFF00 == 0xE000 {

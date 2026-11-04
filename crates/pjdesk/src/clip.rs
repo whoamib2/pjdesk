@@ -15,6 +15,14 @@ pub fn get_text() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
 }
 
+/// Hash of the image this process last put on the clipboard, so a watcher
+/// does not send a received image straight back.
+static LAST_SET_IMAGE: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+pub fn image_was_received(hash: u64) -> bool {
+    *LAST_SET_IMAGE.lock().unwrap() == Some(hash)
+}
+
 pub fn set_image(width: usize, height: usize, rgba: &[u8]) {
     if rgba.len() < width.saturating_mul(height).saturating_mul(4) || width == 0 || height == 0 {
         return;
@@ -24,6 +32,7 @@ pub fn set_image(width: usize, height: usize, rgba: &[u8]) {
         height,
         bytes: std::borrow::Cow::Borrowed(rgba),
     };
+    *LAST_SET_IMAGE.lock().unwrap() = Some(image_hash(width, height, rgba));
     if let Ok(mut cb) = arboard::Clipboard::new() {
         let _ = cb.set_image(image);
     }

@@ -262,6 +262,7 @@ mod imp {
     }
 
     fn run_service() -> Result<()> {
+        crate::platform::ensure_software_sas();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let handler = move |control| match control {
             ServiceControl::Stop | ServiceControl::Shutdown => {

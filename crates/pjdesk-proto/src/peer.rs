@@ -336,6 +336,10 @@ pub const CLIP_MAGIC: &[u8; 8] = b"PJCLIP1\0";
 pub const SIDE_CHUNK: usize = 64 * 1024;
 /// Largest clipboard image accepted (PNG).
 pub const MAX_CLIP_IMAGE: u32 = 4 * 1024 * 1024;
+/// Clipboard images up to this size ride inline on the control stream; bigger
+/// ones go on a side stream in SIDE_CHUNK pieces so keystrokes never wait
+/// behind them (and a 256 KiB PNG would not fit a 256 KiB control frame).
+pub const CLIP_INLINE_MAX: usize = 32 * 1024;
 /// Largest inline clipboard text. Larger text is refused rather than split.
 pub const MAX_CLIP_TEXT: usize = 48 * 1024;
 
@@ -1007,6 +1011,16 @@ pub async fn write_side_chunk<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> 
     Ok(())
 }
 
+/// Writes a whole payload as SIDE_CHUNK pieces followed by the end marker.
+/// (A single oversized chunk is refused, which used to drop every clipboard
+/// image over 256 KiB.)
+pub async fn write_side_bytes<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> Result<()> {
+    for chunk in data.chunks(SIDE_CHUNK) {
+        write_side_chunk(w, chunk).await?;
+    }
+    write_side_chunk(w, &[]).await
+}
+
 /// Reads one chunk. `None` is the end marker.
 pub async fn read_side_chunk<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Vec<u8>>> {
     let mut lenb = [0u8; 4];
@@ -1053,5 +1067,35 @@ mod cursor_shape_tests {
         let chat = postcard::to_allocvec(&ControlMsg::ChatLine { text: String::new(), name: String::new(), unix: 0 }).unwrap();
         let shapes = postcard::to_allocvec(&ControlMsg::CursorShapes).unwrap();
         assert_eq!(shapes[0], chat[0] + 1);
+    }
+}
+
+#[cfg(test)]
+mod side_bytes_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_large_clipboard_image_crosses_in_chunks() {
+        let png: Vec<u8> = (0..(4 * 1024 * 1024 + 7)).map(|i| (i % 251) as u8).collect();
+        let mut wire = Vec::new();
+        write_side_bytes(&mut wire, &png).await.unwrap();
+        let mut r = &wire[..];
+        let mut back = Vec::new();
+        let mut chunks = 0;
+        while let Some(c) = read_side_chunk(&mut r).await.unwrap() {
+            assert!(c.len() <= SIDE_CHUNK);
+            back.extend_from_slice(&c);
+            chunks += 1;
+        }
+        assert_eq!(back, png);
+        assert!(chunks > 64);
+    }
+
+    #[tokio::test]
+    async fn an_empty_payload_is_just_the_end_marker() {
+        let mut wire = Vec::new();
+        write_side_bytes(&mut wire, &[]).await.unwrap();
+        let mut r = &wire[..];
+        assert!(read_side_chunk(&mut r).await.unwrap().is_none());
     }
 }

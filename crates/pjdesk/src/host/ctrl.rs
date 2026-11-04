@@ -469,7 +469,16 @@ impl Session {
             return self.deny(send, "keyboard", "keyboard control was not allowed").await;
         }
         match cmd {
-            SpecialCommand::CtrlAltDel => crate::platform::send_ctrl_alt_del(),
+            SpecialCommand::CtrlAltDel => {
+                if !send_sas() {
+                    self.deny(
+                        send,
+                        "ctrl-alt-del",
+                        "Ctrl+Alt+Del needs the PJDesk service on this computer (Settings > Security > Background service)",
+                    )
+                    .await?;
+                }
+            }
             SpecialCommand::Lock => {
                 if !crate::platform::lock_workstation() {
                     self.deny(send, "lock", "this session could not lock Windows").await?;
@@ -809,7 +818,7 @@ impl Session {
             return Ok(());
         }
         info!("clipboard: sending a {w}x{h} image ({} bytes) to the controller", png.len());
-        if png.len() <= 256 * 1024 {
+        if png.len() <= pjdesk_proto::peer::CLIP_INLINE_MAX {
             let byte_len = png.len() as u32;
             return write_msg(send, &HostMsg::Clipboard(Clipboard { kind: ClipKind::ImagePng, bytes: png, byte_len })).await;
         }
@@ -817,8 +826,7 @@ impl Session {
         tokio::spawn(async move {
             if let Ok(mut uni) = conn.open_uni().await {
                 let _ = write_side_header(&mut uni, CLIP_MAGIC, &SideHeader { id: 0, offset: 0, a: w as u32, b: h as u32 }).await;
-                let _ = write_side_chunk(&mut uni, &png).await;
-                let _ = write_side_chunk(&mut uni, &[]).await;
+                let _ = pjdesk_proto::peer::write_side_bytes(&mut uni, &png).await;
                 let _ = uni.finish();
             }
         });
@@ -922,6 +930,14 @@ impl Session {
         let root = PathBuf::from(self.receive_dir.lock().unwrap().trim());
         let (mut file, offset) = filesafe::open_for_receive(&root, &job.name, header.offset)?;
         let mut got = offset;
+        let mut hasher = {
+            let (root, name) = (root.clone(), job.name.clone());
+            tokio::task::spawn_blocking(move || {
+                let part = filesafe::partial_path(&filesafe::join_under(&root, &name)?);
+                filesafe::hash_prefix(&part, offset)
+            })
+            .await??
+        };
         loop {
             let chunk = match read_side_chunk(stream).await {
                 Ok(Some(chunk)) => chunk,
@@ -946,6 +962,7 @@ impl Session {
                 return Ok(());
             }
             file.write_all(&chunk).context("writing the received file")?;
+            filesafe::Digest::update(&mut hasher, &chunk);
             got += chunk.len() as u64;
             if got % (256 * 1024) < chunk.len() as u64 {
                 let _ = self.host_tx.send(HostMsg::File(FileMsg::Progress { id: header.id, bytes: got }));
@@ -954,6 +971,9 @@ impl Session {
         }
         file.flush()?;
         drop(file);
+        // Confirm the tail at once so the sender's last window never waits.
+        let _ = self.host_tx.send(HostMsg::File(FileMsg::Progress { id: header.id, bytes: got }));
+        super::filewin::incoming_progress(header.id, got);
         let mut expected_hash = None;
         if header.a & filesafe::HASH_TRAILER != 0 {
             let mut trailer = [0u8; 32];
@@ -972,7 +992,8 @@ impl Session {
         }
         let check = {
             let (root, name) = (root.clone(), job.name.clone());
-            tokio::task::spawn_blocking(move || filesafe::finish_receive_checked(&root, &name, expected_hash)).await?
+            let digest: [u8; 32] = filesafe::Digest::finalize(hasher).into();
+            tokio::task::spawn_blocking(move || filesafe::finish_receive_hashed(&root, &name, expected_hash, digest)).await?
         };
         let saved = match check {
             Ok(saved) => saved,
@@ -1097,11 +1118,28 @@ fn clip_line(text: &str, max: usize) -> String {
     text.chars().filter(|c| *c != '\n' && *c != '\r' && !c.is_control()).take(max).collect()
 }
 
+fn send_sas() -> bool {
+    #[cfg(windows)]
+    {
+        super::inputwin::send_sas()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn open_task_manager() -> bool {
     #[cfg(windows)]
     {
+        // Task Manager asks for the highest privileges, so CreateProcess
+        // fails with ERROR_ELEVATION_REQUIRED for administrators. The shell
+        // starts it the way the Start menu does.
         use std::os::windows::process::CommandExt;
-        return std::process::Command::new("taskmgr.exe").creation_flags(0x0800_0000).spawn().is_ok();
+        if std::process::Command::new("taskmgr.exe").creation_flags(0x0800_0000).spawn().is_ok() {
+            return true;
+        }
+        return crate::platform::shell_open("taskmgr.exe", "");
     }
     #[cfg(not(windows))]
     {
@@ -1142,11 +1180,12 @@ async fn send_file_bytes(
     let mut sent = resume;
     let mut reported = resume;
     loop {
-        pacer.wait(sent).await;
+        // Read first so the end marker is never held for the last window.
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
+        pacer.wait(sent).await;
         if super::filewin::cancelled(id) {
             let _ = uni.reset(0u32.into());
             super::filewin::outgoing_state(id, sent, "cancelled");

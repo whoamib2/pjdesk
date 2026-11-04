@@ -1295,8 +1295,12 @@ impl App {
     }
 
     fn send_combo(&mut self, combo: Combo) {
-        if combo == Combo::CtrlAltDel {
-            let _ = self.control.send(ControlMsg::Special(SpecialCommand::CtrlAltDel));
+        // Keys Windows will not take from SendInput go through the host's
+        // own commands: Ctrl+Alt+Del is the secure attention sequence
+        // (SendSAS from the SYSTEM agent) and Win+L is handled by Windows
+        // logon only (LockWorkStation on the host).
+        if let Some(cmd) = combo_special(combo) {
+            let _ = self.control.send(ControlMsg::Special(cmd));
             return;
         }
         // PC/AT set-1 scan codes; 0xE0__ marks an extended key.
@@ -1317,12 +1321,13 @@ impl App {
             Combo::CtrlEsc => &[LCTRL, ESC],
             Combo::WinD => &[LWIN, D],
             Combo::WinE => &[LWIN, E],
-            Combo::WinL => &[LWIN, L],
+            Combo::WinL => &[LWIN, L], // sent as SpecialCommand::Lock above
             Combo::TaskMgr => &[LCTRL, LSHIFT, ESC],
             Combo::AltF4 => &[LALT, F4],
             Combo::PrintScreen => &[PRTSC],
             Combo::CtrlAltDel => return,
         };
+        let _ = L;
         // Clear anything held locally so modifiers don't pile up on the host.
         self.release_all();
         for &scan in keys {
@@ -1419,6 +1424,19 @@ impl App {
         }
         if self.remote_is_android() {
             self.send_android_key(&event, code, down);
+            return;
+        }
+        // Ctrl+Alt+End sends Ctrl+Alt+Del, as Remote Desktop does; End itself
+        // is not forwarded (remembered with scan 0 so its release is dropped).
+        if is_sas_chord(code, down, self.modifiers.control_key(), self.modifiers.alt_key()) {
+            if !event.repeat {
+                let _ = self.control.send(ControlMsg::Special(SpecialCommand::CtrlAltDel));
+            }
+            self.keys_down.insert(code, 0);
+            return;
+        }
+        if !down && self.keys_down.get(&code) == Some(&0) {
+            self.keys_down.remove(&code);
             return;
         }
         let Some(mut scan) = keymap::scancode(code) else { return };
@@ -3672,8 +3690,16 @@ impl ApplicationHandler<UserEvent> for App {
                             window.request_redraw();
                         }
                     }
+                    // A menu item closes its menu on the press, so the release
+                    // lands on the picture. It was never pressed there: a lone
+                    // button-up sent to the remote computer could cancel the
+                    // shortcut just sent (Alt+Tab switcher, Start menu).
+                    if state == ElementState::Released && std::mem::take(&mut self.toolbar.ate_press) {
+                        return;
+                    }
                     if self.toolbar.covers(self.cursor_px.0, self.cursor_px.1, win_w) {
                         if state == ElementState::Pressed {
+                            self.toolbar.ate_press = true;
                             let folded = self.toolbar.is_collapsed();
                             let clicked = self.toolbar.click(self.cursor_px.0, self.cursor_px.1, win_w);
                             if folded != self.toolbar.is_collapsed() {
@@ -3910,5 +3936,42 @@ mod black_tests {
         assert_eq!(black_retry_delay(0), Duration::from_secs(1));
         assert_eq!(black_retry_delay(3), Duration::from_secs(8));
         assert_eq!(black_retry_delay(30), Duration::from_secs(15));
+    }
+}
+
+/// Shortcuts the host runs as commands instead of injected keys.
+pub(crate) fn is_sas_chord(code: KeyCode, down: bool, ctrl: bool, alt: bool) -> bool {
+    down && ctrl && alt && code == KeyCode::End
+}
+
+pub(crate) fn combo_special(combo: Combo) -> Option<SpecialCommand> {
+    match combo {
+        Combo::CtrlAltDel => Some(SpecialCommand::CtrlAltDel),
+        Combo::WinL => Some(SpecialCommand::Lock),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod combo_tests {
+    #[test]
+    fn ctrl_alt_end_is_ctrl_alt_del() {
+        use super::is_sas_chord;
+        use winit::keyboard::KeyCode;
+        assert!(is_sas_chord(KeyCode::End, true, true, true));
+        assert!(!is_sas_chord(KeyCode::End, true, true, false));
+        assert!(!is_sas_chord(KeyCode::End, false, true, true));
+        assert!(!is_sas_chord(KeyCode::Delete, true, true, true));
+    }
+
+    use super::*;
+
+    #[test]
+    fn secure_shortcuts_are_host_commands() {
+        assert_eq!(combo_special(Combo::CtrlAltDel), Some(SpecialCommand::CtrlAltDel));
+        assert_eq!(combo_special(Combo::WinL), Some(SpecialCommand::Lock));
+        for c in [Combo::Win, Combo::AltTab, Combo::CtrlEsc, Combo::WinD, Combo::WinE, Combo::TaskMgr, Combo::AltF4, Combo::PrintScreen] {
+            assert_eq!(combo_special(c), None);
+        }
     }
 }

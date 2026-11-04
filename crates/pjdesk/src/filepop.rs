@@ -582,6 +582,12 @@ pub mod window {
             "cancelled" => "Cancelled".into(),
             "interrupted" => format!("Interrupted at {} of {size} · resumes when the connection is back", human_bytes(item.bytes)),
             "offering" | "offered" => format!("Waiting · {size}"),
+            "sending" | "downloading" if item.size > 0 && item.bytes >= item.size => {
+                // Every byte is out; what is left is delivery of the last
+                // window and the receiver saving the file. A speed here only
+                // decays and the time left grows, so neither is shown.
+                format!("{size} · Finishing…")
+            }
             "sending" | "downloading" => {
                 let mut s = format!("{} of {size}", human_bytes(item.bytes));
                 if speed > 1.0 {
@@ -671,6 +677,9 @@ mod tests {
         let item = Item { id: 1, name: "a".into(), size: 2_000_000, bytes: 1_000_000, incoming: true, state: "downloading".into() };
         let line = window::status_line(&item, v);
         assert!(line.contains("/s") && line.contains("left"), "{line}");
+        let full = Item { bytes: 2_000_000, ..item.clone() };
+        let line = window::status_line(&full, 21_000.0);
+        assert!(line.contains("Finishing") && !line.contains("/s") && !line.contains("left"), "{line}");
         let bad = Item { state: "disk full".into(), ..item };
         assert!(bad.failed());
         assert_eq!(window::status_line(&bad, 0.0), "Failed: disk full");

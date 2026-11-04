@@ -373,8 +373,9 @@ pub fn start(
     let live_clip = live.clone();
     let control_clip = control;
     let wake_clip = wake;
+    let conn_clip = connection.clone();
     spawn_viewer(async move {
-        clip_watch(live_clip, control_clip, wake_clip).await;
+        clip_watch(live_clip, control_clip, wake_clip, conn_clip).await;
     });
 
     (live, cmd_tx, recorder)
@@ -1074,11 +1075,13 @@ async fn send_bytes(conn: Connection, id: u64, path: &Path, resume: u64, live: &
     let mut buf = vec![0u8; pjdesk_link::fileflow::CHUNK];
     let mut sent = resume;
     loop {
-        pacer.wait(sent).await;
+        // Read first: at the end of the file the pacer must not hold the end
+        // marker back until the last window is confirmed.
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
+        pacer.wait(sent).await;
         if live.lock().unwrap().is_cancelled(id) {
             let _ = uni.reset(0u32.into());
             return Ok(false);
@@ -1283,6 +1286,16 @@ async fn receive_file(
     let root = downloads_dir();
     let (mut file, offset) = filesafe::open_for_receive(&root, &name, header.offset)?;
     let mut got = offset;
+    // Hashed as it arrives (the kept part once, up front), so the finish is
+    // a rename rather than a second read of the whole file.
+    let mut hasher = {
+        let (root, name) = (root.clone(), name.clone());
+        tokio::task::spawn_blocking(move || {
+            let part = filesafe::partial_path(&filesafe::join_under(&root, &name)?);
+            filesafe::hash_prefix(&part, offset)
+        })
+        .await??
+    };
     let interrupted = |live: &Arc<Mutex<Live>>, got: u64| {
         if let Some(t) = live.lock().unwrap().live_transfer(header.id) {
             t.bytes = got;
@@ -1304,6 +1317,7 @@ async fn receive_file(
             return Ok(());
         }
         std::io::Write::write_all(&mut file, &chunk)?;
+        filesafe::Digest::update(&mut hasher, &chunk);
         let before = got;
         got += chunk.len() as u64;
         if let Some(t) = live.lock().unwrap().live_transfer(header.id) {
@@ -1318,6 +1332,8 @@ async fn receive_file(
     }
     std::io::Write::flush(&mut file)?;
     drop(file);
+    // Confirm the tail right away so the sender's last window never waits.
+    let _ = control.send(ControlMsg::File(FileMsg::Progress { id: header.id, bytes: got }));
     let mut expected = None;
     if header.a & filesafe::HASH_TRAILER != 0 {
         let mut trailer = [0u8; 32];
@@ -1329,7 +1345,8 @@ async fn receive_file(
     }
     let saved = {
         let (root, name) = (root.clone(), name.clone());
-        tokio::task::spawn_blocking(move || filesafe::finish_receive_checked(&root, &name, expected)).await?
+        let digest: [u8; 32] = filesafe::Digest::finalize(hasher).into();
+        tokio::task::spawn_blocking(move || filesafe::finish_receive_hashed(&root, &name, expected, digest)).await?
     };
     let mut g = live.lock().unwrap();
     match saved {
@@ -1397,8 +1414,18 @@ async fn listen_tunnel(
     }
 }
 
-async fn clip_watch(live: Arc<Mutex<Live>>, control: mpsc::UnboundedSender<ControlMsg>, wake: Arc<dyn Fn() + Send + Sync>) {
+async fn clip_watch(
+    live: Arc<Mutex<Live>>,
+    control: mpsc::UnboundedSender<ControlMsg>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    connection: Connection,
+) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    // Images copied here go to the host automatically, like text. Only a new
+    // copy (sequence change) is looked at, and what was on the clipboard when
+    // the session started is not sent.
+    let mut last_seq = clip::sequence();
+    let mut last_image = clip::get_image().map(|(w, h, rgba)| clip::image_hash(w, h, &rgba));
     loop {
         tick.tick().await;
         let allowed = {
@@ -1412,7 +1439,28 @@ async fn clip_watch(live: Arc<Mutex<Live>>, control: mpsc::UnboundedSender<Contr
             continue;
         }
         let read = clip::get_text().filter(|t| t.len() <= MAX_CLIP_TEXT);
-        let Some(text) = live.lock().unwrap().clip_text.observe(read) else { continue };
+        let has_text = read.as_deref().is_some_and(|t| !t.is_empty());
+        let seq = clip::sequence();
+        let seq_changed = seq.is_some() && seq != last_seq;
+        last_seq = seq;
+        let Some(text) = live.lock().unwrap().clip_text.observe(read) else {
+            if seq_changed && !has_text {
+                if let Some((w, h, rgba)) = clip::get_image() {
+                    let hash = clip::image_hash(w, h, &rgba);
+                    if should_send_image(hash, last_image) {
+                        last_image = Some(hash);
+                        let g = live.lock().unwrap();
+                        info!("clipboard: sending a {w}x{h} image to the host");
+                        send_png(&control, &connection, &g, w, h, &rgba);
+                        drop(g);
+                        wake();
+                    } else {
+                        last_image = Some(hash);
+                    }
+                }
+            }
+            continue;
+        };
         info!("clipboard: sending {} bytes of text to the host", text.len());
         let _ = control.send(ControlMsg::Clipboard(Clipboard {
             kind: ClipKind::Text,
@@ -1423,16 +1471,30 @@ async fn clip_watch(live: Arc<Mutex<Live>>, control: mpsc::UnboundedSender<Contr
     }
 }
 
+/// A newly copied image is sent unless it is the one already sent or the one
+/// just received from the host.
+pub(crate) fn should_send_image(hash: u64, last_sent: Option<u64>) -> bool {
+    last_sent != Some(hash) && !clip::image_was_received(hash)
+}
+
 pub fn send_clipboard_image(control: &mpsc::UnboundedSender<ControlMsg>, connection: &Connection, live: &Live) {
     if !live.allowed(perms::CLIPBOARD) {
         return;
     }
     let Some((w, h, rgba)) = clip::get_image() else { return };
-    let Some(png) = clip::encode_png(w as u32, h as u32, &rgba) else { return };
-    if png.len() > MAX_CLIP_IMAGE as usize {
+    send_png(control, connection, live, w, h, &rgba);
+}
+
+fn send_png(control: &mpsc::UnboundedSender<ControlMsg>, connection: &Connection, live: &Live, w: usize, h: usize, rgba: &[u8]) {
+    if !live.allowed(perms::CLIPBOARD) {
         return;
     }
-    if png.len() <= 256 * 1024 {
+    let Some(png) = clip::encode_png(w as u32, h as u32, rgba) else { return };
+    if png.len() > MAX_CLIP_IMAGE as usize {
+        info!("clipboard: image is {} bytes, over the {} byte limit; not sent", png.len(), MAX_CLIP_IMAGE);
+        return;
+    }
+    if png.len() <= pjdesk_proto::peer::CLIP_INLINE_MAX {
         let _ = control.send(ControlMsg::Clipboard(Clipboard {
             kind: ClipKind::ImagePng,
             byte_len: png.len() as u32,
@@ -1443,8 +1505,7 @@ pub fn send_clipboard_image(control: &mpsc::UnboundedSender<ControlMsg>, connect
         spawn_viewer(async move {
             if let Ok(mut uni) = conn.open_uni().await {
                 let _ = write_side_header(&mut uni, CLIP_MAGIC, &SideHeader { id: 0, offset: 0, a: w as u32, b: h as u32 }).await;
-                let _ = write_side_chunk(&mut uni, &png).await;
-                let _ = write_side_chunk(&mut uni, &[]).await;
+                let _ = pjdesk_proto::peer::write_side_bytes(&mut uni, &png).await;
                 let _ = uni.finish();
             }
         });

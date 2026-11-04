@@ -121,31 +121,160 @@ pub fn run_elevated(args: &[&str]) -> bool {
     }
 }
 
+/// Opens a program the way Explorer does (handles elevation prompts).
+#[cfg(windows)]
+pub fn shell_open(file: &str, params: &str) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    unsafe {
+        let h = ShellExecuteW(None, &HSTRING::from("open"), &HSTRING::from(file), &HSTRING::from(params), windows::core::PCWSTR::null(), SW_SHOWNORMAL);
+        h.0 as isize > 32
+    }
+}
+
 /// Injects the secure attention sequence (Ctrl+Alt+Del) via `sas.dll`. This
 /// only works when the caller runs with enough privilege — i.e. the background
 /// service — so it's best effort. The DLL is loaded dynamically because it
 /// isn't present on every SKU.
 #[cfg(windows)]
-pub fn send_ctrl_alt_del() {
+pub fn send_ctrl_alt_del() -> bool {
     use windows::core::s;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+    if !is_system() {
+        tracing::warn!("Ctrl+Alt+Del: only the PJDesk service (SYSTEM) can send it; is the service installed?");
+        return false;
+    }
+    if !software_sas_allowed() {
+        tracing::warn!("Ctrl+Alt+Del: Windows policy SoftwareSASGeneration does not allow services to send it");
+        return false;
+    }
     unsafe {
         let Ok(lib) = LoadLibraryA(s!("sas.dll")) else {
             tracing::warn!("Ctrl+Alt+Del: sas.dll not available");
-            return;
+            return false;
         };
         if let Some(proc) = GetProcAddress(lib, s!("SendSAS")) {
             // void SendSAS(BOOL AsUser)
             let send: unsafe extern "system" fn(i32) = std::mem::transmute(proc);
-            send(0); // AsUser = FALSE: works from a service/SYSTEM session
+            send(0); // AsUser = FALSE: from a service/SYSTEM
+            tracing::info!("Ctrl+Alt+Del sent");
+            true
         } else {
             tracing::warn!("Ctrl+Alt+Del: SendSAS not found in sas.dll");
+            false
         }
     }
 }
 
+/// HKLM\...\Policies\System\SoftwareSASGeneration: 1 services, 2 ease of
+/// access apps, 3 both. Missing or 0 means nobody may send Ctrl+Alt+Del.
+pub const SAS_POLICY_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+
+pub fn sas_policy_allows_services(value: Option<u32>) -> bool {
+    matches!(value, Some(1) | Some(3))
+}
+
+#[cfg(windows)]
+fn read_sas_policy() -> Option<u32> {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+    let mut v = 0u32;
+    let mut len = 4u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            &HSTRING::from(SAS_POLICY_KEY),
+            &HSTRING::from("SoftwareSASGeneration"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut v as *mut u32 as _),
+            Some(&mut len),
+        )
+        .ok()
+        .ok()?;
+    }
+    Some(v)
+}
+
+#[cfg(windows)]
+fn software_sas_allowed() -> bool {
+    sas_policy_allows_services(read_sas_policy())
+}
+
+/// Called by the service at start: when the policy is not set at all, allow
+/// services to send Ctrl+Alt+Del (value 1), as remote-support tools do. An
+/// explicit 0 or 2 set by an administrator is left alone.
+#[cfg(windows)]
+pub fn ensure_software_sas() {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_LOCAL_MACHINE, REG_DWORD};
+    if read_sas_policy().is_some() {
+        return;
+    }
+    let one = 1u32.to_le_bytes();
+    let r = unsafe {
+        RegSetKeyValueW(
+            HKEY_LOCAL_MACHINE,
+            &HSTRING::from(SAS_POLICY_KEY),
+            &HSTRING::from("SoftwareSASGeneration"),
+            REG_DWORD.0,
+            Some(one.as_ptr() as _),
+            4,
+        )
+    };
+    if r.is_ok() {
+        tracing::info!("Allowed the PJDesk service to send Ctrl+Alt+Del (SoftwareSASGeneration = 1)");
+    } else {
+        tracing::warn!("Could not set SoftwareSASGeneration: {r:?}");
+    }
+}
+
 #[cfg(not(windows))]
-pub fn send_ctrl_alt_del() {}
+pub fn ensure_software_sas() {}
+
+#[cfg(windows)]
+fn is_system() -> bool {
+    std::env::var("USERNAME").map(|u| u.ends_with('$') || u.eq_ignore_ascii_case("SYSTEM")).unwrap_or(false)
+        || whoami_is_system()
+}
+
+#[cfg(windows)]
+fn whoami_is_system() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, IsWellKnownSid, TokenUser, WinLocalSystemSid, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut buf = vec![0u8; 256];
+        let mut len = 0u32;
+        let ok = GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr() as _), buf.len() as u32, &mut len);
+        let _ = CloseHandle(token);
+        if ok.is_err() {
+            return false;
+        }
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        IsWellKnownSid(user.User.Sid, WinLocalSystemSid).as_bool()
+    }
+}
+
+#[cfg(not(windows))]
+pub fn send_ctrl_alt_del() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod sas_policy_tests {
+    #[test]
+    fn only_service_values_allow() {
+        use super::sas_policy_allows_services as ok;
+        assert!(ok(Some(1)) && ok(Some(3)));
+        assert!(!ok(None) && !ok(Some(0)) && !ok(Some(2)));
+    }
+}
 
 /// Relaunches elevated with `args`, passing `password` through a file in the
 /// caller's profile instead of the command line. The command line of an

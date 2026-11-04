@@ -37,6 +37,9 @@ pub struct Rec {
 
 pub const REC_MOUSE: u8 = 0;
 pub const REC_KEYBOARD: u8 = 1;
+/// Not an INPUT: asks the SYSTEM agent for the secure attention sequence
+/// (Ctrl+Alt+Del). Only SYSTEM may call SendSAS; the session helper can't.
+pub const REC_SAS: u8 = 2;
 const REC_LEN: usize = 17;
 /// The most records one request may carry (Unicode text is chunked per char).
 pub const MAX_RECS: usize = 64;
@@ -71,7 +74,7 @@ pub fn decode(body: &[u8]) -> Option<Vec<Rec>> {
     body.chunks_exact(REC_LEN)
         .map(|c| {
             let kind = c[0];
-            (kind == REC_MOUSE || kind == REC_KEYBOARD).then(|| Rec {
+            (kind == REC_MOUSE || kind == REC_KEYBOARD || kind == REC_SAS).then(|| Rec {
                 kind,
                 a: i32_at(&c[1..]),
                 b: i32_at(&c[5..]),
@@ -83,6 +86,27 @@ pub fn decode(body: &[u8]) -> Option<Vec<Rec>> {
 }
 
 /// Reply: `[accepted u8][last_error u32]`.
+pub fn sas_request() -> Vec<Rec> {
+    vec![Rec { kind: REC_SAS, a: 0, b: 0, c: 0, d: 0 }]
+}
+
+/// True when the request is the secure attention sequence.
+pub fn is_sas(recs: &[Rec]) -> bool {
+    recs.len() == 1 && recs[0].kind == REC_SAS
+}
+
+/// Windows virtual keys for scan codes Windows' shell matches by virtual key
+/// (Win and Menu keys): a scan-code-only Win key did not open Start or run
+/// Win+D/Win+E reliably.
+pub fn vk_for_scan(code: u16) -> Option<u16> {
+    match code {
+        0xE05B => Some(0x5B), // VK_LWIN
+        0xE05C => Some(0x5C), // VK_RWIN
+        0xE05D => Some(0x5D), // VK_APPS
+        _ => None,
+    }
+}
+
 pub fn encode_reply(accepted: bool, err: u32) -> [u8; 5] {
     let e = err.to_le_bytes();
     [accepted as u8, e[0], e[1], e[2], e[3]]
@@ -267,5 +291,26 @@ mod tests {
         assert_eq!(outcomes.iter().filter(|o| **o == CheckOutcome::Report).count(), 1);
         assert_eq!(c.observe((5, 5), Some((5, 5))), CheckOutcome::Fine);
         assert_eq!(c.observe((5, 5), None), CheckOutcome::Fine);
+    }
+}
+
+#[cfg(test)]
+mod sas_tests {
+    use super::*;
+
+    #[test]
+    fn sas_crosses_the_pipe() {
+        let recs = sas_request();
+        let body = encode(&recs);
+        let back = decode(&body[1..]).unwrap();
+        assert!(is_sas(&back));
+        assert!(!is_sas(&[Rec { kind: REC_KEYBOARD, a: 0, b: 0, c: 0, d: 0 }]));
+    }
+
+    #[test]
+    fn win_keys_use_virtual_keys() {
+        assert_eq!(vk_for_scan(0xE05B), Some(0x5B));
+        assert_eq!(vk_for_scan(0xE05C), Some(0x5C));
+        assert_eq!(vk_for_scan(0x0020), None);
     }
 }
