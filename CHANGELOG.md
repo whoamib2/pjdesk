@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.86
+
+- One mouse pointer: the remote computer's pointer (arrow, I-beam, resize, and so on) is now shown as your own cursor, with no lag, instead of a dot plus a second pointer in the picture. Needs 0.6.86 on both computers; older hosts keep the dot.
+- Smoother, more reliable mouse: moves are sent as the newest position about every 8 ms, clicks and keys are never dropped or delayed, and a rare stream mix-up that dropped input or ended the session is fixed (Windows and Android).
+- Fixed: the mouse and keyboard stopped working after the remote computer locked or unlocked, showed a UAC prompt, or switched from Remote Desktop to the console (tscon). Input now follows the screen that is showing, retries rejected input, and goes through the PJDesk service as SYSTEM so administrator windows and the sign-in screen accept it. If input is still blocked, the viewer says why.
+- The viewer now explains when the remote computer is in Remote Desktop, its session is disconnected (with the tscon command to run), another user's session is showing, or no monitor is connected, and says when the screen is back.
+- Sharper picture: text is re-sent sharp shortly after the screen stops changing, and a new "Quality: best (60 fps)" option.
+- Received files go to Downloads\PJDesk again by default. A folder you chose in Settings > "Save received files to" is kept.
+
 ## 0.6.85
 
 - Fixed: mouse and keyboard stopped responding on the remote computer during a file transfer. Input and control messages no longer wait behind file data (file data is sent in small pieces, paced by the receiver, below video priority).
