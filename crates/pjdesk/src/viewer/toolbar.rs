@@ -191,6 +191,7 @@ const CONTROL_ITEMS: &[(&str, Action)] = &[
     ("Quality: balanced", Action::Quality("balanced")),
     ("Quality: sharp", Action::Quality("sharp")),
     ("Quality: high", Action::Quality("high")),
+    ("Quality: best (60 fps)", Action::Quality("best")),
     ("Port forward, monitors…", Action::OpenPanel(2)),
 ];
 

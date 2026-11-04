@@ -40,6 +40,9 @@ pub fn preset(name: &str) -> Option<StreamQuality> {
         "balanced" => StreamQuality { fps: 30, bitrate_kbps: 12_000, max_width: 3840 },
         "sharp" => StreamQuality { fps: 30, bitrate_kbps: 20_000, max_width: 3840 },
         "high" => StreamQuality { fps: 60, bitrate_kbps: 30_000, max_width: 3840 },
+        // Remote Desktop-like: 60 fps, native size, plenty of bits for text.
+        // The adaptive controller still steps down on a slow link.
+        "best" => StreamQuality { fps: 60, bitrate_kbps: 45_000, max_width: 3840 },
         _ => return None,
     })
 }
@@ -93,6 +96,35 @@ impl BitrateControl {
             self.bad = 0;
         }
         self.current != before
+    }
+}
+
+/// Static-region refinement: after the screen changes and then stays still
+/// for [`Refine::STILL`], encode one full keyframe of the still picture. The
+/// rate controller has had idle time to save bits, so text that came out soft
+/// while scrolling or dragging is re-sent sharp. One refresh per burst.
+#[derive(Debug, Default, Clone)]
+pub struct Refine {
+    last_change: Option<std::time::Instant>,
+}
+
+impl Refine {
+    pub const STILL: std::time::Duration = std::time::Duration::from_millis(400);
+
+    /// A changed picture was encoded.
+    pub fn changed(&mut self, now: std::time::Instant) {
+        self.last_change = Some(now);
+    }
+
+    /// Nothing changed this tick: true once when a sharp refresh is due.
+    pub fn due(&mut self, now: std::time::Instant) -> bool {
+        match self.last_change {
+            Some(t) if now.duration_since(t) >= Self::STILL => {
+                self.last_change = None;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -172,5 +204,24 @@ mod tests {
         let up = resample_s16_interleaved(&src, 2, 24_000, 48_000);
         assert!(up.len() >= src.len());
         assert_eq!(up[0], src[0]);
+    }
+}
+
+#[cfg(test)]
+mod refine_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn one_sharp_refresh_after_the_screen_goes_still() {
+        let t = Instant::now();
+        let mut r = Refine::default();
+        assert!(!r.due(t + Duration::from_secs(5)), "nothing changed yet");
+        r.changed(t);
+        assert!(!r.due(t + Duration::from_millis(100)));
+        r.changed(t + Duration::from_millis(200));
+        assert!(!r.due(t + Duration::from_millis(500)));
+        assert!(r.due(t + Duration::from_millis(600)));
+        assert!(!r.due(t + Duration::from_millis(900)), "only once per burst");
     }
 }

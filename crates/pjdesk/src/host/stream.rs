@@ -279,6 +279,11 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
     info!("Capturing {} with {}", describe(capturer.display_rect()), capturer.name());
     *shared.display.lock().unwrap() = capturer.display_rect();
 
+    let mut facts_checked = Instant::now();
+    let mut facts_problem: Option<String> = SessionFacts::now().problem();
+    if let Some(p) = &facts_problem {
+        session.notify(&format!("Remote session: {p}"));
+    }
     let mut live_fps = session.fps.load(Ordering::SeqCst);
     let mut live_bitrate = session.bitrate.load(Ordering::SeqCst);
     let mut encoder = VideoEncoder::new(live_bitrate, live_fps)?;
@@ -288,6 +293,7 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
     let mut picture = I420Buffer::default();
     let mut errors = 0u32;
     let mut idle_misses = 0u32;
+    let mut refine = pjdesk_proto::quality::Refine::default();
     // The newest image in `picture` hasn't reached the controller yet
     // (the encoder dropped it to hold the bitrate).
     let mut undelivered = false;
@@ -367,6 +373,8 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
             interval = Duration::from_secs_f64(1.0 / live_fps as f64);
             shared.keyframe_requested.store(true, Ordering::SeqCst);
         }
+        #[cfg(windows)]
+        capture::set_draw_pointer(!session.cursor_shapes.load(Ordering::Relaxed));
         // Follow desktop switches (UAC / lock / sign-in screen): re-attach this
         // thread and rebuild capture so it grabs the desktop now on screen.
         // An empty name means the read failed transiently — don't treat that as
@@ -472,13 +480,34 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
             }
             continue;
         }
+        // Session changes (RDP connect/disconnect, tscon, fast user switch,
+        // monitor unplugged): tell the controller what happened and when it
+        // is back, without waiting for a black picture.
+        if facts_checked.elapsed() >= Duration::from_secs(2) {
+            facts_checked = Instant::now();
+            let problem = SessionFacts::now().problem();
+            if problem != facts_problem {
+                match &problem {
+                    Some(p) => {
+                        warn!("Session state: {p}");
+                        session.notify(&format!("Remote session: {p}"));
+                    }
+                    None => {
+                        info!("Session state is normal again");
+                        session.notify("The remote session is back on the screen.");
+                        shared.keyframe_requested.store(true, Ordering::SeqCst);
+                    }
+                }
+                facts_problem = problem;
+            }
+        }
         if have_picture {
             errors = 0;
             if luma_is_black(&picture.y) {
                 let since = *black_since.get_or_insert_with(Instant::now);
                 if !black_told && since.elapsed() >= Duration::from_secs(3) {
                     black_told = true;
-                    let reason = black_capture_reason(capturer.name(), crate::platform::session_id());
+                    let reason = black_capture_reason(capturer.name(), &SessionFacts::now());
                     warn!("Captured picture is black with {} ({reason})", capturer.name());
                     session.notify(&format!("The remote screen can't be captured: {reason}"));
                     // Try Desktop Duplication again soon instead of in 10 s.
@@ -501,6 +530,13 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
                 *display = rect;
             }
         }
+        let mut refine_now = false;
+        if have_picture {
+            refine.changed(Instant::now());
+        } else if picture.width > 0 && refine.due(Instant::now()) {
+            refine_now = true;
+            have_picture = true;
+        }
         if !have_picture && (want_keyframe || undelivered) && picture.width > 0 {
             // Nothing changed, but the controller needs a keyframe or never got
             // the latest image: encode the newest picture again.
@@ -510,7 +546,7 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
             continue;
         }
 
-        if want_keyframe {
+        if want_keyframe || refine_now {
             encoder.request_keyframe();
         }
         let Some((data, keyframe)) = encoder.encode(&picture)? else {
@@ -554,10 +590,94 @@ fn luma_is_black(y: &[u8]) -> bool {
     bright * 1000 < seen
 }
 
+/// What this process can see about its Windows session, for telling the
+/// controller clearly why the picture or input may not work.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionFacts {
+    pub session: Option<u32>,
+    /// The session the physical console shows (WTSGetActiveConsoleSessionId).
+    pub console: Option<u32>,
+    /// This session is a Remote Desktop (RDP) session.
+    pub remote: bool,
+    /// This session has no one connected (RDP closed or disconnected).
+    pub disconnected: bool,
+    /// The input desktop name (Winlogon = lock screen, sign-in or UAC).
+    pub desktop: String,
+    pub monitors: i32,
+}
+
+impl SessionFacts {
+    #[cfg(windows)]
+    pub fn now() -> SessionFacts {
+        use windows::Win32::System::RemoteDesktop::{
+            WTSActive, WTSConnectState, WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW,
+            WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CMONITORS, SM_REMOTESESSION};
+        let session = crate::platform::session_id();
+        let console = unsafe { WTSGetActiveConsoleSessionId() };
+        let mut disconnected = false;
+        if let Some(id) = session {
+            unsafe {
+                let mut buf = windows::core::PWSTR::null();
+                let mut len = 0u32;
+                if WTSQuerySessionInformationW(Some(WTS_CURRENT_SERVER_HANDLE), id, WTSConnectState, &mut buf, &mut len).is_ok() && !buf.is_null() {
+                    let state = *(buf.0 as *const WTS_CONNECTSTATE_CLASS);
+                    disconnected = state != WTSActive;
+                    WTSFreeMemory(buf.0 as _);
+                }
+            }
+        }
+        SessionFacts {
+            session,
+            console: (console != u32::MAX).then_some(console),
+            remote: unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0,
+            disconnected,
+            desktop: crate::platform::input_desktop_name().unwrap_or_default(),
+            monitors: unsafe { GetSystemMetrics(SM_CMONITORS) },
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn now() -> SessionFacts {
+        SessionFacts { monitors: 1, ..Default::default() }
+    }
+
+    /// A plain reason when this session can't show a normal desktop, else None.
+    pub fn problem(&self) -> Option<String> {
+        let id = self.session.unwrap_or(0);
+        if self.session == Some(0) {
+            return Some("PJDesk is running in Windows session 0, which has no desktop. Install the PJDesk service so it starts in the signed-in session.".into());
+        }
+        if self.remote {
+            return Some(format!("this computer is being used through Remote Desktop (session {id}), so its console screen is not shown. Close Remote Desktop, or on that computer run as administrator: tscon {id} /dest:console"));
+        }
+        if self.disconnected {
+            return Some(format!("the Windows session (session {id}) is disconnected, usually after Remote Desktop was closed, so Windows draws nothing. On that computer run as administrator: tscon {id} /dest:console  — or sign in at the computer."));
+        }
+        if self.console.is_some_and(|c| Some(c) != self.session) {
+            return Some("another Windows session is on the screen (fast user switching or a different sign-in). PJDesk follows it when its service is installed.".into());
+        }
+        if self.monitors <= 0 {
+            return Some("no monitor is connected or turned on. Connect a monitor or a display emulator (HDMI dummy plug).".into());
+        }
+        None
+    }
+
+    /// Short state for the viewer when nothing is wrong but the screen is
+    /// the lock, sign-in or UAC screen.
+    pub fn secure_desktop(&self) -> bool {
+        self.desktop.eq_ignore_ascii_case("winlogon")
+    }
+}
+
 /// Why a captured picture is black, as far as this process can tell.
-fn black_capture_reason(backend: &str, session: Option<u32>) -> String {
-    if session == Some(0) {
-        return "the capture runs in Windows session 0, which has no desktop.".into();
+fn black_capture_reason(backend: &str, facts: &SessionFacts) -> String {
+    if let Some(problem) = facts.problem() {
+        return problem;
+    }
+    if facts.secure_desktop() {
+        return "the lock, sign-in or administrator (UAC) screen is up and could not be captured. Install the PJDesk service to see and use it.".into();
     }
     if backend.contains("GDI") {
         return "Windows gives only a black picture. No monitor may be connected or turned on, or this computer's Remote Desktop session was disconnected. Connect a monitor or a display emulator (HDMI dummy plug), or sign in at the console.".into();
@@ -638,7 +758,27 @@ mod black_capture_tests {
             *v = 200;
         }
         assert!(!luma_is_black(&y));
-        assert!(black_capture_reason("GDI BitBlt", Some(1)).contains("monitor"));
-        assert!(black_capture_reason("DXGI", Some(0)).contains("session 0"));
+        let normal = SessionFacts { session: Some(1), console: Some(1), monitors: 1, ..Default::default() };
+        assert!(black_capture_reason("GDI BitBlt", &normal).contains("monitor"));
+        let zero = SessionFacts { session: Some(0), ..normal.clone() };
+        assert!(black_capture_reason("DXGI", &zero).contains("session 0"));
+    }
+
+    #[test]
+    fn session_facts_name_rdp_disconnect_switch_lock_and_no_monitor() {
+        let normal = SessionFacts { session: Some(2), console: Some(2), monitors: 1, desktop: "Default".into(), ..Default::default() };
+        assert_eq!(normal.problem(), None);
+        let rdp = SessionFacts { remote: true, ..normal.clone() };
+        assert!(rdp.problem().unwrap().contains("tscon 2 /dest:console"));
+        let gone = SessionFacts { disconnected: true, ..normal.clone() };
+        assert!(gone.problem().unwrap().contains("disconnected"));
+        assert!(gone.problem().unwrap().contains("tscon 2"));
+        let switched = SessionFacts { console: Some(5), ..normal.clone() };
+        assert!(switched.problem().unwrap().contains("another Windows session"));
+        let dark = SessionFacts { monitors: 0, ..normal.clone() };
+        assert!(dark.problem().unwrap().contains("monitor"));
+        let locked = SessionFacts { desktop: "Winlogon".into(), ..normal };
+        assert_eq!(locked.problem(), None);
+        assert!(black_capture_reason("DXGI", &locked).contains("lock"));
     }
 }
