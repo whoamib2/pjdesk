@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.90
+
+- Fixed: Send files (files-only) stopped about 20 seconds after signing in, freezing the transfer partway ("45 s left") with the window still open. The PC app was waiting for a picture that a files-only session never sends. Files now keep moving for as long as the transfer takes.
+- New: if a files-only transfer loses its connection or stops making progress for 20 seconds, the files window stays open, shows "Connection lost — reconnecting…", signs in again and continues the transfers from where they stopped.
+
 ## 0.6.89
 
 - New: Send files without a full session. Choose Send files on a saved computer's menu or on the Connect screen. You sign in exactly as for a session (password, one-time code or approval), then only the drag-and-drop files window opens: send and get files in both directions, with resume and the quick "Finishing…" step, saved to Downloads\PJDesk. The other computer does not share its screen or accept input; its popup says "file transfer". Closing the files window ends it. Computers on an older PJDesk show a message asking to update them.
