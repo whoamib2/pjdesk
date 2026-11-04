@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.89
+
+- New: Send files without a full session. Choose Send files on a saved computer's menu or on the Connect screen. You sign in exactly as for a session (password, one-time code or approval), then only the drag-and-drop files window opens: send and get files in both directions, with resume and the quick "Finishing…" step, saved to Downloads\PJDesk. The other computer does not share its screen or accept input; its popup says "file transfer". Closing the files window ends it. Computers on an older PJDesk show a message asking to update them.
+
 ## 0.6.88
 
 - Fixed: the keyboard-shortcut menu. Ctrl+Alt+Del is now sent by the PJDesk service (only Windows' SYSTEM account may send it; the service also allows this in Windows policy when no policy is set), and you get a message if it cannot be sent. Win+L locks the remote computer, the Windows key and Win+D/Win+E work, and Task Manager opens for administrators. Clicking a menu item no longer sends a stray mouse click to the remote computer.
