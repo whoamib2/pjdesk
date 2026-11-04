@@ -106,10 +106,15 @@ impl BitrateControl {
 #[derive(Debug, Default, Clone)]
 pub struct Refine {
     last_change: Option<std::time::Instant>,
+    last_refresh: Option<std::time::Instant>,
 }
 
 impl Refine {
     pub const STILL: std::time::Duration = std::time::Duration::from_millis(400);
+    /// At most one sharp keyframe this often. A blinking caret or a ticking
+    /// clock "stops" every ~half second, and a full software keyframe each
+    /// time kept the host CPU busy on an otherwise still screen.
+    pub const GAP: std::time::Duration = std::time::Duration::from_secs(4);
 
     /// A changed picture was encoded.
     pub fn changed(&mut self, now: std::time::Instant) {
@@ -120,7 +125,11 @@ impl Refine {
     pub fn due(&mut self, now: std::time::Instant) -> bool {
         match self.last_change {
             Some(t) if now.duration_since(t) >= Self::STILL => {
+                if self.last_refresh.is_some_and(|r| now.duration_since(r) < Self::GAP) {
+                    return false;
+                }
                 self.last_change = None;
+                self.last_refresh = Some(now);
                 true
             }
             _ => false,
@@ -223,5 +232,17 @@ mod refine_tests {
         assert!(!r.due(t + Duration::from_millis(500)));
         assert!(r.due(t + Duration::from_millis(600)));
         assert!(!r.due(t + Duration::from_millis(900)), "only once per burst");
+    }
+
+    #[test]
+    fn caret_blink_does_not_force_keyframes_twice_a_second() {
+        let t = Instant::now();
+        let mut r = Refine::default();
+        r.changed(t);
+        assert!(r.due(t + Duration::from_millis(400)));
+        r.changed(t + Duration::from_millis(500));
+        assert!(!r.due(t + Duration::from_millis(1000)), "within the gap");
+        assert!(!r.due(t + Duration::from_secs(3)));
+        assert!(r.due(t + Duration::from_millis(4400)), "after the gap");
     }
 }
