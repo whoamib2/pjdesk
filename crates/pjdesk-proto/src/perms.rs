@@ -48,6 +48,23 @@ pub const CHAT_PEER: u32 = 1 << 13;
 /// its PJDesk version. Absent from [`ALL`], so [`grant`] clears it. An older
 /// host ignores the bit and does not send a message that host cannot decode.
 pub const PEER_VERSION: u32 = 1 << 14;
+/// Capability, not a permission: in `Hello` the controller asks for a session
+/// that only moves files (no capture, video or input). A host that supports it
+/// echoes the bit in `Welcome`; an older host never does.
+pub const FILES_ONLY: u32 = 1 << 15;
+
+/// What a files-only controller asks for in `Hello`.
+pub const FILES_ONLY_REQUEST: u32 = FILES_ONLY | FILE | PEER_VERSION;
+
+/// What the host grants in a files-only session: file transfer at most.
+pub fn files_only_grant(granted: u32) -> u32 {
+    granted & FILE
+}
+
+/// Whether a `Welcome` came from a host that runs files-only sessions.
+pub fn host_runs_files_only(welcome: u32) -> bool {
+    welcome & FILES_ONLY != 0
+}
 
 /// Every permission bit this version defines. Unknown high bits are ignored.
 pub const ALL: u32 =
@@ -126,6 +143,16 @@ pub fn describe(perms: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn files_only_is_a_capability_not_a_permission() {
+        assert_eq!(ALL & FILES_ONLY, 0);
+        assert_eq!(grant(FILES_ONLY_REQUEST, ALL, false) & FILES_ONLY, 0);
+        assert!(!host_runs_files_only(grant(FILES_ONLY_REQUEST, ALL, false)));
+        assert!(host_runs_files_only(FILE | FILES_ONLY));
+        let g = files_only_grant(grant(ALL, ALL, false));
+        assert_eq!(g, FILE);
+    }
+
     use super::*;
 
     #[test]

@@ -62,6 +62,10 @@ fn layout_key(displays: &[DisplayLayout]) -> String {
 
 /// Shared with the capture thread and the side-stream tasks.
 pub struct Session {
+    /// Files-only session: no capture, video or input; file transfer at most.
+    pub files_only: AtomicBool,
+    /// This session's claim on the host's files window and notice (0 = none).
+    pub ui_gen: AtomicU64,
     pub perms: AtomicU32,
     pub display: AtomicUsize,
     pub fps: AtomicU32,
@@ -128,6 +132,8 @@ impl Session {
     ) -> Arc<Self> {
         let initial = if grant.peer_proto < 3 { perms::grant(perms::CLASSIC, grant.ceiling, view_only) } else { 0 };
         Arc::new(Self {
+            files_only: AtomicBool::new(false),
+            ui_gen: AtomicU64::new(0),
             perms: AtomicU32::new(initial),
             display: AtomicUsize::new(args_display),
             fps: AtomicU32::new(args_fps.clamp(1, 60)),
@@ -170,6 +176,11 @@ impl Session {
             controller_label: Mutex::new(grant.peer_name),
             cursor_shapes: AtomicBool::new(false),
         })
+    }
+
+    /// Host files window calls, only while this session owns the window.
+    pub fn fw(&self) -> Fw {
+        Fw(self.ui_gen.load(Ordering::SeqCst))
     }
 
     pub fn initial_mouse_keyboard(&self) -> (bool, bool) {
@@ -255,6 +266,9 @@ impl Session {
         display: Rect,
         keyframe: &AtomicBool,
     ) -> Result<bool> {
+        if self.files_only.load(Ordering::SeqCst) && !files_only_allows(&msg) {
+            return Ok(false);
+        }
         match msg {
             ControlMsg::Input(event) => {
                 if *self.keyboard.lock().unwrap() == KeyboardMode::Translate {
@@ -411,13 +425,16 @@ impl Session {
         let granted = grant(requested, ceiling, self.view_only);
         let dir = self.receive_dir.lock().unwrap().clone();
         let granted = if dir.trim().is_empty() { granted & !perms::FILE } else { granted };
+        let files_only = self.files_only.load(Ordering::SeqCst);
+        let granted = if files_only { perms::files_only_grant(granted) } else { granted };
         self.perms.store(granted, Ordering::SeqCst);
         injector.set_allowed(has(granted, perms::MOUSE), has(granted, perms::KEYBOARD));
         self.display.store(monitor as usize, Ordering::SeqCst);
         self.apply_quality(quality, keyframe);
         let monitors = super::capture::monitor_infos();
         info!("{} granted: {}", self.peer_name, perms::describe(granted));
-        write_msg(send, &HostMsg::Welcome { permissions: granted, monitors, proto: PROTOCOL_VERSION }).await?;
+        let shown = if files_only { granted | perms::FILES_ONLY } else { granted };
+        write_msg(send, &HostMsg::Welcome { permissions: shown, monitors, proto: PROTOCOL_VERSION }).await?;
         if requested & pjdesk_proto::perms::VISITOR != 0 {
             write_msg(send, &HostMsg::AskVisitor).await?;
         }
@@ -429,7 +446,7 @@ impl Session {
             write_msg(send, &HostMsg::ChatReady).await?;
             super::chatwin::arm();
         }
-        if wants_layout {
+        if wants_layout && !files_only {
             self.publish_layout(send, true).await?;
         }
         Ok(())
@@ -686,7 +703,7 @@ impl Session {
         self.expected.lock().unwrap().insert(id, ExpectedFile { name: name.to_string(), size, offset });
         info!("Accepting file \"{name}\" ({size} bytes) from {}, resume {offset}", self.peer_name);
         self.note(&format!("Receiving {name}"));
-        super::filewin::incoming(id, name, size, offset);
+        self.fw().incoming(id, name, size, offset);
         write_msg(send, &HostMsg::File(FileMsg::Accept { id, resume_from: offset })).await
     }
 
@@ -702,12 +719,13 @@ impl Session {
         if resume_from == 0 || resume_from > len {
             job.resume = 0;
         }
-        super::filewin::outgoing_state(job.id, job.resume, "sending");
+        self.fw().outgoing_state(job.id, job.resume, "sending");
         let conn = self.conn.clone();
         let tx = self.host_tx.clone();
+        let fw = self.fw();
         tokio::spawn(async move {
-            if let Err(e) = send_file_bytes(conn, job.id, &job.path, job.resume, tx.clone()).await {
-                super::filewin::outgoing_state(job.id, 0, &format!("{e:#}"));
+            if let Err(e) = send_file_bytes(conn, job.id, &job.path, job.resume, tx.clone(), fw).await {
+                fw.outgoing_state(job.id, 0, &format!("{e:#}"));
                 let _ = tx.send(HostMsg::File(FileMsg::Error { id: job.id, reason: format!("{e:#}") }));
             }
         });
@@ -734,18 +752,21 @@ impl Session {
             }
         }
         let files_ok = self.allow(perms::FILE) && self.v3();
-        super::filewin::set_allowed(files_ok, self.receive_dir.lock().unwrap().trim());
+        self.fw().set_allowed(files_ok, self.receive_dir.lock().unwrap().trim());
         if files_ok {
-            if let Some(shared) = &self.shared {
+            if let Some(shared) = self.shared.as_ref().filter(|_| self.fw().on()) {
                 for path in shared.take_send_files() {
                     self.queue_send(send, path).await?;
                 }
             }
-            for path in super::filewin::take_sends() {
+            for path in self.fw().take_sends() {
                 self.queue_send(send, path).await?;
             }
         } else {
-            let _ = super::filewin::take_sends();
+            let _ = self.fw().take_sends();
+        }
+        if self.files_only.load(Ordering::SeqCst) {
+            return Ok(());
         }
         self.watch_clipboard(send).await?;
         if self.layout_aware.load(Ordering::SeqCst) {
@@ -849,7 +870,7 @@ impl Session {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         self.outgoing.lock().unwrap().insert(id, OutFile { id, path, resume: 0 });
         self.note(&format!("Offering {name}"));
-        super::filewin::outgoing(id, &name, size);
+        self.fw().outgoing(id, &name, size);
         write_msg(send, &HostMsg::File(FileMsg::Offer { id, name, size, resume_from: 0 })).await
     }
 
@@ -943,11 +964,11 @@ impl Session {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(e) => {
-                    super::filewin::incoming_done(header.id, Some("interrupted; resumes on reconnect".into()));
+                    self.fw().incoming_done(header.id, Some("interrupted; resumes on reconnect".into()));
                     return Err(e);
                 }
             };
-            if super::filewin::cancelled(header.id) {
+            if self.fw().cancelled(header.id) {
                 let _ = self.host_tx.send(HostMsg::File(FileMsg::Error {
                     id: header.id,
                     reason: "cancelled on the other computer".into(),
@@ -966,19 +987,19 @@ impl Session {
             got += chunk.len() as u64;
             if got % (256 * 1024) < chunk.len() as u64 {
                 let _ = self.host_tx.send(HostMsg::File(FileMsg::Progress { id: header.id, bytes: got }));
-                super::filewin::incoming_progress(header.id, got);
+                self.fw().incoming_progress(header.id, got);
             }
         }
         file.flush()?;
         drop(file);
         // Confirm the tail at once so the sender's last window never waits.
         let _ = self.host_tx.send(HostMsg::File(FileMsg::Progress { id: header.id, bytes: got }));
-        super::filewin::incoming_progress(header.id, got);
+        self.fw().incoming_progress(header.id, got);
         let mut expected_hash = None;
         if header.a & filesafe::HASH_TRAILER != 0 {
             let mut trailer = [0u8; 32];
             if let Err(e) = stream.read_exact(&mut trailer).await {
-                super::filewin::incoming_done(header.id, Some("interrupted; resumes on reconnect".into()));
+                self.fw().incoming_done(header.id, Some("interrupted; resumes on reconnect".into()));
                 return Err(e.into());
             }
             expected_hash = Some(trailer);
@@ -1000,13 +1021,13 @@ impl Session {
             Err(e) => {
                 let reason = format!("{e:#}");
                 warn!("receive {}: {reason}", job.name);
-                super::filewin::incoming_done(header.id, Some(reason.clone()));
+                self.fw().incoming_done(header.id, Some(reason.clone()));
                 self.expected.lock().unwrap().remove(&header.id);
                 let _ = self.host_tx.send(HostMsg::File(FileMsg::Error { id: header.id, reason }));
                 return Ok(());
             }
         };
-        super::filewin::incoming_done(header.id, None);
+        self.fw().incoming_done(header.id, None);
         self.expected.lock().unwrap().remove(&header.id);
         info!("Saved {}", saved.display());
         self.note(&format!("Saved {}", job.name));
@@ -1159,6 +1180,7 @@ async fn send_file_bytes(
     path: &Path,
     resume: u64,
     tx: mpsc::UnboundedSender<HostMsg>,
+    fw: Fw,
 ) -> Result<()> {
     let mut file = std::fs::File::open(path)?;
     use std::io::{Read, Seek, SeekFrom};
@@ -1186,9 +1208,9 @@ async fn send_file_bytes(
             break;
         }
         pacer.wait(sent).await;
-        if super::filewin::cancelled(id) {
+        if fw.cancelled(id) {
             let _ = uni.reset(0u32.into());
-            super::filewin::outgoing_state(id, sent, "cancelled");
+            fw.outgoing_state(id, sent, "cancelled");
             let _ = tx.send(HostMsg::File(FileMsg::Error { id, reason: "cancelled on the other computer".into() }));
             return Ok(());
         }
@@ -1201,7 +1223,7 @@ async fn send_file_bytes(
             reported = sent;
             let _ = tx.send(HostMsg::File(FileMsg::Progress { id, bytes: sent }));
         }
-        super::filewin::outgoing_bytes(id, sent);
+        fw.outgoing_bytes(id, sent);
     }
     write_side_chunk(&mut uni, &[]).await?;
     let digest: [u8; 32] = filesafe::Digest::finalize(hasher).into();
@@ -1209,6 +1231,139 @@ async fn send_file_bytes(
     let _ = uni.write_all(&digest).await;
     let _ = uni.finish();
     let _ = tx.send(HostMsg::File(FileMsg::Done { id }));
-    super::filewin::outgoing_state(id, sent, "done");
+    fw.outgoing_state(id, sent, "done");
     Ok(())
+}
+
+/// Claims on the host's single files window and connect notice. A normal session
+/// always takes them; a files-only session only when nobody holds them, so it
+/// never ends or overwrites another session's windows.
+static UI_OWNER: Mutex<Option<u64>> = Mutex::new(None);
+static UI_NEXT: AtomicU64 = AtomicU64::new(1);
+
+pub fn claim_ui(force: bool) -> Option<u64> {
+    let mut owner = UI_OWNER.lock().unwrap();
+    if owner.is_some() && !force {
+        return None;
+    }
+    let gen = UI_NEXT.fetch_add(1, Ordering::SeqCst);
+    *owner = Some(gen);
+    Some(gen)
+}
+
+pub fn owns_ui(gen: u64) -> bool {
+    gen != 0 && *UI_OWNER.lock().unwrap() == Some(gen)
+}
+
+/// Gives the windows up. True when this claim still held them.
+pub fn release_ui(gen: u64) -> bool {
+    let mut owner = UI_OWNER.lock().unwrap();
+    if gen != 0 && *owner == Some(gen) {
+        *owner = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// What a files-only session still accepts from the controller.
+pub fn files_only_allows(msg: &ControlMsg) -> bool {
+    !matches!(
+        msg,
+        ControlMsg::Input(_)
+            | ControlMsg::Special(_)
+            | ControlMsg::Clipboard(_)
+            | ControlMsg::SetQuality(_)
+            | ControlMsg::SelectMonitor { .. }
+            | ControlMsg::View { .. }
+            | ControlMsg::RequestKeyframe
+            | ControlMsg::Chat { .. }
+            | ControlMsg::ChatLine { .. }
+    )
+}
+
+/// The host files window, as seen by one session: a no-op once another
+/// session owns the window.
+#[derive(Clone, Copy)]
+pub struct Fw(u64);
+
+impl Fw {
+    pub fn on(&self) -> bool {
+        owns_ui(self.0)
+    }
+    pub fn incoming(&self, id: u64, name: &str, size: u64, offset: u64) {
+        if self.on() {
+            super::filewin::incoming(id, name, size, offset)
+        }
+    }
+    pub fn incoming_progress(&self, id: u64, bytes: u64) {
+        if self.on() {
+            super::filewin::incoming_progress(id, bytes)
+        }
+    }
+    pub fn incoming_done(&self, id: u64, error: Option<String>) {
+        if self.on() {
+            super::filewin::incoming_done(id, error)
+        }
+    }
+    pub fn outgoing(&self, id: u64, name: &str, size: u64) {
+        if self.on() {
+            super::filewin::outgoing(id, name, size)
+        }
+    }
+    pub fn outgoing_state(&self, id: u64, bytes: u64, state: &str) {
+        if self.on() {
+            super::filewin::outgoing_state(id, bytes, state)
+        }
+    }
+    pub fn outgoing_bytes(&self, id: u64, bytes: u64) {
+        if self.on() {
+            super::filewin::outgoing_bytes(id, bytes)
+        }
+    }
+    pub fn cancelled(&self, id: u64) -> bool {
+        self.on() && super::filewin::cancelled(id)
+    }
+    pub fn set_allowed(&self, allowed: bool, save_dir: &str) {
+        if self.on() {
+            super::filewin::set_allowed(allowed, save_dir)
+        }
+    }
+    pub fn take_sends(&self) -> Vec<PathBuf> {
+        if self.on() {
+            super::filewin::take_sends()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod files_only_tests {
+    use super::*;
+
+    #[test]
+    fn files_only_refuses_input_and_screen_messages() {
+        assert!(!files_only_allows(&ControlMsg::RequestKeyframe));
+        assert!(!files_only_allows(&ControlMsg::SelectMonitor { index: 0 }));
+        assert!(files_only_allows(&ControlMsg::Ping { t_us: 1 }));
+        assert!(!files_only_allows(&ControlMsg::Chat { text: "hi".into() }));
+    }
+
+    #[test]
+    fn a_files_only_claim_never_takes_windows_held_by_another_session() {
+        let _l = UI_TEST.lock().unwrap();
+        let video = claim_ui(true).unwrap();
+        assert!(claim_ui(false).is_none());
+        assert!(owns_ui(video));
+        assert!(release_ui(video));
+        let files = claim_ui(false).unwrap();
+        let video2 = claim_ui(true).unwrap();
+        assert!(!owns_ui(files));
+        assert!(!release_ui(files), "the files-only end must not close the newer session's windows");
+        assert!(release_ui(video2));
+        assert!(!Fw(files).cancelled(1));
+    }
+
+    static UI_TEST: Mutex<()> = Mutex::new(());
 }

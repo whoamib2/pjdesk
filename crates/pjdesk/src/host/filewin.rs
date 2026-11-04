@@ -131,6 +131,11 @@ pub fn note(text: &str) {
     *NOTE.lock().unwrap() = text.to_string();
 }
 
+/// Opens the files view (what is arriving) right away: files-only sessions.
+pub fn show_receive() {
+    show_files();
+}
+
 fn show_files() {
     OPEN_FILES.store(true, Ordering::SeqCst);
     RAISE.fetch_add(1, Ordering::SeqCst);

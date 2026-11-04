@@ -1705,7 +1705,7 @@ async fn session_inner(
         receive_dir,
     };
     let result =
-        stream::run(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
+        stream::begin(connection.clone(), auth.send, auth.recv, state.args.clone(), grant, state.shared.clone()).await;
     state.streaming.store(false, Ordering::SeqCst);
     state.session_over_support();
     if let Some(shared) = &state.shared {

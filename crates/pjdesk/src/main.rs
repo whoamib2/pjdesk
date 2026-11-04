@@ -406,6 +406,9 @@ pub struct ConnectArgs {
     /// No window: receive and decode frames, print statistics and exit (testing).
     #[arg(long)]
     pub headless: bool,
+    /// Files only: no picture or input, just the files window. Closing it ends the session.
+    #[arg(long)]
+    pub files: bool,
     /// Number of frames to receive in --headless mode.
     #[arg(long, default_value_t = 150)]
     pub frames: u32,

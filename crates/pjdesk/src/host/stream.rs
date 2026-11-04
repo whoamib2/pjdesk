@@ -102,6 +102,7 @@ pub async fn run(
     args: HostArgs,
     grant: Grant,
     ui: Option<Arc<HostShared>>,
+    first: Option<ControlMsg>,
 ) -> Result<()> {
     let shared = Arc::new(Shared {
         flow: Flow::new(),
@@ -124,6 +125,9 @@ pub async fn run(
         host_tx,
         ui.clone(),
     );
+    // A normal session always owns the host's files window and notice.
+    let _lease = UiLease(super::ctrl::claim_ui(true).unwrap_or(0));
+    session.ui_gen.store(_lease.0, Ordering::SeqCst);
     session.spawn_side_loops();
     let _notice = if args.service_host {
         super::notice::Guard::begin_service(&peer_name)
@@ -167,6 +171,15 @@ pub async fn run(
     let (mouse, keyboard) = session.initial_mouse_keyboard();
     let mut injector = InputInjector::new(!mouse && !keyboard);
     injector.set_allowed(mouse, keyboard);
+    if let Some(msg) = first {
+        let display = *shared.display.lock().unwrap();
+        if session.handle(msg, &mut control_send, &mut injector, display, &shared.keyframe_requested).await? {
+            video_task.abort();
+            shared.flow.stop();
+            let _ = tokio::task::spawn_blocking(move || capture_thread.join()).await;
+            return Ok(());
+        }
+    }
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     // Keeps a partly read message when another branch of the select wins.
     let mut frames = pjdesk_proto::framing::FrameReader::new();
@@ -237,6 +250,170 @@ pub async fn run(
     video_task.abort();
     let _ = tokio::task::spawn_blocking(move || capture_thread.join()).await;
     result
+}
+
+/// Starts an authenticated session: files-only when the controller's first
+/// message asks for it, otherwise the normal picture session.
+pub async fn begin(
+    connection: Connection,
+    control_send: SendStream,
+    mut control_recv: RecvStream,
+    args: HostArgs,
+    grant: Grant,
+    ui: Option<Arc<HostShared>>,
+) -> Result<()> {
+    let first = if grant.peer_proto >= 3 {
+        // Version-3 controllers send Hello at once. Exact reads: nothing is read ahead.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            pjdesk_proto::framing::read_msg::<_, ControlMsg>(&mut control_recv, MAX_CONTROL_FRAME),
+        )
+        .await
+        .ok()
+        .and_then(|m| m.ok())
+    } else {
+        None
+    };
+    match first {
+        Some(hello) if wants_files_only(&hello) => {
+            if let Some(shared) = &ui {
+                *shared.connected.lock().unwrap() = Some(files_only_label(&grant.peer_name));
+            }
+            run_files(connection, control_send, control_recv, args, grant, ui, hello).await
+        }
+        first => run(connection, control_send, control_recv, args, grant, ui, first).await,
+    }
+}
+
+pub fn wants_files_only(msg: &ControlMsg) -> bool {
+    matches!(msg, ControlMsg::Hello { permissions, .. } if permissions & pjdesk_proto::perms::FILES_ONLY != 0)
+}
+
+/// Releases the claim on the host's files window when a session ends.
+struct UiLease(u64);
+
+impl Drop for UiLease {
+    fn drop(&mut self) {
+        super::ctrl::release_ui(self.0);
+    }
+}
+
+/// The popup label for a files-only session.
+pub fn files_only_label(peer: &str) -> String {
+    let peer = peer.trim();
+    if peer.is_empty() {
+        "File transfer".to_string()
+    } else {
+        format!("{peer} (file transfer)")
+    }
+}
+
+/// A files-only session: the same authentication as a normal one, then only the
+/// control stream and file side streams. No capture, encoder, video or input.
+/// It does not take the single-session slot, and when another session is on it
+/// leaves that session's notice and files window alone.
+pub async fn run_files(
+    connection: Connection,
+    mut control_send: SendStream,
+    mut control_recv: RecvStream,
+    args: HostArgs,
+    grant: Grant,
+    ui: Option<Arc<HostShared>>,
+    hello: ControlMsg,
+) -> Result<()> {
+    let (host_tx, mut host_rx) = mpsc::unbounded_channel::<HostMsg>();
+    let label = files_only_label(&grant.peer_name);
+    let session = Session::new(
+        args.fps,
+        args.bitrate,
+        args.max_width,
+        args.display,
+        args.view_only,
+        args.service_host,
+        grant,
+        connection.clone(),
+        host_tx,
+        ui.clone(),
+    );
+    session.files_only.store(true, Ordering::SeqCst);
+    let gen = super::ctrl::claim_ui(false);
+    let _lease = UiLease(gen.unwrap_or(0));
+    session.ui_gen.store(_lease.0, Ordering::SeqCst);
+    session.spawn_side_loops();
+    // Only the owner shows the popup and the files window (receive view).
+    let mut windows = gen.map(|_| {
+        let notice = if args.service_host {
+            super::notice::Guard::begin_service(&label)
+        } else {
+            super::notice::Guard::begin(&label)
+        };
+        let files = super::filewin::Guard::begin(&label);
+        super::filewin::show_receive();
+        (notice, files)
+    });
+    info!("Files-only session for {label}{}", if gen.is_none() { " alongside another session" } else { "" });
+
+    let mut injector = InputInjector::new(true);
+    injector.set_allowed(false, false);
+    let keyframe = AtomicBool::new(false);
+    let display = Rect::default();
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    let mut frames = pjdesk_proto::framing::FrameReader::new();
+    let mut result = match session.handle(hello, &mut control_send, &mut injector, display, &keyframe).await {
+        Ok(true) => Some(Ok(())),
+        Ok(false) => None,
+        Err(e) => Some(Err(e)),
+    };
+    while result.is_none() {
+        tokio::select! {
+            msg = frames.read_msg::<_, ControlMsg>(&mut control_recv, MAX_CONTROL_FRAME) => match msg {
+                Ok(msg) => match session.handle(msg, &mut control_send, &mut injector, display, &keyframe).await {
+                    Ok(true) => result = Some(Ok(())),
+                    Ok(false) => {}
+                    Err(e) => result = Some(Err(e)),
+                },
+                Err(_) => result = Some(Ok(())),
+            },
+            Some(out) = host_rx.recv() => {
+                if let Err(e) = write_msg(&mut control_send, &out).await {
+                    result = Some(Err(e));
+                }
+            }
+            _ = tick.tick() => {
+                let owner = super::ctrl::owns_ui(_lease.0);
+                if owner && super::notice::disconnect_requested() {
+                    info!("The person at this computer ended the file transfer");
+                    let _ = write_msg(&mut control_send, &HostMsg::Notice("The person at this computer disconnected".into())).await;
+                    result = Some(Ok(()));
+                } else if let Err(e) = session.poll_local(&mut control_send).await {
+                    result = Some(Err(e));
+                }
+            }
+            _ = connection.closed() => result = Some(Ok(())),
+        }
+    }
+    injector.release_all();
+    // A normal session that started meanwhile took the windows; leave them up.
+    if !super::ctrl::owns_ui(_lease.0) {
+        if let Some(w) = windows.take() {
+            std::mem::forget(w);
+        }
+    }
+    drop(windows);
+    result.unwrap_or(Ok(()))
+}
+
+#[cfg(test)]
+mod files_only_label_tests {
+    #[test]
+    fn the_popup_names_a_file_transfer() {
+        assert_eq!(super::files_only_label("Ben's laptop"), "Ben's laptop (file transfer)");
+        assert_eq!(super::files_only_label(" "), "File transfer");
+        let hello =
+            |p| pjdesk_proto::peer::ControlMsg::Hello { permissions: p, monitor: 0, quality: Default::default() };
+        assert!(super::wants_files_only(&hello(pjdesk_proto::perms::FILES_ONLY_REQUEST)));
+        assert!(!super::wants_files_only(&hello(pjdesk_proto::perms::ALL)));
+    }
 }
 
 /// Integer downscale factor that keeps the width within `max_width` and the

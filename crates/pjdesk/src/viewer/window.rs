@@ -2406,22 +2406,7 @@ impl App {
     }
 
     fn files_state(live: &super::controls::Live) -> crate::filepop::State {
-        let items = live
-            .transfers
-            .iter()
-            .map(|t| crate::filepop::Item { id: t.id, name: t.name.clone(), size: t.size, bytes: t.bytes, incoming: t.incoming, state: t.state.clone() })
-            .collect();
-        let allowed = live.allowed(pjdesk_proto::perms::FILE);
-        let note = if live.v3 && live.perms != 0 && !allowed { "The other computer did not allow file transfer.".to_string() } else { String::new() };
-        crate::filepop::State {
-            peer: live.peer_label.clone(),
-            allowed: allowed || live.perms == 0,
-            note,
-            items,
-            remote: live.remote_files.clone(),
-            save_dir: super::controls::downloads_dir().to_string_lossy().into_owned(),
-            ..Default::default()
-        }
+        super::filesonly::files_state(live)
     }
 
     fn open_files(&mut self, sid: u64) {
@@ -3858,7 +3843,7 @@ fn display_key(code: KeyCode) -> Option<usize> {
 }
 
 /// A dropped file is sent as itself. A dropped folder is the files inside it.
-fn expand_drop(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub(super) fn expand_drop(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     walk_drop(path, 0, &mut out);
     out.truncate(200);

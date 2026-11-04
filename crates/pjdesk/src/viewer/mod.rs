@@ -13,6 +13,7 @@ pub(crate) fn attach_drop_hwnd(hwnd: isize, on_drop: impl Fn(Vec<std::path::Path
 mod controls;
 pub mod decoder;
 mod filedrop;
+mod filesonly;
 mod keymap;
 mod panel;
 mod render;
@@ -58,6 +59,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         bail!("{message}");
     }
     let direct = args.direct.clone();
+    let files_only = args.files || std::env::var("PJDESK_FILES_ONLY").ok().as_deref() == Some("1");
     let typed = args.id.join(" ");
     let target = normalize_id(&typed);
     if direct.is_none() && !is_valid_id(&target) {
@@ -153,6 +155,9 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
         tracing::info!("Connected to \"{}\" ({}, {})", link.host_name, format_id(&link.host_id), link.path);
         if args.headless {
             return runtime.block_on(headless(link, args.frames));
+        }
+        if files_only {
+            return filesonly::run(&runtime, link);
         }
         let display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let view = std::env::var("PJDESK_VIEW").ok().and_then(|s| s.parse().ok()).unwrap_or(0);

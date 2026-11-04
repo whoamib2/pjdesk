@@ -808,6 +808,15 @@ impl App {
                         *action = Some(RowCmd::Move(id.to_string(), true));
                         ui.close();
                     }
+        if !row.this_computer
+            && ui
+                .button("Send files")
+                .on_hover_text("Files only: no screen or control. Same password as a session.")
+                .clicked()
+        {
+            *action = Some(RowCmd::Files(id.to_string()));
+            ui.close();
+        }
                     if ui.button("Move down").clicked() {
                         *action = Some(RowCmd::Move(id.to_string(), false));
                         ui.close();
@@ -979,7 +988,7 @@ impl App {
             }
             RowCmd::Direct(id, addr) => self.connect_discovered(&id, &addr),
             RowCmd::View(id) => self.request_view(&id),
-            RowCmd::Files(id) => self.connect_to(&id, None, false),
+            RowCmd::Files(id) => self.connect_to(&id, None, true),
             RowCmd::Save(id) => self.save_computer(&id),
             RowCmd::Favorite(id) => self.toggle_favorite(&id),
             RowCmd::ForgetPassword(id) => {

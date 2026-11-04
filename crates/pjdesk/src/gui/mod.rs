@@ -2427,7 +2427,8 @@ impl App {
         if self.outgoing_blocked() {
             return;
         }
-        if !password.is_empty() && self.offer_session_tab(id, password, files, remember, from_store, "") {
+        // Files only runs in its own small process, never as a tab of a picture window.
+        if !files && !password.is_empty() && self.offer_session_tab(id, password, files, remember, from_store, "") {
             self.ask_person_next = false;
             self.ask_view_next = false;
             return;
@@ -2455,7 +2456,7 @@ impl App {
             }
         }
         if files {
-            cmd.env("PJDESK_OPEN_PANEL", "files");
+            cmd.env("PJDESK_FILES_ONLY", "1");
         }
         if from_store {
             cmd.env("PJDESK_SAVED", "1");

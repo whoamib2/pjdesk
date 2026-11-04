@@ -336,7 +336,11 @@ pub fn start(
 
     if peer_proto >= 3 {
         let _ = control.send(ControlMsg::Hello {
-            permissions: perms::ALL | perms::LAYOUT | perms::VISITOR | perms::CHAT_PEER | perms::PEER_VERSION,
+            permissions: if files_only_mode() {
+                perms::FILES_ONLY_REQUEST
+            } else {
+                perms::ALL | perms::LAYOUT | perms::VISITOR | perms::CHAT_PEER | perms::PEER_VERSION
+            },
             monitor: saved_display,
             quality: opening_quality(relayed),
         });
@@ -370,6 +374,9 @@ pub fn start(
             .await;
         });
 
+    if files_only_mode() {
+        return (live, cmd_tx, recorder);
+    }
     let live_clip = live.clone();
     let control_clip = control;
     let wake_clip = wake;
@@ -500,6 +507,11 @@ fn on_host(
     match msg {
         HostMsg::Welcome { permissions, monitors, .. } => {
             tracing::info!("Host granted {}", perms::describe(permissions));
+            if files_only_mode() && !perms::host_runs_files_only(permissions) {
+                g.closed = Some(FILES_ONLY_TOO_OLD.into());
+                return;
+            }
+            let permissions = permissions & !perms::FILES_ONLY;
             g.perms = permissions;
             g.monitors = monitors;
             g.note(format!("This session can {}", perms::describe(permissions)));
@@ -1051,6 +1063,20 @@ pub fn downloads_dir() -> PathBuf {
     let configured = crate::config::Config::load().map(|c| c.settings.receive_dir).unwrap_or_default();
     PathBuf::from(crate::resolve_receive_dir(&configured))
 }
+
+static FILES_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This viewer process runs a files-only session (no picture window).
+pub fn set_files_only(on: bool) {
+    FILES_ONLY.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn files_only_mode() -> bool {
+    FILES_ONLY.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub const FILES_ONLY_TOO_OLD: &str =
+    "This computer's PJDesk is too old for files-only transfer. Update PJDesk on it, or start a normal session and use Send files there.";
 
 /// File streams go below control (0) and the picture (-1).
 pub(crate) const FILE_PRIORITY: i32 = -2;
