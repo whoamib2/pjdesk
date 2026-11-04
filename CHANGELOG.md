@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.87
+
+- Fixed: when the remote computer went to the lock screen or switched Windows sessions (for example after Remote Desktop or tscon), a "Remote session" notice appeared as a dialog, and its Close button ended the session, and reconnecting then failed with a wrong password. Session notices are now a short banner that fades on its own, and the session stays open and reconnects by itself. The host keeps its one-time password when it moves to the new session.
+- Session notices use plain wording, for example "CABINSIGHTHOUND is at the Windows sign-in screen…", and the same notice is not repeated.
+- Lower CPU on a still screen: the sharp-text refresh runs at most once every 4 seconds instead of after every caret blink or clock tick.
+- The PIN lock screen shows the app version (Windows client, Server window and Android).
+
 ## 0.6.86
 
 - One mouse pointer: the remote computer's pointer (arrow, I-beam, resize, and so on) is now shown as your own cursor, with no lag, instead of a dot plus a second pointer in the picture. Needs 0.6.86 on both computers; older hosts keep the dot.

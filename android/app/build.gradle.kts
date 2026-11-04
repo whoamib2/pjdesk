@@ -13,8 +13,8 @@ android {
         applicationId = "us.spader.pjdesk"
         minSdk = 26
         targetSdk = 35
-        versionCode = 63155
-        versionName = "0.6.86"
+        versionCode = 63156
+        versionName = "0.6.87"
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
         }
