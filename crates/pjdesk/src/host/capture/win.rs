@@ -202,6 +202,17 @@ struct SavedArea {
 
 /// Draws the current cursor onto a canvas, remembering the pixels underneath
 /// so the next cursor-only update can undo it without a new desktop image.
+thread_local! {
+    /// False when this capture thread's controller draws the pointer itself.
+    static DRAW_POINTER: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Called by the capture thread each frame: whether to draw the pointer into
+/// the video. A 0.6.86 controller shows the host's pointer itself.
+pub fn set_draw_pointer(draw: bool) {
+    DRAW_POINTER.with(|d| d.set(draw));
+}
+
 #[derive(Default)]
 pub struct CursorOverlay {
     /// Last cursor handle and its hotspot/size.
@@ -230,6 +241,9 @@ impl CursorOverlay {
 
     /// Draws the cursor; `origin` is the desktop position of canvas pixel (0, 0).
     pub fn draw(&mut self, canvas: &mut DibCanvas, origin: (i32, i32)) -> CursorState {
+        if !DRAW_POINTER.with(|d| d.get()) {
+            return CursorState::default();
+        }
         let mut info = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
         if unsafe { GetCursorInfo(&mut info) }.is_err()
             || info.flags.0 & CURSOR_SHOWING.0 == 0

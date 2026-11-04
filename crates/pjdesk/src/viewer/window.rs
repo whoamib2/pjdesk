@@ -396,6 +396,8 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
         pan_shown: (0.0, 0.0),
         pan_at: Instant::now(),
         dot_cursor: None,
+        pointer_applied: 0,
+        pointer_hidden: false,
         separate_pick: None,
         edge_cursor: false,
         last_title_click: None,
@@ -718,6 +720,10 @@ struct App {
     pan_shown: (f32, f32),
     pan_at: Instant,
     dot_cursor: Option<winit::window::CustomCursor>,
+    /// Last `pointer_serial` from the host that was applied (0.6.86 hosts).
+    pointer_applied: u64,
+    /// The host said its pointer is hidden.
+    pointer_hidden: bool,
     /// "Open in new window" from the screen picker: only these screens get a
     /// window. `None` is the full separate-windows view (one per screen).
     separate_pick: Option<Vec<u8>>,
@@ -1436,6 +1442,7 @@ impl App {
             };
             if let Some(dir) = edge {
                 window.set_cursor(winit::window::CursorIcon::from(dir));
+                window.set_cursor_visible(true);
                 self.edge_cursor = true;
                 return;
             }
@@ -1444,6 +1451,7 @@ impl App {
                 if let Some(dot) = &self.dot_cursor {
                     window.set_cursor(dot.clone());
                 }
+                window.set_cursor_visible(!self.pointer_hidden);
             }
         }
         if self.confirm_close {
@@ -2018,7 +2026,10 @@ impl App {
         let Ok(window) = event_loop.create_window(attributes) else { return };
         let window = Rc::new(window);
         let sized = self.apply_place(event_loop, &window, display);
-        if let Ok(source) = CustomCursor::from_rgba(dot_cursor(), 5, 5, 2, 2) {
+        if let Some(pointer) = self.dot_cursor.clone().filter(|_| self.pointer_applied > 0) {
+            window.set_cursor(pointer);
+            window.set_cursor_visible(!self.pointer_hidden);
+        } else if let Ok(source) = CustomCursor::from_rgba(dot_cursor(), 5, 5, 2, 2) {
             let dot = event_loop.create_custom_cursor(source);
             window.set_cursor(dot.clone());
             self.dot_cursor = Some(dot);
@@ -2051,6 +2062,43 @@ impl App {
         self.push_watch();
         self.show_toast(format!("Screen {} closed", closed + 1));
         false
+    }
+
+    /// Shows the host's pointer (0.6.86 hosts) as this window's own cursor, so
+    /// there is exactly one pointer and it moves with no network lag. Older
+    /// hosts draw the pointer into the video and keep the small dot here.
+    fn sync_pointer(&mut self, event_loop: &ActiveEventLoop) {
+        let (serial, pointer) = {
+            let g = self.live.lock().unwrap();
+            (g.pointer_serial, g.pointer.clone())
+        };
+        if serial == self.pointer_applied {
+            return;
+        }
+        self.pointer_applied = serial;
+        let Some((w, h, hx, hy, rgba)) = pointer else { return };
+        let mut windows: Vec<Rc<Window>> = self.extra.iter().map(|p| p.window.clone()).collect();
+        if let Some(window) = &self.window {
+            windows.push(window.clone());
+        }
+        self.pointer_hidden = w == 0;
+        if w > 0 {
+            match CustomCursor::from_rgba(rgba.as_ref().clone(), w, h, hx, hy) {
+                Ok(source) => {
+                    let cursor = event_loop.create_custom_cursor(source);
+                    self.dot_cursor = Some(cursor.clone());
+                    if !self.edge_cursor {
+                        for window in &windows {
+                            window.set_cursor(cursor.clone());
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("host pointer image refused: {e}"),
+            }
+        }
+        for window in &windows {
+            window.set_cursor_visible(!self.pointer_hidden || self.edge_cursor);
+        }
     }
 
     fn sync_separate(&mut self, event_loop: &ActiveEventLoop) {
@@ -3357,6 +3405,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let Some(window) = self.window.clone() else { return };
                 self.sync_separate(event_loop);
+                self.sync_pointer(event_loop);
                 window.request_redraw();
                 for pane in &self.extra {
                     pane.window.request_redraw();

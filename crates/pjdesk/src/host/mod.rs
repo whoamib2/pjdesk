@@ -7,6 +7,7 @@ mod ctrl;
 pub(crate) mod direct;
 mod encoder;
 mod input;
+pub mod cursorshape;
 pub mod inputroute;
 #[cfg(windows)]
 pub mod inputwin;

@@ -108,6 +108,9 @@ pub struct Session {
     chat_peer: AtomicBool,
     /// Account or computer name of the person at the controller.
     controller_label: Mutex<String>,
+    /// 0.6.86 controller draws the pointer itself (ControlMsg::CursorShapes):
+    /// capture leaves it out of the video and a thread sends its shape.
+    pub cursor_shapes: AtomicBool,
 }
 
 impl Session {
@@ -165,6 +168,7 @@ impl Session {
             peer_name: grant.peer_name.clone(),
             chat_peer: AtomicBool::new(false),
             controller_label: Mutex::new(grant.peer_name),
+            cursor_shapes: AtomicBool::new(false),
         })
     }
 
@@ -368,6 +372,12 @@ impl Session {
             }
             ControlMsg::Tunnel(msg) => self.tunnel(msg, send).await?,
             ControlMsg::Audio { enabled } => self.audio(enabled, send).await?,
+            ControlMsg::CursorShapes => {
+                if !self.cursor_shapes.swap(true, Ordering::SeqCst) {
+                    info!("The controller draws the pointer; sending pointer shapes");
+                    super::cursorshape::spawn(self.host_tx.clone());
+                }
+            }
             ControlMsg::Visitor { account, computer, user, id } => {
                 info!("Connected: account={account:?} computer={computer:?} user={user:?} id={id}");
                 let label = if account.trim().is_empty() { computer.clone() } else { account.clone() };

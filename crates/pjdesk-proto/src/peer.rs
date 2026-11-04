@@ -145,7 +145,23 @@ pub enum ControlMsg {
         name: String,
         unix: u64,
     },
+    /// 0.6.86. The controller draws the host's mouse pointer itself: the host
+    /// stops drawing it into the video and sends [`HostMsg::CursorShape`]
+    /// instead. Sent only when the host's [`HostMsg::PeerVersion`] is at least
+    /// [`CURSOR_SHAPES_MIN_VERSION`], so an older host never receives it.
+    CursorShapes,
 }
+
+/// First release whose host understands [`ControlMsg::CursorShapes`].
+pub const CURSOR_SHAPES_MIN_VERSION: &str = "0.6.86";
+
+/// Whether the controller may ask a host running `version` for pointer shapes.
+pub fn cursor_shapes_supported(version: &str) -> bool {
+    pjdesk_app_version(version).is_some_and(|v| crate::update::version_at_least(&v, CURSOR_SHAPES_MIN_VERSION))
+}
+
+/// Largest pointer image a host sends (per side, pixels).
+pub const CURSOR_MAX_SIDE: u16 = 128;
 
 /// [`ControlMsg::View`] mode: one display, the one named by `display`.
 pub const VIEW_SINGLE: u8 = 0;
@@ -410,6 +426,28 @@ pub enum HostMsg {
     PeerVersion {
         version: String,
     },
+    /// 0.6.86. The host's mouse pointer changed. Sent only after
+    /// [`ControlMsg::CursorShapes`]. `width == 0` means the pointer is hidden.
+    /// `rgba` is `width * height * 4` bytes, straight (not premultiplied) alpha.
+    CursorShape {
+        id: u64,
+        width: u16,
+        height: u16,
+        hot_x: u16,
+        hot_y: u16,
+        rgba: Vec<u8>,
+    },
+}
+
+/// A [`HostMsg::CursorShape`] the controller can turn into a pointer.
+pub fn cursor_shape_valid(width: u16, height: u16, hot_x: u16, hot_y: u16, rgba: &[u8]) -> bool {
+    width > 0
+        && height > 0
+        && width <= CURSOR_MAX_SIDE
+        && height <= CURSOR_MAX_SIDE
+        && hot_x < width
+        && hot_y < height
+        && rgba.len() == width as usize * height as usize * 4
 }
 
 /// Whether the session toolbar may offer chat.
@@ -983,4 +1021,37 @@ pub async fn read_side_chunk<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<V
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
     Ok(Some(buf))
+}
+
+#[cfg(test)]
+mod cursor_shape_tests {
+    use super::*;
+
+    #[test]
+    fn only_new_hosts_are_asked_for_pointer_shapes() {
+        assert!(cursor_shapes_supported("0.6.86"));
+        assert!(cursor_shapes_supported("0.7.0"));
+        assert!(!cursor_shapes_supported("0.6.85"));
+        assert!(!cursor_shapes_supported(""));
+        assert!(!cursor_shapes_supported("10.0.22631"));
+    }
+
+    #[test]
+    fn pointer_shapes_are_checked_before_use() {
+        assert!(cursor_shape_valid(2, 2, 1, 1, &[0; 16]));
+        assert!(!cursor_shape_valid(2, 2, 2, 0, &[0; 16]));
+        assert!(!cursor_shape_valid(2, 2, 0, 0, &[0; 15]));
+        assert!(!cursor_shape_valid(0, 2, 0, 0, &[]));
+        assert!(!cursor_shape_valid(CURSOR_MAX_SIDE + 1, 1, 0, 0, &vec![0; (CURSOR_MAX_SIDE as usize + 1) * 4]));
+    }
+
+    #[test]
+    fn new_variants_are_appended_so_old_tags_keep_their_numbers() {
+        let old = postcard::to_allocvec(&HostMsg::PeerVersion { version: "x".into() }).unwrap();
+        let new = postcard::to_allocvec(&HostMsg::CursorShape { id: 1, width: 0, height: 0, hot_x: 0, hot_y: 0, rgba: vec![] }).unwrap();
+        assert_eq!(new[0], old[0] + 1);
+        let chat = postcard::to_allocvec(&ControlMsg::ChatLine { text: String::new(), name: String::new(), unix: 0 }).unwrap();
+        let shapes = postcard::to_allocvec(&ControlMsg::CursorShapes).unwrap();
+        assert_eq!(shapes[0], chat[0] + 1);
+    }
 }

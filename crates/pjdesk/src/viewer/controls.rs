@@ -85,6 +85,10 @@ pub struct Live {
     pub chat_ready: bool,
     /// The host's PJDesk version from PeerVersion, empty until it arrives.
     pub peer_version: String,
+    /// 0.6.86 host pointer image (w, h, hot_x, hot_y, rgba); w == 0 hidden.
+    /// `pointer_serial` counts changes so the window applies each once.
+    pub pointer: Option<(u16, u16, u16, u16, std::sync::Arc<Vec<u8>>)>,
+    pub pointer_serial: u64,
     /// Messages that arrived while the chat panel was closed.
     pub chat_unread: u32,
     /// The session window is showing the chat panel.
@@ -137,6 +141,8 @@ impl Live {
             chat: Vec::new(),
             chat_ready: false,
             peer_version: String::new(),
+            pointer: None,
+            pointer_serial: 0,
             chat_unread: 0,
             chat_open: false,
             peer_label: String::new(),
@@ -190,6 +196,8 @@ impl Live {
             chat: self.chat.clone(),
             chat_ready: self.chat_ready,
             peer_version: self.peer_version.clone(),
+            pointer: self.pointer.clone(),
+            pointer_serial: self.pointer_serial,
             chat_unread: self.chat_unread,
             chat_open: self.chat_open,
             peer_label: self.peer_label.clone(),
@@ -635,6 +643,20 @@ fn on_host(
             g.peer_version = version.clone();
             if pjdesk_proto::peer::chat_gate(&version, "", false) == pjdesk_proto::peer::ChatGate::Ready {
                 g.chat_ready = true;
+            }
+            // One pointer: the host stops drawing it into the video and sends
+            // its shape; this window shows it at the local mouse position.
+            if pjdesk_proto::peer::cursor_shapes_supported(&version) {
+                let _ = control.send(ControlMsg::CursorShapes);
+            }
+        }
+        HostMsg::CursorShape { width, height, hot_x, hot_y, rgba, .. } => {
+            if width == 0 {
+                g.pointer = Some((0, 0, 0, 0, std::sync::Arc::new(Vec::new())));
+                g.pointer_serial += 1;
+            } else if pjdesk_proto::peer::cursor_shape_valid(width, height, hot_x, hot_y, &rgba) {
+                g.pointer = Some((width, height, hot_x, hot_y, std::sync::Arc::new(rgba)));
+                g.pointer_serial += 1;
             }
         }
         HostMsg::Pong { .. } | HostMsg::Tunnel(TunnelMsg::Open { .. }) => {}

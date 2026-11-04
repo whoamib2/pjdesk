@@ -16,6 +16,8 @@ mod gdi;
 pub mod synthetic;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+pub use win::set_draw_pointer;
 
 use std::time::Duration;
 
