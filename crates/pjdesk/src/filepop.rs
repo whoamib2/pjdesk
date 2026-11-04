@@ -100,6 +100,17 @@ fn push_requests(dir: &Path, more: Vec<Request>) {
     }
 }
 
+/// Stops the heartbeat thread from `FilePop::keep_alive` when dropped.
+pub struct KeepAlive {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for KeepAlive {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The viewer's handle on one session's files window.
 pub struct FilePop {
     dir: PathBuf,
@@ -174,6 +185,30 @@ impl FilePop {
         }
         self.written = Some(probe);
         self.last_beat = Instant::now();
+    }
+
+    /// Keeps the window's heartbeat fresh while the caller is blocked (for
+    /// example signing in again after a drop), so the window stays up.
+    pub fn keep_alive(&self) -> KeepAlive {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let dir = self.dir.clone();
+        let mut state = self.state.clone();
+        std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                state.beat = now_ms();
+                if let Ok(body) = serde_json::to_vec(&state) {
+                    write_atomic(&dir.join("state.json"), &body);
+                }
+                for _ in 0..10 {
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        });
+        KeepAlive { stop }
     }
 
     pub fn take_requests(&mut self) -> Vec<Request> {

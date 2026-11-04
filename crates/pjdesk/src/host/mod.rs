@@ -3,7 +3,7 @@
 pub mod capture;
 pub(crate) mod chatwin;
 pub(crate) mod filewin;
-mod ctrl;
+pub(crate) mod ctrl;
 pub(crate) mod direct;
 mod encoder;
 mod input;
@@ -12,7 +12,7 @@ pub mod inputroute;
 #[cfg(windows)]
 pub mod inputwin;
 pub(crate) mod notice;
-mod stream;
+pub(crate) mod stream;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

@@ -88,6 +88,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
     let mut prefer_standby = false;
     let mut move_to: Option<String> = None;
     let mut tries = 0u32;
+    let mut carry: Option<filesonly::Carry> = None;
     loop {
         let link = if let Some(addr) = direct.clone() {
             runtime.block_on(connect_direct(&mut config, &addr, &password, ask.as_deref(), args.trust && !waiting, false))
@@ -126,6 +127,9 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
                 continue;
             }
             Err(e) => {
+                if let Some(c) = carry.take() {
+                    c.close();
+                }
                 let wrong = e.to_string().to_ascii_lowercase().contains("wrong password");
                 if wrong && ask.is_some() {
                     crate::note_failure(&format!("{e:#}"));
@@ -157,7 +161,15 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
             return runtime.block_on(headless(link, args.frames));
         }
         if files_only {
-            return filesonly::run(&runtime, link);
+            match filesonly::run(&runtime, link, carry.take())? {
+                filesonly::FilesStop::Done => return Ok(()),
+                filesonly::FilesStop::Reconnect(c) => {
+                    carry = Some(c);
+                    waiting = true;
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            }
         }
         let display = std::env::var("PJDESK_DISPLAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let view = std::env::var("PJDESK_VIEW").ok().and_then(|s| s.parse().ok()).unwrap_or(0);

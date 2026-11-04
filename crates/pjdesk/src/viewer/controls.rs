@@ -123,7 +123,7 @@ pub struct Live {
 }
 
 impl Live {
-    fn new(v3: bool) -> Self {
+    pub(crate) fn new(v3: bool) -> Self {
         Self {
             v3,
             perms: if v3 { 0 } else { perms::CLASSIC },
@@ -1236,16 +1236,38 @@ async fn dispatch_uni(
     player: Arc<Mutex<Option<Player>>>,
     control: mpsc::UnboundedSender<ControlMsg>,
 ) {
-    let video = match await_video_stream(&connection, &live).await {
-        Ok(stream) => stream,
-        Err(text) => {
-            tracing::error!("{text}");
-            crate::note_failure(&text);
-            live.lock().unwrap().closed = Some(text);
-            return;
-        }
-    };
-    tracing::info!("Video stream received from the host");
+    // Files only: the host never opens a picture stream, and every uni stream
+    // is a file. Waiting for "the video stream" there ended the session after
+    // 20 seconds and would have read a host's file as pictures.
+    if expects_video_stream() {
+        let video = match await_video_stream(&connection, &live).await {
+            Ok(stream) => stream,
+            Err(text) => {
+                tracing::error!("{text}");
+                crate::note_failure(&text);
+                live.lock().unwrap().closed = Some(text);
+                return;
+            }
+        };
+        tracing::info!("Video stream received from the host");
+        read_video(video, frames);
+    }
+    while let Ok(mut stream) = connection.accept_uni().await {
+        let live = live.clone();
+        let player = player.clone();
+        let control = control.clone();
+        spawn_viewer(async move {
+            let _ = read_side(&mut stream, &live, &player, &control).await;
+        });
+    }
+}
+
+/// A normal session's first uni stream is the picture; a files-only one has none.
+pub(crate) fn expects_video_stream() -> bool {
+    !files_only_mode()
+}
+
+fn read_video(video: quinn::RecvStream, frames: std::sync::mpsc::Sender<(VideoHeader, Vec<u8>)>) {
     spawn_viewer(async move {
         let mut video = video;
         loop {
@@ -1260,14 +1282,6 @@ async fn dispatch_uni(
             }
         }
     });
-    while let Ok(mut stream) = connection.accept_uni().await {
-        let live = live.clone();
-        let player = player.clone();
-        let control = control.clone();
-        spawn_viewer(async move {
-            let _ = read_side(&mut stream, &live, &player, &control).await;
-        });
-    }
 }
 
 async fn read_side(
