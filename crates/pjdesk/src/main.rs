@@ -129,6 +129,9 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Internal: the SYSTEM input agent the service launches into the console session.
+    #[command(name = "__input-agent", hide = true)]
+    InputAgent,
     /// Internal: the compact chat window for a session.
     #[command(name = "__chat-window", hide = true)]
     ChatWindow {
@@ -289,19 +292,25 @@ impl Default for HostArgs {
     }
 }
 
-/// Where received files go. Empty, or the word Downloads, is this user's real
-/// Downloads folder (the Known Folder, which may have been moved off the
-/// profile). The word Desktop is the Desktop. Anything else is that folder.
+/// Where received files go. Empty (never changed) is Downloads\PJDesk in this
+/// user's real Downloads folder (the Known Folder, which may have been moved
+/// off the profile). The word Downloads is Downloads itself, Desktop is the
+/// Desktop, and anything else is that folder, exactly as chosen.
 pub fn resolve_receive_dir(configured: &str) -> String {
     let text = configured.trim();
     if text.eq_ignore_ascii_case("desktop") {
         return home_folder("Desktop");
     }
-    if !text.is_empty() && !text.eq_ignore_ascii_case("downloads") {
+    if text.eq_ignore_ascii_case("downloads") {
+        let dir = downloads_folder();
+        let _ = std::fs::create_dir_all(&dir);
+        return dir.to_string_lossy().into_owned();
+    }
+    if !text.is_empty() {
         let _ = std::fs::create_dir_all(text);
         return text.to_string();
     }
-    let dir = downloads_folder();
+    let dir = downloads_folder().join("PJDesk");
     let _ = std::fs::create_dir_all(&dir);
     dir.to_string_lossy().into_owned()
 }
@@ -324,11 +333,14 @@ pub fn downloads_folder() -> std::path::PathBuf {
     if home.is_empty() { std::env::temp_dir() } else { std::path::PathBuf::from(home) }
 }
 
-/// The folder for the Files window footer and drop text: "Downloads" for the
-/// default, else the last two parts of the path.
+/// The folder for the Files window footer and drop text: "Downloads\PJDesk"
+/// for the default, else the last two parts of the path.
 pub fn receive_dir_label(configured: &str) -> String {
     let text = configured.trim();
-    if text.is_empty() || text.eq_ignore_ascii_case("downloads") {
+    if text.is_empty() {
+        return "Downloads\\PJDesk".into();
+    }
+    if text.eq_ignore_ascii_case("downloads") {
         return "Downloads".into();
     }
     if text.eq_ignore_ascii_case("desktop") {
@@ -435,7 +447,7 @@ fn main() {
         // with no log line and no window after the password was accepted.
         init_viewer_com();
     }
-    let is_background = raw.iter().any(|a| a == "__session-host" || a == "__chat-window" || a == "__session-companion" || a == "__files-window" || a == "__consent-window" || a == "update-handoff" || a == "--tray" || a == "--minimized" || a == "--background" || a == "--window")
+    let is_background = raw.iter().any(|a| a == "__session-host" || a == "__input-agent" || a == "__chat-window" || a == "__session-companion" || a == "__files-window" || a == "__consent-window" || a == "update-handoff" || a == "--tray" || a == "--minimized" || a == "--background" || a == "--window")
         || (raw.get(1).map(|s| s == "service").unwrap_or(false) && raw.iter().any(|a| a == "run"));
 
     // With any other argument, attach a console so output and clap errors show.
@@ -459,6 +471,12 @@ fn main() {
             };
             if let Err(e) = started {
                 fatal(&format!("PJDesk could not start: {e:#}"));
+            }
+        }
+        Some(Cmd::InputAgent) => {
+            #[cfg(windows)]
+            if let Err(e) = host::inputwin::run_agent() {
+                tracing::error!("input agent: {e:#}");
             }
         }
         Some(Cmd::SessionHost { config }) => {
@@ -532,7 +550,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::UpdateTask { disable }) => service::set_update_task(!disable),
         Some(Cmd::Console) => interactive(config, cli.server),
         Some(Cmd::Service(cmd)) => service_command(cmd),
-        Some(Cmd::SessionHost { .. }) | Some(Cmd::ChatWindow { .. }) | Some(Cmd::ConsentWindow { .. }) | Some(Cmd::FilesWindow { .. }) | Some(Cmd::SessionCompanion { .. }) | None => {
+        Some(Cmd::SessionHost { .. }) | Some(Cmd::InputAgent) | Some(Cmd::ChatWindow { .. }) | Some(Cmd::ConsentWindow { .. }) | Some(Cmd::FilesWindow { .. }) | Some(Cmd::SessionCompanion { .. }) | None => {
             unreachable!("handled in main")
         }
     }
@@ -990,5 +1008,20 @@ mod cli_lock {
         assert!(!help.contains("no-pin"), "{help}");
         assert!(!help.contains("skip-lock"), "{help}");
         assert!(!help.contains("--unlocked"), "{help}");
+    }
+}
+
+#[cfg(test)]
+mod receive_dir_tests {
+    #[test]
+    fn never_changed_means_downloads_pjdesk_and_a_chosen_folder_is_kept() {
+        let default = std::path::PathBuf::from(super::resolve_receive_dir(""));
+        assert_eq!(default, super::downloads_folder().join("PJDesk"));
+        assert_eq!(super::receive_dir_label(""), "Downloads\\PJDesk");
+        assert_eq!(std::path::PathBuf::from(super::resolve_receive_dir("Downloads")), super::downloads_folder());
+        let custom = std::env::temp_dir().join("pjdesk-receive-test");
+        let text = custom.to_string_lossy().into_owned();
+        assert_eq!(super::resolve_receive_dir(&text), text);
+        let _ = std::fs::remove_dir(&custom);
     }
 }

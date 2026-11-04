@@ -668,7 +668,7 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
                 d.receive_dir = dir.to_string_lossy().into_owned();
             }
         }
-        if !d.receive_dir.trim().is_empty() && ui.button("Reset to Downloads").clicked() {
+        if !d.receive_dir.trim().is_empty() && ui.button("Reset to Downloads\\PJDesk").clicked() {
             d.receive_dir.clear();
         }
     });

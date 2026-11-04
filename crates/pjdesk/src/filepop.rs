@@ -462,7 +462,7 @@ pub mod window {
                     ui.set_width(ui.available_width());
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new(if hovering { "Drop to send" } else { "Drag files or folders here" }).size(15.0).strong());
-                        ui.label(RichText::new("They go to the other computer's Downloads folder, or the folder chosen in its Settings").size(11.0).color(MUTED));
+                        ui.label(RichText::new("They go to Downloads\\PJDesk on the other computer, or the folder chosen in its Settings").size(11.0).color(MUTED));
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             let w = (ui.available_width() - 8.0) / 2.0;
