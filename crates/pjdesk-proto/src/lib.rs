@@ -26,6 +26,7 @@ pub mod discover;
 pub mod filesafe;
 pub mod framing;
 pub mod gesture;
+pub mod inputflow;
 pub mod handoff;
 pub mod layout;
 pub mod peer;

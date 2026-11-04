@@ -3025,6 +3025,8 @@ async fn host_session(
         let _ = send_welcome(&state, &mut control_send, perms::CLASSIC, ceiling, false).await;
         emit(&cb, &json!({"event":"keyframe"}));
     }
+    // Keeps a partly read message when the select below wakes for something else.
+    let mut frames = pjdesk_proto::framing::FrameReader::new();
     let result = loop {
         let pending_move = state.relay_move.lock().unwrap().clone();
         if let Some((sid, primary)) = pending_move {
@@ -3101,7 +3103,7 @@ async fn host_session(
             _ = state.session_wake.notified() => continue,
             msg = tokio::time::timeout(
                 idle,
-                read_msg::<_, ControlMsg>(&mut control_recv, MAX_CONTROL_FRAME),
+                frames.read_msg::<_, ControlMsg>(&mut control_recv, MAX_CONTROL_FRAME),
             ) => msg,
         };
         let msg = match msg {
@@ -4100,7 +4102,7 @@ async fn controller_session(
         state.view_chat_peer.store(true, Ordering::SeqCst);
         emit(&cb, &json!({"event":"chatReady"}));
     }
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlMsg>();
+    let (control_tx, control_rx) = mpsc::unbounded_channel::<ControlMsg>();
     *state.control.lock().unwrap() = Some(control_tx.clone());
     *state.viewer.lock().unwrap() = Some(connection.clone());
     let watch_conn = connection.clone();
@@ -4133,21 +4135,10 @@ async fn controller_session(
             let _ = control_tx.send(ControlMsg::SelectMonitor { index });
         }
     }
-    let mut control_send = auth.send;
+    let control_send = auth.send;
     let mut control_recv = auth.recv;
-    let writer = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        while let Some(msg) = control_rx.recv().await {
-            buf.clear();
-            if let Ok(body) = postcard::to_stdvec(&msg) {
-                buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-                buf.extend_from_slice(&body);
-            }
-            if control_send.write_all(&buf).await.is_err() || control_send.flush().await.is_err() {
-                break;
-            }
-        }
-    });
+    // Touch-pad moves are merged to the newest position; taps and keys never are.
+    let writer = tokio::spawn(pjdesk_proto::inputflow::pump_control(control_send, control_rx));
     let conn = connection.clone();
     let cb_v = cb.clone();
     let tx_ack = control_tx.clone();
@@ -4346,9 +4337,6 @@ async fn send_file_bytes(conn: quinn::Connection, id: u64, path: &Path, resume: 
     let _ = uni.finish();
     Ok(())
 }
-
-// quinn SendStream write_all is on AsyncWrite.
-use tokio::io::AsyncWriteExt;
 
 /// Which password the host refused: the one saved on this phone, or the one
 /// just typed. A saved one is cleared so the next try asks.

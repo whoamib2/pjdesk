@@ -16,7 +16,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use pjdesk_proto::framing::{read_msg, write_msg, MAX_CONTROL_FRAME};
+use pjdesk_proto::framing::{write_msg, MAX_CONTROL_FRAME};
 use pjdesk_proto::peer::{write_video_frame, ControlMsg, HostMsg, VideoHeader};
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::sync::mpsc;
@@ -168,9 +168,11 @@ pub async fn run(
     let mut injector = InputInjector::new(!mouse && !keyboard);
     injector.set_allowed(mouse, keyboard);
     let mut tick = tokio::time::interval(Duration::from_millis(200));
+    // Keeps a partly read message when another branch of the select wins.
+    let mut frames = pjdesk_proto::framing::FrameReader::new();
     let result = loop {
         tokio::select! {
-            msg = read_msg::<_, ControlMsg>(&mut control_recv, MAX_CONTROL_FRAME) => match msg {
+            msg = frames.read_msg::<_, ControlMsg>(&mut control_recv, MAX_CONTROL_FRAME) => match msg {
                 Ok(msg) => {
                     if let ControlMsg::FrameAck { seq } = &msg {
                         shared.flow.ack(*seq);

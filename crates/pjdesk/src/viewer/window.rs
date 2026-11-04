@@ -500,22 +500,10 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
 }
 
 /// Writes queued control messages, batching whatever is pending.
-async fn send_control(mut send: SendStream, mut rx: mpsc::UnboundedReceiver<ControlMsg>) {
-    let mut buf = Vec::new();
-    while let Some(first) = rx.recv().await {
-        buf.clear();
-        let mut next = Some(first);
-        while let Some(msg) = next {
-            if let Ok(body) = postcard::to_stdvec(&msg) {
-                buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-                buf.extend_from_slice(&body);
-            }
-            next = rx.try_recv().ok();
-        }
-        if send.write_all(&buf).await.is_err() {
-            break;
-        }
-    }
+/// Moves are merged to the newest position (at most every 8 ms); clicks,
+/// keys and acks are never merged or dropped. See `pjdesk_proto::inputflow`.
+async fn send_control(send: SendStream, rx: mpsc::UnboundedReceiver<ControlMsg>) {
+    pjdesk_proto::inputflow::pump_control(send, rx).await
 }
 
 async fn report_stats(

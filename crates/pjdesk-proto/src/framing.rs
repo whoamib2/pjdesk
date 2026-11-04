@@ -47,6 +47,54 @@ where
     Ok(postcard::from_bytes(&body)?)
 }
 
+/// Reads frames like [`read_msg`], but is safe to use as a `tokio::select!`
+/// branch. `read_msg` uses `read_exact`, which loses whatever part of a frame
+/// it had already read when another branch wins; the stream then reads from
+/// the middle of a message, so input is dropped or misread and the session
+/// usually ends with a decode error. This keeps the partial frame between
+/// calls, and every await point is a single cancel-safe `read`.
+#[derive(Default)]
+pub struct FrameReader {
+    buf: Vec<u8>,
+    scratch: Vec<u8>,
+}
+
+impl FrameReader {
+    pub fn new() -> Self {
+        Self { buf: Vec::new(), scratch: vec![0u8; 16 * 1024] }
+    }
+
+    /// The next whole frame, decoded. Fails if it exceeds `max_len`, does not
+    /// decode, or the stream ends.
+    pub async fn read_msg<R, T>(&mut self, r: &mut R, max_len: usize) -> Result<T>
+    where
+        R: AsyncRead + Unpin,
+        T: DeserializeOwned,
+    {
+        if self.scratch.is_empty() {
+            self.scratch = vec![0u8; 16 * 1024];
+        }
+        loop {
+            if self.buf.len() >= 4 {
+                let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+                if len > max_len {
+                    bail!("message too large ({len} bytes, limit {max_len})");
+                }
+                if self.buf.len() >= 4 + len {
+                    let msg = postcard::from_bytes(&self.buf[4..4 + len]);
+                    self.buf.drain(..4 + len);
+                    return Ok(msg?);
+                }
+            }
+            let n = r.read(&mut self.scratch).await?;
+            if n == 0 {
+                bail!("the stream ended");
+            }
+            self.buf.extend_from_slice(&self.scratch[..n]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +117,37 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(1024);
         a.write_all(&(10_000_000u32).to_be_bytes()).await.unwrap();
         let r: Result<ServerMsg> = read_msg(&mut b, MAX_SIGNAL_FRAME).await;
+        assert!(r.is_err());
+    }
+    #[tokio::test]
+    async fn frame_reader_survives_a_cancelled_read() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let msg = ClientMsg::Connect { proto: 1, target_id: "123456789".into(), controller_name: "laptop".into() };
+        let body = postcard::to_stdvec(&msg).unwrap();
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        let mut reader = FrameReader::new();
+        // Half the frame arrives, then the read loses a select! race.
+        a.write_all(&frame[..7]).await.unwrap();
+        let raced = tokio::time::timeout(
+            std::time::Duration::from_millis(30),
+            reader.read_msg::<_, ClientMsg>(&mut b, MAX_SIGNAL_FRAME),
+        )
+        .await;
+        assert!(raced.is_err(), "nothing whole has arrived yet");
+        a.write_all(&frame[7..]).await.unwrap();
+        write_msg(&mut a, &ServerMsg::Pong).await.unwrap();
+        let got: ClientMsg = reader.read_msg(&mut b, MAX_SIGNAL_FRAME).await.unwrap();
+        assert!(matches!(got, ClientMsg::Connect { .. }));
+        let got: ServerMsg = reader.read_msg(&mut b, MAX_SIGNAL_FRAME).await.unwrap();
+        assert!(matches!(got, ServerMsg::Pong));
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_oversized_frames() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        a.write_all(&(10_000_000u32).to_be_bytes()).await.unwrap();
+        let r: Result<ServerMsg> = FrameReader::new().read_msg(&mut b, MAX_SIGNAL_FRAME).await;
         assert!(r.is_err());
     }
 }

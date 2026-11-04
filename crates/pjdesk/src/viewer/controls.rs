@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pjdesk_proto::filesafe::{self, MAX_TRANSFER_BYTES};
-use pjdesk_proto::framing::{read_msg, MAX_CONTROL_FRAME};
+use pjdesk_proto::framing::MAX_CONTROL_FRAME;
 use pjdesk_proto::peer::{
     read_side_chunk, read_side_header, read_video_frame, write_side_chunk, write_side_header, Clipboard, ClipKind,
     ControlMsg, DisplayLayout, FileMsg, HostMsg, MonitorInfo, SideHeader, TunnelMsg, VideoHeader, AUDIO_MAGIC,
@@ -397,9 +397,11 @@ async fn run_loop(
     let mut rx_datagrams = connection.stats().udp_rx.datagrams;
     let mut ping = tokio::time::interval(Duration::from_secs(1));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Keeps a partly read message when the ping tick or a command wins the select.
+    let mut frames = pjdesk_proto::framing::FrameReader::new();
     loop {
         tokio::select! {
-            msg = read_msg::<_, HostMsg>(&mut control_recv, MAX_CONTROL_FRAME) => {
+            msg = frames.read_msg::<_, HostMsg>(&mut control_recv, MAX_CONTROL_FRAME) => {
                 match msg {
                     Ok(msg) => {
                         last_heard = Instant::now();
