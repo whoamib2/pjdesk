@@ -19,7 +19,7 @@ routes = [
 directory = "./public"
 binding = "ASSETS"
 not_found_handling = "404-page"
-run_worker_first = ["/api/*", "/download/*"]
+run_worker_first = ["/api/*", "/download/*", "/dl/*"]
 
 [[d1_databases]]
 binding = "DB"
@@ -31,8 +31,19 @@ migrations_dir = "migrations"
 binding = "SYNC"
 bucket_name = "pjdesk-sync"
 
+# Installers only. Create this bucket before deploying (do not reuse pjdesk-sync,
+# which holds encrypted account copies). This file does not create the bucket.
+[[r2_buckets]]
+binding = "RELEASES"
+bucket_name = "pjdesk-releases"
+
 [vars]
 # Accounts that can open /admin and always have cloud sync.
 ADMIN_EMAILS = "ben@spader.us,pjdesk@spader.us"
-# Where releases (and so the download links) come from.
+# Where unauthenticated /api/release links still point (0.6.90 and older).
 RELEASE_REPO = "whoamib2/pjdesk"
+# "1" (default): unauthenticated /api/release keeps returning GitHub URLs so
+# 0.6.90 and older can update while whoamib2/pjdesk is public. Set to "0"
+# after the machines you care about are on 0.6.91+ and the GitHub repo is
+# private (or its assets are gone). 0.6.90 and older cannot follow /dl/ URLs.
+RELEASE_PUBLIC_FALLBACK = "1"

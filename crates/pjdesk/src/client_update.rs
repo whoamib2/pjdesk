@@ -141,7 +141,17 @@ fn start_inner(from_service: bool) -> bool {
     true
 }
 
+
+pub(crate) fn use_account_for_updates() {
+    if let Ok(cfg) = crate::config::Config::load() {
+        if let Some(token) = cfg.account_token() {
+            pjdesk_proto::update::set_cloud_update_token(&token);
+        }
+    }
+}
+
 fn service_install() -> Result<pjdesk_proto::update::Outcome, String> {
+    use_account_for_updates();
     pjdesk_proto::update::install_client_as_service(env!("CARGO_PKG_VERSION"), &set_note).map_err(|e| format!("{e:#}"))
 }
 

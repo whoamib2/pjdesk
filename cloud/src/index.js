@@ -32,16 +32,19 @@
 //   GET  /api/admin/audit       (Bearer, admin)
 //   POST /api/admin/plan        (Bearer, admin) {email, plan, expires_at, note}
 //   POST /api/admin/sync        (Bearer, admin) {email, enabled}  (audited; same as a plan grant)
-//   GET  /api/release           latest release info (from GitHub); ETag.
-//                               Not password-gated: auto-update and the Android
-//                               app use this, then download from GitHub.
+//   GET  /api/release           latest release info. Authenticated callers
+//                               (download cookie, account, updater token or
+//                               admin key) get pjdesk.com /dl/ URLs. Others
+//                               get GitHub URLs while RELEASE_PUBLIC_FALLBACK
+//                               is on, so 0.6.90 and older can still update.
 //   GET  /api/download/state    {password_set, unlocked}
 //   POST /api/download/unlock   {password} → 30-day cookie (same-origin)
 //   POST /api/download/lock     clears the download cookie
 //   GET  /api/account/mirror    (Bearer) synced account copy for the primary
 //   PUT  /api/account/mirror    (Bearer) {base_revision, changes}; 412 + mirror
 //                               This route is not deployed until cloud\deploy.cmd.
-//   GET  /download/{client,server,sums}  → the latest release's files
+//   GET  /download/{client,server,sums}  → /dl/<version>/<file> (cookie)
+//   GET  /dl/latest/<file> and /dl/<version>/<file>  R2 installers (gated)
 // Everything else is the static website in ./public.
 
 import { sealPlainRowsOnce } from "./keyseal.js";
@@ -50,7 +53,8 @@ import { route as networkRoute } from "./network.js";
 import { probeQuery, shapeHealth } from "./health.js";
 import { LOGIN_FAILS, LOGIN_IP, loginRetryAfter, retryAfterSeconds, signInLimitMessage } from "./login-limit.js";
 import { accountMirror } from "./account-mirror.js";
-import { DownloadError, downloadApi, requireDownload } from "./download-gate.js";
+import { DownloadError, downloadApi } from "./download-gate.js";
+import { handleDl, handleReleaseApi, redirectDownload } from "./release-routes.js";
 
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 const AUTH_HASH_ITERATIONS = 100000; // the Workers PBKDF2 maximum
@@ -67,7 +71,13 @@ export default {
         sealPlainRowsOnce(env, ctx);
         return await api(request, env, url, ctx);
       }
-      if (url.pathname.startsWith("/download/")) return await download(request, env, url);
+      const accountOk = () => accountTokenOk(request, env);
+      if (url.pathname.startsWith("/dl/")) return await handleDl(request, env, url, accountOk);
+      if (url.pathname.startsWith("/download/")) {
+        const routed = await redirectDownload(request, env, url, accountOk);
+        if (routed) return routed;
+        return await download(request, env, url);
+      }
       return env.ASSETS.fetch(request);
     } catch (e) {
       if (e instanceof HttpError || e instanceof DownloadError) {
@@ -270,6 +280,8 @@ async function api(request, env, url, ctx) {
   if (p === "/api/account/mirror" && (m === "GET" || m === "PUT")) {
     return accountMirror(request, env, await session(request, env));
   }
+  const published = await handleReleaseApi(request, env, url, () => accountTokenOk(request, env));
+  if (published) return published;
   if (p === "/api/release" && m === "GET") {
     const info = await latestRelease(env);
     const etag = `"${await sha256Hex(JSON.stringify(info))}"`;
@@ -828,6 +840,17 @@ async function latestRelease(env) {
   const info = await releaseInfo(env.RELEASE_REPO, tag);
   releaseMemo = { info, at: Date.now() };
   return info;
+}
+
+async function accountTokenOk(request, env) {
+  const h = request.headers.get("authorization") || "";
+  if (!/^Bearer\s+\S+$/i.test(h)) return false;
+  try {
+    await session(request, env);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function downloadRate(env) {

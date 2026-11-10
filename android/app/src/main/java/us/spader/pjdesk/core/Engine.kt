@@ -722,6 +722,31 @@ class Engine(context: Context) : EngineListener {
                     }
                 }
             }
+            "installApk" -> {
+                val path = event.optString("path")
+                val text = event.optString("text").ifBlank { "Installing the update." }
+                update { it.copy(status = text, notice = text) }
+                val file = java.io.File(path)
+                val canonical = runCatching { file.canonicalFile }.getOrNull()
+                val cacheRoot = runCatching { app.cacheDir.canonicalPath }.getOrNull()
+                val filesRoot = runCatching { app.filesDir.canonicalPath }.getOrNull()
+                val allowed = canonical != null && canonical.isFile && (
+                    (cacheRoot != null && canonical.path.startsWith("$cacheRoot/")) ||
+                        (filesRoot != null && canonical.path.startsWith("$filesRoot/"))
+                    )
+                if (!allowed) {
+                    update { it.copy(error = "Couldn't open the update.") }
+                } else {
+                    val uri = androidx.core.content.FileProvider.getUriForFile(app, "us.spader.pjdesk.files", canonical!!)
+                    val view = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, "application/vnd.android.package-archive")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    runCatching { app.startActivity(view) }.onFailure { failure ->
+                        update { it.copy(error = "Couldn't open the update: ${failure.message}") }
+                    }
+                }
+            }
             "needPassword" -> update {
                 it.copy(
                     askPassword = true,

@@ -243,6 +243,7 @@ fn serve_once() -> bool {
             if BUSY.swap(true, Ordering::SeqCst) {
                 write_line(Outgoing { progress: "", done: true, ok: false, message: "An update is already running." });
             } else {
+                crate::client_update::use_account_for_updates();
                 let outcome = pjdesk_proto::update::install_client_as_service(env!("CARGO_PKG_VERSION"), &|line| {
                     tracing::info!("{line}");
                     write_line(Outgoing { progress: line, done: false, ok: false, message: "" });

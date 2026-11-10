@@ -1,9 +1,12 @@
-//! Self-update: check a GitHub repo's latest release, download the matching
+//! Self-update: check pjdesk.com for the latest release, download the matching
 //! installer, verify its SHA-256 and (on Windows) run it silently.
 //!
-//! The client and server each call [`perform`] with their own installer name
-//! prefix. The GitHub API and the download are plain HTTPS to github.com, so
-//! this works unchanged on the user's machine (no server involvement).
+//! 0.6.91 and later prefer `https://pjdesk.com/api/release` and download from
+//! `/dl/` on pjdesk.com, sending a Cloud account Bearer token when the
+//! machine is signed in, or `Authorization: Updater` when
+//! `PJDESK_UPDATE_TOKEN` is set (runtime or compile-time). SHA-256 against
+//! `SHA256SUMS` is still required. If the site cannot be reached, the GitHub
+//! API is the fallback (needed while public release assets still exist).
 //!
 //! A release is installed only when its `SHA256SUMS` asset matches the
 //! downloaded bytes. The installer is written under a private directory with
@@ -13,7 +16,8 @@
 //! required until a signing key exists (see SECURITY-AUDIT.md).
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -21,6 +25,55 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const USER_AGENT: &str = "PJDesk-Updater";
+const SITE_RELEASE: &str = "https://pjdesk.com/api/release";
+
+static CLOUD_UPDATE_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// Prefer a Cloud / website account session for update requests.
+/// Empty values are ignored. The token is not logged.
+pub fn set_cloud_update_token(token: &str) {
+    let token = token.trim();
+    if token.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = CLOUD_UPDATE_TOKEN.lock() {
+        *g = Some(token.to_string());
+    }
+}
+
+/// `Authorization` value for update requests: a Cloud account Bearer token
+/// when one was supplied, else `Updater` from `PJDESK_UPDATE_TOKEN` (runtime
+/// first, then a compile-time `option_env`). A token baked into a public
+/// binary is extractable; it is never committed in source.
+pub fn update_authorization() -> Option<String> {
+    if let Ok(g) = CLOUD_UPDATE_TOKEN.lock() {
+        if let Some(token) = g.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(format!("Bearer {token}"));
+        }
+    }
+    if let Ok(token) = std::env::var("PJDESK_CLOUD_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(format!("Bearer {token}"));
+        }
+    }
+    if let Ok(token) = std::env::var("PJDESK_UPDATE_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(format!("Updater {token}"));
+        }
+    }
+    match option_env!("PJDESK_UPDATE_TOKEN") {
+        Some(token) if !token.trim().is_empty() => Some(format!("Updater {}", token.trim())),
+        _ => None,
+    }
+}
+
+/// The file name in an HTTPS URL, ignoring a query string such as a download ticket.
+pub fn file_name_from_url(url: &str) -> Option<&str> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.rsplit('/').next().filter(|n| !n.is_empty() && !n.contains('\\'))
+}
 
 #[derive(Deserialize)]
 struct Release {
@@ -123,15 +176,19 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
 
 /// Downloads `url`. `progress` is `(bytes so far, Content-Length if the server sent one)`.
 fn http_get_progress(url: &str, progress: &dyn Fn(u64, Option<u64>)) -> Result<Vec<u8>> {
-    let resp = ureq::builder()
+    let req = ureq::builder()
         .timeout(Duration::from_secs(60))
         .user_agent(USER_AGENT)
         .build()
         .get(url)
         .set("Cache-Control", "no-cache")
-        .set("Pragma", "no-cache")
-        .call()
-        .with_context(|| format!("fetching {url}"))?;
+        .set("Pragma", "no-cache");
+    let req = if let Some(auth) = update_authorization() {
+        req.set("Authorization", &auth)
+    } else {
+        req
+    };
+    let resp = req.call().with_context(|| format!("fetching {url}"))?;
     let total = resp.header("Content-Length").and_then(|h| h.parse().ok()).filter(|n: &u64| *n > 0);
     let mut reader = resp.into_reader().take(200 * 1024 * 1024);
     let mut buf = Vec::new();
@@ -170,8 +227,16 @@ pub fn is_android_apk(name: &str) -> bool {
     lower.ends_with(".apk") && lower.contains("pjdesk") && !lower.contains("debug")
 }
 
-/// Latest Android APK from the GitHub release, when it is newer than `current`.
+/// Latest Android APK. Prefers pjdesk.com, then the GitHub release, when it
+/// is newer than `current`. `sums_url` is set so the APK can be verified.
 pub fn check_android(repo: &str, current: &str) -> Result<Option<Available>> {
+    match check_site_for(current, SiteKind::Android) {
+        Ok(found) => Ok(found),
+        Err(_) => check_android_github(repo, current),
+    }
+}
+
+fn check_android_github(repo: &str, current: &str) -> Result<Option<Available>> {
     let body = http_get(&format!("https://api.github.com/repos/{repo}/releases/latest"))?;
     let release: Release = serde_json::from_slice(&body).context("parsing the GitHub release")?;
     if !is_newer(current, &release.tag_name) {
@@ -180,13 +245,19 @@ pub fn check_android(repo: &str, current: &str) -> Result<Option<Available>> {
     let apk = pick_android_asset(&release.assets)
         .with_context(|| format!("release {} has no Android apk", release.tag_name))?;
     if !trusted_download_url(&apk.browser_download_url) {
-        bail!("the release points at a download outside GitHub, so it was not offered");
+        bail!("the release points at a download outside GitHub or pjdesk.com, so it was not offered");
+    }
+    let sums_url = release.assets.iter().find(|a| a.name == "SHA256SUMS").map(|a| a.browser_download_url.clone());
+    if let Some(url) = sums_url.as_deref() {
+        if !trusted_download_url(url) {
+            bail!("the release points at a download outside GitHub or pjdesk.com, so it was not offered");
+        }
     }
     Ok(Some(Available {
         version: release.tag_name.trim_start_matches('v').to_string(),
         installer_name: apk.name.clone(),
         installer_url: apk.browser_download_url.clone(),
-        sums_url: None,
+        sums_url,
     }))
 }
 
@@ -197,13 +268,19 @@ fn pick_client_asset(assets: &[Asset]) -> Option<&Asset> {
         .min_by_key(|a| if a.name.starts_with("PJDesk-Client-Setup") { 0 } else { 1 })
 }
 
-/// Latest client installer. Prefers `PJDesk-Client-Setup`, then `PJDesk-Setup`.
+/// Latest client installer. Prefers pjdesk.com, then GitHub
+/// (`PJDesk-Client-Setup`, then `PJDesk-Setup`).
 pub fn check_client(repo: &str, current: &str) -> Result<Option<Available>> {
-    let release = fetch_latest(repo)?;
-    if !is_newer(current, &release.tag_name) {
-        return Ok(None);
+    match check_site_for(current, SiteKind::Client) {
+        Ok(found) => Ok(found),
+        Err(_) => {
+            let release = fetch_latest(repo)?;
+            if !is_newer(current, &release.tag_name) {
+                return Ok(None);
+            }
+            available_from_release(&release).map(Some)
+        }
     }
-    available_from_release(&release).map(Some)
 }
 
 /// Looks up the repo's latest release and the installer whose name starts with
@@ -244,10 +321,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// Release downloads must be HTTPS on a GitHub host. The checksum file is
-/// published beside the installer, so a URL that leaves GitHub is not a
-/// second source of truth — it is a place a tampered release listing could
-/// send the updater.
+/// Release downloads must be HTTPS on GitHub or on pjdesk.com `/dl/`.
+/// The checksum file is published beside the installer, so a URL that
+/// leaves those hosts is not a second source of truth — it is a place a
+/// tampered release listing could send the updater.
 fn trusted_download_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
@@ -255,11 +332,16 @@ fn trusted_download_url(url: &str) -> bool {
     if rest.chars().any(|c| c.is_control() || c == ' ' || c == '\\') {
         return false;
     }
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if host.is_empty() || host.contains('@') {
+    let host_part = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host_part.is_empty() || host_part.contains('@') {
         return false;
     }
-    let host = host.split(':').next().unwrap_or("");
+    let host = host_part.split(':').next().unwrap_or("");
+    let after_host = rest.get(host_part.len()..).unwrap_or("");
+    let path = after_host.split(['?', '#']).next().unwrap_or(after_host);
+    if matches!(host, "pjdesk.com" | "www.pjdesk.com") {
+        return path.starts_with("/dl/") && !path.contains("..");
+    }
     matches!(
         host,
         "github.com"
@@ -268,6 +350,7 @@ fn trusted_download_url(url: &str) -> bool {
             | "github-releases.githubusercontent.com"
     )
 }
+
 
 /// Where verified installers are written. Not the shared temp directory: the
 /// update task runs as SYSTEM, and a predictable name there can be replaced
@@ -355,18 +438,28 @@ fn safe_version(version: &str) -> String {
 
 /// Downloads the installer into the private update directory and checks its
 /// SHA-256 against the release's `SHA256SUMS`. A release without that file is
-/// refused: HTTPS to GitHub is necessary, and the checksum catches a truncated
-/// or swapped download before anything is executed.
+/// refused: HTTPS to GitHub or pjdesk.com is necessary, and the checksum
+/// catches a truncated or swapped download before anything is executed.
 pub fn download_verified(update: &Available) -> Result<PathBuf> {
     download_verified_progress(update, &|_| {}, true)
 }
 
+/// Same verification as [`download_verified`], writing into `dir` (Android
+/// uses the app cache so a verified APK can be installed from there).
+pub fn download_verified_to(update: &Available, dir: &Path, lock_acl: bool) -> Result<PathBuf> {
+    download_verified_into(update, dir, &|_| {}, lock_acl)
+}
+
 fn download_verified_progress(update: &Available, progress: &dyn Fn(&str), lock_acl: bool) -> Result<PathBuf> {
+    download_verified_into(update, &update_dir(), progress, lock_acl)
+}
+
+fn download_verified_into(update: &Available, dir: &Path, progress: &dyn Fn(&str), lock_acl: bool) -> Result<PathBuf> {
     let sums_url = update.sums_url.as_deref().context(
         "this release has no SHA256SUMS file, so it was not installed. Publish SHA256SUMS next to the installer.",
     )?;
     if !trusted_download_url(&update.installer_url) || !trusted_download_url(sums_url) {
-        bail!("the release points at a download outside GitHub, so it was not installed");
+        bail!("the release points at a download outside GitHub or pjdesk.com, so it was not installed");
     }
     let version = update.version.clone();
     let last_pct = std::cell::Cell::new(999u64);
@@ -393,9 +486,9 @@ fn download_verified_progress(update: &Available, progress: &dyn Fn(&str), lock_
         bail!("checksum mismatch for {} (expected {want}, got {got})", update.installer_name);
     }
 
-    let dir = update_dir();
-    harden_update_dir(&dir, lock_acl)?;
-    let path = dir.join(format!("{}-{}.exe", hex::encode(crate::random_bytes::<8>()), safe_version(&update.version)));
+    harden_update_dir(dir, lock_acl)?;
+    let ext = if update.installer_name.to_ascii_lowercase().ends_with(".apk") { "apk" } else { "exe" };
+    let path = dir.join(format!("{}-{}.{ext}", hex::encode(crate::random_bytes::<8>()), safe_version(&update.version)));
     {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -551,9 +644,20 @@ pub fn run_installer(_path: &std::path::Path) -> Result<i32> {
 struct SiteRelease {
     version: String,
     #[serde(default)]
+    client: String,
+    #[serde(default)]
     server: String,
     #[serde(default)]
+    apk: String,
+    #[serde(default)]
     sums: String,
+}
+
+#[derive(Clone, Copy)]
+enum SiteKind {
+    Client,
+    Server,
+    Android,
 }
 
 /// Looks up the latest server installer. Tries `https://pjdesk.com/api/release`
@@ -570,7 +674,7 @@ pub fn check_server(current: &str) -> Result<Option<Available>> {
 /// The version string published at `https://pjdesk.com/api/release`.
 /// Callers cache this; it performs a network request.
 pub fn site_version() -> Result<String> {
-    let body = http_get("https://pjdesk.com/api/release")?;
+    let body = http_get(SITE_RELEASE)?;
     let release: SiteRelease = serde_json::from_slice(&body).context("parsing the PJDesk release")?;
     if release.version.is_empty() {
         bail!("the PJDesk release feed did not name a version");
@@ -579,25 +683,43 @@ pub fn site_version() -> Result<String> {
 }
 
 fn check_site(current: &str) -> Result<Option<Available>> {
-    let body = http_get("https://pjdesk.com/api/release")?;
+    check_site_for(current, SiteKind::Server)
+}
+
+fn check_site_for(current: &str, kind: SiteKind) -> Result<Option<Available>> {
+    let body = http_get(SITE_RELEASE)?;
     let release: SiteRelease = serde_json::from_slice(&body).context("parsing the PJDesk release")?;
-    if release.version.is_empty() || release.server.is_empty() || release.sums.is_empty() {
-        bail!("the PJDesk release feed did not name a server installer");
+    let url = match kind {
+        SiteKind::Client => release.client.as_str(),
+        SiteKind::Server => release.server.as_str(),
+        SiteKind::Android => release.apk.as_str(),
+    };
+    let label = match kind {
+        SiteKind::Client => "client installer",
+        SiteKind::Server => "server installer",
+        SiteKind::Android => "Android apk",
+    };
+    if release.version.is_empty() || url.is_empty() || release.sums.is_empty() {
+        bail!("the PJDesk release feed did not name a {label}");
     }
     if is_prerelease(&release.version) || !is_newer(current, &release.version) {
         return Ok(None);
     }
-    let installer_name = release
-        .server
-        .rsplit('/')
-        .next()
-        .filter(|n| n.starts_with("PJDesk-Server-Setup") && n.ends_with(".exe"))
-        .context("the release feed did not name a PJDesk Server installer")?
+    let installer_name = file_name_from_url(url)
+        .filter(|n| match kind {
+            SiteKind::Client => is_client_installer(n),
+            SiteKind::Server => n.starts_with("PJDesk-Server-Setup") && n.ends_with(".exe"),
+            SiteKind::Android => is_android_apk(n),
+        })
+        .with_context(|| format!("the release feed did not name a PJDesk {label}"))?
         .to_string();
+    if !trusted_download_url(url) || !trusted_download_url(&release.sums) {
+        bail!("the release points at a download outside GitHub or pjdesk.com, so it was not offered");
+    }
     Ok(Some(Available {
         version: release.version.trim_start_matches('v').to_string(),
         installer_name,
-        installer_url: release.server,
+        installer_url: url.to_string(),
         sums_url: Some(release.sums),
     }))
 }
@@ -614,7 +736,7 @@ pub fn install_available(update: &Available) -> Result<i32> {
         "this release has no SHA256SUMS file, so it was not installed. Publish SHA256SUMS next to the installer.",
     )?;
     if !trusted_download_url(sums_url) {
-        bail!("the release points at a download outside GitHub, so it was not installed");
+        bail!("the release points at a download outside GitHub or pjdesk.com, so it was not installed");
     }
     let sums = String::from_utf8(http_get(sums_url)?).unwrap_or_default();
     let want = expected_checksum(&sums, &update.installer_name)
@@ -653,13 +775,14 @@ pub fn install_client_as_service(current: &str, progress: &dyn Fn(&str)) -> Resu
 
 fn install_client_reporting_lock(current: &str, progress: &dyn Fn(&str), lock_acl: bool) -> Result<Outcome> {
     progress("Checking for updates…");
-    let release = fetch_latest(crate::UPDATE_REPO)?;
-    if !is_newer(current, &release.tag_name) {
-        let line = format!("PJDesk {current} is up to date. GitHub latest is {}.", release.tag_name.trim());
-        progress(&line);
-        return Ok(Outcome::UpToDate(current.to_string()));
-    }
-    let update = available_from_release(&release)?;
+    let update = match check_client(crate::UPDATE_REPO, current)? {
+        None => {
+            let line = format!("PJDesk {current} is up to date.");
+            progress(&line);
+            return Ok(Outcome::UpToDate(current.to_string()));
+        }
+        Some(update) => update,
+    };
     let path = download_verified_progress(&update, progress, lock_acl)?;
     let line = format!("Installing PJDesk {}. PJDesk will close and open again.", update.version);
     progress(&line);
@@ -777,16 +900,29 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa *PJDesk-Server-
     }
 
     #[test]
-    fn download_urls_stay_on_github() {
+    fn download_urls_stay_on_github_or_pjdesk() {
         assert!(trusted_download_url(
             "https://github.com/whoamib2/pjdesk/releases/download/v0.3.7/PJDesk-Setup-0.3.7.exe"
         ));
         assert!(trusted_download_url("https://objects.githubusercontent.com/github-production-release-asset-2e65be/a"));
+        assert!(trusted_download_url(
+            "https://pjdesk.com/dl/0.6.91/PJDesk-Server-Setup-0.6.91.exe?t=1700000000.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert!(trusted_download_url("https://www.pjdesk.com/dl/0.6.91/SHA256SUMS"));
+        assert!(!trusted_download_url("https://pjdesk.com/download/client"));
+        assert!(!trusted_download_url("https://pjdesk.com.evil.example/dl/0.6.91/a.exe"));
+        assert!(!trusted_download_url("http://pjdesk.com/dl/0.6.91/a.exe"));
+        assert!(!trusted_download_url("https://evil.example/dl/0.6.91/a.exe"));
         assert!(!trusted_download_url("http://github.com/whoamib2/pjdesk/releases/download/v0.3.7/a.exe"));
         assert!(!trusted_download_url("https://github.com.evil.example/a.exe"));
         assert!(!trusted_download_url("https://evil.example/github.com/a.exe"));
         assert!(!trusted_download_url("https://user:pass@github.com/a.exe"));
         assert!(!trusted_download_url("https://github.com\r\nX: y/a.exe"));
+        assert_eq!(
+            file_name_from_url("https://pjdesk.com/dl/0.6.91/PJDesk-Server-Setup-0.6.91.exe?t=abc"),
+            Some("PJDesk-Server-Setup-0.6.91.exe")
+        );
+        assert!(trusted_download_url("https://pjdesk.com:443/dl/0.6.91/SHA256SUMS"));
     }
 
     #[test]

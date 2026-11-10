@@ -11,11 +11,21 @@ One Cloudflare Worker (`src/index.js`) with:
   account).
 - **D1** (`DB`): accounts, sessions, sync bookkeeping (`migrations/`).
 - **R2** (`SYNC`, bucket `pjdesk-sync`): one sealed copy per account.
-- **Downloads**: `/download/client|server|sums` redirect to the latest GitHub
-  release's files, so the site never needs editing per release. Those paths,
-  and the download buttons on the website, require the download password
-  (Worker secret `DOWNLOAD_PASSWORD`). `GET /api/release` stays open so
-  auto-update and the Android app keep working.
+- **R2** (`RELEASES`, bucket `pjdesk-releases`): installers only. Encrypted
+  account copies stay in `pjdesk-sync`. Do not reuse that bucket for releases.
+- **Downloads**: `/dl/latest/<file>` and `/dl/<version>/<file>` serve those
+  installers from R2. `/download/client|server|sums` redirect there once a
+  release is published (and still fall back to GitHub if R2 is empty). Opening
+  a file needs the download-password cookie, a signed-in account Bearer token,
+  `Authorization: Updater` (`UPDATE_TOKEN`), `Authorization: Admin`
+  (`RELEASE_ADMIN_KEY`), or a short-lived `?t=` ticket. Browsers without
+  access are sent to `/#download`; other callers get `401` with
+  `{code:"download_password"}`.
+- **Updates**: authenticated `GET /api/release` returns pjdesk.com `/dl/` URLs
+  with tickets. While `RELEASE_PUBLIC_FALLBACK` is `"1"` (the default),
+  unauthenticated callers still get GitHub URLs so 0.6.90 and older can
+  update. Set it to `"0"` only after those installs are on a build that
+  fetches `/dl/` with auth.
 
 ## Privacy
 
@@ -53,11 +63,81 @@ cd "C:\App Dev\PJDesk\cloud"
 npx.cmd wrangler secret put DOWNLOAD_PASSWORD
 ```
 
-This only locks the website buttons and `/download/*`. The GitHub release
-files stay public, and `/api/release` still lists their URLs, because
-installed copies update from there. NGNVR can lock the files themselves
-because it serves them from R2 behind the same password (and a linked NVR
-uses its device key for updates).
+### Locked files (R2)
+
+Installers live in the `pjdesk-releases` bucket (Worker binding `RELEASES`),
+not in `pjdesk-sync`. Create that bucket yourself before the first deploy that
+includes the binding; this repo does not create it.
+
+A browser that already unlocked the download form can fetch `/dl/...` with the
+cookie. A signed-in pjdesk.com account can send `Authorization: Bearer`. The
+Windows and Android updaters in 0.6.91+ send that account token when the
+machine is signed in to Cloud Sync or a website account, or `Authorization:
+Updater` when `PJDESK_UPDATE_TOKEN` is set at runtime or baked in at build
+time with the same-named compile-time environment variable. A token compiled
+into a public binary is extractable; it is still stronger than a User-Agent
+string, and it is never committed in source. Android cannot send custom
+headers when it opens a download URL, so `/api/release` includes a one-hour
+signed `?t=` ticket on each file URL. The publish script uses
+`Authorization: Admin` (`RELEASE_ADMIN_KEY`).
+
+0.6.90 and older do not send any of those credentials. They either call
+`GET /api/release` with only `User-Agent: PJDesk-Updater` (Windows Server,
+since 0.4.0) or talk only to the GitHub API (Windows Client and Android;
+also every server before 0.4.0). From 0.3.7 on, the Windows updater
+refuses any download URL whose host is not GitHub
+(`github.com` / `*.githubusercontent.com`) before it even issues the GET.
+SHA-256 against `SHA256SUMS` is required on Windows, and that sums URL is
+checked the same way. ureq would follow redirects, but that never helps:
+the host check is on the URL in the feed, not the final hop, and a private
+GitHub repo will not serve a redirect we control. A short-lived
+`?t=` ticket on a pjdesk.com URL also breaks 0.6.90 server name parsing
+(`rsplit('/')` leaves `file.exe?t=...`, which does not end in `.exe`), so
+it would fall back to the GitHub API anyway.
+
+So while `RELEASE_PUBLIC_FALLBACK` is `"1"`, unauthenticated `/api/release`
+keeps returning GitHub URLs. Do not point those old installs at `/dl/` —
+they would refuse the URL or fail the name check. A failed update leaves
+the machine running. After the GitHub repository is private, those old
+installs cannot be kept updating. Only 0.6.91 and later, which trust
+pjdesk.com `/dl/` and send auth (or use the ticket already on the URL),
+will still auto-update.
+
+For 0.6.91+ to keep updating after the repo is private even when the
+machine is not signed in to a pjdesk.com account, bake
+`PJDESK_UPDATE_TOKEN` into that build (and set the same value as the
+Worker secret `UPDATE_TOKEN`). A token compiled into the binary is
+extractable; it is still stronger than a User-Agent string, and it must
+not be committed in source.
+
+Upload a release from the folder that holds the six files (client setup,
+setup, server setup, APK, SHA256SUMS, cloud zip):
+
+```
+cd "C:\App Dev\PJDesk\cloud"
+$env:RELEASE_ADMIN_KEY = "..."   # the Worker secret, not committed
+npx.cmd node tools/publish-release.mjs --dir "C:\path\to\release-0.6.91" --version 0.6.91
+```
+
+The files are not truly locked while the same installers remain public GitHub
+release assets on `whoamib2/pjdesk`. Making that repository private (or
+removing the assets) ends public downloads, and it also ends auto-update
+for every install still on 0.6.90 or older. It will also hide the source
+from people who cloned the public repo. Do that only after the machines
+you care about are already on 0.6.91 or later.
+
+Until then, publish each new version to both R2 and GitHub, and leave
+`RELEASE_PUBLIC_FALLBACK` at `"1"` so 0.6.90 servers can still reach 0.6.91
+from the public assets. After the repo is private, set
+`RELEASE_PUBLIC_FALLBACK` to `"0"`: unauthenticated `/api/release` still
+names the current version (so a current install sees it is up to date) but
+returns empty file URLs instead of GitHub links that would 404. An older
+server then falls back to GitHub, fails, and stays on the old version,
+still online.
+
+None of bucket creation, secret changes, deploys, DNS, or GitHub asset
+removal is done from this tree. Those are decisions for the person who
+publishes.
 
 ## Develop
 

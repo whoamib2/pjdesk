@@ -509,8 +509,16 @@ pub fn check_sentence(current: &str, available: Option<&str>, error: Option<&str
     (format!("Up to date ({current})"), String::new(), String::new())
 }
 
+
+fn use_cloud_account_for_updates(data_dir: &Path) {
+    if let Some(cfg) = crate::cloud::CloudConfig::load(data_dir) {
+        pjdesk_proto::update::set_cloud_update_token(&cfg.token);
+    }
+}
+
 /// Checks the release feed and writes the status file. Does not install.
 pub fn check_now(data_dir: &Path) -> Result<String> {
+    use_cloud_account_for_updates(data_dir);
     let current = env!("CARGO_PKG_VERSION");
     let (sentence, available, error) = match pjdesk_proto::update::check_server(current) {
         Ok(None) => check_sentence(current, None, None),
@@ -531,6 +539,7 @@ pub fn check_now(data_dir: &Path) -> Result<String> {
 /// Checks and, when the plan says so, downloads and launches the installer.
 /// `manual` skips the standby wait and the maintenance window.
 pub fn install_if_planned(data_dir: &Path, manual: bool) -> Result<String> {
+    use_cloud_account_for_updates(data_dir);
     let current = env!("CARGO_PKG_VERSION");
         let found = match pjdesk_proto::update::check_server(current) {
         Ok(v) => v,

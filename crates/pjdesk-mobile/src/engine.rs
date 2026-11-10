@@ -2086,14 +2086,28 @@ async fn offer_android_update(cb: &Arc<dyn Callbacks>, from_server: bool) {
             .await;
     match found {
         Ok(Ok(Some(update))) => {
-            emit(
-                cb,
-                &json!({
-                    "event": "openUrl",
-                    "url": update.installer_url,
-                    "text": format!("Downloading PJDesk {}", update.version),
-                }),
-            );
+            let version = update.version.clone();
+            let verified = tokio::task::spawn_blocking(move || {
+                let dir = std::env::temp_dir().join("pjdesk-updates");
+                pjdesk_proto::update::download_verified_to(&update, &dir, false)
+            })
+            .await;
+            match verified {
+                Ok(Ok(path)) => {
+                    emit(
+                        cb,
+                        &json!({
+                            "event": "installApk",
+                            "path": path.to_string_lossy(),
+                            "text": format!("Installing PJDesk {version}"),
+                        }),
+                    );
+                }
+                Ok(Err(e)) => {
+                    emit(cb, &json!({"event":"error","text": format!("Could not verify the update: {e:#}")}));
+                }
+                Err(_) => emit(cb, &json!({"event":"error","text": "Could not verify the update."})),
+            }
         }
         Ok(Ok(None)) => {
             emit(cb, &json!({"event":"notice","text": format!("PJDesk {APP_VERSION} is up to date.")}));

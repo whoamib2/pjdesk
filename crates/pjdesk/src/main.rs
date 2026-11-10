@@ -752,6 +752,7 @@ fn login_command(config: &mut Config, args: LoginArgs, server_flag: Option<Strin
 
 fn update_command(check: bool) -> Result<()> {
     use pjdesk_proto::update::Outcome;
+    crate::client_update::use_account_for_updates();
     if !check {
         // This process is the administrator prompt (or an elevated console).
         // It may lock down the update folder. The normal window does not.
