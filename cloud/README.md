@@ -12,7 +12,10 @@ One Cloudflare Worker (`src/index.js`) with:
 - **D1** (`DB`): accounts, sessions, sync bookkeeping (`migrations/`).
 - **R2** (`SYNC`, bucket `pjdesk-sync`): one sealed copy per account.
 - **Downloads**: `/download/client|server|sums` redirect to the latest GitHub
-  release's files, so the site never needs editing per release.
+  release's files, so the site never needs editing per release. Those paths,
+  and the download buttons on the website, require the download password
+  (Worker secret `DOWNLOAD_PASSWORD`). `GET /api/release` stays open so
+  auto-update and the Android app keep working.
 
 ## Privacy
 
@@ -33,6 +36,28 @@ Cloud Sync. The site does not list prices, so Free and Cloud Sync are the only
 plans. A grant that reaches its expiry turns Cloud Sync off the next time that
 account is used. `deploy.cmd` applies D1 migrations, including `0002_plans.sql`,
 before it deploys the Worker.
+
+## Download password
+
+The download section on pjdesk.com asks for a password, the same way ngnvr.com
+does: the Worker checks it, it is never in the source, and a right guess gives
+that browser an HttpOnly cookie for 30 days. Ten wrong guesses from one
+address are locked out for 15 minutes. Changing the secret ends every such
+cookie. If the secret is not set, the website shows "Downloads aren't open yet."
+
+Set the secret from your PC (Wrangler prompts for the password; it is not
+echoed). End with a blank line:
+
+```
+cd "C:\App Dev\PJDesk\cloud"
+npx.cmd wrangler secret put DOWNLOAD_PASSWORD
+```
+
+This only locks the website buttons and `/download/*`. The GitHub release
+files stay public, and `/api/release` still lists their URLs, because
+installed copies update from there. NGNVR can lock the files themselves
+because it serves them from R2 behind the same password (and a linked NVR
+uses its device key for updates).
 
 ## Develop
 

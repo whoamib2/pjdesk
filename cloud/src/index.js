@@ -32,7 +32,12 @@
 //   GET  /api/admin/audit       (Bearer, admin)
 //   POST /api/admin/plan        (Bearer, admin) {email, plan, expires_at, note}
 //   POST /api/admin/sync        (Bearer, admin) {email, enabled}  (audited; same as a plan grant)
-//   GET  /api/release           latest release info (from GitHub); ETag
+//   GET  /api/release           latest release info (from GitHub); ETag.
+//                               Not password-gated: auto-update and the Android
+//                               app use this, then download from GitHub.
+//   GET  /api/download/state    {password_set, unlocked}
+//   POST /api/download/unlock   {password} → 30-day cookie (same-origin)
+//   POST /api/download/lock     clears the download cookie
 //   GET  /api/account/mirror    (Bearer) synced account copy for the primary
 //   PUT  /api/account/mirror    (Bearer) {base_revision, changes}; 412 + mirror
 //                               This route is not deployed until cloud\deploy.cmd.
@@ -45,6 +50,7 @@ import { route as networkRoute } from "./network.js";
 import { probeQuery, shapeHealth } from "./health.js";
 import { LOGIN_FAILS, LOGIN_IP, loginRetryAfter, retryAfterSeconds, signInLimitMessage } from "./login-limit.js";
 import { accountMirror } from "./account-mirror.js";
+import { DownloadError, downloadApi, requireDownload } from "./download-gate.js";
 
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 const AUTH_HASH_ITERATIONS = 100000; // the Workers PBKDF2 maximum
@@ -61,10 +67,17 @@ export default {
         sealPlainRowsOnce(env, ctx);
         return await api(request, env, url, ctx);
       }
-      if (url.pathname.startsWith("/download/")) return await download(env, url);
+      if (url.pathname.startsWith("/download/")) return await download(request, env, url);
       return env.ASSETS.fetch(request);
     } catch (e) {
-      if (e instanceof HttpError) return json({ error: e.message }, e.status);
+      if (e instanceof HttpError || e instanceof DownloadError) {
+        if (e instanceof DownloadError && e.status === 302 && e.location) {
+          return new Response(null, { status: 302, headers: { location: e.location, "cache-control": "no-store" } });
+        }
+        const headers = {};
+        if (e.retryAfter) headers["retry-after"] = String(e.retryAfter);
+        return json({ error: e.message, ...(e.code ? { code: e.code } : {}) }, e.status, headers);
+      }
       console.error(e && e.stack ? e.stack : e);
       return json({ error: "Something went wrong. Please try again." }, 500);
     }
@@ -227,6 +240,8 @@ const objectKey = (accountId) => `sync/${accountId}/server.sync`;
 async function api(request, env, url, ctx) {
   const p = url.pathname;
   const m = request.method;
+  const gated = await downloadApi(request, env, url, downloadRate(env));
+  if (gated) return gated;
   if (p === "/api/health") return json({ ok: true });
   if (p === "/api/ip" && (m === "GET" || m === "HEAD")) {
     return json({ ip: request.headers.get("cf-connecting-ip") || "" });
@@ -815,7 +830,21 @@ async function latestRelease(env) {
   return info;
 }
 
-async function download(env, url) {
+function downloadRate(env) {
+  return {
+    rateLimited: (bucket, opts) => rateLimited(env, bucket, opts),
+    noteEvent: (bucket) => noteEvent(env, bucket),
+    async retryAfter(bucket, { limit, window }) {
+      const ev = await eventsSince(env, bucket, now() - window);
+      if (ev.length < limit) return 0;
+      const live = ev.slice().sort((a, b) => a - b);
+      return Math.max(1, live[live.length - limit] + window - now());
+    },
+  };
+}
+
+async function download(request, env, url) {
+  await requireDownload(request, env);
   const what = url.pathname.split("/")[2] || "";
   let info = null;
   try {
