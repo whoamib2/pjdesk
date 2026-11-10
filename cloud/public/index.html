@@ -135,6 +135,19 @@
   .dlcard .btn { align-self: flex-start; }
   .dl-note { color: var(--muted); font-size: 0.85rem; padding-bottom: 60px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .dl-note code { font-family: var(--font-mono); background: var(--surface); border: 1px solid var(--line); padding: 2px 7px; border-radius: 6px; font-size: 0.85em; }
+  .unlock { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 24px; max-width: 28rem; margin-bottom: 28px; }
+  .unlock h3 { font-size: 1.15rem; font-weight: 700; margin: 0 0 8px; }
+  .unlock .lede { color: var(--muted); font-size: 0.92rem; margin: 0 0 16px; }
+  .unlock label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
+  .unlock .pw { display: flex; gap: 8px; }
+  .unlock input[type=password], .unlock input[type=text] {
+    flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; font: inherit;
+  }
+  .unlock input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .unlock .reveal { background: var(--surface-2); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 0 12px; cursor: pointer; }
+  .unlock .error { color: var(--red, #ff6b6b); min-height: 1.2em; margin: 10px 0 0; font-size: 0.9rem; }
+  .unlock .btn { margin-top: 14px; }
 
   footer { border-top: 1px solid var(--line); }
   .foot { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; padding-block: 28px 40px; color: var(--muted); font-size: 0.9rem; }
@@ -294,7 +307,21 @@
         <h2>Download PJDesk</h2>
         <p>Two installers: the app for the computers you use, and the server that connects them. Windows 10 or 11, 64-bit.</p>
       </div>
-      <div class="dl">
+      <section class="unlock" id="unlock-sec" hidden>
+        <h3>Enter the download password</h3>
+        <p class="lede">PJDesk downloads are open to people who have the password.</p>
+        <form id="unlock" novalidate>
+          <label for="dl-password">Download password</label>
+          <div class="pw">
+            <input id="dl-password" type="password" name="password" autocomplete="current-password" required>
+            <button class="reveal" type="button" aria-label="Show password">Show</button>
+          </div>
+          <p class="error" role="alert"></p>
+          <button class="btn btn-primary" type="submit">Show the download</button>
+        </form>
+      </section>
+      <p class="lede" id="dl-closed" hidden>Downloads aren't open yet. Check back soon.</p>
+      <div class="dl" id="dl-files" hidden>
         <div class="dlcard primary">
           <span class="k">The app</span>
           <h3>PJDesk</h3>
@@ -314,9 +341,8 @@
           </a>
         </div>
       </div>
-      <div class="dl-note">
+      <div class="dl-note" id="dl-note" hidden>
         <span><span id="dl-version">Latest version</span> · Windows 10/11, 64-bit · <a class="link" href="/download/sums" style="color:var(--accent);text-decoration:none">SHA-256 checksums</a> · Prefer to build it yourself? Clone the repo and run <code>build.cmd</code>.</span>
-        <a class="link" href="https://github.com/whoamib2/pjdesk/releases" style="color:var(--accent);text-decoration:none">All releases →</a>
       </div>
     </div>
   </section>
