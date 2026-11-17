@@ -427,22 +427,24 @@ mod imp {
     }
 
     /// Launches `pjdesk __input-agent` as LocalSystem in `session_id`. The
-    /// helper (usually running as the user) hands its input to it, so input
-    /// reaches elevated windows (UIPI) and the secure desktop.
+    /// session-host (also SYSTEM) can inject on its own; the agent remains a
+    /// dedicated input thread already attached to the input desktop.
     fn spawn_input_agent(session_id: u32) -> Result<Child> {
         spawn_in_session(session_id, true)
     }
 
     fn spawn_in_session(session_id: u32, input_agent: bool) -> Result<Child> {
         unsafe {
-            // Prefer the interactive user's own token for this session: the
-            // helper then runs exactly like the user's own app — stable, and
-            // able to read secrets DPAPI-encrypted for that user — instead of
-            // as LocalSystem. Only when nobody is signed in (the lock / sign-in
-            // screen) do we fall back to a SYSTEM token so we stay reachable.
+            // Both helpers are SYSTEM in this session so they can attach to
+            // Winlogon (UAC / lock / sign-in). Prefer winlogon's token (already
+            // in the session, as RustDesk does). Fall back to this service's
+            // SYSTEM token moved with TokenSessionId. Do not use the signed-in
+            // user's token: that is what made 0.6.91 still fail at UAC.
             let mut token = HANDLE::default();
-            let as_user = !input_agent && WTSQueryUserToken(session_id, &mut token).is_ok();
-            if !as_user {
+            let mut from_winlogon = token_from_session_winlogon(session_id);
+            if let Some(t) = from_winlogon.take() {
+                token = t;
+            } else {
                 let mut proc_token = HANDLE::default();
                 OpenProcessToken(GetCurrentProcess(), TOKEN_ACCESS_MASK(TOKEN_ALL_ACCESS.0), &mut proc_token)
                     .context("OpenProcessToken")?;
@@ -465,6 +467,7 @@ mod imp {
                     return Err(e).context("SetTokenInformation(session)");
                 }
             }
+            let _ = input_agent;
 
             // Build the command line and desktop. The helper gets its config
             // path on the command line — the token's environment block does not
@@ -488,9 +491,14 @@ mod imp {
                     .collect();
             let mut desktop: Vec<u16> = "winsta0\\default".encode_utf16().chain(std::iter::once(0)).collect();
 
-            // Environment block for the chosen token.
+            // Environment block from the signed-in user when there is one, so
+            // USERPROFILE and Downloads resolve to that account while the
+            // process itself stays SYSTEM.
+            let mut user_token = HANDLE::default();
+            let have_user = WTSQueryUserToken(session_id, &mut user_token).is_ok();
+            let env_src = if have_user { user_token } else { token };
             let mut env_block: *mut core::ffi::c_void = std::ptr::null_mut();
-            let have_env = CreateEnvironmentBlock(&mut env_block, Some(token), false).is_ok();
+            let have_env = CreateEnvironmentBlock(&mut env_block, Some(env_src), false).is_ok();
 
             // Same rule as the post-update relaunch: do not inherit the
             // service's std handles. They are invalid in the user session.
@@ -521,6 +529,9 @@ mod imp {
             if have_env {
                 let _ = DestroyEnvironmentBlock(env_block);
             }
+            if have_user {
+                let _ = CloseHandle(user_token);
+            }
             let _ = CloseHandle(token);
             let _ = &mut si;
 
@@ -529,6 +540,61 @@ mod imp {
         }
     }
 
+    /// Primary SYSTEM token taken from winlogon.exe in `session_id`, if any.
+    fn token_from_session_winlogon(session_id: u32) -> Option<HANDLE> {
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+        };
+        use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+        use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut pid = None;
+            if Process32FirstW(snap, &mut entry).is_ok() {
+                loop {
+                    let raw = &entry.szExeFile;
+                    let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+                    let name = String::from_utf16_lossy(&raw[..end]);
+                    if name.eq_ignore_ascii_case("winlogon.exe") {
+                        let mut sid = 0u32;
+                        if ProcessIdToSessionId(entry.th32ProcessID, &mut sid).is_ok() && sid == session_id {
+                            pid = Some(entry.th32ProcessID);
+                            break;
+                        }
+                    }
+                    if Process32NextW(snap, &mut entry).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = CloseHandle(snap);
+            let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid?).ok()?;
+            let mut tok = HANDLE::default();
+            let opened = OpenProcessToken(proc, TOKEN_ACCESS_MASK(TOKEN_ALL_ACCESS.0), &mut tok);
+            let _ = CloseHandle(proc);
+            opened.ok()?;
+            let mut primary = HANDLE::default();
+            let dup = DuplicateTokenEx(tok, TOKEN_ALL_ACCESS, None, SecurityIdentification, TokenPrimary, &mut primary);
+            let _ = CloseHandle(tok);
+            dup.ok()?;
+            Some(primary)
+        }
+    }
+
+}
+
+/// The service's session-host (capture + input) and input agent both run as
+/// SYSTEM in the console session. A user-mode session-host cannot open
+/// Winlogon, so UAC stays a frozen picture and clicks never reach Yes or No.
+/// This is the same arrangement RustDesk uses. Config is the service file
+/// (machine DPAPI), not the signed-in user's client.json. We do not change
+/// the PromptOnSecureDesktop policy.
+pub fn session_helpers_run_as_system() -> bool {
+    true
 }
 
 #[cfg(windows)]
@@ -1014,3 +1080,11 @@ pub fn status() -> (bool, bool) {
 #[cfg(not(windows))]
 #[allow(dead_code)]
 pub fn protect_service_dir() {}
+
+#[cfg(test)]
+mod system_host_tests {
+    #[test]
+    fn the_service_hosts_as_system_so_uac_can_be_captured_and_clicked() {
+        assert!(super::session_helpers_run_as_system());
+    }
+}

@@ -557,30 +557,35 @@ fn capture_loop(args: &HostArgs, shared: &Shared, session: &Session, frames: &mp
         capture::set_draw_pointer(!session.cursor_shapes.load(Ordering::Relaxed));
         // Follow desktop switches (UAC / lock / sign-in screen): re-attach this
         // thread and rebuild capture so it grabs the desktop now on screen.
-        // An empty name means the read failed transiently — don't treat that as
-        // a switch, and don't let a transient capture failure kill the thread.
+        // An empty name is not ignored: it usually means Winlogon is up and
+        // this thread cannot read it until it attaches (as SYSTEM).
         if args.follow_desktop {
             let current = crate::platform::input_desktop_name().unwrap_or_default();
-            if !current.is_empty() && current != desktop {
-                info!("Input desktop changed to \"{current}\"; following it");
-                desktop = current;
-                crate::platform::attach_thread_to_input_desktop();
-                drop(capturer);
-                std::thread::sleep(Duration::from_millis(200));
-                capturer = loop {
-                    match capture::open(&args) {
-                        Ok(c) => break c,
-                        Err(e) => {
-                            if shared.flow.stopped() {
-                                return Ok(());
+            if crate::platform::should_attempt_desktop_follow(&desktop, &current) {
+                let attached = crate::platform::attach_thread_to_input_desktop();
+                let after = crate::platform::input_desktop_name().unwrap_or_default();
+                if crate::platform::should_rebuild_capture(&desktop, &after) {
+                    info!("Input desktop changed to \"{after}\"; following it");
+                    desktop = after;
+                    drop(capturer);
+                    std::thread::sleep(Duration::from_millis(200));
+                    capturer = loop {
+                        match capture::open(&args) {
+                            Ok(c) => break c,
+                            Err(e) => {
+                                if shared.flow.stopped() {
+                                    return Ok(());
+                                }
+                                warn!("Capture unavailable after desktop switch ({e:#}); retrying");
+                                std::thread::sleep(Duration::from_millis(500));
                             }
-                            warn!("Capture unavailable after desktop switch ({e:#}); retrying");
-                            std::thread::sleep(Duration::from_millis(500));
                         }
-                    }
-                };
-                *shared.display.lock().unwrap() = capturer.display_rect();
-                shared.keyframe_requested.store(true, Ordering::SeqCst);
+                    };
+                    *shared.display.lock().unwrap() = capturer.display_rect();
+                    shared.keyframe_requested.store(true, Ordering::SeqCst);
+                } else if current.is_empty() && !attached {
+                    // Stay on the last picture; keep trying next frame.
+                }
             }
         }
         if capturer.is_fallback() && Instant::now() >= next_dxgi_retry {

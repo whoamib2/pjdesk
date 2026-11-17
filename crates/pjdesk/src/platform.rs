@@ -4,6 +4,32 @@
 //!
 //! On non-Windows these are no-ops.
 
+/// Access rights passed to `OpenInputDesktop` before `SetThreadDesktop`.
+/// `DESKTOP_SWITCHDESKTOP` (0x100) is required: without it, even a SYSTEM
+/// process stays on Default and UAC clicks never land. The other bits match
+/// the mask RustDesk uses. We do not change the PromptOnSecureDesktop policy.
+pub const INPUT_DESKTOP_ACCESS: u32 = 0x0001 // DESKTOP_READOBJECTS
+    | 0x0002 // DESKTOP_CREATEWINDOW
+    | 0x0004 // DESKTOP_CREATEMENU
+    | 0x0008 // DESKTOP_HOOKCONTROL
+    | 0x0040 // DESKTOP_ENUMERATE
+    | 0x0080 // DESKTOP_WRITEOBJECTS
+    | 0x0100 // DESKTOP_SWITCHDESKTOP
+    | 0x4000_0000; // GENERIC_WRITE
+
+/// When the capture thread should try `OpenInputDesktop` again.
+/// An empty name is not "no change": it usually means Winlogon is up and
+/// this thread cannot read it until it attaches.
+pub fn should_attempt_desktop_follow(previous: &str, current: &str) -> bool {
+    current.is_empty() || current != previous
+}
+
+/// Rebuild the capturer only when we know the input desktop's name and it
+/// differs from the one we are already capturing.
+pub fn should_rebuild_capture(previous: &str, after_attach: &str) -> bool {
+    !after_attach.is_empty() && after_attach != previous
+}
+
 /// Returns the name of the desktop currently receiving input ("Default",
 /// "Winlogon", "Screen-saver"…), or `None` if it can't be read.
 #[cfg(windows)]
@@ -76,23 +102,17 @@ pub fn session_id() -> Option<u32> {
 pub fn attach_thread_to_input_desktop() -> bool {
     use std::cell::Cell;
     use windows::Win32::System::StationsAndDesktops::{
-        CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
-        DESKTOP_CREATEWINDOW, DESKTOP_JOURNALPLAYBACK, DESKTOP_JOURNALRECORD, DESKTOP_READOBJECTS,
-        DESKTOP_WRITEOBJECTS, HDESK,
+        CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, HDESK,
     };
     // The desktop this thread previously opened (0 = none). SetThreadDesktop
     // does not free it, so we close it ourselves after switching away.
     thread_local! { static PREV: Cell<isize> = const { Cell::new(0) }; }
 
-    let access = DESKTOP_ACCESS_FLAGS(
-        DESKTOP_READOBJECTS.0
-            | DESKTOP_WRITEOBJECTS.0
-            | DESKTOP_CREATEWINDOW.0
-            | DESKTOP_JOURNALRECORD.0
-            | DESKTOP_JOURNALPLAYBACK.0,
-    );
+    let access = DESKTOP_ACCESS_FLAGS(INPUT_DESKTOP_ACCESS);
     unsafe {
-        match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), true, access) {
+        // Inherit must be false: a thread with inherited windows/hooks cannot
+        // leave its current desktop. RustDesk opens the same way.
+        match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, access) {
             Ok(hdesk) => {
                 if SetThreadDesktop(hdesk).is_ok() {
                     // We've switched off the previous desktop, so it's safe to
@@ -292,6 +312,29 @@ mod sas_policy_tests {
         use super::sas_policy_allows_services as ok;
         assert!(ok(Some(1)) && ok(Some(3)));
         assert!(!ok(None) && !ok(Some(0)) && !ok(Some(2)));
+    }
+}
+
+#[cfg(test)]
+mod desktop_follow_tests {
+    use super::*;
+
+    #[test]
+    fn switch_desktop_access_is_included() {
+        assert_eq!(INPUT_DESKTOP_ACCESS & 0x0100, 0x0100, "DESKTOP_SWITCHDESKTOP");
+        assert_eq!(INPUT_DESKTOP_ACCESS & 0x0001, 0x0001, "DESKTOP_READOBJECTS");
+        assert_eq!(INPUT_DESKTOP_ACCESS & 0x0080, 0x0080, "DESKTOP_WRITEOBJECTS");
+    }
+
+    #[test]
+    fn an_unreadable_or_changed_name_is_followed_and_capture_rebuilds_after_a_named_switch() {
+        assert!(should_attempt_desktop_follow("Default", ""));
+        assert!(should_attempt_desktop_follow("Default", "Winlogon"));
+        assert!(!should_attempt_desktop_follow("Default", "Default"));
+        assert!(should_rebuild_capture("Default", "Winlogon"));
+        assert!(!should_rebuild_capture("Default", ""));
+        assert!(!should_rebuild_capture("Winlogon", "Winlogon"));
+        assert!(should_rebuild_capture("", "Winlogon"));
     }
 }
 

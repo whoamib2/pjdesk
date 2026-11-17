@@ -316,22 +316,59 @@ pub fn resolve_receive_dir(configured: &str) -> String {
 }
 
 /// This user's Downloads folder: FOLDERID_Downloads on Windows, ~/Downloads elsewhere.
+/// When the service host runs as SYSTEM, this is the signed-in console user's
+/// Downloads folder, not SYSTEM's profile.
 pub fn downloads_folder() -> std::path::PathBuf {
     #[cfg(windows)]
-    unsafe {
-        use windows::Win32::System::Com::CoTaskMemFree;
-        use windows::Win32::UI::Shell::{FOLDERID_Downloads, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
-        if let Ok(p) = SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, None) {
-            let text = p.to_string().unwrap_or_default();
-            CoTaskMemFree(Some(p.0 as *const _));
-            if !text.trim().is_empty() {
-                return std::path::PathBuf::from(text);
+    {
+        if let Some(dir) = known_folder_for_console_user(&windows::Win32::UI::Shell::FOLDERID_Downloads) {
+            return dir;
+        }
+        unsafe {
+            use windows::Win32::System::Com::CoTaskMemFree;
+            use windows::Win32::UI::Shell::{FOLDERID_Downloads, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+            if let Ok(p) = SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, None) {
+                let text = p.to_string().unwrap_or_default();
+                CoTaskMemFree(Some(p.0 as *const _));
+                if !text.trim().is_empty() {
+                    return std::path::PathBuf::from(text);
+                }
             }
         }
     }
     let home = home_folder("Downloads");
     if home.is_empty() { std::env::temp_dir() } else { std::path::PathBuf::from(home) }
 }
+
+/// The signed-in console user's Known Folder, when this process can open their
+/// token (the SYSTEM session-host). Otherwise `None` and the caller uses the
+/// current process.
+#[cfg(windows)]
+fn known_folder_for_console_user(folder: &windows::core::GUID) -> Option<std::path::PathBuf> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    unsafe {
+        let session = WTSGetActiveConsoleSessionId();
+        if session == u32::MAX {
+            return None;
+        }
+        let mut token = HANDLE::default();
+        WTSQueryUserToken(session, &mut token).ok()?;
+        let path = SHGetKnownFolderPath(folder, KF_FLAG_DEFAULT, Some(token));
+        let _ = CloseHandle(token);
+        let p = path.ok()?;
+        let text = p.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(p.0 as *const _));
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(text))
+        }
+    }
+}
+
 
 /// The folder for the Files window footer and drop text: "Downloads\PJDesk"
 /// for the default, else the last two parts of the path.
@@ -352,6 +389,12 @@ pub fn receive_dir_label(configured: &str) -> String {
 }
 
 fn home_folder(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(dir) = known_folder_for_console_user(&windows::Win32::UI::Shell::FOLDERID_Profile) {
+            return dir.join(name).to_string_lossy().into_owned();
+        }
+    }
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
     match home {
         Some(home) => std::path::PathBuf::from(home).join(name).to_string_lossy().into_owned(),
