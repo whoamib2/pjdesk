@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.91
+
+- Fixed: clipboard did not sync text or pictures in a password (unattended) session, because the host never granted clipboard. Clipboard (text and images, both ways) is now on by default in normal sessions, including unattended and when someone clicks Allow. View-only and files-only sessions are unchanged.
+- Fixed: a UAC prompt could be seen through PJDesk but Yes and No could not be clicked. The SYSTEM input helper was unreachable from the signed-in session, and the app did not say the PJDesk service was needed. Clicks on UAC and the lock screen now go through that helper when the service is installed and running; if it is missing, the viewer is told to install the PJDesk service on that computer.
+
 ## 0.6.90
 
 - Fixed: Send files (files-only) stopped about 20 seconds after signing in, freezing the transfer partway ("45 s left") with the window still open. The PC app was waiting for a picture that a files-only session never sends. Files now keep moving for as long as the transfer takes.
