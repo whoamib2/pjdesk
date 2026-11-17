@@ -51,6 +51,7 @@ import { probeQuery, shapeHealth } from "./health.js";
 import { LOGIN_FAILS, LOGIN_IP, loginRetryAfter, retryAfterSeconds, signInLimitMessage } from "./login-limit.js";
 import { accountMirror } from "./account-mirror.js";
 import { DownloadError, downloadApi, requireDownload } from "./download-gate.js";
+import { latestRelease, safeRepo, ReleaseError } from "./release-lookup.js";
 
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 const AUTH_HASH_ITERATIONS = 100000; // the Workers PBKDF2 maximum
@@ -70,7 +71,7 @@ export default {
       if (url.pathname.startsWith("/download/")) return await download(request, env, url);
       return env.ASSETS.fetch(request);
     } catch (e) {
-      if (e instanceof HttpError || e instanceof DownloadError) {
+      if (e instanceof HttpError || e instanceof DownloadError || e instanceof ReleaseError) {
         if (e instanceof DownloadError && e.status === 302 && e.location) {
           return new Response(null, { status: 302, headers: { location: e.location, "cache-control": "no-store" } });
         }
@@ -751,84 +752,8 @@ async function adminSetSync(request, env) {
 // ---------------------------------------------------------------------------
 // Releases and downloads (so the website never needs editing per release)
 
-// The latest version comes from github.com's /releases/latest redirect, not the
-// GitHub API: the API's anonymous limit is shared by every Worker on the same
-// Cloudflare address and runs out. The installer names follow a fixed pattern.
-const RELEASE_TTL_MS = 10 * 60 * 1000;
-let releaseMemo = null; // { info, at } — kept for the life of this Worker instance
-
-async function assetExists(url) {
-  try {
-    const res = await fetch(url, { method: "HEAD", redirect: "manual", headers: { "user-agent": "pjdesk-cloud" } });
-    return res.status === 200 || res.status === 301 || res.status === 302;
-  } catch {
-    return false;
-  }
-}
-
-async function releaseInfo(repo, tag) {
-  const version = tag.replace(/^v/, "");
-  const base = `https://github.com/${repo}/releases/download/${tag}`;
-  const clientNew = `${base}/PJDesk-Client-Setup-${version}.exe`;
-  const clientOld = `${base}/PJDesk-Setup-${version}.exe`;
-  // HEAD the release asset. Do not call the GitHub API: that limit is shared
-  // by every Worker on this Cloudflare address. 200 or 302 means the file is there.
-  let client = clientNew;
-  if (!(await assetExists(clientNew)) && (await assetExists(clientOld))) client = clientOld;
-  return {
-    version,
-    client,
-    server: `${base}/PJDesk-Server-Setup-${version}.exe`,
-    sums: `${base}/SHA256SUMS`,
-    notes: `https://github.com/${repo}/releases/tag/${tag}`,
-  };
-}
-
-async function latestTag(repo) {
-  const res = await fetch(`https://github.com/${repo}/releases/latest`, {
-    method: "HEAD",
-    redirect: "manual",
-    headers: { "user-agent": "pjdesk-cloud" },
-  });
-  const m = /\/releases\/tag\/([^/?#]+)/.exec(res.headers.get("location") || "");
-  if (m) return decodeURIComponent(m[1]);
-  // Fallback: the API (may be rate limited).
-  const api = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
-    headers: { "user-agent": "pjdesk-cloud", accept: "application/vnd.github+json" },
-  });
-  if (api.ok) {
-    const r = await api.json();
-    if (r.tag_name) return String(r.tag_name);
-  }
-  return null;
-}
-
-function safeRepo(repo) {
-  return typeof repo === "string" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo);
-}
-
-/** Release tags become part of a redirect URL, so they stay a single path segment. */
-function safeTag(tag) {
-  return typeof tag === "string" && /^v?[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/.test(tag) && !tag.includes("..");
-}
-
-async function latestRelease(env) {
-  if (!safeRepo(env.RELEASE_REPO)) throw new HttpError(500, "Release repository is not configured.");
-  if (releaseMemo && Date.now() - releaseMemo.at < RELEASE_TTL_MS) return releaseMemo.info;
-  let tag = null;
-  try {
-    tag = await latestTag(env.RELEASE_REPO);
-  } catch (e) {
-    console.error("release lookup failed:", e && e.message);
-  }
-  if (!safeTag(tag)) {
-    if (releaseMemo) return releaseMemo.info; // stale is better than nothing
-    throw new HttpError(502, "Couldn't reach GitHub for the latest release.");
-  }
-  const info = await releaseInfo(env.RELEASE_REPO, tag);
-  releaseMemo = { info, at: Date.now() };
-  return info;
-}
+// Latest release lookup lives in release-lookup.js (HEAD /releases/latest, then
+// the GitHub API, with a 10-minute isolate memo and a Cache API last-good copy).
 
 function downloadRate(env) {
   return {
