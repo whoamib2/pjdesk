@@ -224,3 +224,88 @@ fn saved_header_clears_the_toolbar() {
         }
     }
 }
+
+/// Extra computers so the list can scroll in headless shots.
+fn queue_saved_scroll(harness: &mut egui_kittest::Harness<'_, App>, delta: f32) {
+    let key = egui::Id::new(crate::gui::saved::PREVIEW_SAVED_SCROLL);
+    harness.ctx.data_mut(|d| d.insert_temp(key, delta));
+}
+
+/// Before/after review shots, plus a check that a scrolled list does not
+/// cover the toolbar or the pinned column titles.
+#[test]
+fn saved_scrolled_list_keeps_a_clear_header() {
+    let dir = std::path::PathBuf::from(
+        std::env::var("PJDESK_SHOT_DIR").unwrap_or_else(|_| "/workspace/pjdesk/target-shots/saved-scroll".into()),
+    );
+    std::fs::create_dir_all(&dir).expect("create shot dir");
+    let suffix = std::env::var("PJDESK_SHOT_SUFFIX").unwrap_or_default();
+    for (name, width, height) in [("wide", 1280.0_f32, 760.0_f32), ("narrow", 700.0, 2200.0)] {
+        for (view_key, tab, view_name) in [
+            ("list", super::DeskTab::Saved, "list"),
+            ("list-recent", super::DeskTab::Recent, "list"),
+            ("list-discovered", super::DeskTab::Lan, "list"),
+            ("small", super::DeskTab::Saved, "small"),
+        ] {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(width, height))
+                .with_pixels_per_point(1.0)
+                .with_theme(egui::Theme::Light)
+                .wgpu()
+                .build_eframe(move |cc| {
+                    let mut cfg = crate::config::Config::default();
+                    cfg.settings.theme = "light".into();
+                    cfg.settings.saved_view = view_name.into();
+                    let mut app = App::create(cc, cfg, true);
+                    app.load_saved_preview_long(tab);
+                    app
+                });
+            harness.step();
+            harness.step();
+            // A positive offset scrolls the list down. Setting it on the
+            // ScrollArea builder (not via scroll_with_delta inside show)
+            // is reliable in these headless shots.
+            queue_saved_scroll(&mut harness, 360.0);
+            harness.step();
+            harness.step();
+            let image = harness.render().unwrap_or_else(|e| panic!("render {name}-{view_key}: {e}"));
+            let file = if suffix.is_empty() {
+                format!("scrolled-{name}-{view_key}.png")
+            } else {
+                format!("scrolled-{name}-{view_key}-{suffix}.png")
+            };
+            let path = dir.join(&file);
+            image.save(&path).unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
+            eprintln!("wrote {}", path.display());
+
+            if view_name != "list" || tab != super::DeskTab::Saved {
+                continue;
+            }
+            if suffix == "before" {
+                continue;
+            }
+            let toolbar_bottom = ["Remove all saved computers", "Favorites", "Sort", "Support keys"]
+                .iter()
+                .flat_map(|l| harness.query_all_by_label(l).into_iter().map(|n| n.rect().bottom()).collect::<Vec<_>>())
+                .fold(f32::MIN, f32::max);
+            assert!(toolbar_bottom.is_finite(), "{name}: missing toolbar");
+            // Narrow/stacked list hides Version (and sometimes System).
+            let heads: &[&str] = if width >= 960.0 { &["Name", "Status", "Version"] } else { &["Name", "Status"] };
+            for head in heads {
+                let mut seen = false;
+                for node in harness.query_all_by_label(head) {
+                    let r = node.rect();
+                    if r.height() < 1.0 {
+                        continue;
+                    }
+                    seen = true;
+                    assert!(
+                        r.top() >= toolbar_bottom - 0.5,
+                        "{name}: header {head} at {r:?} overlaps the toolbar ending at {toolbar_bottom}"
+                    );
+                }
+                assert!(seen, "{name}: missing column header {head}");
+            }
+        }
+    }
+}

@@ -439,14 +439,26 @@ impl App {
                 SavedView::Small => "saved-small",
                 SavedView::Big => "saved-big",
             };
-            egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]).show(ui, |ui| {
+            let available = ui.available_width();
+            let width = if available.is_finite() { (available - ROW_GUTTER).max(0.0) } else { 640.0 };
+            let layout = saved_layout(width);
+            // Pin the column titles above the rows, on this card's opaque
+            // background, so they stay put while the list scrolls.
+            if view == SavedView::List {
+                saved_header(ui, width, &layout);
+            }
+            let mut scroll = egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]);
+            // Stay inside the visible clip, including inside a parent page
+            // scroll on a narrow/stacked window. Otherwise the list grows to
+            // fit every row and the page scroll takes the toolbar away.
+            let cap = (ui.clip_rect().bottom() - ui.cursor().top() - 4.0).clamp(200.0, 4000.0);
+            scroll = scroll.max_height(cap);
+            #[cfg(feature = "ui-shots")]
+            if let Some(offset) = take_preview_saved_scroll(ui) {
+                scroll = scroll.vertical_scroll_offset(offset);
+            }
+            scroll.show(ui, |ui| {
                 let mut action: Option<RowCmd> = None;
-                let available = ui.available_width();
-                let width = if available.is_finite() { (available - ROW_GUTTER).max(0.0) } else { 640.0 };
-                let layout = saved_layout(width);
-                if view == SavedView::List {
-                    saved_header(ui, width, &layout);
-                }
                 let (groups, rest) = client_sections(rows);
                 if !groups.is_empty() {
                     ui.label(RichText::new("Clients").strong());
@@ -1727,17 +1739,32 @@ fn column_slots(row: Rect, layout: &SavedLayout) -> Slots {
     Slots { icon, name, id, copy, user, last, os, system_text, version, lock, status, connect, menu }
 }
 
+/// Visible part of a cell after intersecting the parent clip (the scroll
+/// viewport). Without this, `set_clip_rect(rect)` replaces that clip and a
+/// scrolled-off row still paints over the toolbar and the pinned header.
+fn clip_child_rect(parent_clip: Rect, rect: Rect) -> Option<Rect> {
+    let clip = rect.intersect(parent_clip);
+    if clip.width() < 1.0 || clip.height() < 1.0 {
+        None
+    } else {
+        Some(clip)
+    }
+}
+
 fn in_rect(ui: &mut egui::Ui, rect: Rect, salt: impl std::hash::Hash + std::fmt::Debug, add: impl FnOnce(&mut egui::Ui)) {
     if rect.width() < 1.0 || rect.height() < 1.0 {
         return;
     }
+    // Intersect with the parent clip (the scroll viewport). Replacing it with
+    // `rect` alone let a scrolled-off cell paint over the toolbar and header.
+    let clip = ui.clip_rect().intersect(rect);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .id_salt(salt)
             .max_rect(rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    child.set_clip_rect(rect);
+    child.set_clip_rect(clip);
     add(&mut child);
 }
 
@@ -2279,7 +2306,9 @@ fn toolbar_rows(width: f32, support_keys: bool, saved_tab: bool) -> usize {
     if saved_tab {
         one_row += 220.0 + 70.0; // Remove all saved computers, Menu
     }
-    if width >= one_row { 1 } else { 2 }
+    // Leave room so the buttons cannot sit on top of each other when the
+    // measured widths are a little short of the real font size or padding.
+    if width >= one_row + 80.0 { 1 } else { 2 }
 }
 
 #[cfg(test)]
@@ -2288,8 +2317,50 @@ mod toolbar_tests {
     fn a_narrow_toolbar_takes_two_rows() {
         assert_eq!(super::toolbar_rows(900.0, true, true), 1);
         assert_eq!(super::toolbar_rows(600.0, true, true), 2);
-        assert_eq!(super::toolbar_rows(600.0, false, true), 1);
+        assert_eq!(super::toolbar_rows(600.0, false, true), 2);
+        assert_eq!(super::toolbar_rows(700.0, false, true), 1);
         assert_eq!(super::toolbar_rows(280.0, false, false), 2);
-        assert_eq!(super::toolbar_rows(400.0, false, false), 1);
+        assert_eq!(super::toolbar_rows(320.0, false, false), 2);
+        assert_eq!(super::toolbar_rows(500.0, false, false), 1);
+    }
+}
+
+#[cfg(feature = "ui-shots")]
+fn take_preview_saved_scroll(ui: &egui::Ui) -> Option<f32> {
+    let key = egui::Id::new(PREVIEW_SAVED_SCROLL);
+    let offset = ui.ctx().data_mut(|d| d.get_temp::<f32>(key).unwrap_or(0.0));
+    if offset == 0.0 {
+        return None;
+    }
+    ui.ctx().data_mut(|d| d.remove::<f32>(key));
+    Some(offset)
+}
+
+#[cfg(feature = "ui-shots")]
+pub(super) const PREVIEW_SAVED_SCROLL: &str = "pjdesk.preview_saved_scroll";
+
+#[cfg(test)]
+mod clip_tests {
+    use super::{clip_child_rect, toolbar_rows};
+    use eframe::egui::Rect;
+
+    #[test]
+    fn a_scrolled_cell_is_clipped_to_the_viewport() {
+        let view = Rect::from_min_max(eframe::egui::pos2(0.0, 200.0), eframe::egui::pos2(400.0, 500.0));
+        let above = Rect::from_min_max(eframe::egui::pos2(0.0, 40.0), eframe::egui::pos2(400.0, 86.0));
+        assert_eq!(clip_child_rect(view, above), None);
+        let crossing = Rect::from_min_max(eframe::egui::pos2(0.0, 180.0), eframe::egui::pos2(400.0, 226.0));
+        let clip = clip_child_rect(view, crossing).expect("partially visible");
+        assert_eq!(clip.top(), 200.0);
+        assert_eq!(clip.bottom(), 226.0);
+        let inside = Rect::from_min_max(eframe::egui::pos2(10.0, 240.0), eframe::egui::pos2(90.0, 280.0));
+        assert_eq!(clip_child_rect(view, inside), Some(inside));
+    }
+
+    #[test]
+    fn the_toolbar_wraps_before_the_buttons_run_together() {
+        // All controls on one row need more than 690 px plus slack.
+        assert_eq!(toolbar_rows(768.0, true, true), 2);
+        assert_eq!(toolbar_rows(1024.0, true, true), 1);
     }
 }

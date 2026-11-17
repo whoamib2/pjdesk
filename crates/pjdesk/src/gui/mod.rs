@@ -857,6 +857,46 @@ impl App {
     }
 
     #[cfg(feature = "ui-shots")]
+    fn load_saved_preview_long(&mut self, tab: DeskTab) {
+        self.load_saved_preview();
+        self.cfg.saved_sync = Some(true);
+        self.cfg.network_refresh = Some(crate::secure::protect_machine("preview-refresh"));
+        let now = unix_now();
+        for i in 0..24 {
+            let id = format!("{}", 200000000 + i);
+            let name = if i == 0 { "CHIP15".to_string() } else { format!("Desk {i}") };
+            self.cfg.address_book.push(pjdesk_proto::signal::AddressEntry {
+                id: id.clone(),
+                alias: name,
+                ..Default::default()
+            });
+            self.cfg.settings.peers.insert(
+                id,
+                crate::config::PeerNote {
+                    favorite: i % 5 == 0,
+                    last_connected: now.saturating_sub(3_600 * (i as u64 + 1)),
+                    last_seen: now,
+                    reported_online: i % 3 == 0,
+                    hostname: format!("HOST-{i}"),
+                    os_family: "windows".into(),
+                    os_version: "11".into(),
+                    console_user: if i == 0 { "Ben".into() } else { format!("User {i}") },
+                    app_version: env!("CARGO_PKG_VERSION").into(),
+                    ..Default::default()
+                },
+            );
+        }
+        for i in 0..16 {
+            self.lan.push((
+                format!("LAN-HOST-{i}"),
+                format!("{}", 300000000 + i),
+                format!("192.168.1.{}:21201", 30 + i),
+            ));
+        }
+        self.desk_tab = tab;
+    }
+
+    #[cfg(feature = "ui-shots")]
     fn load_sign_in_preview(&mut self) {
         self.engine.ready = true;
         self.cfg.server = None;
