@@ -88,6 +88,14 @@ pub(crate) fn console_user() -> String {
     remember_console_user(&path, &live_console_user())
 }
 
+pub const COMPUTER_NAME_MAX: usize = 64;
+
+/// Trims, drops control characters, and caps the length used for this
+/// computer's synced display name.
+pub fn clean_computer_name(name: &str) -> String {
+    sanitize(name, COMPUTER_NAME_MAX)
+}
+
 fn sanitize(text: &str, max: usize) -> String {
     text.trim().chars().filter(|c| !c.is_control()).take(max).collect()
 }
@@ -215,5 +223,13 @@ mod tests {
         assert_eq!(remember_console_user(&path, ""), "Ben");
         assert_eq!(remember_console_user(&path, "Ada"), "Ada");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_computer_name_is_trimmed_and_capped() {
+        assert_eq!(clean_computer_name("  Cabin Desk  "), "Cabin Desk");
+        assert!(clean_computer_name("   ").is_empty());
+        assert_eq!(clean_computer_name(&"x".repeat(80)).len(), COMPUTER_NAME_MAX);
+        assert!(!clean_computer_name("Cabin\nDesk").contains('\n'));
     }
 }

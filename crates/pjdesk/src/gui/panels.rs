@@ -326,6 +326,9 @@ impl App {
     }
 
     fn sign_in_panel(&mut self, ui: &mut egui::Ui) {
+        if self.net_computer_name.trim().is_empty() {
+            self.net_computer_name = self.preferred_sign_in_computer_name();
+        }
         let p = theme::paint(ui);
         let mut go = false;
         let mut net_enter = false;
@@ -431,6 +434,13 @@ impl App {
                         }
                     }
                 }
+                ui.add_space(8.0);
+                widgets::field_label(ui, "Computer name");
+                widgets::text_field(ui, &mut self.net_computer_name, "Shown to your other computers", false);
+                ui.label(widgets::muted(
+                    ui,
+                    "This name is saved on this computer and synced with your account. It must not be empty.",
+                ));
                 ui.add_space(8.0);
                 if self.net_mode != 3 {
                     widgets::checkbox(

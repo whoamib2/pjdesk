@@ -376,6 +376,8 @@ pub struct App {
 
     status: String,
     net_email: String,
+    /// Friendly name entered on the sign-in form. Saved as this computer's display name.
+    net_computer_name: String,
     net_pass: String,
     net_show: bool,
     net_code: String,
@@ -614,6 +616,7 @@ impl App {
             svc_status: crate::syspaths::ServiceStatus::default(),
             status: String::new(),
             net_email,
+            net_computer_name: crate::hostfacts::read_computer_name(),
             net_pass: String::new(),
             net_show: false,
             net_code: String::new(),
@@ -903,6 +906,7 @@ impl App {
         self.cfg.device_id = None;
         self.cfg.network_email = None;
         self.net_email = "ben@spader.us".into();
+        self.net_computer_name = self.preferred_sign_in_computer_name();
         self.net_pass.clear();
         self.net_show = false;
         self.net_mode = 0;
@@ -1741,8 +1745,55 @@ impl App {
         err
     }
 
+    /// Nickname already stored for this computer, then its saved display name, then the hostname.
+    fn preferred_sign_in_computer_name(&self) -> String {
+        let saved = crate::hostfacts::read_computer_name();
+        if !saved.is_empty() {
+            return saved;
+        }
+        let id = pjdesk_proto::normalize_id(&self.visible_id());
+        if pjdesk_proto::is_valid_id(&id) {
+            if let Some(alias) = self
+                .cfg
+                .address_book
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.alias.trim().to_string())
+            {
+                if !alias.is_empty() {
+                    return alias;
+                }
+            }
+            if let Some(note) = self.cfg.settings.peers.get(&id) {
+                let name = note.display_name.trim();
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+        crate::hostname()
+    }
+
+    /// Writes the sign-in name through the same path Settings uses.
+    fn commit_sign_in_computer_name(&mut self) -> bool {
+        let name = crate::hostfacts::clean_computer_name(&self.net_computer_name);
+        if name.is_empty() {
+            self.net_error = "Enter a computer name.".into();
+            return false;
+        }
+        self.net_computer_name = name.clone();
+        if let Err(e) = crate::hostfacts::write_computer_name(&name) {
+            self.net_error = format!("Could not save this computer's name: {e}");
+            return false;
+        }
+        true
+    }
+
     fn start_network_sign_in(&mut self) {
         if self.net_busy {
+            return;
+        }
+        if !self.commit_sign_in_computer_name() {
             return;
         }
         if self.net_mode == 0 && self.sign_in_paused().is_some() {

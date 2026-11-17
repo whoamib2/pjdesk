@@ -291,6 +291,9 @@ class MainActivity : FragmentActivity() {
             var inviteError by remember { mutableStateOf("") }
             var inviteListed by remember { mutableStateOf(false) }
             var netEmail by remember { mutableStateOf(app.store.networkEmail) }
+            var netComputerName by remember {
+                mutableStateOf(app.store.computerName.trim().ifBlank { app.engine.deviceLabel() })
+            }
             var netPass by remember { mutableStateOf("") }
             var netCode by remember { mutableStateOf("") }
             var netUseCode by remember { mutableStateOf(false) }
@@ -964,6 +967,11 @@ class MainActivity : FragmentActivity() {
                 return true
             }
             fun applyImported(blob: String, passphrase: String, bound: Boolean) {
+                val name = commitSignInComputerName(netComputerName)
+                if (name == null) {
+                    netError = "Enter a computer name."
+                    return
+                }
                 val device = app.store.networkDeviceId.ifBlank {
                     UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
                 }
@@ -978,7 +986,7 @@ class MainActivity : FragmentActivity() {
                                 blob,
                                 passphrase,
                                 device,
-                                "Android",
+                                name,
                                 if (bound) email else "",
                                 if (bound) pass else "",
                             )
@@ -2105,7 +2113,14 @@ class MainActivity : FragmentActivity() {
                             copy(text)
                             scope.launch { snackbar.showSnackbar("Copied the last sign-in steps") }
                         },
+                        computerName = netComputerName,
+                        onComputerName = { netComputerName = it },
                         onEnrollOnly = {
+                            val name = commitSignInComputerName(netComputerName)
+                            if (name == null) {
+                                netError = "Enter a computer name."
+                                return@SignInScreen
+                            }
                             val device = app.store.networkDeviceId.ifBlank {
                                 UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
                             }
@@ -2115,7 +2130,7 @@ class MainActivity : FragmentActivity() {
                             val pass = netPass
                             scope.launch {
                                 val result = withContext(Dispatchers.IO) {
-                                    runCatching { signInAccount(email, pass, device) }
+                                    runCatching { signInAccount(email, pass, device, name) }
                                 }
                                 result.onSuccess { session ->
                                     applySignedIn(session, email, null, false, true)
@@ -2127,6 +2142,11 @@ class MainActivity : FragmentActivity() {
                         },
                         offerCurrent = netOffer,
                         onUseCurrent = {
+                            val name = commitSignInComputerName(netComputerName)
+                            if (name == null) {
+                                netError = "Enter a computer name."
+                                return@SignInScreen
+                            }
                             val token = netLogin
                             val address = state.server
                             val fingerprint = state.fingerprint
@@ -2138,7 +2158,7 @@ class MainActivity : FragmentActivity() {
                             netError = ""
                             scope.launch {
                                 val result = withContext(Dispatchers.IO) {
-                                    runCatching { CloudAuth.claimCurrentServer(token, address, fingerprint, device, "Android") }
+                                    runCatching { CloudAuth.claimCurrentServer(token, address, fingerprint, device, name) }
                                 }
                                 result.onSuccess { session ->
                                     applySignedIn(session, netEmail, null, signOutWhenDone, false, accountPassword = netPass)
@@ -2149,6 +2169,11 @@ class MainActivity : FragmentActivity() {
                             }
                         },
                         onSubmit = {
+                            val name = commitSignInComputerName(netComputerName)
+                            if (name == null) {
+                                netError = "Enter a computer name."
+                                return@SignInScreen
+                            }
                             val device = app.store.networkDeviceId.ifBlank {
                                 UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
                             }
@@ -2170,12 +2195,12 @@ class MainActivity : FragmentActivity() {
                                                 blob,
                                                 keyPass,
                                                 device,
-                                                "Android",
+                                                name,
                                                 if (bound) email else "",
                                                 if (bound) pass else "",
                                             )
-                                            useCode -> CloudAuth.enroll(code, device, "Android")
-                                            else -> signInAccount(email, pass, device)
+                                            useCode -> CloudAuth.enroll(code, device, name)
+                                            else -> signInAccount(email, pass, device, name)
                                         }
                                     }
                                 }
@@ -2957,7 +2982,14 @@ class MainActivity : FragmentActivity() {
     private fun showSignInError(message: String, pauseSecs: Long = 0): String =
         us.spader.pjdesk.core.signInShownError(message, pauseSecs, signInHeartbeat())
 
-    private fun signInAccount(email: String, password: String, device: String): us.spader.pjdesk.core.Session {
+    private fun commitSignInComputerName(name: String): String? {
+        val cleaned = name.trim().filter { !it.isISOControl() }.take(64)
+        if (cleaned.isEmpty()) return null
+        app.engine.setDisplayName(cleaned)
+        return cleaned
+    }
+
+    private fun signInAccount(email: String, password: String, device: String, deviceName: String): us.spader.pjdesk.core.Session {
         val known = signInHeartbeat()
         // Before the password derivation, so a failure there still has a step line.
         signInNote(known, "account", "op=sign-in")
@@ -2974,7 +3006,7 @@ class MainActivity : FragmentActivity() {
             .put("email", email.trim().lowercase())
             .put("auth_key", auth)
             .put("device_id", device)
-            .put("device_name", "Android")
+            .put("device_name", deviceName)
         var reply = CloudGate.request(body)
         var server = reply?.optString("server").orEmpty().ifBlank { known }
         var message = reply?.optString("message").orEmpty()
@@ -3036,7 +3068,7 @@ class MainActivity : FragmentActivity() {
         val who = server.ifBlank { known.ifBlank { "the PJDesk server" } }
         signInNote("pjdesk.com", "cloud", "after=$who")
         return try {
-            CloudAuth.signIn(email, password, device, "Android", forceCloud = true)
+            CloudAuth.signIn(email, password, device, deviceName, forceCloud = true)
         } catch (err: CloudAuthException) {
             throw CloudAuthException(
                 "The server at $who answered. Its account copy is empty. ${err.message ?: "pjdesk.com did not answer."}",

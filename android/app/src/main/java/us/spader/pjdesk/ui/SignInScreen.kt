@@ -66,6 +66,8 @@ fun SignInScreen(
     signInTrace: SignInTrace? = null,
     onSignInTrace: (String) -> Unit = {},
     onCopyDiagnostics: () -> Unit = {},
+    computerName: String = "",
+    onComputerName: (String) -> Unit = {},
 ) {
     // Enter (the keyboard's Done) in a password, passphrase or code field does
     // what the Sign in button does.
@@ -155,6 +157,14 @@ fun SignInScreen(
                         color = pjMuted(),
                     )
                 }
+                OutlinedTextField(
+                    value = computerName,
+                    onValueChange = { onComputerName(it.take(64)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("Computer name") },
+                    supportingText = { Text("Shown to your other computers. It must not be empty.") },
+                )
                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                     Checkbox(checked = temporary, onCheckedChange = onTemporary, enabled = !busy)
                     Text("Sign me out when I'm done (use on someone else's computer)")
