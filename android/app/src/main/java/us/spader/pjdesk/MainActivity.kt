@@ -1548,7 +1548,10 @@ class MainActivity : FragmentActivity() {
                                 val device = app.store.networkDeviceId.ifBlank {
                                     UUID.randomUUID().toString().also { app.store.networkDeviceId = it }
                                 }
-                                val signed = signInAccount(email, password, device)
+                                val name = commitSignInComputerName(
+                                    netComputerName.ifBlank { app.engine.deviceLabel() }
+                                ) ?: throw IllegalArgumentException("Enter a computer name.")
+                                val signed = signInAccount(email, password, device, name)
                                 CloudAuth.vaultKey(email, password) to signed
                             }
                         }
