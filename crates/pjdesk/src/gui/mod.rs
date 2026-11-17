@@ -2980,10 +2980,10 @@ impl App {
     fn consent_prompt(&mut self, ctx: &egui::Context) {
         let shared = self.engine.shared.pending_consent();
         let file = read_service_consent();
-        let (from, ip, id, from_file) = if let Some(ask) = shared {
-            (ask.from, ask.ip, ask.id, false)
+        let (from, ip, id, from_file, offered) = if let Some(ask) = shared {
+            (ask.from, ask.ip, ask.id, false, ask.offered)
         } else if let Some(ask) = file {
-            (ask.from, ask.ip, ask.id, true)
+            (ask.from, ask.ip, ask.id, true, ask.offered)
         } else {
             CONSENT_POP.with(|pop| {
                 if pop.borrow().id() != 0 {
@@ -3003,7 +3003,7 @@ impl App {
         });
         if let Some(allow) = answered {
             if from_file {
-                write_service_consent(allow);
+                write_service_consent(id, offered, allow);
             } else {
                 self.engine.shared.answer_consent(id, allow);
             }
@@ -3020,6 +3020,9 @@ struct ServiceConsent {
     from: String,
     #[serde(default)]
     ip: String,
+    /// Policy ceiling the service offered; clipboard is included in the default.
+    #[serde(default)]
+    offered: u32,
 }
 
 thread_local! {
@@ -3101,12 +3104,17 @@ fn read_service_consent() -> Option<ServiceConsent> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn write_service_consent(accept: bool) {
+fn write_service_consent(id: u64, offered: u32, accept: bool) {
     let path = crate::syspaths::service_dir().join("consent-reply.json");
+    let permissions = if accept {
+        pjdesk_proto::perms::allow_permissions(offered)
+    } else {
+        0
+    };
     let body = serde_json::json!({
-        "id": 1,
+        "id": id,
         "accept": accept,
-        "permissions": if accept { pjdesk_proto::perms::KEYBOARD | pjdesk_proto::perms::MOUSE | pjdesk_proto::perms::CHAT } else { 0 },
+        "permissions": permissions,
         "receive_dir": "",
     });
     let _ = std::fs::write(path, body.to_string());

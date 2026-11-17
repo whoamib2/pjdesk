@@ -117,6 +117,34 @@ pub fn agent_pipe_name(session: u32) -> String {
     format!(r"\\.\pipe\PJDeskInput-{session}")
 }
 
+/// SDDL for the SYSTEM input-agent pipe. SYSTEM has full access; the signed-in
+/// user may read and write. The mandatory label is Medium so a Medium-IL
+/// PJDesk helper can connect: a pipe created as SYSTEM otherwise defaults to
+/// System integrity, and Windows then denies the user-mode session host.
+pub fn agent_pipe_sddl(user_sid: Option<&str>) -> String {
+    let dacl = match user_sid {
+        Some(sid) if !sid.is_empty() => format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{sid})"),
+        _ => "D:P(A;;GA;;;SY)".to_string(),
+    };
+    format!("{dacl}S:(ML;;NW;;;ME)")
+}
+
+/// Shown to the viewer when the host can see a UAC or lock screen but cannot
+/// click it because the SYSTEM input agent is missing or unreachable.
+pub const SECURE_DESKTOP_NEEDS_SERVICE: &str = "This computer is showing an administrator (UAC) or lock screen. PJDesk can only click Yes or No when the PJDesk service is installed and running here. Install the PJDesk service on this computer (Settings → Service), then try again.";
+
+/// True when clicks on the secure desktop will not land without the agent.
+pub fn secure_desktop_needs_service(
+    agent_connected: bool,
+    desktop_name: Option<&str>,
+    desktop_inaccessible: bool,
+) -> bool {
+    if agent_connected {
+        return false;
+    }
+    desktop_inaccessible || desktop_name.is_some_and(|n| n.eq_ignore_ascii_case("winlogon"))
+}
+
 /// Decides when the input thread must re-attach to the input desktop.
 #[derive(Debug, Default)]
 pub struct DeskFollower {
@@ -291,6 +319,27 @@ mod tests {
         assert_eq!(outcomes.iter().filter(|o| **o == CheckOutcome::Report).count(), 1);
         assert_eq!(c.observe((5, 5), Some((5, 5))), CheckOutcome::Fine);
         assert_eq!(c.observe((5, 5), None), CheckOutcome::Fine);
+    }
+
+    #[test]
+    fn the_agent_pipe_allows_a_medium_integrity_helper() {
+        let with_user = agent_pipe_sddl(Some("S-1-5-21-1-2-3-1001"));
+        assert!(with_user.starts_with("D:P(A;;GA;;;SY)(A;;GRGW;;;S-1-5-21-1-2-3-1001)"));
+        assert!(with_user.ends_with("S:(ML;;NW;;;ME)"), "{with_user}");
+        let system_only = agent_pipe_sddl(None);
+        assert_eq!(system_only, "D:P(A;;GA;;;SY)S:(ML;;NW;;;ME)");
+        assert_eq!(agent_pipe_sddl(Some("")), system_only);
+    }
+
+    #[test]
+    fn uac_without_the_service_is_reported_even_when_the_desktop_name_cannot_be_read() {
+        assert!(!secure_desktop_needs_service(true, Some("Winlogon"), true));
+        assert!(!secure_desktop_needs_service(false, Some("Default"), false));
+        assert!(secure_desktop_needs_service(false, Some("Winlogon"), false));
+        assert!(secure_desktop_needs_service(false, Some("winlogon"), false));
+        assert!(secure_desktop_needs_service(false, None, true));
+        assert!(SECURE_DESKTOP_NEEDS_SERVICE.contains("UAC"));
+        assert!(SECURE_DESKTOP_NEEDS_SERVICE.contains("Install the PJDesk service"));
     }
 }
 

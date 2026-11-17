@@ -73,8 +73,25 @@ pub const ALL: u32 =
 /// What a version-2 controller is allowed: the original remote desktop.
 pub const CLASSIC: u32 = KEYBOARD | MOUSE;
 
+/// Keyboard, mouse, clipboard (text and pictures both ways), file transfer, and chat.
+/// Used for unattended sessions and when the person clicks Allow with no subset.
+pub const SESSION_DEFAULT: u32 = KEYBOARD | MOUSE | CLIPBOARD | FILE | CHAT;
+
 /// What an unattended (nobody at the screen) session gets unless configured otherwise.
-pub const UNATTENDED_DEFAULT: u32 = KEYBOARD | MOUSE;
+/// Clipboard is included: a password-only session must still sync text and pictures.
+pub const UNATTENDED_DEFAULT: u32 = SESSION_DEFAULT;
+
+/// Bits granted when the person clicks Allow. `offered` is the policy ceiling
+/// (usually [`ALL`]). An empty offer still gets [`SESSION_DEFAULT`], so an
+/// older consent reply cannot silently drop clipboard.
+pub fn allow_permissions(offered: u32) -> u32 {
+    let bits = offered & ALL;
+    if bits == 0 {
+        SESSION_DEFAULT
+    } else {
+        bits
+    }
+}
 
 /// Removed whenever the host is in view-only mode. Clipboard is in this mask
 /// on purpose: a view-only session must not read or write it.
@@ -179,6 +196,19 @@ mod tests {
     #[test]
     fn unknown_bits_are_cleared() {
         assert_eq!(grant(1 << 30 | MOUSE, ALL, false), MOUSE);
+    }
+
+    #[test]
+    fn unattended_and_allow_include_clipboard_by_default() {
+        assert!(has(UNATTENDED_DEFAULT, CLIPBOARD));
+        assert!(has(UNATTENDED_DEFAULT, FILE));
+        assert!(has(SESSION_DEFAULT, CLIPBOARD));
+        assert_eq!(allow_permissions(ALL), ALL);
+        assert_eq!(allow_permissions(0), SESSION_DEFAULT);
+        assert!(has(allow_permissions(0), CLIPBOARD));
+        assert!(has(grant(ALL, UNATTENDED_DEFAULT, false), CLIPBOARD));
+        assert!(!has(grant(ALL, UNATTENDED_DEFAULT, true), CLIPBOARD));
+        assert_eq!(files_only_grant(UNATTENDED_DEFAULT), FILE);
     }
 
     #[test]

@@ -141,12 +141,14 @@ struct Agent {
 }
 
 impl Agent {
-    fn connect() -> Option<Agent> {
-        let session = crate::platform::session_id()?;
+    fn connect() -> Result<Agent, std::io::Error> {
+        let session = crate::platform::session_id().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no Windows session id")
+        })?;
         let name = inputroute::agent_pipe_name(session);
-        let pipe = std::fs::OpenOptions::new().read(true).write(true).open(&name).ok()?;
+        let pipe = std::fs::OpenOptions::new().read(true).write(true).open(&name)?;
         tracing::info!("Input goes through the PJDesk SYSTEM input agent (session {session})");
-        Some(Agent { pipe })
+        Ok(Agent { pipe })
     }
 
     fn send(&mut self, recs: &[Rec]) -> std::io::Result<(bool, u32)> {
@@ -166,12 +168,24 @@ fn input_thread(rx: Receiver<Req>) {
     let mut desk = DeskFollower::default();
     let mut agent: Option<Agent> = None;
     let mut agent_tried: Option<Instant> = None;
+    let mut last_agent_warn: Option<Instant> = None;
     let mut check = SelfCheck::default();
     let mut failures_logged = 0u32;
+    let mut secure_reported = false;
     while let Ok(req) = rx.recv() {
         if agent.is_none() && agent_tried.is_none_or(|t| t.elapsed() >= inputroute::AGENT_RETRY) {
             agent_tried = Some(Instant::now());
-            agent = Agent::connect();
+            match Agent::connect() {
+                Ok(a) => agent = Some(a),
+                Err(e) => {
+                    if last_agent_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(30)) {
+                        last_agent_warn = Some(Instant::now());
+                        tracing::warn!(
+                            "Could not connect to the SYSTEM input agent: {e}. Clicks on UAC and administrator windows need the PJDesk service installed and running."
+                        );
+                    }
+                }
+            }
         }
         let mut result = None;
         if let Some(a) = agent.as_mut() {
@@ -193,6 +207,22 @@ fn input_thread(rx: Receiver<Req>) {
             tracing::warn!("Windows rejected injected input (error {err}) on desktop \"{}\"", desk.current());
         }
         let _ = req.reply.send(ok);
+        if inputroute::secure_desktop_needs_service(
+            agent.is_some(),
+            crate::platform::input_desktop_name().as_deref(),
+            crate::platform::input_desktop_inaccessible(),
+        ) {
+            if !secure_reported {
+                secure_reported = true;
+                let msg = inputroute::SECURE_DESKTOP_NEEDS_SERVICE;
+                tracing::warn!("{msg}");
+                if let Ok(mut p) = inputroute::INPUT_PROBLEM.lock() {
+                    *p = Some(msg.to_string());
+                }
+            }
+        } else if agent.is_some() {
+            secure_reported = false;
+        }
         if let (true, Some(want)) = (ok, req.want) {
             // Keep this thread on the input desktop so GetCursorPos reads the
             // real cursor, then judge whether the move landed.
@@ -243,12 +273,10 @@ pub fn run_agent() -> anyhow::Result<()> {
     }
 }
 
-/// SDDL: SYSTEM, plus the user signed in to `session` (read/write only).
+/// SDDL: SYSTEM, plus the user signed in to `session` (read/write only),
+/// with a Medium mandatory label so the user-mode helper can connect.
 fn pipe_sddl(session: u32) -> String {
-    match session_user_sid(session) {
-        Some(sid) => format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{sid})"),
-        None => "D:P(A;;GA;;;SY)".to_string(),
-    }
+    inputroute::agent_pipe_sddl(session_user_sid(session).as_deref())
 }
 
 fn session_user_sid(session: u32) -> Option<String> {

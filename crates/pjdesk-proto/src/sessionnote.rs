@@ -46,6 +46,9 @@ pub fn is_session_state(notice: &str) -> bool {
         " is at the Windows sign-in screen",
         " has no monitor on.",
         "'s screen is back.",
+        "showing an administrator (UAC) or lock screen",
+        "Install the PJDesk service on this computer",
+        "Install the PJDesk service on that computer so input can reach admin windows",
     ]
     .iter()
     .any(|marker| n.contains(marker))
@@ -83,5 +86,11 @@ mod tests {
         assert!(is_session_state("The remote session is back on the screen."));
         assert!(!is_session_state("The person at this computer disconnected"));
         assert!(!is_session_state("wrong password"));
+        assert!(is_session_state(
+            "This computer is showing an administrator (UAC) or lock screen. PJDesk can only click Yes or No when the PJDesk service is installed and running here. Install the PJDesk service on this computer (Settings → Service), then try again."
+        ));
+        assert!(is_session_state(
+            "The window in front on the remote computer is running as administrator, so Windows blocks input from PJDesk. Install the PJDesk service on that computer so input can reach admin windows."
+        ));
     }
 }

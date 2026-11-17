@@ -32,6 +32,25 @@ pub fn input_desktop_name() -> Option<String> {
     }
 }
 
+/// True when this process cannot open the current input desktop. Typical on a
+/// UAC or lock screen (Winlogon) when this helper is the signed-in user: only
+/// the SYSTEM input agent can attach there and click Yes or No.
+#[cfg(windows)]
+pub fn input_desktop_inaccessible() -> bool {
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
+    };
+    unsafe {
+        match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) {
+            Ok(hdesk) => {
+                let _ = CloseDesktop(hdesk);
+                false
+            }
+            Err(_) => true,
+        }
+    }
+}
+
 /// Windows session this process is running in. Session 0 is the service
 /// session and has no interactive desktop, so capture there stays black.
 #[cfg(windows)]
@@ -375,6 +394,11 @@ pub fn run_elevated(_args: &[&str]) -> bool {
 #[cfg(not(windows))]
 pub fn input_desktop_name() -> Option<String> {
     None
+}
+
+#[cfg(not(windows))]
+pub fn input_desktop_inaccessible() -> bool {
+    false
 }
 
 #[cfg(not(windows))]

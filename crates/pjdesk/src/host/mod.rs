@@ -263,11 +263,11 @@ impl HostShared {
             .as_ref()
             .filter(|ask| ask.id == id)
             .map(|ask| ask.offered)
-            .unwrap_or(pjdesk_proto::perms::KEYBOARD | pjdesk_proto::perms::MOUSE);
+            .unwrap_or(0);
         *self.consent_reply.lock().unwrap() = Some(ConsentReply {
             id,
             accept,
-            permissions: if accept { offered } else { 0 },
+            permissions: if accept { pjdesk_proto::perms::allow_permissions(offered) } else { 0 },
             receive_dir: String::new(),
         });
     }
