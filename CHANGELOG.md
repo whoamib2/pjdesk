@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.93
+
+- Fixed: scrolling the Saved computer list could paint row titles and buttons over the toolbar, the signed-in line, and the search box. The list header stays pinned, and scrolled-off rows stay clipped to the list.
+- New: sign-in asks for this computer's name, prefilled with the current name or hostname, so the account list is right as soon as you sign in. The same field is on Android.
+- Fixed: signing in with "Sign me out when I'm done" and then switching to Stay signed in could drop the session immediately, so you had to sign in again. Switching either way now keeps the current session.
+- The remote mouse is smoother: moves go out at the input rate with no added wait, and the host pointer is drawn as this window's cursor so it moves with no lag. PJDesk never warps, clips, grabs, or hides the local mouse, and never changes its speed. The cursor is restored when the pointer leaves the window, the window loses focus, or it is minimized.
+- Fixed: on Cabin1 and similar hosts, a failed pointer-shape capture was sent as a hidden cursor, and the viewer hid the mouse in the remote window. A failed capture is retried; the viewer no longer hides the local cursor.
+
 ## 0.6.92
 
 - Fixed: a UAC prompt on a computer running the PJDesk service still showed a frozen or dimmed picture in 0.6.91, and Yes and No could not be clicked. The session-host was running as the signed-in user, so it could not follow the Windows secure desktop. When the PJDesk service is installed, capture and input now run as SYSTEM in the signed-in session and follow the desktop that is on screen (including UAC and the lock screen). Received files still go to that user's Downloads folder. Windows' PromptOnSecureDesktop setting is not changed. The PJDesk service must be installed and running on the computer that is sharing its screen.
