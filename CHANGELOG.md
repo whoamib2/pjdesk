@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.92
+
+- Fixed: a UAC prompt on a computer running the PJDesk service still showed a frozen or dimmed picture in 0.6.91, and Yes and No could not be clicked. The session-host was running as the signed-in user, so it could not follow the Windows secure desktop. When the PJDesk service is installed, capture and input now run as SYSTEM in the signed-in session and follow the desktop that is on screen (including UAC and the lock screen). Received files still go to that user's Downloads folder. Windows' PromptOnSecureDesktop setting is not changed. The PJDesk service must be installed and running on the computer that is sharing its screen.
+
 ## 0.6.91
 
 - Fixed: clipboard did not sync text or pictures in a password (unattended) session, because the host never granted clipboard. Clipboard (text and images, both ways) is now on by default in normal sessions, including unattended and when someone clicks Allow. View-only and files-only sessions are unchanged.
