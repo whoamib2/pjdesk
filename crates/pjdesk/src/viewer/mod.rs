@@ -54,6 +54,13 @@ pub struct Link {
     pub host_fingerprint: Option<pjdesk_proto::tls::Fingerprint>,
 }
 
+/// Mouse and other session control stay above the picture (-1) and files (-2).
+fn prefer_control(mut send: SendStream) -> SendStream {
+    let _ = send.set_priority(0);
+    send
+}
+
+
 pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<()> {
     if let Err(message) = crate::incoming::refuse_outgoing() {
         bail!("{message}");
@@ -408,7 +415,7 @@ async fn try_direct_resume(
     Ok(Some(Link {
         connection,
         endpoint,
-        control_send: auth.send,
+        control_send: prefer_control(auth.send),
         control_recv: auth.recv,
         host_name: if auth.peer_name.trim().is_empty() { host_label.trim().to_string() } else { auth.peer_name },
         host_id: host_id.to_string(),
@@ -888,7 +895,7 @@ async fn connect(
     Ok(Link {
         connection,
         endpoint,
-        control_send: auth.send,
+        control_send: prefer_control(auth.send),
         control_recv: auth.recv,
         host_name: reported,
         host_id: target.to_string(),
@@ -1055,7 +1062,7 @@ async fn connect_direct(
     Ok(Link {
         connection,
         endpoint,
-        control_send: auth.send,
+        control_send: prefer_control(auth.send),
         control_recv: auth.recv,
         host_name: if auth.peer_name.is_empty() { socket_addr.to_string() } else { auth.peer_name },
         host_id: "000000000".into(),

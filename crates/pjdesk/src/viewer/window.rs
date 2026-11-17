@@ -397,7 +397,6 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
         pan_at: Instant::now(),
         dot_cursor: None,
         pointer_applied: 0,
-        pointer_hidden: false,
         separate_pick: None,
         edge_cursor: false,
         last_title_click: None,
@@ -501,9 +500,9 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
     Ok(stop)
 }
 
-/// Writes queued control messages, batching whatever is pending.
-/// Moves are merged to the newest position (at most every 8 ms); clicks,
-/// keys and acks are never merged or dropped. See `pjdesk_proto::inputflow`.
+/// Writes queued control messages. Moves already waiting are merged to the
+/// newest position with no added wait; clicks, keys and acks are never merged
+/// or dropped. See `pjdesk_proto::inputflow`.
 async fn send_control(send: SendStream, rx: mpsc::UnboundedReceiver<ControlMsg>) {
     pjdesk_proto::inputflow::pump_control(send, rx).await
 }
@@ -722,8 +721,6 @@ struct App {
     dot_cursor: Option<winit::window::CustomCursor>,
     /// Last `pointer_serial` from the host that was applied (0.6.86 hosts).
     pointer_applied: u64,
-    /// The host said its pointer is hidden.
-    pointer_hidden: bool,
     /// "Open in new window" from the screen picker: only these screens get a
     /// window. `None` is the full separate-windows view (one per screen).
     separate_pick: Option<Vec<u8>>,
@@ -1473,8 +1470,10 @@ impl App {
                 self.edge_cursor = false;
                 if let Some(dot) = &self.dot_cursor {
                     window.set_cursor(dot.clone());
+                } else {
+                    window.set_cursor(winit::window::CursorIcon::Default);
                 }
-                window.set_cursor_visible(!self.pointer_hidden);
+                window.set_cursor_visible(true);
             }
         }
         if self.confirm_close {
@@ -2051,7 +2050,7 @@ impl App {
         let sized = self.apply_place(event_loop, &window, display);
         if let Some(pointer) = self.dot_cursor.clone().filter(|_| self.pointer_applied > 0) {
             window.set_cursor(pointer);
-            window.set_cursor_visible(!self.pointer_hidden);
+            window.set_cursor_visible(true);
         } else if let Ok(source) = CustomCursor::from_rgba(dot_cursor(), 5, 5, 2, 2) {
             let dot = event_loop.create_custom_cursor(source);
             window.set_cursor(dot.clone());
@@ -2090,6 +2089,10 @@ impl App {
     /// Shows the host's pointer (0.6.86 hosts) as this window's own cursor, so
     /// there is exactly one pointer and it moves with no network lag. Older
     /// hosts draw the pointer into the video and keep the small dot here.
+    ///
+    /// The local mouse is never warped, clipped, grabbed, or hidden, and its
+    /// speed is never changed. When the host hides its pointer we keep the last
+    /// shape, or the default arrow, so the OS cursor stays visible.
     fn sync_pointer(&mut self, event_loop: &ActiveEventLoop) {
         let (serial, pointer) = {
             let g = self.live.lock().unwrap();
@@ -2100,11 +2103,7 @@ impl App {
         }
         self.pointer_applied = serial;
         let Some((w, h, hx, hy, rgba)) = pointer else { return };
-        let mut windows: Vec<Rc<Window>> = self.extra.iter().map(|p| p.window.clone()).collect();
-        if let Some(window) = &self.window {
-            windows.push(window.clone());
-        }
-        self.pointer_hidden = w == 0;
+        let windows = self.pointer_windows();
         if w > 0 {
             match CustomCursor::from_rgba(rgba.as_ref().clone(), w, h, hx, hy) {
                 Ok(source) => {
@@ -2118,9 +2117,30 @@ impl App {
                 }
                 Err(e) => tracing::debug!("host pointer image refused: {e}"),
             }
+        } else if self.dot_cursor.is_none() && !self.edge_cursor {
+            for window in &windows {
+                window.set_cursor(winit::window::CursorIcon::Default);
+            }
         }
         for window in &windows {
-            window.set_cursor_visible(!self.pointer_hidden || self.edge_cursor);
+            window.set_cursor_visible(true);
+        }
+    }
+
+    fn pointer_windows(&self) -> Vec<Rc<Window>> {
+        let mut windows: Vec<Rc<Window>> = self.extra.iter().map(|p| p.window.clone()).collect();
+        if let Some(window) = &self.window {
+            windows.push(window.clone());
+        }
+        windows
+    }
+
+    /// The local mouse stays under the OS. Visibility is restored on leave,
+    /// focus loss, and minimize; held remote buttons and keys are released.
+    fn release_pointer_capture(&mut self) {
+        self.release_all();
+        for window in self.pointer_windows() {
+            window.set_cursor_visible(true);
         }
     }
 
@@ -2269,9 +2289,14 @@ impl App {
                 self.remember_places(false);
                 if let Some(pane) = self.extra.iter().find(|p| p.window.id() == id) {
                     pane.window.request_redraw();
+                    if pane.window.is_minimized() == Some(true) {
+                        self.release_pointer_capture();
+                    }
                 }
             }
-            WindowEvent::Focused(false) => self.release_all(),
+            WindowEvent::Focused(false) => self.release_pointer_capture(),
+            WindowEvent::CursorLeft { .. } => self.release_pointer_capture(),
+            WindowEvent::Occluded(true) => self.release_pointer_capture(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
                 let focused = self.extra.iter().find(|p| p.window.id() == id).map(|p| p.window.clone());
@@ -3536,10 +3561,17 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(_) => {
                 if let Some(window) = &self.window {
                     window.request_redraw();
+                    if window.is_minimized() == Some(true) {
+                        self.release_pointer_capture();
+                    }
                 }
             }
-            // Don't leave keys "held" on the host when we lose focus.
-            WindowEvent::Focused(false) => self.release_all(),
+            // Don't leave keys "held" on the host when we lose focus, and
+            // never leave the local cursor hidden after leave, blur, or
+            // minimize. The OS mouse is never warped, clipped, or grabbed.
+            WindowEvent::Focused(false) => self.release_pointer_capture(),
+            WindowEvent::CursorLeft { .. } => self.release_pointer_capture(),
+            WindowEvent::Occluded(true) => self.release_pointer_capture(),
             WindowEvent::ThemeChanged(theme) => {
                 if self.follow_system_theme {
                     self.light = matches!(theme, winit::window::Theme::Light);
