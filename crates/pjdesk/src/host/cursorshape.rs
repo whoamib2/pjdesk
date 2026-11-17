@@ -61,18 +61,30 @@ mod win {
                 let showing = info.flags.0 & CURSOR_SHOWING.0 != 0 && !info.hCursor.is_invalid();
                 let key = (showing, info.hCursor.0 as usize);
                 if last != Some(key) {
-                    let msg = if showing { shape(info.hCursor) } else { None }.unwrap_or(HostMsg::CursorShape {
-                        id: 0,
-                        width: 0,
-                        height: 0,
-                        hot_x: 0,
-                        hot_y: 0,
-                        rgba: Vec::new(),
-                    });
-                    if tx.send(msg).is_err() {
-                        return;
+                    if showing {
+                        // A failed capture is not a hidden pointer. Skip and
+                        // retry next poll; sending width 0 made the viewer
+                        // drop the cursor on Cabin1 and similar hosts.
+                        if let Some(msg) = shape(info.hCursor) {
+                            if tx.send(msg).is_err() {
+                                return;
+                            }
+                            last = Some(key);
+                        }
+                    } else {
+                        let msg = HostMsg::CursorShape {
+                            id: 0,
+                            width: 0,
+                            height: 0,
+                            hot_x: 0,
+                            hot_y: 0,
+                            rgba: Vec::new(),
+                        };
+                        if tx.send(msg).is_err() {
+                            return;
+                        }
+                        last = Some(key);
                     }
-                    last = Some(key);
                 }
             } else {
                 desk.invalidate();
