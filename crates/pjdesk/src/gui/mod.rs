@@ -421,6 +421,8 @@ pub struct App {
     temp: Option<TempHold>,
     session_end: Option<Receiver<()>>,
     temp_left: u64,
+    /// True after Stay signed in this frame, so a click-through cannot sign out.
+    kept_session: bool,
     /// Nine-digit id already published for this sign-in. Empty until that succeeds.
     enrolled_for: String,
     enroll_after: Instant,
@@ -648,6 +650,7 @@ impl App {
             temp: None,
             session_end: if preview { None } else { Some(crate::temp_sign::watch_session_end()) },
             temp_left: 0,
+            kept_session: false,
             enrolled_for: String::new(),
             enroll_after: Instant::now(),
             enroll_rx: None,
@@ -1051,6 +1054,9 @@ impl App {
 
     /// Drops a temporary sign-in. This computer stays in the account.
     fn end_temporary_sign_in(&mut self) {
+        if self.kept_session {
+            return;
+        }
         let Some(temp) = self.temp.take() else { return };
         self.cfg.ephemeral_network = false;
         let (passwords, recents) = crate::temp_sign::marker_ids();
@@ -1097,6 +1103,7 @@ impl App {
         }
         crate::network::copy_to_service(&self.cfg);
         self.sync_passwords(true);
+        self.kept_session = true;
         self.toast.show("Signed in on this computer");
     }
 
@@ -3672,6 +3679,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.ctx = ui.ctx().clone();
         let ctx = self.ctx.clone();
+        self.kept_session = false;
         self.poll_login();
         self.poll_network();
         self.poll_vault();

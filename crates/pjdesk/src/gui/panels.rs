@@ -64,10 +64,14 @@ impl App {
                             self.confirm_clear_saved = true;
                             ui.close();
                         }
+                        // Sign out lives in this menu, not beside it. A click
+                        // on "Stay signed in" used to fall through to a Sign
+                        // out button under the open menu and drop the session.
+                        if ui.button("Sign out").clicked() {
+                            self.end_temporary_sign_in();
+                            ui.close();
+                        }
                     });
-                    if ui.button("Sign out").clicked() {
-                        self.end_temporary_sign_in();
-                    }
                 } else if !email.trim().is_empty() {
                     ui.menu_button(RichText::new(email.trim()).color(p.ok), |ui| {
                         if ui.button("Manage account").clicked() {
