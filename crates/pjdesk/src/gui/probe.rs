@@ -135,13 +135,14 @@ fn probe_loop(cmd: Receiver<ProbeCmd>, tx: Sender<ProbeSnap>, ctx: egui::Context
         if tx.send(sample(update_task)).is_err() {
             return;
         }
-        ctx.request_repaint();
+        super::hangwatch::request_repaint_if_visible(&ctx);
+        super::poll_client_heartbeat();
         if update_task.is_none() {
             update_task = Some(crate::service::update_task_enabled());
             if tx.send(sample(update_task)).is_err() {
                 return;
             }
-            ctx.request_repaint();
+            super::hangwatch::request_repaint_if_visible(&ctx);
         }
         match cmd.recv_timeout(Duration::from_secs(2)) {
             Ok(ProbeCmd::RefreshUpdateTask) => {

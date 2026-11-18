@@ -306,16 +306,23 @@ mod imp {
                 super::super::instance::signal_show();
                 tracing::info!("Tray: {reason}. The window is already running. Bringing it forward.");
                 std::thread::spawn(|| {
-                    if !crate::winshow::window_is_hung("PJDesk") {
+                    // The window is usually still answering at the click. The
+                    // hang, when it happens, is during the restore or the
+                    // first present. Check again for several seconds.
+                    for wait_ms in [2_000u64, 3_000, 5_000] {
+                        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                        if !crate::winshow::window_is_hung("PJDesk") {
+                            continue;
+                        }
+                        let Some(pid) = crate::winshow::window_process("PJDesk") else { return };
+                        if pid == 0 || pid == std::process::id() {
+                            return;
+                        }
+                        tracing::info!("The PJDesk window process {pid} is hung. Replacing that process. The tray stays.");
+                        end_process(pid);
+                        spawn_detached(&["--window"], Some(pid));
                         return;
                     }
-                    let Some(pid) = crate::winshow::window_process("PJDesk") else { return };
-                    if pid == 0 || pid == std::process::id() {
-                        return;
-                    }
-                    tracing::info!("The PJDesk window process {pid} is hung. Replacing that process. The tray stays.");
-                    end_process(pid);
-                    spawn_detached(&["--window"], Some(pid));
                 });
             }
         }

@@ -17,6 +17,7 @@ mod settings;
 mod theme;
 mod tray;
 mod widgets;
+mod hangwatch;
 
 #[cfg(feature = "ui-shots")]
 mod shots;
@@ -3153,7 +3154,7 @@ fn due(slot: &std::sync::Mutex<Option<Instant>>, every: Duration) -> bool {
     true
 }
 
-fn poll_client_heartbeat() {
+pub(super) fn poll_client_heartbeat() {
     static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
     if !due(&LAST, Duration::from_secs(2)) {
         return;
@@ -3287,15 +3288,17 @@ impl App {
 fn reveal_window(ctx: &egui::Context, reason: &str) {
     crate::traywatch::ack();
     crate::winshow::note_user_open();
+    hangwatch::set_parked(false);
     // Put the taskbar button back before the restore looks the window up.
     crate::winshow::reveal_on_taskbar("PJDesk");
     ctx.request_repaint();
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-    // The tray thread already posted the restore. This thread focuses the
-    // viewport and draws the PIN lock. Opening does not sign this computer out.
-    crate::winshow::activate(reason, "PJDesk", instance::holds_window());
+    // The tray already posted ShowWindowAsync. This thread must not call
+    // ShowWindow(SW_RESTORE): that re-enters the window procedure from
+    // inside a frame and can leave the window Not Responding.
+    tracing::info!("Tray click reached the window thread ({reason}). Focusing the viewport without a synchronous restore.");
 }
 
 /// Lets the viewer process bring its window in front of this one.
@@ -3633,6 +3636,7 @@ impl App {
             let view = i.viewport();
             view.minimized == Some(true) || view.visible() == Some(false)
         });
+        hangwatch::set_parked(hidden);
         if !hidden {
             self.hidden_log = None;
             return;
@@ -3672,6 +3676,8 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        hangwatch::begin_frame();
+        hangwatch::mark("on_tray");
         self.ctx = ctx.clone();
         self.on_tray(ctx);
     }
@@ -3680,30 +3686,55 @@ impl eframe::App for App {
         self.ctx = ui.ctx().clone();
         let ctx = self.ctx.clone();
         self.kept_session = false;
+        hangwatch::mark("poll_login");
         self.poll_login();
+        hangwatch::mark("poll_network");
         self.poll_network();
+        hangwatch::mark("poll_vault");
         self.poll_vault();
+        hangwatch::mark("poll_temporary");
         self.poll_temporary(&ctx);
+        hangwatch::mark("poll_self_enroll");
         self.poll_self_enroll();
+        hangwatch::mark("maybe_pull_account");
         self.maybe_pull_account();
+        hangwatch::mark("poll_saved_refresh");
         self.poll_saved_refresh();
+        hangwatch::mark("poll_incoming_result");
         self.poll_incoming_result();
+        hangwatch::mark("poll_account_delete");
         self.poll_account_delete();
+        hangwatch::mark("poll_password");
         self.poll_password();
+        hangwatch::mark("poll_probe");
         self.poll_probe();
+        hangwatch::mark("poll_ask");
         self.poll_ask();
+        hangwatch::mark("poll_session_status");
         self.poll_session_status();
+        hangwatch::mark("poll_viewers");
         self.poll_viewers();
+        hangwatch::mark("poll_admit");
         self.poll_admit();
+        hangwatch::mark("poll_client_update");
         self.poll_client_update();
+        hangwatch::mark("poll_support_offer");
         self.poll_support_offer();
+        hangwatch::mark("poll_support_connect");
         self.poll_support_connect();
+        hangwatch::mark("poll_invite");
         self.poll_invite();
+        hangwatch::mark("poll_support_keys");
         self.poll_support_keys();
+        hangwatch::mark("poll_support_leave");
         self.poll_support_leave();
+        hangwatch::mark("poll_app_lock");
         self.poll_app_lock();
+        hangwatch::mark("note_lock_visibility");
         self.note_lock_visibility(&ctx);
+        hangwatch::mark("lock_after_remote_session");
         self.lock_after_remote_session();
+        hangwatch::mark("notice_sign_in_paste");
         self.notice_sign_in_paste(&ctx);
 
         if ctx
@@ -3755,15 +3786,18 @@ impl eframe::App for App {
                 self.lock_screen(ui);
             }
             self.consent_prompt(&ctx);
-            poll_client_heartbeat();
+            hangwatch::mark("adopt_service");
             adopt_service_notice();
             self.lock_after_remote_session();
             adopt_service_chat();
+            hangwatch::mark("poll_lan");
             self.poll_lan();
             if let Some(text) = saved::take_seen_click() {
                 self.toast.show(text);
             }
             self.toast.render(&ctx);
+            let parked = ctx.input(|i| i.viewport().minimized == Some(true) || i.viewport().visible() == Some(false));
+            hangwatch::end_frame(parked);
             return;
         }
 
@@ -3790,12 +3824,14 @@ impl eframe::App for App {
         self.import_prompt(&ctx);
         self.password_prompt(&ctx);
         self.consent_prompt(&ctx);
-        poll_client_heartbeat();
+        hangwatch::mark("adopt_service");
         adopt_service_notice();
         self.lock_after_remote_session();
         adopt_service_chat();
+        hangwatch::mark("login_window");
         self.login_window(&ctx);
         self.change_password_window(&ctx);
+        hangwatch::mark("poll_lan");
         self.poll_lan();
         self.add_book_window(&ctx);
         if let Some(text) = saved::take_seen_click() {
@@ -3816,6 +3852,8 @@ impl eframe::App for App {
                     });
                 });
         }
+        let parked = ctx.input(|i| i.viewport().minimized == Some(true) || i.viewport().visible() == Some(false));
+        hangwatch::end_frame(parked);
     }
 }
 

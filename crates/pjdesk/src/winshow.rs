@@ -113,10 +113,10 @@ mod imp {
     use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
-    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
+    use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::Shell::{ITaskbarList, TaskbarList};
     use windows::Win32::UI::WindowsAndMessaging::{
-        AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+        AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetWindowLongPtrW, GetWindowRect,
         GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, MoveWindow,
         SendMessageTimeoutW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, ShowWindowAsync, GWL_EXSTYLE,
         HWND_TOP, SMTO_ABORTIFHUNG, SMTO_BLOCK, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
@@ -393,23 +393,19 @@ mod imp {
                 }
             );
             let _ = AllowSetForegroundWindow(0xFFFF_FFFF);
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            // Post the restore. ShowWindow(SW_RESTORE) waits for the window
+            // procedure, so calling it from the window thread (or while that
+            // thread is already in a frame) can hang the UI forever.
+            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
             if !IsWindowVisible(hwnd).as_bool() {
                 tracing::info!("Tray: {title} was still hidden after SW_RESTORE. Showing it.");
-                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = ShowWindowAsync(hwnd, SW_SHOW);
             }
-            let fg = GetForegroundWindow();
-            let fg_thread = if fg.0.is_null() { 0 } else { GetWindowThreadProcessId(fg, None) };
-            let us = GetCurrentThreadId();
-            let attached = fg_thread != 0 && fg_thread != us && AttachThreadInput(fg_thread, us, true).as_bool();
             let brought = SetForegroundWindow(hwnd).as_bool();
             let _ = BringWindowToTop(hwnd);
             let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-            if attached {
-                let _ = AttachThreadInput(fg_thread, us, false);
-            }
             tracing::info!(
-                "Tray: ShowWindow(SW_RESTORE) and SetForegroundWindow for {title} (attach={attached}, foreground={brought})."
+                "Tray: ShowWindowAsync(SW_RESTORE) and SetForegroundWindow for {title} (foreground={brought})."
             );
             move_if_off_screen(title, hwnd);
         }
