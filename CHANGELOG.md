@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.94
+
+- Fixed: the main window could freeze with "Not Responding" after a tray click restored a minimized window. A background status check was still asking the parked window to paint, and the window thread could wait on a synchronous restore. The restore is now posted and returns immediately, a parked window is not woken for a present, and the tray checks again for several seconds and replaces the window process if it hangs.
+- New: if the window thread stays in one frame for more than two seconds, PJDesk logs the last UI operation so a hang can be found.
+
 ## 0.6.93
 
 - Fixed: scrolling the Saved computer list could paint row titles and buttons over the toolbar, the signed-in line, and the search box. The list header stays pinned, and scrolled-off rows stay clipped to the list.
