@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.97
+
+- New: installers and updates are now served from locked storage on pjdesk.com, and the website download section requires the download password.
+
 ## 0.6.96
 
 - Fixed: after you reboot a computer you are already viewing, automatic reconnect could stop with "Wrong password" even though a manual Connect with the saved password worked and did not ask for a password. Reconnect now uses the same saved password a manual Connect would use, and retries a wrong-password reply while the host is still coming up (a few tries, spaced out so the host is not locked out). "Wrong password." is shown only if those credentials still fail after the host is up. Windows and Android.
