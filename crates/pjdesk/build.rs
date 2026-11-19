@@ -4,6 +4,10 @@ fn main() {
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/pjdesk.ico");
+        // Resource id 2 is the chat-bubble mark. The chat window's
+        // AppUserModel.RelaunchIconResource points at this exe,-2 so the
+        // taskbar does not fall back to a generic icon.
+        res.set_icon_with_id("assets/chat.ico", "2");
         res.set("ProductName", "PJDesk");
         res.set("FileDescription", "PJDesk remote desktop");
         res.set("CompanyName", "PJDesk");
@@ -20,6 +24,7 @@ fn main() {
         }
     }
     println!("cargo:rerun-if-changed=assets/pjdesk.ico");
+    println!("cargo:rerun-if-changed=assets/chat.ico");
     // openh264 is C++. rust-lld does not search GCC's directory for libstdc++.
     let target = std::env::var("TARGET").unwrap_or_default();
     if target.contains("linux") {

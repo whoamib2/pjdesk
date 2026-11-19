@@ -21,6 +21,7 @@ mod client_update;
 mod chatpop;
 #[cfg(windows)]
 mod chat_taskbar;
+mod window_place;
 mod consentpop;
 mod filepop;
 mod companion;

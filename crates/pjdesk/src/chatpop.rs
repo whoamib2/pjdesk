@@ -238,6 +238,13 @@ pub fn load_place() -> Place {
     let mut p: Place = std::fs::read(place_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     p.w = p.w.clamp(280.0, 900.0);
     p.h = p.h.clamp(300.0, 1200.0);
+    if let Some((work, _)) = crate::window_place::chat_work_points() {
+        let (x, y, w, h) = pjdesk_proto::winplace::clamp_or_center(p.x, p.y, p.w, p.h, work);
+        p.x = x;
+        p.y = y;
+        p.w = w;
+        p.h = h;
+    }
     p
 }
 
@@ -365,6 +372,8 @@ pub mod window {
             app.sync_title(ctx);
             #[cfg(windows)]
             crate::chat_taskbar::apply_taskbar_icon();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(chat_icon()))));
+            crate::window_place::apply_chat_hwnd_place(app.place.x, app.place.y, app.place.w, app.place.h);
             if app.state.lines.iter().any(|l| !l.mine) {
                 app.flash_until = Some(Instant::now() + Duration::from_millis(1500));
                 alert_sound();
@@ -592,6 +601,8 @@ pub mod window {
             self.sync_title(ctx);
             #[cfg(windows)]
             crate::chat_taskbar::apply_taskbar_icon();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(chat_icon()))));
+            crate::window_place::apply_chat_hwnd_place(self.place.x, self.place.y, self.place.w, self.place.h);
             let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
             self.note_seen(focused);
             self.remember(ctx);

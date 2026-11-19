@@ -37,6 +37,7 @@ pub mod sessionnote;
 pub mod signal;
 pub mod tls;
 pub mod trayshow;
+pub mod winplace;
 pub mod traywatch;
 pub mod udp;
 pub mod update;

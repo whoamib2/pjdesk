@@ -941,10 +941,17 @@ impl App {
             let extra = self.toolbar.tab_height() as u32
                 + if self.toolbar.shows_android_nav() { toolbar::ANDROID_BAR_H as u32 } else { 0 };
             if self.remote_size != Some(size) || self.fitted_extra != Some(extra) {
+                let first = self.remote_size.is_none();
                 self.remote_size = Some(size);
                 self.fitted_extra = Some(extra);
-                self.sized_to_remote = true;
-                Self::fit_remote(window, frame.width, frame.height, extra);
+                if first && self.sized_to_remote {
+                    // A saved place was already applied. Keep that size, but
+                    // slide it back if it now hangs off the work area.
+                    Self::clamp_current(window);
+                } else {
+                    Self::fit_remote(window, frame.width, frame.height, extra);
+                    self.sized_to_remote = true;
+                }
             }
         }
 
@@ -1991,29 +1998,90 @@ impl App {
         let Some(place) = self.places.iter().find(|p| p.display == display && !p.monitor.is_empty()) else {
             return false;
         };
-        let present = event_loop.available_monitors().filter_map(|m| m.name()).any(|n| n == place.monitor);
+        let work = crate::window_place::work_by_name(window, &place.monitor);
+        let present = work.is_some()
+            || event_loop.available_monitors().filter_map(|m| m.name()).any(|n| n == place.monitor);
         if !present {
             return false;
         }
-        let sized = place.width >= 320 && place.height >= 200;
-        if sized {
-            let _ = window.request_inner_size(PhysicalSize::new(place.width, place.height));
+        if place.width < 320 || place.height < 200 {
+            return false;
         }
-        window.set_outer_position(PhysicalPosition::new(place.x, place.y));
-        sized
+        let work = work.unwrap_or_else(|| crate::window_place::target_work(Some(window)));
+        let (chrome_w, chrome_h) = crate::window_place::chrome(window);
+        let saved = pjdesk_proto::trayshow::Rect {
+            x: place.x,
+            y: place.y,
+            w: place.width as i32 + chrome_w,
+            h: place.height as i32 + chrome_h,
+        };
+        let placed = pjdesk_proto::winplace::clamp_to_work_area(saved, work);
+        crate::window_place::apply_outer(window, placed);
+        true
     }
 
     fn fit_remote(window: &Window, frame_w: usize, frame_h: usize, extra_h: u32) {
         if frame_w == 0 || frame_h == 0 || !auto_resize(window.is_maximized(), window.fullscreen().is_some()) {
             return;
         }
-        let monitor = window.current_monitor().map(|m| m.size()).unwrap_or(PhysicalSize::new(1920, 1080));
-        let scale =
-            (monitor.width as f64 * 0.9 / frame_w as f64).min(monitor.height as f64 * 0.85 / frame_h as f64).min(1.0);
-        let _ = window.request_inner_size(PhysicalSize::new(
-            ((frame_w as f64 * scale) as u32).max(320),
-            ((frame_h as f64 * scale) as u32).max(200) + extra_h,
-        ));
+        let (chrome_w, chrome_h) = crate::window_place::chrome(window);
+        let work = crate::window_place::target_work(Some(window));
+        let avail = pjdesk_proto::trayshow::Rect {
+            x: work.x,
+            y: work.y,
+            w: (work.w - chrome_w).max(1),
+            h: (work.h - chrome_h).max(1),
+        };
+        let inner = pjdesk_proto::winplace::fit_centered(frame_w as i32, frame_h as i32, extra_h as i32, avail);
+        let outer = pjdesk_proto::winplace::clamp_to_work_area(
+            pjdesk_proto::trayshow::Rect {
+                x: inner.x,
+                y: inner.y,
+                w: inner.w + chrome_w,
+                h: inner.h + chrome_h,
+            },
+            work,
+        );
+        crate::window_place::apply_outer(window, outer);
+    }
+
+    fn clamp_current(window: &Window) {
+        if !auto_resize(window.is_maximized(), window.fullscreen().is_some()) {
+            return;
+        }
+        let Ok(pos) = window.outer_position() else { return };
+        let size = window.outer_size();
+        let rect = pjdesk_proto::trayshow::Rect {
+            x: pos.x,
+            y: pos.y,
+            w: size.width as i32,
+            h: size.height as i32,
+        };
+        let work = crate::window_place::target_work(Some(window));
+        let placed = pjdesk_proto::winplace::clamp_to_work_area(rect, work);
+        if placed != rect {
+            crate::window_place::apply_outer(window, placed);
+        }
+    }
+
+    fn center_default(window: &Window) {
+        if !auto_resize(window.is_maximized(), window.fullscreen().is_some()) {
+            return;
+        }
+        let (chrome_w, chrome_h) = crate::window_place::chrome(window);
+        let work = crate::window_place::target_work(Some(window));
+        let size = window.inner_size();
+        let (x, y, w, h) = pjdesk_proto::winplace::clamp_or_center(
+            f32::NAN,
+            f32::NAN,
+            (size.width as i32 + chrome_w) as f32,
+            (size.height as i32 + chrome_h) as f32,
+            work,
+        );
+        crate::window_place::apply_outer(
+            window,
+            pjdesk_proto::trayshow::Rect { x: x as i32, y: y as i32, w: w as i32, h: h as i32 },
+        );
     }
 
     fn place_of(window: &Window, display: u8) -> Option<crate::config::SavedWindow> {
@@ -2099,6 +2167,9 @@ impl App {
         let Ok(window) = event_loop.create_window(attributes) else { return };
         let window = Rc::new(window);
         let sized = self.apply_place(event_loop, &window, display);
+        if !sized {
+            Self::center_default(&window);
+        }
         if let Some(pointer) = self.dot_cursor.clone().filter(|_| self.pointer_applied > 0) {
             window.set_cursor(pointer);
             window.set_cursor_visible(true);
@@ -3462,6 +3533,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         info!("Viewer window is open");
+        if self.apply_place(event_loop, &window, self.primary_display) {
+            self.sized_to_remote = true;
+        } else {
+            Self::center_default(&window);
+        }
         self.hook_drops(&window);
         let waiting = self
             .live
