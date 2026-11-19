@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.95
+
+- New: when a remote session window is in focus, every key is sent to the other computer, including Win, Alt+Tab, and other system shortcuts that Windows would otherwise keep. Open the toolbar with the mouse to turn capture off or end the session. Ctrl+Alt+Del still uses the session menu or Ctrl+Alt+End. On Android, hardware keyboard keys go to the session when that view is focused, without stealing the phone's Back, Home, or volume keys.
+- New: when the app opens to Set a PIN, Enter PIN, or the lock screen, the PIN field is focused automatically so you can type right away, on Windows and Android.
+- Fixed: a list sorted by Last connected or Recently used no longer moves a computer to the top as soon as Connect is clicked, which made the row jump under the cursor. The computer moves to the top only after the connection succeeds. A failed or cancelled attempt leaves the list where it was.
+
 ## 0.6.94
 
 - Fixed: the main window could freeze with "Not Responding" after a tray click restored a minimized window. A background status check was still asking the parked window to paint, and the window thread could wait on a synchronous restore. The restore is now posted and returns immediately, a parked window is not woken for a present, and the tray checks again for several seconds and replaces the window process if it hangs.
