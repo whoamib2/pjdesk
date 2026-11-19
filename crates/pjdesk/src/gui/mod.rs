@@ -1433,15 +1433,6 @@ impl App {
             .or_else(|| self.cfg.saved_password(id))
     }
 
-    fn mark_recent(&mut self, id: &str) {
-        let note = self.cfg.settings.peers.entry(id.to_string()).or_default();
-        note.last_connected = unix_now();
-        if self.temp.is_some() {
-            crate::temp_sign::note_recent(id);
-        }
-        self.save_cfg();
-    }
-
     fn toggle_favorite(&mut self, id: &str) {
         let note = self.cfg.settings.peers.entry(id.to_string()).or_default();
         note.favorite = !note.favorite;
@@ -2597,7 +2588,6 @@ impl App {
         match cmd.spawn() {
             Ok(child) => {
                 clear_session_status();
-                self.mark_recent(id);
                 let what = if files { "Opening file transfer for" } else { "Opening" };
                 self.toast.show(format!("{what} {}", format_id(id)));
                 self.track_viewer(id.to_string(), child, files);
@@ -2691,9 +2681,6 @@ impl App {
             return;
         }
         clear_session_status();
-        if job.direct.is_empty() {
-            self.mark_recent(&job.id);
-        }
     }
 
     fn track_viewer(&mut self, id: String, mut child: std::process::Child, files: bool) {
@@ -2722,6 +2709,9 @@ impl App {
         let Some(text) = read_session_status() else { return };
         if text != self.status {
             self.status = text;
+            // The viewer stamps last_connected only after auth succeeds. Reload
+            // so Last connected / Recent does not jump when Connect is clicked.
+            self.reload_peer_reports();
         }
     }
 

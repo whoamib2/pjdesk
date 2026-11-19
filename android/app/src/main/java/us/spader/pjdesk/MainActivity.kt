@@ -801,8 +801,6 @@ class MainActivity : FragmentActivity() {
                 connectError = null
                 offlineRetry = null
                 val digits = id.filter { it.isDigit() }
-                app.store.touchRecent(digits)
-                recentIds = app.store.recentIds()
                 val label = connectStatusLabel(name, digits)
                 val gen = connectGen + 1
                 connectGen = gen
@@ -1385,6 +1383,8 @@ class MainActivity : FragmentActivity() {
                 val session = state.session ?: return@LaunchedEffect
                 if (session.id.isBlank()) return@LaunchedEffect
                 app.store.noteRemote(session.id, session.peer, session.platform, session.version)
+                // Session is set only after auth ("controlling"). Failed or
+                // cancelled attempts never reach here, so Recently used stays put.
                 app.store.touchRecent(session.id)
                 showSaved()
                 recentIds = app.store.recentIds()

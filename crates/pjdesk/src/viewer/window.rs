@@ -3053,7 +3053,10 @@ impl App {
             });
         }
         match self.hold(link, seed, sid) {
-            Ok(held) => self.install(held),
+            Ok(held) => {
+                super::note_session_established(&held.peer_id);
+                self.install(held);
+            }
             Err(e) => {
                 self.tab_order.retain(|id| *id != sid);
                 self.show_toast(format!("Could not open that computer: {e:#}"));
@@ -3111,6 +3114,7 @@ impl App {
         };
         match arm_link(&self.rt, link, &self.proxy, sid, view, display) {
             Ok(armed) => {
+                super::note_session_established(&armed.peer_id);
                 self.graft(sid, armed);
                 self.show_toast("Reconnected");
             }

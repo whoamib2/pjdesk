@@ -535,6 +535,30 @@ impl Config {
         });
     }
 
+    /// Stamps Last connected after a session is actually established.
+    /// Connect click and failed or cancelled attempts must not call this, or
+    /// the Saved list jumps under the cursor when sorted by Last connected.
+    pub fn note_last_connected(id: &str) {
+        Self::note_last_connected_to(&Self::path(), id, unix_now());
+    }
+
+    pub(crate) fn note_last_connected_to(path: &std::path::Path, id: &str, when: u64) {
+        let id = pjdesk_proto::normalize_id(id);
+        if !pjdesk_proto::is_valid_id(&id) || when == 0 {
+            return;
+        }
+        let mut cfg = Self::load_from(path).unwrap_or_default();
+        if cfg.local_saved_cleared {
+            return;
+        }
+        let note = cfg.settings.peers.entry(id).or_default();
+        if when <= note.last_connected {
+            return;
+        }
+        note.last_connected = when;
+        let _ = cfg.save_to(path);
+    }
+
     /// Fills hostname and OS this copy does not have yet. A value already in
     /// memory is kept. Used before a save so the window does not wipe what the
     /// viewer just wrote.
@@ -623,8 +647,9 @@ impl Config {
     }
 
     /// Copies host-reported hostname and OS from `disk` when that file has them.
-    /// The viewer writes those after a connect; the window re-reads them when
-    /// Saved computers opens and when the viewer exits.
+    /// The viewer writes those after a connect, and stamps last_connected only
+    /// once the session is established. The window re-reads them when the
+    /// session status changes and when the viewer exits.
     pub fn take_peer_reports_from(&mut self, disk: &Config) {
         if self.local_saved_cleared {
             return;
@@ -1541,6 +1566,50 @@ mod tests {
         let note = typed.settings.peers.get("123456789").unwrap();
         assert_eq!(note.hostname, "BEN-PC");
         assert_eq!(note.os_version, "11");
+    }
+
+    #[test]
+    fn last_connected_is_stamped_only_when_the_session_is_established() {
+        let dir = std::env::temp_dir().join(format!(
+            "pjdesk-last-connected-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client.json");
+        Config::default().save_to(&path).unwrap();
+
+        Config::note_last_connected_to(&path, "not-an-id", 100);
+        Config::note_last_connected_to(&path, "000000000", 100);
+        assert!(Config::load_from(&path).unwrap().settings.peers.is_empty());
+
+        Config::note_last_connected_to(&path, "123456789", 50);
+        assert_eq!(Config::load_from(&path).unwrap().settings.peers["123456789"].last_connected, 50);
+
+        Config::note_last_connected_to(&path, "123456789", 40);
+        assert_eq!(
+            Config::load_from(&path).unwrap().settings.peers["123456789"].last_connected,
+            50,
+            "a failed or earlier stamp must not move the row backward"
+        );
+
+        Config::note_last_connected_to(&path, "123456789", 90);
+        assert_eq!(Config::load_from(&path).unwrap().settings.peers["123456789"].last_connected, 90);
+
+        let mut cleared = Config::load_from(&path).unwrap();
+        cleared.local_saved_cleared = true;
+        cleared.save_to(&path).unwrap();
+        Config::note_last_connected_to(&path, "123456789", 120);
+        assert_eq!(
+            Config::load_from(&path).unwrap().settings.peers["123456789"].last_connected,
+            90,
+            "a cleared local list must not be restamped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

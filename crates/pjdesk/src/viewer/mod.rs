@@ -165,6 +165,7 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
             let _ = config.save();
         }
         tracing::info!("Connected to \"{}\" ({}, {})", link.host_name, format_id(&link.host_id), link.path);
+        note_session_established(&target);
         if args.headless {
             return runtime.block_on(headless(link, args.frames));
         }
@@ -980,6 +981,18 @@ async fn wait_asked_password(path: &std::path::Path, host_name: &str) -> Result<
 /// before the password, and the handshake refreshes it after the password is accepted.
 fn cache_host_name(id: &str, name: &str) {
     crate::config::Config::remember_hostname(id, name);
+}
+
+/// Updates Last connected after handshake and auth succeed. A Connect click,
+/// a cancelled tab, or a failed attempt must not call this.
+fn note_session_established(id: &str) {
+    if !is_valid_id(id) {
+        return;
+    }
+    crate::config::Config::note_last_connected(id);
+    if crate::temp_sign::marker_active() {
+        crate::temp_sign::note_recent(id);
+    }
 }
 
 /// Direct IP: QUIC to `host:port` with the saved certificate pin (or first use).

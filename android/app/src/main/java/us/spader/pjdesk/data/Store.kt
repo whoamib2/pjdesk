@@ -726,7 +726,9 @@ class Store(context: Context) {
         prefs.edit().putString("passwordTimes", obj.toString()).commit()
     }
 
-    /** Computers this phone has connected to, newest first. Stays on this phone. */
+    /** Computers this phone has connected to, newest first. Stays on this phone.
+     *  Call only after a session is established. A Connect tap must not call
+     *  this, or a list sorted by Recently used jumps under the finger. */
     fun touchRecent(id: String) {
         val digits = id.filter { it.isDigit() }
         if (digits.length != 9) return
