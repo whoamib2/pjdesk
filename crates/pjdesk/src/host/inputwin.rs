@@ -214,7 +214,8 @@ fn input_thread(rx: Receiver<Req>) {
         ) {
             if !secure_reported {
                 secure_reported = true;
-                let msg = inputroute::SECURE_DESKTOP_NEEDS_SERVICE;
+                let present = std::env::args().any(|a| a == "__session-host") || crate::service::status().0;
+                let msg = inputroute::secure_desktop_input_notice(present);
                 tracing::warn!("{msg}");
                 if let Ok(mut p) = inputroute::INPUT_PROBLEM.lock() {
                     *p = Some(msg.to_string());

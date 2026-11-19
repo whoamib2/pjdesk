@@ -49,6 +49,8 @@ pub fn is_session_state(notice: &str) -> bool {
         "showing an administrator (UAC) or lock screen",
         "Install the PJDesk service on this computer",
         "Install the PJDesk service on that computer so input can reach admin windows",
+        "The PJDesk service is following it",
+        "could not be captured yet",
     ]
     .iter()
     .any(|marker| n.contains(marker))
@@ -91,6 +93,12 @@ mod tests {
         ));
         assert!(is_session_state(
             "The window in front on the remote computer is running as administrator, so Windows blocks input from PJDesk. Install the PJDesk service on that computer so input can reach admin windows."
+        ));
+        assert!(is_session_state(
+            "This computer is showing an administrator (UAC) or lock screen. The PJDesk service is following it; try again in a moment."
+        ));
+        assert!(is_session_state(
+            "The remote screen can't be captured: the lock, sign-in or administrator (UAC) screen is up and could not be captured yet."
         ));
     }
 }

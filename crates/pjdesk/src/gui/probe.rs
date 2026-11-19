@@ -104,26 +104,53 @@ pub fn service_holds_registration(hosting: bool, status_server: &str, expected_s
     got.eq_ignore_ascii_case(expected_server.trim())
 }
 
-/// The first sample starts the window immediately when the service is not
-/// registered. After the service has been seen hosting, [`SERVICE_DOWN_POLLS`]
-/// consecutive misses are required. `sample_hosting` is true only when the
+/// Who should register this computer after one service-status sample.
+///
+/// When the service is not installed, the first sample starts the window
+/// immediately. When it is installed, the window waits for the service to
+/// register — including the first look after sign-in — so a user-mode app
+/// that starts at logon does not steal the session from the SYSTEM
+/// session-host. After the service has been seen hosting (or was given
+/// that chance), [`SERVICE_DOWN_POLLS`] consecutive misses are required
+/// before the window takes over. `sample_hosting` is true only when the
 /// service status file is fresh and says this computer is online. Service
-/// Control Manager "Running" is not enough.
-pub fn host_duty(ready: bool, service_running: bool, down_polls: u32, sample_hosting: bool) -> HostDuty {
-    if !ready {
-        return HostDuty { service_running: sample_hosting, down_polls: 0, window_hosts: !sample_hosting };
-    }
+/// Control Manager "Running" is not enough to count as hosting, but
+/// "installed" is enough to wait.
+pub fn host_duty(
+    ready: bool,
+    service_running: bool,
+    down_polls: u32,
+    sample_hosting: bool,
+    service_installed: bool,
+) -> HostDuty {
     if sample_hosting {
         return HostDuty { service_running: true, down_polls: 0, window_hosts: false };
     }
-    if !service_running {
-        return HostDuty { service_running: false, down_polls: 0, window_hosts: true };
-    }
-    let polls = down_polls.saturating_add(1);
-    if polls >= SERVICE_DOWN_POLLS {
-        HostDuty { service_running: false, down_polls: polls, window_hosts: true }
+    if service_installed {
+        if !ready {
+            return HostDuty { service_running: true, down_polls: 0, window_hosts: false };
+        }
+        if service_running {
+            let polls = down_polls.saturating_add(1);
+            if polls >= SERVICE_DOWN_POLLS {
+                HostDuty { service_running: false, down_polls: polls, window_hosts: true }
+            } else {
+                HostDuty { service_running: true, down_polls: polls, window_hosts: false }
+            }
+        } else {
+            HostDuty { service_running: false, down_polls, window_hosts: true }
+        }
+    } else if !ready {
+        HostDuty { service_running: false, down_polls: 0, window_hosts: true }
+    } else if !service_running {
+        HostDuty { service_running: false, down_polls: 0, window_hosts: true }
     } else {
-        HostDuty { service_running: true, down_polls: polls, window_hosts: false }
+        let polls = down_polls.saturating_add(1);
+        if polls >= SERVICE_DOWN_POLLS {
+            HostDuty { service_running: false, down_polls: polls, window_hosts: true }
+        } else {
+            HostDuty { service_running: true, down_polls: polls, window_hosts: false }
+        }
     }
 }
 
@@ -160,25 +187,25 @@ mod tests {
 
     #[test]
     fn probe_down_starts_window() {
-        let first_down = host_duty(false, false, 0, false);
+        let first_down = host_duty(false, false, 0, false, false);
         assert!(first_down.window_hosts, "the first sample starts the window when the service is down");
         assert!(!first_down.service_running);
 
-        let first_up = host_duty(false, false, 0, true);
+        let first_up = host_duty(false, false, 0, true, false);
         assert!(!first_up.window_hosts);
         assert!(first_up.service_running);
 
-        let one_miss = host_duty(true, true, 0, false);
+        let one_miss = host_duty(true, true, 0, false, false);
         assert_eq!(one_miss.down_polls, 1);
         assert!(one_miss.service_running);
         assert!(!one_miss.window_hosts, "one missed check must not start a second registrar");
 
-        let two_miss = host_duty(true, true, one_miss.down_polls, false);
+        let two_miss = host_duty(true, true, one_miss.down_polls, false, false);
         assert_eq!(two_miss.down_polls, SERVICE_DOWN_POLLS);
         assert!(!two_miss.service_running);
         assert!(two_miss.window_hosts);
 
-        let back = host_duty(true, false, two_miss.down_polls, true);
+        let back = host_duty(true, false, two_miss.down_polls, true, false);
         assert!(back.service_running);
         assert_eq!(back.down_polls, 0);
         assert!(!back.window_hosts);
@@ -189,14 +216,38 @@ mod tests {
         let mut stale = ServiceStatus::default();
         stale.online = true;
         assert!(!stale.is_hosting());
-        let still = host_duty(true, false, 0, stale.is_hosting());
+        let still = host_duty(true, false, 0, stale.is_hosting(), false);
         assert!(still.window_hosts, "a service process with no fresh registration does not take over");
 
         let fresh = ServiceStatus::now(Some("692996394".into()), true, None, None, false);
         assert!(fresh.is_hosting());
-        let yielded = host_duty(true, false, 0, fresh.is_hosting());
+        let yielded = host_duty(true, false, 0, fresh.is_hosting(), false);
         assert!(!yielded.window_hosts);
         assert!(yielded.service_running);
+    }
+
+    #[test]
+    #[test]
+    fn an_installed_service_is_given_time_to_register_after_sign_in() {
+        let first = host_duty(false, false, 0, false, true);
+        assert!(!first.window_hosts, "the window must not grab the host before the installed service registers");
+        assert!(first.service_running);
+
+        let one = host_duty(true, true, 0, false, true);
+        assert_eq!(one.down_polls, 1);
+        assert!(!one.window_hosts);
+        assert!(one.service_running);
+
+        let two = host_duty(true, true, one.down_polls, false, true);
+        assert!(two.window_hosts);
+        assert!(!two.service_running);
+
+        let kept = host_duty(true, false, two.down_polls, false, true);
+        assert!(kept.window_hosts, "after taking over, keep hosting until the service is actually online");
+
+        let back = host_duty(true, false, kept.down_polls, true, true);
+        assert!(!back.window_hosts);
+        assert!(back.service_running);
     }
 
     #[test]

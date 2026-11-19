@@ -853,8 +853,15 @@ impl SessionFacts {
 
     /// A plain reason when this session can't show a normal desktop, else None.
     pub fn problem(&self) -> Option<String> {
+        self.problem_with(service_is_present())
+    }
+
+    fn problem_with(&self, service_present: bool) -> Option<String> {
         let id = self.session.unwrap_or(0);
         if self.session == Some(0) {
+            if service_present {
+                return Some("PJDesk is running in Windows session 0, which has no desktop. The PJDesk service should start in the signed-in session.".into());
+            }
             return Some("PJDesk is running in Windows session 0, which has no desktop. Install the PJDesk service so it starts in the signed-in session.".into());
         }
         if self.remote {
@@ -879,12 +886,29 @@ impl SessionFacts {
     }
 }
 
+/// True when this process is the SYSTEM session-host, or the PJDesk service
+/// is already installed. A host in that case must never tell the viewer to
+/// install the service.
+fn service_is_present() -> bool {
+    if std::env::args().any(|a| a == "__session-host") {
+        return true;
+    }
+    crate::service::status().0
+}
+
 /// Why a captured picture is black, as far as this process can tell.
 fn black_capture_reason(backend: &str, facts: &SessionFacts) -> String {
-    if let Some(problem) = facts.problem() {
+    black_capture_reason_with(backend, facts, service_is_present())
+}
+
+fn black_capture_reason_with(backend: &str, facts: &SessionFacts, service_present: bool) -> String {
+    if let Some(problem) = facts.problem_with(service_present) {
         return problem;
     }
     if facts.secure_desktop() {
+        if service_present {
+            return "the lock, sign-in or administrator (UAC) screen is up and could not be captured yet.".into();
+        }
         return "the lock, sign-in or administrator (UAC) screen is up and could not be captured. Install the PJDesk service to see and use it.".into();
     }
     if backend.contains("GDI") {
@@ -988,5 +1012,15 @@ mod black_capture_tests {
         let locked = SessionFacts { desktop: "Winlogon".into(), ..normal };
         assert_eq!(locked.problem(), None);
         assert!(black_capture_reason("DXGI", &locked).contains("lock"));
+        let with_service = black_capture_reason_with("DXGI", &locked, true);
+        assert!(with_service.contains("lock"));
+        assert!(
+            !with_service.contains("Install the PJDesk service"),
+            "an installed service must not be told to install itself: {with_service}"
+        );
+        let session_zero = SessionFacts { session: Some(0), ..locked.clone() };
+        let zero_with = session_zero.problem_with(true).expect("session 0");
+        assert!(zero_with.contains("session 0"));
+        assert!(!zero_with.contains("Install the PJDesk service"), "{zero_with}");
     }
 }

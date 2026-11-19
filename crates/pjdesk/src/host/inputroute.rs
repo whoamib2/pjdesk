@@ -133,6 +133,20 @@ pub fn agent_pipe_sddl(user_sid: Option<&str>) -> String {
 /// click it because the SYSTEM input agent is missing or unreachable.
 pub const SECURE_DESKTOP_NEEDS_SERVICE: &str = "This computer is showing an administrator (UAC) or lock screen. PJDesk can only click Yes or No when the PJDesk service is installed and running here. Install the PJDesk service on this computer (Settings → Service), then try again.";
 
+/// Same situation when the service is already installed: never tell the
+/// person to install it.
+pub const SECURE_DESKTOP_SERVICE_RETRY: &str = "This computer is showing an administrator (UAC) or lock screen. The PJDesk service is following it; try again in a moment.";
+
+/// Message for a secure-desktop input failure. Only the "install the service"
+/// wording is used when the service is not already present.
+pub fn secure_desktop_input_notice(service_present: bool) -> &'static str {
+    if service_present {
+        SECURE_DESKTOP_SERVICE_RETRY
+    } else {
+        SECURE_DESKTOP_NEEDS_SERVICE
+    }
+}
+
 /// True when clicks on the secure desktop will not land without the agent.
 pub fn secure_desktop_needs_service(
     agent_connected: bool,
@@ -340,6 +354,8 @@ mod tests {
         assert!(secure_desktop_needs_service(false, None, true));
         assert!(SECURE_DESKTOP_NEEDS_SERVICE.contains("UAC"));
         assert!(SECURE_DESKTOP_NEEDS_SERVICE.contains("Install the PJDesk service"));
+        assert!(!secure_desktop_input_notice(true).contains("Install the PJDesk service"));
+        assert_eq!(secure_desktop_input_notice(false), SECURE_DESKTOP_NEEDS_SERVICE);
     }
 }
 

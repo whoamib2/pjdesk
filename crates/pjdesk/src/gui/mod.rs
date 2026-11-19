@@ -182,10 +182,16 @@ impl Engine {
         }
     }
 
-    fn on_service(&mut self, config: &Config, hosting: bool) {
+    fn on_service(&mut self, config: &Config, hosting: bool, service_installed: bool) {
         let was_ready = self.ready;
         let window_was_hosting = self.ready && !self.service_running;
-        let duty = probe::host_duty(self.ready, self.service_running, self.service_down_polls, hosting);
+        let duty = probe::host_duty(
+            self.ready,
+            self.service_running,
+            self.service_down_polls,
+            hosting,
+            service_installed,
+        );
         self.ready = true;
         self.service_down_polls = duty.down_polls;
         if !was_ready {
@@ -196,6 +202,10 @@ impl Engine {
                     self.server.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "no server".into())
                 );
                 self.spawn(config);
+            } else if service_installed {
+                tracing::info!(
+                    "The background service is installed; this window will wait for it to register this computer"
+                );
             }
             return;
         }
@@ -1362,7 +1372,7 @@ impl App {
             &self.svc_status.server,
             &cfg.effective_server(),
         );
-        self.engine.on_service(&cfg, hosting);
+        self.engine.on_service(&cfg, hosting, self.scm_installed);
         self.note_self_status();
     }
 
