@@ -11,6 +11,11 @@
 # Optional Authenticode signing: set PJDESK_SIGN_PFX to a PKCS#12 file and
 # PJDESK_SIGN_PASSWORD to its password. Signing is skipped when PJDESK_SIGN_PFX
 # is unset. osslsigncode or signtool must be on PATH when a certificate is set.
+#
+# To bake the updater token into the binaries, set PJDESK_UPDATE_TOKEN in this
+# process only. Do not echo it or write it into the tree. Use
+# cloud/tools/with-update-token.sh (or .ps1 on Windows) so the value is loaded
+# from the token file and unset afterwards.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
