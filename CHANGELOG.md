@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.96
+
+- Fixed: after you reboot a computer you are already viewing, automatic reconnect could stop with "Wrong password" even though a manual Connect with the saved password worked and did not ask for a password. Reconnect now uses the same saved password a manual Connect would use, and retries a wrong-password reply while the host is still coming up (a few tries, spaced out so the host is not locked out). "Wrong password." is shown only if those credentials still fail after the host is up. Windows and Android.
+
 ## 0.6.95
 
 - New: when a remote session window is in focus, every key is sent to the other computer, including Win, Alt+Tab, and other system shortcuts that Windows would otherwise keep. Open the toolbar with the mouse to turn capture off or end the session. Ctrl+Alt+Del still uses the session menu or Ctrl+Alt+End. On Android, hardware keyboard keys go to the session when that view is focused, without stealing the phone's Back, Home, or volume keys.
