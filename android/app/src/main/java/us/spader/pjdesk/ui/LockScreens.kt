@@ -40,6 +40,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -73,6 +74,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import us.spader.pjdesk.R
@@ -559,7 +563,18 @@ private fun HiddenPinInput(
     enabled: Boolean,
 ) {
     val keyboard = LocalSoftwareKeyboardController.current
-    LaunchedEffect(enabled) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var resumes by remember { mutableIntStateOf(0) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) resumes++
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    // Request focus when the field is enabled, and again every time this
+    // screen resumes (task switcher, home, notification shade).
+    LaunchedEffect(enabled, resumes) {
         if (!enabled) return@LaunchedEffect
         repeat(4) { attempt ->
             if (attempt > 0) delay(120)

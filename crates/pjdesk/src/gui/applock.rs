@@ -183,6 +183,7 @@ impl App {
         self.lock_password.clear();
         self.lock_pin_armed = false;
         self.setup_pin_focused = false;
+        self.setup_on_confirm = false;
         self.show_settings = false;
         self.show_invite = false;
         self.show_login = false;
@@ -428,6 +429,7 @@ impl App {
                 self.lock_armed = true;
                 self.lock_resetting = true;
                 self.setup_pin_focused = false;
+                self.setup_on_confirm = false;
                 self.lock_forgot = false;
                 self.lock_password.clear();
                 self.lock_pin.clear();
@@ -774,7 +776,9 @@ impl App {
                     }
                     let pin_box = pin_box(ui, &mut pin, egui::Id::new("lock-pin-entry"), false, pin_shake_offset(shook), "");
                     let active = pin_window_active(ui.ctx());
-                    hold_initial_pin_focus(&pin_box, &mut self.lock_pin_armed, active, &mut self.pin_focus_window_active);
+                    if !self.lock_forgot {
+                        hold_initial_pin_focus(&pin_box, &mut self.lock_pin_armed, active, &mut self.pin_focus_window_active);
+                    }
                     let prior = self.lock_pin.clone();
                     self.lock_pin = digits_only(&pin);
                     if self.lock_pin != prior && !waiting {
@@ -896,16 +900,12 @@ impl App {
                     ui.label("PIN");
                     let mut pin = self.pin_new.clone();
                     let pin_box = pin_entry(ui, &mut pin, "setup-new", "4 to 8 digits", &mut self.pin_show_new);
-                    if self.account_email().is_empty() && !local {
-                        // Email comes first; do not steal it.
-                    } else if !local && (need_password || self.account_email().is_empty()) {
-                        // The password box is already on screen; PIN follows when that is submitted.
-                    } else {
-                        let active = pin_window_active(ui.ctx());
-                        hold_initial_pin_focus(&pin_box, &mut self.setup_pin_focused, active, &mut self.pin_focus_window_active);
-                    }
                     self.pin_new = digits_only(&pin);
                     let advance = widgets::submitted(ui, &pin_box);
+                    if advance {
+                        self.setup_on_confirm = true;
+                        self.setup_pin_focused = false;
+                    }
                     ui.label("Confirm PIN");
                     let mut confirm = self.pin_confirm.clone();
                     let confirm_box = pin_entry(ui, &mut confirm, "confirm", "Repeat the PIN", &mut self.pin_show_confirm);
@@ -913,6 +913,18 @@ impl App {
                         confirm_box.request_focus();
                     }
                     self.pin_confirm = digits_only(&confirm);
+                    let need_account = !local && (need_password || self.account_email().is_empty());
+                    match pin_focus_target(need_account, self.setup_on_confirm, false) {
+                        PinFocusTarget::Pin => {
+                            let active = pin_window_active(ui.ctx());
+                            hold_initial_pin_focus(&pin_box, &mut self.setup_pin_focused, active, &mut self.pin_focus_window_active);
+                        }
+                        PinFocusTarget::Confirm => {
+                            let active = pin_window_active(ui.ctx());
+                            hold_initial_pin_focus(&confirm_box, &mut self.setup_pin_focused, active, &mut self.pin_focus_window_active);
+                        }
+                        PinFocusTarget::None => {}
+                    }
                     if widgets::submitted(ui, &confirm_box) && !self.lock_busy {
                         self.start_save(false);
                     }
@@ -1714,7 +1726,26 @@ fn pin_window_active(ctx: &egui::Context) -> bool {
     })
 }
 
-/// Keep requesting focus until it sticks, and again when the window is restored.
+/// Which PIN box should receive focus when the lock or Set a PIN screen is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinFocusTarget {
+    None,
+    Pin,
+    Confirm,
+}
+
+fn pin_focus_target(need_email_or_password: bool, on_confirm: bool, forgot_password: bool) -> PinFocusTarget {
+    if need_email_or_password || forgot_password {
+        PinFocusTarget::None
+    } else if on_confirm {
+        PinFocusTarget::Confirm
+    } else {
+        PinFocusTarget::Pin
+    }
+}
+
+/// Keep requesting focus until it sticks, and again when the window is restored
+/// (taskbar, tray, Alt+Tab, second-instance, unminimize, or focus regained).
 fn hold_initial_pin_focus(
     resp: &egui::Response,
     settled: &mut bool,
@@ -2064,5 +2095,19 @@ mod version_label_tests {
     fn lock_screen_shows_package_version() {
         assert_eq!(super::lock_version_label(), format!("PJDesk {}", env!("CARGO_PKG_VERSION")));
         assert!(super::lock_version_label().starts_with("PJDesk 0."));
+    }
+}
+
+#[cfg(test)]
+mod pin_focus_target_tests {
+    use super::{pin_focus_target, PinFocusTarget};
+
+    #[test]
+    fn pin_focus_skips_account_fields_and_prefers_confirm_after_advance() {
+        assert_eq!(pin_focus_target(false, false, false), PinFocusTarget::Pin);
+        assert_eq!(pin_focus_target(true, false, false), PinFocusTarget::None);
+        assert_eq!(pin_focus_target(false, false, true), PinFocusTarget::None);
+        assert_eq!(pin_focus_target(false, true, false), PinFocusTarget::Confirm);
+        assert_eq!(pin_focus_target(true, true, false), PinFocusTarget::None);
     }
 }

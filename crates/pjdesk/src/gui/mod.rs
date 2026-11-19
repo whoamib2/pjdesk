@@ -515,6 +515,8 @@ pub struct App {
     lock_pin_armed: bool,
     /// The Set-a-PIN field has been focused for this appearance.
     setup_pin_focused: bool,
+    /// The person has moved on to Confirm PIN; restores should focus that field.
+    setup_on_confirm: bool,
     /// Last time the PIN screen saw an active (focused, visible) window.
     pin_focus_window_active: bool,
 }
@@ -733,6 +735,7 @@ impl App {
             lock_resetting: false,
             lock_pin_armed: false,
             setup_pin_focused: false,
+            setup_on_confirm: false,
             pin_focus_window_active: false,
         };
         let lock_email = app.account_email();
@@ -3640,6 +3643,14 @@ impl App {
             view.minimized == Some(true) || view.visible() == Some(false)
         });
         hangwatch::set_parked(hidden);
+        if hidden {
+            // The lock/PIN screen is not drawn while parked. Clear so the next
+            // show (taskbar, tray, Alt+Tab) treats the window as newly active
+            // and focuses the PIN field again.
+            self.pin_focus_window_active = false;
+            self.lock_pin_armed = false;
+            self.setup_pin_focused = false;
+        }
         if !hidden {
             self.hidden_log = None;
             return;
