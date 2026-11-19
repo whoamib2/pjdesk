@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.98
+
+- New: the chat window has its own taskbar button with a chat-bubble icon, and the button flashes when a new message arrives.
+
 ## 0.6.97
 
 - New: installers and updates are now served from locked storage on pjdesk.com, and the website download section requires the download password.
