@@ -363,6 +363,38 @@ pub fn session_refusal(reason: &str) -> Option<&'static str> {
     }
 }
 
+/// Wrong-password tries after a host restart, before the viewer stops. Stays
+/// under the host's per-source lockout (five in twenty minutes).
+pub const RESTART_AUTH_TRIES: u32 = 3;
+/// Wait after a refused password so the host can finish loading its saved
+/// permanent password after a reboot.
+pub const RESTART_AUTH_MIN_WAIT: Duration = Duration::from_secs(8);
+
+/// A "wrong password" during automatic reconnect is not proof the saved
+/// credentials are wrong. After a reboot the host may still be starting, or
+/// the session may still be holding a one-time password that was rotated.
+/// A manual Connect uses the saved password and often succeeds.
+pub fn retry_wrong_password_after_restart(auth_fails: u32) -> bool {
+    auth_fails > 0 && auth_fails < RESTART_AUTH_TRIES
+}
+
+/// Prefer the saved password a manual Connect would use.
+pub fn reconnect_password<'a>(session: &'a str, saved: Option<&'a str>) -> &'a str {
+    match saved.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(saved) => saved,
+        None => session,
+    }
+}
+
+/// True when this error is a password refusal, including the reconnect wording
+/// "the other computer no longer accepts the password this session used".
+pub fn is_wrong_password_reason(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("wrong password")
+        || lower.contains("incorrect password")
+        || lower.contains("no longer accepts the password")
+}
+
 /// Line under "Connection lost, reconnecting…". `trying` means a dial is already running.
 pub fn retry_countdown(wait_secs: u64, trying: bool) -> String {
     if trying || wait_secs == 0 {
@@ -1038,6 +1070,24 @@ mod tests {
     fn a_refused_session_stops_and_a_drop_keeps_trying() {
         assert_eq!(session_refusal("wrong password"), Some("Wrong password."));
         assert_eq!(session_refusal("Incorrect password for 123"), Some("Wrong password."));
+    }
+
+    #[test]
+    fn after_a_host_restart_reconnect_uses_the_saved_password_and_retries_a_false_refusal() {
+        assert!(is_wrong_password_reason(
+            "wrong password: the other computer no longer accepts the password this session used"
+        ));
+        assert!(is_wrong_password_reason("incorrect password"));
+        assert!(!is_wrong_password_reason("the host did not respond"));
+        assert!(retry_wrong_password_after_restart(1));
+        assert!(retry_wrong_password_after_restart(2));
+        assert!(!retry_wrong_password_after_restart(0));
+        assert!(!retry_wrong_password_after_restart(RESTART_AUTH_TRIES));
+        assert!(RESTART_AUTH_TRIES < 5, "stay under the host per-source lockout");
+        assert_eq!(RESTART_AUTH_MIN_WAIT, Duration::from_secs(8));
+        assert_eq!(reconnect_password("one-time-now", Some("saved-permanent")), "saved-permanent");
+        assert_eq!(reconnect_password("session-password", Some("  ")), "session-password");
+        assert_eq!(reconnect_password("session-password", None), "session-password");
         assert_eq!(session_refusal("access revoked"), Some("Access was revoked."));
         assert_eq!(session_refusal("this computer is blocked"), Some("This computer is blocked."));
         assert_eq!(session_refusal("screen sharing not allowed"), Some("The other computer declined the session."));

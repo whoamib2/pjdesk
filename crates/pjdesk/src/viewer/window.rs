@@ -140,6 +140,9 @@ enum SessionCover {
 struct RetryWait {
     next_at: Instant,
     delay: Duration,
+    /// Wrong-password replies since this drop. A host that just rebooted may
+    /// refuse once, then accept the saved password a manual Connect would use.
+    auth_fails: u32,
 }
 
 pub enum ViewerStop {
@@ -2915,7 +2918,7 @@ impl App {
     fn reconnect_now(&mut self, sid: u64) {
         self.resume_stop.lock().unwrap().insert(sid);
         self.relinking.remove(&sid);
-        self.retries.insert(sid, RetryWait { next_at: Instant::now(), delay: Duration::from_secs(1) });
+        self.retries.insert(sid, RetryWait { next_at: Instant::now(), delay: Duration::from_secs(1), auth_fails: 0 });
         self.begin_relink(sid, String::new(), false);
     }
 
@@ -3131,14 +3134,34 @@ impl App {
             return;
         }
         if let Some(plain) = pjdesk_proto::failover::session_refusal(&error) {
+            if pjdesk_proto::failover::is_wrong_password_reason(&error) {
+                let prev = self.retries.get(&sid).map(|wait| wait.delay).unwrap_or(Duration::from_secs(1));
+                let auth_fails = self.retries.get(&sid).map(|wait| wait.auth_fails).unwrap_or(0) + 1;
+                if pjdesk_proto::failover::retry_wrong_password_after_restart(auth_fails) {
+                    let delay = pjdesk_proto::signal::next_reconnect_delay(prev)
+                        .max(pjdesk_proto::failover::RESTART_AUTH_MIN_WAIT);
+                    self.retries.insert(sid, RetryWait {
+                        next_at: Instant::now() + delay,
+                        delay,
+                        auth_fails,
+                    });
+                    info!(
+                        "The host refused the password after coming back; trying the saved credentials again in {} s",
+                        delay.as_secs()
+                    );
+                    self.show_cover(sid, SessionCover::Reconnecting);
+                    return;
+                }
+            }
             self.retries.remove(&sid);
             info!("Reconnect stopped: {plain}");
             self.show_cover(sid, SessionCover::Ended(plain.to_string()));
             return;
         }
         let prev = self.retries.get(&sid).map(|wait| wait.delay).unwrap_or(Duration::from_secs(1));
+        let auth_fails = self.retries.get(&sid).map(|wait| wait.auth_fails).unwrap_or(0);
         let delay = pjdesk_proto::signal::next_reconnect_delay(prev);
-        self.retries.insert(sid, RetryWait { next_at: Instant::now() + delay, delay });
+        self.retries.insert(sid, RetryWait { next_at: Instant::now() + delay, delay, auth_fails });
         info!("Could not reconnect ({}); trying again in {} s", public_failure(&error), delay.as_secs());
         self.show_cover(sid, SessionCover::Reconnecting);
     }
@@ -3151,7 +3174,7 @@ impl App {
             self.show_cover(sid, SessionCover::Reconnecting);
             return;
         }
-        self.retries.entry(sid).or_insert(RetryWait { next_at: Instant::now(), delay: Duration::from_secs(1) });
+        self.retries.entry(sid).or_insert(RetryWait { next_at: Instant::now(), delay: Duration::from_secs(1), auth_fails: 0 });
         self.begin_relink(sid, String::new(), false);
     }
 
@@ -3391,9 +3414,12 @@ fn public_failure(error: &str) -> String {
 }
 
 fn admit_from_seed(seed: &Seed) -> crate::session_window::Admit {
+    let id = pjdesk_proto::normalize_id(&seed.target);
+    let saved = crate::config::Config::load().ok().and_then(|cfg| cfg.saved_password(&id));
+    let password = pjdesk_proto::failover::reconnect_password(&seed.password, saved.as_deref()).to_string();
     crate::session_window::Admit {
         id: seed.target.clone(),
-        password: seed.password.clone(),
+        password,
         server: seed.server.clone(),
         direct: seed.direct.clone().unwrap_or_default(),
         label: seed.label.clone(),

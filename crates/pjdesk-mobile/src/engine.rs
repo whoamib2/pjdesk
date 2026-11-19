@@ -955,6 +955,7 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
             }
             let id = normalize_id(cmd.get("id").and_then(|v| v.as_str()).unwrap_or(""));
             let password = cmd.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let saved = cmd.get("saved").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let ask_now = cmd.get("ask").and_then(|v| v.as_bool()).unwrap_or(false);
             let label = cmd.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
             let shown = if label.is_empty() { format_id(&id) } else { label.to_string() };
@@ -996,6 +997,7 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                 let mut established = false;
                 let mut delay = Duration::from_secs(1);
                 let mut prefer_standby = false;
+                let mut auth_fails = 0u32;
                 loop {
                     if state.view_gen.load(Ordering::SeqCst) != view_mark
                         || state.gen.load(Ordering::SeqCst) != gen
@@ -1003,11 +1005,15 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                     {
                         break;
                     }
+                    let auth_pw = pjdesk_proto::failover::reconnect_password(
+                        &password,
+                        if saved.is_empty() { None } else { Some(saved.as_str()) },
+                    );
                     match controller_session(
                         state.clone(),
                         cb.clone(),
                         &id,
-                        &password,
+                        auth_pw,
                         gen,
                         view_mark,
                         ask_now,
@@ -1031,6 +1037,36 @@ async fn apply(state: &Arc<State>, cb: &Arc<dyn Callbacks>, cmd: Value) {
                                 break;
                             }
                             if let Some(plain) = pjdesk_proto::failover::session_refusal(&head) {
+                                if established
+                                    && pjdesk_proto::failover::is_wrong_password_reason(&head)
+                                {
+                                    auth_fails = auth_fails.saturating_add(1);
+                                    if pjdesk_proto::failover::retry_wrong_password_after_restart(auth_fails)
+                                    {
+                                        delay = pjdesk_proto::signal::next_reconnect_delay(delay)
+                                            .max(pjdesk_proto::failover::RESTART_AUTH_MIN_WAIT);
+                                        let secs = delay.as_secs().max(1);
+                                        log_line(
+                                            &cb,
+                                            format!(
+                                                "The host refused the password after coming back; trying the saved credentials again in {secs} s"
+                                            ),
+                                        );
+                                        emit(
+                                            &cb,
+                                            &json!({
+                                                "event": "reconnecting",
+                                                "after": secs,
+                                                "reason": "Connection lost, reconnecting…"
+                                            }),
+                                        );
+                                        let _ = tokio::select! {
+                                            _ = tokio::time::sleep(delay) => false,
+                                            _ = state.view_wake.notified() => true,
+                                        };
+                                        continue;
+                                    }
+                                }
                                 log_line(&cb, format!("connect refused: {plain}"));
                                 if established {
                                     emit(&cb, &json!({"event":"disconnected","role":"controller","reason": plain}));

@@ -349,6 +349,7 @@ class Engine(context: Context) : EngineListener {
                 .put("cmd", "connect")
                 .put("id", digits)
                 .put("password", if (askPerson) "" else password)
+                .put("saved", store.computerPassword(digits))
                 .put("ask", askPerson)
                 .put("name", name)
                 .toString(),

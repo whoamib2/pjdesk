@@ -846,8 +846,10 @@ async fn connect(
                 attempt = wait_asked_password(path, &host_name).await?;
             }
             Err(e) if e.is::<session::WrongPassword>() && in_window => {
-                // A reconnect: the password worked minutes ago, so the saved one is
-                // not cleared and the window is not closed; the caller stops retrying.
+                // A reconnect: do not clear the saved password or close the window.
+                // After a host reboot this can be a false alarm (one-time password
+                // rotated, or the host is still starting). The caller retries with
+                // the saved credentials a manual Connect would use.
                 connection.close(1u32.into(), b"authentication failed");
                 let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
                 return Err(anyhow!("wrong password: the other computer no longer accepts the password this session used"));
