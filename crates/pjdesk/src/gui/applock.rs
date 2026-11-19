@@ -773,10 +773,8 @@ impl App {
                         ui.ctx().request_repaint_after(Duration::from_millis(16));
                     }
                     let pin_box = pin_box(ui, &mut pin, egui::Id::new("lock-pin-entry"), false, pin_shake_offset(shook), "");
-                    if !self.lock_pin_armed {
-                        pin_box.request_focus();
-                        self.lock_pin_armed = true;
-                    }
+                    let active = pin_window_active(ui.ctx());
+                    hold_initial_pin_focus(&pin_box, &mut self.lock_pin_armed, active, &mut self.pin_focus_window_active);
                     let prior = self.lock_pin.clone();
                     self.lock_pin = digits_only(&pin);
                     if self.lock_pin != prior && !waiting {
@@ -898,9 +896,13 @@ impl App {
                     ui.label("PIN");
                     let mut pin = self.pin_new.clone();
                     let pin_box = pin_entry(ui, &mut pin, "setup-new", "4 to 8 digits", &mut self.pin_show_new);
-                    if !self.setup_pin_focused {
-                        pin_box.request_focus();
-                        self.setup_pin_focused = true;
+                    if self.account_email().is_empty() && !local {
+                        // Email comes first; do not steal it.
+                    } else if !local && (need_password || self.account_email().is_empty()) {
+                        // The password box is already on screen; PIN follows when that is submitted.
+                    } else {
+                        let active = pin_window_active(ui.ctx());
+                        hold_initial_pin_focus(&pin_box, &mut self.setup_pin_focused, active, &mut self.pin_focus_window_active);
                     }
                     self.pin_new = digits_only(&pin);
                     let advance = widgets::submitted(ui, &pin_box);
@@ -1704,6 +1706,36 @@ fn apply_pin_key(pin: &mut String, key: PinKey) {
 /// A visible rounded PIN box. The dots (or digits, when shown) grow out from
 /// the middle; there are no slots or placeholder digits, so it never hints at
 /// the length. Backspace removes the last digit typed, Delete or Esc clears it.
+
+fn pin_window_active(ctx: &egui::Context) -> bool {
+    ctx.input(|i| {
+        let view = i.viewport();
+        view.minimized != Some(true) && view.visible() != Some(false) && view.focused != Some(false)
+    })
+}
+
+/// Keep requesting focus until it sticks, and again when the window is restored.
+fn hold_initial_pin_focus(
+    resp: &egui::Response,
+    settled: &mut bool,
+    window_active: bool,
+    window_was_active: &mut bool,
+) {
+    let restored = window_active && !*window_was_active;
+    *window_was_active = window_active;
+    if restored || !window_active {
+        *settled = false;
+    }
+    if !window_active || *settled {
+        return;
+    }
+    if resp.has_focus() {
+        *settled = true;
+        return;
+    }
+    resp.request_focus();
+}
+
 fn pin_box(ui: &mut egui::Ui, pin: &mut String, id: egui::Id, shown: bool, shake: f32, hint: &str) -> egui::Response {
     let p = theme::paint(ui);
     // egui drops focus on Esc before widgets run, so remember last frame's focus.

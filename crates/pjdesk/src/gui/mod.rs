@@ -505,6 +505,8 @@ pub struct App {
     lock_pin_armed: bool,
     /// The Set-a-PIN field has been focused for this appearance.
     setup_pin_focused: bool,
+    /// Last time the PIN screen saw an active (focused, visible) window.
+    pin_focus_window_active: bool,
 }
 
 struct AdmitJob {
@@ -721,6 +723,7 @@ impl App {
             lock_resetting: false,
             lock_pin_armed: false,
             setup_pin_focused: false,
+            pin_focus_window_active: false,
         };
         let lock_email = app.account_email();
         if let Some(verifier) = app.cfg.app_lock_for(&lock_email) {

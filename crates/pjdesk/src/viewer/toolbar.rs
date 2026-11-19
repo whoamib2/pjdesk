@@ -49,6 +49,8 @@ pub enum Action {
     Android(u8),
     /// Show or hide the Android navigation bar under the phone picture.
     ToggleAndroidBar,
+    /// Send every key to the remote while this window is in front (on by default).
+    ToggleKeyboardCapture,
 }
 
 /// Key combinations the "Send keys" menu can send to the host.
@@ -484,6 +486,8 @@ pub struct Toolbar {
     android: bool,
     /// The navigation bar under an Android picture. On until the Phone menu hides it.
     android_nav: bool,
+    /// Low-level capture sends every key to the remote. On by default.
+    keyboard_capture: bool,
     /// The window has no system title bar; tabs and caption buttons share one strip.
     titlebar: bool,
     maximized: bool,
@@ -493,11 +497,11 @@ pub struct Toolbar {
 
 impl Default for Toolbar {
     fn default() -> Self {
-        let menus = vec![owned(ZOOM_ITEMS), owned(KEY_ITEMS), owned(CONTROL_ITEMS)];
+        let menus = vec![owned(ZOOM_ITEMS), keys_menu(true), owned(CONTROL_ITEMS)];
         let spec: [(&'static str, &'static str, Kind, Mark); 8] = [
             ("View", "Zoom and fit", Kind::Menu(0), Mark::View),
             ("Screens", "Screens and windows", Kind::Screens, Mark::Screens),
-            ("Keys", "Send special keys", Kind::Menu(1), Mark::Keys),
+            ("Keys", "Send keys to the remote. Open this menu with the mouse — keys go to the remote while this window is in front.", Kind::Menu(1), Mark::Keys),
             ("Session", "Audio, privacy, record, restart", Kind::Menu(2), Mark::Session),
             ("Files", "Send and receive files", Kind::Act(Action::OpenPanel(0)), Mark::Files),
             ("Chat", pjdesk_proto::peer::CHAT_NEEDS_TIP, Kind::Act(Action::OpenPanel(1)), Mark::Chat),
@@ -537,6 +541,7 @@ impl Default for Toolbar {
             chat_ready: false,
             android: false,
             android_nav: true,
+            keyboard_capture: true,
         }
     }
 }
@@ -648,6 +653,21 @@ fn draw_windows_icon(buf: &mut [u32], w: usize, h: usize, x: f32, y: f32, color:
 fn owned(items: &[(&str, Action)]) -> Menu {
     let items: Vec<(String, Action)> = items.iter().map(|(l, a)| ((*l).to_string(), *a)).collect();
     let width = items.iter().map(|(l, _)| text_width(l)).fold(160.0_f32, f32::max) + PAD * 3.0;
+    Menu { items, width }
+}
+
+fn capture_label(on: bool) -> &'static str {
+    if on {
+        "Capture all keys  (on)"
+    } else {
+        "Capture all keys  (off)"
+    }
+}
+
+fn keys_menu(capture: bool) -> Menu {
+    let mut items = vec![(capture_label(capture).to_string(), Action::ToggleKeyboardCapture)];
+    items.extend(KEY_ITEMS.iter().map(|(label, action)| ((*label).to_string(), *action)));
+    let width = items.iter().map(|(l, _)| text_width(l)).fold(200.0_f32, f32::max) + PAD * 3.0;
     Menu { items, width }
 }
 
@@ -820,11 +840,11 @@ impl Toolbar {
         }
         self.android = on;
         self.open = None;
-        let mut menus = vec![owned(ZOOM_ITEMS), owned(KEY_ITEMS), owned(CONTROL_ITEMS)];
+        let mut menus = vec![owned(ZOOM_ITEMS), keys_menu(self.keyboard_capture), owned(CONTROL_ITEMS)];
         let mut spec: Vec<(&str, &str, Kind, Mark)> = vec![
             ("View", "Zoom and fit", Kind::Menu(0), Mark::View),
             ("Screens", "Screens and windows", Kind::Screens, Mark::Screens),
-            ("Keys", "Send special keys", Kind::Menu(1), Mark::Keys),
+            ("Keys", "Send keys to the remote. Open this menu with the mouse — keys go to the remote while this window is in front.", Kind::Menu(1), Mark::Keys),
             ("Session", "Audio, privacy, record, restart", Kind::Menu(2), Mark::Session),
         ];
         if on {
@@ -882,6 +902,30 @@ impl Toolbar {
                 menu.width = w;
             }
         }
+    }
+
+    pub fn keyboard_capture_on(&self) -> bool {
+        self.keyboard_capture
+    }
+
+    pub fn set_keyboard_capture(&mut self, on: bool) {
+        self.keyboard_capture = on;
+        let label = capture_label(on);
+        if let Some(menu) = self.menus.get_mut(1) {
+            if let Some(item) = menu.items.iter_mut().find(|(_, action)| *action == Action::ToggleKeyboardCapture) {
+                item.0 = label.to_string();
+            }
+            let w = text_width(label) + PAD * 3.0;
+            if w > menu.width {
+                menu.width = w;
+            }
+        }
+    }
+
+    pub fn toggle_keyboard_capture(&mut self) -> bool {
+        let on = !self.keyboard_capture;
+        self.set_keyboard_capture(on);
+        on
     }
 
     fn bar_rect(&self, win_w: usize) -> (f32, f32, f32, f32) {

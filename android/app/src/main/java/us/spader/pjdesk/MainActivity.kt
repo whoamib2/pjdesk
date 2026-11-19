@@ -95,6 +95,9 @@ import us.spader.pjdesk.ui.connectPasswordMessage
 import us.spader.pjdesk.ui.ReauthScreen
 import us.spader.pjdesk.ui.SecretField
 import us.spader.pjdesk.ui.submitKeyboard
+import us.spader.pjdesk.input.HardwareKeys
+import us.spader.pjdesk.input.SessionKeyDispatch
+import android.view.KeyEvent as AndroidKeyEvent
 import us.spader.pjdesk.ui.SetPinScreen
 import us.spader.pjdesk.ui.SignInScreen
 import us.spader.pjdesk.ui.UnlockScreen
@@ -186,6 +189,18 @@ class MainActivity : FragmentActivity() {
     override fun onUserInteraction() {
         super.onUserInteraction()
         interaction.intValue++
+    }
+
+    override fun dispatchKeyEvent(event: AndroidKeyEvent): Boolean {
+        val typing = currentFocus?.onCheckIsTextEditor() == true
+        val handler = SessionKeyDispatch.handler
+        if (!typing && handler != null && HardwareKeys.shouldCapture(event)) {
+            val scan = HardwareKeys.scan(event) ?: return super.dispatchKeyEvent(event)
+            if (handler(scan, event.action == AndroidKeyEvent.ACTION_DOWN)) {
+                return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onStop() {

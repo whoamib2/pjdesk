@@ -87,6 +87,7 @@ import us.spader.pjdesk.core.SessionInfo
 import us.spader.pjdesk.input.GestureMap
 import us.spader.pjdesk.input.PictureView
 import us.spader.pjdesk.input.PointerSession
+import us.spader.pjdesk.input.SessionKeyDispatch
 import us.spader.pjdesk.media.ScreenDecoder
 
 private class OverlaySpace {
@@ -186,6 +187,27 @@ fun SessionScreen(
     }
     LaunchedEffect(session.id, remote.privacy) { onPrivacy(remote.privacy) }
     LaunchedEffect(session.id, remote.keyboardMode) { onKeyboardMode(remote.keyboardMode) }
+    val onKeyNow = rememberUpdatedState(onKey)
+    val viewOnly = remote.viewOnly
+    DisposableEffect(session.id, viewOnly) {
+        val held = mutableSetOf<Int>()
+        if (!viewOnly) {
+            SessionKeyDispatch.handler = { scan, down ->
+                if (down) held.add(scan) else held.remove(scan)
+                onKeyNow.value(scan, down)
+                true
+            }
+        }
+        onDispose {
+            if (SessionKeyDispatch.handler != null) {
+                SessionKeyDispatch.handler = null
+            }
+            for (scan in held) {
+                onKeyNow.value(scan, false)
+            }
+            held.clear()
+        }
+    }
     LaunchedEffect(remote.scale, session.frameW, viewW, viewH) {
         picture = when (remote.scale) {
             "original" -> {

@@ -6,7 +6,10 @@
 //!  window input events ───────────────────────┴──────────► sender task ─► QUIC control stream
 //! ```
 //!
-//! Local shortcut (not sent to the host): Ctrl+Alt+Enter toggles full screen.
+//! Full screen is on the Session menu. While keyboard capture is on (the default),
+//! keys in this window go to the remote; open the toolbar with the mouse to turn
+//! capture off, send Ctrl+Alt+Del, or end the session. Ctrl+Alt+End also sends
+//! Ctrl+Alt+Del. Capture is off the UI thread so the message loop can still run.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -382,9 +385,10 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
         slot: armed.slot,
         current: None,
         layout: Layout::default(),
-        control: armed.control,
+        control: armed.control.clone(),
         sized_to_remote: false,
         keys_down: HashMap::new(),
+        keyhook: super::keyhook::SessionHook::start(armed.control.clone()),
         modifiers: ModifiersState::empty(),
         last_position: None,
         cursor_px: (0.0, 0.0),
@@ -704,6 +708,8 @@ struct App {
     sized_to_remote: bool,
     /// Keys held down here, and the code each was sent as.
     keys_down: HashMap<KeyCode, u16>,
+    /// Windows low-level hook: swallows keys only while this window is in front.
+    keyhook: super::keyhook::SessionHook,
     modifiers: ModifiersState,
     last_position: Option<(u16, u16)>,
     /// Last pointer position in window pixels (for toolbar hit-testing).
@@ -799,7 +805,38 @@ impl App {
 
     fn release_all(&mut self) {
         self.keys_down.clear();
+        self.keyhook.clear_pressed();
         self.send(InputEvent::ReleaseAll);
+    }
+
+    fn viewer_hwnds(&self) -> Vec<isize> {
+        let mut out = Vec::new();
+        if let Some(window) = &self.window {
+            if let Some(hwnd) = super::keyhook::hwnd_of(window) {
+                out.push(hwnd);
+            }
+        }
+        for pane in &self.extra {
+            if let Some(hwnd) = super::keyhook::hwnd_of(&pane.window) {
+                out.push(hwnd);
+            }
+        }
+        out
+    }
+
+    /// Keep the hook in sync: only swallow keys when this window is in front,
+    /// capture is on, and a local field or dialog is not using the keyboard.
+    fn sync_keyhook(&self) {
+        self.keyhook.set_hwnds(self.viewer_hwnds());
+        self.keyhook.set_android_remote(self.remote_is_android());
+        let minimized = self.window.as_ref().is_some_and(|w| w.is_minimized() == Some(true));
+        let swallow = self.keyhook.enabled()
+            && !self.closed
+            && !self.toolbar.block_input
+            && !self.confirm_close
+            && self.panel.focus == 0
+            && !minimized;
+        self.keyhook.set_swallow(swallow);
     }
 
     fn display_indexes(&self) -> Vec<u8> {
@@ -1036,6 +1073,17 @@ impl App {
             Action::ZoomIn => self.set_scale(self.current_scale() * 1.25),
             Action::ZoomOut => self.set_scale(self.current_scale() / 1.25),
             Action::Keys(combo) => self.send_combo(combo),
+            Action::ToggleKeyboardCapture => {
+                let on = self.toolbar.toggle_keyboard_capture();
+                self.keyhook.set_enabled(on);
+                self.sync_keyhook();
+                let text = if on {
+                    "All keys go to the remote while this window is in front. Open the toolbar with the mouse to turn this off or end the session."
+                } else {
+                    "Keyboard capture is off. Keys can be used on this computer again."
+                };
+                self.live.lock().unwrap().notices.push(text.into());
+            }
             Action::Refresh => {
                 let _ = self.control.send(ControlMsg::RequestKeyframe);
             }
@@ -2061,6 +2109,7 @@ impl App {
         window.request_redraw();
         self.hook_drops(&window);
         self.extra.push(ExtraPane { display, window, surface, layout: Layout::default(), cursor: (0.0, 0.0), sized });
+        self.sync_keyhook();
     }
 
     fn promote(&mut self, pane: ExtraPane) {
@@ -2655,8 +2704,12 @@ impl App {
     }
 
     fn take_active(&mut self, next: Held) -> Held {
+        self.keyhook.release_pressed();
         let held = self.take_active_inner(next);
+        self.keyhook.set_control(self.control.clone());
+        self.toolbar.set_keyboard_capture(self.keyhook.enabled());
         self.pan_shown = (self.pan.0 as f32, self.pan.1 as f32);
+        self.sync_keyhook();
         held
     }
 
@@ -3231,6 +3284,7 @@ impl App {
             self.endpoint = armed.endpoint;
             self.slot = armed.slot;
             self.control = armed.control;
+            self.keyhook.set_control(self.control.clone());
             self.live = armed.live;
             self.cmds = armed.cmds;
             self.saw_picture = armed.saw_picture;
@@ -3418,6 +3472,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         window.request_redraw();
         self.window = Some(window);
+        self.sync_keyhook();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -3484,6 +3539,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.sync_keyhook();
         // Chat and files windows and incoming lines are checked a few times a second.
         self.pump_files();
         if self.pump_chats() {

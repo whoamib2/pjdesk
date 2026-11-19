@@ -22,7 +22,6 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.rememberScrollState
@@ -49,6 +48,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -64,9 +65,12 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import us.spader.pjdesk.R
 import us.spader.pjdesk.core.AppLockPolicy
@@ -127,9 +131,8 @@ fun SetPinScreen(
             onSave(pin, password, enableBio && biometricsAvailable)
         }
     }
-    LaunchedEffect(needPassword) {
-        if (!needPassword) runCatching { focus.requestFocus() }
-    }
+    // Hidden PIN field requests focus and shows the soft keyboard once the
+    // account password is not in the way (and again if this screen returns).
     LockPage {
     Column(
         Modifier
@@ -182,6 +185,15 @@ fun SetPinScreen(
         Text(
             if (confirming) "Confirm PIN" else "Choose a PIN",
             style = MaterialTheme.typography.titleLarge,
+        )
+        HiddenPinInput(
+            value = entered,
+            onValue = { next ->
+                localError = ""
+                if (confirming) confirm = next else pin = next
+            },
+            focus = focus,
+            enabled = !busy && !needPassword,
         )
         PinMarks(count = entered.length, shakeToken = shakeToken)
         if (shown.isNotEmpty()) {
@@ -309,9 +321,6 @@ fun UnlockScreen(
             localError = ""
         }
     }
-    LaunchedEffect(Unit) {
-        runCatching { focus.requestFocus() }
-    }
     val withheld = oneTimeWithheld(oneTimePassword, permanentSet, passwordHidden)
     val help = lockHelp(computerId, oneTimePassword, withheld)
     LockPage {
@@ -363,6 +372,12 @@ fun UnlockScreen(
             textAlign = TextAlign.Center,
         )
         Spacer(Modifier.size(24.dp))
+        HiddenPinInput(
+            value = pin,
+            onValue = { changePin(it) },
+            focus = focus,
+            enabled = !busy && !lockedOut,
+        )
         PinMarks(count = pin.length, shakeToken = rejectCount + localShake)
         val shownError = error.ifBlank { localError }
         if (shownError.isNotEmpty()) {
@@ -533,6 +548,39 @@ fun ReauthScreen(
 }
 
 @Composable
+
+@OptIn(ExperimentalComposeUiApi::class)
+@Composable
+private fun HiddenPinInput(
+    value: String,
+    onValue: (String) -> Unit,
+    focus: FocusRequester,
+    enabled: Boolean,
+) {
+    val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(enabled) {
+        if (!enabled) return@LaunchedEffect
+        repeat(4) { attempt ->
+            if (attempt > 0) delay(120)
+            runCatching { focus.requestFocus() }
+            keyboard?.show()
+        }
+    }
+    BasicTextField(
+        value = value,
+        onValueChange = { next -> onValue(next.filter { it.isDigit() }.take(8)) },
+        modifier = Modifier
+            .size(1.dp)
+            .focusRequester(focus),
+        enabled = enabled,
+        keyboardOptions = KeyboardOptions(
+            keyboardType = KeyboardType.NumberPassword,
+            imeAction = ImeAction.Done,
+        ),
+        decorationBox = { _ -> },
+    )
+}
+
 private fun LockMark() {
     Image(
         painter = painterResource(R.drawable.ic_launcher),

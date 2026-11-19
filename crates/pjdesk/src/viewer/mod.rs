@@ -15,6 +15,7 @@ pub mod decoder;
 mod filedrop;
 mod filesonly;
 mod keymap;
+mod keyhook;
 mod panel;
 mod render;
 mod toolbar;
