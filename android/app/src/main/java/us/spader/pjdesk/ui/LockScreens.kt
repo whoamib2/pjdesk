@@ -22,7 +22,10 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -547,8 +550,6 @@ fun ReauthScreen(
     }
 }
 
-@Composable
-
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 private fun HiddenPinInput(
@@ -581,6 +582,7 @@ private fun HiddenPinInput(
     )
 }
 
+@Composable
 private fun LockMark() {
     Image(
         painter = painterResource(R.drawable.ic_launcher),
