@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.99
+
+- Fixed: the chat window's taskbar button now shows the chat-bubble icon instead of a generic window icon.
+- Fixed: a remote session window opens centered on the monitor and is sized to fit the screen, keeping the remote picture's shape, so you do not have to pull it up.
+
 ## 0.6.98
 
 - New: the chat window has its own taskbar button with a chat-bubble icon, and the button flashes when a new message arrives.
