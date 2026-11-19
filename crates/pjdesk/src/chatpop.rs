@@ -50,6 +50,25 @@ fn write_atomic(path: &Path, body: &[u8]) {
     }
 }
 
+
+/// Taskbar and title-bar text: "PJDesk Chat" or "PJDesk Chat – <computer>".
+pub fn window_title(peer: &str) -> String {
+    let peer = peer.trim();
+    if peer.is_empty() {
+        "PJDesk Chat".to_string()
+    } else {
+        format!("PJDesk Chat – {peer}")
+    }
+}
+
+fn chat_icon() -> eframe::egui::IconData {
+    eframe::egui::IconData {
+        rgba: include_bytes!("../assets/chat_icon_256.rgba").to_vec(),
+        width: 256,
+        height: 256,
+    }
+}
+
 /// The owner's handle on one chat window.
 pub struct ChatPop {
     dir: PathBuf,
@@ -273,11 +292,15 @@ pub fn enter_sends(enter: bool, shift: bool) -> bool {
 pub fn run_window(dir: PathBuf) -> anyhow::Result<()> {
     use eframe::egui;
     let place = load_place();
+    #[cfg(windows)]
+    crate::chat_taskbar::set_app_user_model_id();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("PJDesk Chat")
+        .with_title(window_title(""))
         .with_inner_size([place.w, place.h])
         .with_min_inner_size([280.0, 300.0])
-        .with_app_id("pjdesk-chat");
+        .with_taskbar(true)
+        .with_icon(std::sync::Arc::new(chat_icon()))
+        .with_app_id("PJDesk.Chat");
     if place.x.is_finite() && place.y.is_finite() {
         viewport = viewport.with_position([place.x, place.y]);
     }
@@ -315,6 +338,7 @@ pub mod window {
         flash_until: Option<Instant>,
         stick_bottom: bool,
         started: Instant,
+        title: String,
     }
 
     impl ChatApp {
@@ -334,9 +358,13 @@ pub mod window {
                 flash_until: None,
                 stick_bottom: true,
                 started: Instant::now(),
+                title: window_title(""),
             };
             app.poll(ctx);
             app.last_alert = app.state.alert;
+            app.sync_title(ctx);
+            #[cfg(windows)]
+            crate::chat_taskbar::apply_taskbar_icon();
             if app.state.lines.iter().any(|l| !l.mine) {
                 app.flash_until = Some(Instant::now() + Duration::from_millis(1500));
                 alert_sound();
@@ -365,11 +393,14 @@ pub mod window {
                         ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                             egui::UserAttentionType::Informational,
                         ));
+                        #[cfg(windows)]
+                        crate::chat_taskbar::flash_taskbar();
                     }
                     if state.lines.len() != self.state.lines.len() {
                         self.stick_bottom = true;
                     }
                     self.state = state;
+                    self.sync_title(ctx);
                 }
                 None if self.started.elapsed() > Duration::from_secs(10) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -398,6 +429,15 @@ pub mod window {
             if let Ok(body) = serde_json::to_vec(&out) {
                 write_atomic(&path, &body);
             }
+        }
+
+        fn sync_title(&mut self, ctx: &egui::Context) {
+            let title = window_title(&self.state.peer);
+            if self.title == title {
+                return;
+            }
+            self.title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
 
         fn note_seen(&mut self, focused: bool) {
@@ -549,6 +589,9 @@ pub mod window {
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             let ctx = &ui.ctx().clone();
             self.poll(ctx);
+            self.sync_title(ctx);
+            #[cfg(windows)]
+            crate::chat_taskbar::apply_taskbar_icon();
             let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
             self.note_seen(focused);
             self.remember(ctx);
@@ -575,6 +618,14 @@ pub mod window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_title_names_the_computer() {
+        assert_eq!(window_title(""), "PJDesk Chat");
+        assert_eq!(window_title("  "), "PJDesk Chat");
+        assert_eq!(window_title("CABIN1"), "PJDesk Chat – CABIN1");
+        assert_eq!(window_title("  OFFICE-PC  "), "PJDesk Chat – OFFICE-PC");
+    }
 
     #[test]
     fn enter_sends_and_shift_enter_does_not() {

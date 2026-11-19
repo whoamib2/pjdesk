@@ -131,4 +131,43 @@ mod tests {
         assert!(tray_dark > 400, "the server tray mark stays dark");
         assert!(tray_green > 4, "the server tray mark keeps a green light");
     }
+
+    #[test]
+    fn chat_icon_is_a_transparent_accent_bubble() {
+        let bytes = include_bytes!("../assets/chat_icon_256.rgba");
+        corners_clear(bytes, 256);
+        let opaque = bytes.chunks(4).filter(|p| p[3] > 200).count();
+        assert!(opaque > 8_000, "the bubble should fill the square");
+        let blue = bytes
+            .chunks(4)
+            .filter(|p| p[3] > 200 && p[2] > 160 && p[2] > p[0].saturating_add(40))
+            .count();
+        assert!(blue > 2_000, "the bubble uses the PJDesk accent");
+        let tray = include_bytes!("../assets/chat_icon_32.rgba");
+        corners_clear(tray, 32);
+        let tray_blue = tray
+            .chunks(4)
+            .filter(|p| p[3] > 180 && p[2] > 140 && p[2] > p[0].saturating_add(20))
+            .count();
+        assert!(tray_blue > 80, "the 32 px mark still reads as the accent bubble");
+    }
+
+    #[test]
+    fn chat_windows_icon_carries_16_through_256() {
+        let ico = include_bytes!("../assets/chat.ico");
+        assert_eq!(&ico[..4], &[0, 0, 1, 0]);
+        let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+        assert_eq!(count, 7);
+        let mut sizes = Vec::new();
+        for i in 0..count {
+            let w = ico[6 + i * 16];
+            sizes.push(if w == 0 { 256 } else { u16::from(w) });
+            let size = u32::from_le_bytes(ico[6 + i * 16 + 8..6 + i * 16 + 12].try_into().unwrap());
+            let offset = u32::from_le_bytes(ico[6 + i * 16 + 12..6 + i * 16 + 16].try_into().unwrap()) as usize;
+            assert!(size > 32, "image {i} is empty");
+            assert_eq!(&ico[offset..offset + 4], b"\x89PNG", "image {i} should be a PNG");
+        }
+        assert_eq!(sizes, vec![16, 24, 32, 48, 64, 128, 256]);
+        assert!(sizes.contains(&16) && sizes.contains(&48) && sizes.contains(&256));
+    }
 }

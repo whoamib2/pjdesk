@@ -19,6 +19,8 @@ mod access_keys;
 mod audio;
 mod client_update;
 mod chatpop;
+#[cfg(windows)]
+mod chat_taskbar;
 mod consentpop;
 mod filepop;
 mod companion;
