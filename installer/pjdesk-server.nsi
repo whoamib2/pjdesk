@@ -119,6 +119,9 @@ Section "PJDesk Server (required)" SecCore
   ; Restart the service (several tries) and start the tray in the signed-in
   ; user's session. Launching it from this installer would run it as SYSTEM
   ; when the update task is the one installing. net start is the fallback.
+  ; Install and start the service by default, including silent installs.
+  DetailPrint "Installing and starting the PJDesk Server service..."
+  ExecWait '"$INSTDIR\${EXE}" service install --firewall'
   nsExec::ExecToLog '"$INSTDIR\${EXE}" update-handoff'
   nsExec::Exec 'net start PJDeskServer'
 
@@ -138,14 +141,8 @@ Section "PJDesk Server (required)" SecCore
   WriteRegDWORD HKLM "${ARP}" "NoRepair" 1
 SectionEnd
 
-Section "Run as a service now (recommended)" SecService
-  DetailPrint "Installing and starting the PJDesk Server service..."
-  ExecWait '"$INSTDIR\${EXE}" service install --firewall'
-SectionEnd
-
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecCore} "The PJDesk Server program and its management window."
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecService} "Install and start the server as an auto-start Windows service (listens on TCP+UDP 21200 and adds a firewall rule). You can also do this later from the server window."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecCore} "The PJDesk Server program, its management window, and the auto-start Windows service (listens on TCP+UDP 21200 and adds a firewall rule)."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Section "Uninstall"

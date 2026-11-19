@@ -702,7 +702,7 @@ fn security_tab(ui: &mut egui::Ui, d: &mut SettingsDraft, installed: bool, runni
     if known {
         ui.horizontal(|ui| {
             if !installed {
-                if ui.add(egui::Button::new("Install service").fill(theme::paint(ui).accent)).clicked() {
+                if ui.add(egui::Button::new("Install the PJDesk service").fill(theme::paint(ui).accent)).clicked() {
                     d.service_note = "Approve the administrator prompt to install the service.".into();
                     crate::platform::run_elevated(&["service", "install", "--firewall"]);
                 }

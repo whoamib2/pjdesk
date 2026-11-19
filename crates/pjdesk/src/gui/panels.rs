@@ -683,6 +683,18 @@ impl App {
                 widgets::status_dot(ui, p.muted, &format!("{rtt} ms"));
             }
         });
+        if self.scm_known && !self.scm_installed {
+            ui.add_space(8.0);
+            ui.label(widgets::muted(
+                ui,
+                "Install the PJDesk service to reach this computer at the sign-in screen and during administrator (UAC) prompts.",
+            ));
+            ui.add_space(4.0);
+            if ui.add(egui::Button::new("Install the PJDesk service").fill(theme::paint(ui).accent)).clicked() {
+                crate::platform::run_elevated(&["service", "install", "--firewall"]);
+                self.toast.show("Approve the administrator prompt to install the service.");
+            }
+        }
         if let Some(err) = &failure {
             let lines = pjdesk_proto::routes::registration_detail_lines(err);
             if !lines.is_empty() {

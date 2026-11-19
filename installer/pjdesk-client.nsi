@@ -42,6 +42,7 @@ VIAddVersionKey "OriginalFilename" "PJDesk-Client-Setup-${VERSION}.exe"
 !include "StrFunc.nsh"
 ${Using:StrFunc} StrStr
 !include "replace.nsh"
+Var PjHadInstall
 
 !define MUI_ICON "pjdesk.ico"
 !define MUI_UNICON "pjdesk.ico"
@@ -91,6 +92,12 @@ FunctionEnd
 Section "PJDesk (required)" SecCore
   SectionIn RO
 
+  ; Remember a previous install before we write the new uninstaller.
+  StrCpy $PjHadInstall 0
+  IfFileExists "$INSTDIR\uninstall.exe" 0 client_fresh
+    StrCpy $PjHadInstall 1
+  client_fresh:
+
   ; Extract beside the running program, then stop, wait, and swap.
   ; The service is started again inside the swap, before the registry is written.
   InitPluginsDir
@@ -115,11 +122,26 @@ Section "PJDesk (required)" SecCore
   nsExec::Exec 'netsh advfirewall firewall add rule name="PJDesk LAN" dir=in action=allow protocol=UDP localport=21201 profile=any'
   nsExec::Exec 'netsh advfirewall firewall delete rule name="PJDesk"'
   nsExec::Exec 'netsh advfirewall firewall add rule name="PJDesk" dir=in action=allow program="$INSTDIR\${EXE}" enable=yes profile=any'
-  ; Unattended access is the service. Every install, including a silent update,
-  ; installs and starts it. An existing computer-name.txt is left alone; a
-  ; fresh install uses the Windows name until someone renames it in the app.
-  DetailPrint "Installing the PJDesk background service..."
-  ExecWait '"$INSTDIR\${EXE}" service install --firewall'
+  ; Fresh installs, and interactive upgrades, install and start the service
+  ; by default (silent first installs too). A silent auto-update of a
+  ; computer that never had the service leaves hosting as it is, so the
+  ; update cannot take the computer offline. Settings then offers
+  ; "Install the PJDesk service".
+  ; An existing computer-name.txt is left alone; a fresh install uses the
+  ; Windows name until someone renames it in the app.
+  StrCmp $PjHadInstall 0 client_install_service
+  IfSilent client_silent_upgrade 0
+  client_install_service:
+    DetailPrint "Installing the PJDesk background service..."
+    ExecWait '"$INSTDIR\${EXE}" service install --firewall'
+    Goto client_service_done
+  client_silent_upgrade:
+    nsExec::Exec 'sc query "${APPNAME}"'
+    Pop $0
+    IntCmp $0 0 client_install_service client_skip_service client_skip_service
+  client_skip_service:
+    DetailPrint "The background service is not installed; not adding it during a silent update."
+  client_service_done:
   ; The new exe restarts the service (several tries) and opens PJDesk in the
   ; signed-in user's session. net start is the fallback if that command is absent.
   nsExec::ExecToLog '"$INSTDIR\${EXE}" update-handoff'
