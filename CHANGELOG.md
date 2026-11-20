@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.1
+
+- Fixed: in a remote session, the other computer's resize, move, and text cursors now show. Monochrome system cursors are converted correctly, and the viewer uses its own native resize cursors when the host names a standard pointer.
+
 ## 0.7.0
 
 - Fixed: the chat window now shows the blue chat-bubble icon in the taskbar, because that identity is applied to the real chat window rather than a hidden helper window.
