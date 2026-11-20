@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.2
+
+- Fixed: when you control a computer from your phone, moving one finger only moves the mouse. A drag starts from a still long-press (about 700ms) or a double-tap-and-drag, not from ordinary movement. A two-finger tap is a right-click, and a two-finger slide scrolls smoothly up, down, and sideways.
+- New: a Keyboard button in the session toolbar opens the soft keyboard and an extra-keys row (sticky Ctrl, Alt, Win, and Shift). Letters, numbers, symbols, and Unicode characters go to the remote computer, including accented text, and predictive text is sent when you commit it. The host maps Enter, Backspace, Tab, and Escape sent as text to keys.
+
 ## 0.7.1
 
 - Fixed: in a remote session, the other computer's resize, move, and text cursors now show. Monochrome system cursors are converted correctly, and the viewer uses its own native resize cursors when the host names a standard pointer.
