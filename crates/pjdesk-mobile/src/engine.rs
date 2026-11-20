@@ -1392,7 +1392,8 @@ fn mouse_from(cmd: &Value) -> Option<InputEvent> {
         "up" => InputEvent::MouseButton { button, down: false },
         "wheel" => {
             let dy = cmd.get("dy").and_then(|v| v.as_i64()).unwrap_or(0).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
-            InputEvent::Wheel { dx: 0, dy }
+            let dx = cmd.get("dx").and_then(|v| v.as_i64()).unwrap_or(0).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+            InputEvent::Wheel { dx, dy }
         }
         _ => return None,
     })
@@ -4510,6 +4511,10 @@ mod tests {
         let left = mouse_from(&json!({"kind":"up","x":1,"y":2})).unwrap();
         assert!(matches!(left, InputEvent::MouseButton { button: pjdesk_proto::peer::MouseButton::Left, down: false }));
         assert_eq!(clip_text("héllo").len(), "héllo".len());
+        let wheel = mouse_from(&json!({"kind":"wheel","x":1,"y":2,"dy":-240,"dx":120})).unwrap();
+        assert!(matches!(wheel, InputEvent::Wheel { dx: 120, dy: -240 }));
+        let vertical = mouse_from(&json!({"kind":"wheel","dy":120})).unwrap();
+        assert!(matches!(vertical, InputEvent::Wheel { dx: 0, dy: 120 }));
     }
 
     #[test]

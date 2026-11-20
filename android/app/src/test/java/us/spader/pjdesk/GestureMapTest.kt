@@ -159,13 +159,20 @@ class GestureMapTest {
         val wheel = pointer.move(listOf(100 to 3000, 120 to 3000))
             .filterIsInstance<PointerSession.Out.Mouse>()
             .first { it.kind == "wheel" }
-        assertEquals(-240, wheel.dy)
+        assertTrue(wheel.dy < 0)
+        val slower = PointerSession(android = false, trackpad = true)
+        slower.scrollSpeed = 1f
+        slower.down(0, listOf(100 to 1000, 120 to 1000))
+        val modest = slower.move(listOf(100 to 3000, 120 to 3000))
+            .filterIsInstance<PointerSession.Out.Mouse>()
+            .first { it.kind == "wheel" }
+        assertTrue(kotlin.math.abs(wheel.dy) > kotlin.math.abs(modest.dy))
         pointer.invertScroll = true
         pointer.down(10, listOf(100 to 1000, 120 to 1000))
         val flipped = pointer.move(listOf(100 to 3000, 120 to 3000))
             .filterIsInstance<PointerSession.Out.Mouse>()
             .first { it.kind == "wheel" }
-        assertEquals(240, flipped.dy)
+        assertEquals(-wheel.dy, flipped.dy)
     }
 
     @Test

@@ -9,10 +9,11 @@ package us.spader.pjdesk.input
  * motion to zoom the picture instead.
  *
  * Trackpad mode moves a cursor. A short tap clicks. A one-finger drag only
- * moves the pointer. Holding the button takes a drag-lock or a tap followed
- * by a press-and-drag. Two fingers scroll, and three fingers click the middle
- * button. [speed] scales that movement (0.6 is the default). [accelerate]
- * lengthens a fast flick.
+ * moves the pointer — never a press-and-hold. A double-tap-and-drag, or a
+ * still long-press of [GestureMap.LONG_PRESS_MS] inside the slop, may start
+ * a drag. Two fingers tap for a right-click, slide to scroll, and three
+ * fingers click the middle button. [speed] scales that movement (0.6 is the
+ * default). [accelerate] lengthens a fast flick.
  *
  * Touch mode on a desktop remote clicks where the finger is. A long-press or a
  * two-finger tap is the right button. A drag holds the left button. Callers
@@ -40,16 +41,23 @@ class PointerSession(
     private var origin: Pair<Int, Int>? = null
     private var pinchStart: Pair<Pair<Int, Int>, Pair<Int, Int>>? = null
     private var pinchLast: Pair<Pair<Int, Int>, Pair<Int, Int>>? = null
-    private var scrollY: Int? = null
+    private var twoStart: Pair<Pair<Int, Int>, Pair<Int, Int>>? = null
+    private var twoLast: Pair<Pair<Int, Int>, Pair<Int, Int>>? = null
+    private var scrollAccX = 0
+    private var scrollAccY = 0
     private var dragging = false
     private var middle = false
     private var twoFinger = false
+    private var twoMoved = false
     private var rightSent = false
     private var downMs = 0L
     /** Finger travel past the move threshold, without a button necessarily held. */
     private var moved = false
     /** Set by a tap-then-press so the next drag holds the button. */
     private var armed = false
+    /** The stroke that just ended was a short motionless tap. */
+    var lastWasTap: Boolean = false
+        private set
 
     val cursorNorm: Pair<Int, Int> get() = cursor
     val dragArmed: Boolean get() = armed
@@ -61,21 +69,32 @@ class PointerSession(
 
     fun down(tMs: Long, points: List<Pair<Int, Int>>) {
         if (points.isEmpty()) return
+        lastWasTap = false
         if (relative) {
             if (points.size >= 3) {
                 middle = true
-                scrollY = null
+                twoFinger = false
+                twoStart = null
                 origin = null
                 return
             }
             if (points.size >= 2) {
-                scrollY = points[0].second
+                twoFinger = true
+                twoMoved = false
+                twoStart = points[0] to points[1]
+                twoLast = twoStart
+                downMs = tMs
+                scrollAccX = 0
+                scrollAccY = 0
+                origin = null
                 return
             }
             origin = points[0]
             last = points[0]
             dragging = false
             moved = false
+            twoFinger = false
+            downMs = tMs
             return
         }
         if (android) {
@@ -107,18 +126,8 @@ class PointerSession(
                 middle = true
                 return emptyList()
             }
-            if (points.size >= 2) {
-                val originY = scrollY ?: points[0].second.also { scrollY = it }
-                val dy = points[0].second - originY
-                val speed = scrollSpeed.coerceIn(0.25f, 4f)
-                val threshold = (1200f / speed).toInt().coerceIn(200, 4800)
-                if (kotlin.math.abs(dy) < threshold) return emptyList()
-                scrollY = points[0].second
-                var notches = if (dy > 0) -1 else 1
-                if (invertScroll) notches = -notches
-                val scaled = kotlin.math.round(kotlin.math.abs(notches) * speed).toInt().coerceAtLeast(1)
-                val signed = scaled * if (notches < 0) -1 else 1
-                return listOf(Out.Mouse("wheel", cursor.first, cursor.second, signed * 120))
+            if (points.size >= 2 || twoFinger) {
+                return moveTwoFinger(points)
             }
             val from = last ?: points[0]
             val dx = points[0].first - from.first
@@ -128,6 +137,9 @@ class PointerSession(
             val start = origin
             if (start != null && chebyshev(start, points[0]) >= GestureMap.MOVE_THRESHOLD) {
                 moved = true
+                // Movement past slop cancels a pending long-press. A drag
+                // starts only when the user armed a double-tap-and-drag, or
+                // asked for drag-lock, or already held after a long-press.
                 if (!dragging && (dragLock || armed)) {
                     dragging = true
                     out.add(Out.Mouse("down", cursor.first, cursor.second, 0))
@@ -165,23 +177,47 @@ class PointerSession(
                 middle = false
                 origin = null
                 last = null
-                scrollY = null
+                twoStart = null
+                twoFinger = false
                 dragging = false
+                lastWasTap = false
                 return listOf(
                     Out.Mouse("down", cursor.first, cursor.second, 0, "middle"),
                     Out.Mouse("up", cursor.first, cursor.second, 0, "middle"),
                 )
             }
-            scrollY = null
+            if (twoFinger) {
+                val start = twoStart
+                val travelled = twoMoved
+                val held = tMs - downMs
+                twoFinger = false
+                twoStart = null
+                twoLast = null
+                twoMoved = false
+                scrollAccX = 0
+                scrollAccY = 0
+                lastWasTap = false
+                if (start != null && !travelled && held <= GestureMap.TWO_FINGER_TAP_MS) {
+                    return listOf(
+                        Out.Mouse("down", cursor.first, cursor.second, 0, "right"),
+                        Out.Mouse("up", cursor.first, cursor.second, 0, "right"),
+                    )
+                }
+                return emptyList()
+            }
             val had = origin
             origin = null
             last = null
-            if (had == null) return emptyList()
+            if (had == null) {
+                lastWasTap = false
+                return emptyList()
+            }
             val held = dragging
             val travelled = moved
             dragging = false
             moved = false
             armed = false
+            lastWasTap = !held && !travelled
             return when {
                 held -> listOf(Out.Mouse("up", cursor.first, cursor.second, 0))
                 travelled -> emptyList()
@@ -245,11 +281,19 @@ class PointerSession(
     }
 
     fun poll(tMs: Long): Out? {
+        if (relative) {
+            if (!dragging && origin != null && !moved && tMs - downMs >= GestureMap.LONG_PRESS_MS) {
+                dragging = true
+                armed = false
+                return Out.Mouse("down", cursor.first, cursor.second, 0)
+            }
+            return null
+        }
         if (android && !relative) {
             val g = stroke.pollLongPress(tMs) ?: return null
             return Out.Gesture(g)
         }
-        if (!relative && !rightSent && !dragging && origin != null && tMs - downMs >= GestureMap.LONG_PRESS_MS) {
+        if (!rightSent && !dragging && origin != null && tMs - downMs >= GestureMap.LONG_PRESS_MS) {
             rightSent = true
             val at = origin!!
             return Out.Mouse("down", at.first, at.second, 0, "right")
@@ -267,16 +311,56 @@ class PointerSession(
         stroke.cancel()
         pinchStart = null
         pinchLast = null
+        twoStart = null
+        twoLast = null
         origin = null
         last = null
-        scrollY = null
+        scrollAccX = 0
+        scrollAccY = 0
         dragging = false
         moved = false
         armed = false
         middle = false
         twoFinger = false
+        twoMoved = false
         rightSent = false
         return release
+    }
+
+    private fun moveTwoFinger(points: List<Pair<Int, Int>>): List<Out> {
+        if (points.size < 2) return emptyList()
+        val now = points[0] to points[1]
+        val start = twoStart ?: now.also { twoStart = it }
+        val prev = twoLast ?: start
+        twoLast = now
+        twoFinger = true
+        val prevCx = (prev.first.first + prev.second.first) / 2
+        val prevCy = (prev.first.second + prev.second.second) / 2
+        val nowCx = (now.first.first + now.second.first) / 2
+        val nowCy = (now.first.second + now.second.second) / 2
+        scrollAccX += nowCx - prevCx
+        scrollAccY += nowCy - prevCy
+        val travel = maxOf(
+            chebyshev(start.first, now.first),
+            chebyshev(start.second, now.second),
+        )
+        if (travel < GestureMap.SCROLL_SLOP) return emptyList()
+        twoMoved = true
+        val speed = scrollSpeed.coerceIn(0.25f, 4f)
+        val units = (GestureMap.SCROLL_UNITS_PER_NOTCH / speed).toInt().coerceIn(200, 8000)
+        var notchesY = scrollAccY / units
+        var notchesX = scrollAccX / units
+        scrollAccY -= notchesY * units
+        scrollAccX -= notchesX * units
+        // Fingers down (positive Android y) → negative wheel, same as before.
+        if (invertScroll) {
+            notchesY = -notchesY
+            notchesX = -notchesX
+        }
+        val dy = -notchesY * 120
+        val dx = -notchesX * 120
+        if (dx == 0 && dy == 0) return emptyList()
+        return listOf(Out.Mouse("wheel", cursor.first, cursor.second, dy, dx = dx))
     }
 
     private fun scaleDelta(dx: Int, dy: Int): Pair<Int, Int> {
@@ -295,6 +379,6 @@ class PointerSession(
 
     sealed class Out {
         data class Gesture(val gesture: GestureMap.Gesture) : Out()
-        data class Mouse(val kind: String, val x: Int, val y: Int, val dy: Int, val button: String = "left") : Out()
+        data class Mouse(val kind: String, val x: Int, val y: Int, val dy: Int, val button: String = "left", val dx: Int = 0) : Out()
     }
 }

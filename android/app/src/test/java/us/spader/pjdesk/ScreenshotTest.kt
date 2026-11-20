@@ -266,7 +266,7 @@ class ScreenshotTest {
                 frameH = 2400,
             ),
             onGesture = {},
-            onMouse = { _, _, _, _, _ -> },
+            onMouse = { _, _, _, _, _, _ -> },
             onText = {},
             onSpecial = {},
             onKey = { _, _ -> },

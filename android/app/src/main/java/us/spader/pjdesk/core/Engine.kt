@@ -421,7 +421,7 @@ class Engine(context: Context) : EngineListener {
         )
     }
 
-    fun mouse(kind: String, x: Int, y: Int, dy: Int = 0, button: String = "left") {
+    fun mouse(kind: String, x: Int, y: Int, dy: Int = 0, button: String = "left", dx: Int = 0) {
         command(
             JSONObject()
                 .put("cmd", "mouse")
@@ -430,6 +430,7 @@ class Engine(context: Context) : EngineListener {
                 .put("x", x)
                 .put("y", y)
                 .put("dy", dy)
+                .put("dx", dx)
                 .toString(),
         )
     }

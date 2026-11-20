@@ -41,12 +41,19 @@ impl InputInjector {
     }
 
     /// Unicode entry for Translate keyboard mode. Ignored without keyboard permission.
+    /// Control characters that IME or a soft keyboard may send as text are mapped
+    /// to keys, because `SendInput` Unicode injection drops them.
     pub fn text(&mut self, chars: &str) {
         if !self.allow_keyboard {
             return;
         }
         for ch in chars.chars().take(64) {
-            platform::unicode(ch);
+            if let Some(scan) = control_scan(ch) {
+                platform::key(scan, true);
+                platform::key(scan, false);
+            } else {
+                platform::unicode(ch);
+            }
         }
     }
 
@@ -328,5 +335,33 @@ mod platform {
     pub fn unicode(ch: char) -> bool {
         tracing::debug!("unicode {ch}");
         true
+    }
+}
+
+fn control_scan(ch: char) -> Option<u16> {
+    match ch {
+        '\u{0008}' | '\u{007f}' => Some(0x0E),
+        '\t' => Some(0x0F),
+        '\n' | '\r' => Some(0x1C),
+        '\u{001b}' => Some(0x01),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::control_scan;
+
+    #[test]
+    fn control_characters_map_to_keys_and_letters_stay_unicode() {
+        assert_eq!(control_scan('\u{0008}'), Some(0x0E));
+        assert_eq!(control_scan('\u{007f}'), Some(0x0E));
+        assert_eq!(control_scan('\n'), Some(0x1C));
+        assert_eq!(control_scan('\r'), Some(0x1C));
+        assert_eq!(control_scan('\t'), Some(0x0F));
+        assert_eq!(control_scan('\u{001b}'), Some(0x01));
+        assert_eq!(control_scan('a'), None);
+        assert_eq!(control_scan('@'), None);
+        assert_eq!(control_scan('é'), None);
     }
 }

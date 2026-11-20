@@ -44,7 +44,7 @@ class SessionMenuTest {
                         frameH = 1080,
                     ),
                     onGesture = {},
-                    onMouse = { _, _, _, _, _ -> },
+                    onMouse = { _, _, _, _, _, _ -> },
                     onText = {},
                     onSpecial = {},
                     onKey = { _, _ -> },
@@ -60,6 +60,8 @@ class SessionMenuTest {
         rule.onNodeWithContentDescription("Session menu").assertHeightIsAtLeast(56.dp)
         rule.onNodeWithContentDescription("Session settings").assertIsDisplayed()
         rule.onNodeWithContentDescription("Session settings").assertWidthIsAtLeast(56.dp)
+        rule.onNodeWithContentDescription("Keyboard").assertIsDisplayed()
+        rule.onNodeWithContentDescription("Keyboard").assertWidthIsAtLeast(56.dp)
         rule.onNodeWithContentDescription("Session menu").performClick()
         rule.waitForIdle()
         rule.onNodeWithText("Input").assertIsDisplayed()

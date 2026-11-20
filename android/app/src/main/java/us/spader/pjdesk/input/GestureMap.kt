@@ -12,7 +12,14 @@ object GestureMap {
     const val SWIPE: Int = 2
     const val PINCH: Int = 3
     const val MOVE_THRESHOLD: Int = 800
-    const val LONG_PRESS_MS: Long = 500
+    /** Long-press / drag-hold. Must stay inside [MOVE_THRESHOLD]. */
+    const val LONG_PRESS_MS: Long = 700
+    /** Two-finger tap must lift before this to count as a right-click. */
+    const val TWO_FINGER_TAP_MS: Long = 400
+    /** Two-finger travel below this is still a tap, not a scroll. */
+    const val SCROLL_SLOP: Int = 800
+    /** Normalized travel, at scroll speed 1, that yields one 120-unit wheel notch. */
+    const val SCROLL_UNITS_PER_NOTCH: Int = 1000
 
     data class Letterbox(val x: Int, val y: Int, val width: Int, val height: Int)
 

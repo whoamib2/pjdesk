@@ -6,6 +6,7 @@
 package us.spader.pjdesk.ui
 
 import android.app.Activity
+import android.os.SystemClock
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.compose.BackHandler
@@ -30,6 +31,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.systemGestures
@@ -62,8 +65,19 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.PointerEventTimeoutCancellationException
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -87,6 +101,8 @@ import us.spader.pjdesk.core.SessionInfo
 import us.spader.pjdesk.input.GestureMap
 import us.spader.pjdesk.input.PictureView
 import us.spader.pjdesk.input.PointerSession
+import us.spader.pjdesk.input.RemoteTextInput
+import us.spader.pjdesk.input.RemoteTextDelta
 import us.spader.pjdesk.input.SessionKeyDispatch
 import us.spader.pjdesk.media.ScreenDecoder
 
@@ -99,7 +115,7 @@ private class OverlaySpace {
 fun SessionScreen(
     session: SessionInfo,
     onGesture: (GestureMap.Gesture) -> Unit,
-    onMouse: (String, Int, Int, Int, String) -> Unit,
+    onMouse: (String, Int, Int, Int, String, Int) -> Unit,
     onText: (String) -> Unit,
     onSpecial: (Int) -> Unit,
     onKey: (Int, Boolean) -> Unit,
@@ -314,7 +330,7 @@ fun SessionScreen(
                             dispatch(out, onGesture, onMouse)
                         }
                         val now = first.uptimeMillis
-                        val repeat = now - lastTap in 1..280
+                        val repeat = pointer.lastWasTap && now - lastTap in 1..280
                         if (repeat && trackpad && !viewOnly) pointer.armDrag()
                         val doubleTap = repeat && !trackpad
                         if (doubleTap) {
@@ -367,7 +383,14 @@ fun SessionScreen(
                             }
                         }
                         while (true) {
-                            val event = awaitPointerEvent()
+                            val event = try {
+                                withTimeout(50L) { awaitPointerEvent() }
+                            } catch (_: PointerEventTimeoutCancellationException) {
+                                if (sawDown && !zooming && !scrolling && !doubleTap && !viewOnly && fingers < 2) {
+                                    pointer.poll(SystemClock.uptimeMillis())?.let { send(it) }
+                                }
+                                continue
+                            }
                             val pressed = event.changes.filter { it.pressed }
                             if (pressed.size > fingers) fingers = pressed.size
                             if (pressed.size >= 3 && trackpad) {
@@ -389,25 +412,41 @@ fun SessionScreen(
                                         dropPointer()
                                         sawDown = false
                                     }
-                                } else if (trackpad && kotlin.math.abs(span / startSpan - 1f) < 0.08f && !viewOnly) {
-                                    scrolling = true
-                                    val p1 = pointOf(a)
-                                    val p2 = pointOf(b)
-                                    if (p1 != null && p2 != null) {
-                                        if (!sawDown) {
+                                    if (trackpad && !viewOnly) {
+                                        val p1 = pointOf(a)
+                                        val p2 = pointOf(b)
+                                        if (p1 != null && p2 != null) {
                                             pointer.down(pressed[0].uptimeMillis, listOf(p1, p2))
                                             sawDown = true
-                                        } else {
-                                            pointer.move(listOf(p1, p2)).forEach { send(it) }
                                         }
                                     }
-                                } else {
+                                } else if (kotlin.math.abs(span / startSpan - 1f) >= 0.08f) {
+                                    if (trackpad && sawDown && !zooming) {
+                                        pointer.cancel().forEach { send(it) }
+                                        sawDown = false
+                                    }
                                     zooming = true
                                     picture = PictureView.zoomAbout(
                                         viewW, viewH, session.frameW, session.frameH,
                                         startPicture, centroid.x, centroid.y,
                                         startPicture.scale * span / startSpan,
                                     )
+                                    moved += hypot(
+                                        (centroid.x - lastCentroid.x).toDouble(),
+                                        (centroid.y - lastCentroid.y).toDouble(),
+                                    ).toFloat()
+                                    lastCentroid = centroid
+                                } else if (trackpad && !viewOnly) {
+                                    val p1 = pointOf(a)
+                                    val p2 = pointOf(b)
+                                    if (p1 != null && p2 != null) {
+                                        val outs = pointer.move(listOf(p1, p2))
+                                        if (outs.any { it is PointerSession.Out.Mouse && it.kind == "wheel" }) {
+                                            scrolling = true
+                                        }
+                                        outs.forEach { send(it) }
+                                    }
+                                } else {
                                     moved += hypot(
                                         (centroid.x - lastCentroid.x).toDouble(),
                                         (centroid.y - lastCentroid.y).toDouble(),
@@ -469,8 +508,8 @@ fun SessionScreen(
                             }
                             if (pressed.isEmpty()) {
                                 if (fingers >= 3 && trackpad && !viewOnly) {
-                                    onMouse("down", cursor.first, cursor.second, 0, "middle")
-                                    onMouse("up", cursor.first, cursor.second, 0, "middle")
+                                    onMouse("down", cursor.first, cursor.second, 0, "middle", 0)
+                                    onMouse("up", cursor.first, cursor.second, 0, "middle", 0)
                                 } else if (startSpan > 0f && moved < 36f && !trackpad && !scrolling && !viewOnly) {
                                     val point = if (stretch) {
                                         pointOf(lastCentroid)
@@ -481,13 +520,14 @@ fun SessionScreen(
                                         )
                                     }
                                     if (point != null) {
-                                        onMouse("down", point.first, point.second, 0, "right")
-                                        onMouse("up", point.first, point.second, 0, "right")
+                                        onMouse("down", point.first, point.second, 0, "right", 0)
+                                        onMouse("up", point.first, point.second, 0, "right", 0)
                                     }
                                 } else if ((scrolling || !zooming) && !doubleTap && sawDown) {
-                                    pointer.up(event.changes.firstOrNull()?.uptimeMillis ?: now).forEach { send(it) }
+                                    val liftAt = event.changes.firstOrNull()?.uptimeMillis ?: now
+                                    pointer.up(liftAt).forEach { send(it) }
                                     cursor = if (trackpad) pointer.cursorNorm else cursor
-                                    lastTap = event.changes.firstOrNull()?.uptimeMillis ?: now
+                                    lastTap = if (pointer.lastWasTap) liftAt else 0L
                                 }
                                 dropPointer()
                                 break
@@ -640,6 +680,18 @@ fun SessionScreen(
                         )
                     }
                 }
+                HitButton(
+                    description = "Keyboard",
+                    space = space,
+                    padId = "keyboard",
+                    color = if (remote.showKeyBar) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)
+                    },
+                    pressedColor = MaterialTheme.colorScheme.primary,
+                    onClick = { onRemote(remote.copy(showKeyBar = !remote.showKeyBar)) },
+                ) { Mark("keyboard") }
                 HitButton(
                     description = "Session settings",
                     space = space,
@@ -910,11 +962,11 @@ private fun CursorMark(x: Float, y: Float) {
 private fun dispatch(
     out: PointerSession.Out,
     onGesture: (GestureMap.Gesture) -> Unit,
-    onMouse: (String, Int, Int, Int, String) -> Unit,
+    onMouse: (String, Int, Int, Int, String, Int) -> Unit,
 ) {
     when (out) {
         is PointerSession.Out.Gesture -> onGesture(out.gesture)
-        is PointerSession.Out.Mouse -> onMouse(out.kind, out.x, out.y, out.dy, out.button)
+        is PointerSession.Out.Mouse -> onMouse(out.kind, out.x, out.y, out.dy, out.button, out.dx)
     }
 }
 
@@ -925,8 +977,43 @@ private fun ModifierBar(
     onKey: (Int, Boolean) -> Unit,
     onClose: () -> Unit,
 ) {
-    var typed by remember { mutableStateOf("") }
+    var typed by remember { mutableStateOf(TextFieldValue("")) }
     var held by remember { mutableStateOf(setOf<Int>()) }
+    val input = remember { RemoteTextInput() }
+    val focus = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(Unit) {
+        focus.requestFocus()
+        keyboard?.show()
+    }
+    fun emit(delta: RemoteTextDelta) {
+        if (delta.isEmpty) return
+        repeat(delta.backspaces) {
+            onKey(0x0E, true)
+            onKey(0x0E, false)
+        }
+        if (delta.text.isEmpty()) return
+        if (held.isNotEmpty()) {
+            for (ch in delta.text) {
+                val scan = RemoteTextInput.scanForChar(ch)
+                if (scan != null) {
+                    val needShift = ch.isUpperCase() && !held.contains(0x2A)
+                    if (needShift) onKey(0x2A, true)
+                    onKey(scan, true)
+                    onKey(scan, false)
+                    if (needShift) onKey(0x2A, false)
+                } else {
+                    onText(ch.toString())
+                }
+            }
+        } else {
+            onText(delta.text)
+        }
+    }
+    fun pulse(scan: Int) {
+        onKey(scan, true)
+        onKey(scan, false)
+    }
     Surface(
         modifier = modifier.padding(8.dp),
         shape = RoundedCornerShape(16.dp),
@@ -955,10 +1042,7 @@ private fun ModifierBar(
                 WinKeys.forEach { (label, scan) ->
                     androidx.compose.material3.FilterChip(
                         selected = false,
-                        onClick = {
-                            onKey(scan, true)
-                            onKey(scan, false)
-                        },
+                        onClick = { pulse(scan) },
                         label = { Text(label) },
                     )
                 }
@@ -967,19 +1051,69 @@ private fun ModifierBar(
                 androidx.compose.material3.OutlinedTextField(
                     value = typed,
                     onValueChange = { next ->
-                        val added = if (next.length >= typed.length && next.startsWith(typed)) {
-                            next.removePrefix(typed)
-                        } else {
-                            "\u0008".repeat((typed.length - next.length).coerceAtLeast(1))
-                        }
-                        if (added.isNotEmpty()) onText(added)
+                        val composing = next.composition != null
+                        input.onField(next.text, composing)?.let { emit(it) }
                         typed = next
                     },
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier
+                        .weight(1f)
+                        .focusRequester(focus)
+                        .onPreviewKeyEvent { event ->
+                            if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                            when (event.key) {
+                                Key.Enter, Key.NumPadEnter -> {
+                                    pulse(0x1C)
+                                    true
+                                }
+                                Key.Tab -> {
+                                    pulse(0x0F)
+                                    true
+                                }
+                                Key.Escape -> {
+                                    pulse(0x01)
+                                    true
+                                }
+                                Key.DirectionUp -> {
+                                    pulse(0xE048)
+                                    true
+                                }
+                                Key.DirectionDown -> {
+                                    pulse(0xE050)
+                                    true
+                                }
+                                Key.DirectionLeft -> {
+                                    pulse(0xE04B)
+                                    true
+                                }
+                                Key.DirectionRight -> {
+                                    pulse(0xE04D)
+                                    true
+                                }
+                                Key.Backspace -> {
+                                    if (typed.composition != null) {
+                                        false
+                                    } else if (typed.text.isEmpty()) {
+                                        pulse(0x0E)
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                else -> false
+                            }
+                        },
                     singleLine = true,
                     label = { Text("Type") },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+                    keyboardActions = KeyboardActions(onGo = { pulse(0x1C) }),
                 )
-                androidx.compose.material3.IconButton(onClick = { onText("\n"); typed = "" }) { Mark("enter") }
+                androidx.compose.material3.IconButton(
+                    onClick = {
+                        pulse(0x1C)
+                        typed = TextFieldValue("")
+                        input.reset()
+                    },
+                ) { Mark("enter") }
                 androidx.compose.material3.IconButton(onClick = onClose) { Mark("end") }
             }
         }
@@ -1021,6 +1155,7 @@ private fun Mark(kind: String) {
 private val WinKeys = listOf(
     "Esc" to 0x01,
     "Tab" to 0x0F,
+    "Bksp" to 0x0E,
     "↑" to 0xE048,
     "↓" to 0xE050,
     "←" to 0xE04B,
