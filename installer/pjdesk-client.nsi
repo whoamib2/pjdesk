@@ -151,6 +151,7 @@ Section "PJDesk (required)" SecCore
 
   CreateDirectory "$SMPROGRAMS\${APPNAME}"
   CreateShortcut "$SMPROGRAMS\${APPNAME}\PJDesk.lnk" "$INSTDIR\${EXE}"
+  CreateShortcut "$SMPROGRAMS\${APPNAME}\PJDesk Chat.lnk" "$INSTDIR\${EXE}" "" "$INSTDIR\${EXE}" 1
   CreateShortcut "$SMPROGRAMS\${APPNAME}\Uninstall PJDesk.lnk" "$INSTDIR\uninstall.exe"
 
   WriteRegStr HKLM "${ARP}" "DisplayName" "${APPNAME}"
@@ -211,6 +212,7 @@ Section "Uninstall"
   RMDir "$INSTDIR"
 
   Delete "$SMPROGRAMS\${APPNAME}\PJDesk.lnk"
+  Delete "$SMPROGRAMS\${APPNAME}\PJDesk Chat.lnk"
   Delete "$SMPROGRAMS\${APPNAME}\Uninstall PJDesk.lnk"
   RMDir "$SMPROGRAMS\${APPNAME}"
   Delete "$DESKTOP\PJDesk.lnk"
