@@ -876,6 +876,21 @@ mod tests {
         assert!(!version_is_behind("0.6.44", "0.6.44"));
         assert!(!version_is_behind("0.6.43", ""));
         assert!(is_newer("0.5.2", "0.6.0"));
+        // Numeric (major, minor, patch) compare, not string compare. Windows
+        // client, Windows Server, and Android all use is_newer from here, so
+        // 0.6.99 must treat 0.7.0 as newer. ("0.7.0" > "0.6.99" also happens
+        // to be true as strings because '7' > '6'; 0.10.0 after 0.9.9 would
+        // not.)
+        assert!(is_newer("0.6.99", "0.7.0"));
+        assert!(is_newer("0.6.99", "v0.7.0"));
+        assert!(!is_newer("0.7.0", "0.6.99"));
+        assert!(!is_newer("0.7.0", "0.7.0"));
+        assert!(version_is_behind("0.6.99", "0.7.0"));
+        assert!(!version_is_behind("0.7.0", "0.6.99"));
+        assert!(version_at_least("0.7.0", "0.6.99"));
+        assert!(!version_at_least("0.6.99", "0.7.0"));
+        assert!(is_newer("0.9.9", "0.10.0"));
+        assert!(!is_newer("0.10.0", "0.9.9"));
         assert!(version_at_least("0.4.1", "0.4.0"));
         assert!(version_at_least("0.4.0", "0.4.0"));
         assert!(!version_at_least("0.4.0-rc1", "0.4.0"));

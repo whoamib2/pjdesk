@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.0
+
+- Fixed: the chat window now shows the blue chat-bubble icon in the taskbar, because that identity is applied to the real chat window rather than a hidden helper window.
+- New: a Start menu shortcut named PJDesk Chat, so Windows can use the chat-bubble icon for that button.
+
 ## 0.6.99
 
 - Fixed: the chat window's taskbar button now shows the chat-bubble icon instead of a generic window icon.
