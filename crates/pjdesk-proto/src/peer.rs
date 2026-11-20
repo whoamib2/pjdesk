@@ -163,6 +163,61 @@ pub fn cursor_shapes_supported(version: &str) -> bool {
 /// Largest pointer image a host sends (per side, pixels).
 pub const CURSOR_MAX_SIDE: u16 = 128;
 
+/// High bit of [`HostMsg::CursorShape::id`]: the low byte names a
+/// [`StandardCursor`]. Older viewers ignore `id` and still use `rgba`.
+pub const CURSOR_STANDARD_FLAG: u64 = 1 << 63;
+
+/// A well-known system pointer the host can name so the viewer uses its own
+/// native cursor (resize arrows, I-beam, and so on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StandardCursor {
+    Arrow = 1,
+    IBeam = 2,
+    Wait = 3,
+    Cross = 4,
+    UpArrow = 5,
+    SizeNwse = 6,
+    SizeNesw = 7,
+    SizeWe = 8,
+    SizeNs = 9,
+    SizeAll = 10,
+    No = 11,
+    Hand = 12,
+    AppStarting = 13,
+    Help = 14,
+}
+
+/// Encodes `kind` into a [`HostMsg::CursorShape::id`] that older viewers ignore.
+pub fn standard_cursor_id(kind: StandardCursor) -> u64 {
+    CURSOR_STANDARD_FLAG | kind as u8 as u64
+}
+
+/// Reads a [`StandardCursor`] named in a [`HostMsg::CursorShape::id`].
+pub fn standard_cursor(id: u64) -> Option<StandardCursor> {
+    if id & CURSOR_STANDARD_FLAG == 0 {
+        return None;
+    }
+    match (id & 0xff) as u8 {
+        1 => Some(StandardCursor::Arrow),
+        2 => Some(StandardCursor::IBeam),
+        3 => Some(StandardCursor::Wait),
+        4 => Some(StandardCursor::Cross),
+        5 => Some(StandardCursor::UpArrow),
+        6 => Some(StandardCursor::SizeNwse),
+        7 => Some(StandardCursor::SizeNesw),
+        8 => Some(StandardCursor::SizeWe),
+        9 => Some(StandardCursor::SizeNs),
+        10 => Some(StandardCursor::SizeAll),
+        11 => Some(StandardCursor::No),
+        12 => Some(StandardCursor::Hand),
+        13 => Some(StandardCursor::AppStarting),
+        14 => Some(StandardCursor::Help),
+        _ => None,
+    }
+}
+
+
 /// [`ControlMsg::View`] mode: one display, the one named by `display`.
 pub const VIEW_SINGLE: u8 = 0;
 /// [`ControlMsg::View`] mode: every display, stitched at its real position.
@@ -1067,6 +1122,34 @@ mod cursor_shape_tests {
         let chat = postcard::to_allocvec(&ControlMsg::ChatLine { text: String::new(), name: String::new(), unix: 0 }).unwrap();
         let shapes = postcard::to_allocvec(&ControlMsg::CursorShapes).unwrap();
         assert_eq!(shapes[0], chat[0] + 1);
+    }
+
+    #[test]
+    fn a_standard_pointer_id_uses_the_high_bit_and_keeps_rgba() {
+        let id = standard_cursor_id(StandardCursor::SizeNwse);
+        assert_eq!(standard_cursor(id), Some(StandardCursor::SizeNwse));
+        assert!(id & CURSOR_STANDARD_FLAG != 0);
+        assert_eq!(standard_cursor(1), None);
+        assert_eq!(standard_cursor(CURSOR_STANDARD_FLAG | 99), None);
+        let rgba = vec![0u8, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 255];
+        let msg = HostMsg::CursorShape {
+            id,
+            width: 2,
+            height: 2,
+            hot_x: 0,
+            hot_y: 0,
+            rgba: rgba.clone(),
+        };
+        let bytes = postcard::to_allocvec(&msg).unwrap();
+        match postcard::from_bytes::<HostMsg>(&bytes).unwrap() {
+            HostMsg::CursorShape { id: got, width, height, rgba: got_rgba, .. } => {
+                assert_eq!(got, id);
+                assert_eq!((width, height), (2, 2));
+                assert_eq!(got_rgba, rgba);
+                assert_eq!(standard_cursor(got), Some(StandardCursor::SizeNwse));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
 

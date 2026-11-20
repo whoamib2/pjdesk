@@ -62,6 +62,17 @@ pub struct Transfer {
 /// from the partial file after the reconnect, or with Resume.
 pub const INTERRUPTED: &str = "interrupted";
 
+/// The host's current mouse pointer, as sent in [`pjdesk_proto::peer::HostMsg::CursorShape`].
+#[derive(Clone)]
+pub struct RemotePointer {
+    pub id: u64,
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub rgba: std::sync::Arc<Vec<u8>>,
+}
+
 pub struct Live {
     pub v3: bool,
     pub perms: u32,
@@ -85,9 +96,10 @@ pub struct Live {
     pub chat_ready: bool,
     /// The host's PJDesk version from PeerVersion, empty until it arrives.
     pub peer_version: String,
-    /// 0.6.86 host pointer image (w, h, hot_x, hot_y, rgba); w == 0 hidden.
-    /// `pointer_serial` counts changes so the window applies each once.
-    pub pointer: Option<(u16, u16, u16, u16, std::sync::Arc<Vec<u8>>)>,
+    /// 0.6.86 host pointer; w == 0 hidden. `id` may name a standard system
+    /// cursor (see [`pjdesk_proto::peer::standard_cursor`]). `pointer_serial`
+    /// counts changes so the window applies each once.
+    pub pointer: Option<RemotePointer>,
     pub pointer_serial: u64,
     /// Messages that arrived while the chat panel was closed.
     pub chat_unread: u32,
@@ -679,12 +691,21 @@ fn on_host(
                 let _ = control.send(ControlMsg::CursorShapes);
             }
         }
-        HostMsg::CursorShape { width, height, hot_x, hot_y, rgba, .. } => {
+        HostMsg::CursorShape { id, width, height, hot_x, hot_y, rgba } => {
             if width == 0 {
-                g.pointer = Some((0, 0, 0, 0, std::sync::Arc::new(Vec::new())));
+                g.pointer = Some(RemotePointer {
+                    id: 0,
+                    width: 0,
+                    height: 0,
+                    hot_x: 0,
+                    hot_y: 0,
+                    rgba: std::sync::Arc::new(Vec::new()),
+                });
                 g.pointer_serial += 1;
-            } else if pjdesk_proto::peer::cursor_shape_valid(width, height, hot_x, hot_y, &rgba) {
-                g.pointer = Some((width, height, hot_x, hot_y, std::sync::Arc::new(rgba)));
+            } else if pjdesk_proto::peer::standard_cursor(id).is_some()
+                || pjdesk_proto::peer::cursor_shape_valid(width, height, hot_x, hot_y, &rgba)
+            {
+                g.pointer = Some(RemotePointer { id, width, height, hot_x, hot_y, rgba: std::sync::Arc::new(rgba) });
                 g.pointer_serial += 1;
             }
         }

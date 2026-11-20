@@ -39,6 +39,43 @@ use super::toolbar::{self, Action, Combo};
 use super::{keymap, Link};
 use pjdesk_proto::peer::SpecialCommand;
 
+
+/// The host pointer currently shown as this window's OS cursor.
+enum AppliedPointer {
+    Default,
+    Icon(winit::window::CursorIcon),
+    Custom(CustomCursor),
+}
+
+impl AppliedPointer {
+    fn apply(&self, window: &Window) {
+        match self {
+            Self::Default => window.set_cursor(winit::window::CursorIcon::Default),
+            Self::Icon(icon) => window.set_cursor(*icon),
+            Self::Custom(cursor) => window.set_cursor(cursor.clone()),
+        }
+    }
+}
+
+fn standard_cursor_icon(id: u64) -> Option<winit::window::CursorIcon> {
+    use pjdesk_proto::peer::StandardCursor;
+    Some(match pjdesk_proto::peer::standard_cursor(id)? {
+        StandardCursor::Arrow | StandardCursor::UpArrow => winit::window::CursorIcon::Default,
+        StandardCursor::IBeam => winit::window::CursorIcon::Text,
+        StandardCursor::Wait => winit::window::CursorIcon::Wait,
+        StandardCursor::Cross => winit::window::CursorIcon::Crosshair,
+        StandardCursor::SizeNwse => winit::window::CursorIcon::NwseResize,
+        StandardCursor::SizeNesw => winit::window::CursorIcon::NeswResize,
+        StandardCursor::SizeWe => winit::window::CursorIcon::EwResize,
+        StandardCursor::SizeNs => winit::window::CursorIcon::NsResize,
+        StandardCursor::SizeAll => winit::window::CursorIcon::AllScroll,
+        StandardCursor::No => winit::window::CursorIcon::NotAllowed,
+        StandardCursor::Hand => winit::window::CursorIcon::Pointer,
+        StandardCursor::AppStarting => winit::window::CursorIcon::Progress,
+        StandardCursor::Help => winit::window::CursorIcon::Help,
+    })
+}
+
 /// Events delivered to the window from other threads.
 #[derive(Debug)]
 enum UserEvent {
@@ -404,6 +441,7 @@ pub fn run(runtime: &Runtime, link: Link, mut seed: Seed) -> Result<ViewerStop> 
         pan_at: Instant::now(),
         dot_cursor: None,
         pointer_applied: 0,
+        applied_pointer: AppliedPointer::Default,
         separate_pick: None,
         edge_cursor: false,
         last_title_click: None,
@@ -730,6 +768,8 @@ struct App {
     dot_cursor: Option<winit::window::CustomCursor>,
     /// Last `pointer_serial` from the host that was applied (0.6.86 hosts).
     pointer_applied: u64,
+    /// The pointer last applied from the host, restored after a local edge resize.
+    applied_pointer: AppliedPointer,
     /// "Open in new window" from the screen picker: only these screens get a
     /// window. `None` is the full separate-windows view (one per screen).
     separate_pick: Option<Vec<u8>>,
@@ -1526,11 +1566,7 @@ impl App {
             }
             if self.edge_cursor {
                 self.edge_cursor = false;
-                if let Some(dot) = &self.dot_cursor {
-                    window.set_cursor(dot.clone());
-                } else {
-                    window.set_cursor(winit::window::CursorIcon::Default);
-                }
+                self.applied_pointer.apply(&window);
                 window.set_cursor_visible(true);
             }
         }
@@ -2170,13 +2206,14 @@ impl App {
         if !sized {
             Self::center_default(&window);
         }
-        if let Some(pointer) = self.dot_cursor.clone().filter(|_| self.pointer_applied > 0) {
-            window.set_cursor(pointer);
+        if self.pointer_applied > 0 {
+            self.applied_pointer.apply(&window);
             window.set_cursor_visible(true);
         } else if let Ok(source) = CustomCursor::from_rgba(dot_cursor(), 5, 5, 2, 2) {
             let dot = event_loop.create_custom_cursor(source);
-            window.set_cursor(dot.clone());
-            self.dot_cursor = Some(dot);
+            self.dot_cursor = Some(dot.clone());
+            self.applied_pointer = AppliedPointer::Custom(dot.clone());
+            window.set_cursor(dot);
         }
         let Ok(context) = softbuffer::Context::new(window.clone()) else { return };
         let Ok(surface) = softbuffer::Surface::new(&context, window.clone()) else { return };
@@ -2225,24 +2262,31 @@ impl App {
             return;
         }
         self.pointer_applied = serial;
-        let Some((w, h, hx, hy, rgba)) = pointer else { return };
+        let Some(pointer) = pointer else { return };
         let windows = self.pointer_windows();
-        if w > 0 {
-            match CustomCursor::from_rgba(rgba.as_ref().clone(), w, h, hx, hy) {
+        if let Some(icon) = standard_cursor_icon(pointer.id) {
+            self.applied_pointer = AppliedPointer::Icon(icon);
+        } else if pointer.width > 0 {
+            match CustomCursor::from_rgba(
+                pointer.rgba.as_ref().clone(),
+                pointer.width,
+                pointer.height,
+                pointer.hot_x,
+                pointer.hot_y,
+            ) {
                 Ok(source) => {
                     let cursor = event_loop.create_custom_cursor(source);
                     self.dot_cursor = Some(cursor.clone());
-                    if !self.edge_cursor {
-                        for window in &windows {
-                            window.set_cursor(cursor.clone());
-                        }
-                    }
+                    self.applied_pointer = AppliedPointer::Custom(cursor);
                 }
                 Err(e) => tracing::debug!("host pointer image refused: {e}"),
             }
-        } else if self.dot_cursor.is_none() && !self.edge_cursor {
+        } else if matches!(self.applied_pointer, AppliedPointer::Default) {
+            self.applied_pointer = AppliedPointer::Icon(winit::window::CursorIcon::Default);
+        }
+        if !self.edge_cursor {
             for window in &windows {
-                window.set_cursor(winit::window::CursorIcon::Default);
+                self.applied_pointer.apply(window);
             }
         }
         for window in &windows {
@@ -3557,7 +3601,10 @@ impl ApplicationHandler<UserEvent> for App {
         window.focus_window();
         window.request_user_attention(Some(UserAttentionType::Critical));
         if let Ok(source) = CustomCursor::from_rgba(dot_cursor(), 5, 5, 2, 2) {
-            window.set_cursor(event_loop.create_custom_cursor(source));
+            let dot = event_loop.create_custom_cursor(source);
+            self.dot_cursor = Some(dot.clone());
+            self.applied_pointer = AppliedPointer::Custom(dot.clone());
+            window.set_cursor(dot);
         }
         let surface = softbuffer::Context::new(window.clone())
             .and_then(|context| softbuffer::Surface::new(&context, window.clone()));
