@@ -2487,7 +2487,7 @@ impl App {
             return;
         }
         let label = self.row_title(&id);
-        self.status = format!("Waiting for {label} to accept");
+        self.status = pjdesk_proto::consent::WAITING.to_string();
         self.ask_view_label = label;
         self.ask_view_next = true;
         self.spawn_viewer(&id, "", false, false, false);
@@ -3084,7 +3084,7 @@ impl App {
     /// `consent.json` for this window.
     fn consent_prompt(&mut self, ctx: &egui::Context) {
         let shared = self.engine.shared.pending_consent();
-        let file = read_service_consent();
+        let file = read_service_consent().filter(|ask| !service_consent_answered(ask.id));
         let (from, ip, id, from_file, offered) = if let Some(ask) = shared {
             (ask.from, ask.ip, ask.id, false, ask.offered)
         } else if let Some(ask) = file {
@@ -3207,6 +3207,12 @@ fn read_service_consent() -> Option<ServiceConsent> {
     let path = crate::syspaths::service_dir().join("consent.json");
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn service_consent_answered(id: u64) -> bool {
+    let path = crate::syspaths::service_dir().join("consent-reply.json");
+    let Ok(bytes) = std::fs::read(path) else { return false };
+    serde_json::from_slice::<crate::host::ConsentReply>(&bytes).ok().is_some_and(|reply| reply.id == id)
 }
 
 fn write_service_consent(id: u64, offered: u32, accept: bool) {

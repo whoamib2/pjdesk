@@ -4096,9 +4096,8 @@ async fn controller_session(
             }
         }
         let authed = if ask_person {
-            let who = if host_name.trim().is_empty() { format_id(target) } else { host_name.clone() };
-            emit(&cb, &json!({"event":"status","text": format!("Waiting for {who} to accept…")}));
-            let asked = session::controller_ask_person_for(&connection, &label, Duration::from_secs(60));
+            emit(&cb, &json!({"event":"status","text": pjdesk_proto::consent::WAITING}));
+            let asked = session::controller_ask_person_for(&connection, &label, pjdesk_proto::consent::WAIT);
             tokio::pin!(asked);
             let result = loop {
                 tokio::select! {

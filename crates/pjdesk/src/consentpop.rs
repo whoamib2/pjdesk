@@ -22,16 +22,22 @@ pub struct ConsentPop {
     dir: PathBuf,
     child: Option<Child>,
     id: u64,
+    /// Set after Allow or Decline so the same request cannot open another popup.
+    answered: Option<u64>,
 }
 
 impl ConsentPop {
     pub fn new() -> ConsentPop {
         let dir = std::env::temp_dir().join(format!("pjdesk-consent-{}", std::process::id()));
-        ConsentPop { dir, child: None, id: 0 }
+        ConsentPop { dir, child: None, id: 0, answered: None }
     }
 
     /// Shows the popup for this request. A new id replaces the old popup.
+    /// After Allow or Decline for this id, it stays closed.
     pub fn show(&mut self, ask: &Ask) {
+        if self.answered == Some(ask.id) {
+            return;
+        }
         if self.id == ask.id && self.child.is_some() {
             return;
         }
@@ -66,7 +72,11 @@ impl ConsentPop {
         let text = std::fs::read_to_string(&path).ok()?;
         let _ = std::fs::remove_file(&path);
         let allow = text.trim().trim_matches('"') == "allow";
-        self.close();
+        self.answered = Some(self.id);
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         Some(allow)
     }
 
@@ -78,6 +88,7 @@ impl ConsentPop {
         }
         let _ = std::fs::remove_file(self.dir.join("ask.json"));
         self.id = 0;
+        self.answered = None;
     }
 
     pub fn id(&self) -> u64 {
@@ -196,5 +207,12 @@ mod tests {
         super::answer(&pop.dir, true);
         assert_eq!(pop.take_answer(), Some(true));
         assert_eq!(pop.take_answer(), None);
+        pop.show(&super::Ask { id: 7, from: "OMAS-DESKTOP".into(), ip: "10.0.0.2".into() });
+        assert_eq!(pop.take_answer(), None, "Allow already recorded; do not open another popup");
+        pop.close();
+        pop.show(&super::Ask { id: 8, from: "OMAS-DESKTOP".into(), ip: "10.0.0.2".into() });
+        assert_eq!(pop.id(), 8);
+        super::answer(&pop.dir, false);
+        assert_eq!(pop.take_answer(), Some(false));
     }
 }

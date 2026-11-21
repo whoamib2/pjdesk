@@ -122,6 +122,9 @@ pub fn run(server: ServerAddr, mut config: Config, args: ConnectArgs) -> Result<
             }
             Err(e) if waiting && tries < 40 => {
                 let text = format!("{e:#}");
+                if pjdesk_proto::failover::session_refusal(&text).is_some() {
+                    return Err(e);
+                }
                 if pjdesk_proto::signal::is_standby_refusal(&text) {
                     tracing::info!("failover: standby has not taken over; trying the primary again");
                     prefer_standby = false;
@@ -773,7 +776,7 @@ async fn connect(
     let mut attempt = if ask_view {
         let label = std::env::var("PJDESK_PEER_LABEL").unwrap_or_default();
         let label = if label.trim().is_empty() { host_name.clone() } else { label };
-        crate::note_status(&format!("Waiting for {label} to accept"));
+        crate::note_status(pjdesk_proto::consent::WAITING);
         Asked::View
     } else if ask_person {
         Asked::Person
@@ -821,8 +824,8 @@ async fn connect(
             Asked::Person => {
                 tracing::info!("Asking the person at {}", format_id(target));
                 let who = if host_name.trim().is_empty() { format_id(target) } else { host_name.clone() };
-                crate::note_status(&format!("Waiting for {who} to accept..."));
-                session::controller_ask_person_for(&connection, &presenter_name(), std::time::Duration::from_secs(60)).await
+                crate::note_status(pjdesk_proto::consent::WAITING);
+                session::controller_ask_person_for(&connection, &presenter_name(), pjdesk_proto::consent::WAIT).await
             }
             Asked::Password(password) => {
                 tracing::info!("Checking the password with {}", format_id(target));
@@ -1051,7 +1054,7 @@ async fn connect_direct(
         }
     }
     let authed = match &asked {
-        Asked::Person => session::controller_ask_person_for(&connection, &presenter_name(), std::time::Duration::from_secs(60)).await,
+        Asked::Person => session::controller_ask_person_for(&connection, &presenter_name(), pjdesk_proto::consent::WAIT).await,
         Asked::View => {
             let account = signed_in_account(config);
             let id = config.device_id.clone().unwrap_or_default();

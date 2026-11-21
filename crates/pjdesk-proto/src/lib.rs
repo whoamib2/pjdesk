@@ -17,6 +17,7 @@
 pub mod access;
 pub mod account_mirror;
 pub mod applock;
+pub mod consent;
 pub mod failover;
 pub mod routes;
 pub mod netkey;

@@ -114,6 +114,10 @@ pub struct ConsentAsk {
     /// Permission bits the person may grant.
     #[allow(dead_code)]
     pub offered: u32,
+    /// Live session_inner / direct waits sharing this popup.
+    waiters: u32,
+    /// When this popup was first shown. Reconnects keep this clock.
+    started: Instant,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -228,30 +232,92 @@ impl HostShared {
     }
 
     pub fn begin_consent(&self, from: &str, ip: &str, offered: u32) -> u64 {
+        let mut slot = self.consent.lock().unwrap();
+        if let Some(ask) = slot.as_mut() {
+            if pjdesk_proto::consent::reuse_pending(&ask.from, from) {
+                ask.waiters = ask.waiters.saturating_add(1);
+                return ask.id;
+            }
+        }
         let id = self.consent_seq.fetch_add(1, Ordering::SeqCst) + 1;
         *self.consent_reply.lock().unwrap() = None;
-        *self.consent.lock().unwrap() = Some(ConsentAsk { id, from: from.to_string(), ip: ip.to_string(), offered });
+        *slot = Some(ConsentAsk {
+            id,
+            from: from.to_string(),
+            ip: ip.to_string(),
+            offered,
+            waiters: 1,
+            started: Instant::now(),
+        });
         id
     }
 
+    /// The Allow or Decline already recorded for this popup, left in place so a
+    /// second wait from the same viewer can use it too.
+    pub fn reply_for(&self, id: u64) -> Option<ConsentReply> {
+        self.consent_reply.lock().unwrap().as_ref().filter(|r| r.id == id).cloned()
+    }
+
     pub fn take_reply(&self, id: u64) -> Option<ConsentReply> {
-        let mut slot = self.consent_reply.lock().unwrap();
-        if slot.as_ref().is_some_and(|r| r.id == id) {
-            slot.take()
-        } else {
-            None
-        }
+        self.reply_for(id)
     }
 
     pub fn clear_consent(&self, id: u64) {
         let mut slot = self.consent.lock().unwrap();
         if slot.as_ref().is_some_and(|c| c.id == id) {
             *slot = None;
+            *self.consent_reply.lock().unwrap() = None;
+        }
+    }
+
+    /// A waiter finished. The popup stays when the same viewer may reconnect,
+    /// or when Allow/Decline still has to be read by another waiter.
+    pub fn end_consent_wait(&self, id: u64, keep_prompt: bool) {
+        let mut slot = self.consent.lock().unwrap();
+        let Some(ask) = slot.as_mut().filter(|ask| ask.id == id) else { return };
+        ask.waiters = ask.waiters.saturating_sub(1);
+        let idle = ask.waiters == 0;
+        drop(slot);
+        if !idle {
+            return;
+        }
+        if !keep_prompt || self.reply_for(id).is_some_and(|reply| !reply.accept) {
+            self.clear_consent(id);
         }
     }
 
     pub fn pending_consent(&self) -> Option<ConsentAsk> {
+        self.expire_consent();
+        if self.consent_reply.lock().unwrap().is_some() {
+            return None;
+        }
         self.consent.lock().unwrap().clone()
+    }
+
+    /// Allow succeeded: hide the popup for this viewer.
+    pub fn clear_prompt_for(&self, from: &str) {
+        let id = self
+            .consent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|ask| pjdesk_proto::consent::same_viewer(&ask.from, from))
+            .map(|ask| ask.id);
+        if let Some(id) = id {
+            self.clear_consent(id);
+        }
+    }
+
+    fn expire_consent(&self) {
+        let (id, stale) = {
+            let slot = self.consent.lock().unwrap();
+            let Some(ask) = slot.as_ref() else { return };
+            let has_reply = self.consent_reply.lock().unwrap().as_ref().is_some_and(|r| r.id == ask.id);
+            (ask.id, pjdesk_proto::consent::stale_prompt(ask.waiters, has_reply, ask.started.elapsed()))
+        };
+        if stale {
+            self.clear_consent(id);
+        }
     }
 
     /// The window's Allow or Decline. `offered` bits are granted on Allow.
@@ -1671,7 +1737,7 @@ async fn session_inner(
         state.note_success(&source);
     }
     let (mut ceiling, receive_dir) =
-        open_session(state, &mut auth, &passwords, permanent.as_deref(), controller_name, controller_ip, true).await?;
+        open_session(state, &mut auth, &passwords, permanent.as_deref(), controller_name, controller_ip, true, &connection).await?;
 
     // Authenticated: this session takes the screen, unless another one got there first.
     state.pending.fetch_sub(1, Ordering::SeqCst);
@@ -1840,6 +1906,9 @@ enum Person {
     No,
     TimedOut,
     Unavailable,
+    /// The peer connection closed while the prompt was still up. The popup
+    /// stays so a retry from the same viewer can use a click already given.
+    Dropped,
 }
 
 async fn open_session(
@@ -1850,6 +1919,7 @@ async fn open_session(
     controller_name: &str,
     controller_ip: &str,
     via_server: bool,
+    connection: &Connection,
 ) -> Result<(u32, String)> {
     if auth.password_slot != ASK_SLOT {
         let support = state.support_password.lock().unwrap().clone();
@@ -1887,9 +1957,13 @@ async fn open_session(
     } else {
         controller_name
     };
-    match approve(state, who, controller_ip).await {
+    match approve(state, who, controller_ip, connection).await {
         Person::Yes(bits, dir) => {
             grant_auth(&mut auth.send, &state.name).await?;
+            if let Some(shared) = &state.shared {
+                shared.clear_prompt_for(who);
+            }
+            clear_service_consent_files();
             state.note_support_connection(via_server, controller_name);
             Ok((bits, dir))
         }
@@ -1907,6 +1981,9 @@ async fn open_session(
             let message = "No one is available to accept";
             let _ = refuse_auth(&mut auth.send, message).await;
             bail!(message)
+        }
+        Person::Dropped => {
+            bail!("the other computer closed the connection while waiting for Allow")
         }
     }
 }
@@ -1950,29 +2027,33 @@ fn platform_init() {
 /// Asks the person at this computer. Called only after a password was accepted
 /// and the host's mode still requires approval, or the controller chose
 /// "Ask the person instead". A timeout is not a decline.
-async fn approve(state: &Arc<HostState>, name: &str, ip: &str) -> Person {
+async fn approve(state: &Arc<HostState>, name: &str, ip: &str, connection: &Connection) -> Person {
     let policy = state.policy.lock().unwrap().clone();
     if let Some(shared) = &state.shared {
         if !state.args.service_host {
             let id = shared.begin_consent(name, ip, policy.max_permissions);
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-            loop {
-                if let Some(reply) = shared.take_reply(id) {
-                    shared.clear_consent(id);
-                    return match consent_grant(&policy, reply) {
+            let deadline = tokio::time::Instant::now() + pjdesk_proto::consent::WAIT;
+            let outcome = loop {
+                if let Some(reply) = shared.reply_for(id) {
+                    break match consent_grant(&policy, reply) {
                         Some(answer) => Person::Yes(answer.0, answer.1),
                         None => Person::No,
                     };
                 }
+                if connection.close_reason().is_some() {
+                    break Person::Dropped;
+                }
                 if tokio::time::Instant::now() >= deadline {
-                    shared.clear_consent(id);
-                    return Person::TimedOut;
+                    break Person::TimedOut;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
-            }
+            };
+            let keep = matches!(outcome, Person::Yes(_, _) | Person::No | Person::Dropped);
+            shared.end_consent_wait(id, keep);
+            return outcome;
         }
     }
-    service_consent(state, name, ip, policy.max_permissions).await
+    service_consent(state, name, ip, policy.max_permissions, connection).await
 }
 
 fn consent_grant(policy: &Policy, reply: ConsentReply) -> Option<(u32, String)> {
@@ -2009,7 +2090,13 @@ fn someone_can_answer() -> bool {
     notice::client_alive()
 }
 
-async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) -> Person {
+fn clear_service_consent_files() {
+    let dir = crate::syspaths::service_dir();
+    let _ = std::fs::remove_file(dir.join("consent.json"));
+    let _ = std::fs::remove_file(dir.join("consent-reply.json"));
+}
+
+async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32, connection: &Connection) -> Person {
     if !someone_can_answer() {
         return Person::Unavailable;
     }
@@ -2019,31 +2106,54 @@ async fn service_consent(state: &HostState, name: &str, ip: &str, offered: u32) 
     }
     let ask_path = dir.join("consent.json");
     let reply_path = dir.join("consent-reply.json");
-    let _ = std::fs::remove_file(&reply_path);
-    let id =
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1);
-    let ask = serde_json::json!({ "id": id, "from": name, "ip": ip, "offered": offered });
-    if std::fs::write(&ask_path, ask.to_string()).is_err() {
-        return Person::Unavailable;
+    let existing = std::fs::read(&ask_path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let existing_from = existing.as_ref().and_then(|v| v.get("from")).and_then(|v| v.as_str()).unwrap_or("");
+    let reuse = pjdesk_proto::consent::reuse_pending(existing_from, name);
+    let id = if reuse {
+        existing.as_ref().and_then(|v| v.get("id")).and_then(|v| v.as_u64()).unwrap_or(1)
+    } else {
+        let _ = std::fs::remove_file(&reply_path);
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1)
+    };
+    if !reuse {
+        let ask = serde_json::json!({ "id": id, "from": name, "ip": ip, "offered": offered });
+        if std::fs::write(&ask_path, ask.to_string()).is_err() {
+            return Person::Unavailable;
+        }
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + pjdesk_proto::consent::WAIT;
     let reply = loop {
         if let Ok(bytes) = std::fs::read(&reply_path) {
             if let Ok(reply) = serde_json::from_slice::<ConsentReply>(&bytes) {
-                break Some(reply);
+                if reply.id == id || reuse {
+                    break Some(reply);
+                }
             }
+        }
+        if connection.close_reason().is_some() {
+            return Person::Dropped;
         }
         if tokio::time::Instant::now() >= deadline {
             break None;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
-    let _ = std::fs::remove_file(&ask_path);
-    let _ = std::fs::remove_file(&reply_path);
-    let Some(reply) = reply else {
+    // Leave the files when this connection dropped so a retry can use Allow.
+    // On a verdict, leave the reply for a second waiter from the same viewer;
+    // a later request from someone else replaces them in the branch above.
+    if reply.is_none() {
+        let still_ours = std::fs::read(&ask_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("id").and_then(|id| id.as_u64()))
+            == Some(id);
+        if still_ours && !std::fs::read(&reply_path).ok().and_then(|b| serde_json::from_slice::<ConsentReply>(&b).ok()).is_some() {
+            let _ = std::fs::remove_file(&ask_path);
+            let _ = std::fs::remove_file(&reply_path);
+        }
         return Person::TimedOut;
-    };
-    match consent_grant(&state.policy.lock().unwrap(), reply) {
+    }
+    match consent_grant(&state.policy.lock().unwrap(), reply.unwrap()) {
         Some(answer) => Person::Yes(answer.0, answer.1),
         None => Person::No,
     }
@@ -2058,6 +2168,44 @@ mod permanent_tests {
         assert_eq!(super::fresh_permanent(old.clone(), false, None), None, "removed in settings");
         assert_eq!(super::fresh_permanent(old.clone(), true, None), old, "unreadable blob keeps the current one");
         assert_eq!(super::fresh_permanent(None, true, Some("  ".into())), None);
+    }
+}
+
+#[cfg(test)]
+mod consent_tests {
+    use super::*;
+
+    #[test]
+    fn a_second_request_from_the_same_viewer_keeps_the_popup_and_an_allow() {
+        let shared = HostShared::default();
+        let id = shared.begin_consent("ben@spader.us — CABINDESK", "68.234.75.68", 0);
+        shared.answer_consent(id, true);
+        let again = shared.begin_consent("ben@spader.us — CABINDESK", "68.234.75.68", 0);
+        assert_eq!(again, id, "one popup per viewer");
+        let reply = shared.reply_for(id).expect("Allow must still be on file");
+        assert!(reply.accept);
+        assert!(shared.pending_consent().is_none(), "the popup hides after Allow");
+    }
+
+    #[test]
+    fn a_different_viewer_gets_a_new_popup() {
+        let shared = HostShared::default();
+        let id = shared.begin_consent("CABINDESK", "1.2.3.4", 0);
+        shared.answer_consent(id, true);
+        let other = shared.begin_consent("LENOVO", "5.6.7.8", 0);
+        assert_ne!(other, id);
+        assert!(shared.reply_for(id).is_none(), "a new viewer must not inherit the last Allow");
+        assert!(shared.pending_consent().is_some());
+    }
+
+    #[test]
+    fn decline_clears_the_prompt_after_the_last_waiter() {
+        let shared = HostShared::default();
+        let id = shared.begin_consent("CABINDESK", "1.2.3.4", 0);
+        shared.answer_consent(id, false);
+        shared.end_consent_wait(id, true);
+        assert!(shared.pending_consent().is_none());
+        assert!(shared.reply_for(id).is_none());
     }
 }
 

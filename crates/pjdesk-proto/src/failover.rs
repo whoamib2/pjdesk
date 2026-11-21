@@ -354,10 +354,14 @@ pub fn session_refusal(reason: &str) -> Option<&'static str> {
         Some("Access was revoked.")
     } else if lower.contains("blocked") {
         Some("This computer is blocked.")
-    } else if lower.contains("not allowed") || lower.contains("declined") {
-        Some("The other computer declined the session.")
-    } else if lower.contains("stopped sharing") {
-        Some("The other computer stopped sharing.")
+    } else if crate::consent::is_decline(reason) {
+        if lower.contains("stopped sharing") {
+            Some("The other computer stopped sharing.")
+        } else {
+            Some("The other computer declined the session.")
+        }
+    } else if crate::consent::is_timeout(reason) {
+        Some("The other computer did not accept in time.")
     } else {
         None
     }
@@ -1093,6 +1097,8 @@ mod tests {
         assert_eq!(session_refusal("screen sharing not allowed"), Some("The other computer declined the session."));
         assert_eq!(session_refusal("the person declined"), Some("The other computer declined the session."));
         assert_eq!(session_refusal("stopped sharing"), Some("The other computer stopped sharing."));
+        assert_eq!(session_refusal("No answer"), Some("The other computer did not accept in time."));
+        assert_eq!(session_refusal("No one is available to accept"), Some("The other computer did not accept in time."));
         assert_eq!(session_refusal("the connection ended"), None);
         assert_eq!(session_refusal("Disconnected: timed out"), None);
         assert_eq!(session_refusal("session lost: the control stream closed"), None);
