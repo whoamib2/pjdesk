@@ -3241,7 +3241,7 @@ fn prepare_viewer(cmd: &mut std::process::Command) {
 
 impl App {
     fn fail_session(&mut self, text: impl Into<String>) {
-        let text = text.into();
+        let text = pjdesk_proto::signal::user_facing_error(&text.into());
         self.status = text.clone();
         self.session_error = Some(text);
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));

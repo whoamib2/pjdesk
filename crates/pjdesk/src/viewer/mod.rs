@@ -622,19 +622,29 @@ async fn connect(
                 if !followed_redirect && pjdesk_proto::signal::is_standby_refusal(&message) =>
             {
                 followed_redirect = true;
-                let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) else {
-                    bail!("{message}");
+                let Some((targets, routes)) = pjdesk_proto::signal::standby_redirect_plan(&message, &mine) else {
+                    bail!("{}", pjdesk_proto::signal::user_facing_error(&message));
                 };
                 if !routes.is_empty() {
                     config.network_routes = pjdesk_proto::routes::keep_other_server(&config.network_routes, &routes);
                     crate::routes_store::store(&config.network_routes);
                     let _ = config.save();
                 }
-                if addr.is_empty() {
-                    bail!("{message}");
+                let mut hopped = None;
+                for addr in &targets {
+                    tracing::info!("Standby redirected the session to {addr}");
+                    match SignalClient::connect_endpoint(addr, config, pjdesk_proto::routes::dial_budget(addr)).await {
+                        Ok(s) => {
+                            hopped = Some(s);
+                            break;
+                        }
+                        Err(err) => tracing::info!("redirected route {addr} failed: {err:#}"),
+                    }
                 }
-                tracing::info!("Standby redirected the session to {addr}");
-                signal = SignalClient::connect_endpoint(&addr, config, pjdesk_proto::routes::dial_budget(&addr)).await?;
+                let Some(new_signal) = hopped else {
+                    bail!("{}", pjdesk_proto::signal::user_facing_error(&message));
+                };
+                signal = new_signal;
                 if !access.is_empty() {
                     let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
                 }
@@ -656,7 +666,7 @@ async fn connect(
                     let _ = config.save();
                 }
             }
-            Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
+            Ok(Some(ServerMsg::Error { message, .. })) => bail!("{}", pjdesk_proto::signal::user_facing_error(&message)),
             Ok(Some(_)) => continue,
             Ok(None) => bail!("the server closed the connection"),
             Err(_) => bail!("the host did not respond"),
@@ -731,7 +741,7 @@ async fn connect(
                 if let Some(link) = lan_after_relay_setup(config, target, password, &mine, force_relay).await? {
                     return Ok(link);
                 }
-                bail!("{message}")
+                bail!("{}", pjdesk_proto::signal::user_facing_error(&message))
             }
             Ok(Some(_)) => continue,
             Ok(None) => bail!("the server closed the connection"),

@@ -982,7 +982,7 @@ fn install_session_panic_hook() {
 /// Writes the reason a viewer or connect command stopped, next to pjdesk.log.
 /// The main window reads this when the viewer process exits.
 fn note_failure(text: &str) {
-    let text = phone_view_failure(text);
+    let text = pjdesk_proto::signal::user_facing_error(&phone_view_failure(text));
     let connect = std::env::args().any(|a| a == "connect");
     if connect {
         tracing::error!("session failed: {text}");

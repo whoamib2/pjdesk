@@ -833,6 +833,39 @@ pub fn parse_standby_redirect(message: &str) -> Option<(String, crate::routes::S
     Some((primary, routes))
 }
 
+/// Shown when a standby redirected us but the primary could not be reached.
+pub const STANDBY_PRIMARY_UNREACHABLE: &str =
+    "This PJDesk server is a standby. The primary server could not be reached. Check that the primary is running and try again.";
+
+/// Primary addresses and catalog from a standby refusal.
+pub fn standby_redirect_plan(
+    message: &str,
+    mine: &[std::net::Ipv4Addr],
+) -> Option<(Vec<String>, crate::routes::ServerRoutes)> {
+    let (hint, routes) = parse_standby_redirect(message)?;
+    let targets = crate::routes::primary_redirect_targets(&routes, &hint, mine);
+    if targets.is_empty() {
+        return None;
+    }
+    Some((targets, routes))
+}
+
+/// Error text a person can read. Never includes the raw `routes` payload.
+pub fn user_facing_error(message: &str) -> String {
+    if is_standby_refusal(message) || has_routes_payload(message) {
+        STANDBY_PRIMARY_UNREACHABLE.to_string()
+    } else {
+        message.trim().to_string()
+    }
+}
+
+fn has_routes_payload(message: &str) -> bool {
+    message.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("routes ") || line.contains("primary_lan=")
+    })
+}
+
 fn routes_line(routes: &crate::routes::ServerRoutes) -> String {
     if routes.is_empty() {
         return String::new();
@@ -1169,6 +1202,49 @@ mod tests {
         assert_eq!(next_reconnect_delay(RECONNECT_CAP), RECONNECT_CAP);
         let paused = jitter_reconnect(Duration::from_secs(4));
         assert!(paused >= Duration::from_millis(3200) && paused <= Duration::from_millis(4800), "{paused:?}");
+    }
+
+    #[test]
+    fn a_standby_redirect_is_followed_on_primary_lan_then_public_and_never_shown_raw() {
+        let message = concat!(
+            "This server is the standby. Connect to the primary at 204.248.122.44:21200.\n",
+            "routes primary_lan=192.168.0.193:21200,192.168.56.1:21200 ",
+            "primary_public=204.248.122.44:21200 ",
+            "standby_lan=10.0.0.20:21200,10.5.0.21:21200,172.28.208.1:21200 ",
+            "standby_public=68.234.75.68:21200 names=-",
+        );
+        let (hint, routes) = parse_standby_redirect(message).unwrap();
+        assert_eq!(hint, "204.248.122.44:21200");
+        assert_eq!(
+            routes.primary_lan,
+            vec!["192.168.0.193:21200".to_string(), "192.168.56.1:21200".to_string()]
+        );
+        assert_eq!(routes.primary_public, vec!["204.248.122.44:21200".to_string()]);
+        assert_eq!(
+            routes.standby_lan,
+            vec![
+                "10.0.0.20:21200".to_string(),
+                "10.5.0.21:21200".to_string(),
+                "172.28.208.1:21200".to_string()
+            ]
+        );
+        assert_eq!(routes.standby_public, vec!["68.234.75.68:21200".to_string()]);
+        assert!(routes.names.is_empty(), "names=- must parse as an empty list");
+        let cabin = [std::net::Ipv4Addr::new(10, 0, 0, 50)];
+        let (targets, _) = standby_redirect_plan(message, &cabin).unwrap();
+        assert_eq!(targets, vec!["204.248.122.44:21200".to_string()]);
+        let home = [std::net::Ipv4Addr::new(192, 168, 0, 50)];
+        let (targets, _) = standby_redirect_plan(message, &home).unwrap();
+        assert_eq!(
+            targets,
+            vec!["192.168.0.193:21200".to_string(), "204.248.122.44:21200".to_string()]
+        );
+        let shown = user_facing_error(message);
+        assert_eq!(shown, STANDBY_PRIMARY_UNREACHABLE);
+        assert!(!shown.contains("routes"), "{shown}");
+        assert!(!shown.contains("primary_lan="), "{shown}");
+        assert!(!shown.contains("204.248.122.44"), "{shown}");
+        assert_eq!(user_facing_error("device 902 488 771 is not online"), "device 902 488 771 is not online");
     }
 }
 

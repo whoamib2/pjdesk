@@ -1077,19 +1077,34 @@ async fn register_catalog(
                     if pjdesk_proto::signal::is_standby_refusal(&message) && redirects < 1 =>
                 {
                     redirects += 1;
-                    let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) else {
-                        bail!("could not reach the primary after the standby redirect; retrying");
+                    let Some((targets, routes)) = pjdesk_proto::signal::standby_redirect_plan(&message, &mine) else {
+                        bail!("{}", pjdesk_proto::signal::user_facing_error(&message));
                     };
                     remember_routes(config, routes);
-                    if addr.is_empty() {
-                        bail!("could not reach the primary after the standby redirect; retrying");
+                    let mut hopped = None;
+                    let mut misses = Vec::new();
+                    for addr in &targets {
+                        info!("Standby redirected registration to {addr}");
+                        match SignalClient::connect_endpoint(addr, config, pjdesk_proto::routes::dial_budget(addr)).await {
+                            Ok(s) => {
+                                hopped = Some(s);
+                                break;
+                            }
+                            Err(err) => {
+                                let why = one_line(&err);
+                                info!("registration route {addr} failed: {why}");
+                                misses.push((addr.clone(), why));
+                            }
+                        }
                     }
-                    info!("Standby redirected registration to {addr}");
-                    signal = SignalClient::connect_endpoint(&addr, config, pjdesk_proto::routes::dial_budget(&addr)).await.map_err(|err| {
-                        let why = one_line(&err);
-                        info!("registration route {addr} failed: {why}");
-                        anyhow::anyhow!("{}", pjdesk_proto::routes::registration_miss(&[(&addr, why.as_str())]))
-                    })?;
+                    let Some(new_signal) = hopped else {
+                        if !misses.is_empty() {
+                            let rows: Vec<(&str, &str)> = misses.iter().map(|(a, w)| (a.as_str(), w.as_str())).collect();
+                            bail!("{}", pjdesk_proto::routes::registration_miss(&rows));
+                        }
+                        bail!("{}", pjdesk_proto::signal::user_facing_error(&message));
+                    };
+                    signal = new_signal;
                     break;
                 }
                 Ok(Some(ServerMsg::Error { message, .. })) => {
@@ -1097,7 +1112,7 @@ async fn register_catalog(
                         state.server_proto.store(pjdesk_proto::MIN_PROTOCOL_VERSION, Ordering::SeqCst);
                         bail!("the server speaks an older protocol; reconnecting");
                     }
-                    bail!("the server refused registration: {message}");
+                    bail!("the server refused registration: {}", pjdesk_proto::signal::user_facing_error(&message));
                 }
                 Ok(Some(other)) => bail!("unexpected reply from the server: {other:?}"),
                 Ok(None) if used_install_key && !state.legacy_register.swap(true, Ordering::SeqCst) => {

@@ -1958,15 +1958,25 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                         }
                         if !redirected && pjdesk_proto::signal::is_standby_refusal(&message) {
                             redirected = true;
-                            if let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) {
+                            if let Some((targets, routes)) = pjdesk_proto::signal::standby_redirect_plan(&message, &mine) {
                                 if !routes.is_empty() {
                                     let previous = state.routes.lock().unwrap().clone();
                                     *state.routes.lock().unwrap() = pjdesk_proto::routes::keep_other_server(&previous, &routes);
                                     persist(&state);
                                 }
-                                if !addr.is_empty() {
+                                let mut hopped = None;
+                                for addr in &targets {
                                     log_line(&cb, format!("standby redirected registration to {addr}"));
-                                    signal = SignalClient::connect_endpoint(&addr, pinned, pjdesk_proto::routes::dial_budget(&addr)).await?;
+                                    match SignalClient::connect_endpoint(addr, pinned, pjdesk_proto::routes::dial_budget(addr)).await {
+                                        Ok(s) => {
+                                            hopped = Some(s);
+                                            break;
+                                        }
+                                        Err(err) => log_line(&cb, format!("redirected route {addr} failed: {err:#}")),
+                                    }
+                                }
+                                if let Some(new_signal) = hopped {
+                                    signal = new_signal;
                                     if presented {
                                         let token = if keyed {
                                             state.access_key.lock().unwrap().trim().to_string()
@@ -1992,12 +2002,13 @@ async fn host_once(state: Arc<State>, cb: Arc<dyn Callbacks>, public_only: bool,
                                     server, signal.via, signal.server_addr
                                 ),
                             );
-                            bail!("{message}");
+                            bail!("{}", pjdesk_proto::signal::user_facing_error(&message));
                         }
+                        let shown = pjdesk_proto::signal::user_facing_error(&message);
                         if message.contains("account owner's password") {
-                            emit(&cb, &json!({"event":"error","text": message}));
+                            emit(&cb, &json!({"event":"error","text": shown}));
                         } else {
-                            emit(&cb, &json!({"event":"status","text": message}));
+                            emit(&cb, &json!({"event":"status","text": shown}));
                         }
                     }
                     ServerMsg::WantHostReport => {
@@ -3837,6 +3848,8 @@ async fn controller_session(
     let _ = (primary, standby, prefer_standby);
     let pinned = state.fingerprint.lock().unwrap().clone().and_then(|s| pjdesk_proto::tls::parse_fingerprint(&s).ok());
     let mut signal = open_ordered(&state, &cb, pinned).await?;
+    let extra = state.phone_mine.lock().unwrap().clone();
+    let mine = tokio::task::spawn_blocking(move || merged_mine(&extra)).await.unwrap_or_default();
     let mut followed_redirect = false;
     if let Some(fp) = signal.observed {
         *state.fingerprint.lock().unwrap() = Some(pjdesk_proto::tls::format_fingerprint(&fp));
@@ -3868,19 +3881,29 @@ async fn controller_session(
                 if !followed_redirect && pjdesk_proto::signal::is_standby_refusal(&message) =>
             {
                 followed_redirect = true;
-                let Some((addr, routes)) = pjdesk_proto::signal::parse_standby_redirect(&message) else {
-                    bail!("{message}");
+                let Some((targets, routes)) = pjdesk_proto::signal::standby_redirect_plan(&message, &mine) else {
+                    bail!("{}", pjdesk_proto::signal::user_facing_error(&message));
                 };
                 if !routes.is_empty() {
                     let previous = state.routes.lock().unwrap().clone();
                     *state.routes.lock().unwrap() = pjdesk_proto::routes::keep_other_server(&previous, &routes);
                     persist(&state);
                 }
-                if addr.is_empty() {
-                    bail!("{message}");
+                let mut hopped = None;
+                for addr in &targets {
+                    log_line(&cb, format!("standby redirected the session to {addr}"));
+                    match SignalClient::connect_endpoint(addr, pinned, pjdesk_proto::routes::dial_budget(addr)).await {
+                        Ok(s) => {
+                            hopped = Some(s);
+                            break;
+                        }
+                        Err(err) => log_line(&cb, format!("redirected route {addr} failed: {err:#}")),
+                    }
                 }
-                log_line(&cb, format!("standby redirected the session to {addr}"));
-                signal = SignalClient::connect_endpoint(&addr, pinned, pjdesk_proto::routes::dial_budget(&addr)).await?;
+                let Some(new_signal) = hopped else {
+                    bail!("{}", pjdesk_proto::signal::user_facing_error(&message));
+                };
+                signal = new_signal;
                 if !access.is_empty() {
                     let _ = signal.send(ClientMsg::PresentAccess { token: access.clone() });
                 }
@@ -3919,7 +3942,7 @@ async fn controller_session(
                 emit(&cb, &json!({"event":"accountSession","state":"expired"}));
                 bail!("{}", pjdesk_proto::signal::SIGN_IN_EXPIRED);
             }
-            Ok(Some(ServerMsg::Error { message, .. })) => bail!("{message}"),
+            Ok(Some(ServerMsg::Error { message, .. })) => bail!("{}", pjdesk_proto::signal::user_facing_error(&message)),
             Ok(Some(_)) => continue,
             Ok(None) => bail!("the server closed the connection"),
             Err(_) => bail!("the PJDesk server did not start a session"),
@@ -3962,12 +3985,13 @@ async fn controller_session(
                 break (public_addr, local_addrs, cert_fingerprint.context("the server didn't send the host's key")?)
             }
             Some(Ok(Some(ServerMsg::Error { message, .. }))) => {
+                let shown = pjdesk_proto::signal::user_facing_error(&message);
                 if let Some(Some((addr, fp))) = heard {
-                    log_line(&cb, format!("the server stopped the relay setup ({message}); connecting on this network to {addr}"));
+                    log_line(&cb, format!("the server stopped the relay setup ({shown}); connecting on this network to {addr}"));
                     lan_direct = Some(addr);
                     break (addr, Vec::new(), fp);
                 }
-                bail!("{message}")
+                bail!("{shown}")
             }
             Some(Ok(Some(_))) => continue,
             Some(Ok(None)) => bail!("the server closed the connection"),
@@ -4004,8 +4028,6 @@ async fn controller_session(
             (p2p::controller_endpoint_on(socket, Some(fingerprint))?.0, None)
         }
     };
-    let extra = state.phone_mine.lock().unwrap().clone();
-    let mine = tokio::task::spawn_blocking(move || merged_mine(&extra)).await.unwrap_or_default();
     let direct = p2p::candidates(peer_public, &peer_local);
     let candidates = p2p::candidates_from(peer_public, &peer_local, &mine);
     if candidates.len() != direct.len() {

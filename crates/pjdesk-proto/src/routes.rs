@@ -429,7 +429,10 @@ pub fn apply_route_health(order: Vec<String>, routes: &ServerRoutes) -> Vec<Stri
     }
     kept.extend(demoted);
     let preferred = canonical(&routes.preferred);
-    if !preferred.is_empty() && miss_count(routes, &preferred) == 0 {
+    if !preferred.is_empty()
+        && miss_count(routes, &preferred) == 0
+        && !standby_is_behind_primary(routes, &preferred)
+    {
         if let Some(pos) = kept.iter().position(|addr| same_endpoint(addr, &preferred)) {
             let item = kept.remove(pos);
             kept.insert(0, item);
@@ -474,26 +477,25 @@ fn prefer_public_off_lan(order: Vec<String>, routes: &ServerRoutes, mine: &[Ipv4
     public
 }
 
-/// On the server's LAN, that LAN address stays ahead of a public address.
+/// On the primary's LAN, that LAN address stays ahead of a public address.
 ///
 /// A saved public route, including one that answered on cellular, does not
-/// jump the queue while this computer shares the server's /24. A LAN address
+/// jump the queue while this computer shares the primary's /24. A LAN address
 /// that answered recently is included when this computer's own address is
 /// unknown, so a missed interface list does not hide the path that just worked.
+///
+/// The standby's LAN is not promoted. Reaching a standby first only produces a
+/// redirect; the primary's public address is tried before a local standby.
 fn promote_same_lan(order: Vec<String>, routes: &ServerRoutes, mine: &[Ipv4Addr]) -> Vec<String> {
     let mut lan = Vec::new();
-    for raw in routes.primary_lan.iter().chain(routes.standby_lan.iter()) {
+    for raw in &routes.primary_lan {
         let addr = canonical(raw);
         if on_subnet(&addr, mine) {
             push_unique(&mut lan, addr);
         }
     }
     let preferred = canonical(&routes.preferred);
-    let listed = routes
-        .primary_lan
-        .iter()
-        .chain(routes.standby_lan.iter())
-        .any(|addr| same_endpoint(addr, &preferred));
+    let listed = routes.primary_lan.iter().any(|addr| same_endpoint(addr, &preferred));
     if listed && miss_count(routes, &preferred) < 4 && (mine.is_empty() || on_subnet(&preferred, mine)) {
         if let Some(pos) = lan.iter().position(|addr| same_endpoint(addr, &preferred)) {
             let item = lan.remove(pos);
@@ -531,8 +533,56 @@ pub fn note_answer(routes: &mut ServerRoutes, addr: &str) {
     if addr.is_empty() {
         return;
     }
-    routes.preferred = addr.clone();
     routes.misses.retain(|row| !same_endpoint(&row.addr, &addr));
+    // A standby that answers TCP is not the server a session should prefer.
+    if standby_is_behind_primary(routes, &addr) {
+        if same_endpoint(&routes.preferred, &addr) {
+            routes.preferred.clear();
+        }
+    } else {
+        routes.preferred = addr;
+    }
+}
+
+/// True when `addr` is a known standby and a primary address is also listed.
+pub fn standby_is_behind_primary(routes: &ServerRoutes, addr: &str) -> bool {
+    has_primary(routes) && is_standby_endpoint(routes, addr)
+}
+
+fn has_primary(routes: &ServerRoutes) -> bool {
+    routes.primary_lan.iter().chain(routes.primary_public.iter()).any(|addr| !canonical(addr).is_empty())
+}
+
+fn is_standby_endpoint(routes: &ServerRoutes, addr: &str) -> bool {
+    routes.standby_lan.iter().chain(routes.standby_public.iter()).any(|have| same_endpoint(have, addr))
+}
+
+/// Primary addresses to try after a standby redirect: same-subnet LAN, then public.
+pub fn primary_redirect_targets(routes: &ServerRoutes, hinted: &str, mine: &[Ipv4Addr]) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in &routes.primary_lan {
+        let addr = canonical(raw);
+        if on_subnet(&addr, mine) {
+            push_unique(&mut out, addr);
+        }
+    }
+    for raw in &routes.primary_public {
+        let addr = canonical(raw);
+        if !addr.is_empty() {
+            push_unique(&mut out, addr);
+        }
+    }
+    let hinted = canonical(hinted);
+    if hinted.is_empty() {
+        return out;
+    }
+    // Do not put an off-subnet primary LAN first; that is what delayed the hop.
+    let private = endpoint_v4(&hinted).is_some_and(|ip| ip.is_private());
+    if private && !on_subnet(&hinted, mine) {
+        return out;
+    }
+    push_unique(&mut out, hinted);
+    out
 }
 
 /// This address did not answer. The count is consecutive.
@@ -565,6 +615,9 @@ pub fn display_host(text: &str) -> String {
 fn carry_health(next: &mut ServerRoutes, previous: &ServerRoutes) {
     if next.preferred.trim().is_empty() {
         next.preferred = previous.preferred.clone();
+    }
+    if standby_is_behind_primary(next, &next.preferred) {
+        next.preferred.clear();
     }
     if next.misses.is_empty() {
         next.misses = previous.misses.clone();
@@ -1035,12 +1088,13 @@ mod tests {
         assert_eq!(order[0], "192.168.0.20:21200");
         assert!(order.iter().any(|addr| addr == "198.51.100.8:21200"));
         assert_eq!(order.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
-        // 10.1.1.8 is the standby LAN on this computer's /24, so it is first.
-        // The primary's public address follows.
+        // The standby's LAN is on this /24, but the primary's public address
+        // is still first so registration does not land on a redirect.
         let cabin = [v4(10, 1, 1, 50)];
         let from_cabin = registration_targets("", &sample(), &cabin, "");
-        assert_eq!(from_cabin[0], "10.1.1.8:21200");
-        assert_eq!(from_cabin[1], "204.248.122.44:21200");
+        assert_eq!(from_cabin[0], "204.248.122.44:21200", "{from_cabin:?}");
+        let standby_at = from_cabin.iter().position(|addr| addr == "10.1.1.8:21200");
+        assert!(standby_at.is_some_and(|i| i > 0), "{from_cabin:?}");
         assert!(from_cabin.iter().any(|addr| addr == "198.51.100.8:21200"));
         assert_eq!(from_cabin.last().map(String::as_str), Some("pjdesk.spader.us:21200"));
     }
@@ -1234,5 +1288,42 @@ mod tests {
         assert!(order.iter().any(|addr| addr.starts_with("10.0.0.20")), "{order:?}");
         assert!(!order.iter().any(|addr| addr.starts_with("192.168.0.169")), "{order:?}");
         assert!(!order.iter().any(|addr| addr.starts_with("192.168.0.193")), "{order:?}");
+    }
+
+    #[test]
+    fn a_cabin_client_dials_the_primary_public_address_before_the_local_standby() {
+        let mut routes = ServerRoutes {
+            primary_lan: vec!["192.168.0.193:21200".into(), "192.168.56.1:21200".into()],
+            primary_public: vec!["204.248.122.44:21200".into()],
+            standby_lan: vec!["10.0.0.20:21200".into(), "10.5.0.21:21200".into(), "172.28.208.1:21200".into()],
+            standby_public: vec!["68.234.75.68:21200".into()],
+            preferred: "10.0.0.20:21200".into(),
+            ..ServerRoutes::default()
+        };
+        let cabin = [v4(10, 0, 0, 50)];
+        let order = dial_targets(&routes, &cabin, "");
+        // Primary public first. The nearer standby is kept only as failover.
+        // The primary's 192.168.x LAN is a different site, so it is skipped.
+        assert_eq!(
+            order,
+            vec![
+                "204.248.122.44:21200".to_string(),
+                "10.0.0.20:21200".to_string(),
+                "68.234.75.68:21200".to_string(),
+            ],
+            "{order:?}"
+        );
+        note_answer(&mut routes, "10.0.0.20:21200");
+        assert_ne!(routes.preferred, "10.0.0.20:21200");
+        let again = dial_targets(&routes, &cabin, "");
+        assert_eq!(again[0], "204.248.122.44:21200", "{again:?}");
+        let targets = primary_redirect_targets(&routes, "204.248.122.44:21200", &cabin);
+        assert_eq!(targets, vec!["204.248.122.44:21200".to_string()]);
+        let at_primary = [v4(192, 168, 0, 50)];
+        let home = primary_redirect_targets(&routes, "204.248.122.44:21200", &at_primary);
+        assert_eq!(
+            home,
+            vec!["192.168.0.193:21200".to_string(), "204.248.122.44:21200".to_string()]
+        );
     }
 }
