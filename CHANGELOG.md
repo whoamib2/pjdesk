@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.4
+
+- Fixed: the Allow this connection? prompt no longer keeps coming back if the other computer retries. One prompt stays up until you Allow or Decline it, and an Allow you already gave is reused if that computer tries again. After you answer, the prompt goes away. The other computer waits up to a minute (it shows "Waiting for the other computer to accept") instead of dialing again, and Decline or no answer stops the retries.
+
 ## 0.7.3
 
 - Fixed: when a standby PJDesk server is on the same local network, the client now prefers the active primary (its LAN address if you are on that network, otherwise its public address). If a standby still answers first and redirects you, the client follows that redirect to the primary without showing an error. If the primary cannot be reached, you see a short message, never the raw routes text.
