@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.3
+
+- Fixed: when a standby PJDesk server is on the same local network, the client now prefers the active primary (its LAN address if you are on that network, otherwise its public address). If a standby still answers first and redirects you, the client follows that redirect to the primary without showing an error. If the primary cannot be reached, you see a short message, never the raw routes text.
+
 ## 0.7.2
 
 - Fixed: when you control a computer from your phone, moving one finger only moves the mouse. A drag starts from a still long-press (about 700ms) or a double-tap-and-drag, not from ordinary movement. A two-finger tap is a right-click, and a two-finger slide scrolls smoothly up, down, and sideways.
